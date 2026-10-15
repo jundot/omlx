@@ -71,16 +71,8 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_draft_model",
     "dflash_draft_quant_enabled",
     "dflash_draft_quant_weight_bits",
-    "dflash_draft_quant_activation_bits",
     "dflash_draft_quant_group_size",
-    "dflash_max_ctx",
-    "dflash_in_memory_cache",
-    "dflash_in_memory_cache_max_entries",
-    "dflash_in_memory_cache_max_bytes",
-    "dflash_ssd_cache",
-    "dflash_ssd_cache_max_bytes",
     "dflash_draft_window_size",
-    "dflash_draft_sink_size",
     "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
@@ -114,6 +106,10 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_engram_ssd_offload",
         # Architecture-level prefill strategy; explicit per model.
         "deepseek_v41_ced_prefill_enabled",
+        # Gain and memory cost depend on the checkpoint's GDN recipe.
+        "qwen4_gdn_decode_wide_proj",
+        # Which engine serves the model depends on what this Mac has installed.
+        "external_engine",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
         # Memory residency of an embedding model's audio tower; explicit per model.

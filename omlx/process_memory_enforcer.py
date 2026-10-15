@@ -701,7 +701,9 @@ class ProcessMemoryEnforcer:
         omlx_usage = get_phys_footprint()
         reserve = self._tier_reserve_bytes()
         terms = {
-            "omlx": omlx_usage,
+            # Splash's wired memory is neither free nor reclaimable, so it
+            # counts as oMLX's own: unloading the model frees it.
+            "omlx": omlx_usage + self._external_process_bytes(),
             "free": 0,
             "inactive": 0,
             "other_apps": 0,
@@ -734,7 +736,7 @@ class ProcessMemoryEnforcer:
         reclaimable = terms["free"] + terms["inactive"] + terms["other_apps"]
         # Other apps may already hold the reserve. Stay at 1 byte rather than
         # 0, which callers read as "guard disabled".
-        terms["dynamic"] = max(1, omlx_usage + reclaimable - reserve)
+        terms["dynamic"] = max(1, terms["omlx"] + reclaimable - reserve)
         return terms
 
     def _get_hard_limit_bytes(self) -> int:
@@ -942,6 +944,9 @@ class ProcessMemoryEnforcer:
 
         When no request is active we keep the legacy direct MLX telemetry path
         so idle/status accounting remains as precise as before.
+
+        Models served from their own processes (Splash) are added, since
+        evicting them frees that memory too.
         """
         phys = get_phys_footprint()
         if self._has_active_requests():
@@ -951,7 +956,20 @@ class ProcessMemoryEnforcer:
             active = mx.get_active_memory()
             mlx_bytes = active + mx.get_cache_memory()
             fresh = True
-        return max(active, phys - unreleased_graphics_bytes(mlx_bytes, fresh=fresh))
+        own = max(active, phys - unreleased_graphics_bytes(mlx_bytes, fresh=fresh))
+        return own + self._external_process_bytes()
+
+    def _external_process_bytes(self) -> int:
+        """Memory of models served from their own processes (Splash)."""
+        reader = getattr(self._engine_pool, "external_process_memory_bytes", None)
+        if not callable(reader):
+            return 0
+        try:
+            value = reader()
+        except Exception:  # noqa: BLE001
+            logger.debug("external process memory read failed", exc_info=True)
+            return 0
+        return value if isinstance(value, int) else 0
 
     def _is_emergency_pressure(self, current: int, ceiling: int) -> bool:
         """Return True only for pressure beyond the configured ceiling.
@@ -1323,20 +1341,27 @@ class ProcessMemoryEnforcer:
             self._propagate_memory_limit()
         logger.info(f"Prefill memory guard: {'enabled' if value else 'disabled'}")
 
+    def _request_memory_requeue(self, entry: Any) -> int:
+        """Ask the entry's scheduler to keep its requests; 0 means abort them."""
+        scheduler = self._resolve_scheduler(entry)
+        # Look the method up on the class so a mock's auto-attribute is ignored.
+        requeue = getattr(type(scheduler), "request_memory_requeue", None)
+        if not callable(requeue):
+            return 0
+        try:
+            return int(requeue(scheduler) or 0)
+        except Exception as e:
+            logger.warning("Memory requeue request failed: %s", e)
+            return 0
+
     @staticmethod
     def _resolve_scheduler(entry: Any) -> Any | None:
-        """Resolve the watermark target (Scheduler or DFlash guard) from an
-        EnginePool entry.
+        """Resolve the watermark target Scheduler from an EnginePool entry.
 
         Most engines (BatchedEngine, VLMBatchedEngine) wrap the scheduler
-        as ``entry.engine._engine.engine.scheduler`` (AsyncEngineCore →
-        EngineCore → Scheduler). Some non-streaming engines may expose
-        ``entry.engine.scheduler`` directly — including ``DFlashEngine`` in
-        fallback mode, whose ``scheduler`` property resolves the fallback
-        engine's real scheduler. DFlash's *primary* speculative path has no
-        scheduler at all, so it exposes a lightweight ``_prefill_guard`` that
-        carries the same watermark attrs; tried last so standard engines
-        resolve unchanged. Returns None if nothing resolves.
+        as ``entry.engine._engine.engine.scheduler`` (AsyncEngineCore ->
+        EngineCore -> Scheduler). Some engines may expose
+        ``entry.engine.scheduler`` directly. Returns None if nothing resolves.
         """
         eng = entry.engine
         if eng is None:
@@ -1351,10 +1376,7 @@ class ProcessMemoryEnforcer:
                 sched = getattr(inner_engine, "scheduler", None)
                 if sched is not None:
                     return sched
-        # DFlash primary mode bypasses the scheduler entirely; the enforcer
-        # still needs to push the ceiling somewhere, so it lands on the
-        # engine's ``_prefill_guard`` (None for every non-DFlash engine).
-        return getattr(eng, "_prefill_guard", None)
+        return None
 
     def _propagate_memory_limit(self) -> None:
         """Propagate ceiling-derived watermarks to all schedulers.
@@ -1370,14 +1392,6 @@ class ProcessMemoryEnforcer:
         abort_limit = self._get_abort_limit_bytes()
         hot_cache_reserved = (
             self._hot_cache_reserved_bytes() if ceiling > 0 or abort_limit > 0 else 0
-        )
-        # Clamp to the reservation: the usage-side exclusion must never exceed
-        # what the ceiling actually gave up, or a transient hot-cache overshoot
-        # past max_bytes would net-weaken the guard exactly under pressure.
-        hot_cache_used = (
-            min(self._hot_cache_used_bytes(), hot_cache_reserved)
-            if hot_cache_reserved > 0
-            else 0
         )
         scheduler_ceiling = self._scheduler_limit_bytes(
             ceiling, reserved=hot_cache_reserved
@@ -1420,11 +1434,6 @@ class ProcessMemoryEnforcer:
                     # Its rank processes own the schedulers and receive their
                     # guard budgets from the signed deployment, so there is no
                     # coordinator scheduler for this enforcer to update.
-                    continue
-                if (
-                    type(engine).__name__ == "DFlashEngine"
-                    and getattr(engine, "_fallback_engine", None) is None
-                ):
                     continue
                 if getattr(engine, "is_diffusion_model", False):
                     continue
@@ -1469,12 +1478,6 @@ class ProcessMemoryEnforcer:
             scheduler._memory_metal_cap_bytes = breakdown["metal_cap"]
             scheduler._memory_metal_cap_raw_bytes = metal_cap_raw
             scheduler._memory_hot_cache_reserved_bytes = hot_cache_reserved
-            # Usage-side counterpart of the reservation above: targets whose
-            # usage read is raw phys_footprint (the DFlash primary guard)
-            # subtract this so serialized hot-cache CPU bytes are not charged
-            # both here and in the reserved ceiling. The Scheduler reads its
-            # own live counter instead and ignores this attr.
-            scheduler._memory_hot_cache_used_bytes = hot_cache_used
             # Tier name disambiguates dynamic = computed reclaimable
             # (safe/balanced/aggressive) from dynamic = user-pinned
             # custom_ceiling_bytes (custom). The advice ladder needs
@@ -1836,6 +1839,16 @@ class ProcessMemoryEnforcer:
                     busy_victim = self._find_lru_busy_non_pinned_victim_locked()
                     if busy_victim is not None:
                         entry = self._engine_pool._entries.get(busy_victim)
+                        if not emergency and entry is not None:
+                            requeued = self._request_memory_requeue(entry)
+                            if requeued > 0:
+                                logger.warning(
+                                    "Hard memory pressure: storing and requeueing "
+                                    "%d request(s) on '%s' instead of aborting",
+                                    requeued,
+                                    busy_victim,
+                                )
+                                break
                         aborted = 0
                         if (
                             entry

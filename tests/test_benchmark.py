@@ -1121,16 +1121,16 @@ class TestFilterUploadedSettings:
                 qwen35_oq_a8_min_tokens=64,
                 moe_expert_offload_enabled=True,
                 moe_expert_offload_resident_fraction=0.5,
-                dflash_in_memory_cache_max_bytes=123,
-                dflash_ssd_cache_max_bytes=456,
+                dflash_draft_window_size=4096,
+                dflash_block_size=8,
             )
         )
         assert out["qwen35_oq_a8_enabled"] is True
         assert out["qwen35_oq_a8_min_tokens"] == 64
         assert out["moe_expert_offload_enabled"] is True
         assert out["moe_expert_offload_resident_fraction"] == 0.5
-        assert out["dflash_in_memory_cache_max_bytes"] == 123
-        assert out["dflash_ssd_cache_max_bytes"] == 456
+        assert out["dflash_draft_window_size"] == 4096
+        assert out["dflash_block_size"] == 8
 
     def test_full_snapshot_stays_under_the_size_cap(self):
         from omlx.admin import benchmark as bench
@@ -1160,11 +1160,8 @@ class TestFilterUploadedSettings:
                 dflash_draft_model="/models/z-lab/Qwen3.8-27B-DFlash2-b16",
                 dflash_draft_quant_enabled=True,
                 dflash_draft_quant_weight_bits=4,
-                dflash_draft_quant_activation_bits=8,
                 dflash_draft_quant_group_size=64,
-                dflash_max_ctx=131072,
                 dflash_draft_window_size=4096,
-                dflash_draft_sink_size=4,
                 dflash_block_size=16,
                 dflash_verify_mode="adaptive",
                 vlm_mtp_draft_model="gemma-4-26B-A4B-it-assistant",

@@ -26,7 +26,7 @@ from omlx.exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
-from omlx.model_settings import ModelSettings
+from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
     Qwen4ExpResidencyEstimate,
 )
@@ -905,6 +905,26 @@ class TestQwenCpuShareMemoryEstimate:
         settings.deepseek_v41_ced_prefill_enabled = False
         assert pool._engine_runtime_signature("v41", settings) == off
 
+    def test_qwen4_wide_decode_setting_changes_engine_signature(self, tmp_path):
+        from omlx.model_settings import ModelSettings
+
+        pool = _make_pool(ceiling=500)
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(tmp_path),
+            model_type="vlm",
+            engine_type="vlm",
+            config_model_type="qwen4_exp",
+            estimated_size=100,
+        )
+        pool._entries[entry.model_id] = entry
+        settings = ModelSettings()
+        off = pool._engine_runtime_signature("qwen4", settings)
+        settings.qwen4_gdn_decode_wide_proj = True
+        on = pool._engine_runtime_signature("qwen4", settings)
+        assert off != on
+        assert dict(on)["qwen4_gdn_decode_wide_proj"] == "True"
+
     @pytest.mark.asyncio
     async def test_v41_live_admission_keeps_viable_mmap_fallback(self, tmp_path):
         """Real pressure may select mmap without making that override sticky."""
@@ -1023,6 +1043,101 @@ class TestApplySettingsOverrides:
 
         assert pool.get_entry("model-a").model_type == "llm"
         assert pool.get_entry("model-a").engine_type == "batched"
+
+    def test_new_models_get_recommended_sampling(self, tmp_path):
+        models = tmp_path / "models"
+        for name, model_type, generation in (
+            (
+                "plain",
+                "llama",
+                {"do_sample": False, "temperature": 0.6, "top_p": 0.9, "top_k": -1},
+            ),
+            ("family", "qwen3", None),
+            ("custom", "llama", {"temperature": 0.3}),
+            ("bare", "llama", None),
+        ):
+            path = models / name
+            path.mkdir(parents=True)
+            (path / "config.json").write_text(json.dumps({"model_type": model_type}))
+            (path / "model.safetensors").write_bytes(b"0" * 1024)
+            if generation is not None:
+                (path / "generation_config.json").write_text(json.dumps(generation))
+        manager = ModelSettingsManager(tmp_path / "settings")
+        manager.set_settings("custom", ModelSettings(model_alias="mine"))
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(models))
+
+        pool.apply_settings_overrides(manager)
+
+        # do_sample is ignored and top_k -1 means disabled.
+        assert manager.get_settings("plain").to_dict() == (
+            ModelSettings(temperature=0.6, top_p=0.9, top_k=0).to_dict()
+        )
+        assert manager.get_settings("family").to_dict() == (
+            ModelSettings(top_k=20, top_p=0.95).to_dict()
+        )
+        assert manager.get_settings("custom").temperature is None
+        assert not manager.has_settings("bare")
+
+        # A value the user clears stays cleared on the next discovery.
+        manager.set_settings("plain", ModelSettings())
+        pool.apply_settings_overrides(manager)
+        assert manager.get_settings("plain").temperature is None
+        reloaded = ModelSettingsManager(tmp_path / "settings")
+        assert reloaded.get_settings("family").top_k == 20
+
+    def test_new_lightning_mtp_checkpoints_start_with_mtp_on(self, tmp_path):
+        models = tmp_path / "models"
+        config = {"model_type": "qwen3_5", "text_config": {"mtp_num_hidden_layers": 1}}
+        builds = (("mtp", True), ("stripped", False), ("saved", True))
+        for name, has_mtp_weights in builds:
+            path = models / name
+            path.mkdir(parents=True)
+            (path / "config.json").write_text(json.dumps(config))
+            (path / "model.safetensors").write_bytes(b"0" * 1024)
+            weight_map = {
+                "language_model.model.embed_tokens.weight": "model.safetensors"
+            }
+            if has_mtp_weights:
+                weight_map["language_model.mtp.fc.weight"] = "model.safetensors"
+            (path / "model.safetensors.index.json").write_text(
+                json.dumps({"metadata": {}, "weight_map": weight_map})
+            )
+        manager = ModelSettingsManager(tmp_path / "settings")
+        manager.set_settings("saved", ModelSettings(model_alias="mine"))
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(models))
+
+        pool.apply_settings_overrides(manager)
+
+        assert manager.get_settings("mtp").mtp_enabled is True
+        # Config heads without MTP tensors cannot run Lightning MTP.
+        assert not manager.get_settings("stripped").mtp_enabled
+        # Saved settings are the user's; discovery does not touch them.
+        assert not manager.get_settings("saved").mtp_enabled
+
+    def test_recommended_sampling_keeps_ocr_defaults(self, tmp_path):
+        (tmp_path / "generation_config.json").write_text(
+            json.dumps({"temperature": 0.7, "top_p": 0.8})
+        )
+        entry = EngineEntry(
+            model_id="ocr",
+            model_path=str(tmp_path),
+            model_type="vlm",
+            engine_type="vlm",
+            estimated_size=0,
+            config_model_type="glm_ocr",
+        )
+
+        assert EnginePool.recommended_sampling_settings(entry) == {
+            "temperature": 0.0,
+            "top_p": 0.8,
+            "repetition_penalty": 1.1,
+        }
+        entry.config_model_type = "diffusion_gemma"
+        assert EnginePool.recommended_sampling_settings(entry) == {"temperature": 0.7}
+        entry.model_type = "embedding"
+        assert EnginePool.recommended_sampling_settings(entry) == {}
 
 
 class TestVLMFallback:
@@ -1383,66 +1498,6 @@ class TestEnginePoolLRU:
         assert victim == "model-a"
 
 
-class TestEnginePoolDFlashIsolation:
-    """Tests for DFlash process-global runtime isolation."""
-
-    class DFlashEngine:
-        def __init__(self, *, active: bool = False):
-            self.active = active
-
-        def has_active_requests(self):
-            return self.active
-
-    class OtherEngine:
-        def has_active_requests(self):
-            return False
-
-    @staticmethod
-    def _entry(model_id: str, engine) -> EngineEntry:
-        return EngineEntry(
-            model_id=model_id,
-            model_path=f"/models/{model_id}",
-            model_type="llm",
-            engine_type="batched",
-            estimated_size=1024,
-            engine=engine,
-        )
-
-    @pytest.mark.asyncio
-    async def test_unload_other_dflash_engines_unloads_idle_dflash_only(self):
-        pool = EnginePool()
-        pool._entries["old-dflash"] = self._entry("old-dflash", self.DFlashEngine())
-        pool._entries["other"] = self._entry("other", self.OtherEngine())
-        pool._entries["new-dflash"] = self._entry("new-dflash", None)
-
-        unloaded = []
-
-        async def fake_unload(model_id):
-            unloaded.append(model_id)
-            pool._entries[model_id].engine = None
-
-        pool._unload_engine = fake_unload
-
-        await pool._unload_other_dflash_engines("new-dflash")
-
-        assert unloaded == ["old-dflash"]
-        assert pool._entries["other"].engine is not None
-
-    @pytest.mark.asyncio
-    async def test_unload_other_dflash_engines_blocks_active_dflash(self):
-        pool = EnginePool()
-        pool._entries["active-dflash"] = self._entry(
-            "active-dflash", self.DFlashEngine(active=True)
-        )
-        pool._entries["new-dflash"] = self._entry("new-dflash", None)
-        pool._unload_engine = AsyncMock()
-
-        with pytest.raises(RuntimeError, match="active-dflash"):
-            await pool._unload_other_dflash_engines("new-dflash")
-
-        pool._unload_engine.assert_not_awaited()
-
-
 class TestEnginePoolAsync:
     """Async tests for EnginePool (mocked)."""
 
@@ -1563,65 +1618,6 @@ class TestEnginePoolAsync:
         )
 
     @pytest.mark.asyncio
-    async def test_bundled_dflash_profile_switch_reloads_engine(
-        self, pool_with_mock_engines, small_mock_model_dir
-    ):
-        from omlx.model_settings import ModelSettings
-
-        pool = pool_with_mock_engines
-        model_path = small_mock_model_dir / "model-a"
-        (model_path / "config.json").write_text(json.dumps({"model_type": "mimo_v2"}))
-        draft_path = model_path / "dflash"
-        draft_path.mkdir()
-        (draft_path / "config.json").write_text(
-            json.dumps(
-                {
-                    "architectures": ["DFlashDraftModel"],
-                    "dflash_config": {
-                        "attention_value_scale": 0.612,
-                        "attention_sink_bias": True,
-                    },
-                }
-            )
-        )
-        (draft_path / "model.safetensors").touch()
-        (draft_path / "mask_embedding.pt").touch()
-        plain = ModelSettings()
-        bundled = ModelSettings(dflash_enabled=True)
-        tuned = ModelSettings(dflash_enabled=True, dflash_block_size=8)
-        explicit = ModelSettings(
-            dflash_enabled=True,
-            dflash_draft_model=str(draft_path),
-            dflash_block_size=8,
-        )
-        engines = [MagicMock() for _ in range(4)]
-        for engine in engines:
-            engine.start = AsyncMock()
-            engine.stop = AsyncMock()
-
-        with (
-            patch(
-                "omlx.engine_pool.BatchedEngine", side_effect=[engines[0], engines[3]]
-            ),
-            patch("omlx.engine.dflash.DFlashEngine", side_effect=engines[1:3]) as load,
-        ):
-            for settings, expected in zip(
-                [plain, bundled, tuned, explicit, plain],
-                [engines[0], engines[1], engines[2], engines[2], engines[3]],
-                strict=True,
-            ):
-                assert (
-                    await pool.get_engine("model-a", runtime_settings=settings)
-                    is expected
-                )
-
-        assert load.call_count == 2
-        assert load.call_args.kwargs["draft_model_path"] == str(draft_path)
-        for engine in engines[:3]:
-            engine.stop.assert_awaited_once()
-        engines[3].stop.assert_not_awaited()
-
-    @pytest.mark.asyncio
     async def test_dflash_enabled_without_resolvable_draft_warns_and_falls_back(
         self, pool_with_mock_engines, caplog
     ):
@@ -1653,10 +1649,16 @@ class TestEnginePoolAsync:
         self, pool_with_mock_engines
     ):
         pool = pool_with_mock_engines
+        pool.get_entry("model-a").config_model_type = "qwen3"
+        # The drafter estimate charges a context ring per scheduler row.
+        pool._scheduler_config.max_num_seqs = 8
         engine = MagicMock()
         engine.start = AsyncMock()
 
-        with patch("omlx.engine.dflash.DFlashEngine", return_value=engine) as load:
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch("omlx.engine_pool.load_dflash_drafter") as load,
+        ):
             await pool.get_engine(
                 "model-a",
                 runtime_settings=ModelSettings(
@@ -1664,9 +1666,8 @@ class TestEnginePoolAsync:
                 ),
             )
 
-        assert load.call_args.kwargs["draft_model_path"] == (
-            pool.get_entry("model-b").model_path
-        )
+        assert load.call_args.args[0] == pool.get_entry("model-b").model_path
+        engine.set_dflash_drafter.assert_called_once_with(load.return_value)
 
     @pytest.mark.asyncio
     async def test_runtime_settings_reload_rejected_while_leased(
@@ -1699,35 +1700,59 @@ class TestEnginePoolAsync:
         base_engine.stop.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_dflash_start_fallback_reuses_requested_variant_while_leased(
+    async def test_dflash_without_a_draft_uses_the_bundled_draft(
+        self, pool_with_mock_engines, small_mock_model_dir
+    ):
+        """MiMo ships its DFlash draft in ``dflash/`` inside the checkpoint."""
+        pool = pool_with_mock_engines
+        pool._scheduler_config.max_num_seqs = 8
+        entry = pool.get_entry("model-a")
+        entry.config_model_type = "mimo_v2"
+        draft_path = small_mock_model_dir / "model-a" / "dflash"
+        draft_path.mkdir()
+        (draft_path / "config.json").write_text("{}")
+        (draft_path / "model.safetensors").touch()
+        engine = MagicMock()
+        engine.start = AsyncMock()
+
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch("omlx.engine_pool.load_dflash_drafter") as load,
+        ):
+            await pool.get_engine(
+                "model-a", runtime_settings=ModelSettings(dflash_enabled=True)
+            )
+
+        assert load.call_args.args[0] == str(draft_path)
+        engine.set_dflash_drafter.assert_called_once_with(load.return_value)
+        assert entry.runtime_settings_signature == pool._engine_runtime_signature(
+            "model-a", ModelSettings(dflash_enabled=True)
+        )
+
+    @pytest.mark.asyncio
+    async def test_dflash_drafter_failure_reuses_requested_variant_while_leased(
         self, pool_with_mock_engines
     ):
-        """Identical DFlash requests must reuse a fail-soft fallback (#2406)."""
+        """Identical DFlash requests must reuse a fail-soft engine (#2406)."""
         from omlx.model_settings import ModelSettings
 
         pool = pool_with_mock_engines
+        pool.get_entry("model-a").config_model_type = "qwen3"
+        pool._scheduler_config.max_num_seqs = 8
         settings = ModelSettings(
             dflash_enabled=True,
             dflash_draft_model="/draft",
         )
-
-        class DFlashEngine:
-            pass
-
-        dflash_engine = DFlashEngine()
-        dflash_engine.start = AsyncMock(side_effect=RuntimeError("draft load failed"))
-        dflash_engine.stop = AsyncMock()
-
-        fallback_engine = MagicMock()
-        fallback_engine.start = AsyncMock()
-        fallback_engine.stop = AsyncMock()
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
 
         with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
             patch(
-                "omlx.engine.dflash.DFlashEngine",
-                return_value=dflash_engine,
-            ),
-            patch("omlx.engine_pool.BatchedEngine", return_value=fallback_engine),
+                "omlx.engine_pool.load_dflash_drafter",
+                side_effect=RuntimeError("draft load failed"),
+            ) as load,
         ):
             first = await pool.get_engine(
                 "model-a",
@@ -1741,16 +1766,16 @@ class TestEnginePoolAsync:
             )
 
         entry = pool.get_entry("model-a")
-        assert first is fallback_engine
-        assert second is fallback_engine
+        assert first is engine
+        assert second is engine
         assert entry.in_use == 2
         assert entry.runtime_settings_signature == pool._engine_runtime_signature(
             "model-a", settings
         )
-        dflash_engine.start.assert_awaited_once()
-        dflash_engine.stop.assert_awaited_once()
-        fallback_engine.start.assert_awaited_once()
-        fallback_engine.stop.assert_not_awaited()
+        load.assert_called_once()
+        engine.start.assert_awaited_once()
+        engine.set_dflash_drafter.assert_not_called()
+        engine.stop.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_vlm_mtp_fallback_reuses_requested_variant_while_leased(
@@ -2066,12 +2091,12 @@ class TestEnginePoolAsync:
             patch(
                 "omlx.engine_pool.DecisionEngine", return_value=mock_engine
             ) as MockDecisionEngine,
-            patch("omlx.engine.dflash.DFlashEngine") as MockDFlashEngine,
+            patch("omlx.engine_pool.load_dflash_drafter") as load_drafter,
         ):
             engine = await pool.get_engine("clef")
 
         assert engine is mock_engine
-        MockDFlashEngine.assert_not_called()
+        load_drafter.assert_not_called()
         MockDecisionEngine.assert_called_once_with(
             model_name=str(model_path),
             trust_remote_code=False,
@@ -2134,11 +2159,6 @@ class TestEnginePoolAsync:
             scheduler_config=SchedulerConfig(max_num_seqs=1, completion_batch_size=1)
         )
         batched, scheduler = self._engine_with_scheduler(executor, prefill_batch_size=6)
-        fallback, fallback_scheduler = self._engine_with_scheduler(executor)
-        dflash_config = SchedulerConfig(max_num_seqs=1, completion_batch_size=1)
-        dflash = SimpleNamespace(
-            _scheduler_config=dflash_config, _fallback_engine=fallback
-        )
         stopping, stopping_scheduler = self._engine_with_scheduler(stopped)
         cluster_config = SchedulerConfig(max_num_seqs=1, completion_batch_size=1)
         cluster = SimpleNamespace(
@@ -2147,7 +2167,6 @@ class TestEnginePoolAsync:
         )
         for model_id, engine in (
             ("batched", batched),
-            ("dflash", dflash),
             ("stopping", stopping),
             ("cluster", cluster),
         ):
@@ -2159,14 +2178,11 @@ class TestEnginePoolAsync:
         for config in (
             pool._scheduler_config,
             scheduler.config,
-            dflash_config,
-            fallback_scheduler.config,
             stopping_scheduler.config,
         ):
             assert (config.max_num_seqs, config.completion_batch_size) == (4, 4)
         # The generator cap keeps the BatchGenerator floor of prefill rows.
         assert scheduler.batch_generator.completion_batch_size == 6
-        assert fallback_scheduler.batch_generator.completion_batch_size == 4
         assert (cluster_config.max_num_seqs, cluster_config.completion_batch_size) == (
             1,
             1,

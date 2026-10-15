@@ -121,6 +121,7 @@ def apply() -> bool:
                     logger.debug("MTP path not active: %s", reason)
 
         def patched_next(self, *args, **kwargs):
+            model = getattr(self, "model", None)
             if _is_mtp_batch_eligible(self):
                 policy = _batch_policy_for_next(self)
                 _batch_park_memory(self.model).tick()
@@ -149,7 +150,7 @@ def apply() -> bool:
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        with _spec_command_buffers():
+                        with _spec_command_buffers(model):
                             return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
@@ -176,7 +177,7 @@ def apply() -> bool:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
-                            with _spec_command_buffers():
+                            with _spec_command_buffers(model):
                                 return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
@@ -370,6 +371,24 @@ def _model_has_mtp_module(model: Any) -> bool:
 # raise its peak memory.
 _SPEC_BUFFER_CAPS = (200, 512)
 
+# Target model types supported by the Qwen Lightning MTP/DFlash paths.
+_SPEC_CAPS_TARGET_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_5_vl",
+        "qwen3_6",
+        "qwen3_6_moe",
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }
+)
+
+
+def _spec_caps_target(model: Any) -> bool:
+    """Whether the loaded target belongs to the selected Qwen family."""
+    return getattr(model, "model_type", None) in _SPEC_CAPS_TARGET_TYPES
+
 
 @functools.lru_cache(maxsize=1)
 def _raises_spec_buffer_caps() -> bool:
@@ -388,11 +407,12 @@ def _raises_spec_buffer_caps() -> bool:
 
 
 @contextlib.contextmanager
-def _spec_command_buffers():
-    """Raise MLX's command-buffer caps for one speculative decode step.
+def _spec_command_buffers(model: Any = None):
+    """Raise caps for supported Qwen targets and GPUs, then restore them."""
+    if not _spec_caps_target(model):
+        yield
+        return
 
-    Measured on M5 and M3 Ultra, so other GPUs keep MLX's caps.
-    """
     from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
 
     previous = None
@@ -411,7 +431,7 @@ def _drafter_for(model: Any) -> Optional[Any]:
     A drafter replaces the embedded MTP head as the draft source. It is
     stamped on the language model as ``_omlx_drafter`` at attach time and
     exposes ``depth``, ``target_layer_ids``, ``draft``, ``observe``,
-    ``release`` and ``decode_scope`` (see omlx.speculative.dflash_drafter).
+    ``release`` and ``decode_scope`` (see omlx.speculative.dflash).
     """
     candidates = [model]
     for attr in ("language_model", "_language_model"):
@@ -1375,8 +1395,7 @@ def _batch_policy_for_next(gen_batch: Any):
         policy = BatchPolicy(
             gen_batch.uids,
             depth if chain else 1,
-            fixed=_drafter_for(gen_batch.model) is not None
-            or _mtp_depth_fixed(gen_batch.model),
+            fixed=_mtp_depth_fixed(gen_batch.model),
         )
         memory.seed(policy)
         gen_batch._omlx_mtp_batch_policy = policy
@@ -2252,7 +2271,14 @@ def _resolve_mtp_chain_depth(model: Any) -> Tuple[bool, int, bool]:
 
 
 def _mtp_depth_fixed(model: Any) -> bool:
-    """True when the model was loaded with a fixed draft depth (no controller)."""
+    """True when the draft depth has no controller.
+
+    That is a model loaded with a fixed MTP depth, or a block drafter whose
+    verify mode keeps the whole block.
+    """
+    drafter = _drafter_for(model)
+    if drafter is not None:
+        return not getattr(drafter, "adaptive", False)
     candidates = [model]
     for attr in ("language_model", "_language_model"):
         inner = getattr(model, attr, None)
@@ -3217,20 +3243,6 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
-        if drafter is not None:
-            # Block drafters keep their own per-request context and draft a
-            # fixed block, so neither the head cache nor the depth
-            # controller applies. The captured hidden of main_tok is the
-            # newest context entry; next_main is the anchor.
-            state.mtp_cache = []
-            state.next_main = _ensure_uint32(next_main_tok)
-            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
-            state.queue.append(
-                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
-            )
-            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
-            gen_batch._omlx_mtp_state = state
-            return
         if depth > 1 and not _mtp_depth_fixed(gen_batch.model):
             factory = getattr(
                 _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
@@ -3249,6 +3261,20 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
                     gen_batch.model._omlx_mtp_depth_seed = state.controller
                 except Exception:
                     pass
+        if drafter is not None:
+            # Block drafters keep their own per-request context and draft
+            # the whole block; the depth controller only narrows the
+            # verified part. The captured hidden of main_tok is the newest
+            # context entry; next_main is the anchor.
+            state.mtp_cache = []
+            state.next_main = _ensure_uint32(next_main_tok)
+            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+            state.queue.append(
+                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+            )
+            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
+            gen_batch._omlx_mtp_state = state
+            return
         primed = _prompt_priming.take_primed(
             gen_batch.model,
             gen_batch.prompt_cache,
@@ -3353,7 +3379,6 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
     if policy is not None and policy.uids != tuple(gen_batch.uids):
         policy = None
     saved = [(state.controller, state.depth) for state in states]
-    depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
     # Copied windows are not draft-depth decisions; the singleton depth
     # controller skips them too.
     copied = any(state.copy_drafts for state in states)
@@ -3363,6 +3388,19 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
         for state in states:
             state.controller = None
             state.depth = requested
+    if _drafter_for(gen_batch.model) is not None:
+        # Clip before grouping so rows that share a window verify together.
+        for state in states:
+            if state.chain:
+                _clip_block_drafts(
+                    state,
+                    (
+                        state.controller.cur
+                        if state.controller is not None
+                        else state.depth
+                    ),
+                )
+    depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
     started = time.perf_counter()
     try:
         advance(gen_batch, batch_state)
@@ -3824,6 +3862,25 @@ def _dense_q_rows(draft_accept_lps) -> list:
     return list(draft_accept_lps)
 
 
+def _clip_block_drafts(state: _MtpState, limit: int) -> None:
+    """Keep the first ``limit`` drafts of a block for this verify.
+
+    Block drafters pick positions left to right, so a prefix of the block
+    with its draft distributions is a complete proposal.
+    """
+    drafts = state.drafts
+    if drafts is None or limit >= int(drafts.shape[0]):
+        return
+    state.drafts = drafts[:limit]
+    if state.draft_lps:
+        state.draft_lps = state.draft_lps[:limit]
+    q = state.draft_accept_lps
+    if isinstance(q, SparseDraftQ):
+        state.draft_accept_lps = SparseDraftQ(q.ids[:limit], q.logq[:limit], q.vocab)
+    elif q:
+        state.draft_accept_lps = list(q)[:limit]
+
+
 def _sparse_top_k(sampler) -> int:
     """Top-k of a sampler whose target filter is exactly top-p + top-k, else 0."""
     top_k = int(getattr(sampler, "top_k", 0) or 0)
@@ -4044,6 +4101,13 @@ def _run_verify_cycle_chain(
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
     is_greedy = _is_greedy(gen_batch)
+    drafter = _drafter_for(gen_batch.model)
+    if drafter is not None and verify_result is None:
+        # A shared verify was already built from the drafts it was given.
+        _clip_block_drafts(
+            state,
+            state.controller.cur if state.controller is not None else state.depth,
+        )
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
@@ -4063,7 +4127,6 @@ def _run_verify_cycle_chain(
 
     # --- backbone verify forward + single host sync ---
     t0 = time.perf_counter()
-    drafter = _drafter_for(gen_batch.model)
     if verify_result is None:
         verify_result = _call_backbone_captured(
             gen_batch.model,

@@ -42,6 +42,9 @@ _RPS = 4
 # weight pass between rows, up to this many per-lane input values.
 _SHARED_ROWS_MIN_TILES = 2048
 _ROW_VALUES_BUDGET = 32
+# Padding a partial row tile pays for large 8-bit weight streams. Smaller
+# matrices and 4/5/6-bit unpackers are faster with the existing divisor tile.
+_PADDED_ROWS_MIN_WEIGHT_BYTES = 128 * 1024 * 1024
 
 # Per row this is qmv_fast_impl (FAST) or qmv_impl, exactly as
 # moe_verify_gather runs them per (row, expert) pair; the row loop sits
@@ -410,26 +413,47 @@ def _kernel_supported(linear: nn.QuantizedLinear, x: mx.array) -> bool:
     )
 
 
-def _launch_geometry(bits: int, fast: bool, n: int, rows: int) -> tuple[int, int]:
+def _launch_geometry(
+    bits: int, fast: bool, n: int, rows: int, k: int
+) -> tuple[int, int]:
     """(rows per threadgroup, output columns per simdgroup) for one launch."""
     if (n + 2 * _RPS - 1) // (2 * _RPS) < _SHARED_ROWS_MIN_TILES:
         return 1, _RPS
     limit = _ROW_VALUES_BUDGET // _values_per_thread(bits, fast)
-    rows_per_group = next((d for d in range(min(rows, limit), 1, -1) if rows % d == 0), 1)
+    rows_per_group = next(
+        (d for d in range(min(rows, limit), 1, -1) if rows % d == 0), 1
+    )
+    if (
+        rows_per_group == 1
+        and bits == 8
+        and fast
+        and n * k >= _PADDED_ROWS_MIN_WEIGHT_BYTES
+    ):
+        rows_per_group = min(rows, limit)
     return rows_per_group, _RPS
 
 
 class _Plan:
     """Static launch parameters of one (linear, row count, dtype) shape."""
 
-    __slots__ = ("kernel", "template", "grid", "output_shapes", "output_dtypes", "bias")
+    __slots__ = (
+        "kernel",
+        "template",
+        "grid",
+        "output_shapes",
+        "output_dtypes",
+        "bias",
+        "padding",
+    )
 
     def __init__(self, linear: nn.QuantizedLinear, x: mx.array, rows: int):
         k = int(x.shape[-1])
         n = int(linear.weight.shape[0])
         bits = int(linear.bits)
         fast = qmv_fast_layout(k, n, bits)
-        rows_per_group, rps = _launch_geometry(bits, fast, n, rows)
+        rows_per_group, rps = _launch_geometry(bits, fast, n, rows, k)
+        self.padding = -rows % rows_per_group
+        padded_rows = rows + self.padding
         self.kernel = _kernel(bits, int(linear.group_size), fast)
         self.template = [
             ("T", x.dtype),
@@ -438,8 +462,12 @@ class _Plan:
             ("ROWS", rows_per_group),
             ("RPS", rps),
         ]
-        self.grid = (32, 2 * (rows // rows_per_group), (n + 2 * rps - 1) // (2 * rps))
-        self.output_shapes = [(rows, n)]
+        self.grid = (
+            32,
+            2 * (padded_rows // rows_per_group),
+            (n + 2 * rps - 1) // (2 * rps),
+        )
+        self.output_shapes = [(padded_rows, n)]
         self.output_dtypes = [x.dtype]
         self.bias = "bias" in linear
 
@@ -473,8 +501,12 @@ def quantized_linear(linear: nn.QuantizedLinear, x: mx.array) -> mx.array:
     flat = x.reshape(rows, x.shape[-1])
     plan = _plan(linear, x, rows)
     if plan is None:
-        y = mx.concatenate([linear(flat[r : r + 1][None])[0] for r in range(rows)], axis=0)
+        y = mx.concatenate(
+            [linear(flat[r : r + 1][None])[0] for r in range(rows)], axis=0
+        )
         return y.reshape(*lead, -1)
+    if plan.padding:
+        flat = mx.pad(flat, [(0, plan.padding), (0, 0)])
     y = plan.kernel(
         inputs=[flat, linear.weight, linear.scales, linear.biases],
         template=plan.template,
@@ -483,6 +515,8 @@ def quantized_linear(linear: nn.QuantizedLinear, x: mx.array) -> mx.array:
         output_shapes=plan.output_shapes,
         output_dtypes=plan.output_dtypes,
     )[0]
+    if plan.padding:
+        y = y[:rows]
     if plan.bias:
         y = y + linear["bias"]
     return y.reshape(*lead, -1)
@@ -491,7 +525,14 @@ def quantized_linear(linear: nn.QuantizedLinear, x: mx.array) -> mx.array:
 class _GroupPlan:
     """Static launch parameters of one same-input projection group."""
 
-    __slots__ = ("kernel", "template", "grid", "output_shapes", "output_dtypes")
+    __slots__ = (
+        "kernel",
+        "template",
+        "grid",
+        "output_shapes",
+        "output_dtypes",
+        "padding",
+    )
 
     def __init__(self, linears, x: mx.array, rows: int, geometry=None):
         k = int(x.shape[-1])
@@ -500,24 +541,31 @@ class _GroupPlan:
         bits = int(first.bits)
         fast = qmv_fast_layout(k, sizes[0], bits)
         rows_per_group, rps, unrolled = geometry or (
-            *_launch_geometry(bits, fast, max(sizes), rows),
+            *_launch_geometry(bits, fast, max(sizes), rows, k),
             False,
         )
-        self.kernel = _group_kernel(bits, int(first.group_size), fast, len(linears), unrolled)
+        self.padding = -rows % rows_per_group
+        padded_rows = rows + self.padding
+        self.kernel = _group_kernel(
+            bits, int(first.group_size), fast, len(linears), unrolled
+        )
         self.template = [("T", x.dtype), ("K_SIZE", k)]
         self.template += [(f"N_{i}", n) for i, n in enumerate(sizes)]
         self.template += [("ROWS", rows_per_group), ("RPS", rps)]
         tiles = sum((n + 2 * rps - 1) // (2 * rps) for n in sizes)
-        self.grid = (32, 2 * (rows // rows_per_group), tiles)
-        self.output_shapes = [(rows, n) for n in sizes]
+        self.grid = (32, 2 * (padded_rows // rows_per_group), tiles)
+        self.output_shapes = [(padded_rows, n) for n in sizes]
         self.output_dtypes = [x.dtype] * len(sizes)
 
     def launch(self, linears, x: mx.array) -> list:
         """The group's outputs for ``x`` of shape [rows, K]."""
+        rows = x.shape[0]
+        if self.padding:
+            x = mx.pad(x, [(0, self.padding), (0, 0)])
         inputs = [x]
         for linear in linears:
             inputs += [linear.weight, linear.scales, linear.biases]
-        return self.kernel(
+        outputs = self.kernel(
             inputs=inputs,
             template=self.template,
             grid=self.grid,
@@ -525,6 +573,7 @@ class _GroupPlan:
             output_shapes=self.output_shapes,
             output_dtypes=self.output_dtypes,
         )
+        return [y[:rows] for y in outputs] if self.padding else outputs
 
 
 def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _GroupPlan | None:

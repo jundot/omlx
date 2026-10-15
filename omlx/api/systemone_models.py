@@ -3,7 +3,7 @@
 Pydantic models for the TypeSafe System One API.
 
 These models define the request schema for:
-- /v1/systemone endpoint (decision models such as Clef and OpenJev)
+- /v1/systemone endpoint (decision models such as Clef, OpenJev and Decision 3.0)
 
 Each decision model applies its own rules to ``instructions`` and
 ``criteria``; this schema only checks the shared shape.
@@ -42,6 +42,9 @@ class SystemOneRequest(BaseModel):
 
     images: list[str] | None = None
     """Base64 image data URIs. An oMLX extension to the System One API."""
+
+    videos: list[str] | None = None
+    """Base64 video data URIs, for models that read video (Decision 3.0)."""
 
     truncate: bool = True
     """Clef only: cut the state to fit the context instead of returning 413."""

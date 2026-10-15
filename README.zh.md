@@ -135,9 +135,13 @@ brew services info omlx     # 查看状态
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 管理后台" width="720">
 </p>
 
+### 实验性多 Mac 推理
+
+源码构建版本可通过基于 Ring 或雷雳（Thunderbolt）RDMA/JACCL 的 MLX 流水线秩，将已下载的单一语言模型拆分并运行在多台内存规格不等的 Mac 上。集群仪表盘支持只读节点发现、严格的 SSH/运行时校验、感知字节级差异的分片规划、实测算力与链路负载均衡、感知内存余量的执行调优、激活，并在两台 Mac 上提供实时的分片与性能图谱。交互模式、均衡模式与吞吐量配置模式公开了合并批处理、提示词缓存亲和性、轮换 KV 限制、Ring 连接调优以及受能力门禁控制的实验性纯 Token 输出路径。有关安装设置、安全边界、当前限制以及物理硬件验证清单，请参阅[跨 Mac 分布式推理](docs/experimental/distributed-cluster.md)。
+
 ### 视觉语言模型
 
-使用与文本 LLM 相同的连续批处理和分层 KV 缓存堆栈运行 VLM。支持多图聊天、base64/URL/文件图像输入，以及带视觉上下文的工具调用。OCR 模型（DeepSeek-OCR、DOTS-OCR、GLM-OCR）会被自动识别，并使用优化的提示词。
+使用与文本 LLM 相同的连续批处理和分层 KV 缓存堆栈运行 VLM。支持多图聊天、base64/URL/文件图像输入，以及带视觉上下文的工具调用。MiMo V2.6 权重（包含配套 sidecar）还支持抽帧视频和 24 kHz 音频输入。Qwen3.5、Qwen3.6 和 Qwen3.8 权重（包括密集模型与 MoE）支持通过 base64 `video_url` / `input_video` 数据 URI 进行原生视频输入；视频输入需要 OpenCV (`opencv-python-headless`)。官方 MiMo V2.6 权重的 oQ 格式转换完整保留图像和音频支持。OCR 模型（DeepSeek-OCR、DOTS-OCR、GLM-OCR）会被自动识别，并使用优化的提示词。
 
 ### 分层 KV 缓存（热缓存 + 冷缓存）
 
@@ -223,7 +227,7 @@ brew services info omlx     # 查看状态
 
 ### API 兼容性
 
-OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、llama.cpp 风格的 prefill 进度（`return_progress`）、Anthropic adaptive thinking 和视觉输入（base64、URL）。
+OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、llama.cpp 风格的 prefill 进度（`return_progress`）、Anthropic adaptive thinking 和视觉输入（图像支持 base64 或 URL，视频支持 base64）。
 
 | 端点 | 说明 |
 |----------|------|
@@ -255,6 +259,8 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 
 上表未列出的模型，只要聊天模板支持 `tools` 参数且输出采用可识别的 `<tool_call>` XML 格式，也有可能正常工作。针对支持工具调用的流式请求，系统会增量发射助手文本，同时隐藏已知的工具调用控制标记；结构化工具调用将在完成整个回合解析后发射。
 
+裸 JSON、EBNF 或正则表达式语法会从第一个生成的 token 开始约束回答，因此会忽略 `thinking_budget`。如需将受约束的结构化输出与独立的、带预算的推理阶段相结合，请配置兼容的 `reasoning_parser`。
+
 ## 模型
 
 将 `--model-dir` 指向包含 MLX 格式模型子目录的目录。支持两级目录结构（如 `mlx-community/model-name/`）。
@@ -277,7 +283,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
 | 嵌入 | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | 重排序 | ModernBERT、XLM-RoBERTa |
-| 决策 | Clef、Clef-Flash、OpenJev |
+| 决策 | Clef、Clef-Flash、OpenJev、Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
 
 ## CLI 配置
 
@@ -405,3 +411,7 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 应用包的便携 Python 环境分层
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon 嵌入模型支持
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon 上的块扩散推测解码 (Block diffusion speculative decoding)
+- [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP 的验证形态 Metal 内核由 Youssof Altoukhi 的 MTPLX 提供支持，同时也启发了 depth-k 流水线设计
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - 融合 GDN 验证预处理内核改编自 mlx-serve 对 mlxfast-challenge qwen35_packed_gdn_prework 内核的移植，Qwen4 的融合 GDN decode 与 prefill 内核改编自 mlx-serve 的 MIT 开源 `transformer.zig`；Qwen4 QSA 的 128 位 K/V 暂存改编自 mlx-serve 的 MIT 开源 `msv_attn_p256` 内核
+- [Splash](https://github.com/incoai/splash) - 验证形态线性内核采用 Splash 的 bf16 `0x4300 | q` 权重操作数与分组输入求和（来自其 Apache-2.0 开源的 `linear_q4_sgmatrix.metal`），张量运算验证注意力借鉴了 Splash `paged_attention_tile.h` 的分块设计
+- [SiliconScope](https://github.com/kennss/SiliconScope) - 菜单栏统计信息的设计和渲染方法参考了 Kennt Kim 的 SiliconScope，这也启发了高能效重渲染门禁机制

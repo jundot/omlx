@@ -159,8 +159,18 @@ final class OMLXClient: ObservableObject {
         try await put(AdminAPI.modelSettings(id), body: patch)
     }
 
+    /// Settings write with explicit JSON nulls, for clearing fields.
+    @discardableResult
+    func updateModelSettings(id: String, settings: [String: AnyCodable]) async throws -> SimpleStatusResponse {
+        try await put(AdminAPI.modelSettings(id), body: settings)
+    }
+
     func resetModelSettings(id: String) async throws -> SettingsApplyResultDTO {
         try await postEmpty(AdminAPI.modelSettingsReset(id))
+    }
+
+    func getGenerationConfig(id: String) async throws -> GenerationConfigDTO {
+        try await get(AdminAPI.modelGenerationConfig(id))
     }
 
     /// Server-side lookup of the best omlx.ai benchmarks for this device

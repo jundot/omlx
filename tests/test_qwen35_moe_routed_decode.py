@@ -74,6 +74,7 @@ def _block(
         shared_expert_intermediate_size=inter,
         num_experts=experts,
         num_experts_per_tok=top_k,
+        norm_topk_prob=True,
     )
     block = Qwen3_5MoeSparseMoeBlock(args)
     block.set_dtype(dtype)
@@ -438,6 +439,7 @@ def test_block_without_gate_up_fusion_is_not_routed():
         shared_expert_intermediate_size=320,
         num_experts=EXPERTS,
         num_experts_per_tok=10,
+        norm_topk_prob=True,
     )
     block = Qwen3_5MoeSparseMoeBlock(args)
     block.set_dtype(mx.bfloat16)

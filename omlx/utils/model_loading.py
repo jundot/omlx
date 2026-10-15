@@ -12,6 +12,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
+from ..patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
+from ..patches.qwen35_yarn import apply_qwen35_yarn_patch, set_context_window
+
 logger = logging.getLogger(__name__)
 
 _VLM_TEXT_PREFIX = "language_model."
@@ -526,7 +529,7 @@ def maybe_apply_pre_load_patches(
       LanguageModel tree even when ``mtp_enabled`` is False (otherwise
       strict load fails on a Qwen3.6 *-mtp VLM and the engine falls back
       to LLM, losing vision). VLMBatchedEngine passes ``for_vlm=True``;
-      BatchedEngine / DFlashEngine / LLM loaders keep the default.
+      BatchedEngine / LLM loaders keep the default.
     - mlx-vlm MoE VLM sanitize patch when ``for_vlm`` is True and the
       checkpoint is a Qwen3.6 MoE VLM without declared MTP heads.
       Pre-converted mlx-lm exports ship ``switch_mlp`` weights; stock
@@ -589,6 +592,15 @@ def maybe_apply_pre_load_patches(
 
     apply_arrays_cache_extract_guard()
 
+    # Model-independent: unused ArraysCache padding metadata otherwise grows
+    # lazy graphs until a long-lived BatchGenerator hits the Metal resource limit.
+    apply_arrays_cache_metadata_patch()
+
+    # Model-independent: honors yarn rope entries on every Qwen3.5-family
+    # attention, whatever model loaded first.
+    apply_qwen35_yarn_patch()
+    set_context_window(model_name, getattr(model_settings, "max_context_window", None))
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
@@ -640,6 +652,23 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
+    if for_vlm and model_type in {"qwen3_5", "qwen3_5_moe", "qwen4_exp"}:
+        from ..patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
+
+        apply_qwen35_ssm_mask_patch()
+
+    if for_vlm and model_type == "qwen3_5":
+        from ..patches.mlx_vlm_qwen35_base_compat import (
+            apply_mlx_vlm_qwen35_base_compat_patch,
+            needs_base_compat,
+        )
+
+        if needs_base_compat(config) and apply_mlx_vlm_qwen35_base_compat_patch():
+            logger.info(
+                "Qwen3.5 base-checkpoint mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
     if for_vlm and model_type in {"moondream1", "moondream2"}:
         from ..patches.moondream2_compat import apply_moondream2_compat_patch
 
@@ -871,9 +900,9 @@ def maybe_apply_pre_load_patches(
     # never had MTP heads.
     # The batched DFlash drafter rides the Lightning MTP verify path, so its
     # patches are installed even when the checkpoint declares no MTP heads.
-    dflash_batched = for_vlm and dflash_batched_supported(
-        model_type, "vlm"
-    ) and dflash_batched_requested(model_settings)
+    dflash_batched = dflash_batched_supported(
+        model_type, "vlm" if for_vlm else "batched"
+    ) and dflash_batched_requested(model_settings, model_name)
     if _is_mtp_compatible(config, model_type) or dflash_batched:
         mtp_enabled = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
@@ -976,7 +1005,7 @@ def maybe_apply_pre_load_patches(
         # behaves identically to a stock no-MTP model at inference time
         # (with a small constant memory cost for the unused MTPModule).
         #
-        # ``for_vlm=False`` skips this branch on BatchedEngine / DFlashEngine
+        # ``for_vlm=False`` skips this branch on BatchedEngine
         # paths so mlx-vlm classes are not touched when the load goes
         # through mlx-lm only.
         if for_vlm:
@@ -1098,7 +1127,7 @@ def maybe_apply_pre_load_patches(
     # to vision_tower.* for Qwen3.6's nested ViT layout. Wraps whichever
     # Model.sanitize is current (stock mlx-vlm or mlx_vlm_mtp runtime), so
     # the call has to land after apply_mlx_vlm_mtp_runtime_patch above.
-    # VLM-only: dflash / mlx-lm paths never instantiate mlx-vlm classes,
+    # VLM-only: mlx-lm paths never instantiate mlx-vlm classes,
     # so touching them there is just dead weight.
     if for_vlm and model_type and model_type.startswith("qwen3_5_moe"):
         try:
@@ -1294,24 +1323,70 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     return _checkpoint_weight_prefix(Path(model_path) / "mtp", prefixes) is not None
 
 
-_DFLASH_BATCHED_MODEL_TYPES = ("qwen3_5", "qwen3_5_moe")
+# Model types whose engine runs DFlash as a block drafter, by engine type.
+_DFLASH_BATCHED_MODEL_TYPES = {
+    "vlm": (
+        "qwen3_5",
+        "qwen3_5_moe",
+        "glm5_next",
+        "gemma4",
+        "gemma4_unified",
+        "muse_glimmer",
+    ),
+    "batched": (
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3",
+        "qwen3_moe",
+        "laguna",
+        "mimo_v2",
+        "mimo_v2_flash",
+    ),
+}
 
 
 def dflash_batched_supported(model_type: str | None, engine_type: str | None) -> bool:
-    """True when DFlash runs as a block drafter inside the batched VLM engine.
-
-    Other DFlash targets (gemma4, laguna, muse, mlx-lm text loads) keep the
-    single-stream DFlashEngine.
-    """
-    return engine_type == "vlm" and model_type in _DFLASH_BATCHED_MODEL_TYPES
+    """True when DFlash runs as a block drafter inside the batched engine."""
+    return model_type in _DFLASH_BATCHED_MODEL_TYPES.get(engine_type or "", ())
 
 
-def dflash_batched_requested(model_settings: Any | None) -> bool:
-    return bool(
-        model_settings is not None
-        and getattr(model_settings, "dflash_enabled", False)
-        and getattr(model_settings, "dflash_draft_model", None)
+def dflash_compatibility(
+    model_type: str | None, engine_type: str | None
+) -> tuple[bool, str]:
+    """``(supported, reason)`` for the admin DFlash toggle."""
+    if dflash_batched_supported(model_type, engine_type):
+        return True, ""
+    return False, (
+        "DFlash supports Qwen3, Qwen3.5/3.6, Laguna, MiMo V2, GLM-5.3, Gemma 4 and "
+        f"Muse Glimmer models (model_type='{model_type or ''}', "
+        f"engine='{engine_type}')"
     )
+
+
+def bundled_dflash_draft(model_path: str | Path | None) -> str | None:
+    """A DFlash draft shipped inside the target checkpoint (MiMo's ``dflash/``)."""
+    if not model_path:
+        return None
+    path = Path(model_path) / "dflash"
+    if (path / "config.json").is_file() and any(path.glob("*.safetensors")):
+        return str(path)
+    return None
+
+
+def dflash_draft_for(
+    model_settings: Any | None, model_path: str | Path | None
+) -> str | None:
+    """The configured DFlash draft, else one bundled with the target."""
+    if model_settings is None or not getattr(model_settings, "dflash_enabled", False):
+        return None
+    configured = getattr(model_settings, "dflash_draft_model", None)
+    return configured or bundled_dflash_draft(model_path)
+
+
+def dflash_batched_requested(
+    model_settings: Any | None, model_path: str | Path | None = None
+) -> bool:
+    return dflash_draft_for(model_settings, model_path) is not None
 
 
 def _nax_available() -> bool:
@@ -1347,6 +1422,30 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"
     )
+
+
+def lightning_mtp_supported(model_path: str | Path) -> bool:
+    """Whether the Lightning MTP toggle accepts this checkpoint.
+
+    Same gates as the admin toggle: not paroquant, MTP heads on a supported
+    model type (Qwen4-Exp uses its own runtime), and MTP tensors in the weights.
+    """
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    quantization = config.get("quantization_config") or {}
+    if str(quantization.get("quant_method") or "").lower() == "paroquant":
+        return False
+    model_type = config.get("model_type")
+    if model_type == "qwen4_exp":
+        if not _has_mtp_heads(config):
+            return False
+    elif not _is_mtp_compatible(config, model_type):
+        return False
+    return _checkpoint_has_mtp_weights(model_path)
 
 
 def mimo_mtp_sidecar_config(model_name: str | Path) -> dict[str, str] | None:

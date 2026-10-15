@@ -92,6 +92,42 @@ def test_grouped_rows_equal_one_row_quantized_matmul(k, sizes, bits, group_size,
         assert _bit_equal(output, _serial(linear, x))
 
 
+@pytest.mark.parametrize("rows", [5, 7, 11, 13])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_partial_shared_row_tiles_equal_serial(rows, dtype, grouped):
+    linears = [_linear(2560, n, 8, 64, seed=rows + n) for n in (65536, 16)]
+    for linear in linears:
+        linear.scales = linear.scales.astype(dtype)
+        linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((1, rows, 2560)).astype(dtype)
+    if grouped:
+        assert row_exact_qmv._group_plan(linears, x, rows) is not None
+        outputs = row_exact_qmv.quantized_linears(linears, x)
+    else:
+        linears[0]["bias"] = mx.random.normal((65536,)).astype(dtype)
+        outputs = [row_exact_qmv.quantized_linear(linears[0], x)]
+    for linear, output in zip(linears, outputs):
+        expected = _serial(linear, x)
+        assert output.shape == expected.shape and output.dtype == dtype
+        assert _bit_equal(output, expected)
+
+
+def test_partial_row_tile_plan_reads_current_weights():
+    linear = _linear(2560, 65536, 8, 64, seed=7)
+    x = mx.random.normal((1, 7, 2560)).astype(mx.bfloat16)
+    first = row_exact_qmv.quantized_linear(linear, x)
+    mx.eval(first)
+    linear.weight, linear.scales, linear.biases = mx.quantize(
+        (mx.random.normal((65536, 2560)) * 0.05).astype(mx.bfloat16),
+        group_size=64,
+        bits=8,
+    )
+    current = row_exact_qmv.quantized_linear(linear, x)
+    assert _bit_equal(current, _serial(linear, x))
+    assert not _bit_equal(first, current)
+
+
 def test_row_exact_arming_routes_multi_row_quantized_linear():
     qwen35_verify_qmm.apply_verify_qmm_patch()
     linear = _linear(2560, 6144, 6, 64, seed=3)

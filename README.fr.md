@@ -277,7 +277,7 @@ Les modèles sont auto-détectés par type. Vous pouvez aussi télécharger des 
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
-| Decision | Clef, Clef-Flash, OpenJev |
+| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
 
 ## Configuration CLI
 

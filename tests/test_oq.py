@@ -31,6 +31,7 @@ from omlx.oq import (
     _affine_minmax_params,
     _affine_perturb_group_size,
     _bpw_targets_for_level,
+    _build_model_sanitizer,
     _build_proxy_for_sensitivity,
     _build_quant_plan,
     _build_streaming_proxy_for_sensitivity,
@@ -43,6 +44,7 @@ from omlx.oq import (
     _discover_sanitize_plan,
     _DiscoveredPlan,
     _extract_layer_index,
+    _find_model_layers,
     _format_size,
     _forward_layer,
     _forward_layer_result,
@@ -1359,8 +1361,8 @@ class TestStreamingHelpers:
 
         assert report["missing"] == [f"{base}.weights_proj"]
 
-    def test_qwen4_ngram_group32_is_priced_into_budget_plan(self):
-        from omlx.oq import _structural_quant_overrides
+    def test_qwen4_ngram_table_stays_outside_budget_plan(self):
+        from omlx.oq import _budgeted_shapes, _get_predicate_bits
 
         ple = (
             "language_model.model.layers.1.ple.ple_embedding."
@@ -1382,32 +1384,21 @@ class TestStreamingHelpers:
             "_oq_sensitivity_map": {"0": 1.0, "1": 0.5},
         }
 
-        unpriced = _build_quant_plan(
-            named_shapes,
-            config,
-            4,
-            target_bpw=4.6,
-            hard_cap_bpw=4.7,
-        )
-        fixed = _structural_quant_overrides(named_shapes, config, 4)
         plan = _build_quant_plan(
-            named_shapes,
+            _budgeted_shapes(named_shapes, config),
             config,
-            4,
-            target_bpw=4.6,
-            hard_cap_bpw=4.7,
-            fixed_overrides=fixed,
+            2.5,
+            target_bpw=3.1,
+            hard_cap_bpw=3.3,
         )
 
-        assert unpriced.effective_bpw > 5.5
-        assert fixed[ple] == {
-            "bits": 4,
-            "group_size": 32,
-            "mode": "affine",
-        }
-        assert plan.effective_bpw <= 4.7
         assert ple not in plan.boost_map
+        assert plan.effective_bpw <= 3.3
         assert plan.boost_map["language_model.lm_head"]["bits"] == 8
+        # The table keeps its own group-32 policy and never drops below 4 bits.
+        weight = f"{ple}.weight"
+        assert _get_predicate_bits(weight, config, 2.5, 64) == (4, 32, "affine")
+        assert _get_predicate_bits(weight, config, 6, 64) == (6, 32, "affine")
 
     def test_build_quant_plan_respects_hard_cap(self):
         named_shapes = {
@@ -2035,6 +2026,18 @@ class TestGemma4StatefulLayerForward:
         assert state["kind"] == "gemma4_shared_kv"
         assert state["previous_kvs"] == [0, 0]
 
+    def test_noncausal_layer_inputs_drop_every_mask(self):
+        """Decision 3.0 calibrates with the non-causal attention it serves with."""
+        tokens = mx.array([[1, 2, 3, 4]])
+        inputs = mx.zeros((1, 4, 8))
+        layers = [object(), object(), object()]
+        out, masks, positions = _prepare_layer_inputs(
+            object(), layers, tokens, inputs, noncausal=True
+        )
+        assert out is inputs
+        assert masks == [None, None, None]
+        assert positions.tolist() == [[0, 1, 2, 3]]
+
     def test_cache_signature_invalidates_only_stateful_gemma4(self, tmp_path):
         common = {
             "model_type": "gemma4",
@@ -2134,6 +2137,69 @@ def _write_safetensors(path, tensors):
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestEmbeddingGemma2Calibration:
+    _TEXT = {
+        "vocab_size": 32,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "hidden_size_per_layer_input": 4,
+        "embedding_dim": 8,
+        "sliding_window": 2,
+        "layer_types": ["sliding_attention", "full_attention"],
+    }
+
+    def test_layer_walk_matches_the_encoder_forward(self):
+        """Calibration replays the bidirectional encoder with its PLE inputs."""
+        pytest.importorskip("mlx_vlm.models.embedding_gemma2")
+        from mlx_vlm.models.embedding_gemma2 import Model, ModelConfig
+
+        mx.random.seed(0)
+        model = Model(
+            ModelConfig.from_dict(
+                {
+                    "model_type": "embedding_gemma2",
+                    "text_config": self._TEXT,
+                    "vision_config": None,
+                    "audio_config": None,
+                }
+            )
+        )
+        ids = mx.array([[3, 7, 1, 9, 4, 2, 8, 5]])
+        embed_fn, layers = _find_model_layers(model)
+        assert embed_fn is model.language_model.embed_tokens
+
+        hidden, masks, state = _prepare_layer_inputs(model, layers, ids, embed_fn(ids))
+        for layer_idx, layer in enumerate(layers):
+            hidden, _ = _forward_layer_result(
+                layer, hidden, masks[layer_idx], state, layer_idx=layer_idx
+            )
+        text = model.language_model
+        walked = text.embedding_projection(text.norm(hidden))
+        scaled = embed_fn(ids) * mx.array(16**0.5, dtype=mx.float32)
+        expected = text(scaled, mx.ones_like(ids))
+        assert mx.allclose(walked, expected, atol=1e-5)
+
+    def test_vlm_sanitizer_keeps_vision_weights(self):
+        """The sanitize proxy answers EmbeddingGemma 2's vision_tower check."""
+        pytest.importorskip("mlx_vlm.models.embedding_gemma2")
+        config = {
+            "model_type": "embedding_gemma2",
+            "architectures": ["EmbeddingGemma2Model"],
+            "text_config": self._TEXT,
+            "vision_config": {"hidden_size": 8},
+        }
+        sanitize = _build_model_sanitizer(config, text_only=False)
+        weights = {
+            "vision_tower.encoder.layers.0.mlp.up_proj.weight": mx.zeros((2, 2)),
+            "language_model.norm.weight": mx.zeros((16,)),
+        }
+        assert set(sanitize(weights)) == set(weights)
+
+
 class TestLazyTensorIndex:
     @pytest.fixture
     def sf_file(self, tmp_path):
@@ -4535,6 +4601,78 @@ class TestQuantizeOqStreamingPassthroughDtypes:
         assert set(index["weight_map"].values()) == {"model.safetensors"}
         for name in ("joint_head.safetensors", "joint_head_config.json"):
             assert (out / name).read_bytes() == (src / name).read_bytes()
+
+    def _d3_source(self, tmp_path):
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        np_save(
+            {
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+        np_save(
+            {"weight": np.ones((255, hidden), dtype=np.float32)},
+            str(src / "readout.safetensors"),
+        )
+        (src / "decision_config.json").write_text(
+            json.dumps(
+                {
+                    "format_id": "d3-code-readout-v1",
+                    "attention_mode": "noncausal_full_attention",
+                }
+            )
+        )
+        (src / "MODEL_MANIFEST.json").write_text("{}")
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_passthrough",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+        return src
+
+    def test_d3_readout_is_copied_beside_an_indexed_backbone(self, tmp_path):
+        """The d3 readout stays FP32 outside the shards with its decision
+        config; the package manifest no longer matches and is not copied."""
+        src = self._d3_source(tmp_path)
+        assert [f.name for f in _source_weight_files(src)] == ["model.safetensors"]
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        index = json.loads((out / "model.safetensors.index.json").read_text())
+        assert set(index["weight_map"].values()) == {"model.safetensors"}
+        assert not any("weight" == key for key in index["weight_map"])
+        for name in ("readout.safetensors", "decision_config.json"):
+            assert (out / name).read_bytes() == (src / name).read_bytes()
+        assert not (out / "MODEL_MANIFEST.json").exists()
+        config = json.loads((out / "config.json").read_text())
+        assert "_oq_noncausal_attention" not in config
+
+    def test_d3_rejects_text_only_output(self, tmp_path):
+        src = self._d3_source(tmp_path)
+        with pytest.raises(ValueError, match="vision tower"):
+            quantize_oq_streaming(
+                str(src), str(tmp_path / "out"), oq_level=4, text_only=True
+            )
 
     def test_float16_keeps_vision_audio_passthrough_tensors_float32(self, tmp_path):
         """Protected VLM/audio tensors must not be saved as FP16."""
@@ -7225,6 +7363,50 @@ class TestGlm5NextLayerWalk:
             collector.restore(model)
         assert linear_attention.fuse_in
 
+    def test_mtp_head_imatrix_hooks_execute(self):
+        from omlx.oq import _collect_mtp_head_imatrix, _run_glm5_next_mtp_blocks
+        from omlx.patches import mlx_vlm_glm5_next_compat
+        from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+        from tests.test_mlx_vlm_glm5_next_compat import _tiny_config
+
+        mlx_vlm_glm5_next_compat.apply_mlx_vlm_glm5_next_compat_patch()
+        assert glm5_next_vlm_runtime.apply()
+        from mlx_vlm.models.glm5_next import Model
+
+        config = _tiny_config()
+        config.text_config.index_topk = 2048
+        config.text_config.num_nextn_predict_layers = 1
+        model = Model(config)
+        language_model = model.language_model
+        # Past 8 rows, attention reads embed_q only through q_b_proj's hook.
+        tokens = mx.arange(1, 13, dtype=mx.int32)[None]
+        layers = language_model.model.layers
+        inputs = language_model.model.embed_tokens(tokens)
+        inputs, masks, state = _prepare_layer_inputs(model, layers, tokens, inputs)
+
+        collector = OQImatrixCollector()
+        collector.install(model)
+        try:
+            for layer_idx, layer in enumerate(layers):
+                inputs, _ = _forward_layer_result(
+                    layer, inputs, masks[layer_idx], state, layer_idx=layer_idx
+                )
+            assert _collect_mtp_head_imatrix(model, tokens, inputs)
+        finally:
+            collector.restore(model)
+        assert "language_model.mtp.0.eh_proj" in collector.entries
+
+        # The streamed collector installs the head alone under its entry prefix.
+        head = language_model.mtp[0]
+        collector = OQImatrixCollector()
+        collector.install(head, name_prefix="language_model.mtp.0.")
+        try:
+            embed = language_model.model.embed_tokens
+            _run_glm5_next_mtp_blocks([head], inputs, embed, tokens[:, 1:])
+        finally:
+            collector.restore(head)
+        assert "language_model.mtp.0.block.self_attn.embed_q" in collector.entries
+
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestInklingLayerWalk:
@@ -7546,6 +7728,7 @@ class TestStreamedCalibration:
         [
             (None, "llama", True, False),
             (None, "minimax_m3_vl", True, True),
+            (None, "glm5_next", True, True),
             (None, "qwen4_exp", False, False),
             (False, "qwen4_exp", True, False),
             (True, "qwen4_exp", False, True),

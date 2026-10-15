@@ -62,6 +62,7 @@ import mlx.nn as nn
 
 from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches.mimo_v2 import moe_decode, sdpa_flash
+from omlx.patches.mlx_lm_mtp import drafter_target
 
 logger = logging.getLogger(__name__)
 
@@ -1020,6 +1021,7 @@ def run_layers(model, h, cache, full_mask, swa_mask):
         if gate is None:
             h, xm = add_rms(h, a, post.weight, post.eps)
             h, x = add_rms(h, mlp(xm), nxt.weight, nxt.eps)
+            drafter_target.record(h)
             continue
         h, xm = add_rms(h, a, post.weight, post.eps)
         gc = _gate_cache(gate)
@@ -1037,4 +1039,5 @@ def run_layers(model, h, cache, full_mask, swa_mask):
         else:
             y = mlp.switch_mlp(xm, inds)
         h, x = combine_rms(h, y, scores, nxt.weight, nxt.eps)
+        drafter_target.record(h)
     return h, x

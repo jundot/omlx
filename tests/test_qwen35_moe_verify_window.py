@@ -98,6 +98,7 @@ def _block(
         shared_expert_intermediate_size=inter,
         num_experts=experts,
         num_experts_per_tok=top_k,
+        norm_topk_prob=True,
     )
     block = Qwen3_5MoeSparseMoeBlock(args)
     block.set_dtype(dtype)

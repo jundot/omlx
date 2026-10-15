@@ -765,7 +765,6 @@ def prepare_system_messages_for_template(
     tools: list[dict] | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     is_partial: bool = False,
-    merge_consecutive_roles: bool = True,
     unsupported_mid_system_policy: str = "strict",
 ) -> list[dict]:
     """Preserve cache-friendly mid-system turns when the template supports them.
@@ -779,10 +778,7 @@ def prepare_system_messages_for_template(
         unsupported_mid_system_policy = "strict"
 
     def strict_fallback() -> list[dict]:
-        prepared = _consolidate_system_messages(messages)
-        if merge_consecutive_roles:
-            prepared = _merge_consecutive_roles(prepared)
-        return prepared
+        return _merge_consecutive_roles(_consolidate_system_messages(messages))
 
     def unsupported_fallback() -> list[dict]:
         if unsupported_mid_system_policy == "user_note_safe":
@@ -792,9 +788,7 @@ def prepare_system_messages_for_template(
                 # consecutive system messages so strict templates (Qwen3.6+)
                 # that require a single leading system message don't fail.
                 prepared = _merge_consecutive_system_messages(prepared)
-                if merge_consecutive_roles:
-                    prepared = _merge_consecutive_roles(prepared)
-                return prepared
+                return _merge_consecutive_roles(prepared)
         return strict_fallback()
 
     if not is_partial and has_nonleading_system_message(messages):
@@ -1341,7 +1335,7 @@ def extract_multimodal_content(
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
         processed_messages = _consolidate_system_messages(processed_messages)
-    return processed_messages
+    return _merge_consecutive_roles(processed_messages)
 
 
 # =============================================================================

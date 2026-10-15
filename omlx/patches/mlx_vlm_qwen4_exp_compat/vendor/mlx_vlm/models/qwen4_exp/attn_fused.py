@@ -9,7 +9,8 @@ replace most of them with the same float operations in the same order:
 
 * ``prep_qk``: the q and k RMS norms (``mx.fast.rms_norm`` with the FP32
   ``1 + weight`` scale, its ``rms_single_row`` reduction lane for lane) and
-  mlx-vlm's fused MRoPE kernel, for every head and row in one launch.
+  mlx-vlm's fused MRoPE kernel, for every head and row in one launch. With a
+  YaRN attention scaling it follows mlx-vlm's eager MRoPE, which serves YaRN.
 * ``dense_sdpa_gate``: MLX 0.32.2's vector SDPA plan of each row -- the
   one-pass kernel below 1024 keys, the two-pass kernel with 128 partitions
   from 1024 keys (Apple 'd' GPUs) -- then MLX's multiply by the gate's
@@ -129,6 +130,19 @@ _PREP_SOURCE = r"""
         float pos = static_cast<float>(position_ids[t]);
 #endif
         float angle = pos * static_cast<float>(inv_freq[freq_idx]);
+        if (rope_scale[0] != 1.0f) {
+            // YaRN runs mlx-vlm's eager MRoPE instead: precise cos/sin times
+            // the attention scaling, rounded to T, then T arithmetic with
+            // each product rounded (MLX does not contract it into an fma).
+#pragma clang fp contract(off)
+            const T c = static_cast<T>(metal::precise::cos(angle) * rope_scale[0]);
+            const T s = static_cast<T>(metal::precise::sin(angle) * rope_scale[0]);
+            const T xv = normed[d];
+            const T xp = normed[pair_d];
+            x_out[d] = xv * c + (-xp) * s;
+            x_out[pair_d] = xp * c + xv * s;
+            continue;
+        }
         float c = metal::cos(angle);
         float s = metal::sin(angle);
         float xv = static_cast<float>(normed[d]);
@@ -419,6 +433,7 @@ def _kernel(name: str):
                 "position_ids",
                 "inv_freq",
                 "position_selector",
+                "rope_scale",
             ],
             output_names=["queries", "keys"],
             source=_PREP_SOURCE,
@@ -509,10 +524,12 @@ def prep_qk(
     heads: int,
     kv_heads: int,
     rotary_dim: int,
+    rope_scale: float = 1.0,
 ):
     """``(queries [1, heads, R, D], keys [1, kv_heads, R, D])``: the q/k norms
     and MRoPE of ``R`` projected rows -- ``q_proj`` [R, heads * 2 * D] holds
-    each head's query then gate, ``k_proj`` [R, kv_heads * D]; ``D`` = 256."""
+    each head's query then gate, ``k_proj`` [R, kv_heads * D]; ``D`` = 256.
+    ``rope_scale`` is the rotary's attention scaling (YaRN mscale)."""
     rows = q_proj.shape[0]
     head_dim = k_proj.shape[-1] // kv_heads
     dtype = q_proj.dtype
@@ -526,6 +543,7 @@ def prep_qk(
             position_ids,
             inv_freq,
             position_selector,
+            _scalar(rope_scale, mx.float32),
         ],
         template=[
             ("T", dtype),

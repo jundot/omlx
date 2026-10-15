@@ -1281,6 +1281,7 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
         shared_expert_intermediate_size=64,
         num_experts=512,
         num_experts_per_tok=10,
+        norm_topk_prob=True,
     )
     model = nn.Module()
     model.language_model = nn.Module()

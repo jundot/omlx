@@ -16,6 +16,7 @@ Note: BatchGenerator is mocked; step() coverage is limited to targeted paths.
 """
 
 import concurrent.futures
+import copy
 import gc
 import json
 import sys
@@ -30,8 +31,11 @@ import pytest
 from mlx_lm.models.cache import BatchKVCache, CacheList, KVCache
 
 import omlx.scheduler as scheduler_module
+from omlx.adapter import output_parser as output_parser_module
+from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
 from omlx.cache.stats import PrefixCacheStats
 from omlx.models.vlm import VLMModelAdapter
+from omlx.patches.deepseek_v41 import output_parser as dsv41_output_parser
 from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
 from omlx.patches.specprefill import _OffsetAdjustedRoPE
@@ -1095,6 +1099,69 @@ class TestSchedulerAddRequest:
 
         assert scheduler._should_defer_for_cache_freshness(request) is expected
         assert (request.request_id in scheduler._cache_freshness_waits) is expected
+        future.result.assert_not_called()
+
+    def test_admission_freshness_gate_waits_for_sub_block_tail_on_stateful_model(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stateful model's tail-terminal block makes a sub-block prompt reusable.
+
+        Below one block there is no grid match, so without the tail path the
+        wait never fires and the repeat request looks up before the store's
+        tail is registered, re-prefilling from scratch (the <block_size cliff).
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.config.paged_cache_block_size = 2048
+        scheduler._boundary_snapshot_required = True
+        prompt = list(range(786))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(781)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        assert request.request_id in scheduler._cache_freshness_waits
+        future.result.assert_not_called()
+
+    def test_admission_freshness_gate_skips_tail_not_covering_the_prompt(
+        self, mock_model, mock_tokenizer
+    ):
+        """A store longer than the prompt cannot serve it from a tail block."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.config.paged_cache_block_size = 2048
+        scheduler._boundary_snapshot_required = True
+        prompt = list(range(1000))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(3149)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        assert request.request_id not in scheduler._cache_freshness_waits
         future.result.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -2316,6 +2383,49 @@ class TestSchedulerReset:
         assert len(scheduler._pending_async_removes) == 0
         assert len(scheduler._inflight_store_futures) == 0
 
+    @pytest.mark.parametrize("phase", ["decode", "prefill", "external_prefill"])
+    def test_reset_does_not_start_cancel_cache_store(
+        self, mock_model, mock_tokenizer, phase
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="cancel-before-reset",
+            prompt=[3, 4, 5],
+            sampling_params=SamplingParams(),
+        )
+        scheduler.add_request(request)
+        scheduler._abort_keeps_cache = MagicMock(return_value=True)
+        scheduler._cleanup_finished = MagicMock()
+        scheduler._submit_abort_store = MagicMock()
+        scheduler._prepare_abort_prefill_store = MagicMock(return_value=object())
+        if phase == "decode":
+            scheduler.running[request.request_id] = request
+            scheduler.request_id_to_uid[request.request_id] = 0
+            scheduler.uid_to_request_id[0] = request.request_id
+        elif phase == "prefill":
+            scheduler._prefill_states[request.request_id] = SimpleNamespace(cache=[])
+            scheduler.prefilling.append(request)
+        else:
+            request._abort_store_prepared = object()
+        scheduler.abort_request(request.request_id, keep_cache=True)
+
+        abort = scheduler._do_abort_request
+
+        def abort_with_late_cancel(request_id, **kwargs):
+            # A client can cancel after reset clears the pending flags.
+            scheduler.abort_request(request_id, keep_cache=True)
+            return abort(request_id, **kwargs)
+
+        with patch.object(
+            scheduler, "_do_abort_request", side_effect=abort_with_late_cancel
+        ):
+            scheduler.reset()
+
+        scheduler._cleanup_finished.assert_not_called()
+        scheduler._submit_abort_store.assert_not_called()
+        assert not scheduler._abort_keep_cache_ids
+        assert not scheduler.requests
+
     def test_reset_waits_for_store_worker_before_snapshot_and_cache_cleanup(
         self, mock_model, mock_tokenizer
     ):
@@ -2688,6 +2798,62 @@ class TestSchedulerSuppressTokens:
         round_token = captured["sampler"](round_logits)
         mx.eval(round_token)
         assert int(round_token.item()) == 2
+
+
+class TestSchedulerNoRepeatNgram:
+    @staticmethod
+    def _decode(model, tokenizer, rows):
+        scheduler = Scheduler(model=model, tokenizer=tokenizer)
+        requests = [
+            Request(request_id=f"r{i}", prompt=list(prompt), sampling_params=params)
+            for i, (prompt, params) in enumerate(rows)
+        ]
+        for request in requests:
+            scheduler.add_request(request)
+        for _ in range(200):
+            scheduler.step()
+            if not any(r.request_id in scheduler.requests for r in requests):
+                break
+        scheduler.shutdown()
+        return [list(r.output_token_ids) for r in requests]
+
+    def test_batched_greedy_decode_bans_only_its_own_row(self, mock_tokenizer):
+        from mlx_lm.models.llama import Model, ModelArgs
+
+        mx.random.seed(0)
+        model = Model(
+            ModelArgs(
+                model_type="llama",
+                hidden_size=32,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                rms_norm_eps=1e-5,
+                vocab_size=64,
+                tie_word_embeddings=True,
+            )
+        )
+        greedy = SamplingParams(max_tokens=40, temperature=0)
+        banned = SamplingParams(max_tokens=40, temperature=0, no_repeat_ngram_size=3)
+        short, long = [5, 9, 12], [7, 3, 30, 22, 14, 9, 41, 8, 17]
+
+        def repeated_trigrams(tokens):
+            trigrams = [tuple(tokens[i : i + 3]) for i in range(len(tokens) - 2)]
+            return len(trigrams) - len(set(trigrams))
+
+        loop, neighbour = self._decode(
+            model, mock_tokenizer, [(short, greedy), (long, greedy)]
+        )
+        fixed, same_neighbour = self._decode(
+            model, mock_tokenizer, [(short, banned), (long, greedy)]
+        )
+
+        # The tiny greedy model loops; with the ban, prompt plus output never
+        # repeats a trigram, and the other row of the batch is untouched.
+        assert repeated_trigrams(short + loop) > 10
+        assert len(fixed) > 10 and repeated_trigrams(short + fixed) == 0
+        assert same_neighbour == neighbour
 
 
 class TestSchedulerXtcSpecialTokens:
@@ -6024,23 +6190,36 @@ class TestStoreCacheAdmissionBackpressure:
         assert scheduler.running == {}
         scheduler._ensure_batch_generator.assert_not_called()
 
-    def test_memory_guard_fails_persistent_admission_stall(
-        self, mock_model, mock_tokenizer
+    @pytest.mark.parametrize("admission_paused", [False, True])
+    def test_memory_guard_times_out_only_after_decode_stalls(
+        self, mock_model, mock_tokenizer, admission_paused
     ):
-        """A persistent memory-gated head-of-line wait should fail cleanly."""
+        """Decode progress keeps a queued request alive until progress stops."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         request = self._make_request("req-stalled")
         self._queue_request(scheduler, request)
         running = self._make_request("req-running")
         scheduler.running[running.request_id] = running
         scheduler.requests[running.request_id] = running
+        scheduler.uid_to_request_id[1] = running.request_id
+        scheduler._admission_paused = admission_paused
         scheduler._prefill_memory_guard = True
         scheduler._memory_limit_bytes = 100
         scheduler._current_usage_bytes = MagicMock(return_value=101)
         scheduler._memory_admission_blocked_request_id = request.request_id
         scheduler._memory_admission_blocked_since = 0.0
 
+        with patch("omlx.scheduler.time.monotonic", return_value=30.0):
+            scheduler._process_batch_responses(
+                [SimpleNamespace(uid=1, token=42, finish_reason=None)]
+            )
         with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+
+        with patch("omlx.scheduler.time.monotonic", return_value=91.0):
             scheduled, rejected = scheduler._schedule_waiting()
 
         assert scheduled == []
@@ -6260,10 +6439,24 @@ class TestStoreCacheAdmissionBackpressure:
         scheduler._pending_async_removes.append(
             (2, done_request.request_id, done_future)
         )
+        self._queue_request(scheduler, self._make_request("req-waiting"))
+        with patch("omlx.scheduler.time.monotonic", return_value=0.0):
+            assert (
+                scheduler._memory_admission_stall_output("store_cache_backpressure")
+                is None
+            )
 
-        with patch("omlx.scheduler._safe_sync_stream"):
+        with (
+            patch("omlx.scheduler._safe_sync_stream"),
+            patch("omlx.scheduler.time.monotonic", return_value=30.0),
+        ):
             drained = scheduler._drain_pending_async_removes()
 
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            assert (
+                scheduler._memory_admission_stall_output("store_cache_backpressure")
+                is None
+            )
         assert drained is True
         assert list(scheduler._pending_async_removes) == [
             (1, slow_request.request_id, slow_future)
@@ -7560,6 +7753,26 @@ class _StopSequenceTokenizer:
         return text
 
 
+class _ThinkingStopSequenceTokenizer(_StopSequenceTokenizer):
+    """A stop-sequence tokenizer whose vocabulary carries think markers."""
+
+    has_thinking = True
+    think_start = "<think>"
+    think_end = "</think>"
+    think_start_id = 200
+    think_end_id = 201
+    think_start_tokens = (200,)
+    think_end_tokens = (201,)
+    pieces = {**_StopSequenceTokenizer.pieces, 200: "<think>", 201: "</think>"}
+
+    def encode(self, text, add_special_tokens=False):
+        if text == "<think>":
+            return [200]
+        if text == "</think>":
+            return [201]
+        return super().encode(text, add_special_tokens)
+
+
 class TestStopStringOutputBuffer:
     """Regression coverage for partially emitted multi-token stops (#2386)."""
 
@@ -7745,6 +7958,49 @@ class TestStopStringOutputBuffer:
         assert outputs[-1].finish_reason == "stop"
         assert sum(output.finished for output in outputs) == 1
 
+    @pytest.mark.parametrize("terminal_reason", ["length", "stop"])
+    def test_deepseek_v41_calls_without_outer_close(
+        self, mock_model, monkeypatch, terminal_reason
+    ):
+        from omlx.patches.deepseek_v41 import output_parser
+
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = []
+        tokenizer = scheduler.tokenizer
+        pieces = [
+            "Prose.\n\n",
+            '<｜DSML｜ calls>\n<｜DSML｜ invoke name="get">\n',
+            '<｜DSML｜ parameter name="city" string="true">Seoul</｜DSML｜ parameter>\n',
+            "</｜DSML｜ invoke>\n",
+        ]
+        tokenizer.pieces = {**tokenizer.pieces, **dict(enumerate(pieces, 100))}
+        scheduler._build_state_machine(request)
+        monkeypatch.setattr(
+            output_parser,
+            "create_streaming_detokenizer",
+            lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
+        )
+        session = output_parser.DeepSeekV41OutputParserSession(tokenizer)
+        scheduler._output_parser_sessions[request.request_id] = session
+        scheduler._get_output_parser_session = lambda request_id: session
+        responses = [self._response(100 + i) for i in range(len(pieces))]
+        if terminal_reason == "stop":
+            responses.append(self._response(tokenizer.eos_token_id, "stop"))
+        else:
+            responses[-1].finish_reason = "length"
+
+        outputs, _ = scheduler._process_batch_responses(responses)
+
+        if terminal_reason == "stop":
+            assert outputs[-1].finish_reason == "tool_calls"
+            assert [call["name"] for call in outputs[-1].tool_calls] == ["get"]
+            assert outputs[-1].output_text == "Prose.\n\n"
+        else:
+            assert outputs[-1].finish_reason == "length"
+            assert not outputs[-1].tool_calls
+            assert outputs[-1].output_text == "".join(pieces)
+
     def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
         scheduler = self._setup(mock_model)
         responses = [
@@ -7816,6 +8072,272 @@ class TestStopStringOutputBuffer:
         assert streamed_text == "잠"
         assert outputs[-1].output_text == "잠"
         assert "�" not in streamed_text
+
+
+class TestStopStringsSkipReasoning:
+    """Stop strings skip the leading think block (#3943)."""
+
+    _response = staticmethod(TestStopStringOutputBuffer._response)
+    _pieces = {
+        100: "Count: 1 2 3 4 5 6 7 8 9",
+        101: " 10",
+        102: "\n\n",
+        103: "The answer is 7",
+        104: ".",
+        105: " Use ",
+        106: " END",
+        107: " more",
+    }
+
+    def _setup(
+        self,
+        mock_model,
+        stops,
+        needs_think_prefix=False,
+        stop_skips_reasoning=True,
+        tokenizer=None,
+        factory=None,
+    ):
+        tokenizer = tokenizer or _ThinkingStopSequenceTokenizer()
+        scheduler = Scheduler(model=mock_model, tokenizer=tokenizer)
+        tokenizer = scheduler.tokenizer
+        tokenizer.pieces = {**tokenizer.pieces, **self._pieces}
+        scheduler._get_detokenizer = lambda request_id: (
+            scheduler._request_detokenizers.setdefault(
+                request_id,
+                _StopSequenceDetokenizer(tokenizer),
+            )
+        )
+        scheduler._output_parser_factory = factory
+        request = Request(
+            request_id="stop-output",
+            prompt="prompt",
+            sampling_params=SamplingParams(
+                max_tokens=32, stop=stops, stop_skips_reasoning=stop_skips_reasoning
+            ),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+            batch_uid=99,
+        )
+        request.needs_think_prefix = needs_think_prefix
+        scheduler._build_state_machine(request)
+        scheduler.running[request.request_id] = request
+        scheduler.requests[request.request_id] = request
+        scheduler.uid_to_request_id[99] = request.request_id
+        scheduler.request_id_to_uid[request.request_id] = 99
+        return scheduler, request
+
+    def _run(self, scheduler, tokens):
+        responses = [self._response(token) for token in tokens]
+        responses.append(self._response(scheduler.tokenizer.eos_token_id, "stop"))
+        outputs, _ = scheduler._process_batch_responses(responses)
+        assert outputs[-1].finish_reason == "stop"
+        return outputs[-1].output_text, "".join(o.new_text for o in outputs)
+
+    @pytest.mark.parametrize(
+        "prompt_opened, tokens, stops, text",
+        [
+            # Stop only in the reasoning.
+            (
+                True,
+                [100, 101, 201, 102, 103, 104],
+                ["10"],
+                "Count: 1 2 3 4 5 6 7 8 9 10</think>\n\nThe answer is 7.",
+            ),
+            # Stop in the reasoning and the answer.
+            (
+                True,
+                [100, 101, 201, 102, 103, 104],
+                ["7"],
+                "Count: 1 2 3 4 5 6 7 8 9 10</think>\n\nThe answer is ",
+            ),
+            # Model-opened block.
+            (
+                False,
+                [200, 100, 101, 201, 102, 103, 104],
+                ["10"],
+                "<think>Count: 1 2 3 4 5 6 7 8 9 10</think>\n\nThe answer is 7.",
+            ),
+            # Stop right after the block closes.
+            (
+                True,
+                [100, 201, 102, 103, 104],
+                ["\n\nThe"],
+                "Count: 1 2 3 4 5 6 7 8 9</think>",
+            ),
+            # Reasoning that never closes.
+            (True, [100, 101], ["10"], "Count: 1 2 3 4 5 6 7 8 9 10"),
+        ],
+    )
+    def test_stop_strings_skip_the_leading_think_block(
+        self, mock_model, prompt_opened, tokens, stops, text
+    ):
+        scheduler, _ = self._setup(mock_model, stops, needs_think_prefix=prompt_opened)
+
+        output_text, streamed = self._run(scheduler, tokens)
+
+        assert output_text == text
+        assert streamed == ("<think>\n" if prompt_opened else "") + text
+
+    @pytest.mark.parametrize(
+        "prompt_opened, tokens, stops, flagged, text",
+        [
+            # A think marker in the answer is answer text.
+            (
+                False,
+                [103, 105, 200, 106, 107],
+                ["END"],
+                True,
+                "The answer is 7 Use <think> ",
+            ),
+            (
+                True,
+                [100, 201, 102, 105, 200, 106, 107],
+                ["END"],
+                True,
+                "Count: 1 2 3 4 5 6 7 8 9</think>\n\n Use <think> ",
+            ),
+            # /v1/completions returns reasoning inline and keeps the old match.
+            (
+                True,
+                [100, 101, 201, 102, 103],
+                ["10"],
+                False,
+                "Count: 1 2 3 4 5 6 7 8 9 ",
+            ),
+        ],
+    )
+    def test_stop_strings_match_outside_the_leading_think_block(
+        self, mock_model, prompt_opened, tokens, stops, flagged, text
+    ):
+        scheduler, _ = self._setup(
+            mock_model,
+            stops,
+            needs_think_prefix=prompt_opened,
+            stop_skips_reasoning=flagged,
+        )
+
+        output_text, _ = self._run(scheduler, tokens)
+
+        assert output_text == text
+
+    def test_token_matcher_skips_only_the_leading_think_block(self, mock_model):
+        scheduler, request = self._setup(mock_model, [">>>>>>> UPDATED"])
+        stop = list(_StopSequenceTokenizer.stop_tokens)
+        eos = scheduler.tokenizer.eos_token_id
+
+        def run(automaton, tokens):
+            matcher = automaton.matcher()
+            return [matcher.advance(token) for token in tokens]
+
+        automaton = scheduler._build_state_machine(request)
+        assert not any(run(automaton, [200, *stop]))
+        assert run(automaton, [200, 201, *stop])[-1]
+        assert run(automaton, [200, eos])[-1]
+        # A later think marker does not pause the stop strings.
+        assert run(automaton, [10, 200, *stop])[-1]
+        assert run(automaton, [200, 201, 200, *stop])[-1]
+
+        # The MTP draft path advances a copy on its own.
+        matcher = automaton.matcher()
+        draft = copy.copy(matcher)
+        draft.advance(200)
+        assert [matcher.advance(token) for token in stop][-1]
+
+        request.needs_think_prefix = True
+        prompt_opened = scheduler._build_state_machine(request)
+        assert not any(run(prompt_opened, stop))
+        assert run(prompt_opened, [201, *stop])[-1]
+
+        # A multi-token open marker counts only at the start of the output.
+        tracker = scheduler_module._ThinkTracker((7, 8, 9), (5,), False)
+        assert [tracker.advance(t) for t in (7, 8, 9, 1, 5)] == [False] * 4 + [True]
+        tracker = scheduler_module._ThinkTracker((7, 8, 9), (5,), False)
+        for token in (1, 7, 8, 9):
+            tracker.advance(token)
+        assert not tracker.in_thinking
+
+    @pytest.mark.parametrize(
+        "stops, answer", [(["10"], "The answer is 7."), (["7"], "The answer is ")]
+    )
+    def test_harmony_analysis_channel_is_skipped(
+        self, mock_model, monkeypatch, stops, answer
+    ):
+        encoding = load_harmony_gpt_oss_encoding()
+
+        def ids(text):
+            return encoding.encode(text, allowed_special="all")
+
+        analysis = "Count: 1 2 3 4 5 6 7 8 9 10"
+        tokens = [
+            *ids("<|channel|>analysis<|message|>"),
+            *ids(analysis),
+            *ids("<|end|><|start|>assistant<|channel|>final<|message|>"),
+            *ids("The answer is 7."),
+        ]
+
+        text_pieces = {token: encoding.decode([token]) for token in tokens}
+        # Header tokens carry no text.
+        text_pieces.update(
+            dict.fromkeys(ids("<|channel|><|message|><|end|><|start|>"), "")
+        )
+
+        class _HarmonyTokenizer(_StopSequenceTokenizer):
+            eos_token_id = ids("<|return|>")[0]
+            pieces = text_pieces
+
+            def encode(self, text, add_special_tokens=False):
+                return ids(text)
+
+        factory = SimpleNamespace(
+            kind="harmony",
+            stop_token_ids=set(encoding.stop_tokens_for_assistant_actions()),
+            thinking_start_text="<|channel|>analysis<|message|>",
+            thinking_end_text="<|end|>",
+        )
+        scheduler, _ = self._setup(
+            mock_model, stops, tokenizer=_HarmonyTokenizer(), factory=factory
+        )
+        monkeypatch.setattr(
+            output_parser_module,
+            "create_streaming_detokenizer",
+            lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
+        )
+        session = output_parser_module.HarmonyOutputParserSession(scheduler.tokenizer)
+        scheduler._get_output_parser_session = lambda request_id: session
+
+        output_text, streamed = self._run(scheduler, tokens)
+
+        # Non-streaming responses read the reasoning from this prefix.
+        assert output_text == f"<think>\n{analysis}\n</think>\n{answer}"
+        assert analysis in streamed
+        assert streamed.endswith(answer)
+
+    @pytest.mark.parametrize(
+        "stops, answer", [(["10"], "The answer is 7."), (["7"], "The answer is ")]
+    )
+    def test_protocol_parser_reasoning_is_skipped(
+        self, mock_model, monkeypatch, stops, answer
+    ):
+        scheduler, _ = self._setup(
+            mock_model, stops, factory=SimpleNamespace(kind="deepseek_v41")
+        )
+        monkeypatch.setattr(
+            dsv41_output_parser,
+            "create_streaming_detokenizer",
+            lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
+        )
+        session = dsv41_output_parser.DeepSeekV41OutputParserSession(
+            scheduler.tokenizer
+        )
+        scheduler._get_output_parser_session = lambda request_id: session
+
+        output_text, _ = self._run(scheduler, [200, 100, 101, 201, 102, 103, 104])
+
+        assert output_text == (
+            "<think>Count: 1 2 3 4 5 6 7 8 9 10</think>\n\n" + answer
+        )
 
 
 class TestTurboQuantMLAGuard:

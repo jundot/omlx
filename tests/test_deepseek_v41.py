@@ -277,6 +277,20 @@ def test_echoed_reasoning_renders_one_think_block():
     assert turn.count("<think>") == 1
 
 
+def test_partial_assistant_continues_without_eos():
+    processor = Processor(SimpleNamespace(), SimpleNamespace(image_token_id=129264))
+    prompt = processor.apply_chat_template(
+        [
+            {"role": "user", "content": "Is it urgent?"},
+            {"role": "assistant", "content": "Answer:"},
+        ],
+        add_generation_prompt=False,
+        enable_thinking=False,
+        continue_final_message=True,
+    )
+    assert prompt.endswith("<｜User｜>Is it urgent?<｜Assistant｜></think>Answer:")
+
+
 def test_literal_image_placeholder_in_text_is_replaced():
     literal = f"log {IMAGE_PLACEHOLDER}"
     messages = [

@@ -199,7 +199,6 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
-    qwen4_gdn_decode_wide_proj: bool = False
     distributed_inference_enabled: bool = False
     # Human-readable size, same grammar as cache limits ("100MB", "1GB").
     max_audio_upload_size: str = "100MB"
@@ -255,7 +254,6 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
-            qwen4_gdn_decode_wide_proj=data.get("qwen4_gdn_decode_wide_proj", False),
             distributed_inference_enabled=data.get(
                 "distributed_inference_enabled",
                 False,
@@ -550,6 +548,9 @@ class CacheSettings:
 
 MemoryGuardTier = Literal["safe", "balanced", "aggressive", "custom"]
 VALID_MEMORY_GUARD_TIERS: set[str] = {"safe", "balanced", "aggressive", "custom"}
+
+# KV cache storage formats `splash serve --kv-format` accepts.
+SPLASH_KV_FORMATS = frozenset({"int8", "bf16"})
 
 
 @dataclass
@@ -942,6 +943,7 @@ class IntegrationSettings:
     openclaw_model: str | None = None
     hermes_model: str | None = None
     pi_model: str | None = None
+    vibe_model: str | None = None
     copilot_model: str | None = None
     dsh_model: str | None = None
     openclaw_tools_profile: str = "coding"
@@ -959,6 +961,13 @@ class IntegrationSettings:
     web_search_content_mode: str = "snippet"  # "snippet" | "full"
     web_search_content_truncate: bool = True
     web_search_content_max_chars: int = 20000
+    # External engines: Splash (omlx/engine/splash.py). An empty path means
+    # oMLX looks for an installed launcher itself.
+    splash_path: str | None = None
+    splash_kv_format: str = "int8"  # "int8" | "bf16"
+    splash_max_memory_gb: float | None = None  # None = what the ceiling leaves
+    splash_ssd_cache_gb: float | None = None  # None = oMLX's SSD cache size
+    splash_ane_prefill: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -968,6 +977,7 @@ class IntegrationSettings:
             "openclaw_model": self.openclaw_model,
             "hermes_model": self.hermes_model,
             "pi_model": self.pi_model,
+            "vibe_model": self.vibe_model,
             "copilot_model": self.copilot_model,
             "dsh_model": self.dsh_model,
             "openclaw_tools_profile": self.openclaw_tools_profile,
@@ -984,6 +994,11 @@ class IntegrationSettings:
             "web_search_content_mode": self.web_search_content_mode,
             "web_search_content_truncate": self.web_search_content_truncate,
             "web_search_content_max_chars": self.web_search_content_max_chars,
+            "splash_path": self.splash_path,
+            "splash_kv_format": self.splash_kv_format,
+            "splash_max_memory_gb": self.splash_max_memory_gb,
+            "splash_ssd_cache_gb": self.splash_ssd_cache_gb,
+            "splash_ane_prefill": self.splash_ane_prefill,
         }
 
     @classmethod
@@ -995,6 +1010,7 @@ class IntegrationSettings:
             openclaw_model=data.get("openclaw_model"),
             hermes_model=data.get("hermes_model"),
             pi_model=data.get("pi_model"),
+            vibe_model=data.get("vibe_model"),
             copilot_model=data.get("copilot_model"),
             dsh_model=data.get("dsh_model"),
             openclaw_tools_profile=data.get("openclaw_tools_profile", "coding"),
@@ -1019,6 +1035,11 @@ class IntegrationSettings:
             web_search_content_max_chars=data.get(
                 "web_search_content_max_chars", 20000
             ),
+            splash_path=data.get("splash_path") or None,
+            splash_kv_format=data.get("splash_kv_format", "int8"),
+            splash_max_memory_gb=data.get("splash_max_memory_gb"),
+            splash_ssd_cache_gb=data.get("splash_ssd_cache_gb"),
+            splash_ane_prefill=data.get("splash_ane_prefill", True),
         )
 
 
@@ -1534,7 +1555,7 @@ class GlobalSettings:
         self._save_data(data)
 
     def ensure_inference_auth_setting(self) -> None:
-        """Add the manual opt-in default without persisting runtime overrides."""
+        """Add the opt-in default without persisting runtime overrides."""
         path = self.base_path / "settings.json"
         data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         auth = data.setdefault("auth", {})
@@ -1851,6 +1872,16 @@ class GlobalSettings:
             errors.append("markitdown_max_files_per_request must be > 0")
         if not str(self.integrations.markitdown_pdf_processing_engine or "").strip():
             errors.append("markitdown_pdf_processing_engine must not be empty")
+        if self.integrations.splash_kv_format not in SPLASH_KV_FORMATS:
+            errors.append(
+                f"splash_kv_format must be one of {sorted(SPLASH_KV_FORMATS)}"
+            )
+        memory = self.integrations.splash_max_memory_gb
+        if memory is not None and memory <= 0:
+            errors.append("splash_max_memory_gb must be > 0")
+        ssd = self.integrations.splash_ssd_cache_gb
+        if ssd is not None and ssd < 0:
+            errors.append("splash_ssd_cache_gb must be >= 0")
 
         # HuggingFace validation
         if self.huggingface.endpoint:
@@ -1905,7 +1936,6 @@ class GlobalSettings:
         )
 
         return SchedulerConfig(
-            qwen4_gdn_decode_wide_proj=self.server.qwen4_gdn_decode_wide_proj,
             max_num_seqs=self.scheduler.max_concurrent_requests,
             completion_batch_size=self.scheduler.max_concurrent_requests,
             embedding_batch_size=self.scheduler.embedding_batch_size,

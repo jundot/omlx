@@ -310,7 +310,7 @@ mlx-lm에서 사용 가능한 모든 함수 호출 형식, JSON 스키마 검증
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | 임베딩 | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | 리랭커 | ModernBERT, XLM-RoBERTa |
-| Decision | Clef, Clef-Flash, OpenJev |
+| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
 
 ## CLI 설정
 

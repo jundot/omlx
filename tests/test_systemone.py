@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the decision models behind /v1/systemone (Clef and OpenJev)."""
+"""Tests for the decision models behind /v1/systemone (Clef, OpenJev, d3)."""
 
 import copy
+import inspect
 import json
 import math
 from types import SimpleNamespace
@@ -14,7 +15,8 @@ mx = pytest.importorskip("mlx.core")
 import mlx.nn as nn  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 
-from omlx.models import clef, openjev  # noqa: E402
+from omlx.exceptions import InvalidRequestError  # noqa: E402
+from omlx.models import clef, d3, decision, openjev  # noqa: E402
 from omlx.models.decision import (  # noqa: E402
     DecisionBackbone,
     DecisionContextLengthError,
@@ -489,3 +491,476 @@ def test_lm_head_rows_are_dequantized():
     expected = linear.weight[mx.array([3, 7])]
     assert rows.shape == (2, 64)
     assert np.allclose(np.array(rows), np.array(expected), atol=2e-2)
+
+
+def test_backbone_files_hide_a_head_beside_an_unindexed_shard(tmp_path):
+    for name in ("model.safetensors", "readout.safetensors", "config.json"):
+        (tmp_path / name).write_text(name)
+    with decision._backbone_files(tmp_path) as view:
+        assert view != tmp_path
+        assert sorted(p.name for p in view.iterdir()) == [
+            "config.json",
+            "model.safetensors",
+        ]
+        assert (view / "model.safetensors").read_text() == "model.safetensors"
+    assert not view.exists()
+
+    # An index already names the backbone shards.
+    (tmp_path / "model.safetensors.index.json").write_text("{}")
+    with decision._backbone_files(tmp_path) as view:
+        assert view == tmp_path
+
+
+# --------------------------------------------------------------------------
+# Decision 3.0 (d3)
+
+_ROUTE = {
+    "type": "choice",
+    "instructions": "Which team should handle this request?",
+    "criteria": {
+        "returns": "Refunds, replacements and damaged deliveries",
+        "billing": "Payments, invoices and charges",
+        "technical": "Product setup and faults",
+    },
+}
+
+
+def test_d3_user_prompt_matches_release_text():
+    question = d3.normalize_question("route", _ROUTE)
+    text = d3.user_prompt("The order arrived damaged.", question, ["A", "B", "C"])
+    assert text == (
+        "State:\nThe order arrived damaged.\n\n"
+        "Question:\nWhich team should handle this request?\n\n"
+        "Options:\n"
+        "A: returns: Refunds, replacements and damaged deliveries\n"
+        "B: billing: Payments, invoices and charges\n"
+        "C: technical: Product setup and faults\n\n"
+        "Reply with only the code of the best option."
+    )
+
+    # Noul shows descriptions only, false first; an empty description falls back.
+    noul = d3.normalize_question(
+        "n", {"type": "noul", "criteria": {"true": "Only some", "false": ""}}
+    )
+    assert noul.keys == ["false", "true"]
+    lines = d3.user_prompt("", noul, ["A", "B"]).split("\n")
+    assert lines[:5] == ["State:", "(empty)", "", "Question:", d3.DEFAULT_INSTRUCTIONS]
+    assert lines[7:9] == ["A: No / false", "B: Only some"]
+
+    # Non-string values are spaced JSON in the prompt and compact sorted JSON
+    # in the legend; choice keys keep the request order.
+    score = d3.normalize_question(
+        "s",
+        {
+            "type": "score",
+            "instructions": {"scale": "0-2", "metric": "risk"},
+            "criteria": [{"b": 1, "a": 0}, "mid", "high"],
+        },
+    )
+    text = d3.user_prompt({"z": 1, "a": [1, 2]}, score, ["A", "B", "C"])
+    assert 'State:\n{"z": 1, "a": [1, 2]}' in text
+    assert 'Question:\n{"scale": "0-2", "metric": "risk"}' in text
+    assert 'A: {"b": 1, "a": 0}\nB: mid\nC: high' in text
+    answer = d3.format_answer(score, [0.2, 0.3, 0.5])
+    assert answer["legend"] == {"0": '{"a":0,"b":1}', "1": "mid", "2": "high"}
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        {"type": "choice", "criteria": {}},
+        {"type": "choice", "criteria": {str(i): None for i in range(256)}},
+        {"type": "choice", "criteria": {"": None}},
+        {"type": "choice", "criteria": ["a", "b"]},
+        {"type": "noul", "criteria": {"maybe": "x"}},
+        {"type": "score", "criteria": ["only"]},
+        {"type": "score", "criteria": [str(i) for i in range(11)]},
+        {"type": "score", "criteria": ["same", "same"]},
+        {"type": "score", "criteria": ["", "x"]},
+        {"type": "noul", "instructions": float("nan")},
+        {"type": "rank", "criteria": {"a": None}},
+    ],
+)
+def test_d3_rejects_malformed_questions(question):
+    with pytest.raises(DecisionRequestError):
+        d3.normalize_question("q", question)
+
+
+def test_d3_answer_format():
+    route = d3.normalize_question("route", _ROUTE)
+    # The first maximum wins a tie, as in the release.
+    answer = d3.format_answer(route, [0.4, 0.4, 0.2])
+    assert answer["choice"] == "returns"
+    assert list(answer) == ["type", "choice", "probabilities", "confidence"]
+    assert answer["confidence"] == pytest.approx(
+        1 + sum(p * math.log(p) for p in (0.4, 0.4, 0.2)) / math.log(3), abs=1e-4
+    )
+    noul = d3.normalize_question("n", {"type": "noul"})
+    assert d3.format_answer(noul, [0.25, 0.75]) == {"type": "noul", "noul": 0.75}
+    score = d3.normalize_question("s", {"type": "score", "criteria": ["a", "b", "c"]})
+    answer = d3.format_answer(score, [0.0, 0.5, 0.5])
+    assert answer["score"] == 1.5
+    assert answer["probabilities"] == {"0": 0.0, "1": 0.5, "2": 0.5}
+    single = d3.normalize_question("o", {"type": "choice", "criteria": {"x": None}})
+    assert d3.format_answer(single, [1.0])["confidence"] == 1.0
+
+
+def test_d3_mrope_positions_follow_transformers():
+    t, image, video = 1, 300, 301
+    ids = np.array(
+        [t] * 3 + [image] * 4 + [t] * 2 + [video] * 6 + [t] + [video] * 6 + [t]
+    )
+    positions = d3.mrope_positions(
+        ids, image, video, np.array([[1, 4, 4]]), np.array([[2, 4, 6]]), 2
+    )
+    expected = [
+        [0, 1, 2] + [3] * 4 + [5, 6] + [7] * 6 + [10] + [11] * 6 + [14],
+        [0, 1, 2]
+        + [3, 3, 4, 4]
+        + [5, 6]
+        + [7, 7, 7, 8, 8, 8]
+        + [10]
+        + [11, 11, 11, 12, 12, 12]
+        + [14],
+        [0, 1, 2]
+        + [3, 4, 3, 4]
+        + [5, 6]
+        + [7, 8, 9, 7, 8, 9]
+        + [10]
+        + [11, 12, 13, 11, 12, 13]
+        + [14],
+    ]
+    assert positions.tolist() == expected
+
+
+def test_d3_video_sampling_and_timestamps():
+    # A 10 s clip at 30 fps is read at 2 fps; short clips keep at least 4 frames.
+    assert (
+        d3.sample_indices(300, 30.0)
+        == np.linspace(0, 299, 20).round().astype(int).tolist()
+    )
+    assert d3.sample_indices(30, 30.0) == [0, 10, 19, 29]
+    assert d3.sample_indices(2, 30.0) == [0, 1]
+    assert len(d3.sample_indices(3000, 30.0)) == d3.VIDEO_MAX_FRAMES
+    video = d3.D3Video(np.zeros((4, 8, 8, 3), np.uint8), 30.0, [0, 10, 19, 29])
+    assert d3.frame_timestamps(video, 2) == pytest.approx([5 / 30, 24 / 30])
+
+
+class _D3Tokenizer:
+    """Character tokenizer with Qwen-style media placeholders."""
+
+    special = {"<|image_pad|>": 300, "<|video_pad|>": 301, "<|vision_start|>": 302}
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        while text:
+            for token, token_id in self.special.items():
+                if text.startswith(token):
+                    ids.append(token_id)
+                    text = text[len(token) :]
+                    break
+            else:
+                ids.append(ord(text[0]) % 250 + 1)
+                text = text[1:]
+        return ids
+
+    def apply_chat_template(self, conversation, **kwargs):
+        content = conversation[1]["content"]
+        if isinstance(content, str):
+            return f"<s>{conversation[0]['content']}<u>{content}<a>"
+        media = "".join(
+            (
+                "<|vision_start|><|image_pad|>"
+                if part["type"] == "image"
+                else "<|vision_start|><|video_pad|>"
+            )
+            for part in content[:-1]
+        )
+        return f"<u>{media}{content[-1]['text']}<a>"
+
+    def convert_tokens_to_ids(self, token):
+        return self.special[token]
+
+
+@pytest.fixture
+def tiny_d3(tiny_backbone):
+    tiny_backbone.tokenizer = _D3Tokenizer()
+    model = d3.D3Model("tiny")
+    model.backbone = tiny_backbone
+    model.codes = [chr(code) for code in range(ord("A"), ord("Z") + 1)]
+    model._image_token_id, model._video_token_id = 300, 301
+    model.readout = mx.random.normal((d3.MAX_OPTIONS, 64), key=mx.random.key(4))
+    return model
+
+
+def test_d3_encode_matches_full_forward_without_causal_mask(tiny_d3, monkeypatch):
+    from mlx_vlm.models.qwen3_5 import language
+
+    backbone = tiny_d3.backbone
+    ids = np.arange(5, 45, dtype=np.int32)
+    positions = mx.array(np.tile(np.arange(len(ids), dtype=np.int32), (3, 1)))[:, None]
+
+    def encode(chunk, causal):
+        return _drain(
+            backbone.encode(
+                backbone.embed_tokens(ids), positions, lambda: chunk, causal
+            )
+        )
+
+    tokens = mx.array(ids)[None]
+    causal = backbone._text_model(tokens, position_ids=positions)[0, -1]
+    assert np.allclose(np.array(encode(len(ids), True)), np.array(causal), atol=1e-4)
+
+    monkeypatch.setattr(language, "_create_qwen3_5_attention_mask", lambda *a: None)
+    full = backbone._text_model(tokens, position_ids=positions)[0, -1]
+    for chunk in (len(ids), 7, 1):
+        assert np.allclose(np.array(encode(chunk, False)), np.array(full), atol=1e-4)
+    assert not np.allclose(np.array(full), np.array(causal), atol=1e-3)
+
+
+def test_d3_run_answers_every_question(tiny_d3):
+    request = {
+        "state": {"ticket": "charged twice"},
+        "questions": {
+            "route": _ROUTE,
+            "angry": {"type": "noul", "instructions": "Is the customer angry?"},
+            "urgency": {"type": "score", "criteria": ["later", "today", "now"]},
+        },
+    }
+    plan = tiny_d3.encode(request)
+    steps = []
+
+    def chunk():
+        return 16
+
+    run = tiny_d3.run(plan, chunk)
+    try:
+        while True:
+            steps.append(next(run))
+    except StopIteration as stop:
+        result = stop.value
+    lengths = [len(ids) for ids in plan.ids]
+    assert sum(steps) == sum(lengths) == result["input_tokens"]
+    assert len(steps) > len(lengths)
+    answers = result["answers"]
+    assert list(answers) == ["route", "angry", "urgency"]
+    assert sum(answers["route"]["probabilities"].values()) == pytest.approx(1, abs=1e-3)
+    assert answers["route"]["choice"] in _ROUTE["criteria"]
+    assert 0 <= answers["angry"]["noul"] <= 1
+    assert answers["urgency"]["legend"] == {"0": "later", "1": "today", "2": "now"}
+    whole = _drain(tiny_d3.run(tiny_d3.encode(request), lambda: 4096))
+    assert whole["answers"]["route"] == answers["route"]
+    json.dumps(result)
+
+
+def test_d3_expands_media_placeholders(tiny_d3):
+    ids = [1, 302, 300, 2, 302, 301, 3]
+    assert tiny_d3._expand(ids, [3], [[7, 8, 301, 301]]) == [
+        1,
+        302,
+        300,
+        300,
+        300,
+        2,
+        302,
+        7,
+        8,
+        301,
+        301,
+        3,
+    ]
+    # Text requests keep a literal placeholder token as text.
+    assert tiny_d3._expand(ids, [], []) == ids
+
+
+def test_d3_rejects_literal_placeholder_with_media(tiny_d3, monkeypatch):
+    monkeypatch.setattr(d3, "decode_images", lambda urls: [object()] if urls else [])
+    monkeypatch.setattr(
+        tiny_d3.backbone,
+        "preprocess_images",
+        lambda images: (np.zeros((16, 96), np.float32), np.array([[1, 4, 4]])),
+    )
+    tiny_d3.backbone.image_processor = SimpleNamespace(merge_size=2)
+    request = {
+        "state": "see <|image_pad|> here",
+        "images": ["data:image/png;base64,AA=="],
+        "questions": {"q": {"type": "noul"}},
+    }
+    with pytest.raises(DecisionRequestError, match="placeholder"):
+        tiny_d3.encode(request)
+
+
+def test_d3_video_encode_and_token_budget(tiny_d3, monkeypatch):
+    decoded = []
+
+    def decode(url):
+        decoded.append(url)
+        return d3.D3Video(np.zeros((4, 64, 64, 3), np.uint8), 2.0, [0, 1, 2, 3])
+
+    monkeypatch.setattr(d3, "decode_video", decode)
+    tiny_d3.backbone.image_processor = SimpleNamespace(
+        patch_size=16,
+        temporal_patch_size=2,
+        merge_size=2,
+        image_mean=[0.5] * 3,
+        image_std=[0.5] * 3,
+    )
+    request = {
+        "state": "a clip",
+        "videos": ["v0", "v1"],
+        "questions": {"q": {"type": "noul"}},
+    }
+    # Four 64 x 64 frames are two temporal patches of 2 x 2 tokens.
+    plan = tiny_d3.encode(request)
+    assert plan.video_grids.tolist() == [[2, 4, 4], [2, 4, 4]]
+    (ids,) = plan.ids
+    assert int((ids == 301).sum()) == 16
+    assert plan.positions[0].shape == (3, len(ids))
+
+    # Decoding stops at the first video over the budget.
+    decoded.clear()
+    monkeypatch.setattr(d3, "VIDEO_MAX_TOKENS", 20)
+    request["videos"] = [f"v{i}" for i in range(5)]
+    with pytest.raises(DecisionRequestError, match="first 3 videos take 24"):
+        tiny_d3.encode(request)
+    assert decoded == ["v0", "v1", "v2"]
+
+
+def test_d3_video_uri_errors_name_the_video(tiny_d3, monkeypatch):
+    monkeypatch.setattr(d3, "require_opencv", lambda field: None)
+    with pytest.raises(InvalidRequestError) as error:
+        tiny_d3._decode_video("data:video/mp4,AAAA", 1)
+    assert str(error.value) == "videos[1]: the video must use a base64 video data URI."
+    assert error.value.field == "videos"
+
+
+@pytest.mark.parametrize("model_class", [clef.ClefModel, openjev.OpenJevModel])
+def test_clef_and_openjev_reject_videos(model_class):
+    model = model_class("unused")
+    request = {
+        "state": "s",
+        "videos": ["data:video/mp4;base64,AA=="],
+        "questions": {"q": {"type": "noul", "instructions": "?"}},
+    }
+    with pytest.raises(DecisionRequestError, match="videos"):
+        model.encode(request)
+
+
+# --------------------------------------------------------------------------
+# Qwen3.5 base-model checkpoints (d3 weights in mlx-vlm)
+
+
+def _base_config(**overrides):
+    text = dict(_TEXT_CONFIG, **overrides.pop("text", {}))
+    return {
+        "model_type": "qwen3_5",
+        "text_config": text,
+        "vision_config": {
+            "model_type": "qwen3_5",
+            "depth": 1,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_heads": 2,
+            "out_hidden_size": 64,
+            "patch_size": 4,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "in_channels": 3,
+            "num_position_embeddings": 64,
+            "deepstack_visual_indexes": [],
+        },
+        **overrides,
+    }
+
+
+@pytest.fixture
+def base_compat(monkeypatch):
+    """Install the base-model compat patch for one test, then restore mlx-vlm."""
+    from mlx_vlm.models.qwen3_5 import config, language, qwen3_5
+
+    from omlx.patches import mlx_vlm_qwen35_base_compat as compat
+
+    for target, name in (
+        (config.TextConfig, "from_dict"),
+        (config.ModelConfig, "from_dict"),
+        (language.Qwen3_5DecoderLayer, "__init__"),
+        (language.Qwen3_5Model, "__init__"),
+        (language.LanguageModel, "__init__"),
+        (qwen3_5, "sanitize_key"),
+    ):
+        monkeypatch.setattr(target, name, inspect.getattr_static(target, name))
+    monkeypatch.setattr(compat, "_APPLIED", False)
+    assert compat.apply_mlx_vlm_qwen35_base_compat_patch()
+    return compat
+
+
+def test_layer_types_and_headless_base_model(base_compat):
+    from mlx_vlm.models.qwen3_5 import Model, ModelConfig
+
+    schedule = [
+        "linear_attention",
+        "full_attention",
+        "full_attention",
+        "linear_attention",
+    ]
+    config = _base_config(
+        text={"layer_types": schedule}, architectures=["Qwen3_5Model"]
+    )
+    assert base_compat.needs_base_compat(config)
+    model = Model(ModelConfig.from_dict(config))
+    layers = model.language_model.model.layers
+    assert [layer.is_linear for layer in layers] == [True, False, False, True]
+    assert "linear_attn" in layers[0] and "self_attn" in layers[2]
+    assert "linear_attn" not in layers[2]
+    assert model.language_model.model.fa_idx == 1
+    assert "lm_head" not in model.language_model
+
+    periodic = ["linear_attention", "full_attention"] * 2
+    stock = _base_config(
+        text={"layer_types": periodic},
+        architectures=["Qwen3_5ForConditionalGeneration"],
+    )
+    assert not base_compat.needs_base_compat(stock)
+    model = Model(ModelConfig.from_dict(stock))
+    assert [layer.is_linear for layer in model.language_model.model.layers] == [
+        True,
+        False,
+        True,
+        False,
+    ]
+    assert model.language_model.model.fa_idx == 1
+    assert "lm_head" in model.language_model
+
+
+def test_base_layout_weights_sanitize_once():
+    from mlx_vlm.models.qwen3_5 import Model, ModelConfig
+
+    from omlx.patches.mlx_vlm_mtp import apply_mlx_vlm_mtp_patch
+
+    apply_mlx_vlm_mtp_patch()
+    model = Model(ModelConfig.from_dict(_base_config(architectures=["Qwen3_5Model"])))
+    raw = {
+        "language_model.embed_tokens.weight": mx.zeros((320, 64)),
+        "language_model.norm.weight": mx.zeros((64,)),
+        "language_model.layers.0.input_layernorm.weight": mx.zeros((64,)),
+        "language_model.layers.0.linear_attn.conv1d.weight": mx.zeros((96, 1, 3)),
+        "visual.blocks.0.norm1.weight": mx.zeros((32,)),
+    }
+    once = model.sanitize(dict(raw))
+    assert set(once) == {
+        "language_model.model.embed_tokens.weight",
+        "language_model.model.norm.weight",
+        "language_model.model.layers.0.input_layernorm.weight",
+        "language_model.model.layers.0.linear_attn.conv1d.weight",
+        "vision_tower.blocks.0.norm1.weight",
+    }
+    assert once["language_model.model.norm.weight"].tolist() == [1.0] * 64
+    assert once["language_model.model.layers.0.linear_attn.conv1d.weight"].shape == (
+        96,
+        3,
+        1,
+    )
+    # A quantized output is sanitized again on load; norms must not shift twice.
+    twice = model.sanitize(dict(once))
+    assert set(twice) == set(once)
+    assert twice["language_model.model.norm.weight"].tolist() == [1.0] * 64

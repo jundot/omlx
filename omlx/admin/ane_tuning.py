@@ -513,7 +513,7 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     )
     # The tuner reaches into the engine for the raw model and compares prompt
     # throughput across slots, so it must stage the plain LM engine: a DFlash
-    # engine exposes no _model and would skew every measurement (issue #2914).
+    # drafter would skew every measurement (issue #2914).
     if hasattr(settings, "dflash_enabled"):
         settings.dflash_enabled = False
     # SpecPrefill compresses the measurement prompt to a sparse subset before

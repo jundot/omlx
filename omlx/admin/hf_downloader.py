@@ -1203,7 +1203,8 @@ class HFDownloader(_QueuePersistenceMixin):
             ValueError: If repo_id format is invalid or download is already queued.
         """
         repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
+        parts = repo_id.split("/")
+        if len(parts) != 2 or any(part in ("", ".", "..") for part in parts):
             raise ValueError(
                 f"Invalid repository ID: '{repo_id}'. "
                 "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"

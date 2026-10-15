@@ -81,6 +81,21 @@ class TestThinkingBudgetProcessor:
         assert target_logit == 0.0
         assert other_logit == float("-inf")
 
+    def test_repeated_history_preserves_budget_and_forced_sequence(self):
+        proc = self._make_processor(budget=3, end_ids=[50, 51], trailing_ids=[99])
+        history = [10]
+        for token in [20, 30, 50, 51, 99, 25]:
+            logits = proc(_make_tokens(*history), _make_logits())
+            state = proc.snapshot_state()
+            repeated = proc(_make_tokens(*history), _make_logits())
+            assert proc.snapshot_state() == state
+            assert mx.array_equal(repeated, logits)
+            if token in [50, 51, 99]:
+                assert logits[0, token].item() == 0.0
+                assert logits[0, 0].item() == float("-inf")
+            history.append(token)
+        assert proc._done
+
     def test_done_after_forced_sequence(self):
         """After forcing the close sequence, processor should become a no-op."""
         proc = self._make_processor(budget=1)

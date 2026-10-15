@@ -19,6 +19,9 @@ final class AppServices: NSObject {
     /// PR 8 — when non-nil, the AppView swaps the Models screen for the
     /// per-model ModelSettingsScreen drilled to this id.
     var modelDetailID: String?
+    /// Sub-page shown inside the per-model settings; nil is its top page.
+    /// AppView resets it whenever `modelDetailID` changes.
+    var modelDetailPage: ModelSettingsPage?
     /// When set, AppView pulls the sidebar selection to this section on
     /// the next runloop tick and clears the request. Lets a screen
     /// imperatively navigate the user (e.g. the Profiles tab's

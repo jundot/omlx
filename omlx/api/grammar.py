@@ -125,6 +125,10 @@ class GrammarConstraintProcessor:
         mx_bitmask = mx.array(self._bitmask)
         return self._apply_mask(mx_bitmask, logits, self._vocab_size)
 
+    def discard_pending(self) -> None:
+        """Forget the in-flight token; its row was dropped before it was sent."""
+        self._pending = False
+
     def accept_token(self, token_id: int) -> None:
         """Accept a generated token to advance matcher state."""
         self._pending = False

@@ -46,16 +46,16 @@ def test_chat_sidebar_model_settings_use_i18n_keys():
     html = _chat_template()
 
     expected_keys = [
-        "chat.model_tab",
         "chat.profile_tab",
         "chat.active_profile",
-        "chat.active_model",
+        "chat.composer.attach",
+        "chat.composer.settings",
+        "chat.reasoning.label",
+        "chat.reasoning.budget",
         "modal.model_settings.temperature",
         "modal.model_settings.max_tokens",
         "modal.model_settings.top_p",
         "modal.model_settings.repetition_penalty_short",
-        "chat.thinking_mode.on_limited",
-        "chat.model_settings_advanced_hint",
         "chat.stats.token_generation",
         "chat.status.prefilling_percent",
         "chat.web_search_on",

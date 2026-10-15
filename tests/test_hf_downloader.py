@@ -12,11 +12,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from huggingface_hub import HfApi
 from huggingface_hub.utils import HfHubHTTPError
 
 from omlx._hf_download_worker import _download_without_xet
 from omlx.admin import hf_downloader as hf_downloader_mod
+from omlx.admin import routes as admin_routes
 from omlx.admin.hf_downloader import (
     DownloadStatus,
     DownloadTask,
@@ -206,9 +208,10 @@ class TestHFDownloader:
             await downloader.start_download("no-slash")
 
     @pytest.mark.asyncio
-    async def test_start_download_invalid_repo_id_too_many_parts(self, downloader):
+    @pytest.mark.parametrize("repo_id", ["a/b/c", "../..", "a/..", "/etc"])
+    async def test_start_download_invalid_repo_id_parts(self, downloader, repo_id):
         with pytest.raises(ValueError, match="Invalid repository ID"):
-            await downloader.start_download("a/b/c")
+            await downloader.start_download(repo_id)
 
     @pytest.mark.asyncio
     async def test_start_download_strips_whitespace(self, downloader):
@@ -1131,6 +1134,36 @@ class TestHFDownloaderRoutes:
         return model_dir
 
     @pytest.mark.asyncio
+    async def test_recommendations_report_free_space_of_the_model_folder(
+        self, tmp_path
+    ):
+        import omlx.admin.routes as routes_module
+        from fastapi import HTTPException
+
+        downloader = MagicMock()
+        # A fresh install has no model folder yet; its parent volume counts.
+        downloader.model_dir = tmp_path / "models"
+        orig_downloader = routes_module._hf_downloader
+        try:
+            routes_module._hf_downloader = None
+            with pytest.raises(HTTPException) as exc:
+                await routes_module.get_model_recommendations(is_admin=True)
+            assert exc.value.status_code == 503
+
+            routes_module._hf_downloader = downloader
+            with patch.object(
+                routes_module.model_recommender,
+                "recommendations",
+                AsyncMock(return_value={"sections": {}}),
+            ):
+                result = await routes_module.get_model_recommendations(is_admin=True)
+        finally:
+            routes_module._hf_downloader = orig_downloader
+
+        assert result["disk"]["model_dir"] == str(tmp_path / "models")
+        assert result["disk"]["free_bytes"] > 0
+
+    @pytest.mark.asyncio
     async def test_list_models(self, model_dir_with_models):
         """Test the list_hf_models endpoint logic."""
         from omlx.admin.routes import list_hf_models, _get_global_settings
@@ -1147,7 +1180,7 @@ class TestHFDownloaderRoutes:
         # Create a mock global settings
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         import omlx.admin.routes as routes_module
 
@@ -1176,6 +1209,12 @@ class TestHFDownloaderRoutes:
             )
             assert display_names["model-a"] == "model-a"
 
+            repo_ids = {m["name"]: m["repo_id"] for m in models}
+            assert repo_ids["Qwen3.6-27B-MLX-oQ5-FP16"] == (
+                "deepsweet/Qwen3.6-27B-MLX-oQ5-FP16"
+            )
+            assert repo_ids["model-a"] is None
+
             for m in models:
                 assert "size" in m
                 assert "size_formatted" in m
@@ -1200,7 +1239,7 @@ class TestHFDownloaderRoutes:
 
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1253,7 +1292,7 @@ class TestHFDownloaderRoutes:
         downloader = HFDownloader(model_dir=str(model_dir))
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1339,7 +1378,7 @@ class TestHFDownloaderRoutes:
         (model_path / "model.safetensors").write_bytes(b"x" * 8)
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1395,7 +1434,7 @@ class TestHFDownloaderRoutes:
         )
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1436,7 +1475,7 @@ class TestHFDownloaderRoutes:
 
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         orig = routes_module._get_global_settings
         routes_module._get_global_settings = lambda: mock_settings
@@ -1463,7 +1502,7 @@ class TestHFDownloaderRoutes:
 
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         orig = routes_module._get_global_settings
         routes_module._get_global_settings = lambda: mock_settings
@@ -1486,7 +1525,7 @@ class TestHFDownloaderRoutes:
         import omlx.admin.routes as routes_module
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1540,7 +1579,7 @@ class TestHFDownloaderRoutes:
         import omlx.admin.routes as routes_module
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1574,7 +1613,7 @@ class TestHFDownloaderRoutes:
         import omlx.admin.routes as routes_module
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1610,6 +1649,96 @@ class TestHFDownloaderRoutes:
             routes_module._get_global_settings = orig_settings
             routes_module._get_engine_pool = orig_pool
             routes_module._get_settings_manager = orig_mgr
+
+    @staticmethod
+    def _make_hf_cache_repo(hub, org, name):
+        """Create an HF Hub cache repo whose snapshot files link into blobs/."""
+        repo = hub / f"models--{org}--{name}"
+        (repo / "refs").mkdir(parents=True)
+        (repo / "refs" / "main").write_text("abc123")
+        (repo / "blobs").mkdir()
+        snapshot = repo / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        for filename, data in (
+            ("config.json", b'{"model_type": "llama"}'),
+            ("model.safetensors", b"0" * 1000),
+        ):
+            blob = repo / "blobs" / filename
+            blob.write_bytes(data)
+            (snapshot / filename).symlink_to(blob)
+        return repo
+
+    @staticmethod
+    def _patch_route_state(model_dirs):
+        settings = MagicMock()
+        settings.get_effective_model_dirs.return_value = model_dirs
+        pool = MagicMock()
+        pool.get_loaded_model_ids.return_value = []
+        pool._entries = {}
+        settings_manager = MagicMock()
+        settings_manager.get_pinned_model_ids.return_value = []
+        patcher = patch.multiple(
+            admin_routes,
+            _get_global_settings=lambda: settings,
+            _get_engine_pool=lambda: pool,
+            _get_settings_manager=lambda: settings_manager,
+        )
+        return patcher, settings_manager
+
+    @pytest.mark.asyncio
+    async def test_hf_cache_repo_is_listed_and_deleted_whole(self, tmp_path):
+        """MLX repos in the HF Hub cache list and delete like discovery sees them."""
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        hub = tmp_path / "hub"
+        repo = self._make_hf_cache_repo(hub, "mlx-community", "Tiny-4bit")
+        plain = self._make_hf_cache_repo(hub, "acme", "PlainModel")
+        patcher, settings_manager = self._patch_route_state([models_dir, hub])
+
+        with patcher:
+            listed = (await admin_routes.list_hf_models(is_admin=True))["models"]
+            assert [(m["name"], m["source_type"], m["repo_id"]) for m in listed] == [
+                ("mlx-community--Tiny-4bit", "hf_cache", "mlx-community/Tiny-4bit")
+            ]
+            assert listed[0]["size"] == 1023
+
+            result = await admin_routes.delete_hf_model(
+                model_name="mlx-community--Tiny-4bit", is_admin=True
+            )
+            assert result["success"] is True
+            assert not repo.exists()
+            assert plain.exists()
+            settings_manager.delete_settings.assert_called_once_with(
+                "mlx-community--Tiny-4bit"
+            )
+
+            # Discovery skips non-MLX cache repos, so deletion does too.
+            with pytest.raises(HTTPException) as exc_info:
+                await admin_routes.delete_hf_model(
+                    model_name="acme--PlainModel", is_admin=True
+                )
+            assert exc_info.value.status_code == 404
+            assert plain.exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target_inside_hub", [False, True])
+    async def test_delete_refuses_symlinked_hf_cache_repo(
+        self, tmp_path, target_inside_hub
+    ):
+        """A cache repo entry that is a symlink is refused and its target kept."""
+        hub = tmp_path / "hub"
+        hub.mkdir()
+        target_parent = hub / "store" if target_inside_hub else tmp_path / "other"
+        target = self._make_hf_cache_repo(target_parent, "mlx-community", "Tiny-4bit")
+        (hub / target.name).symlink_to(target, target_is_directory=True)
+        patcher, _ = self._patch_route_state([hub])
+
+        with patcher, pytest.raises(HTTPException) as exc_info:
+            await admin_routes.delete_hf_model(
+                model_name="mlx-community--Tiny-4bit", is_admin=True
+            )
+        assert exc_info.value.status_code == 400
+        assert (target / "snapshots" / "abc123" / "model.safetensors").exists()
 
 
 # =============================================================================

@@ -719,7 +719,8 @@ class MSDownloader(_QueuePersistenceMixin):
             )
 
         model_id = model_id.strip()
-        if "/" not in model_id or len(model_id.split("/")) != 2:
+        parts = model_id.split("/")
+        if len(parts) != 2 or any(part in ("", ".", "..") for part in parts):
             raise ValueError(
                 f"Invalid model ID: '{model_id}'. "
                 "Expected format: 'owner/model' (e.g., 'qwen/Qwen2.5-7B-Instruct-MLX')"

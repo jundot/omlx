@@ -802,7 +802,8 @@ class EngineCore:
             )
             return False
 
-        result = scheduler.abort_request(request_id)
+        # A client cancel keeps the computed prefix for a resend.
+        result = scheduler.abort_request(request_id, keep_cache=True)
 
         # Signal consumer with abort error so any waiting
         # stream_outputs() / generate() can exit gracefully.

@@ -11,7 +11,7 @@ function usageLocale() {
 /* Local serving history; independent of the high-frequency live stats poll. */
 function usageHistory() {
     return {
-        range: 'today', model: '', models: [], data: null, error: '', disabled: false, loading: false, peak: 1, displayedQuery: '',
+        range: 'today', model: '', modelIds: [], data: null, error: '', disabled: false, loading: false, peak: 1, displayedQuery: '',
         timer: null, request: null,
         init() {
             this.$watch('mainTab', tab => {
@@ -40,13 +40,13 @@ function usageHistory() {
                 this.disabled = data.enabled === false;
                 if (this.disabled) {
                     this.data = null;
-                    this.models = [];
+                    this.modelIds = [];
                     this.error = '';
                     return;
                 }
                 this.data = data;
                 this.peak = Math.max(1, ...data.heatmap.flatMap(day => day.tokens));
-                if (!this.model) this.models = data.models.map(row => row.model_id);
+                if (!this.model) this.modelIds = data.models.map(row => row.model_id);
                 this.error = data.available && !data.dropped_requests ? '' : window.t('usage.delayed');
             } catch (error) {
                 if (error.name === 'AbortError' || request.signal.aborted) return;

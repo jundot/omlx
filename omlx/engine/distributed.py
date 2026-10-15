@@ -32,6 +32,7 @@ from ..cluster.liveness import (
     marker_owner_is_live,
     read_marker,
 )
+from ..exceptions import InvalidRequestError
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
@@ -610,6 +611,12 @@ raise SystemExit(2)
             raise ValueError("logit_bias is not yet supported by distributed inference")
         if kwargs.get("specprefill") is True:
             raise ValueError("SpecPrefill is not supported by distributed inference")
+        if kwargs.get("no_repeat_ngram_size"):
+            # Ranks run mlx-lm's server, which has no n-gram ban.
+            raise InvalidRequestError(
+                "no_repeat_ngram_size is not supported by distributed inference",
+                field="no_repeat_ngram_size",
+            )
 
     def _completion_payload(
         self,

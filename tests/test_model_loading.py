@@ -344,6 +344,25 @@ class TestVlmMtpPreLoadDispatch:
         )
         return calls, sanitize_mock, runtime_mock, attach_mock
 
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe", "qwen4_exp"])
+    @pytest.mark.parametrize("for_vlm", [False, True])
+    def test_qwen_ssm_mask_patch_runs_without_speculation(
+        self, tmp_path, monkeypatch, model_type, for_vlm
+    ):
+        from omlx.patches import qwen35_ssm_mask
+
+        self._stub_patches(monkeypatch)
+        monkeypatch.setitem(
+            sys.modules, "omlx.patches.mlx_vlm_qwen4_exp_compat", MagicMock()
+        )
+        apply_mask = MagicMock()
+        monkeypatch.setattr(qwen35_ssm_mask, "apply_qwen35_ssm_mask_patch", apply_mask)
+        path = _write_config(tmp_path, json.dumps({"model_type": model_type}))
+
+        maybe_apply_pre_load_patches(path, for_vlm=for_vlm)
+
+        assert apply_mask.call_count == int(for_vlm)
+
     def test_sanitize_patch_runs_before_runtime_for_vlm_mtp(
         self, tmp_path, monkeypatch
     ):
@@ -443,7 +462,7 @@ class TestVlmMtpPreLoadDispatch:
         assert calls == ["attach=False", "sanitize", "runtime"]
 
     def test_vlm_patches_skipped_when_not_for_vlm(self, tmp_path, monkeypatch):
-        # BatchedEngine / DFlashEngine / LLM loader paths must NOT touch
+        # BatchedEngine / LLM loader paths must NOT touch
         # mlx-vlm classes even when the model declares MTP heads. for_vlm
         # defaults to False so they pass through without invoking mlx-vlm
         # patches.

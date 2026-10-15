@@ -42,7 +42,6 @@ from ..qwen3_5.language import (
     Qwen3_5Attention,
     Qwen3_5GatedDeltaNet,
     _create_qwen3_5_attention_mask,
-    _create_qwen3_5_ssm_mask,
 )
 from ..qwen3_5 import language as q35_language
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
@@ -585,6 +584,45 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     @classmethod
     def merge(cls, caches):
         return BatchQSAKVCache.merge(caches)
+
+    def _kv_bytes_per_token(self) -> int:
+        return (self.keys.nbytes + self.values.nbytes) // max(1, self.keys.shape[2])
+
+    def _reserved_capacity(self, tokens: int) -> int:
+        # One spare step keeps a short reply from copying the K/V buffers
+        # right after prefill.
+        return (-(-int(tokens) // self.step) + 1) * self.step
+
+    def prefill_capacity_bytes(self, tokens: int) -> int:
+        """Bytes ``reserve_prefill_capacity(tokens)`` would add."""
+        if self.keys is None:
+            return 0
+        added = self._reserved_capacity(tokens) - self.keys.shape[2]
+        return added * self._kv_bytes_per_token() if added > 0 else 0
+
+    def prefill_spare_bytes(self) -> int:
+        """Bytes of K/V capacity beyond the tokens written so far."""
+        if self.keys is None:
+            return 0
+        return (self.keys.shape[2] - self.offset) * self._kv_bytes_per_token()
+
+    def reserve_prefill_capacity(self, tokens: int) -> list:
+        """Size K/V for a known prompt length in one allocation.
+
+        Geometric regrowth leaves up to half the buffer unused and the old
+        copy in the MLX pool. After a reservation the cache grows in plain
+        steps, like the indexer. Returns the arrays to evaluate.
+        """
+        if not self.prefill_capacity_bytes(tokens):
+            return []
+        capacity = self._reserved_capacity(tokens)
+        for name in ("keys", "values"):
+            old = getattr(self, name)
+            new = mx.zeros((*old.shape[:2], capacity, old.shape[3]), dtype=old.dtype)
+            new[..., : self.offset, :] = old[..., : self.offset, :]
+            setattr(self, name, new)
+        self.geometric_growth = False
+        return [self.keys, self.values]
 
     def to_quantized(self, group_size: int = 64, bits: int = 4):
         base = super().to_quantized(group_size=group_size, bits=bits)
@@ -2680,7 +2718,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         launch takes the four projections and the kernels this layout."""
         rotary = self.rotary_emb
         return (
-            rotary.fused_apply
+            rotary.position_selector is not None
             and rotary.pairing == "half_split"
             and self.q_norm.group_size is None
             and self.k_norm.group_size is None
@@ -2740,6 +2778,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             heads=self.num_attention_heads,
             kv_heads=self.num_key_value_heads,
             rotary_dim=rotary.dim,
+            rope_scale=rotary.attention_scaling,
         )
         return q_out, index_out, v_out, queries, keys, index_positions
 
@@ -3171,7 +3210,10 @@ def _ple_require_owner(owner_pid=None):
         )
 
 
-_PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
+_PLE_IO_WORKERS = 48
+_PLE_IO_POOL = ThreadPoolExecutor(
+    max_workers=_PLE_IO_WORKERS, thread_name_prefix="ple-io"
+)
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 # Slow gathers may indicate page eviction. Allow normal gather overhead and
 # rate-limit retries; elapsed time is a heuristic, not a residency check.
@@ -3265,7 +3307,8 @@ class _SafeTensorMMap:
             buffer=self._mapping,
             offset=self._data_start + start,
         )
-        copied = np.array(view[row_indices], copy=True)
+        # Integer-array indexing already copies the selected rows out of mmap.
+        copied = view[row_indices]
         if gather_start is not None:
             self._rearm_if_slow(time.perf_counter() - gather_start, row_indices.size)
         return copied, dtype
@@ -3297,28 +3340,32 @@ class _SafeTensorMMap:
             return True
         fd = self._file.fileno()
 
-        def touch(page: int) -> None:
-            offset = int(page) * _PLE_PAGE_SIZE
-            remaining = _PLE_PAGE_SIZE
-            while remaining > 0:
-                chunk = os.pread(fd, remaining, offset + (_PLE_PAGE_SIZE - remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
+        def touch(pages) -> None:
+            for page in pages:
+                offset = int(page) * _PLE_PAGE_SIZE
+                remaining = _PLE_PAGE_SIZE
+                while remaining > 0:
+                    chunk = os.pread(
+                        fd, remaining, offset + (_PLE_PAGE_SIZE - remaining)
+                    )
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
 
         # #3602 (Matt Barnson) uses submit/wait to drain failed page batches.
         # Also drain partial submission here before releasing the reader mutex;
         # otherwise close could recycle an FD still used by another page read.
         futures = []
         try:
-            for page in fresh.tolist():
-                futures.append(_PLE_IO_POOL.submit(touch, int(page)))
+            # Preserve page-read parallelism without one Future per page.
+            task_count = min(fresh.size, _PLE_IO_WORKERS)
+            for index in range(task_count):
+                futures.append(_PLE_IO_POOL.submit(touch, fresh[index::task_count]))
             for future in futures:
                 future.result()
         finally:
             wait(futures)
-        for page in fresh.tolist():
-            self._seen_pages[page] = 1
+        seen[fresh] = 1
         return False
 
     def _rearm_if_slow(self, elapsed: float, row_count: int) -> None:
@@ -3612,7 +3659,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         shape = indices.shape
         host = self._host_indices(indices)
         if host.size == 0:
-            return mx.zeros((*shape, self.dims), dtype=mx.bfloat16)
+            return mx.zeros((*shape, self.dims), dtype=self.weight_scale.dtype)
         pending = self._pending.pop(host.tobytes(), None)
         if pending is not None:
             plan, buffers = pending[0], pending[1].result()
@@ -3638,7 +3685,9 @@ class DiskBackedShardedEmbedding(nn.Module):
                 bits=bits,
                 mode="affine",
             )
-        values = values.astype(mx.bfloat16) * self.weight_scale
+        # Decode in the checkpoint's scale dtype. bf16 rows times an fp16
+        # scale promote to fp32.
+        values = values.astype(self.weight_scale.dtype) * self.weight_scale
         return values.reshape(*shape, self.dims)
 
     def _gather_per_shard(self, host_indices: list[int], shape) -> mx.array:
@@ -3650,7 +3699,7 @@ class DiskBackedShardedEmbedding(nn.Module):
         touched = tuple(sorted(set(shard_indices)))
         self.last_touched_shards = touched
         self.rows_read = 0
-        result = mx.zeros((len(host_indices), self.dims), dtype=mx.bfloat16)
+        result = mx.zeros((len(host_indices), self.dims), dtype=self.weight_scale.dtype)
         for shard_index in touched:
             positions = [
                 i
@@ -3678,7 +3727,7 @@ class DiskBackedShardedEmbedding(nn.Module):
                     bits=bits,
                     mode="affine",
                 )
-            values = values.astype(mx.bfloat16) * self.weight_scale
+            values = values.astype(self.weight_scale.dtype) * self.weight_scale
             self.rows_read += len(local)
             result = result.at[mx.array(positions, dtype=mx.int32)].add(values)
         return result.reshape(*shape, self.dims)
@@ -4208,7 +4257,8 @@ class Qwen4ExpPLELayer(nn.Module):
             history = self.ple_embedding._previous_context(
                 input_ids.astype(mx.int64), cache
             )
-        embeddings = self.ple_embedding(input_ids, cache)
+        # Any other table dtype would promote the residual stream to fp32.
+        embeddings = self.ple_embedding(input_ids, cache).astype(hidden_states.dtype)
         keys = self.norm_key(
             (
                 _target_verify_linear(self.key_proj, embeddings)
@@ -4373,7 +4423,9 @@ class Qwen4ExpModel(nn.Module):
             cache = [None] * len(self.layers)
 
         fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
+        ssm_mask = q35_language._create_qwen3_5_ssm_mask(
+            hidden_states, cache[self.ssm_idx]
+        )
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
             ssm_mask = mask
 
