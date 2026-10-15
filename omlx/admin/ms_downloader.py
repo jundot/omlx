@@ -315,9 +315,8 @@ def _parse_ms_model_entry(entry: dict) -> dict:
     Returns:
         Normalized model dict matching the HF format.
     """
-    # Path is the organization/owner, Name is the model name
-    # repo_id should be "owner/model" format
-    path = entry.get("Path") or ""
+    # Path (REST) or Owner (SDK) is the organization, Name is the model
+    path = entry.get("Path") or entry.get("Owner") or ""
     name = entry.get("Name") or ""
     if path and name:
         model_id = f"{path}/{name}"

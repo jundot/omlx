@@ -127,6 +127,23 @@ class TestParseMsModelEntry:
         result = _parse_ms_model_entry(entry)
         assert result["name"] == "my-model"
 
+    @pytest.mark.parametrize(
+        "entry,expected_repo_id",
+        [
+            (
+                {"Owner": "mlx-community", "Name": "Qwen3.8-27B-4bit"},
+                "mlx-community/Qwen3.8-27B-4bit",
+            ),
+            (
+                {"Path": "qwen", "Owner": "other", "Name": "Qwen2.5-7B"},
+                "qwen/Qwen2.5-7B",
+            ),
+        ],
+    )
+    def test_repo_id_from_path_or_owner_key(self, entry, expected_repo_id):
+        result = _parse_ms_model_entry(entry)
+        assert result["repo_id"] == expected_repo_id
+
 
 # =============================================================================
 # MSDownloader Tests
