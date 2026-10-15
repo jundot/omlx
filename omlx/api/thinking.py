@@ -9,6 +9,8 @@ Used by reasoning models like DeepSeek R1, Qwen3/3.5, MiniMax that wrap
 their chain-of-thought reasoning in <think>...</think> tags.
 """
 
+import functools
+import json
 import re
 from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
@@ -408,6 +410,117 @@ class ThinkingParser:
                 return True
 
         return False
+
+
+_BYTE_FALLBACK_PIECE = re.compile(r"(?:<0x[0-9A-Fa-f]{2}>)+")
+_BYTE_FALLBACK_BYTE = re.compile(r"<0x([0-9A-Fa-f]{2})>")
+
+
+@functools.lru_cache(maxsize=1)
+def _gpt2_byte_decoder() -> dict[str, int]:
+    """Inverse of GPT-2's ``bytes_to_unicode`` table (byte-level BPE pieces)."""
+    byte_values = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    code_points = byte_values[:]
+    extra = 0
+    for byte in range(256):
+        if byte not in byte_values:
+            byte_values.append(byte)
+            code_points.append(256 + extra)
+            extra += 1
+    return {chr(point): byte for byte, point in zip(byte_values, code_points)}
+
+
+def _decoder_is_byte_level(state) -> bool:
+    if not isinstance(state, dict):
+        return False
+    if state.get("type") == "ByteLevel":
+        return True
+    if state.get("type") == "Sequence":
+        return any(_decoder_is_byte_level(item) for item in state.get("decoders") or ())
+    return False
+
+
+def _tokenizer_byte_decoder(tokenizer) -> dict[str, int] | None:
+    """Return the piece-char -> byte table for a byte-level BPE tokenizer."""
+    byte_decoder = _safe_tokenizer_attr(tokenizer, "byte_decoder")
+    if isinstance(byte_decoder, dict) and byte_decoder:
+        return byte_decoder
+    backend = _safe_tokenizer_attr(tokenizer, "backend_tokenizer")
+    decoder = _safe_tokenizer_attr(backend, "decoder")
+    getstate = _safe_tokenizer_attr(decoder, "__getstate__")
+    if not callable(getstate):
+        return None
+    try:
+        state = json.loads(getstate())
+    except Exception:
+        return None
+    return _gpt2_byte_decoder() if _decoder_is_byte_level(state) else None
+
+
+class BudgetTokenPieces:
+    """Token id -> piece lookup for the budget's UTF-8 boundary wait.
+
+    Returns raw ``bytes`` when the piece can be mapped back to the bytes it
+    encodes (SentencePiece ``<0xNN>`` byte fallback, or a GPT-2 style
+    byte-level BPE piece such as Qwen's ``"ðŁ"``), otherwise the piece text.
+    ``ThinkingBudgetProcessor`` only tracks partial characters across
+    ``bytes`` pieces, so byte-level vocabularies must take the ``bytes``
+    path or a forced close can land between the bytes of one character.
+    """
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self._byte_decoder = _tokenizer_byte_decoder(tokenizer)
+        added = _safe_tokenizer_attr(tokenizer, "added_tokens_decoder")
+        try:
+            self._added_ids = (
+                frozenset(int(i) for i in added)
+                if isinstance(added, dict)
+                else frozenset()
+            )
+        except (TypeError, ValueError):
+            self._added_ids = frozenset()
+
+    def piece_to_bytes(self, token: str, token_id: int | None = None) -> bytes | None:
+        """Convert a vocabulary piece to raw bytes when its encoding is known."""
+        if _BYTE_FALLBACK_PIECE.fullmatch(token) is not None:
+            return bytes(
+                int(match.group(1), 16)
+                for match in _BYTE_FALLBACK_BYTE.finditer(token)
+            )
+        # Added tokens (<think>, <|im_end|>, ...) are stored verbatim, not
+        # byte-level encoded.
+        if self._byte_decoder and token and token_id not in self._added_ids:
+            try:
+                return bytes(self._byte_decoder[char] for char in token)
+            except (KeyError, TypeError, ValueError):
+                pass
+        return None
+
+    def __call__(self, token_id: int) -> str | bytes | None:
+        try:
+            token = self.tokenizer.convert_ids_to_tokens(token_id)
+            if isinstance(token, bytes):
+                return token
+            if isinstance(token, str):
+                byte_piece = self.piece_to_bytes(token, token_id)
+                return byte_piece if byte_piece is not None else token
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
+
+        try:
+            return self.tokenizer.decode([token_id], skip_special_tokens=False)
+        except TypeError:
+            try:
+                return self.tokenizer.decode([token_id])
+            except Exception:
+                return None
+        except Exception:
+            return None
 
 
 class ThinkingBudgetProcessor:
