@@ -969,6 +969,7 @@ class TestModelsStatusEndpoint:
             max_tokens = 8192
             is_favorite = False
             is_hidden = False
+            exclusive_group = None
 
         class SettingsManager:
             def get_settings(self, model_id):
