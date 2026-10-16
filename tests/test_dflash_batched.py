@@ -376,16 +376,207 @@ def test_pending_captures_stay_within_the_window():
     assert kept.context_length(0) == tail.context_length(0) == 30
 
 
-def test_release_detaches_rows_and_new_cohort_reuses_ring():
+def test_release_prunes_rows_and_new_cohort_reuses_ring():
     drafter = _tiny_drafter()
     _run_cycles(drafter, [{0: (3, 1), 1: (2, 2)}])
     assert drafter._cohort is not None and drafter._cohort.uids == (0, 1)
     drafter.release([1])
-    assert drafter._cohort is None
-    assert drafter._rows[0].keys is not None
+    assert drafter._cohort.uids == (0,)
+    assert drafter._rows[0].keys is None
     _run_cycles(drafter, [{0: (1, 3), 5: (2, 4)}])
     assert drafter._cohort.uids == (0, 5)
     assert drafter.context_length(0) == 4 and drafter.context_length(5) == 2
+
+
+def test_release_pruned_cohort_does_not_restack(monkeypatch):
+    drafter = _tiny_drafter()
+    _run_cycles(drafter, [{0: (3, 1), 1: (2, 2), 2: (4, 3)}])
+    drafter.release([1])
+    cohort = drafter._cohort
+
+    def restack(*args, **kwargs):
+        raise AssertionError("survivors must not be unbatched and restacked")
+
+    monkeypatch.setattr(mx, "stack", restack)
+    assert drafter._assemble_cohort([0, 2], mx.float32) is cohort
+
+
+@pytest.mark.parametrize("removed", [[], [1], [1, 1], [1, 0], [100], [9]])
+def test_release_pruning_never_evaluates(removed, monkeypatch):
+    drafter = _tiny_drafter()
+    _run_cycles(drafter, [{0: (3, 1), 1: (2, 2)}])
+    drafter.seed(9, _captured(2, seed=91))
+    cohort = drafter._cohort
+
+    def evaluate(*args, **kwargs):
+        raise AssertionError("release must not submit GPU evaluation")
+
+    monkeypatch.setattr(mx, "eval", evaluate)
+    monkeypatch.setattr(mx, "async_eval", evaluate)
+    drafter.release(iter(removed))
+    if removed == [9]:
+        assert drafter._cohort is cohort
+    assert set(drafter._rows) == {0, 1, 9} - set(removed)
+
+
+def test_release_pruning_preserves_order_positions_and_repeated_removals():
+    drafter = _tiny_drafter()
+    _run_cycles(drafter, [{4: (3, 1), 1: (2, 2), 9: (4, 3), 2: (1, 4)}])
+    original = drafter._cohort
+    mx.eval(original.keys, original.values, original.pos)
+    for removed, indices in [([1], [0, 2, 3]), ([4, 2], [2])]:
+        drafter.release(removed)
+        cohort = drafter._assemble_cohort(drafter._cohort.uids, mx.float32)
+        assert cohort.uids == tuple(original.uids[i] for i in indices)
+        for actual, expected in zip(
+            [*cohort.keys, *cohort.values, cohort.pos],
+            [*original.keys, *original.values, original.pos],
+        ):
+            assert mx.array_equal(actual, expected[mx.array(indices)]).item()
+    drafter.release([9])
+    assert drafter._cohort is None and not drafter._rows
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="Metal allocator required")
+@pytest.mark.parametrize("remaining", [1, 4, 7])
+@pytest.mark.parametrize("sequential", [False, True])
+def test_pruned_cohort_peak_excludes_per_row_intermediate_copies(remaining, sequential):
+    model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[0], sliding_window=2048),
+        layers=[
+            SimpleNamespace(
+                self_attn=SimpleNamespace(n_kv_heads=8, head_dim=128, causal=False)
+            )
+            for _ in range(5)
+        ],
+    )
+    drafter = dd.DFlashDrafter(model, block_size=8, source_path="synthetic")
+    mx.synchronize()
+    gc.collect()
+    mx.clear_cache()
+    initial = mx.get_active_memory()
+    for uid in range(8):
+        drafter._row(uid)
+    cohort = drafter._assemble_cohort(range(8), mx.bfloat16)
+    shape = (8, 8, drafter.capacity, 128)
+    for i in range(5):
+        cohort.keys[i] = mx.full(shape, 2 * i, dtype=mx.bfloat16)
+        cohort.values[i] = mx.full(shape, 2 * i + 1, dtype=mx.bfloat16)
+    mx.eval(cohort.keys, cohort.values, cohort.pos)
+    del cohort
+    original_bytes = mx.get_active_memory() - initial
+    mx.reset_peak_memory()
+    if sequential:
+        for uid in range(remaining, 8):
+            drafter.release([uid])
+    else:
+        drafter.release(range(remaining, 8))
+    cohort = drafter._assemble_cohort(range(remaining), mx.bfloat16)
+    mx.eval(cohort.keys, cohort.values, cohort.pos)
+    mx.synchronize()
+    peak = mx.get_peak_memory() - initial
+    # Price physical buffers after measuring peak: original banks + one new
+    # batched set are allowed, not another per-row intermediate set.
+    ref_before = mx.get_active_memory()
+    reference = [
+        mx.full((remaining, 8, drafter.capacity, 128), i + 100, dtype=mx.bfloat16)
+        for i in range(10)
+    ] + [mx.full((remaining, drafter.capacity), -1, dtype=mx.int32)]
+    mx.eval(reference)
+    new_bytes = mx.get_active_memory() - ref_before
+    assert peak <= original_bytes + new_bytes + 128 * 1024, (
+        peak,
+        original_bytes,
+        new_bytes,
+    )
+    assert all(
+        mx.all(cohort.keys[i] == 2 * i).item()
+        and mx.all(cohort.values[i] == 2 * i + 1).item()
+        for i in range(5)
+    )
+
+
+def test_release_pruning_coalesces_before_reordered_reentry():
+    drafter = _tiny_drafter()
+    plan = {4: (9, 1), 1: (7, 2), 9: (5, 3), 2: (3, 4)}
+    _run_cycles(drafter, [plan])
+    original = drafter._cohort
+    drafter.release([1])
+    drafter.release([2])
+    assert drafter._cohort.ring_rows == (0, 2)
+    assert drafter._cohort.keys is original.keys
+    # Reorder before the deferred gather; detaching must map into the old
+    # bank, not mistake row1 of the filtered uids for original row1.
+    got = _run_cycles(drafter, [{9: (6, 7), 4: (8, 8)}], cycle_offset=1)[0]
+    for uid in (9, 4):
+        solo = _tiny_drafter()
+        _run_cycles(solo, [{uid: plan[uid]}])
+        assert (
+            got[uid]
+            == _run_cycles(
+                solo, [{uid: (6, 7) if uid == 9 else (8, 8)}], cycle_offset=1
+            )[0][uid]
+        )
+
+
+@pytest.mark.parametrize("fail_at", [2, 5])
+def test_release_pruning_assembly_failure_keeps_retryable_banks(fail_at, monkeypatch):
+    drafter = _tiny_drafter()
+    _run_cycles(drafter, [{0: (3, 1), 1: (2, 2), 2: (4, 3)}])
+    drafter.release([1])
+    cohort = drafter._cohort
+    original_keys, original_values, original_pos = (
+        cohort.keys,
+        cohort.values,
+        cohort.pos,
+    )
+    original_take = mx.take
+    calls = 0
+
+    def fail(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == fail_at:
+            raise RuntimeError("synthetic gather construction failure")
+        return original_take(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "take", fail)
+        with pytest.raises(RuntimeError, match="synthetic gather"):
+            drafter._assemble_cohort([0, 2], mx.float32)
+    assert cohort.keys is original_keys and cohort.values is original_values
+    assert cohort.pos is original_pos and cohort.ring_rows == (0, 2)
+    assert drafter._assemble_cohort([0, 2], mx.float32) is cohort
+    assert cohort.ring_rows is None
+    for actual, original in zip(
+        [*cohort.keys, *cohort.values, cohort.pos],
+        [*original_keys, *original_values, original_pos],
+    ):
+        assert mx.array_equal(actual, original[mx.array([0, 2])]).item()
+
+
+@DRAFTER_FAMILIES
+def test_release_pruning_matches_solo_drafts_across_reentry(make_drafter):
+    plan = [
+        {0: (9, 3), 1: (5, 4), 2: (7, 5)},
+        {2: (6, 6), 0: (3, 7)},
+        {0: (9, 8)},
+        {3: (8, 9), 0: (5, 10)},
+    ]
+    expected = [{} for _ in plan]
+    for uid in (0, 1, 2, 3):
+        alone = make_drafter()
+        for cycle, rows in enumerate(plan):
+            if uid in rows:
+                expected[cycle].update(
+                    _run_cycles(alone, [{uid: rows[uid]}], cycle_offset=cycle)[0]
+                )
+    drafter = make_drafter()
+    got = []
+    for cycle, rows in enumerate(plan):
+        drafter.release([uid for uid in drafter._rows if uid not in rows])
+        got.extend(_run_cycles(drafter, [rows], cycle_offset=cycle))
+    assert got == expected
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal allocator required")
