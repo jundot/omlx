@@ -47,6 +47,12 @@ from .staging import home_relative_model_path, validate_staged_model
 logger = logging.getLogger(__name__)
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
+# The complete set of event types a worker emits as fatal today
+# (inference_worker.py: launcher_lost, peer_lost). Matching on this instead
+# of "carries a reason or error key" means a future *informational* event
+# with one of those keys can no longer brick a healthy deployment by
+# accident. (§E2)
+_FATAL_EVENT_TYPES = frozenset({"launcher_lost", "peer_lost", "generation_failed"})
 _LOG_LINE_LIMIT = 8192
 _LOG_HISTORY = 200
 _FAILURE_OUTPUT_GRACE_SECONDS = 2.0
@@ -2854,8 +2860,17 @@ class DistributedJobSupervisor:
                             rank = event.get("rank")
                             if isinstance(rank, int) and not isinstance(rank, bool):
                                 self.rank_ready_events[rank] = event
-                        elif event.get("reason") or event.get("error"):
+                        elif event.get("type") in _FATAL_EVENT_TYPES:
                             self.failure_event = event
+                        elif event.get("reason") or event.get("error"):
+                            # Not a recognized fatal type, but it looks like
+                            # one -- log it so a genuinely new fatal type
+                            # doesn't wedge a deployment in total silence.
+                            logger.warning(
+                                "cluster event carries reason/error but is "
+                                "not a recognized fatal type, ignoring: %r",
+                                event,
+                            )
                 # mlx.launch does not emit a structured event when a native
                 # JACCL watchdog terminates a rank.  Worse, its SSH cleanup
                 # thread can raise after that and leave the launcher itself
@@ -3388,6 +3403,24 @@ class DistributedJobSupervisor:
 
     def status(self) -> DistributedJobStatus:
         process = self.process
+        # _drain (the launcher stderr reader thread) appends to _stderr and
+        # mutates rank_ready_events under self._condition; status() sits on
+        # the per-request path (_ensure_available et al.), so an unlocked
+        # snapshot here racing a burst of launcher stderr can raise
+        # "deque mutated during iteration" and fail an unrelated request (§C2).
+        with self._condition:
+            stderr_tail = tuple(self._stderr)[-20:]
+            ranks = tuple(
+                dict(self.rank_ready_events[rank])
+                for rank in sorted(self.rank_ready_events)
+            )
+            stage_links = _effective_rdma_report(
+                self.stage_link_report,
+                tuple(
+                    self.rank_ready_events[rank]
+                    for rank in sorted(self.rank_ready_events)
+                ),
+            )
         returncode = process.poll() if process is not None else None
         phase = self._phase
         failure_reason = self._failure_reason()
@@ -3411,19 +3444,10 @@ class DistributedJobSupervisor:
             returncode=returncode,
             world_size=self.deployment.world_size,
             plan_hash=self.deployment.plan_hash,
-            stderr_tail=tuple(self._stderr)[-20:],
+            stderr_tail=stderr_tail,
             failure_reason=self._failure_reason(),
-            ranks=tuple(
-                dict(self.rank_ready_events[rank])
-                for rank in sorted(self.rank_ready_events)
-            ),
-            stage_links=_effective_rdma_report(
-                self.stage_link_report,
-                tuple(
-                    self.rank_ready_events[rank]
-                    for rank in sorted(self.rank_ready_events)
-                ),
-            ),
+            ranks=ranks,
+            stage_links=stage_links,
         )
 
     def __enter__(self) -> DistributedJobSupervisor:
