@@ -3361,6 +3361,78 @@
                                     embedding_audio_max_seconds: audioSeconds > 0 ? audioSeconds : null,
                                 });
                             }
+                            // Only submit the fields the user actually changed.
+                            // The backend applies each key in request.model_fields_set,
+                            // so an untouched field sent here would be written back
+                            // with whatever the form happened to hold (#3089).
+                            // The baseline holds raw form values while the payload
+                            // holds server-ready ones, so compare both sides through
+                            // the same JSON round-trip before deciding a field is
+                            // untouched.
+                            const baseline = this._modelSettingsBaseline
+                                ? JSON.parse(this._modelSettingsBaseline)
+                                : null;
+                            if (baseline) {
+                                for (const key of Object.keys(payload)) {
+                                    if (JSON.stringify(payload[key] ?? null)
+                                        === JSON.stringify(baseline[key] ?? null)) {
+                                        delete payload[key];
+                                    }
+                                }
+                            }
+                            // A field the form derives (mtp_adaptive_max_depth is
+                            // submitted as a number but held as a string) and the
+                            // three toggles whose form value is the derived flag
+                            // rather than the field itself never match the baseline
+                            // by value, so drop them when the toggle is untouched.
+                            const derivedUnchanged = {
+                                index_cache_freq: !this.modelSettings.enableIndexCache,
+                                thinking_budget_enabled:
+                                    !this.modelSettings.enableThinkingBudget,
+                                thinking_budget_tokens:
+                                    !this.modelSettings.enableThinkingBudget,
+                                max_tool_result_tokens:
+                                    !this.modelSettings.enableToolResultLimit,
+                                specprefill_keep_pct:
+                                    !this.modelSettings.specprefill_enabled,
+                                dflash_verify_mode: !this.modelSettings.dflash_enabled,
+                                dflash_draft_quant_weight_bits:
+                                    !this.modelSettings.dflash_draft_quant_enabled,
+                                dflash_draft_quant_group_size:
+                                    !this.modelSettings.dflash_draft_quant_enabled,
+                            };
+                            for (const [key, unchanged] of Object.entries(derivedUnchanged)) {
+                                if (!unchanged || !baseline) continue;
+                                if (JSON.stringify(payload[key] ?? null)
+                                    === JSON.stringify(baseline[key] ?? null)) {
+                                    delete payload[key];
+                                }
+                            }
+                            // Numeric fields are held as strings in the form but
+                            // submitted as numbers, so the JSON comparison above
+                            // keeps them; compare those by value instead.
+                            const numericUnchanged = {
+                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled,
+                                specprefill_keep_pct: this.modelSettings.specprefill_enabled,
+                            };
+                            for (const [key, unchanged] of Object.entries(numericUnchanged)) {
+                                if (!unchanged || !baseline || !(key in baseline)) continue;
+                                if (Number(payload[key]) === Number(baseline[key])) {
+                                    delete payload[key];
+                                }
+                            }
+                            // A toggle the user left off must not turn a feature on:
+                            // its form value lives in a derived flag, so the value
+                            // comparison above never sees it as unchanged.
+                            const toggleUnchanged = {
+                                thinking_budget_enabled:
+                                    !this.modelSettings.enableThinkingBudget
+                                    && !this.modelSettings.thinking_budget_tokens,
+                            };
+                            for (const [key, unchanged] of Object.entries(toggleUnchanged)) {
+                                if (unchanged && !baseline) continue;
+                                if (unchanged && !(key in baseline)) delete payload[key];
+                            }
                             return payload;
                         })()),
                     });
