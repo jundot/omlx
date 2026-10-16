@@ -592,6 +592,113 @@ def _mma_mse_attention(real_cache, queries, keys, values, scale, starts=None):
     return output.reshape(B, n_q_heads, L, D).astype(queries.dtype)
 
 
+# Long causal prefill over MSE states runs in the codecs' rotated space:
+# q . k = (q R^T) . (n c[idx]) and sum p v = (sum p n c[idx]) R, so the cache
+# decodes to rotated K/V with one codebook lookup and norm multiply per value
+# (no per-token rotation), the dense FA-256 prefill kernel attends over them,
+# and only the output is rotated back. Past the long-prefill threshold the
+# tiled quantized_attention path materializes each score block and syncs per
+# key chunk, about 2x slower; below it dequantize+SDPA is already as fast.
+_DEQUANT_ROTATED_SOURCE = """
+    constexpr uint PER_WORD = 32 / BITS;
+    constexpr uint MASK = (1u << BITS) - 1u;
+    const uint gid = thread_position_in_grid.x;
+    const uint words = uint(packed_shape[3]);
+    const long cap = packed_shape[2];
+    const int total = tokens[0];
+    const uint word = gid % words;
+    const long row = gid / words;
+    const long t = row % total;
+    const long bh = row / total;
+    if (bh >= packed_shape[0] * packed_shape[1]) {
+        return;
+    }
+    const uint w = packed[(bh * cap + t) * words + word];
+    const float n = float(norms[bh * cap + t]);
+    device T* dst = out + (bh * total + t) * long(words * PER_WORD) + word * PER_WORD;
+    for (uint i = 0; i < PER_WORD; ++i) {
+        dst[i] = static_cast<T>(codebook[(w >> (i * BITS)) & MASK] * n);
+    }
+"""
+
+
+@cache
+def _dequant_rotated_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_tq_mse_dequant_rotated",
+        input_names=["packed", "norms", "codebook", "tokens"],
+        output_names=["out"],
+        source=_DEQUANT_ROTATED_SOURCE,
+    )
+
+
+def _dequantize_rotated(state, codec, total, dtype):
+    """``(B, H, total, D)`` rotated-space values of the first ``total`` tokens."""
+    batch, heads, _, words = state.indices.shape
+    tokens = mx.array([total], dtype=mx.int32)
+    (out,) = _dequant_rotated_kernel()(
+        inputs=[state.indices, state.norms, codec.codebook, tokens],
+        template=[("T", dtype), ("BITS", int(codec.bits))],
+        grid=(batch * heads * total * words, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(batch, heads, total, codec.dim)],
+        output_dtypes=[dtype],
+    )
+    return out
+
+
+def _rotated_prefill_attention(real_cache, queries, keys, values, scale):
+    """Causal prefill over MSE states through FA-256 in the rotated space.
+
+    Returns None outside the envelope: other codecs, bit widths that
+    straddle packed words, batches with offsets, or no FA-256 kernel.
+    """
+    from mlx_vlm import turboquant as _tq
+
+    from .qwen35_fa256_attention import causal_prefill_attention
+
+    key_codec = getattr(real_cache, "key_codec", None)
+    value_codec = getattr(real_cache, "value_codec", None)
+    if not (
+        isinstance(key_codec, _tq._TurboQuantMSECodec)
+        and isinstance(value_codec, _tq._TurboQuantMSECodec)
+        and isinstance(getattr(real_cache, "offset", None), int)
+        and queries.dtype in (mx.float16, mx.bfloat16)
+    ):
+        return None
+    keys_state = real_cache._unwrap(keys)
+    values_state = real_cache._unwrap(values)
+    if not (
+        isinstance(keys_state, _tq.TurboQuantMSEState)
+        and isinstance(values_state, _tq.TurboQuantMSEState)
+    ):
+        return None
+    total = keys_state.norms.shape[2]
+    for codec in (key_codec, value_codec):
+        if not (
+            codec.bits == int(codec.bits)
+            and int(codec.bits) in (1, 2, 4, 8)
+            and codec.dim == queries.shape[-1]
+        ):
+            return None
+    if total < queries.shape[-2]:
+        return None
+    k_rot = _dequantize_rotated(
+        _full_state(real_cache.keys, keys_state, total), key_codec, total, queries.dtype
+    )
+    v_rot = _dequantize_rotated(
+        _full_state(real_cache.values, values_state, total),
+        value_codec,
+        total,
+        queries.dtype,
+    )
+    q_rot = key_codec.prepare_queries(queries).astype(queries.dtype)
+    out = causal_prefill_attention(q_rot, k_rot, v_rot, scale)
+    if out is None:
+        return None
+    return value_codec._rotate_inverse(out).astype(queries.dtype)
+
+
 def _decode_multirow_quantized_attention(real_cache, queries, keys, values, scale):
     """Wider verify rows: one-shot quantized_attention over the whole KV.
 
@@ -952,9 +1059,23 @@ def apply_turboquant_attention_patch() -> bool:
                 total_tokens = _state_length(keys_state)
             except Exception:
                 total_tokens = 0
-            use_tiled_first = (
-                total_tokens > _LONG_PREFILL_QUANTIZED_THRESHOLD
-                and hasattr(real_cache, "quantized_attention")
+            long_prefill = total_tokens > _LONG_PREFILL_QUANTIZED_THRESHOLD
+            if long_prefill and isinstance(mask, str) and mask == "causal":
+                try:
+                    result = _rotated_prefill_attention(
+                        real_cache, queries, keys, values, scale
+                    )
+                except Exception:
+                    logger.debug(
+                        "TurboQuant rotated FA-256 prefill failed; "
+                        "falling back to quantized prefill paths",
+                        exc_info=True,
+                    )
+                    result = None
+                if result is not None:
+                    return result
+            use_tiled_first = long_prefill and hasattr(
+                real_cache, "quantized_attention"
             )
             if use_tiled_first:
                 old_query_block_size = getattr(
