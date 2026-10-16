@@ -522,8 +522,8 @@ class EnginePool:
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
         self._shutting_down = False
-        # Last logged forced-offload state per (model_id, kind).
-        self._offload_warn_state: dict[tuple[str, str], bool] = {}
+        # Last logged forced-offload state per (model_id, kind, scope).
+        self._offload_warn_state: dict[tuple[str, str, str], bool] = {}
         # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
         # from ServerSettings.gpu_keep_warm_interval; started on first load.
         self._gpu_keep_warm_interval: float = 0.0
@@ -916,11 +916,14 @@ class EnginePool:
         forced: bool,
         message: str,
         *args: object,
+        scope: str = "residency",
     ) -> None:
         """Log a forced offload only when its state changes for this model.
 
         The admin model list and the runtime signature resolve it on every poll
-        and request.
+        and request. Admission decides with a live ceiling and the residency
+        checks use a stable one, so each caller keeps its own ``scope``.
+        Otherwise the two would flip one shared state on every retry pass.
         """
 
         state = getattr(self, "_offload_warn_state", None)
@@ -929,7 +932,7 @@ class EnginePool:
             # ran __init__; keep dedup working without requiring it.
             state = {}
             self._offload_warn_state = state
-        key = (model_id, kind)
+        key = (model_id, kind, scope)
         if state.get(key) == forced:
             return
         state[key] = forced
@@ -943,6 +946,7 @@ class EnginePool:
         *,
         ceiling: int | None = None,
         log_decision: bool = True,
+        log_scope: str = "residency",
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced Qwen4 PLE mmap mode for this process."""
 
@@ -1008,6 +1012,7 @@ class EnginePool:
                 estimate.resident_bytes / 1e9,
                 ceiling / 1e9,
                 estimate.mmap_bytes / 1e9,
+                scope=log_scope,
             )
         requested = bool(
             settings is not None and getattr(settings, "qwen4_ple_ssd_offload", False)
@@ -1020,6 +1025,7 @@ class EnginePool:
         settings: object | None,
         *,
         ceiling: int | None = None,
+        log_scope: str = "residency",
     ) -> object | None:
         """Apply a forced mmap decision without mutating persisted settings."""
 
@@ -1027,6 +1033,7 @@ class EnginePool:
             entry,
             settings,
             ceiling=ceiling,
+            log_scope=log_scope,
         )
         if not enabled or not forced or settings is None:
             return settings
@@ -1041,6 +1048,7 @@ class EnginePool:
         *,
         ceiling: int | None = None,
         log_decision: bool = True,
+        log_scope: str = "residency",
     ) -> tuple[bool, bool, object | None]:
         """Resolve requested/forced DeepSeek V4.1 Engram mmap mode for this process."""
 
@@ -1099,6 +1107,7 @@ class EnginePool:
                 estimate.resident_bytes / 1e9,
                 ceiling / 1e9,
                 estimate.mmap_bytes / 1e9,
+                scope=log_scope,
             )
         requested = bool(
             settings is not None
@@ -1112,6 +1121,7 @@ class EnginePool:
         settings: object | None,
         *,
         ceiling: int | None = None,
+        log_scope: str = "residency",
     ) -> object | None:
         """Apply a forced mmap decision without mutating persisted settings."""
 
@@ -1119,6 +1129,7 @@ class EnginePool:
             entry,
             settings,
             ceiling=ceiling,
+            log_scope=log_scope,
         )
         if not enabled or not forced:
             return settings
@@ -3084,9 +3095,13 @@ class EnginePool:
             entry,
             admission_settings,
             ceiling=ngram_admission_ceiling,
+            log_scope="admission",
         )
         load_settings = self._effective_deepseek_v41_model_settings(
-            entry, load_settings, ceiling=ngram_admission_ceiling
+            entry,
+            load_settings,
+            ceiling=ngram_admission_ceiling,
+            log_scope="admission",
         )
         ngram_admission_override = load_settings is not admission_settings
         runtime_load_settings = (
@@ -4442,7 +4457,8 @@ class EnginePool:
             # A status read may have logged a forced offload long before this
             # load. Log it again next to the load.
             for kind in ("qwen4_ple_ssd_offload", "deepseek_v41_engram_ssd_offload"):
-                self._offload_warn_state.pop((model_id, kind), None)
+                for scope in ("residency", "admission"):
+                    self._offload_warn_state.pop((model_id, kind, scope), None)
             model_settings = self._effective_qwen4_model_settings(entry, model_settings)
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
