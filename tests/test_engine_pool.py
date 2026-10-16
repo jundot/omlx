@@ -4063,6 +4063,28 @@ class TestExclusiveGroup:
                 await asyncio.gather(task_b, return_exceptions=True)
 
     @pytest.mark.asyncio
+    async def test_queued_waiters_count_in_swap_waiting(
+        self, small_mock_model_dir, monkeypatch
+    ):
+        """The head and a queued waiter have no engine yet. Both must show in
+        swap_waiting, and the count must drop back to 0 when they finish."""
+        groups = {"model-a": "g", "model-b": "g", "model-c": "g"}
+        pool = self._pool(small_mock_model_dir, monkeypatch, groups)
+        self._add_model_c(small_mock_model_dir, pool)
+        with self._engines():
+            await pool.get_engine("model-a", _lease=True)
+            task_b = asyncio.create_task(pool.get_engine("model-b"))
+            await asyncio.sleep(0.05)
+            task_c = asyncio.create_task(pool.get_engine("model-c"))
+            await asyncio.sleep(0.05)
+            try:
+                assert pool.get_status()["swap_waiting"] == 2
+            finally:
+                await pool.release_engine("model-a")
+                await self._stop(task_b, task_c)
+        assert pool.get_status()["swap_waiting"] == 0
+
+    @pytest.mark.asyncio
     async def test_admin_unload_of_drained_member_wakes_head(
         self, small_mock_model_dir, monkeypatch
     ):
