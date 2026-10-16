@@ -94,6 +94,14 @@ Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_pref
 
 Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, exact SpecPrefill static-prefix sidecars, off-boundary completion, and unknown or inconsistent cache positions.
 
+# Prefix-index metadata storage
+
+Run `python -m pytest -q tests/test_prefix_index_storage.py tests/test_prefix_cache.py tests/test_paged_cache.py` to check linear block-ID storage, immutable snapshots, partial matches, divergent stores and stale-block validation. The store regression enters through `store_cache` with small synthetic KV tensors.
+
+Run `python tests/bench_prefix_index_storage.py --baseline <main-revision>` for three interleaved ABBA blocks at 128K, 512K and 1M synthetic tokens with the default 256-token block size. Each arm discards a warmup and builds a cold index with cold block hashes; GC runs outside timing. Separate tracemalloc passes measure retained/peak Python metadata. These CPU-stage timings are not engine TTFT, decode throughput, RSS or GPU memory measurements.
+
+Repeat with `--prehashed` to reuse the hashes that `store_cache` normally assigns before updating the index. Both arms still rebuild the same index; no model execution or tensor allocation is included.
+
 # Batch KV capacity tests
 
 Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `omlx/patches/vlm_batch_kv_capacity.py` or bumping the mlx-lm or mlx-vlm pin. The tests load the installed, unpatched cache module next to the patched one and compare cache state and attention output bit for bit through random appends, trims, rollbacks, merges, joins, filters and restores. They cover the mlx-vlm class, the mlx-lm class that prefix restore builds, and a batch that mixes both.
