@@ -3415,6 +3415,7 @@ async def health(response: Response):
             "loaded_count": _server_state.engine_pool.loaded_model_count,
             "final_ceiling": ceiling,
             "current_model_memory": _server_state.engine_pool.current_model_memory,
+            "swap_waiting": _server_state.engine_pool.swap_waiting,
         }
 
     loading = not _server_state.pinned_preload_complete

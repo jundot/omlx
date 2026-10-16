@@ -524,6 +524,8 @@ class EnginePool:
         self._shutting_down = False
         # Last logged forced-offload state per (model_id, kind, scope).
         self._offload_warn_state: dict[tuple[str, str, str], bool] = {}
+        # Requests parked in the get_engine admission retry loop, per model.
+        self._swap_waiting: dict[str, int] = {}
         # Idle GPU keep-warm ticker (see _touch_gpu). Configured by the server
         # from ServerSettings.gpu_keep_warm_interval; started on first load.
         self._gpu_keep_warm_interval: float = 0.0
@@ -2826,66 +2828,84 @@ class EnginePool:
         retrying = False
         attempt = 0
         unload_epoch = self._unload_epoch
-        while True:
-            ready = self._acquire_loaded_engine(
-                model_id, force_lm, _lease, runtime_settings, reload_failed
-            )
-            if ready is not None:
-                return ready
-            try:
-                async with self._lock:
-                    if self._shutting_down:
-                        # A waiter that wakes after shutdown() unloaded the
-                        # pool must not load a model again.
-                        raise ModelUnavailableError(
-                            model_id,
-                            f"Model '{model_id}' is unavailable: "
-                            "the engine pool is shutting down",
-                        )
-                    return await self._admit_engine_locked(
-                        model_id,
-                        force_lm=force_lm,
-                        _lease=_lease,
-                        runtime_settings=runtime_settings,
-                        reload_failed=reload_failed,
-                        allow_ceiling_rechecks=(attempt == 0),
-                        freed_since_start=(self._unload_epoch != unload_epoch),
-                    )
-            except _AdmissionNeverFitsError:
-                raise
-            except InsufficientMemoryError:
-                attempt += 1
-                # Bounded retry (#1970). The refusal above was decided with the
-                # lock held, so the wait below happens only after the lock is
-                # released: sleeping under ``self._lock`` would serialize every
-                # other model behind this one request and reintroduce the stall
-                # this retry exists to remove. Re-acquiring the lock per attempt
-                # also means a competing load that finished while we waited is
-                # observed on the next pass.
-                if not await self._admission_retry_worthwhile(
-                    model_id, deadline, busy_deadline
-                ):
-                    raise
-                if not retrying:
-                    retrying = True
-                    logger.info(
-                        "Admission for '%s' refused while the pool can still "
-                        "change (a load or unload in flight, or another "
-                        "request's lease); retrying for up to %.1fs (%.1fs "
-                        "when only an unrelated in-flight request can free "
-                        "memory).",
-                        model_id,
-                        budget_s,
-                        busy_s,
-                    )
-                wait = delay * (
-                    1.0
-                    + random.uniform(-_ADMISSION_RETRY_JITTER, _ADMISSION_RETRY_JITTER)
+        try:
+            while True:
+                ready = self._acquire_loaded_engine(
+                    model_id, force_lm, _lease, runtime_settings, reload_failed
                 )
-                delay = min(delay * 2.0, _ADMISSION_RETRY_MAX_DELAY_S)
-                # Floor the sleep so tuning the constants to zero cannot turn
-                # the retry loop into a hot spin.
-                await asyncio.sleep(max(0.01, wait))
+                if ready is not None:
+                    return ready
+                try:
+                    async with self._lock:
+                        if self._shutting_down:
+                            # A waiter that wakes after shutdown() unloaded the
+                            # pool must not load a model again.
+                            raise ModelUnavailableError(
+                                model_id,
+                                f"Model '{model_id}' is unavailable: "
+                                "the engine pool is shutting down",
+                            )
+                        return await self._admit_engine_locked(
+                            model_id,
+                            force_lm=force_lm,
+                            _lease=_lease,
+                            runtime_settings=runtime_settings,
+                            reload_failed=reload_failed,
+                            allow_ceiling_rechecks=(attempt == 0),
+                            freed_since_start=(self._unload_epoch != unload_epoch),
+                        )
+                except _AdmissionNeverFitsError:
+                    raise
+                except InsufficientMemoryError:
+                    attempt += 1
+                    # Bounded retry (#1970). The refusal above was decided with the
+                    # lock held, so the wait below happens only after the lock is
+                    # released: sleeping under ``self._lock`` would serialize every
+                    # other model behind this one request and reintroduce the stall
+                    # this retry exists to remove. Re-acquiring the lock per attempt
+                    # also means a competing load that finished while we waited is
+                    # observed on the next pass.
+                    if not await self._admission_retry_worthwhile(
+                        model_id, deadline, busy_deadline
+                    ):
+                        raise
+                    if not retrying:
+                        retrying = True
+                        self._swap_waiting[model_id] = (
+                            self._swap_waiting.get(model_id, 0) + 1
+                        )
+                        logger.info(
+                            "Admission for '%s' refused while the pool can still "
+                            "change (a load or unload in flight, or another "
+                            "request's lease); retrying for up to %.1fs (%.1fs "
+                            "when only an unrelated in-flight request can free "
+                            "memory).",
+                            model_id,
+                            budget_s,
+                            busy_s,
+                        )
+                    wait = delay * (
+                        1.0
+                        + random.uniform(
+                            -_ADMISSION_RETRY_JITTER, _ADMISSION_RETRY_JITTER
+                        )
+                    )
+                    delay = min(delay * 2.0, _ADMISSION_RETRY_MAX_DELAY_S)
+                    # Floor the sleep so tuning the constants to zero cannot turn
+                    # the retry loop into a hot spin.
+                    await asyncio.sleep(max(0.01, wait))
+        finally:
+            if retrying:
+                left = self._swap_waiting.get(model_id, 0) - 1
+                if left > 0:
+                    self._swap_waiting[model_id] = left
+                else:
+                    self._swap_waiting.pop(model_id, None)
+
+    @property
+    def swap_waiting(self) -> int:
+        """Requests parked in the admission retry loop, across all models."""
+        return sum(self._swap_waiting.values())
 
     async def _admission_retry_worthwhile(
         self, model_id: str, deadline: float, busy_deadline: float
@@ -5138,6 +5158,7 @@ class EnginePool:
             ),
             "load_seconds_per_gb_estimate": self._load_seconds_per_gb_ema,
             "load_time_observations": self._load_time_observations,
+            "swap_waiting": self.swap_waiting,
             "models": models,
         }
 

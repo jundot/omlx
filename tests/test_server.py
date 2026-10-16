@@ -1497,6 +1497,24 @@ class TestHealthPreloadReadiness:
             server_mod._server_state.pinned_preload_complete = old
 
 
+class TestHealthSwapWaiting:
+    @pytest.mark.asyncio
+    async def test_health_engine_pool_reports_swap_waiting(self):
+        from fastapi import Response
+
+        from omlx import server as server_mod
+
+        state = server_mod._server_state
+        old = (state.engine_pool, state.pinned_preload_complete)
+        try:
+            state.engine_pool = MagicMock(swap_waiting=3)
+            state.pinned_preload_complete = True
+            body = await server_mod.health(Response())
+            assert body["engine_pool"]["swap_waiting"] == 3
+        finally:
+            state.engine_pool, state.pinned_preload_complete = old
+
+
 @pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(
     "model_type, template_default, kwargs, forced, expected",

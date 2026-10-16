@@ -2913,6 +2913,61 @@ class TestCrossModelAdmissionRetry:
         assert len(sweeps) >= 2
 
     @pytest.mark.asyncio
+    async def test_parked_request_counts_in_swap_waiting(self, retry_pool):
+        """A request parked in admission retry has no engine yet. It must
+        show in get_status()["swap_waiting"] until it is admitted."""
+        pool = retry_pool
+        engine_a = self._mock_engine()
+        engine_b = self._mock_engine()
+        seen: list[int] = []
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return engine_a if "model-a" in name else engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            await pool.get_engine("model-b", _lease=True)
+            assert pool.get_status()["swap_waiting"] == 0
+
+            async def drain_competing_lease():
+                await asyncio.sleep(0.05)
+                seen.append(pool.get_status()["swap_waiting"])
+                await pool.release_engine("model-b")
+
+            drainer = asyncio.create_task(drain_competing_lease())
+            await asyncio.wait_for(pool.get_engine("model-a", _lease=True), timeout=5.0)
+            await drainer
+            await pool.release_engine("model-a")
+
+        assert seen == [1]
+        assert pool.get_status()["swap_waiting"] == 0
+
+    @pytest.mark.asyncio
+    async def test_swap_waiting_released_when_retry_gives_up(
+        self, retry_pool, monkeypatch
+    ):
+        """The count drops back to 0 when the retry deadline raises."""
+        pool = retry_pool
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 0.2)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
+        engine_a = self._mock_engine()
+        engine_b = self._mock_engine()
+
+        def create_engine(*args, **kwargs):
+            name = str(kwargs.get("model_name", args[0] if args else ""))
+            return engine_a if "model-a" in name else engine_b
+
+        with patch("omlx.engine_pool.BatchedEngine", side_effect=create_engine):
+            await pool.get_engine("model-a")
+            # The lease on model-b is never released, so model-a cannot load.
+            await pool.get_engine("model-b", _lease=True)
+            with pytest.raises(InsufficientMemoryError):
+                await pool.get_engine("model-a", _lease=True)
+
+        assert pool.get_status()["swap_waiting"] == 0
+
+    @pytest.mark.asyncio
     async def test_quiescent_pool_fails_fast_with_unchanged_message(self, retry_pool):
         """Nothing loading, unloading, or serving means nothing can free the
         memory on its own: fail at once, with the exact pre-existing message."""
