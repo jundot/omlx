@@ -50,6 +50,16 @@ Cluster process-group tests use the `mock_cluster_ssh` fixture; remote teardown 
 
 # Cache cleanup logging tests
 
+## Hot-cache promotion materialization
+
+Run `python -m pytest -q tests/test_batched_hot_promotion.py tests/test_hot_cache.py tests/test_paged_ssd_cache.py`
+to check single-block batched materialization before hot-cache buffer copies,
+exact dtype/shape/byte preservation (including BF16 special values), cold SSD
+load integration, and failed-promotion accounting. Benchmark cold disk restores
+separately from later hot hits; keep hot-tier size and cache state equal, and
+report CPU time as well as completed wall time. This does not change precision
+or the native file loader.
+
 Run `python -m pytest -q tests/test_vision_feature_cache.py tests/test_paged_ssd_cache.py -k "cleanup_unlink_failure or corrupt_block_cleanup_logging"` to check failed-delete warnings and cache cleanup state. These cases use the existing cache fixtures to close writer threads.
 
 # Cache-preserving engine teardown tests
