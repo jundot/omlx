@@ -2983,17 +2983,17 @@ async def _with_sse_keepalive(
                     return
                 yield result
     finally:
-        if task is not None and not task.done():
-            task.cancel()
-            # Starlette's cancelled response scope would cancel the task again
-            # and cut its cleanup short, e.g. closing an upstream connection.
-            with anyio.CancelScope(shield=True):
+        # Starlette's cancelled response scope would cancel this cleanup again
+        # and cut it short, e.g. closing an upstream connection.
+        with anyio.CancelScope(shield=True):
+            if task is not None and not task.done():
+                task.cancel()
                 try:
                     await task
                 except (asyncio.CancelledError, StopAsyncIteration):
                     pass
-        if hasattr(ait, "aclose"):
-            await ait.aclose()
+            if hasattr(ait, "aclose"):
+                await ait.aclose()
 
 
 async def _run_with_disconnect_guard(

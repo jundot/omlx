@@ -150,11 +150,13 @@ class TestSSEKeepaliveExceptionHandling:
 async def test_cancelled_response_scope_lets_upstream_cleanup_finish(wrapper):
     """Starlette cancels the response scope on disconnect; cleanup must finish."""
     cleaned = asyncio.Event()
+    produced = asyncio.Event()
 
     async def gen():
         try:
             while True:
                 await asyncio.sleep(0.01)
+                produced.set()
                 yield "data: token\n\n"
         finally:
             await asyncio.sleep(0.01)  # e.g. closing the upstream connection
@@ -171,7 +173,8 @@ async def test_cancelled_response_scope_lets_upstream_cleanup_finish(wrapper):
 
     async with anyio.create_task_group() as task_group:
         task_group.start_soon(_collect, body)
-        await asyncio.sleep(0.05)
+        # Cancel after the upstream yields but before the wrapper resumes.
+        await produced.wait()
         task_group.cancel_scope.cancel()
 
     assert cleaned.is_set()
