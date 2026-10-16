@@ -4162,6 +4162,107 @@ class TestStreamingHelperFunctions:
         assert completed["output"][1]["type"] == "message"
         assert completed["usage"]["output_tokens_details"]["reasoning_tokens"] > 0
 
+    @pytest.mark.asyncio
+    async def test_stream_responses_api_closed_thought_block_streams_as_content(
+        self,
+    ):
+        """Gemma 4 with thinking off: an already-closed thought block in the
+        prompt must not start the parser in thinking, even when the template
+        advertises preserve_thinking (native_reasoning=True)."""
+        from omlx.api.responses_models import ResponsesRequest
+        from omlx.server import stream_responses_api
+
+        class GemmaThinkingOffTokenizer(MockTokenizer):
+            think_start = "<|channel>"
+            think_end = "<channel|>"
+            think_start_id = 100
+            think_end_id = 101
+            unk_token_id = -1
+
+            def convert_tokens_to_ids(self, token: str):
+                if token == self.think_start:
+                    return self.think_start_id
+                if token == self.think_end:
+                    return self.think_end_id
+                return self.unk_token_id
+
+            def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+                if text.endswith("<|channel>thought\n<channel|>"):
+                    return [2, 105, 7, self.think_start_id, 8, self.think_end_id]
+                return [2, 105, 7]
+
+            def apply_chat_template(
+                self, messages: list[dict], tokenize: bool = False, **kwargs
+            ) -> str:
+                assert kwargs.get("enable_thinking") is False
+                return (
+                    "<|turn>user\nHi<turn|>\n"
+                    "<|turn>model\n<|channel>thought\n<channel|>"
+                )
+
+        engine = MockBaseEngine()
+        engine._tokenizer = GemmaThinkingOffTokenizer()
+        engine.set_stream_outputs(
+            [
+                MockGenerationOutput(
+                    text="The sky is",
+                    new_text="The sky is",
+                    completion_tokens=1,
+                    finished=False,
+                ),
+                MockGenerationOutput(
+                    text="The sky is blue.",
+                    new_text=" blue.",
+                    completion_tokens=2,
+                    finished=True,
+                    finish_reason="stop",
+                ),
+            ]
+        )
+
+        request = ResponsesRequest(model="test-model", input="Hi", stream=True)
+
+        events = [
+            event
+            async for event in stream_responses_api(
+                engine,
+                [{"role": "user", "content": "Hi"}],
+                request,
+                store_response=False,
+                native_reasoning=True,
+                max_tokens=256,
+                chat_template_kwargs={"enable_thinking": False},
+            )
+        ]
+
+        parsed_events = []
+        for event in events:
+            for line in event.splitlines():
+                if line.startswith("data: "):
+                    parsed_events.append(json.loads(line[6:]))
+
+        reasoning_text = "".join(
+            event.get("delta", "")
+            for event in parsed_events
+            if event.get("type") == "response.reasoning_summary_text.delta"
+        )
+        content_deltas = [
+            event.get("delta", "")
+            for event in parsed_events
+            if event.get("type") == "response.output_text.delta"
+        ]
+        completed = next(
+            event["response"]
+            for event in parsed_events
+            if event.get("type") == "response.completed"
+        )
+
+        assert reasoning_text == ""
+        # Streamed as it is generated, not recovered in one delta at the end.
+        assert len(content_deltas) >= 2
+        assert "".join(content_deltas) == "The sky is blue."
+        assert [item["type"] for item in completed["output"]] == ["message"]
+
 
 class TestStreamingEdgeCases:
     """Tests for edge cases in streaming responses."""
