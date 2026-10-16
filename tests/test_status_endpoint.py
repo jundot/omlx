@@ -105,9 +105,11 @@ class TestStatusEndpoint:
         """Health should stay healthy when optional memory telemetry fails."""
         pool = MagicMock(spec=[
             "model_count", "loaded_model_count", "current_model_memory",
+            "swap_waiting",
         ])
         pool.model_count = 1
         pool.loaded_model_count = 1
+        pool.swap_waiting = 0
         pool.current_model_memory = 16 * 1024**3
         enforcer = MagicMock(spec=["get_final_ceiling"])
         enforcer.get_final_ceiling.side_effect = RuntimeError(

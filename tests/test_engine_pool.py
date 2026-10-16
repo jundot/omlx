@@ -847,6 +847,58 @@ class TestQwenCpuShareMemoryEstimate:
             sum("Qwen4-Exp PLE forced" in r.getMessage() for r in caplog.records) == 2
         )
 
+    def test_forced_offload_warning_dedup_is_scoped_per_caller(
+        self, tmp_path, caplog
+    ):
+        """Admission (live ceiling) and residency (stable ceiling) can disagree.
+        Each scope warns once per real change, not once per retry pass."""
+        model = tmp_path / "qwen4"
+        model.mkdir()
+        entry = EngineEntry(
+            model_id="qwen4",
+            model_path=str(model),
+            model_type="llm",
+            engine_type="batched",
+            config_model_type="qwen4_exp",
+            estimated_size=400,
+        )
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool._entries[entry.model_id] = entry
+
+        def count():
+            return sum("Qwen4-Exp PLE forced" in r.getMessage() for r in caplog.records)
+
+        with (
+            patch(
+                "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+                "qwen4_exp_residency_estimate",
+                return_value=estimate,
+            ),
+            caplog.at_level(logging.WARNING, logger="omlx.engine_pool"),
+        ):
+            # Admission sees a small live ceiling (forced), residency a big one.
+            for _ in range(5):
+                pool._qwen4_ple_offload_status(
+                    entry, None, ceiling=500, log_scope="admission"
+                )
+                pool._qwen4_ple_offload_status(entry, None, ceiling=10**6)
+            assert count() == 1
+            # Admission state really changes: not forced, then forced again.
+            pool._qwen4_ple_offload_status(
+                entry, None, ceiling=10**6, log_scope="admission"
+            )
+            pool._qwen4_ple_offload_status(
+                entry, None, ceiling=500, log_scope="admission"
+            )
+            assert count() == 2
+
     def test_glm5_next_offload_admission_threads_mtp_resident(self, tmp_path):
         # glm5_next Lightning MTP + expert offload: the admission estimate
         # must be told the draft head stays resident, or it discounts the

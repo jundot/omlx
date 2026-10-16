@@ -327,6 +327,10 @@ class MockEnginePool:
         return sum(1 for m in self._models if m["loaded"])
 
     @property
+    def swap_waiting(self) -> int:
+        return 0
+
+    @property
     def max_model_memory(self) -> int:
         return 32 * 1024 * 1024 * 1024  # 32GB
 
