@@ -417,6 +417,73 @@ class TestStreamChatCompletion:
         finally:
             await client.aclose()
 
+    @pytest.mark.parametrize(
+        "prefix",
+        [[], [_content_chunk("partial")], [_content_chunk("partial"), _usage_chunk()]],
+        ids=["before-content", "after-content", "after-usage"],
+    )
+    async def test_stream_error_preserves_provider_detail(self, prefix):
+        def handler(request):
+            return httpx.Response(
+                200,
+                content=_sse_body(
+                    [
+                        *prefix,
+                        {
+                            "error": {
+                                "message": "prefill memory exceeded",
+                                "type": "server_error",
+                            }
+                        },
+                    ]
+                ),
+            )
+
+        client = _client(handler)
+        try:
+            with pytest.raises(
+                ExternalEndpointError, match="prefill memory exceeded"
+            ) as exc_info:
+                await client.stream_chat_completion(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=8,
+                    temperature=0.0,
+                )
+        finally:
+            await client.aclose()
+        assert exc_info.value.status == "stream_error"
+        assert "stream usage" not in str(exc_info.value)
+
+    async def test_stream_error_redacts_and_bounds_provider_detail(self):
+        def handler(request):
+            return httpx.Response(
+                200,
+                content=_sse_body(
+                    [
+                        {
+                            "error": {
+                                "message": f"provider echoed {API_KEY} " + "x" * 500
+                            }
+                        },
+                    ]
+                ),
+            )
+
+        client = _client(handler)
+        try:
+            with pytest.raises(ExternalEndpointError) as exc_info:
+                await client.stream_chat_completion(
+                    messages=[{"role": "user", "content": "hi"}],
+                    max_tokens=8,
+                    temperature=0.0,
+                )
+        finally:
+            await client.aclose()
+        message = str(exc_info.value)
+        assert API_KEY not in message
+        assert "[REDACTED]" in message
+        assert len(message) < 400
+
     async def test_connect_error_mapped(self):
         def handler(request):
             raise httpx.ConnectError("connection refused", request=request)
