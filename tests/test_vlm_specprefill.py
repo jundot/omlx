@@ -195,3 +195,123 @@ class TestVLMEngineSpecPrefillForwarding:
 
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert "specprefill_system_end" not in call_kwargs
+
+
+class _FakeCacheLayer:
+    def __init__(self, offset=0):
+        self.offset = offset
+
+    @property
+    def state(self):
+        import mlx.core as mx
+
+        return mx.zeros((1, 1))
+
+
+class _NoRopeVLM:
+    """mlx_vlm Qwen3.5 shape: ``rotary_emb`` instead of ``.rope``."""
+
+    def __init__(self):
+        self.layers = [SimpleNamespace(self_attn=SimpleNamespace(rotary_emb=object()))]
+        self.seen = []
+
+    def position_ids_for_absolute(self, positions):
+        return positions.reshape(1, -1)
+
+    def __call__(self, input_ids, cache=None, position_ids=None):
+        import mlx.core as mx
+
+        length = input_ids.shape[1]
+        if position_ids is None:
+            # mlx_vlm's fallback: a contiguous run from the cache offset.
+            start = cache[0].offset
+            position_ids = mx.arange(start, start + length).reshape(1, -1)
+        self.seen.extend(position_ids.reshape(-1).tolist())
+        for layer in cache:
+            layer.offset += length
+        return mx.zeros((1, length, 8))
+
+
+_SELECTED = [0, 5, 6, 17, 40, 41, 99]
+
+
+@pytest.mark.parametrize("offset", [0, 12288])
+def test_sparse_prefill_keeps_selected_positions_without_rope(offset):
+    import mlx.core as mx
+
+    from omlx.patches.specprefill import sparse_prefill
+
+    model = _NoRopeVLM()
+    cache = [_FakeCacheLayer(offset)]
+    sparse_prefill(
+        model,
+        mx.arange(120),
+        mx.array(_SELECTED),
+        cache,
+        step_size=4,
+        position_offset=offset,
+    )
+
+    assert model.seen == [index + offset for index in _SELECTED]
+    assert model._specprefill_decode_adjustment == 120 - len(_SELECTED)
+
+
+def test_adapter_passes_explicit_position_ids_through():
+    import mlx.core as mx
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    language_model = MagicMock()
+    language_model.return_value = SimpleNamespace(logits=mx.zeros((1, 3, 8)))
+    adapter = VLMModelAdapter(MagicMock(language_model=language_model))
+    adapter._uses_mrope = True
+    adapter._batch_rope_deltas = mx.array([0.0])
+
+    supplied = adapter.position_ids_for_absolute(mx.array([3, 9, 40]))
+    assert supplied.shape == (3, 1, 3)
+    adapter(mx.array([[1, 2, 3]]), cache=[_FakeCacheLayer(512)], position_ids=supplied)
+
+    assert mx.array_equal(language_model.call_args.kwargs["position_ids"], supplied)
+
+
+def test_sparse_prefill_rope_models_keep_the_wrapper_path():
+    import mlx.core as mx
+
+    from omlx.patches.specprefill import _PositionMappedRoPE, sparse_prefill
+
+    class _Rope:
+        dims = 8
+        base = 10000.0
+        scale = 1.0
+
+        def __call__(self, x, offset=0):
+            return x
+
+    seen = []
+
+    class _RopeModel:
+        def __init__(self):
+            self.layers = [SimpleNamespace(self_attn=SimpleNamespace(rope=_Rope()))]
+
+        def position_ids_for_absolute(self, positions):
+            return positions.reshape(1, -1)
+
+        def __call__(self, input_ids, cache=None, **kwargs):
+            assert isinstance(self.layers[0].self_attn.rope, _PositionMappedRoPE)
+            seen.append(kwargs)
+            for layer in cache:
+                layer.offset += input_ids.shape[1]
+            return mx.zeros((1, input_ids.shape[1], 8))
+
+    model = _RopeModel()
+    sparse_prefill(
+        model,
+        mx.arange(120),
+        mx.array(_SELECTED),
+        [_FakeCacheLayer()],
+        step_size=4,
+        position_offset=0,
+    )
+
+    assert seen and all(kwargs == {} for kwargs in seen)
+    assert model._specprefill_decode_adjustment is None

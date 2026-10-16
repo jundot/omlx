@@ -220,6 +220,16 @@ def run_specprefill_target_prefill(
             ):
                 attention_module.rope._adjustment -= 1
 
+        # Models without a rope wrapper decode from cache offset + rope_deltas,
+        # so the adjustment (less the kickoff token) goes on the request.
+        decode_adjustment = getattr(
+            target_model, "_specprefill_decode_adjustment", None
+        )
+        if decode_adjustment is not None and hasattr(
+            target_model, "register_rope_delta"
+        ):
+            request.rope_deltas = float(int(decode_adjustment) - 1)
+
         selected_token_count = int(selected.shape[0])
         prefill_seconds = time.monotonic() - prefill_started_at
         system_cache_summary = (

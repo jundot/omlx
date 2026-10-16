@@ -1043,6 +1043,23 @@ def sparse_prefill(
     first_attn = _get_attn_module(attn_layers[0][1])
     has_rope = hasattr(first_attn, "rope")
 
+    # mlx_vlm mRoPE models (Qwen3.5) rotate from position_ids and have no
+    # ``.rope`` to wrap. Without explicit positions they fall back to the cache
+    # offset and write the selected tokens at dense positions.
+    shape_positions = getattr(model, "position_ids_for_absolute", None)
+    explicit_positions = not has_rope and callable(shape_positions)
+    supplied_positions = False
+
+    def _position_kwargs(start: int, length: int) -> dict:
+        nonlocal supplied_positions
+        if not explicit_positions:
+            return {}
+        positions = shape_positions(selected_positions[start : start + length])
+        if positions is None:
+            return {}
+        supplied_positions = True
+        return {"position_ids": positions}
+
     # Patch RoPE for position-mapped prefill
     original_ropes = {}
     if has_rope:
@@ -1069,7 +1086,11 @@ def sparse_prefill(
                 # target-model eval returns, but don't advance completed-token
                 # progress until the eval has actually finished.
                 progress_callback(processed, n)
-            model(prompt[processed : processed + chunk][None], cache=cache)
+            model(
+                prompt[processed : processed + chunk][None],
+                cache=cache,
+                **_position_kwargs(processed, chunk),
+            )
             mx.eval([c.state for c in cache])
             processed += chunk
             if progress_callback is not None:
@@ -1077,17 +1098,26 @@ def sparse_prefill(
             mx.clear_cache()
 
         # Last token -> logits
-        logits = model(prompt[processed:][None], cache=cache)
+        logits = model(
+            prompt[processed:][None],
+            cache=cache,
+            **_position_kwargs(processed, n - processed),
+        )
         mx.eval(logits)
         if progress_callback is not None:
             progress_callback(n, n)
 
     finally:
         # Replace position-mapped RoPE with offset-adjusted RoPE for decode
+        total_prompt_len = position_offset + M
+        final_cache_offset = cache_start + N
+        adjustment = int(total_prompt_len) - int(final_cache_offset)
+        # Without a rope wrapper to carry it, leave the decode adjustment for
+        # the caller to put on the request.
+        model._specprefill_decode_adjustment = (
+            adjustment if supplied_positions else None
+        )
         if has_rope:
-            total_prompt_len = position_offset + M
-            final_cache_offset = cache_start + N
-            adjustment = int(total_prompt_len) - int(final_cache_offset)
             for layer_idx, layer in attn_layers:
                 attn = _get_attn_module(layer)
                 original = original_ropes[layer_idx]
@@ -1105,6 +1135,7 @@ def cleanup_rope(model):
     Call after generation to remove _OffsetAdjustedRoPE wrappers.
     No-op for architectures without RoPE (e.g. Nemotron-H).
     """
+    model._specprefill_decode_adjustment = None
     for _, layer in _find_attention_layers(model):
         attn = _get_attn_module(layer)
         if attn is None or not hasattr(attn, "rope"):
