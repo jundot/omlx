@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from omlx_web.routes import _load_locale
+
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -166,7 +168,7 @@ def test_lazy_chat_creation_preserves_preconfigured_draft():
 
 def test_new_chat_strings_exist_in_every_locale():
     for locale_path in I18N_DIR.glob("*.json"):
-        translations = json.loads(locale_path.read_text())
+        translations = _load_locale(locale_path.stem)
         missing = NEW_I18N_KEYS - translations.keys()
         assert not missing, f"{locale_path.name} is missing {sorted(missing)}"
         assert "{max}" in translations["chat.error.image_too_large"]

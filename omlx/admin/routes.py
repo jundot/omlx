@@ -783,6 +783,9 @@ class GlobalSettingsRequest(BaseModel):
     skip_api_key_verification: bool | None = None
     allow_unauthenticated_inference: bool | None = None
 
+    # Cluster settings
+    cluster_auto_evict_competing_local_models: bool | None = None
+
     @field_validator("idle_timeout_seconds", mode="before")
     @classmethod
     def _normalize_idle_timeout(cls, v):
@@ -1093,11 +1096,16 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.vlm_mtp_draft_block_size = None
 
 
-def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
+def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str, bool]:
     """Mirror of ``_dflash_compat_for_model`` for the native MTP toggle.
 
-    Returns ``(compatible, reason)``. Reason is empty on success and
-    suitable for surfacing to users (admin UI shows it under the toggle).
+    Returns ``(compatible, reason, mtplx_sidecar_available)``. Reason is
+    empty on success and suitable for surfacing to users (admin UI shows
+    it under the toggle). ``mtplx_sidecar_available`` is a structured
+    signal for whether the one-click MTPLX side-car import button should
+    show — the UI used to pattern-match the reason string for "MTPLX
+    side-car", which broke if this text ever changed and threw outright
+    when no model was selected (reason undefined).
 
     The check is conservative: even when the config declares MTP layers
     we also peek at the safetensors weight index to verify that the
@@ -1119,21 +1127,21 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
 
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
     if is_paro:
-        return False, paro_reason
+        return False, paro_reason, False
 
     model_path = model_info.get("model_path") or ""
     if not model_path:
-        return False, "model_path missing"
+        return False, "model_path missing", False
     cfg_path = Path(model_path) / "config.json"
     if not cfg_path.exists():
-        return False, "config.json not found"
+        return False, "config.json not found", False
     try:
         cfg = json.loads(cfg_path.read_text())
     except Exception as e:
-        return False, f"failed to read config: {e}"
+        return False, f"failed to read config: {e}", False
     model_type = cfg.get("model_type")
     if not _has_mtp_heads(cfg):
-        return False, "model has no MTP heads in config"
+        return False, "model has no MTP heads in config", False
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
     # the dedicated VLM path in omlx.utils.model_loading (vendored mlx-vlm
     # qwen4_exp model + mlx_lm_mtp dispatch patch) and never goes through the
@@ -1146,28 +1154,26 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
             f"model_type={model_type!r} is not on the MTP whitelist "
             "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
             "gemma4, gemma4_unified)"
-        )
+        ), False
     if not _checkpoint_has_mtp_weights(model_path):
         from ..oq import _resolve_mtplx_sidecar
 
         if _resolve_mtplx_sidecar(Path(model_path), cfg) is not None:
-            # The dashboard keys the one-click import button off this
-            # "MTPLX side-car" marker (models.js).
             return False, (
                 "MTPLX side-car detected but not imported. Import it to "
                 "merge the MTP head into the checkpoint index."
-            )
+            ), True
         if model_type == "qwen4_exp":
             return False, (
                 "Qwen4-Exp Lightning MTP requires embedded mtp.* tensors; "
                 "native nextn layers are not supported by its dedicated runtime."
-            )
+            ), False
         return False, (
             "Config declares MTP layers but the weight files contain neither "
             "mtp.* tensors nor native nextn layers. Re-convert from HF with a "
             "converter that preserves MTP weights."
-        )
-    return True, ""
+        ), False
+    return True, "", False
 
 
 def _apply_log_level_runtime(level: str) -> None:
@@ -2350,7 +2356,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
 
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
-        mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        mtp_compat_ok, mtp_compat_reason, mtplx_sidecar_available = _mtp_compat_for_model(model_info)
         external_engines = _external_engines_for_model(
             engine_pool, model_info, settings
         )
@@ -2492,6 +2498,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
             "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
+            "mtplx_sidecar_available": mtplx_sidecar_available,
             "deepseek_v41_engram_ssd_offload_supported": deepseek_v41_engram_ssd_offload_supported,
             "deepseek_v41_engram_ssd_offload_forced": deepseek_v41_engram_ssd_offload_forced,
             "deepseek_v41_engram_resident_bytes": v41_resident_bytes,
@@ -2543,6 +2550,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "dflash_compatibility_reason": "",
                 "mtp_compatible": False,
                 "mtp_compatibility_reason": "",
+                "mtplx_sidecar_available": False,
                 "is_paroquant": False,
                 "paroquant_reason": "",
                 "virtual": True,
@@ -3858,7 +3866,7 @@ def _feature_problem(
             return problem
         return _vlm_mtp_recipe_problem(entry, snapshot["vlm_mtp_draft_model"])
     if name == "mtp":
-        ok, reason = _mtp_compat_for_model(info)
+        ok, reason, _mtplx_sidecar_available = _mtp_compat_for_model(info)
         if not ok:
             return reason or "Lightning MTP is not available for this model"
         for key in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
@@ -4682,6 +4690,11 @@ def _global_settings_response(global_settings):
         },
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
+        },
+        "cluster": {
+            "auto_evict_competing_local_models": (
+                global_settings.cluster.auto_evict_competing_local_models
+            ),
         },
     }
 
@@ -5738,6 +5751,14 @@ async def update_global_settings(
             logger.info(f"Idle timeout set to: {request.idle_timeout_seconds}s")
         else:
             logger.info("Idle timeout disabled")
+
+    # Apply cluster settings (Live — read fresh on the next activation attempt,
+    # nothing to restart).
+    if request.cluster_auto_evict_competing_local_models is not None:
+        global_settings.cluster.auto_evict_competing_local_models = (
+            request.cluster_auto_evict_competing_local_models
+        )
+        runtime_applied.append("cluster_auto_evict_competing_local_models")
 
     # Apply auth settings (API key change)
     if request.api_key is not None:

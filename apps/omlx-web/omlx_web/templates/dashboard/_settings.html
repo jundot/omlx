@@ -791,7 +791,7 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.generation.max_context_window_policy') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.generation.max_context_window_policy_hint') }}</p>
                                     </div>
-                                    <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="None"
+                                    <input type="number" x-model.number="globalSettings.sampling.max_context_window_policy" min="1" max="2097152" placeholder="{{ t('settings.generation.no_limit_placeholder') }}"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
@@ -1956,10 +1956,11 @@
                                             <template x-if="!model.virtual">
                                                 <button
                                                     @click="openModelSettings(model)"
-                                                    class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
+                                                    :disabled="modelSettingsLoadingId === model.id"
+                                                    class="p-2 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                                                     :title="window.t('settings.models.table.sampling_settings_tooltip')"
                                                 >
-                                                    <i data-lucide="settings" class="w-4 h-4"></i>
+                                                    <i data-lucide="settings" class="w-4 h-4" :class="modelSettingsLoadingId === model.id && 'animate-spin'"></i>
                                                 </button>
                                             </template>
                                             <template x-if="model.virtual">
