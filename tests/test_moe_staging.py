@@ -31,7 +31,7 @@ def native():
 @pytest.fixture(autouse=True)
 def fresh_pool(monkeypatch):
     offload._shutdown_io_pool()
-    monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", "12")
+    monkeypatch.setattr(offload, "_IO_WORKERS", 12)
     monkeypatch.delenv("OMLX_MOE_OFFLOAD_STAGING", raising=False)
     yield
     offload._shutdown_io_pool()
@@ -146,7 +146,7 @@ def test_transport_bits_zero_copy_and_lazy_lifetime(tmp_path, native, tag):
 def test_exact_output_cache_installs_and_nine_reads(
     tmp_path, native, monkeypatch, buffers, workers
 ):
-    monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", str(workers))
+    monkeypatch.setattr(offload, "_IO_WORKERS", workers)
     glu = _make_glu(34)
     mx.random.seed(37)
     steps = [

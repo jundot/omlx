@@ -41,13 +41,14 @@ main_tok) pair is folded by :func:`take_primed` at activation instead.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, List, Optional
+
+from ...prefill.packed import PackedBatch, packed_batch_of
 
 logger = logging.getLogger(__name__)
 
@@ -63,31 +64,6 @@ _CTX_ATTR = "_omlx_mtp_prime_ctx"
 _PLAN_ATTR = "_omlx_mtp_prime_plan"
 
 _SUPPRESS = threading.local()
-
-
-def priming_enabled() -> bool:
-    """Prompt priming is on by default for MTP-enabled models."""
-    return os.environ.get("OMLX_MTP_PROMPT_PRIMING", "1").strip().lower() not in (
-        "0",
-        "false",
-        "off",
-    )
-
-
-def prime_window() -> int:
-    """Max tokens to fold into one prime context; 0 = unlimited.
-
-    Escape hatch for the head-cache memory cost of priming (one
-    full-attention layer of KV over the folded span). The cap is measured
-    against the span actually folded this request — with a warm prefix cache
-    that is only the boundary remainder, not the full prompt — so a
-    long-context request with a small remainder still primes. A remainder
-    larger than the window runs unprimed.
-    """
-    try:
-        return max(0, int(os.environ.get("OMLX_MTP_PRIME_WINDOW", "0")))
-    except ValueError:
-        return 0
 
 
 @contextmanager
@@ -118,17 +94,13 @@ class _PrimeCtx:
     # capture requires offset_now - S == expected_offset (contiguity).
     expected_offset: int = 0
     valid: bool = True
-    # The current contiguous timeline exceeded OMLX_MTP_PRIME_WINDOW. Keep a
-    # lightweight marker so later small chunks cannot restart priming.
-    window_exceeded: bool = False
-    # Absolute MTP history is ``folded``; this counter is only the work folded
-    # by the current request.  A warm prefix restore starts at a nonzero
-    # absolute history but must still apply OMLX_MTP_PRIME_WINDOW to the small
-    # uncached suffix, preserving the option's documented meaning.
-    folded_this_request: int = 0
     # Committed pairs collected during ordinary decoding. None means
     # ordinary prompt priming; a list resumes an already active head.
     deferred_pairs: Optional[List[Any]] = None
+    # The pairs are deferred only to batch the prompt priming's decode folds
+    # (``_defer_decode_history``): a broken timeline drops the history, as
+    # an eager fold would, instead of failing a resumed head's handoff.
+    decode_deferred: bool = False
     # Request/prefix-cache metadata used to publish and restore one exact
     # MTP boundary snapshot. The cache itself remains generic and
     # treats the snapshot as an opaque sidecar.
@@ -170,6 +142,8 @@ class _MtpBoundaryCandidate:
 
     boundary_tokens: int
     pending_hidden: Any
+    # Head copy at C-1, kept only for pooled heads.
+    mtp_cache: list[Any] | None = None
 
 
 def _read_offset(entry: Any) -> Optional[int]:
@@ -309,10 +283,12 @@ def drop_ctx(model: Any) -> None:
 def _host_eligible(host: Any) -> bool:
     get_mtp = getattr(host, "get_mtp_module", None)
     mtp = get_mtp() if callable(get_mtp) else getattr(host, "mtp", None)
+    # An attached block drafter replaces the head, which then never drafts.
     return (
         getattr(host, "_omlx_mtp_decode_enabled", False) is True
         and getattr(host, "_omlx_mtp_chain", False) is True
         and mtp is not None
+        and getattr(host, "_omlx_drafter", None) is None
     )
 
 
@@ -355,6 +331,20 @@ def _flat_cache_entries(cache: List[Any]):
             yield from subs
 
 
+def _pooled(entry: Any) -> bool:
+    """A PoolingCache-style entry: ``offset`` counts pooled rows."""
+    return all(
+        type(getattr(entry, attr, None)) is int
+        for attr in ("ratio", "remainder", "_pool_len")
+    )
+
+
+def _token_offset(entry: Any) -> int | None:
+    if _pooled(entry):
+        return entry._pool_len * entry.ratio + entry.remainder
+    return _read_offset(entry)
+
+
 def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
     """Return a detached, exactly trimmed MTP cache or fail closed."""
     if target < 0 or not cache:
@@ -362,7 +352,14 @@ def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
     cloned = _clone_mtp_cache(cache)
     saw_offset = False
     for entry in _flat_cache_entries(cloned):
-        current = _read_offset(entry)
+        if (
+            hasattr(entry, "ratio")
+            and hasattr(entry, "remainder")
+            and not _pooled(entry)
+        ):
+            # Batched/unknown pooled layout: no token position.
+            return None
+        current = _token_offset(entry)
         if current is None:
             continue
         saw_offset = True
@@ -373,7 +370,7 @@ def _cache_at_offset(cache: List[Any], target: int) -> Optional[List[Any]]:
             trim = getattr(entry, "trim", None)
             if not callable(trim) or int(trim(extra)) != extra:
                 return None
-        if _read_offset(entry) != target:
+        if _token_offset(entry) != target:
             return None
     return cloned if saw_offset else None
 
@@ -401,18 +398,15 @@ def capture_eligible(host: Any, cache: Optional[List[Any]]) -> bool:
     :func:`maybe_capture`; this exists purely to keep the ineligible path
     identical to stock.
     """
-    return (
-        not _suppressed()
-        and priming_enabled()
-        and cache is not None
-        and _host_eligible(host)
-    )
+    return not _suppressed() and cache is not None and _host_eligible(host)
 
 
 @dataclass
 class _OwnedPriming:
     requests: dict = field(default_factory=dict)
     uids: dict = field(default_factory=dict)
+    # Request selected by the last ``activate_request`` (DSpark capture).
+    active: Optional[str] = None
 
 
 _OWNED_ATTR = "_omlx_mtp_owned_priming"
@@ -422,7 +416,7 @@ _PREFILL_SCOPE = ContextVar("omlx_mtp_priming_prefill", default=None)
 
 def _owned(model, create=False):
     host = _eligible_host(model)
-    if host is None or getattr(host, "_omlx_dspark_decode_enabled", False):
+    if host is None:
         return None, None
     state = getattr(host, _OWNED_ATTR, None)
     if not isinstance(state, _OwnedPriming):
@@ -430,6 +424,12 @@ def _owned(model, create=False):
         if state is not None:
             setattr(host, _OWNED_ATTR, state)
     return host, state
+
+
+def _dspark(host):
+    """DSpark keeps its own context type in the slot; it shares the request and
+    UID transport but not generic capture or head-history retention."""
+    return bool(getattr(host, "_omlx_dspark_decode_enabled", False))
 
 
 def _slot(host):
@@ -450,6 +450,43 @@ def activate_request(model, request_id):
     host, state = _owned(model)
     if state is not None:
         _restore_slot(host, state.requests.get(request_id, (None, None)))
+        state.active = request_id
+
+
+def owned_capture(host, capture):
+    """Run a host-specific ``capture()`` on the context of its owner.
+
+    ``capture`` reads and writes the host slot (DSpark). Inside a generator
+    prefill or decode step of one row (the final prompt token is fed by the
+    first decode step) the row's UID record is swapped in and stored back;
+    otherwise the slot belongs to the request chosen by
+    :func:`activate_request`.
+    """
+    _, state = _owned(host)
+    if state is None:
+        capture()
+        return
+    uids = None
+    prefill, decode = _PREFILL_SCOPE.get(), _DECODE_SCOPE.get()
+    if prefill is not None and prefill["host"] is host:
+        uids = prefill["uids"]
+    elif decode is not None and decode[0] is host:
+        uids = decode[1]
+    if uids is not None and len(uids) == 1:
+        uid = uids[0]
+        record = state.uids.get(uid)
+        if record is not None:
+            previous = _slot(host)
+            try:
+                _restore_slot(host, record)
+                capture()
+                state.uids[uid] = _slot(host)
+            finally:
+                _restore_slot(host, previous)
+            return
+    capture()
+    if state.active in state.requests:
+        state.requests[state.active] = _slot(host)
 
 
 def bind_uid(model, request_id, uid):
@@ -462,8 +499,12 @@ def bind_uid(model, request_id, uid):
         if uid in state.uids:
             raise RuntimeError("Lightning MTP priming UID already owned")
         state.uids[uid] = record
+    if state.active == request_id:
+        state.active = None
     current = _find_plan(host)
-    if current is not None and current.request_id == request_id:
+    if (current is not None and current.request_id == request_id) or (
+        record is not None and record[0] is not None and _find_ctx(host) is record[0]
+    ):
         drop_ctx(host)
 
 
@@ -504,7 +545,7 @@ def prefill_scope(model, uids, tokens, cache):
     ):
         yield
         return
-    host, state = _owned(model, create=bool(tokens) and priming_enabled())
+    host, state = _owned(model, create=bool(tokens))
     if state is None or not tokens or len(uids) != len(tokens):
         yield
         return
@@ -542,9 +583,13 @@ def decode_scope(model, uids):
 
 
 def prepare_prefix_context(model, *, request_id, **kwargs):
-    host, state = _owned(model, create=priming_enabled())
+    host, state = _owned(model, create=True)
     if state is None:
         return _prepare_prefix_context(model, request_id=request_id, **kwargs)
+    if _dspark(host):
+        # Register only; another request's context may still occupy the slot.
+        state.requests.setdefault(request_id, (None, None))
+        return False
     activate_request(model, request_id)
     result = _prepare_prefix_context(model, request_id=request_id, **kwargs)
     record = _slot(host)
@@ -582,7 +627,7 @@ def _prepare_prefix_context(
         # request may still need it at activation; generic sidecar preparation
         # must neither interpret it nor replace it with a generic plan.
         return False
-    if host is None or not priming_enabled():
+    if host is None:
         drop_ctx(model)
         return False
 
@@ -728,11 +773,21 @@ def _capture_boundary_candidate(
     try:
         import mlx.core as mx
 
+        head = None
+        if any(_pooled(e) for e in _flat_cache_entries(ctx.mtp_cache)):
+            # A pooled head cannot rewind to C-1 after the seam, so copy it
+            # now or keep the previous candidate.
+            head = _cache_at_offset(ctx.mtp_cache, boundary - 1)
+            if head is None:
+                return
         candidate = _MtpBoundaryCandidate(
             boundary_tokens=boundary,
             pending_hidden=normed[:, row : row + 1] + 0,
+            mtp_cache=head,
         )
-        mx.async_eval(candidate.pending_hidden)
+        mx.async_eval(
+            [candidate.pending_hidden] if head is None else _snapshot_arrays(candidate)
+        )
     except Exception as exc:
         logger.debug("MTP prefix boundary capture failed closed: %s", exc)
         return
@@ -745,7 +800,9 @@ def _publish_boundary_candidate(ctx: _PrimeCtx) -> None:
     if not isinstance(candidate, _MtpBoundaryCandidate) or not callable(store):
         return
     try:
-        snapshot_cache = _cache_at_offset(ctx.mtp_cache, candidate.boundary_tokens - 1)
+        snapshot_cache = candidate.mtp_cache or _cache_at_offset(
+            ctx.mtp_cache, candidate.boundary_tokens - 1
+        )
         if snapshot_cache is None:
             return
         snapshot = _MtpPrefixSnapshot(
@@ -791,8 +848,32 @@ def _row_offsets(cache, size):
     return None
 
 
+def _capture_packed(host, inputs, normed, batch: PackedBatch) -> None:
+    """Fold each packed row into its own request's priming slot."""
+    _, state = _owned(host)
+    if state is None:
+        return
+    previous = _slot(host)
+    try:
+        for row, (start, end) in zip(batch.rows, batch.spans):
+            record = state.requests.get(row.request_id)
+            if record is None:
+                continue
+            _restore_slot(host, record)
+            _capture_single(host, inputs[:, start:end], normed[:, start:end], row.cache)
+            plan = _find_plan(host)
+            if plan is not None and plan.request_id in state.requests:
+                state.requests[plan.request_id] = _slot(host)
+    finally:
+        _restore_slot(host, previous)
+
+
 def maybe_capture(host, inputs, normed, cache):
-    if _suppressed() or not priming_enabled():
+    if _suppressed():
+        return
+    batch = packed_batch_of(cache)
+    if batch is not None:
+        _capture_packed(host, inputs, normed, batch)
         return
     _, state = _owned(host)
     prefill = _PREFILL_SCOPE.get()
@@ -836,6 +917,8 @@ def maybe_capture(host, inputs, normed, cache):
                 if not valid:
                     continue
                 _restore_slot(host, record)
+                if prefill is None:
+                    _defer_decode_history(host)
                 _capture_single(
                     host,
                     inputs[row : row + 1, :valid],
@@ -857,10 +940,8 @@ def maybe_capture(host, inputs, normed, cache):
 
 def retain_batch_head_history(batch, owner):
     """Keep committed head history at a drained handoff to ordinary decode."""
-    if not priming_enabled():
-        return
     host, registry = _owned(batch.model, create=True)
-    if registry is None:
+    if registry is None or _dspark(host):
         # Models with their own priming transport retain their existing path.
         logger.debug("MTP head history retention: model-owned priming transport")
         return
@@ -904,11 +985,9 @@ def retain_parked_head_history(model, uid, mtp_cache, folded, pending_hidden, ca
     ``pending_hidden`` is the head input of the token the park handoff just
     fed, so the next ordinary decode token continues the same timeline.
     """
-    if not priming_enabled():
-        return
     host, registry = _owned(model, create=True)
     anchor = _anchor(cache)
-    if registry is None or anchor is None or uid in registry.uids:
+    if registry is None or _dspark(host) or anchor is None or uid in registry.uids:
         return
     ctx = _PrimeCtx(
         mtp_cache=mtp_cache,
@@ -918,6 +997,31 @@ def retain_parked_head_history(model, uid, mtp_cache, folded, pending_hidden, ca
         deferred_pairs=[],
     )
     registry.uids[uid] = (ctx, None)
+
+
+# Deferred decode pairs fold once this many have collected, in one head
+# forward per row (bounds the held hidden rows: ~20 KB per token on Qwen4).
+_DEFERRED_FOLD_TOKENS = 256
+
+
+def _defer_decode_history(host):
+    """Collect a primed row's ordinary-decode pairs instead of folding them.
+
+    A batched ordinary decode step would otherwise run one MTP-head forward
+    per row per token (about 7% of an 8-row step on Qwen3.8-Flash-Next).
+    The pairs fold in chunks of ``_DEFERRED_FOLD_TOKENS`` and at activation,
+    through the same deferred-history path a parked batch uses; the head
+    history is the same sequence of committed pairs.
+    """
+    ctx = _find_ctx(host)
+    if (
+        isinstance(ctx, _PrimeCtx)
+        and ctx.deferred_pairs is None
+        and ctx.valid
+        and ctx.folded > 0
+    ):
+        ctx.deferred_pairs = []
+        ctx.decode_deferred = True
 
 
 def _capture_deferred_history(host, inputs, hidden, cache):
@@ -935,6 +1039,9 @@ def _capture_deferred_history(host, inputs, hidden, cache):
         or after is None
         or ctx.expected_offset != after - count
     ):
+        if ctx.decode_deferred:
+            drop_ctx(host)
+            return True
         raise RuntimeError("Deferred head history lost its request timeline")
     if ctx.pending_hidden is None:
         paired_hidden, paired_tokens = hidden[:, :-1], inputs[:, 1:]
@@ -945,6 +1052,8 @@ def _capture_deferred_history(host, inputs, hidden, cache):
         ctx.deferred_pairs.append((paired_hidden, paired_tokens))
     ctx.pending_hidden = hidden[:, -1:]
     ctx.expected_offset = after
+    if len(ctx.deferred_pairs) >= _DEFERRED_FOLD_TOKENS:
+        _flush_deferred_history(host, ctx)
     return True
 
 
@@ -979,7 +1088,6 @@ def _flush_deferred_history(model, ctx, chunk_size=512):
                 )
         mx.async_eval(values)
     ctx.folded += count
-    ctx.folded_this_request += count
     ctx.deferred_pairs = []
 
 
@@ -998,7 +1106,7 @@ def _capture_single(
     inputs_embeds) before calling; everything here re-checks what is
     load-bearing and bails silently, so a miss degrades to unprimed.
     """
-    if _suppressed() or not priming_enabled():
+    if _suppressed():
         return
     if cache is None or not _host_eligible(host):
         return
@@ -1035,26 +1143,6 @@ def _capture_single(
         if plan is not None:
             setattr(host, _PLAN_ATTR, plan)
         ctx = None
-    if ctx is not None and ctx.window_exceeded:
-        ctx.expected_offset = offset_after
-        return
-    window = prime_window()
-    if window:
-        # Cap by the primed span (the head-KV the window exists to bound),
-        # not the absolute prompt offset: on a warm prefix cache only the
-        # boundary remainder is ever folded, so a long-context request with a
-        # small remainder is exactly the cheap case priming is for (#2909).
-        folded = ctx.folded_this_request if ctx is not None else 0
-        if folded + seq_len > window:
-            setattr(
-                host,
-                _CTX_ATTR,
-                _PrimeCtx(
-                    expected_offset=offset_after,
-                    window_exceeded=True,
-                ),
-            )
-            return
     if ctx is None:
         if seq_len <= 1:
             # A lone decode step cannot start a prompt timeline.
@@ -1096,7 +1184,6 @@ def _capture_single(
     # on them, so the lm_head tail costs nothing.
     host.mtp_forward(pairs_hidden, pairs_tokens, ctx.mtp_cache, logits_keep=1)
     ctx.folded += int(pairs_tokens.shape[1])
-    ctx.folded_this_request += int(pairs_tokens.shape[1])
     ctx.pending_hidden = normed[:, -1:]
     ctx.expected_offset = offset_after
     _capture_boundary_candidate(
@@ -1132,7 +1219,7 @@ def take_primed(model, cache, main_tok, *, uid=None, cache_offset=None):
     if record is None:
         # Never consume another scheduler request's cursor at activation.
         ctx, plan = previous
-        if plan is not None or (ctx is not None and ctx.request_id is not None):
+        if plan is not None or getattr(ctx, "request_id", None) is not None:
             return None
         return _take_primed(model, cache, main_tok, cache_offset=cache_offset)
     try:
@@ -1182,12 +1269,12 @@ def _take_primed(
         return None
     drop_ctx(model)
     if not (ctx.valid and ctx.folded > 0 and ctx.pending_hidden is not None):
-        if ctx.deferred_pairs is not None:
+        if ctx.deferred_pairs is not None and not ctx.decode_deferred:
             raise RuntimeError("Deferred head history activation seam is invalid")
         return None
     offset = _activation_offset(cache) if cache_offset is None else cache_offset
     if offset is None or ctx.expected_offset != offset - 1:
-        if ctx.deferred_pairs is not None:
+        if ctx.deferred_pairs is not None and not ctx.decode_deferred:
             raise RuntimeError("Deferred head history activation seam is invalid")
         logger.debug(
             "MTP priming discarded: seam offset mismatch (ctx=%s cache=%s)",
@@ -1214,13 +1301,11 @@ def _take_primed(
 def prime_ctx_stats(model: Any) -> Optional[int]:
     """Folded pair count of a live context (introspection / tests)."""
     ctx = _find_ctx(model)
-    return ctx.folded if ctx is not None and not ctx.window_exceeded else None
+    return ctx.folded if ctx is not None else None
 
 
 __all__ = [
     "HEAD_HIDDEN_POST_NORM",
-    "priming_enabled",
-    "prime_window",
     "prepare_prefix_context",
     "capture_tail_boundary",
     "suppress_capture",

@@ -20,14 +20,12 @@ in-kernel; same math up to fp32 summation order), falling back to the stock
 ``gated_delta_update`` when the gate is not the fp32 safe-gate form.
 
 Eligibility is fail-closed (see ``glm53_kda_prefill_eligible``); anything
-unexpected runs the stock path. Kill switch:
-``OMLX_GLM53_KDA_PREFILL_FUSED=0``.
+unexpected runs the stock path.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 
 import mlx.core as mx
 
@@ -35,9 +33,6 @@ from .glm53_kda_recurrence import kda_recurrence
 
 logger = logging.getLogger(__name__)
 
-_GLM53_KDA_PREFILL_ENABLED = (
-    os.environ.get("OMLX_GLM53_KDA_PREFILL_FUSED", "1") != "0"
-)
 _GLM53_KDA_PREFILL_MIN_ROWS = 64
 
 _PREWORK_SOURCE = """
@@ -64,8 +59,8 @@ _PREWORK_SOURCE = """
             acc += float(xv) * float(conv_w[channel * 4 + tap]);
         }
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+        const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
         activated[i] = act;
         if (is_q || is_k) {
             const float f = float(act);
@@ -220,8 +215,7 @@ def kda_norm_gate_fused(y, gate, norm_w, eps, heads, dim):
 
 def glm53_kda_prefill_eligible(module, inputs, mask, cache) -> bool:
     if (
-        not _GLM53_KDA_PREFILL_ENABLED
-        or mask is not None
+        mask is not None
         or cache is None
         or not isinstance(inputs, mx.array)
         or inputs.ndim != 3

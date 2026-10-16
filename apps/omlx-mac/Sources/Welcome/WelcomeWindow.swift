@@ -381,13 +381,14 @@ final class WelcomeViewModel: ObservableObject {
     }
 
     /// Opens the admin dashboard after the setup step has started the server.
+    /// Signs in with the key set in the setup step, like the menubar item.
     @discardableResult
     func openWebDashboard() -> Bool {
         guard let services else { return false }
-        guard let url = AppConfig.httpURL(
+        guard let url = MenubarController.webAdminURL(
             host: services.config.host,
             port: services.config.port,
-            path: "/admin/dashboard"
+            apiKey: services.config.apiKey
         ) else {
             return false
         }

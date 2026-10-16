@@ -89,7 +89,7 @@ struct UsageHistoryView: View {
                         Row(label: row.modelId ?? "", sublabel: detail(row)) {
                             VStack(alignment: .trailing, spacing: 3) {
                                 Text(String(localized: "status.usage.row.tokens",
-                                            defaultValue: "\(compact(row.totalTokens)) tokens",
+                                            defaultValue: "\(CountFormat.compact(row.totalTokens)) tokens",
                                             comment: "Per-model total token count; placeholder is a compact number"))
                                 Text(String(localized: "status.usage.row.requests_speed",
                                             defaultValue: "\(row.requests) requests · \(speed(row.generationTps)) tok/s",
@@ -166,7 +166,7 @@ struct UsageHistoryView: View {
     private func tile(_ label: String, _ value: Int) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label).font(.omlxText(11)).foregroundStyle(.secondary)
-            Text(compact(value)).font(.omlxMono(20))
+            Text(CountFormat.compact(value)).font(.omlxMono(20))
         }
         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
         .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
@@ -219,17 +219,13 @@ struct UsageHistoryView: View {
                comment: "Tooltip and accessibility label for one heatmap cell; placeholders are the date, the two-digit hour, and a formatted token count")
     }
 
-    private func compact(_ count: Int) -> String {
-        count.formatted(.number.notation(.compactName).precision(.fractionLength(0...1)))
-    }
-
     private func speed(_ value: Double?) -> String {
         value.map { String(format: "%.1f", $0) } ?? "—"
     }
 
     private func detail(_ row: UsageHistoryDTO.UsageTotalsDTO) -> String {
         String(localized: "status.usage.row.detail",
-               defaultValue: "Prompt \(compact(row.promptTokens)) · output \(compact(row.completionTokens)) · cached \(compact(row.cachedTokens))",
+               defaultValue: "Prompt \(CountFormat.compact(row.promptTokens)) · output \(CountFormat.compact(row.completionTokens)) · cached \(CountFormat.compact(row.cachedTokens))",
                comment: "Per-model breakdown sublabel; placeholders are compact prompt, output, and cached token counts")
     }
 }

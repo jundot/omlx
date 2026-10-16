@@ -7,6 +7,7 @@ import socket
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import anyio
 import pytest
 from fastapi import HTTPException
 
@@ -142,6 +143,41 @@ class TestSSEKeepaliveExceptionHandling:
         assert items[0] == ": keep-alive\n\n"
         assert request.checks == 2
         assert closed.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wrapper", ["sse", "json"])
+async def test_cancelled_response_scope_lets_upstream_cleanup_finish(wrapper):
+    """Starlette cancels the response scope on disconnect; cleanup must finish."""
+    cleaned = asyncio.Event()
+    produced = asyncio.Event()
+
+    async def gen():
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+                produced.set()
+                yield "data: token\n\n"
+        finally:
+            await asyncio.sleep(0.01)  # e.g. closing the upstream connection
+            cleaned.set()
+
+    async def drain():
+        async for _ in gen():
+            pass
+
+    if wrapper == "sse":
+        body = _with_sse_keepalive(gen(), keepalive_chunk=None)
+    else:
+        body = _with_json_keepalive(None, drain())
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(_collect, body)
+        # Cancel after the upstream yields but before the wrapper resumes.
+        await produced.wait()
+        task_group.cancel_scope.cancel()
+
+    assert cleaned.is_set()
 
 
 @pytest.mark.asyncio

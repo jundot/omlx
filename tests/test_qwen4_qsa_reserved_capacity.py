@@ -112,6 +112,54 @@ def test_next_capacity_policy_table():
     assert unreserved._next_capacity(64, 65, _STEP) == 128
 
 
+def _kv_cache_after(tokens: int):
+    cache = language.QSAKVCache()
+    cache.step = _STEP
+    values = mx.arange(tokens, dtype=mx.float32).reshape(1, 1, tokens, 1)
+    cache.update_and_fetch(values, values)
+    return cache
+
+
+def _append_kv(cache, start: int, stop: int) -> None:
+    values = mx.arange(start, stop, dtype=mx.float32).reshape(1, 1, stop - start, 1)
+    cache.update_and_fetch(values, values)
+
+
+def _reserve_kv(cache, tokens: int) -> None:
+    ns = SimpleNamespace(
+        _stream=mx.default_stream(mx.gpu),
+        _memory_hard_limit_bytes=0,
+    )
+    assert Scheduler._reserve_prefill_capacity(ns, [cache], tokens) == 1
+
+
+def test_unreserved_kv_doubles_past_the_prompt():
+    cache = _kv_cache_after(_STEP)
+    _append_kv(cache, _STEP, 4 * _STEP)
+    _append_kv(cache, 4 * _STEP, 5 * _STEP)
+
+    # Crossing 4 steps doubles to 8 steps for a 5-step prompt.
+    assert cache.keys.shape[2] == 8 * _STEP
+
+
+def test_scheduler_reserves_kv_once_and_decode_grows_in_steps():
+    cache = _kv_cache_after(_STEP)
+    _reserve_kv(cache, 5 * _STEP - 3)
+
+    # The prompt's 5 steps plus one spare step for the reply.
+    assert cache.keys.shape[2] == 6 * _STEP
+    assert cache.prefill_spare_bytes() == 5 * _STEP * 2 * 4
+    _append_kv(cache, _STEP, 6 * _STEP)
+    assert cache.keys.shape[2] == 6 * _STEP  # chunks and decode write in place
+
+    _append_kv(cache, 6 * _STEP, 6 * _STEP + 1)  # decode crosses the reservation
+
+    assert cache.keys.shape[2] == 7 * _STEP  # a step, not 12 steps
+    expected = mx.arange(6 * _STEP + 1, dtype=mx.float32)
+    assert mx.array_equal(cache.state[0].reshape(-1), expected).item()
+    assert mx.array_equal(cache.state[1].reshape(-1), expected).item()
+
+
 def test_scheduler_reservation_skips_non_qsa_caches():
     class _Plain:
         pass
@@ -159,6 +207,7 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
         block_aware_cache=object() if snapshots_enabled else None,
         _stream=mx.default_stream(mx.gpu),
         _prefill_tail_plan=lambda *a: (None, False),
+        _memory_hard_limit_bytes=0,
     )
     state = Scheduler._begin_prefill(
         ns,
@@ -178,6 +227,7 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
     with pytest.raises(RuntimeError, match="reservation complete"):
         Scheduler._step_prefill_chunk(ns, state)
     assert cache._index_reserved_tokens >= 256
+    assert cache.keys.shape[2] >= cache._index_reserved_tokens
 
 
 def test_reserved_qsa_prefill_and_decode_match_unreserved_model():

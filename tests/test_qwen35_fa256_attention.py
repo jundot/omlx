@@ -63,12 +63,6 @@ def _fresh_fa256_patch(monkeypatch):
         "_auto_dispatch_budget",
         lambda *a, **k: patch._DEFAULT_DISPATCH_BUDGET,
     )
-    monkeypatch.delenv("OMLX_FA256_STEEL", raising=False)
-    monkeypatch.delenv("OMLX_FA256_MIN_KV_LEN", raising=False)
-    monkeypatch.delenv("OMLX_FA256_Q_BLOCK", raising=False)
-    monkeypatch.delenv("OMLX_FA256_K_BLOCK", raising=False)
-    monkeypatch.delenv("OMLX_FA256_DEBUG", raising=False)
-    monkeypatch.delenv("OMLX_FA256_DISPATCH_BUDGET", raising=False)
     yield
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
     memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
@@ -79,7 +73,12 @@ def test_route_gate_is_qwen_fa256_only():
 
     q, k, _ = _qkv(128, 2048)
     assert patch._should_route(q, k, None, "causal", None, min_kv_len=2048)
-    assert patch._should_route(q, k, None, None, None, min_kv_len=2048)
+    # E4: mask=None means "no mask" in MLX's own semantics, but this kernel
+    # is always invoked with causal=True -- routing on None would silently
+    # causal-ize a caller that intended unrestricted attention. Only the
+    # literal "causal" string routes.
+    # See docs/qwen35-hardening-and-optimization.md E4.
+    assert not patch._should_route(q, k, None, None, None, min_kv_len=2048)
     # any q%kv==0 GQA layout routes (issue #2155): the MoE 16/2 layout is
     # the case the relaxation exists for
     assert patch._should_route(q[:, :12], k, None, "causal", None, 2048)
@@ -177,32 +176,7 @@ def test_kernel_failure_keeps_registered_bounded_route(monkeypatch):
     bounded.assert_called_once_with(q, k, v, scale, "causal", None)
 
 
-def test_dispatch_budget_env_and_capability_gate(monkeypatch):
-    import omlx.patches.qwen35_fa256_attention as patch
-
-    base, _ = _install_fake_vlm_base(monkeypatch)
-    calls = []
-
-    def fake_kernel(
-        q, k, v, scale, causal=True, q_block=32, k_block=8, dispatch_budget=0
-    ):
-        calls.append(dispatch_budget)
-        return "steel"
-
-    monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
-    monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
-    )
-    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
-    monkeypatch.setenv("OMLX_FA256_DISPATCH_BUDGET", "12345")
-
-    assert patch.apply_qwen35_fa256_attention_patch(min_kv_len=16)
-    q, k, v = _qkv(32, 32)
-    base.scaled_dot_product_attention(q, k, v, None, 0.0625, "causal")
-    assert calls == [12345]
-
-
-def test_dispatch_budget_auto_calibration_used_when_env_unset(monkeypatch):
+def test_dispatch_budget_uses_auto_calibration(monkeypatch):
     import omlx.patches.qwen35_fa256_attention as patch
 
     base, _ = _install_fake_vlm_base(monkeypatch)
@@ -256,28 +230,10 @@ def test_dispatch_budget_zeroed_on_old_extension(monkeypatch):
 
 def test_apply_skips_on_nax_gpu(monkeypatch):
     # MLX 0.32.2 has a native NAX split-D fused path for head-dim-256 causal
-    # prefill, so the auto mode must not replace it with the pre-NAX kernel.
+    # prefill, so the patch must not replace it with the pre-NAX kernel.
     import omlx.patches.qwen35_fa256_attention as patch
 
     monkeypatch.setattr(patch, "is_nax_available", lambda: True)
-    assert patch.apply_qwen35_fa256_attention_patch() is False
-
-
-def test_apply_env_forces_steel_on_nax_gpu(monkeypatch):
-    import omlx.patches.qwen35_fa256_attention as patch
-
-    _install_fake_vlm_base(monkeypatch)
-    monkeypatch.setattr(patch, "is_nax_available", lambda: True)
-    monkeypatch.setattr(patch, "_native_kernel", lambda: lambda *a, **k: "steel")
-    monkeypatch.setenv("OMLX_FA256_STEEL", "1")
-    assert patch.apply_qwen35_fa256_attention_patch() is True
-
-
-def test_apply_env_kill_switch_wins(monkeypatch):
-    import omlx.patches.qwen35_fa256_attention as patch
-
-    monkeypatch.setattr(patch, "is_nax_available", lambda: False)
-    monkeypatch.setenv("OMLX_FA256_STEEL", "0")
     assert patch.apply_qwen35_fa256_attention_patch() is False
 
 

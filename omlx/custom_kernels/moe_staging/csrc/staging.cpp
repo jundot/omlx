@@ -28,7 +28,7 @@ struct State {
   size_t reads = 0, fallbacks = 0, high_water = 0, busy = 0;
   std::thread::id owner = std::this_thread::get_id();
   ~State() {
-    for (auto& slot : slots) mx::allocator::free(slot.buffer);
+    for (auto& slot : slots) mx::allocator::allocator().free(slot.buffer);
   }
   void release(size_t index) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -53,7 +53,7 @@ struct Pool {
     state->slots.reserve(sizes.size());
     for (auto size : sizes) {
       if (!size) throw std::invalid_argument("Zero-size staging buffer");
-      auto buffer = mx::allocator::malloc(size);
+      auto buffer = mx::allocator::allocator().malloc(size);
       // Resolve Metal contents only on owner; workers use this raw address.
       state->slots.push_back({buffer, buffer.raw_ptr(), size});
     }
@@ -144,8 +144,9 @@ NB_MODULE(_ext, m) {
     auto buffer = lease->state->slots[lease->index].buffer;
     // MLX's lazy graph and Metal completion handlers retain shared Data.
     // No reuse on Python-wrapper death, install return, or async_eval return.
-    return mx::array(buffer, mx::Shape(shape.begin(), shape.end()), dtype,
-        [lease = std::move(lease)](mx::allocator::Buffer) {});
+    return mx::array(
+        mx::allocator::Data(buffer, [lease = std::move(lease)](mx::allocator::Buffer) {}),
+        mx::Shape(shape.begin(), shape.end()), dtype);
   });
   m.def("address", [](mx::array& a) {
     if (!a.is_available())

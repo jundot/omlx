@@ -56,7 +56,17 @@ class DeepseekV41Cache(ArraysCache):
 
     def extract(self, idx):
         result = type(self)(self.compress_ratio)
-        result.cache = [x[idx : idx + 1] if x is not None else None for x in self.cache]
+        if self.batch_size == 1 and idx in (0, -1):
+            # Forward passes run on extracted rows. Share the arrays and the
+            # growth registry so appends keep extending the same storage.
+            if getattr(self, "_ds41_buffers", None) is None:
+                self._ds41_buffers = {}
+            result.cache = list(self.cache)
+            result._ds41_buffers = self._ds41_buffers
+        else:
+            result.cache = [
+                x[idx : idx + 1] if x is not None else None for x in self.cache
+            ]
         ratio = self.compress_ratio
         if result.cache[0] is None or ratio is None:
             return result

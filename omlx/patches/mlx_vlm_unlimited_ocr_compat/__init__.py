@@ -108,7 +108,7 @@ def _patch_prompt_utils(prompt_utils: Any) -> None:
         **kwargs,
     ):
         if _is_unlimited_ocr(model_name):
-            content = "" if prompt is None else str(prompt)
+            content = prompt_utils.extract_text_from_content(prompt)
             # Unlimited-OCR uses a single literal <image> token for one or many
             # pages, matching upstream infer_multi (MessageFormat.SINGLE_IMAGE_TOKEN).
             if role == "user" and not skip_image_token and num_images > 0:

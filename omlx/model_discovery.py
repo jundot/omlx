@@ -12,6 +12,7 @@ Supports:
 - Reranker models: Use RerankerEngine for document reranking
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
+- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, Decision 3.0)
 """
 
 import contextlib
@@ -25,8 +26,13 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal[
+    "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+]
+EngineType = Literal[
+    "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+]
+DecisionKind = Literal["clef", "openjev", "d3"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -63,12 +69,14 @@ VLM_MODEL_TYPES = {
     "glm_ocr",
     "minimax_m3_vl",
     "minicpmv",
+    "minicpmv4_7",
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
     "inkling",
     "inkling_mm_model",  # config model_type of Inkling Small checkpoints
     "muse_glimmer",
+    "muse_spark",
     "glm5_next",
 }
 
@@ -95,6 +103,24 @@ MLX_LM_TEXT_ONLY_MODEL_TYPES = {
 _MIMO_VISION_SIDECAR = Path("omnimodal/vision_encoder.safetensors")
 _MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
 
+# Clef ships its decision head next to the backbone shards. It is not part of
+# the backbone index, so backbone loaders and quantizers must skip it.
+CLEF_HEAD_WEIGHTS = "joint_head.safetensors"
+CLEF_HEAD_CONFIG = "joint_head_config.json"
+_OPENJEV_HELPER = Path("helper/shim.py")
+# Decision 3.0 (vllm-sr d3) scores answer codes with an FP32 readout stored
+# next to the backbone shards, described by its decision config.
+D3_READOUT_WEIGHTS = "readout.safetensors"
+D3_DECISION_CONFIG = "decision_config.json"
+D3_FORMAT_ID = "d3-code-readout-v1"
+# Files of a decision head, not of the backbone. Quantizers copy them as is.
+DECISION_SIDECAR_WEIGHTS = (CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS)
+DECISION_SIDECAR_FILES = (
+    *DECISION_SIDECAR_WEIGHTS,
+    CLEF_HEAD_CONFIG,
+    D3_DECISION_CONFIG,
+)
+
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
 # distinctive top-level model_type — an ``*_assistant`` (e.g. gemma4_assistant)
@@ -102,8 +128,7 @@ _MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
 # a plain model_type (e.g. ``qwen3``) and are only distinguishable by their
 # architecture name (``DFlashDraftModel``) or a drafter-only config block
 # (``dflash_config``). Keep these in sync with the drafter resolution in
-# engine_pool.py (~1498) and the dflash gate in engine/dflash.py when new
-# drafter families are added.
+# engine_pool.py when new drafter families are added.
 HELPER_CONFIG_MODEL_TYPE_SUFFIXES = ("_assistant", "_mtp")
 _HELPER_ARCH_TOKENS = ("draft", "assistant", "mtp")
 _HELPER_CONFIG_KEYS = ("dflash_config",)
@@ -171,6 +196,7 @@ VLM_ARCHITECTURES = {
     "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
+    "MuseSparkForConditionalGeneration",  # meta-models/Muse-Spark-1.2-820B-A42B
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
     "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
     "Moondream",  # vikhyatk/moondream2 (2024 revisions)
@@ -208,6 +234,7 @@ EMBEDDING_ARCHITECTURES = {
     "SiglipModel",
     "SiglipVisionModel",
     "SiglipTextModel",
+    "EmbeddingGemma2Model",  # via mlx-vlm; has vision_config, checked before VLM
 }
 
 # Supported reranker architectures
@@ -389,6 +416,7 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    reasoning_efforts: list[str] | None = None  # Template effort levels (None = no effort)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
@@ -448,6 +476,45 @@ def _model_name_hint(model_path: Path) -> str:
         if decoded is not None:
             return decoded[1].rsplit("/", 1)[-1].lower()
     return model_path.name.lower()
+
+
+def _is_d3_decision_config(path: Path) -> bool:
+    try:
+        with open(path) as f:
+            return json.load(f).get("format_id") == D3_FORMAT_ID
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
+    """Return the decision-model family of a checkpoint, or None.
+
+    Clef is identified by its joint head files and Decision 3.0 by its
+    readout and decision config. OpenJev is a plain Qwen3.5 checkpoint, so it
+    is identified by its helper directory or, for MLX conversions without the
+    helper, by the directory name.
+    """
+    if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
+        model_path / CLEF_HEAD_CONFIG
+    ).is_file():
+        return "clef"
+    if (model_path / D3_READOUT_WEIGHTS).is_file() and _is_d3_decision_config(
+        model_path / D3_DECISION_CONFIG
+    ):
+        return "d3"
+    if config is None:
+        try:
+            with open(model_path / "config.json") as f:
+                config = json.load(f)
+        except (OSError, ValueError):
+            return None
+    if config.get("model_type") != "qwen3_5":
+        return None
+    if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
+        model_path
+    ):
+        return "openjev"
+    return None
 
 
 def _is_causal_lm_reranker(model_path: Path) -> bool:
@@ -629,11 +696,15 @@ def detect_model_type(model_path: Path) -> ModelType:
        ``mm_vision_tower`` — see :func:`_has_vision_subconfig`)
     7. Audio model detection (STT/TTS/STS)
 
+    Decision models (see :func:`decision_kind`) are checked first because
+    their backbones look like ordinary VLM checkpoints.
+
     Args:
         model_path: Path to model directory
 
     Returns:
-        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", or "audio_sts"
+        Model type: "llm", "vlm", "embedding", "reranker", "audio_stt",
+        "audio_tts", "audio_sts", or "decision"
     """
     config_path = model_path / "config.json"
     if not config_path.exists():
@@ -644,6 +715,9 @@ def detect_model_type(model_path: Path) -> ModelType:
             config = json.load(f)
     except (json.JSONDecodeError, IOError):
         return "llm"
+
+    if decision_kind(model_path, config) is not None:
+        return "decision"
 
     # Check architectures field for reranker first (more specific)
     architectures = config.get("architectures", [])
@@ -815,7 +889,28 @@ def detect_model_type(model_path: Path) -> ModelType:
     return "llm"
 
 
-def detect_thinking_default(model_path: Path) -> bool | None:
+def _read_chat_template_text(model_path: Path) -> str | None:
+    """Return the chat template from chat_template.jinja or tokenizer_config.json."""
+    jinja_path = model_path / "chat_template.jinja"
+    if jinja_path.exists():
+        with contextlib.suppress(OSError):
+            return jinja_path.read_text(encoding="utf-8")
+
+    tc_path = model_path / "tokenizer_config.json"
+    if tc_path.exists():
+        try:
+            with open(tc_path) as f:
+                template = json.load(f).get("chat_template")
+        except Exception:
+            return None
+        if isinstance(template, str):
+            return template
+    return None
+
+
+def detect_thinking_default(
+    model_path: Path, template_text: str | None = None
+) -> bool | None:
     """Detect a model's effective thinking default from local metadata.
 
     Inspects the Jinja chat template for ``enable_thinking`` references and
@@ -831,22 +926,8 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     * **None** — template does not reference ``enable_thinking`` (model has
       no thinking toggle).
     """
-    # Try standalone Jinja file first, then tokenizer_config.json
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
     if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
+        template_text = _read_chat_template_text(model_path)
 
     if not template_text or "enable_thinking" not in template_text:
         return None
@@ -956,7 +1037,9 @@ def _read_model_context_length(model_path: Path) -> int | None:
     return None
 
 
-def detect_preserve_thinking(model_path: Path) -> bool | None:
+def detect_preserve_thinking(
+    model_path: Path, template_text: str | None = None
+) -> bool | None:
     """Detect whether a model's chat template supports ``preserve_thinking``.
 
     Qwen 3.6+ templates strip ``<think>`` blocks from historical assistant
@@ -968,26 +1051,53 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
         True if the template references ``preserve_thinking`` (should be
         enabled), None otherwise (template has no such flag).
     """
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
     if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
+        template_text = _read_chat_template_text(model_path)
 
     if not template_text or "preserve_thinking" not in template_text:
         return None
 
     return True
+
+
+REASONING_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# `reasoning_effort == 'low'` or `reasoning_effort (not) in ['low', 'high']`.
+_EFFORT_CHECK = re.compile(
+    r"reasoning_effort\s*(?:==|(?:not\s+)?in)\s*"
+    r"([\[(][^\])]*[\])]|'[^']*'|\"[^\"]*\")"
+)
+_QUOTED = re.compile(r"['\"]([^'\"]+)['\"]")
+# `reasoning_effort in levels` where the template sets `levels` to a literal.
+_EFFORT_NAME_CHECK = re.compile(r"reasoning_effort\s+(?:not\s+)?in\s+([A-Za-z_]\w*)")
+_DICT_KEY = re.compile(r"['\"]([^'\"]+)['\"]\s*:")
+
+
+def detect_reasoning_effort(
+    model_path: Path, template_text: str | None = None
+) -> list[str] | None:
+    """Return the effort levels the chat template accepts.
+
+    None means the template does not read ``reasoning_effort``. An empty list
+    means it reads the value but names none of the standard levels.
+    """
+    if template_text is None:
+        template_text = _read_chat_template_text(model_path)
+    if not template_text or "reasoning_effort" not in template_text:
+        return None
+    named = set()
+    for match in _EFFORT_CHECK.finditer(template_text):
+        named.update(_QUOTED.findall(match.group(1)))
+    for match in _EFFORT_NAME_CHECK.finditer(template_text):
+        literal = re.search(
+            rf"set\s+{match.group(1)}\s*=\s*(\{{[^}}]*\}}|\[[^\]]*\]|\([^)]*\))",
+            template_text,
+        )
+        if literal is not None:
+            text = literal.group(1)
+            # A dict literal names the accepted levels as its keys.
+            pattern = _DICT_KEY if text.startswith("{") else _QUOTED
+            named.update(pattern.findall(text))
+    return [level for level in REASONING_EFFORT_LEVELS if level in named]
 
 
 def estimate_model_size(model_path: Path) -> int:
@@ -1603,6 +1713,8 @@ def _register_model(
             engine_type = "audio_tts"
         elif model_type == "audio_sts":
             engine_type = "audio_sts"
+        elif model_type == "decision":
+            engine_type = "decision"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)
@@ -1646,8 +1758,10 @@ def _register_model(
                 model_id,
             )
 
-        thinking_default = detect_thinking_default(model_dir)
-        preserve_thinking_default = detect_preserve_thinking(model_dir)
+        template_text = _read_chat_template_text(model_dir)
+        thinking_default = detect_thinking_default(model_dir, template_text)
+        preserve_thinking_default = detect_preserve_thinking(model_dir, template_text)
+        reasoning_efforts = detect_reasoning_effort(model_dir, template_text)
         model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
@@ -1660,6 +1774,7 @@ def _register_model(
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            reasoning_efforts=reasoning_efforts,
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,

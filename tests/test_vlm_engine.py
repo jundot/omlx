@@ -12,6 +12,7 @@ Tests cover:
 
 import base64
 import io
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import numpy as np
 import pytest
 
+from omlx.exceptions import InvalidRequestError
 from omlx.patches.gemma4_audio import apply_gemma4_audio_patch
 from omlx.patches.mlx_vlm_glm5_next_compat import (
     apply_mlx_vlm_glm5_next_compat_patch,
@@ -1561,6 +1563,32 @@ class TestPrepareVisionInputs:
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_text_only_template_reports_missing_image_tokens(
+        self, mock_vlm_act, mock_prepare
+    ):
+        from PIL import Image
+
+        engine = self._setup_engine_for_vision()
+        engine._processor.image_token = "<|image_pad|>"
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+        messages = [{"role": "user", "content": "Describe"}]
+        images = [Image.new("RGB", (4, 4), "red")]
+
+        with pytest.raises(InvalidRequestError, match="text-only chat template"):
+            engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_not_called()
+
+        engine._processor.apply_chat_template.return_value = "<|image_pad|>Describe"
+        engine._prepare_vision_inputs(messages, images)
+        mock_prepare.assert_called_once()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
     def test_bytesio_audio_survives_missing_resample_export(
         self, mock_vlm_act, mock_prepare, monkeypatch
     ):
@@ -1871,6 +1899,67 @@ class TestGemma4AudioPatch:
         assert Gemma4Processor.supports_multiple_audio
         assert rows.shape[0] == sum(counts)
         assert mx.allclose(rows[counts[0] :], encode(clips[1:]), atol=1e-5).item()
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestGemma4UnifiedImageProcessorOnLoad:
+    @staticmethod
+    def _model_dir(tmp_path, model_type="gemma4_unified"):
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+        return tmp_path
+
+    def test_load_keeps_configured_processor(self, tmp_path, monkeypatch):
+        import mlx_vlm.utils as vlm_utils
+        from mlx_vlm.models.gemma4_unified import Gemma4UnifiedImageProcessor
+
+        configured = Gemma4UnifiedImageProcessor(max_soft_tokens=1120)
+        model = SimpleNamespace(config=SimpleNamespace(eos_token_id=1))
+        processor = SimpleNamespace(image_processor=configured)
+        # Real mlx-vlm load(); only weight and tokenizer loading are stubbed.
+        monkeypatch.setattr(vlm_utils, "load_model", lambda *a, **kw: model)
+        monkeypatch.setattr(vlm_utils, "load_processor", lambda *a, **kw: processor)
+        original = vlm_utils.load_image_processor
+
+        model_dir = self._model_dir(tmp_path)
+        with vlm_module._preserve_gemma4_unified_image_processor_on_load(model_dir):
+            _, loaded = vlm_utils.load(model_dir, trust_remote_code=False)
+
+        assert loaded.image_processor is configured
+        assert vlm_utils.load_image_processor is original
+
+    def test_other_model_types_keep_the_loader(self, tmp_path):
+        import mlx_vlm.utils as vlm_utils
+
+        original = vlm_utils.load_image_processor
+        model_dir = self._model_dir(tmp_path, "gemma4")
+        with vlm_module._preserve_gemma4_unified_image_processor_on_load(model_dir):
+            assert vlm_utils.load_image_processor is original
+
+    @pytest.mark.asyncio
+    async def test_engine_start_applies_it(self, tmp_path, monkeypatch):
+        import mlx_vlm.utils as vlm_utils
+
+        from omlx.utils import model_loading
+
+        class LoadReachedError(Exception):
+            pass
+
+        def check_load(model_path, **kwargs):
+            assert vlm_utils.load_image_processor(model_path, **kwargs) is None
+            raise LoadReachedError
+
+        original = vlm_utils.load_image_processor
+        monkeypatch.setattr(vlm_utils, "load", check_load)
+        monkeypatch.setattr(
+            model_loading, "maybe_apply_pre_load_patches", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            model_loading, "maybe_load_custom_quantization", lambda *a, **kw: None
+        )
+        engine = vlm_module.VLMBatchedEngine(model_name=str(self._model_dir(tmp_path)))
+        with pytest.raises(LoadReachedError):
+            await engine.start()
+        assert vlm_utils.load_image_processor is original
 
 
 class TestFormatMessagesForVLMTemplate:
@@ -2591,6 +2680,34 @@ class TestPartialModeVLM:
         assert call_kwargs["add_generation_prompt"] is True
         assert "continue_final_message" not in call_kwargs
 
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    async def test_tokenize_chat_returns_generation_path_ids(self, mock_prepare):
+        """tokenize_chat returns the ids the generation render produces."""
+        engine = self._vision_engine()
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[7, 8, 9]]),
+            "pixel_values": None,
+        }
+        executor = ThreadPoolExecutor(max_workers=1)
+        engine._engine = SimpleNamespace(_mlx_executor=executor)
+        try:
+            token_ids = await engine.tokenize_chat(
+                self._plain_messages(), add_generation_prompt=False
+            )
+            with pytest.raises(InvalidRequestError, match="add_special_tokens"):
+                await engine.tokenize_chat(
+                    self._plain_messages(), add_special_tokens=True
+                )
+        finally:
+            executor.shutdown(wait=False)
+
+        assert token_ids == [7, 8, 9]
+        call_kwargs = engine._processor.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is False
+        assert "continue_final_message" not in call_kwargs
+
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_no_chat_template_fallback_drops_continue_final_message(
@@ -3118,16 +3235,20 @@ class TestVLMEngineFrequencyPenalty:
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
-    async def test_generate_forwards_preserve_reasoning(self):
-        """The non-streaming path must carry the flag the streaming path already does."""
+    async def test_generate_forwards_request_flags(self):
+        """The non-streaming path must carry the flags the streaming path already does."""
         engine = _make_loaded_engine(model_type="test-vlm")
         engine._engine = SimpleNamespace(
             generate=AsyncMock(return_value=self._fake_output())
         )
 
-        await engine.generate("a prompt", preserve_reasoning=True)
+        await engine.generate(
+            "a prompt", preserve_reasoning=True, skip_cache_store=True
+        )
 
-        assert engine._engine.generate.call_args.kwargs["preserve_reasoning"] is True
+        kwargs = engine._engine.generate.call_args.kwargs
+        assert kwargs["preserve_reasoning"] is True
+        assert kwargs["skip_cache_store"] is True
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(
@@ -3550,4 +3671,3 @@ class TestNativeVideo:
         assert estimate.call_count == 2
         kwargs = engine._preflight_or_raise_with_eviction.call_args.kwargs
         assert kwargs["num_prompt_tokens"] == 1002
-        assert kwargs["text_only"] is False

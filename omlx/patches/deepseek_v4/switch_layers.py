@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import math
-import os
 from functools import lru_cache
 
 import mlx.core as mx
@@ -25,36 +24,22 @@ _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
 _DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES = 8192
 # Affine 2/3-bit g64 crossovers measured on M1 Ultra. Other formats keep
 # their existing 64-route sorting threshold.
-_SORT_MIN_ROUTES = int(os.environ.get("OMLX_DEEPSEEK_SORT_MIN_ROUTES", "32"))
-_AFFINE_NATIVE_MIN_ROUTES = int(
-    os.environ.get("OMLX_DEEPSEEK_AFFINE_BLOCK_MIN_ROUTES", "1024")
-)
+_SORT_MIN_ROUTES = 32
+_AFFINE_NATIVE_MIN_ROUTES = 1024
 # Tuned on M3 Ultra. Set this to 8192 to restore the previous crossover on
 # other pre-NAX chips; M5 prefill uses the NAX fallback below.
-_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = int(
-    os.environ.get("OMLX_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES", "16384")
-)
+_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = 16384
 
 # On NAX GPUs (M5 family) mx.gather_qmm dispatches to the tensor-unit
 # gather_qmm_rhs_nax kernels, which beat the pre-NAX block-list kernels for
 # prefill-sized route counts (same regression shape as the Qwen qmm patch:
 # 4k pp 828 -> 400 tok/s on M5 Max). Decode-sized calls stay on the block
-# kernels pending M5 measurements. OMLX_DEEPSEEK_MOE_NAX=0 keeps the block
-# kernels everywhere, =1 routes every call to stock on NAX GPUs.
-_NAX_STOCK_MODE = os.environ.get("OMLX_DEEPSEEK_MOE_NAX", "").strip().lower()
-_NAX_STOCK_MIN_ROUTES = int(
-    os.environ.get("OMLX_DEEPSEEK_MOE_NAX_MIN_ROUTES", "1024")
-)
+# kernels pending M5 measurements.
+_NAX_STOCK_MIN_ROUTES = 1024
 
 
 def _nax_prefers_stock(num_routes: int) -> bool:
-    if _NAX_STOCK_MODE in ("0", "false", "off"):
-        return False
-    if not is_nax_available():
-        return False
-    if _NAX_STOCK_MODE in ("1", "true", "on"):
-        return True
-    return num_routes >= _NAX_STOCK_MIN_ROUTES
+    return num_routes >= _NAX_STOCK_MIN_ROUTES and is_nax_available()
 
 
 def _sort_threshold(*projections) -> int:

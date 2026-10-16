@@ -545,7 +545,9 @@ def _remote_deployment_worker_pids(
 
     command = " ".join(
         (
-            "python3",
+            # Absolute like the serve marker: the scan script is stdlib-only,
+            # and a bare python3 resolves through the login shell's PATH.
+            "/usr/bin/python3",
             "-c",
             shlex.quote(_REMOTE_WORKER_SCAN_SCRIPT),
             shlex.quote(deployment_id),
@@ -3250,7 +3252,8 @@ class DistributedJobSupervisor:
             try:
                 completed = _run_cluster_ssh(
                     host.ssh,
-                    f"python3 -c {shlex.quote(script)}",
+                    # Absolute like the other remote stdlib probes.
+                    f"/usr/bin/python3 -c {shlex.quote(script)}",
                     timeout=8.0,
                     runner=runner,
                 )

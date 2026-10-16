@@ -441,6 +441,18 @@ class TestParseJsonOutput:
         assert is_valid is True
         assert parsed == {"result": True}
 
+    def test_returns_extracted_json_text_verbatim(self):
+        json_text = '{\n  "name": "\\u0421",\n  "price": 1.50\n}'
+        text = f"Sure:\n```json\n{json_text}\n```"
+
+        cleaned, parsed, is_valid, error = parse_json_output(
+            text, {"type": "json_object"}
+        )
+
+        assert is_valid is True
+        assert cleaned == json_text
+        assert parsed == {"name": "С", "price": 1.5}
+
 
 class TestBuildJsonSystemPrompt:
     """Tests for build_json_system_prompt function."""
@@ -1620,6 +1632,31 @@ def test_payload_without_any_close_marker_is_still_withheld():
 
     assert visible == "Before "
     assert f.take_recovery_candidate() == '<tool_call>{"name":"f" After'
+
+
+@pytest.mark.parametrize(
+    "markers,text,is_payload",
+    [
+        ((), "<tool_call> is how qwen calls a tool. END", False),
+        ((), "<|tool_call_start|> is the Hermes form. END", False),
+        ((), "<tool_call> named again:\n```\n<tool_call>\n```\nEND", False),
+        ((), '<tool_call>{"name":"f"', True),
+        ((), "<tool_call><function=write><parameter=x>", True),
+        ((), "<function=write><parameter=content>cut", True),
+        ((), "<tool_call>", True),
+        ((), '<tool_call> is it. Now: <tool_call>{"name":"write"', True),
+        ((), "The tag <tool_call> is it. Now: <function=write>", True),
+        (("<|tool_call>", "<|tool_call|>"), '<|tool_call>call:f{city:"Seat', True),
+    ],
+)
+def test_recovery_candidate_payload_versus_quoted_marker(markers, text, is_payload):
+    tokenizer = _make_tokenizer_with_end(*markers) if markers else _make_tokenizer()
+    f = ToolCallStreamFilter(tokenizer)
+    f.feed(text)
+    f.finish()
+
+    assert f.recovery_candidate_is_payload() is is_payload
+    assert f.take_recovery_candidate()
 
 
 def test_close_marker_fallback_rescans_the_recovered_tail():
@@ -5626,7 +5663,14 @@ def test_qwen_untyped_parameter_conversion_boundaries(spec, raw, expected):
     assert json.loads(calls[0].function.arguments)["v"] == expected
 
 
-@pytest.mark.parametrize("spec", [{}, {"type": ["string", "null"]}])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {},
+        {"type": ["string", "null"]},
+        {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+    ],
+)
 def test_qwen_parameter_is_not_decoded_twice(monkeypatch, spec):
     from mlx_lm.tool_parsers import qwen3_coder
 
@@ -5683,9 +5727,63 @@ def test_xml_union_parameter_preserves_declared_value_type(
     assert validate_json_schema(arguments, schema)[0]
 
 
+@pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+@pytest.mark.parametrize(
+    "spec, raw, expected",
+    [
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "123", "123"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "true", "true"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, '{"a": 1}', '{"a": 1}'),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "[1, 2]", "[1, 2]"),
+        ({"oneOf": [{"type": "string"}, {"type": "null"}]}, '{"a": 1}', '{"a": 1}'),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, '"123"', "123"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "null", None),
+        ({"anyOf": [{"type": "string"}]}, "123", "123"),
+        ({"anyOf": [{"type": "string"}]}, "null", "null"),
+        ({"oneOf": [{"type": "string"}, {"type": "object"}]}, '{"a": 1}', {"a": 1}),
+        (
+            {"anyOf": [{"type": "array"}, {"type": "null"}]},
+            "[true, null]",
+            [True, None],
+        ),
+        ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, "7", 7),
+    ],
+)
+def test_xml_union_keyword_parameter_keeps_declared_alternatives(
+    parser_module, spec, raw, expected
+):
+    """The oneOf/anyOf alternatives bound what an XML value may decode to."""
+    schema = {"type": "object", "properties": {"v": spec}, "required": ["v"]}
+    tools = [{"function": {"name": "f", "parameters": schema}}]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer(parser_module),
+        tools,
+    )
+    assert calls and len(calls) == 1
+    arguments = json.loads(calls[0].function.arguments)
+    assert arguments["v"] == expected
+    assert type(arguments["v"]) is type(expected)
+    assert validate_json_schema(arguments, schema)[0]
+
+
 @pytest.mark.parametrize("types", [["unknown"], [None], []])
 def test_invalid_union_type_declarations_keep_best_effort_parsing(types):
     assert _coerce_param_value("123", "v", {"v": {"type": types}}, "f") == 123
+
+
+@pytest.mark.parametrize(
+    "alternatives, raw, expected",
+    [
+        ([{"$ref": "#/$defs/M"}, {"type": "null"}], '{"a": 1}', {"a": 1}),
+        ([{"enum": [1, 2]}, {"type": "null"}], "1", 1),
+    ],
+)
+def test_untyped_union_alternatives_keep_best_effort_parsing(
+    alternatives, raw, expected
+):
+    spec = {"v": {"anyOf": alternatives}}
+    assert _coerce_param_value(raw, "v", spec, "f") == expected
 
 
 @pytest.mark.parametrize(
@@ -5716,3 +5814,37 @@ def test_native_union_parameter_keeps_correct_python_literal_values(
         tools,
     )
     assert json.loads(calls[0].function.arguments)["v"] == expected
+
+
+
+def test_stream_filter_suppresses_envelope_with_long_tool_name():
+    name = "t" * 120
+    f = ToolCallStreamFilter(_make_tokenizer(), tools={name})
+    raw = f'before <function name="{name}"><param name="a">1</param></function> after'
+    out = [f.feed(raw[i : i + 3]) for i in range(0, len(raw), 3)]
+    out.append(f.finish())
+    assert "".join(out) == "before  after"
+
+
+def test_qwen_missing_outer_close_does_not_merge_next_call():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"a": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    text = (
+        "<tool_call><function=f><parameter=a>one</parameter></function>"
+        "<tool_call><function=f><parameter=a>two</parameter></function>"
+        "</tool_call>"
+    )
+    _, calls, errors = parse_qwen_tool_calls(text, MagicMock(spec=[]), tools, "stop")
+    decoded = [(c.function.name, c.function.arguments) for c in calls]
+    assert decoded == [("f", '{"a": "one"}'), ("f", '{"a": "two"}')]
+    assert errors == ()

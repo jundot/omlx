@@ -2,10 +2,9 @@
 
 """Lossless one-dispatch Qwen4 hyperconnection input projection.
 
-The Metal arithmetic in this module is transcribed from MLX core at pinned
-commit ``ceab91938`` (``mlx/backend/metal/kernels/quantized.h``): its first
-320 rows use MLX's literal ``qmv_fast`` traversal and its final four rows use
-the literal standalone-N=4 general ``qmv`` traversal.  This preserves both raw
+The Metal arithmetic in this module follows MLX 0.32.4
+(``mlx/backend/metal/kernels/quantized.h``): both the first 320 rows and
+the final four rows use MLX's ``qmv_fast`` traversal. This preserves both raw
 projection outputs while avoiding the two-dispatch canonical implementation.
 
 MLX is Copyright © 2023 Apple Inc. and licensed under the MIT License:
@@ -32,7 +31,6 @@ SOFTWARE.
 from __future__ import annotations
 
 import logging
-import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -40,18 +38,14 @@ import mlx.nn as nn
 logger = logging.getLogger(__name__)
 
 
-def env_enabled(name: str) -> bool:
-    """False when the switch ``name`` is set to 0, false, no or off."""
-    return os.environ.get(name, "1").strip().lower() not in {"0", "false", "no", "off"}
-
-
 _HC_COUNT = 4
 _HIDDEN_SIZE = 2560
 _STREAM_WIDTH = _HC_COUNT * _HIDDEN_SIZE
 _LOW_RANK = 320
-_GROUP_SIZE = 64
+# MLX's qmv traversal is the same for every group size; only the scale/bias
+# pointers move with it (lane / (GS / VPT), then BLOCK / GS per block).
+_GROUP_SIZES = (32, 64)
 _SUPPORTED_BITS = (4, 5, 6, 8)
-_DISABLED = not env_enabled("OMLX_QWEN4_HC_HYBRID")
 _KERNEL = None
 _RUNTIME_FAILED = False
 _FAILURE_LOGGED = False
@@ -76,7 +70,7 @@ inline float hc_load_vector(const device T* x, thread float* xt) {
     float sum = 0.0f;
     if (bits == 4) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 16.0f;
             xt[i + 2] = x[i + 2] / 256.0f;
@@ -84,8 +78,8 @@ inline float hc_load_vector(const device T* x, thread float* xt) {
         }
     } else if (bits == 5) {
         for (int i = 0; i < N; i += 8) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]
-                + x[i + 4] + x[i + 5] + x[i + 6] + x[i + 7];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3])
+                + float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 32.0f;
             xt[i + 2] = x[i + 2] / 4.0f;
@@ -97,7 +91,7 @@ inline float hc_load_vector(const device T* x, thread float* xt) {
         }
     } else if (bits == 6) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 64.0f;
             xt[i + 2] = x[i + 2] / 16.0f;
@@ -163,56 +157,6 @@ inline float hc_qdot(
     return scale * accum + sum * bias;
 }
 
-template <int N, int bits>
-inline float hc_qdot_safe(
-    const device uint8_t* w,
-    const thread float* xt,
-    float scale,
-    float bias,
-    float sum) {
-    float accum = 0.0f;
-    if (bits == 4) {
-        const device uint16_t* ws = (const device uint16_t*)w;
-        for (int i = 0; i < N / 4; ++i) {
-            accum +=
-                (xt[4 * i] * (ws[i] & 0x000f)
-                 + xt[4 * i + 1] * (ws[i] & 0x00f0)
-                 + xt[4 * i + 2] * (ws[i] & 0x0f00)
-                 + xt[4 * i + 3] * (ws[i] & 0xf000));
-        }
-    } else if (bits == 5) {
-        for (int i = 0; i < N / 8; ++i) {
-            xt += 8 * i;
-            w += 5 * i;
-            accum += (w[0] & 0x1f) * xt[0];
-            accum += (w[0] & 0xe0) * xt[1];
-            accum += (w[1] & 0x3) * (xt[1] * 256.0f);
-            accum += (w[1] & 0x7c) * xt[2];
-            accum += (w[1] & 0x80) * xt[3];
-            accum += (w[2] & 0xf) * (xt[3] * 256.0f);
-            accum += (w[2] & 0xf0) * xt[4];
-            accum += (w[3] & 0x1) * (xt[4] * 256.0f);
-            accum += (w[3] & 0x3e) * xt[5];
-            accum += (w[3] & 0xc0) * xt[6];
-            accum += (w[4] & 0x7) * (xt[6] * 256.0f);
-            accum += (w[4] & 0xf8) * xt[7];
-        }
-    } else if (bits == 6) {
-        for (int i = 0; i < N / 4; ++i) {
-            xt += 4 * i;
-            w += 3 * i;
-            accum += (w[0] & 0x3f) * xt[0];
-            accum += (w[0] & 0xc0) * xt[1];
-            accum += (w[1] & 0x0f) * (xt[1] * 256.0f);
-            accum += (w[1] & 0xf0) * xt[2];
-            accum += (w[2] & 0x03) * (xt[2] * 256.0f);
-            accum += (w[2] & 0xfc) * xt[3];
-        }
-    } else if (bits == 8) {
-        for (int i = 0; i < N; ++i) accum += xt[i] * w[i];
-    }
-    return scale * accum + sum * bias;
-}
 """
 
 
@@ -222,14 +166,14 @@ _SOURCE = r"""
     const uint lane = thread_index_in_simdgroup;
     constexpr int PF = hc_pack_factor<BITS>();
     constexpr int BP = hc_bytes_per_pack<BITS>();
-    constexpr int GROUPS = K / 64;
+    constexpr int GROUPS = K / GS;
     constexpr int ROW_BYTES = K * BP / PF;
 
     if (tg < 40) {
         constexpr int PPT = 2;
         constexpr int VPT = PF * PPT;
         constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = 64 / VPT;
+        constexpr int SCALE_STEP = GS / VPT;
         const int out_row = int(tg) * 8 + int(sg) * 4;
         const device uint8_t* wp = (const device uint8_t*)down_w
             + out_row * ROW_BYTES + int(lane) * PPT * BP;
@@ -251,8 +195,8 @@ _SOURCE = r"""
                     sum);
             }
             wp += BLOCK * BP / PF;
-            sp += BLOCK / 64;
-            bp += BLOCK / 64;
+            sp += BLOCK / GS;
+            bp += BLOCK / GS;
             xp += BLOCK;
         }
         for (int row = 0; row < 4; ++row) {
@@ -263,19 +207,18 @@ _SOURCE = r"""
     }
 
     if (sg != 0) return;
-    constexpr int PPT = 1;
-    constexpr int VPT = PF;
+    constexpr int PPT = 2;
+    constexpr int VPT = PF * PPT;
     constexpr int BLOCK = VPT * 32;
-    constexpr int SCALE_STEP = 64 / VPT;
+    constexpr int SCALE_STEP = GS / VPT;
     const device uint8_t* wp = (const device uint8_t*)inject_w
-        + int(lane) * BP;
+        + int(lane) * PPT * BP;
     const device T* sp = inject_s + int(lane) / SCALE_STEP;
     const device T* bp = inject_b + int(lane) / SCALE_STEP;
     const device T* xp = x + int(lane) * VPT;
     float result[4] = {0.0f};
     float xv[VPT];
-    int k = 0;
-    for (; k < K - BLOCK; k += BLOCK) {
+    for (int k = 0; k < K; k += BLOCK) {
         float sum = hc_load_vector<T, VPT, BITS>(xp, xv);
         for (int row = 0; row < 4; ++row) {
             result[row] += hc_qdot<VPT, BITS>(
@@ -286,18 +229,11 @@ _SOURCE = r"""
                 sum);
         }
         wp += BLOCK * BP / PF;
-        sp += BLOCK / 64;
-        bp += BLOCK / 64;
+        sp += BLOCK / GS;
+        bp += BLOCK / GS;
         xp += BLOCK;
     }
-    float sum = hc_load_vector<T, VPT, BITS>(xp, xv);
     for (int row = 0; row < 4; ++row) {
-        result[row] += hc_qdot_safe<VPT, BITS>(
-            wp + row * ROW_BYTES,
-            xv,
-            float(sp[row * GROUPS]),
-            float(bp[row * GROUPS]),
-            sum);
         result[row] = simd_sum(result[row]);
         if (lane == 0) combined[320 + row] = T(result[row]);
     }
@@ -328,14 +264,12 @@ def _kernel():
 
 def compatible_projections(down, injection) -> bool:
     """Whether two raw Qwen4 projection banks match the native contract."""
-    if _DISABLED:
-        return False
     if not (
         type(down) is nn.QuantizedLinear
         and type(injection) is nn.QuantizedLinear
         and getattr(down, "group_size", None)
         == getattr(injection, "group_size", None)
-        == _GROUP_SIZE
+        in _GROUP_SIZES
         and getattr(down, "bits", None) == getattr(injection, "bits", None)
         and getattr(down, "bits", None) in _SUPPORTED_BITS
         and getattr(down, "mode", None)
@@ -353,13 +287,13 @@ def compatible_projections(down, injection) -> bool:
     if not all(isinstance(value, mx.array) for value in tensors):
         return False
     packed_width = _STREAM_WIDTH * down.bits // 32
+    groups = _STREAM_WIDTH // down.group_size
     return bool(
         down.weight.shape == (_LOW_RANK, packed_width)
         and injection.weight.shape == (_HC_COUNT, packed_width)
         and down.weight.dtype == injection.weight.dtype == mx.uint32
-        and down.scales.shape == (_LOW_RANK, _STREAM_WIDTH // _GROUP_SIZE)
-        and injection.scales.shape
-        == (_HC_COUNT, _STREAM_WIDTH // _GROUP_SIZE)
+        and down.scales.shape == (_LOW_RANK, groups)
+        and injection.scales.shape == (_HC_COUNT, groups)
         and down.biases.shape == down.scales.shape
         and injection.biases.shape == injection.scales.shape
         and down.scales.dtype == down.biases.dtype == mx.bfloat16
@@ -400,6 +334,7 @@ def hybrid_projection(
                 ("T", x.dtype),
                 ("BITS", down.bits),
                 ("K", _STREAM_WIDTH),
+                ("GS", down.group_size),
             ],
             grid=(32, 82, 1),
             threadgroup=(32, 2, 1),

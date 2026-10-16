@@ -69,16 +69,14 @@ inline float gdn_decay(InT a, InT dt, float neg_a) {
     return metal::precise::exp(neg_a * static_cast<float>(sp));
 }
 
+// MLX's Sigmoid functor, rounded to InT once.
 template <typename InT>
 inline float gdn_beta(InT x) {
-    InT ax = static_cast<InT>(metal::abs(static_cast<float>(x)));
-    InT e = static_cast<InT>(metal::precise::exp(static_cast<float>(ax)));
-    auto y = 1 / (1 + e);
-    InT r = (x < 0) ? y : 1 - y;
-    return static_cast<float>(r);
+    auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+    return static_cast<float>(static_cast<InT>((x < InT(0)) ? y : 1 - y));
 }
 
-// MLX's half softplus and sigmoid round every half op, which fast math would
+// MLX's half softplus rounds every half op, which fast math would
 // fuse away here, so each step runs in float and rounds to half explicitly.
 inline half gdn_h(float x) {
     return static_cast<half>(x);
@@ -112,14 +110,6 @@ inline float gdn_decay(half a, half dt, float neg_a) {
     return metal::precise::exp(neg_a * static_cast<float>(sp));
 }
 
-inline float gdn_beta(half x) {
-    half ax = metal::abs(x);
-    half e = gdn_h(metal::precise::exp(static_cast<float>(ax)));
-    half d = gdn_h(1.0f + static_cast<float>(e));
-    half y = gdn_h(metal::precise::divide(1.0f, static_cast<float>(d)));
-    half r = (x < half(0)) ? y : gdn_h(1.0f - static_cast<float>(y));
-    return static_cast<float>(r);
-}
 """
 
 _PROLOGUE = """

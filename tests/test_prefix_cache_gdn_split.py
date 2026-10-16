@@ -17,16 +17,22 @@ LAYER_TYPES = ["KVCache", "ArraysCache"]
 
 
 class _HybridModel:
-    def __init__(self):
+    def __init__(self, recurrent_arrays=2):
         self.layers = [MagicMock(), MagicMock()]
+        self.recurrent_arrays = recurrent_arrays
 
     def make_cache(self):
         from mlx_lm.models.cache import ArraysCache, KVCache
 
-        return [KVCache(), ArraysCache(size=2)]
+        return [KVCache(), ArraysCache(size=self.recurrent_arrays)]
 
 
-def _hybrid_extracted(token_count: int, recurrent_value: float):
+def _hybrid_extracted(token_count: int, recurrent_value: float, recurrent_arrays=2):
+    # LFM2 short-conv layers hold only the conv state (ArraysCache(size=1)).
+    recurrent_state = (
+        mx.full((1, 3, 8), recurrent_value),
+        mx.full((1, 2, 4, 8), recurrent_value),
+    )[:recurrent_arrays]
     return [
         {
             "state": (
@@ -38,10 +44,7 @@ def _hybrid_extracted(token_count: int, recurrent_value: float):
             "meta_state": (token_count,),
         },
         {
-            "state": (
-                mx.full((1, 3, 8), recurrent_value),
-                mx.full((1, 2, 4, 8), recurrent_value),
-            ),
+            "state": recurrent_state,
             "class_name": "ArraysCache",
             "cache_type": "ArraysCache",
             "meta_state": (),
@@ -996,7 +999,8 @@ def test_split_restore_retry_budget_is_one_per_block(tmp_path):
         ssd.close()
 
 
-def test_split_store_persists_tail_sidecar_and_restores(tmp_path):
+@pytest.mark.parametrize("recurrent_arrays", [2, 1])
+def test_split_store_persists_tail_sidecar_and_restores(tmp_path, recurrent_arrays):
     """A tail block commits its own sidecar and restores the whole prompt."""
     cache_dir = tmp_path / "cache"
     paged = PagedCacheManager(
@@ -1016,7 +1020,7 @@ def test_split_store_persists_tail_sidecar_and_restores(tmp_path):
     )
     boundary = BoundarySnapshotSSDStore(cache_dir, pending_max_bytes=1024**2)
     prefix = BlockAwarePrefixCache(
-        model=_HybridModel(),
+        model=_HybridModel(recurrent_arrays),
         paged_cache_manager=paged,
         paged_ssd_cache_manager=ssd,
         gdn_ssd_split_enabled=True,
@@ -1026,7 +1030,9 @@ def test_split_store_persists_tail_sidecar_and_restores(tmp_path):
     try:
         request_id = "tail-request"
         for token_count in (4, 8, 11):
-            extracted = _hybrid_extracted(token_count, float(token_count))
+            extracted = _hybrid_extracted(
+                token_count, float(token_count), recurrent_arrays
+            )
             assert boundary.save(
                 request_id,
                 token_count,
@@ -1045,7 +1051,7 @@ def test_split_store_persists_tail_sidecar_and_restores(tmp_path):
         stored = prefix.store_cache(
             request_id,
             tokens,
-            _hybrid_extracted(11, 11.0),
+            _hybrid_extracted(11, 11.0, recurrent_arrays),
             boundary_snapshots=provider,
             _store_tail_terminal=True,
         )
@@ -1067,6 +1073,7 @@ def test_split_store_persists_tail_sidecar_and_restores(tmp_path):
         restored = prefix.reconstruct_cache(hit_table)
         assert restored is not None
         assert restored[0].keys_and_values()[0].shape[2] == 11
+        assert len(restored[1].cache) == recurrent_arrays
         assert float(restored[1].cache[0][0, 0, 0]) == pytest.approx(11.0)
         assert (
             prefix.get_stats_dict()["gdn_last_restore"]["chosen_endpoint_tokens"] == 11

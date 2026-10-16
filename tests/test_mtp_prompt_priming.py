@@ -16,7 +16,11 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
+from mlx_lm.models.cache import KVCache
+
+from omlx.patches.deepseek_v4.cache_extras import PoolingCache
 from omlx.patches.mlx_lm_mtp import prompt_priming
+from omlx.prefill.packed import PackedBatch, PackedRow, PackedRows
 
 
 TINY_CONFIG = {
@@ -228,6 +232,96 @@ def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
     assert not cache._prefix_index
 
 
+POOL_TOKENS = list(range(100, 140))
+
+
+class PooledHead:
+    """glm5_next-shaped head: a ``[KVCache, PoolingCache(4)]`` pair."""
+
+    _omlx_mtp_decode_enabled = True
+    _omlx_mtp_chain = True
+    mtp = object()
+
+    def make_mtp_cache(self):
+        return [KVCache(), PoolingCache(4)]
+
+    def mtp_forward(self, hidden, tokens, cache, logits_keep=0):
+        x = hidden + tokens[..., None].astype(hidden.dtype)
+        cache[0].update_and_fetch(x[:, None], x[:, None])
+        ready, gate, _ = cache[1].accumulate_windows(x, 1 - x, 0)
+        if ready.size:
+            windows = mx.unflatten(ready + gate, 1, (-1, 4))
+            cache[1].update_and_fetch(windows.mean(axis=2))
+
+
+def _pooled_run(prefix_cache, request_id, chunks, *, cached=0, tail=None):
+    """Prefill chunks in scheduler order, then fold the activation seam."""
+    host = PooledHead()
+    warm = prompt_priming.prepare_prefix_context(
+        host,
+        request_id=request_id,
+        prompt_tokens=POOL_TOKENS,
+        cached_tokens=cached,
+        prefix_cache=prefix_cache,
+    )
+    end = cached
+    for n in chunks:
+        if end == tail:
+            prompt_priming.capture_tail_boundary(host, request_id, tail)
+        tokens = mx.array([POOL_TOKENS[end : end + n]])
+        end += n
+        hidden = tokens[..., None].astype(mx.float32)
+        prompt_priming.maybe_capture(
+            host, tokens, hidden, [SimpleNamespace(offset=end)]
+        )
+    main_tok = mx.array([POOL_TOKENS[end]])
+    return warm, prompt_priming.take_primed(host, [], main_tok, cache_offset=end + 1)
+
+
+def _pooled_reference(pairs):
+    cache = PooledHead().make_mtp_cache()
+    hidden = mx.array(POOL_TOKENS[:pairs], dtype=mx.float32)[None, :, None]
+    tokens = mx.array([POOL_TOKENS[1 : pairs + 1]])
+    PooledHead().mtp_forward(hidden, tokens, cache)
+    return cache
+
+
+def _pooled_state(cache):
+    kv, pool = cache
+    rem = pool.remainder
+    return (
+        kv.keys[..., : kv.offset, :].tolist(),
+        pool.pooled.tolist(),
+        pool.buf_kv[:, :rem].tolist(),
+        pool.buf_gate[:, :rem].tolist(),
+    )
+
+
+def test_pooled_head_snapshot_publishes_and_restores_at_tail_boundary():
+    # The seam leaves the head at 21 pairs. Rewinding it to C-1 = 19 crosses a
+    # completed pooled window, so the snapshot must be taken at tail capture.
+    sidecar = _MemoryMtpPrefixCache()
+    _, cold = _pooled_run(sidecar, "cold", (16, 4, 1), tail=20)
+    snapshot = sidecar.snapshots[sidecar._key(POOL_TOKENS, 20)]
+    expected = _pooled_state(_pooled_reference(19))
+    assert _pooled_state(snapshot.mtp_cache) == expected
+
+    restored, warm = _pooled_run(sidecar, "warm", (1,), cached=20)
+    assert restored and warm[1] == cold[1] == 21
+    assert _pooled_state(warm[0]) == _pooled_state(cold[0])
+    assert _pooled_state(snapshot.mtp_cache) == expected
+
+
+def test_pooled_head_keeps_older_snapshot_when_newer_boundary_cannot_rewind():
+    # Block 32 lies 4 tokens behind the head after chunk 2, beyond the pooled
+    # remainder and with no undo log for a 20-token update.
+    sidecar = _MemoryMtpPrefixCache()
+    _pooled_run(sidecar, "cold", (16, 20))
+    assert list(sidecar.snapshots) == [sidecar._key(POOL_TOKENS, 16)]
+    snapshot = sidecar.snapshots[sidecar._key(POOL_TOKENS, 16)]
+    assert _pooled_state(snapshot.mtp_cache) == _pooled_state(_pooled_reference(15))
+
+
 @pytest.fixture(autouse=True)
 def _apply_patch():
     try:
@@ -428,12 +522,6 @@ class TestCaptureFold:
 
 
 class TestCaptureSkips:
-    def test_env_off_disables_capture(self, model, monkeypatch):
-        monkeypatch.setenv("OMLX_MTP_PROMPT_PRIMING", "0")
-        cache = _make_cache(model)
-        _chunked_prefill(model, cache, _tokens(6), [6])
-        assert prompt_priming.prime_ctx_stats(model) is None
-
     def test_suppress_capture(self, model):
         cache = _make_cache(model)
         with prompt_priming.suppress_capture():
@@ -488,45 +576,6 @@ class TestCaptureSkips:
         _chunked_prefill(model, cache, tokens[8:], [4])
         # Restarted mid-prompt: only the new chunk's internal pairs.
         assert prompt_priming.prime_ctx_stats(model) == 3
-
-    def test_window_cap_disables_long_prompts(self, model, monkeypatch):
-        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
-        cache = _make_cache(model)
-        _chunked_prefill(model, cache, _tokens(10, seed=5), [5, 5])
-        assert prompt_priming.prime_ctx_stats(model) is None
-
-    def test_window_caps_folded_span_not_absolute_offset(self, model, monkeypatch):
-        """A warm prefix cache leaves only a small remainder to fold; the
-        window must cap that folded span (the head-KV it exists to bound),
-        not the absolute prompt offset — otherwise every long-context
-        warm-cache request runs unprimed even when the remainder is tiny
-        (#2909)."""
-        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "6")
-        tokens = _tokens(12, seed=8)
-        cache = _make_cache(model)
-        with prompt_priming.suppress_capture():
-            _chunked_prefill(model, cache, tokens[:8], [8])
-        assert prompt_priming.prime_ctx_stats(model) is None
-        # Remainder of 4 tokens at absolute offset 12: over the old
-        # absolute-offset guard (12 > 6), within the span guard (4 <= 6).
-        _chunked_prefill(model, cache, tokens[8:], [4])
-        assert prompt_priming.prime_ctx_stats(model) == 3
-
-    def test_window_overflow_stays_latched_across_small_chunks(
-        self, model, monkeypatch
-    ):
-        """An oversized multi-chunk remainder must not restart priming after
-        the first context is dropped."""
-        monkeypatch.setenv("OMLX_MTP_PRIME_WINDOW", "4")
-        tokens = _tokens(17, seed=9)
-        cache = _make_cache(model)
-        with prompt_priming.suppress_capture():
-            _chunked_prefill(model, cache, tokens[:8], [8])
-        _chunked_prefill(model, cache, tokens[8:], [3, 3, 3])
-        assert prompt_priming.prime_ctx_stats(model) is None
-        ctx = prompt_priming._find_ctx(model)
-        assert ctx is not None and ctx.window_exceeded
-        assert ctx.expected_offset == 17
 
     def test_take_primed_requires_seam_offset(self, model):
         """No activation forward ran: seam mismatch must discard the ctx."""
@@ -810,6 +859,9 @@ def test_owned_batch_calibration_history_matches_full_prompt_fold(strict_model):
     for uid, tokens in zip([11, 12], histories):
         ctx = owned.uids[uid][0]
         assert ctx.expected_offset == 11
+        # Ordinary decode collects its pairs; they fold at activation.
+        assert ctx.folded == 5 and len(ctx.deferred_pairs) == 5
+        prompt_priming._flush_deferred_history(model, ctx)
         assert ctx.folded == 10
         ref = _reference_head_cache(model, tokens)
         for (keys, values), (ref_keys, ref_values) in zip(
@@ -1175,6 +1227,31 @@ def capture(host, tokens, offset):
     )
 
 
+def test_packed_prefill_folds_each_row_into_its_own_request():
+
+    host = HeadHost()
+    prepare(host, "a", [1, 2, 3, 4])
+    capture(host, [1, 2], 2)
+    prepare(host, "b", [5, 6, 7, 8, 9])
+    capture(host, [5, 6], 2)
+    previous = prompt_priming._find_ctx(host)
+    batch = PackedBatch(
+        [
+            PackedRow("a", mx.array([[3, 4]]), [SimpleNamespace(offset=4)]),
+            PackedRow("b", mx.array([[7, 8, 9]]), [SimpleNamespace(offset=5)]),
+        ]
+    )
+    inputs = mx.array([[3, 4, 7, 8, 9]])
+    cache = [PackedRows(batch, [row.cache[0] for row in batch.rows])]
+    prompt_priming.maybe_capture(host, inputs, inputs[..., None], cache)
+    assert prompt_priming._find_ctx(host) is previous
+    prompt_priming.bind_uid(host, "a", 11)
+    prompt_priming.bind_uid(host, "b", 12)
+    _, state = prompt_priming._owned(host)
+    assert state.uids[11][0].mtp_cache[0].pairs == [(1, 2), (2, 3), (3, 4)]
+    assert state.uids[12][0].mtp_cache[0].pairs == [(5, 6), (6, 7), (7, 8), (8, 9)]
+
+
 def test_interleaved_equal_length_requests_keep_distinct_history():
     host = HeadHost()
     prepare(host, "a", [1, 2, 3, 4])
@@ -1282,16 +1359,28 @@ def test_decode_scope_restores_after_exception_and_models_do_not_share_state():
     assert prompt_priming._owned(first)[1] is not prompt_priming._owned(second)[1]
 
 
-def test_dspark_context_is_owned_by_custom_hook():
+def test_dspark_contexts_move_with_their_requests():
     host = HeadHost()
     host._omlx_dspark_decode_enabled = True
-    custom = object()
-    setattr(host, prompt_priming._CTX_ATTR, custom)
+    first, second = object(), object()
+    setattr(host, prompt_priming._CTX_ATTR, first)
+    # Registration leaves the slot to the request that is still prefilling.
+    prepare(host, "b", [3, 4])
+    assert prompt_priming._find_ctx(host) is first
     prepare(host, "a", [1, 2])
-    prompt_priming.release_request(host, "a")
+    for request_id, ctx in (("a", first), ("b", second)):
+        prompt_priming.activate_request(host, request_id)
+        prompt_priming.owned_capture(
+            host, lambda ctx=ctx: setattr(host, prompt_priming._CTX_ATTR, ctx)
+        )
+    prompt_priming.activate_request(host, "a")
+    assert prompt_priming._find_ctx(host) is first
+    prompt_priming.bind_uid(host, "a", 1)
+    assert prompt_priming._find_ctx(host) is None
+    state = prompt_priming._owned(host)[1]
+    assert state.uids[1][0] is first and state.requests["b"][0] is second
     prompt_priming.clear_owned(host)
-    assert prompt_priming._find_ctx(host) is custom
-    assert prompt_priming._owned(host)[1] is None
+    assert not state.requests and not state.uids
 
 
 @pytest.mark.parametrize("operation", ["reset", "deep_reset", "shutdown"])

@@ -76,7 +76,6 @@ std::string type_str(Dtype dt) {
 // ---------------------------------------------------------------------------
 
 array ensure_row_contiguous(const array& x, const Stream& s) {
-    if (x.flags().row_contiguous) return x;
     return contiguous(x, /*allow_col_major=*/false, s);
 }
 

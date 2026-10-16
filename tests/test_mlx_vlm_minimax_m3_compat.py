@@ -288,6 +288,35 @@ def test_minimax_unpacked_mixed_bit_moe_forward():
     assert bool(mx.all(mx.isfinite(output)).item())
 
 
+def test_minimax_m3_kv_cache_state_and_to_batch_accept_both_kv_classes():
+    mx = pytest.importorskip("mlx.core")
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+    keys = mx.random.normal((1, 2, 5, 4))
+    values = mx.random.normal((1, 2, 5, 4))
+    fresh = MiniMaxM3KVCache()
+    fresh.update_and_fetch(keys, values)
+    # extract() wraps the mlx_lm KVCache instead of the mlx_vlm one.
+    extracted = fresh.to_batch([0]).extract(0)
+    assert type(extracted.kv_cache) is not type(fresh.kv_cache)
+
+    for cache in (fresh, extracted):
+        (state_keys, state_values), _ = cache.state
+        assert mx.array_equal(state_keys, keys)
+        assert mx.array_equal(state_values, values)
+
+        batch_keys, batch_values = cache.to_batch([2]).kv_cache.keys_and_values()
+        assert batch_keys.shape[2] == 7
+        assert mx.array_equal(batch_keys[..., 2:, :], keys)
+        assert mx.array_equal(batch_values[..., 2:, :], values)
+
+
 def test_omlx_loader_respects_minimax_shared_expert_layout_override():
     from omlx.engine.vlm import _should_pack_minimax_m3_shared_expert
 

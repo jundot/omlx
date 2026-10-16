@@ -631,14 +631,10 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
         ("mlx_vlm.models.cache", "BatchQuantizedKVCache"),
     ],
 )
-def test_batch_cache_finalize_refreshes_identity_cached_padding(module_name, cache_name):
+def test_qwen_decode_mask_follows_in_place_finalize_padding(module_name, cache_name):
     import importlib
 
     from mlx_vlm.models.qwen3_5 import language as q35_lang
-
-    from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
-
-    qwen35_vlm_runtime._patch_batch_cache_padding_identity()
 
     cache_class = getattr(importlib.import_module(module_name), cache_name)
     kwargs = {"max_size": 32} if cache_name == "BatchRotatingKVCache" else {}
@@ -655,13 +651,68 @@ def test_batch_cache_finalize_refreshes_identity_cached_padding(module_name, cac
     assert q35_lang._create_qwen3_5_attention_mask(mx.zeros((2, 1, 4)), cache)
     assert cache._qwen3_5_decode_left_padding == [2, 3]
 
-    padding = cache.left_padding
-    padding_info = cache._qwen3_5_left_padding_info
-    cache.prepare(lengths=[1, 1], right_padding=[0, 0])
-    cache.finalize()
-    assert cache.left_padding is padding
-    assert q35_lang._qwen3_5_left_padding_info(cache) == ((2, 3), 3)
-    assert cache._qwen3_5_left_padding_info is padding_info
+
+@pytest.mark.parametrize(
+    "left_padding,lengths,expected",
+    [
+        ([0, 0], [0, 3], [[False, False, False], [True, True, True]]),
+        ([1, 0], [2, 3], [[False, True, False], [True, True, True]]),
+        ([1, 0], [7, 7], [[False, True, True], [True, True, True]]),
+        (None, [1, 3], [[True, False, False], [True, True, True]]),
+        ([0, 0], [3, 7], None),
+        ([0, 0], None, None),
+    ],
+)
+def test_qwen_ssm_mask_preserves_padding_bounds(left_padding, lengths, expected):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language
+
+    from omlx.patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
+
+    apply_qwen35_ssm_mask_patch()
+    cache = ArraysCache(2, left_padding=left_padding)
+    if lengths is not None:
+        cache.prepare(lengths=lengths)
+    mask = language._create_qwen3_5_ssm_mask(mx.zeros((2, 3, 4)), cache)
+    assert (None if mask is None else mask.tolist()) == expected
+
+
+@pytest.mark.parametrize("chunk_size", [3, 7])
+def test_qwen_gdn_padded_prefill_matches_unpadded_state(chunk_size):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language
+    from mlx_vlm.models.qwen3_5.config import TextConfig
+
+    from omlx.patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
+
+    from test_mtp_prompt_priming import TINY_CONFIG
+
+    apply_qwen35_ssm_mask_patch()
+    mx.random.seed(173)
+    config = TextConfig.from_dict(
+        dict(TINY_CONFIG, linear_key_head_dim=128, linear_value_head_dim=128)
+    )
+    layer = language.Qwen3_5GatedDeltaNet(config)
+    layer.eval()
+    inputs = mx.random.normal((2, 7, config.hidden_size))
+    references = []
+    for row, length in enumerate([3, 7]):
+        reference = ArraysCache(2)
+        mx.eval(layer(inputs[row : row + 1, :length], cache=reference))
+        references.append(reference)
+
+    cache = ArraysCache.merge([ArraysCache(2), ArraysCache(2)])
+    cache.prepare(lengths=[3, 7])
+    for start in range(0, 7, chunk_size):
+        chunk = inputs[:, start : start + chunk_size]
+        mask = language._create_qwen3_5_ssm_mask(chunk, cache)
+        mx.eval(layer(chunk, mask=mask, cache=cache))
+
+    for row, reference in enumerate(references):
+        for state in range(2):
+            assert mx.allclose(
+                cache[state][row : row + 1], reference[state], atol=1e-6, rtol=1e-5
+            ).item()
 
 
 def test_dense_vlm_runtime_delegates_foreign_subclasses_unchanged():
@@ -908,6 +959,41 @@ def test_moe_vlm_runtime_sanitize_stacks_per_expert_backbone():
     assert result[f"{pfx}.switch_mlp.gate_proj.weight"].shape == (2, 8, 4)
     assert result[f"{pfx}.switch_mlp.up_proj.weight"].shape == (2, 8, 4)
     assert result[f"{pfx}.switch_mlp.down_proj.weight"].shape == (2, 4, 8)
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
+def test_moe_vlm_runtime_sanitize_stacks_nvfp4_global_scales():
+    """mlx-vlm keeps ModelOpt NVFP4 global scales as separate keys; per-expert
+    ones must be stacked with the weights or strict load_weights fails."""
+    from mlx_vlm.quantization.checkpoint import transform_quantized_weights
+
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_runtime
+
+    class FakeModel:
+        pass
+
+    qwen35_moe_vlm_runtime._patch_vlm_outer_model_sanitize(
+        SimpleNamespace(Model=FakeModel)
+    )
+
+    pfx_in = "model.language_model.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            key = f"{pfx_in}.experts.{e}.{proj}"
+            weights[f"{key}.weight"] = mx.zeros((32, 32), dtype=mx.uint8)
+            weights[f"{key}.weight_scale"] = mx.zeros((32, 4), dtype=mx.uint8)
+            weights[f"{key}.weight_scale_2"] = mx.array(0.5, dtype=mx.float32)
+            weights[f"{key}.input_scale"] = mx.array(1.0, dtype=mx.float32)
+    weights, _ = transform_quantized_weights(
+        weights, {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}
+    )
+
+    result = FakeModel.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.model.layers.0.mlp"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        assert result[f"{pfx}.switch_mlp.{proj}.weight_scale_2"].shape == (2,)
     assert not any(f"{pfx}.experts." in k for k in result)
 
 

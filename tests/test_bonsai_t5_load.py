@@ -32,7 +32,7 @@ from omlx.patches.bonsai_t5_load import (
     free_t5_biases,
     remove_bonsai_t5_load_patch,
 )
-from tools.repack_ternary_t5 import pack_t5
+from scripts.repack_ternary_t5 import pack_t5
 
 
 # ---------------------------------------------------------------------------

@@ -359,6 +359,35 @@ class TestModelSettingsManager:
             assert settings.is_pinned is True
             assert settings.is_default is True
 
+    def test_initial_settings_keep_unreadable_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text("{not json")
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            assert manager.add_initial_settings({"new": {"top_k": 20}}) == []
+            assert settings_file.read_text() == "{not json"
+
+    def test_initial_settings_keep_records_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            old = {"temperature": 0.2, "future_field": True}
+            broken = {"mtp_enabled": True, "dflash_enabled": True}
+            settings_file.write_text(
+                json.dumps({"version": 1, "models": {"old": old, "broken": broken}})
+            )
+            manager = ModelSettingsManager(Path(tmpdir))
+
+            added = manager.add_initial_settings(
+                {"old": {"top_k": 1}, "broken": {"top_k": 1}, "new": {"top_k": 20}}
+            )
+
+            assert added == ["new"]
+            models = json.loads(settings_file.read_text())["models"]
+            assert models["old"] == old
+            assert models["broken"] == broken
+            assert models["new"]["top_k"] == 20
+
     def test_set_settings(self):
         """Test setting and saving settings."""
         with tempfile.TemporaryDirectory() as tmpdir:

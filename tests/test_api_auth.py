@@ -1,9 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for API key authentication."""
 
+import json
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
+
+from omlx.settings import SubKeyEntry
 
 # Note: These tests need a mock server setup since the actual server requires models
 
@@ -633,8 +641,14 @@ class TestUnauthenticatedInference:
             "/v1/messages/count_tokens",
             "/v1/embeddings",
             "/v1/rerank",
+            "/v1/systemone",
+            "/v1/decisions",
             "/v1/responses",
             "/v1/audio/speech",
+            "/tokenize",
+            "/v1/tokenize",
+            "/detokenize",
+            "/v1/detokenize",
         ],
     )
     def test_http_inference_auth_gate(self, configured_server, path):
@@ -667,6 +681,59 @@ class TestUnauthenticatedInference:
         server, _ = configured_server
         response = TestClient(server.app).request(method, path)
         assert response.status_code == 401
+
+    def test_admin_api_accepts_the_main_key_as_bearer(
+        self, configured_server, monkeypatch
+    ):
+        from omlx.admin import routes as admin_routes
+
+        server, settings = configured_server
+        # Other suites can leave a stale settings getter on the routes module.
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        response = TestClient(server.app).get(
+            "/admin/api/global-settings",
+            headers={"Authorization": "Bearer management-key"},
+        )
+        assert response.status_code == 200
+
+    def test_admin_settings_toggle_applies_without_restart(
+        self, configured_server, monkeypatch, tmp_path
+    ):
+        from omlx.admin import routes as admin_routes
+
+        server, settings = configured_server
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        settings.auth.allow_unauthenticated_inference = False
+        client = TestClient(server.app)
+        admin = {"Authorization": "Bearer management-key"}
+        assert client.post("/v1/chat/completions", json={}).status_code == 401
+
+        response = client.post(
+            "/admin/api/global-settings",
+            json={"allow_unauthenticated_inference": True},
+            headers=admin,
+        )
+        assert response.status_code == 200, response.text
+        saved = json.loads((tmp_path / "settings.json").read_text())
+        assert saved["auth"]["allow_unauthenticated_inference"] is True
+        auth = client.get("/admin/api/global-settings", headers=admin).json()["auth"]
+        assert auth["allow_unauthenticated_inference"] is True
+        assert client.post("/v1/chat/completions", json={}).status_code == 422
+        assert client.get("/admin/api/global-settings").status_code == 401
+
+    @pytest.mark.parametrize("token", ["sub-key-1234", "wrong-key"])
+    def test_admin_api_rejects_other_bearer_keys(
+        self, configured_server, token, caplog
+    ):
+        server, settings = configured_server
+        settings.auth.sub_keys = [SubKeyEntry(key="sub-key-1234", name="sub")]
+        response = TestClient(server.app, follow_redirects=False).get(
+            "/admin/api/global-settings",
+            headers={"Authorization": f"Bearer {token}", "Accept": "text/html"},
+        )
+        # A rejected key gets 401 even from a browser, never the login redirect.
+        assert response.status_code == 401
+        assert "Rejected admin API key" in caplog.text
 
     def test_tool_routes_execute_without_key(self, configured_server, monkeypatch):
         from types import SimpleNamespace
@@ -717,3 +784,64 @@ class TestUnauthenticatedInference:
         settings.auth.allow_unauthenticated_inference = False
         assert _verify_ws_api_key(None) is False
         assert _verify_ws_api_key("management-key") is True
+
+
+HEADLESS_PROBE = textwrap.dedent("""
+    import json
+    import sys
+    from pathlib import Path
+
+    from fastapi.testclient import TestClient
+
+    from omlx import server
+    from omlx.admin import auth
+    from omlx.admin import routes as admin_routes
+    from omlx.settings import GlobalSettings
+
+    settings = GlobalSettings(base_path=Path(sys.argv[1]))
+    settings.auth.api_key = "main-key-1234"
+    server._server_state.global_settings = settings
+    server._server_state.api_key = "main-key-1234"
+    server._server_state.bind_host = "127.0.0.1"
+    auth._get_global_settings = lambda: settings
+    admin_routes._get_global_settings = lambda: settings
+
+    client = TestClient(server.app, follow_redirects=False)
+    html = {"Accept": "text/html"}
+    status = {
+        "login_page": client.get("/admin", headers=html).status_code,
+        "dashboard": client.get("/admin/dashboard", headers=html).status_code,
+        "static": client.get("/admin/static/favicon.svg").status_code,
+        "auto_login": client.get(
+            "/admin/auto-login", params={"key": "main-key-1234"}
+        ).status_code,
+        "api_html_no_session": client.get(
+            "/admin/api/global-settings", headers=html
+        ).status_code,
+    }
+    client.post("/admin/api/login", json={"api_key": "main-key-1234"})
+    status["api_with_session"] = client.get("/admin/api/global-settings").status_code
+    print(json.dumps(status))
+    """)
+
+
+def test_headless_serves_admin_api_without_pages(tmp_path):
+    env = {**os.environ, "OMLX_HEADLESS": "1", "HOME": str(tmp_path)}
+    env["OMLX_BASE_PATH"] = str(tmp_path / "base")
+    result = subprocess.run(
+        [sys.executable, "-c", HEADLESS_PROBE, str(tmp_path / "base")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    status = json.loads(result.stdout.strip().splitlines()[-1])
+    assert status == {
+        "login_page": 404,
+        "dashboard": 404,
+        "static": 404,
+        "auto_login": 404,
+        "api_html_no_session": 401,
+        "api_with_session": 200,
+    }

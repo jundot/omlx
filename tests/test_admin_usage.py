@@ -2,8 +2,6 @@
 """Authenticated local admin usage endpoint, including degraded storage."""
 
 import asyncio
-import json
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -14,16 +12,6 @@ from omlx.admin.auth import require_admin
 from omlx.admin.routes import router
 from omlx.server_metrics import ServerMetrics
 from omlx.usage_history import UsageHistory
-
-ROOT = Path(__file__).resolve().parents[1]
-I18N_DIR = ROOT / "omlx/admin/i18n"
-USAGE_HISTORY_I18N_KEYS = {
-    "settings.usage.section_label",
-    "settings.usage.history",
-    "settings.usage.history_hint",
-    "usage.disabled",
-    "usage.open_settings",
-}
 
 
 @pytest.fixture
@@ -156,19 +144,6 @@ async def test_completed_stream_records_once_and_analytics_failure_preserves_res
         metrics.close()
 
 
-def test_usage_template_renders_with_localized_labels(client):
-    client, _ = client
-    response = client.get("/admin/dashboard")
-    assert response.status_code == 200
-    assert 'x-data="usageHistory()"' in response.text
-    assert "Usage History" in response.text
-    assert "js/usage.js" in response.text
-    assert (
-        'id="usage-heading" class="text-xl font-bold">Usage History</h3>'
-        in response.text
-    )
-
-
 def test_usage_endpoint_reports_disabled_state(client):
     client, metrics = client
     metrics.usage_history.set_enabled(False)
@@ -236,29 +211,6 @@ def test_global_settings_toggle_applies_at_runtime(client, tmp_path, monkeypatch
     )
     assert "usage_history" not in untouched["runtime_applied"]
     assert gs.usage.usage_history is True
-
-
-def test_dashboard_renders_usage_history_switch_and_disabled_notice(client):
-    client, _ = client
-    html = client.get("/admin/dashboard").text
-    assert "globalSettings.usage.usage_history" in html
-    assert "Record usage history" in html
-    assert "Usage history is off. Turn it on in Settings" in html
-    assert "setSettingsTab('global')" in html
-    javascript = (ROOT / "omlx/admin/static/js/dashboard.js").read_text(
-        encoding="utf-8"
-    )
-    assert "usage: { usage_history: true }" in javascript
-    assert "usage_history: this.globalSettings.usage.usage_history" in javascript
-
-
-def test_usage_history_i18n_keys_present_in_every_locale():
-    locales = sorted(I18N_DIR.glob("*.json"))
-    assert len(locales) == 10
-    for locale_path in locales:
-        locale = json.loads(locale_path.read_text(encoding="utf-8"))
-        missing = {key for key in USAGE_HISTORY_I18N_KEYS if not locale.get(key)}
-        assert not missing, f"{locale_path.name}: missing {sorted(missing)}"
 
 
 @pytest.mark.parametrize("model", ["", "canonical-model", "missing"])

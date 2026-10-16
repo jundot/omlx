@@ -204,7 +204,8 @@ class ModelSettings:
         chat_template_kwargs: Extra chat template keyword arguments.
         forced_ct_kwargs: Keys in chat_template_kwargs that cannot be overridden.
         ttl_seconds: Auto-unload after idle seconds (None = no TTL).
-        model_type_override: "llm", "vlm", "embedding", "reranker", or None (auto-detect).
+        model_type_override: "llm", "vlm", "embedding", "reranker", "decision",
+            or None (auto-detect).
         model_alias: API-visible alternative to the directory name.
         index_cache_freq: IndexCache: every Nth layer keeps indexer (DeepSeek DSA
             only; GLM-5.2 uses its native checkpoint schedule).
@@ -251,6 +252,9 @@ class ModelSettings:
             tensor operations -- M5-series and newer. On anything older the
             kernels do not load and the setting is refused. Decode is
             unaffected. Changes numerics: activations are quantized to INT8.
+            Also covers the routed-expert gate/up of Qwen3.8-Flash-Next
+            (affine Q4 / GS64 experts); the MTP draft layer and the down
+            projection stay on the A16 path.
             Mutually exclusive with qwen35_ane_prefill_enabled.
         qwen35_oq_a8_min_tokens: Shortest sequence routed to the kernels.
         moe_expert_offload_enabled: Stream MoE expert weights from the
@@ -262,31 +266,26 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
-        dflash_enabled: Enable DFlash speculative decoding. Qwen3.5-family VLM
-            targets draft inside the batched engine (Lightning MTP verify path
-            with greedy or sampled acceptance, continuous batching); other
-            targets use the single-stream DFlash engine, which alone honours
-            the max_ctx, cache, window, sink and verify_mode settings below.
-        dflash_draft_model: Path/repo for DFlash draft checkpoint.
+        dflash_enabled: Enable DFlash speculative decoding. Qwen3.5-family,
+            Qwen3, Laguna and MiMo V2 targets, and GLM-5.3, Gemma 4 and Muse
+            Glimmer VLM targets, draft inside the batched engine (Lightning
+            MTP verify path with greedy or sampled acceptance; Qwen3, Laguna,
+            MiMo V2, Gemma 4 and Muse Glimmer speculate for single requests
+            only). Other model types load without DFlash.
+        dflash_draft_model: Path/repo for DFlash draft checkpoint (None = the
+            draft bundled in the target's ``dflash/`` directory, as MiMo V2
+            ships it).
         dflash_draft_quant_enabled: Enable draft model quantization.
         dflash_draft_quant_weight_bits: Quantization weight bits (2, 4, 8).
-        dflash_draft_quant_activation_bits: Quantization activation bits (16, 32).
         dflash_draft_quant_group_size: Quantization group size (32, 64, 128).
-        dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
-        dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
-        dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
-        dflash_in_memory_cache_max_bytes: L1 cache byte budget.
-        dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
-        dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
-        dflash_draft_window_size: Draft model sliding-attention window
-            (None = use the draft checkpoint's sliding_window when present).
-            Helps stabilise acceptance rate on long-context prompts.
-        dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
-            (default 0, disabling sink tokens).
+        dflash_draft_window_size: Context tokens the drafter attends to
+            (None = the draft checkpoint's sliding_window, else 2048).
         dflash_block_size: Draft/verify tokens per cycle (None = checkpoint default).
-        dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
-            (None = dflash default "adaptive"). "adaptive" can shrink block size when
-            acceptance drops.
+        dflash_verify_mode: "adaptive", "dflash" or "off" (None = "adaptive").
+            "adaptive" verifies the number of drafts per cycle that the
+            Lightning MTP depth controllers pick from measured cost and
+            acceptance; "dflash" and "off" verify the whole block. A stored
+            "ddtree" from older versions loads as "adaptive".
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -325,7 +324,7 @@ class ModelSettings:
     )
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = (
-        None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
+        None  # "llm", "vlm", "embedding", "reranker", "decision", or None (auto)
     )
     model_alias: Optional[str] = (
         None  # API-visible name (alternative to directory name)
@@ -340,6 +339,9 @@ class ModelSettings:
     # through mmap. The runtime may force this on when resident loading cannot
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    # Qwen4-Exp only: admit any canonical affine GDN projection recipe to the
+    # fused one-row decode route, not only the oQe allow-list.
+    qwen4_gdn_decode_wide_proj: bool = False
     deepseek_v41_engram_ssd_offload: bool = False
     # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
     # last window-size tokens; decoder global KV is the encoder-final
@@ -388,7 +390,7 @@ class ModelSettings:
     qwen35_ane_prefill_cpu_threads: int = 8
     qwen35_ane_prefill_cpu_shared_resource: bool = True
 
-    # oQ mixed-bit QxA8 prefill kernels for Qwen3.5/3.6/3.8.
+    # oQ mixed-bit QxA8 prefill kernels for Qwen3.5/3.6/3.8 and Qwen3.8 Flash-Next.
     #
     # Off by default because it is an accuracy decision, not just a speed one:
     # activations are quantized to INT8 per row, which the W4/W5A16 path does
@@ -420,30 +422,11 @@ class ModelSettings:
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
     dflash_draft_quant_enabled: Optional[bool] = None
     dflash_draft_quant_weight_bits: Optional[int] = None  # 2, 4, 8
-    dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
     dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
-    dflash_max_ctx: Optional[int] = (
-        None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
-    )
-    # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
-    # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
-    dflash_in_memory_cache: bool = True
-    dflash_in_memory_cache_max_entries: int = (
-        4  # Matches dflash balanced profile default
-    )
-    dflash_in_memory_cache_max_bytes: int = (
-        8 * 1024 * 1024 * 1024
-    )  # 8 GiB (balanced profile default)
-    dflash_ssd_cache: bool = (
-        False  # Requires in-memory cache and an omlx paged SSD cache dir
-    )
-    dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
-    # DFlash runtime tuning knobs. None window size uses the draft checkpoint's
-    # sliding_window when present; sink size defaults to no attention-sink tokens.
+    # None uses the draft checkpoint's sliding_window.
     dflash_draft_window_size: Optional[int] = None
-    dflash_draft_sink_size: Optional[int] = 0
     dflash_block_size: Optional[int] = None
-    dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    dflash_verify_mode: Optional[str] = None  # "adaptive" | "dflash" | "off"
 
     # Lightning MTP uses the embedded head for single and concurrent requests.
     # Equal-depth rows share target verification when supported by the backbone;
@@ -481,10 +464,24 @@ class ModelSettings:
     is_hidden: bool = False  # Hidden from /v1/models (still shown, badged, in admin)
     is_favorite: bool = False  # Listed first in /v1/models and admin lists
 
+    # External engine serving this model instead of oMLX's MLX engines
+    # (omlx/engine/splash.py). None runs the model in-process.
+    external_engine: Optional[str] = None
+
     # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
     # loaders are allowed to execute custom Python from the model repository
     # (modeling_*.py, tokenization_*.py). Off by default — see issue #926.
     trust_remote_code: bool = False
+
+    # Embedding models with an audio tower (EmbeddingGemma 2): load it so
+    # /v1/embeddings accepts items[].audio. Off by default because the tower is
+    # resident even for text-only requests (EmbeddingGemma 2: 0.88 -> 1.46 GB).
+    embedding_audio_enabled: bool = False
+    # Longest audio item, in seconds, an embedding model reads before cutting
+    # the waveform. None keeps the processor default (Gemma 4 audio: 30 s).
+    # The model's context still bounds it: EmbeddingGemma 2 fits about 327 s
+    # (8192 tokens at 40 ms each); longer inputs get the token-limit error.
+    embedding_audio_max_seconds: Optional[float] = None
 
     # Metadata
     display_name: Optional[str] = None
@@ -494,6 +491,9 @@ class ModelSettings:
     def __post_init__(self) -> None:
         # Profiles retain raw JSON types; engine signatures use repr().
         self.turboquant_kv_bits = normalize_turboquant_kv_bits(self.turboquant_kv_bits)
+        # The ddtree verify mode was removed; stored settings run as adaptive.
+        if self.dflash_verify_mode == "ddtree":
+            self.dflash_verify_mode = "adaptive"
         if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
             raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
@@ -808,7 +808,11 @@ class ModelSettingsManager:
                 for model_id, settings in self._settings.items()
             },
         }
+        self._write_settings_file(data)
+        logger.debug(f"Saved settings for {len(self._settings)} models")
 
+    def _write_settings_file(self, data: dict) -> None:
+        """Replace the settings file with ``data`` atomically."""
         # Write to temp file first, then rename for atomicity. The pid in
         # the temp name keeps concurrent processes from sharing a temp path
         # and renaming each other's partial writes into place.
@@ -822,7 +826,6 @@ class ModelSettingsManager:
                 os.fsync(f.fileno())
 
             temp_file.replace(self.settings_file)
-            logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
             logger.error(f"Failed to save settings file: {e}")
@@ -845,6 +848,47 @@ class ModelSettingsManager:
                 return ModelSettings.from_dict(settings.to_dict())
 
             return ModelSettings()
+
+    def has_settings(self, model_id: str) -> bool:
+        """Return True when settings for the model are saved."""
+        with self._lock:
+            return model_id in self._settings
+
+    def add_initial_settings(self, initial: dict[str, dict[str, Any]]) -> list[str]:
+        """Save settings for models that have none yet.
+
+        Only the new records are added to the file. Records already on disk
+        keep their content, including fields or records this build cannot
+        load. Nothing is written when the file cannot be read. Returns the
+        IDs of the models that were added.
+        """
+        with self._lock:
+            pending = [mid for mid in initial if mid not in self._settings]
+            if not pending:
+                return []
+            data: Any = {"version": SETTINGS_VERSION, "models": {}}
+            if self.settings_file.exists():
+                try:
+                    data = json.loads(self.settings_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as e:
+                    logger.warning(f"Initial model settings not saved: {e}")
+                    return []
+            models = data.setdefault("models", {}) if isinstance(data, dict) else None
+            if not isinstance(models, dict):
+                logger.warning("Initial model settings not saved: invalid file")
+                return []
+            added = {
+                mid: ModelSettings.from_dict(initial[mid])
+                for mid in pending
+                if mid not in models
+            }
+            if not added:
+                return []
+            for mid, settings in added.items():
+                models[mid] = settings.to_dict()
+            self._write_settings_file(data)
+            self._settings.update(added)
+            return list(added)
 
     def get_settings_for_request(
         self,
@@ -1649,7 +1693,7 @@ class ModelSettingsManager:
 
     def list_templates(self) -> list[dict]:
         # Shipped JSON seeds were retired in favor of the client-side preset
-        # bundle (`omlx/admin/static/omlx_preset.json`); every entry on this
+        # bundle (`omlx_web/static/omlx_preset.json`); every entry on this
         # surface is user-created. Callers that distinguish presets from
         # user templates do so via the preset bundle, not an `is_builtin`
         # flag on this response.

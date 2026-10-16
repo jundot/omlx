@@ -312,7 +312,7 @@ class OQManager:
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
             mtp_assistant_model_path: Optional checkpoint whose MTP head is
-                merged into the output. A gemma4_assistant donor uses the
+                merged into the output. A Gemma 4 assistant donor uses the
                 assistant merge; any other donor grafts its native
                 Qwen3.5/3.6 mtp.* head (same-geometry, same-tokenizer
                 pairs only). Validated at submission.
@@ -324,6 +324,7 @@ class OQManager:
             ValueError: On invalid inputs or output conflict.
         """
         from ..oq import (
+            GEMMA4_ASSISTANT_TYPES,
             OQ_DTYPES,
             OQ_LEVELS,
             _validate_oq_dtype_for_model,
@@ -378,7 +379,7 @@ class OQManager:
                 )
             with open(assistant / "config.json") as f:
                 assistant_config = json.load(f)
-            if assistant_config.get("model_type") == "gemma4_assistant":
+            if assistant_config.get("model_type") in GEMMA4_ASSISTANT_TYPES.values():
                 validate_gemma4_assistant_pair(config, assistant_config)
             else:
                 validate_mtp_donor_pair(source, assistant)
@@ -421,6 +422,9 @@ class OQManager:
                     f"{'e' if enhanced else ''} "
                     f"({dtype}) is already in progress"
                 )
+            # A failed job removes its output directory.
+            if task.output_path == str(output_path) and task.status in _ACTIVE_STATUSES:
+                raise ValueError(f"Another quantization is writing to {output_path}")
 
         if enhanced:
             if imatrix_num_samples < 1:

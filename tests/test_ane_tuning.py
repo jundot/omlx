@@ -679,6 +679,23 @@ async def test_measure_rejects_candidate_whose_ane_never_executed(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_idle_gdn_branch_is_not_blamed_on_chunk_size(monkeypatch):
+    """MLP ran on the same chunks, so the chunk width cannot be the cause."""
+    pool = _measure_env(monkeypatch, trace=_trace(mlp_ops=126, gdn_ops=0))
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048, repeats=1)
+    )
+    candidate = ane_tuning._Candidate("MLP 50%", True, 0.5, True, 0.5)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await ane_tuning._measure_candidate(run, pool, ModelSettings(), candidate)
+
+    message = str(excinfo.value)
+    assert "mlp=378, gdn=0" in message
+    assert "set sequence_length" not in message
+
+
+@pytest.mark.asyncio
 async def test_measure_accepts_candidate_whose_ane_executed(monkeypatch):
     pool = _measure_env(monkeypatch, trace=_trace(mlp_ops=126))
     run = ane_tuning.create_run(
@@ -817,6 +834,74 @@ async def test_tuner_preserves_partial_matrix_and_failure_reason(monkeypatch):
         "sequence_length": run.request.sequence_length,
         "tail_padding_min_tokens": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_failed_refinement_keeps_the_verified_prediction(monkeypatch):
+    monkeypatch.setattr(
+        ane_tuning, "_fraction_grid", lambda: [0.4, 0.45, 0.5, 0.53, 0.6]
+    )
+    operations = 192
+
+    async def measure(run, pool, settings, candidate):
+        if candidate.label == "Profile-refined optimum":
+            raise RuntimeError("A required ANE branch never executed")
+        tps = 125.0 if candidate.enabled else 100.0
+        return {
+            **ane_tuning._empty_result(candidate),
+            "processing_tps": tps,
+            "samples": [tps],
+            # Rebalances the 0.5 prediction to 0.35, so the refine slot runs.
+            "_profile": {
+                "mlp": {
+                    "operations": operations,
+                    "ane0_eval_ns": 19.0e6 * operations,
+                    "ane1_eval_ns": 19.0e6 * operations,
+                    "gpu_completion_ns": 10.0e6 * operations,
+                }
+            },
+        }
+
+    async def calibrate(run, engine, settings):
+        return ane_tuning._CalibrationChoice(
+            mlp_fraction=0.5,
+            cpu_fraction=0.0,
+            cpu_down_fraction=0.0,
+            gdn_enabled=False,
+            gdn_fraction=None,
+            cpu_enabled=False,
+            cpu_threads=8,
+            cpu_shared_resource=False,
+        )
+
+    monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)
+    monkeypatch.setattr(ane_tuning, "_calibrate_components", calibrate)
+
+    async def get_engine(*args, **kwargs):
+        return object()
+
+    pool = SimpleNamespace(
+        _settings_manager=SimpleNamespace(
+            get_settings=lambda model_id: ModelSettings()
+        ),
+        get_loaded_model_ids=lambda: [],
+        get_engine=get_engine,
+    )
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="qwen", repeats=1)
+    )
+
+    await ane_tuning.run_tuning(run, pool)
+    snapshot = ane_tuning.run_snapshot(run)
+
+    assert run.status == "completed"
+    assert snapshot["results"][ane_tuning._REFINE_SLOT]["state"] == "failed"
+    assert snapshot["recommendation"]["enabled"] is True
+    assert snapshot["recommendation"]["mlp_fraction"] == 0.5
+    assert snapshot["recommendation"]["processing_tps"] == 125.0
+    assert snapshot["termination_reason"].startswith(
+        "Skipped Profile-refined optimum after it failed: RuntimeError"
+    )
 
 
 @pytest.mark.parametrize(

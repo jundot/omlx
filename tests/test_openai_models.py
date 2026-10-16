@@ -797,6 +797,15 @@ class TestCompletionModels:
                 }
             )
 
+    def test_ngram_window_shorter_than_ngram_is_rejected(self):
+        fields = {"no_repeat_ngram_size": 35, "ngram_window": 34}
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest.model_validate(
+                {"model": "m", "messages": [{"role": "user", "content": "hi"}]} | fields
+            )
+        with pytest.raises(ValidationError):
+            CompletionRequest.model_validate({"model": "m", "prompt": "hi"} | fields)
+
     def test_completion_request(self):
         """Test creating completion request."""
         req = CompletionRequest(

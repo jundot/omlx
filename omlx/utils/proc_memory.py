@@ -71,6 +71,7 @@ class _RusageInfoV4(ctypes.Structure):
 
 
 _RUSAGE_INFO_V4 = 4
+_PROC_PGRP_ONLY = 2
 
 
 # task_vm_info from /usr/include/mach/task_info.h (rev7). Metal buffers are
@@ -149,9 +150,12 @@ _TASK_VM_INFO_GRAPHICS_COUNT = (
 ) // 4
 
 _libproc: ctypes.CDLL | None = None
+_libc: ctypes.CDLL | None = None
 _proc_pid_rusage = None
+_proc_listpids = None
 _task_info = None
 _mach_task_self: ctypes.c_uint | None = None
+_malloc_zone_pressure_relief = None
 
 if sys.platform == "darwin":
     try:
@@ -163,10 +167,20 @@ if sys.platform == "darwin":
             ctypes.c_void_p,
         ]
         _proc_pid_rusage.restype = ctypes.c_int
+
+        _proc_listpids = _libproc.proc_listpids
+        _proc_listpids.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        _proc_listpids.restype = ctypes.c_int
     except OSError as e:
         logger.warning(f"libproc unavailable, phys_footprint will return 0: {e}")
         _libproc = None
         _proc_pid_rusage = None
+        _proc_listpids = None
     try:
         _libc = ctypes.CDLL("/usr/lib/libc.dylib")
         _task_info = _libc.task_info
@@ -182,6 +196,13 @@ if sys.platform == "darwin":
         logger.debug(f"task_info unavailable, graphics footprint will return 0: {e}")
         _task_info = None
         _mach_task_self = None
+    if _libc is not None:
+        try:
+            _malloc_zone_pressure_relief = _libc.malloc_zone_pressure_relief
+            _malloc_zone_pressure_relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        except AttributeError as e:
+            logger.debug(f"malloc_zone_pressure_relief unavailable: {e}")
+            _malloc_zone_pressure_relief = None
 
 
 def get_phys_footprint(pid: int | None = None) -> int:
@@ -256,3 +277,32 @@ def get_graphics_footprint() -> int:
     if rc != 0 or count.value < _TASK_VM_INFO_GRAPHICS_COUNT:
         return 0
     return max(0, int(info.ledger_tag_graphics_footprint))
+
+
+def release_free_malloc_memory() -> None:
+    """Return freed malloc pages to the OS.
+
+    macOS malloc keeps freed blocks in phys_footprint, nearly all of them when
+    they sit between live blocks.
+    """
+    if _malloc_zone_pressure_relief is not None:
+        _malloc_zone_pressure_relief(None, 0)
+
+
+def list_process_group_pids(pgid: int) -> list[int]:
+    """Return the process IDs in process group ``pgid``.
+
+    Returns an empty list off Darwin, without libproc, or when the call fails.
+    """
+    if _proc_listpids is None or pgid <= 0:
+        return []
+    # A NULL buffer asks for the required buffer size in bytes.
+    size = _proc_listpids(_PROC_PGRP_ONLY, pgid, None, 0)
+    if size <= 0:
+        return []
+    buf = (ctypes.c_int * (size // ctypes.sizeof(ctypes.c_int)))()
+    ret = _proc_listpids(_PROC_PGRP_ONLY, pgid, buf, size)
+    if ret <= 0:
+        return []
+    count = ret // ctypes.sizeof(ctypes.c_int)
+    return [buf[i] for i in range(count) if buf[i] > 0]
