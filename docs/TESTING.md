@@ -2,6 +2,15 @@
 
 Server tests live in `tests/` and must not depend on `apps/`: after the full run, CI deletes `apps/`, collects the server tests again, and starts `omlx serve` to check the API-only fallback. Web UI tests live in `apps/omlx-web/tests/` and the macOS app's Python tests in `apps/omlx-mac/Tests/python/`. A plain `pytest` runs all three through `testpaths`. The standalone dashboard script tests are the `apps/omlx-web/tests/*.test.cjs` files except `network_auth_ui.test.cjs`, which `test_admin_network_auth_ui.py` runs with its input.
 
+# Packed-prefill admission
+
+Run `python -m pytest -q tests/test_scheduler_chunked_prefill.py tests/test_decode_fairness.py tests/test_scheduler_prefill_memory_guard.py`.
+Short lone prompts that fit one contended chunk keep one-call admission;
+waiting/in-flight companions, longer prompts and explicit chunked prefill retain
+packing. For a real-server check, overlap a short cached-prefix turn with decode,
+verify the admission route, and compare first text plus the existing reply's
+throughput using the same model, settings, prefix and cache warmup in both arms.
+
 # Qwen3-ASR audio quantization tests
 
 Run `python -m pytest -q tests/test_audio_stt.py -k Qwen3ASRAudioQuantization` to check Qwen3-ASR audio quantization through the STT loader. Small local checkpoints cover mixed 4-bit text and 8-bit audio weights and floating-point audio layers. No model download is required.

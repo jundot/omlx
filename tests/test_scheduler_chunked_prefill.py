@@ -2458,9 +2458,9 @@ def test_packed_rows_emit_their_own_boundary_snapshots(monkeypatch):
     "chunked, contended, min_row, cap_fits, excluded, packed",
     [
         (True, False, 1, True, False, True),
-        # Decode fairness chunks prompts under contention even when chunked
-        # prefill is off, so those prompts pack too.
-        (False, True, 1, True, False, True),
+        # A lone short prompt fits one contended chunk; fairness alone does
+        # not defer its first forward when there is nothing to pack with.
+        (False, True, 1, True, False, False),
         (False, False, 1, True, False, False),
         (True, False, 64, True, False, False),
         # The resumable path holds the last token back: 2 tokens < 3.
@@ -2524,3 +2524,57 @@ def test_packed_rows_activate_their_own_priming_slot_for_tail_snapshots(monkeypa
     tails = [i for i, event in enumerate(events) if event[0] == "tail"]
     assert [events[i][1] for i in tails] == ["a", "b", "a", "b"]
     assert all(events[i - 1] == ("activate", events[i][1]) for i in tails)
+
+
+@pytest.mark.parametrize(
+    "chunked,n_tokens,peer,packed",
+    [
+        (False, 3, None, False),
+        (False, 5, None, False),  # Four prefill tokens plus held last token.
+        (False, 6, None, True),
+        (False, 3, "waiting", True),
+        (False, 3, "prefilling", True),
+        (True, 3, None, True),
+    ],
+)
+def test_fairness_short_admission_needs_a_potential_pack_companion(
+    monkeypatch, chunked, n_tokens, peer, packed
+):
+    sched = _make_scheduler(chunked_prefill=chunked, step_size=4)
+    sched._packed_min_row_tokens = 1
+    monkeypatch.setattr(Scheduler, "_packed_prefill_ready", lambda self: True)
+    monkeypatch.setattr(Scheduler, "_decode_contention", lambda self: True)
+    monkeypatch.setattr(Scheduler, "_packing_fits_contended_cap", lambda self: True)
+    monkeypatch.setattr(sched, "_prefill_step_size_for_progress", lambda *args: 4)
+    req = _make_request("short-alone", n_tokens=n_tokens)
+    sched.add_request(req)
+    companion = _make_request("companion", n_tokens=3)
+    if peer == "waiting":
+        sched.add_request(companion)
+    elif peer == "prefilling":
+        sched.prefilling.append(companion)
+        sched._prefill_states[companion.request_id] = _make_prefill_state(
+            sched, companion, 2
+        )
+    begun = []
+
+    def begin(request, tokens, cache):
+        begun.append(request.request_id)
+        return _make_prefill_state(sched, request, len(tokens) - 1)
+
+    with (
+        patch.object(sched, "_begin_prefill", side_effect=begin),
+        patch.object(sched, "_step_prefill_chunk") as step,
+        patch.object(
+            sched, "_do_external_prefill", side_effect=_PrefillAbortedError([], 0)
+        ) as external,
+    ):
+        sched._schedule_waiting()
+    step.assert_not_called()
+    assert (req.request_id in begun) is packed
+    assert (req in sched.prefilling) is packed
+    assert (req.request_id in sched._prefill_states) is packed
+    assert external.called is not packed
+    if peer == "waiting":
+        assert set(begun) == {req.request_id, companion.request_id}
+        assert companion in sched.prefilling

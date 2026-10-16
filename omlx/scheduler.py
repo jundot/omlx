@@ -13029,8 +13029,10 @@ class Scheduler:
                     if force_chunk
                     else self.config.prefill_step_size
                 )
-                # Prompts that would take the resumable path anyway also take
-                # it when short, so they can join other requests' forwards.
+                # Under decode fairness, a prompt that fits one contended
+                # chunk need not become resumable unless another prefill can
+                # potentially share its forward. Explicit chunked prefill
+                # keeps its existing packing behavior.
                 packed = (
                     vlm_embeds is None
                     and not request.packed_prefill_excluded
@@ -13039,6 +13041,12 @@ class Scheduler:
                     # The resumable path holds the last prompt token back.
                     and len(tokens_to_process) > self._packed_min_row_tokens
                     and Scheduler._packing_fits_contended_cap(self)
+                    and (
+                        self.config.chunked_prefill
+                        or len(tokens_to_process) > chunk_threshold + 1
+                        or bool(self.prefilling)
+                        or bool(self.waiting)
+                    )
                 )
                 if packed or (
                     (self.config.chunked_prefill or force_chunk)
