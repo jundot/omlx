@@ -267,6 +267,11 @@ def detect_transports(
 
     transports: list[TransportInfo] = []
     physical_edges: set[tuple[int, int]] = set()
+    # #3021/#3030: a probe that could not run is "unknown", never a measured
+    # Ethernet link. transports_are_fast_enough reads an empty result as
+    # unknown and declines to refuse; a fabricated Ethernet is a refusal on
+    # evidence that was never gathered.
+    probe_failed = False
 
     # Try Thunderbolt connectivity
     try:
@@ -300,8 +305,8 @@ def detect_transports(
                             )
                         )
     except Exception:
-        # Thunderbolt detection failed — degrade to Ethernet
-        pass
+        # Thunderbolt detection failed — unknown, NOT measured Ethernet.
+        probe_failed = True
 
     # Check RDMA
     try:
@@ -335,11 +340,13 @@ def detect_transports(
                     )
                 )
     except Exception:
-        # RDMA detection failed — skip
-        pass
+        # RDMA detection failed — also unknown, not measured Ethernet.
+        probe_failed = True
 
-    # If no transports detected, assume Ethernet
-    if not transports:
+    # If no transports detected AND every probe ran, Ethernet is the measured
+    # answer. A failed probe returns "unknown" (empty) instead of a
+    # fabricated measurement that would refuse tensor parallelism (#3021).
+    if not transports and not probe_failed:
         for i, _host in enumerate(hosts):
             for j, peer_host in enumerate(hosts):
                 if i == j:
