@@ -90,27 +90,32 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(vm.currentSettingsDict()[ProfileSettingsKey.mtpAdaptiveMaxDepth])
     }
 
-    func testLightningMtpEditIsNotSavedToGlobalProfile() async {
+    func testProfileFieldEditAutoSavesWithoutAProfile() async {
         let vm = ModelSettingsScreenVM()
-        vm.resetWorkingBaseline()
-        vm.temperature = "0.7"
-        vm.markProfileDirty()
-        XCTAssertFalse(vm.hasModelSpecificEdits)
-        XCTAssertEqual(vm.defaultSaveAsScope, .global)
-
-        vm.mtpEnabled = true
-        XCTAssertTrue(vm.hasModelSpecificEdits)
-        XCTAssertEqual(vm.defaultSaveAsScope, .model)
-
-        // Global templates keep only universal keys, so both writes must stop
-        // before any request instead of dropping mtp_enabled.
+        vm.autoSaveDelay = .zero
+        // The closed port only wires the client; every request fails.
         let client = OMLXClient(host: "127.0.0.1", port: 9)
-        await vm.saveWorkingAs(scope: .global, name: "mtp", client: client)
-        XCTAssertTrue(vm.lastError?.contains("Model profile") == true)
+        await vm.load(modelID: "m", client: client)
+        vm.resetWorkingBaseline()
         vm.lastError = nil
-        await vm.updateProfileWithWorking(scope: .global, name: "mtp", client: client)
-        XCTAssertTrue(vm.lastError?.contains("Model profile") == true)
-        XCTAssertTrue(vm.profileDirty)
+        let temperature = vm.bindProfile(Binding(
+            get: { vm.temperature },
+            set: { vm.temperature = $0 }
+        ))
+
+        // An invalid value is reported and never sent.
+        temperature.wrappedValue = "-1"
+        await vm.waitForAutoSave()
+        guard case .failure(let invalid) = SamplingValidator.temperature("-1") else {
+            return XCTFail("negative temperature must fail validation")
+        }
+        XCTAssertEqual(vm.lastError, invalid.message)
+
+        // A valid value is written, so the closed port reports a transport error.
+        temperature.wrappedValue = "0.7"
+        await vm.waitForAutoSave()
+        XCTAssertNotNil(vm.lastError)
+        XCTAssertNotEqual(vm.lastError, invalid.message)
     }
 
     func testVlmMtpDraftModelOptionsIncludeQwenMtpConfigType() {
@@ -562,7 +567,286 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertNil(qwen["qwen35_ane_prefill_shared_fraction"])
     }
 
-    private func makeModel(id: String, configModelType: String?) -> ModelDTO {
+    func testMtplxImportIsOfferedOnlyForTheServerSideSidecarMarker() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(
+            id: "Qwen3.8-27B-MTPLX-Optimized-Speed",
+            configModelType: "qwen3_5",
+            mtpCompatible: false,
+            mtpCompatibilityReason: "MTPLX side-car detected but not imported. Import it to merge the MTP head into the checkpoint index."
+        )
+        XCTAssertTrue(vm.canImportMtplxSidecar)
+
+        vm.model = makeModel(
+            id: "missing-mtp",
+            configModelType: "qwen3_5",
+            mtpCompatible: false,
+            mtpCompatibilityReason: "Config declares MTP layers but the weight files contain neither mtp.* tensors nor native nextn layers."
+        )
+        XCTAssertFalse(vm.canImportMtplxSidecar)
+
+        vm.model = makeModel(
+            id: "already-compatible",
+            configModelType: "qwen3_5",
+            mtpCompatible: true,
+            mtpCompatibilityReason: "MTPLX side-car detected but not imported."
+        )
+        XCTAssertFalse(vm.canImportMtplxSidecar)
+    }
+
+    func testMtplxImportEndpointUsesModelScopedAdminRoute() {
+        XCTAssertEqual(
+            AdminAPI.importMtplx("Qwen3.8-27B-MTPLX-Optimized-Speed"),
+            "/admin/api/models/Qwen3.8-27B-MTPLX-Optimized-Speed/import-mtplx"
+        )
+    }
+
+    func testPagesFollowModelTypeAndSummarizeEnabledFeatures() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "llm", configModelType: "qwen3_5")
+        XCTAssertTrue(vm.showsGenerationSection)
+        XCTAssertTrue(vm.showsEnginePages)
+
+        vm.model = makeModel(id: "embed", configModelType: "bert", modelType: "embedding")
+        XCTAssertFalse(vm.showsGenerationSection)
+        XCTAssertFalse(vm.showsEnginePages)
+
+        vm.model = makeModel(id: "diffusion", configModelType: "diffusion_gemma")
+        XCTAssertTrue(vm.showsGenerationSection)
+        XCTAssertFalse(vm.showsEnginePages)
+
+        vm.model = makeModel(id: "llm", configModelType: "qwen3_5")
+        vm.mtpEnabled = true
+        vm.dflashEnabled = true
+        vm.vlmMtpEnabled = true
+        // CED prefill only counts on the family that shows its row.
+        vm.deepseekV41CedPrefillEnabled = true
+        XCTAssertEqual(vm.enabledFeatures(on: .acceleration).count, 3)
+        XCTAssertEqual(ModelSettingsScreenVM.summary(["A", "B", "C"], empty: "Off"), "A, B +1")
+        XCTAssertEqual(ModelSettingsScreenVM.summary(["A"], empty: "Off"), "A")
+        XCTAssertEqual(ModelSettingsScreenVM.summary([], empty: "Off"), "Off")
+
+        let summary = vm.summary(for: .acceleration)
+        vm.externalEngine = "splash"
+        XCTAssertNotEqual(vm.summary(for: .acceleration), summary)
+    }
+
+    func testRejectedAutoSaveRestoresTheStoredValues() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RejectingSettingsURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = OMLXClient(host: "127.0.0.1", port: 18160, session: session)
+        let vm = ModelSettingsScreenVM()
+        vm.autoSaveDelay = .zero
+        await vm.load(modelID: "m", client: client)
+        XCTAssertNil(vm.lastError)
+        XCTAssertTrue(vm.mtpEnabled)
+
+        let dflash = vm.bindProfile(Binding(
+            get: { vm.dflashEnabled },
+            set: { vm.dflashEnabled = $0 }
+        ))
+        dflash.wrappedValue = true
+        await vm.waitForAutoSave()
+
+        XCTAssertFalse(vm.dflashEnabled)
+        XCTAssertFalse(vm.profileDirty)
+        XCTAssertTrue(vm.lastError?.contains("cannot both be enabled") == true)
+    }
+
+    func testLightningMtpAndDflashLockEachOther() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "qwen", configModelType: "qwen3_5")
+        vm.mtpEnabled = true
+        XCTAssertNotNil(vm.dflashConflictReason)
+        XCTAssertNil(vm.mtpConflictReason)
+
+        vm.mtpEnabled = false
+        vm.dflashEnabled = true
+        XCTAssertNotNil(vm.mtpConflictReason)
+        XCTAssertNil(vm.dflashConflictReason)
+    }
+
+    func testMoeExpertOffloadLocksSpeculativeDecodersUnlessMtpHeadStaysResident() {
+        let vm = ModelSettingsScreenVM()
+        var model = makeModel(id: "moe", configModelType: "qwen3_moe")
+        model.moeExpertOffloadSupported = true
+        vm.model = model
+        vm.moeExpertOffloadEnabled = true
+        XCTAssertNotNil(vm.mtpConflictReason)
+        XCTAssertNotNil(vm.dflashConflictReason)
+        XCTAssertNotNil(vm.vlmMtpConflictReason)
+
+        vm.model?.moeOffloadAllowsMtp = true
+        XCTAssertNil(vm.mtpConflictReason)
+        XCTAssertNotNil(vm.dflashConflictReason)
+
+        vm.moeExpertOffloadEnabled = false
+        vm.mtpEnabled = true
+        XCTAssertNil(vm.moeExpertOffloadConflictReason)
+        vm.model?.moeOffloadAllowsMtp = false
+        XCTAssertNotNil(vm.moeExpertOffloadConflictReason)
+    }
+
+    func testMoeResidentPercentIsSavedAsFractionAndValidated() async {
+        let vm = ModelSettingsScreenVM()
+        var model = makeModel(id: "moe", configModelType: "qwen3_moe")
+        model.moeExpertOffloadSupported = true
+        vm.model = model
+        vm.resetWorkingBaseline()
+        vm.moeExpertOffloadEnabled = true
+        vm.moeExpertOffloadResidentPercent = "30"
+        vm.refreshProfileDirty()
+
+        let settings = vm.currentSettingsDict()
+        XCTAssertEqual(settings[ProfileSettingsKey.moeExpertOffloadEnabled]?.value as? Bool, true)
+        XCTAssertEqual(settings[ProfileSettingsKey.moeExpertOffloadResidentFraction]?.value as? Double, 0.3)
+
+        // An out-of-range edit stops the profile write before any request.
+        vm.moeExpertOffloadResidentPercent = "2"
+        XCTAssertNil(vm.moeExpertOffloadResidentFraction)
+        await vm.saveWorkingAs(scope: .model, name: "moe",
+                               client: OMLXClient(host: "127.0.0.1", port: 9))
+        XCTAssertEqual(vm.lastError, vm.moeResidentRangeError)
+    }
+
+    func testGuidedGrammarIsUniversalProfileSettingAndBlocksVlmMtp() {
+        let vm = ModelSettingsScreenVM()
+        vm.resetWorkingBaseline()
+        vm.guidedGrammarEnabled = true
+        vm.guidedGrammar = #"root ::= "YES""#
+        vm.refreshProfileDirty()
+
+        // Applying a profile resets missing universal keys, so the grammar
+        // must travel with every profile write.
+        let settings = vm.currentSettingsDict()
+        XCTAssertEqual(settings[ProfileSettingsKey.guidedGrammarEnabled]?.value as? Bool, true)
+        XCTAssertEqual(settings[ProfileSettingsKey.guidedGrammar]?.value as? String, #"root ::= "YES""#)
+        XCTAssertTrue(ProfileSettingsKey.templateKeys.contains(ProfileSettingsKey.guidedGrammar))
+
+        XCTAssertTrue(vm.vlmMtpProcessorConflict)
+        XCTAssertNotNil(vm.vlmMtpConflictReason)
+    }
+
+    func testForcedSsdNgramOffloadKeepsTheStoredChoice() async throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let model = try decoder.decode(ModelDTO.self, from: Data(#"{"id":"dsv41","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"deepseek_v41","deepseek_v41_engram_ssd_offload_supported":true,"deepseek_v41_engram_ssd_offload_forced":true,"moe_expert_offload_supported":true,"moe_offload_allows_mtp":true}"#.utf8))
+        XCTAssertEqual(model.moeOffloadAllowsMtp, true)
+
+        let vm = ModelSettingsScreenVM()
+        vm.model = model
+        vm.deepseekV41EngramSsdOffloadSupported = true
+        vm.deepseekV41EngramSsdOffloadForced = true
+        XCTAssertTrue(vm.ssdNgramOffloadSupported)
+        XCTAssertTrue(vm.ssdNgramOffloadForced)
+        vm.ssdNgramOffload = true
+        XCTAssertTrue(vm.deepseekV41EngramSsdOffload)
+
+        // Forced: nothing is sent, so the closed port never reports an error.
+        let client = OMLXClient(host: "127.0.0.1", port: 9)
+        await vm.save(.ssdNgramOffload, client: client)
+        XCTAssertNil(vm.lastError)
+        vm.deepseekV41EngramSsdOffloadForced = false
+        await vm.save(.ssdNgramOffload, client: client)
+        XCTAssertNotNil(vm.lastError)
+
+        var patch = ModelSettingsPatch()
+        patch.deepseekV41EngramSsdOffload = true
+        patch.deepseekV41CedPrefillEnabled = true
+        patch.qwen4GdnDecodeWideProj = true
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try JSONSerialization.jsonObject(with: encoder.encode(patch)) as? [String: Any]
+        XCTAssertEqual(object?["deepseek_v41_engram_ssd_offload"] as? Bool, true)
+        XCTAssertEqual(object?["deepseek_v41_ced_prefill_enabled"] as? Bool, true)
+        XCTAssertEqual(object?["qwen4_gdn_decode_wide_proj"] as? Bool, true)
+    }
+
+    func testUndoingAnEditClearsTheUnsavedState() {
+        let vm = ModelSettingsScreenVM()
+        vm.resetWorkingBaseline()
+        let binding = vm.bindProfile(Binding(
+            get: { vm.mtpEnabled },
+            set: { vm.mtpEnabled = $0 }
+        ))
+        binding.wrappedValue = true
+        XCTAssertTrue(vm.profileDirty)
+        binding.wrappedValue = false
+        XCTAssertFalse(vm.profileDirty)
+    }
+
+    func testDirectSaveSendsNullForClearedFields() throws {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "m", configModelType: "qwen3_5")
+        vm.temperature = "0.6"
+
+        let body = vm.workingSettingsBody()
+        XCTAssertEqual(body[ProfileSettingsKey.temperature]?.value as? Double, 0.6)
+        XCTAssertEqual(body[ProfileSettingsKey.indexCacheFreq]?.value as? Int, 0)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let object = try JSONSerialization.jsonObject(with: encoder.encode(body)) as? [String: Any]
+        XCTAssertTrue(object?["top_p"] is NSNull)
+        XCTAssertTrue(object?["reasoning_parser"] is NSNull)
+        XCTAssertTrue(object?["mtp_fixed_depth"] is NSNull)
+        XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, false)
+    }
+
+    func testQwenInt8RowNeedsSupportedHardwareUnlessAlreadyOn() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        func model(_ extra: String) throws -> ModelDTO {
+            try decoder.decode(ModelDTO.self, from: Data(#"{"id":"q","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"qwen3_5"\#(extra)}"#.utf8))
+        }
+        let vm = ModelSettingsScreenVM()
+        vm.model = try model(#","qwen35_oq_a8_supported":false"#)
+        XCTAssertTrue(vm.isQwenOqA8Model)
+        XCTAssertFalse(vm.showsQwenOqA8)
+        vm.model = try model(#","qwen35_oq_a8_supported":true"#)
+        XCTAssertTrue(vm.showsQwenOqA8)
+        vm.model = try model(#","qwen35_oq_a8_supported":false,"settings":{"qwen35_oq_a8_enabled":true}"#)
+        XCTAssertTrue(vm.showsQwenOqA8)
+    }
+
+    func testLoadDefaultsStagesGenerationFieldsOnly() {
+        let vm = ModelSettingsScreenVM()
+        vm.maxTokens = "512"
+        vm.minP = "0.1"
+        vm.forceSampling = true
+        vm.ttlSeconds = "600"
+        vm.mtpEnabled = true
+        vm.resetWorkingBaseline()
+
+        let defaults = GenerationConfigDTO(
+            maxContextWindow: 32768, temperature: 0.6, topP: 0.95, topK: 20
+        )
+        vm.applyGenerationDefaults(defaults)
+        XCTAssertEqual(vm.contextLength, "32768")
+        XCTAssertEqual(vm.temperature, "0.6")
+        XCTAssertEqual(vm.topP, "0.95")
+        XCTAssertEqual(vm.topK, "20")
+        XCTAssertEqual(vm.repetitionPenalty, "")
+        XCTAssertEqual(vm.maxTokens, "")
+        XCTAssertEqual(vm.minP, "")
+        XCTAssertFalse(vm.forceSampling)
+        XCTAssertEqual(vm.ttlSeconds, "600")
+        XCTAssertTrue(vm.mtpEnabled)
+        XCTAssertTrue(vm.profileDirty)
+
+        vm.resetWorkingBaseline()
+        vm.applyGenerationDefaults(defaults)
+        XCTAssertFalse(vm.profileDirty)
+    }
+
+    private func makeModel(
+        id: String,
+        configModelType: String?,
+        modelType: String? = nil,
+        mtpCompatible: Bool? = nil,
+        mtpCompatibilityReason: String? = nil
+    ) -> ModelDTO {
         var model = ModelDTO(
             id: id,
             displayName: nil,
@@ -577,15 +861,14 @@ final class ModelSettingsScreenVMTests: XCTestCase {
             isDefault: nil,
             isFavorite: nil,
             engineType: nil,
-            modelType: nil,
+            modelType: modelType,
             configModelType: configModelType,
             modelContextLength: nil,
             thinkingDefault: nil,
             dflashCompatible: nil,
             dflashCompatibilityReason: nil,
-            dflashSsdCacheAvailable: nil,
-            mtpCompatible: nil,
-            mtpCompatibilityReason: nil,
+            mtpCompatible: mtpCompatible,
+            mtpCompatibilityReason: mtpCompatibilityReason,
             qwen4PleSsdOffloadSupported: nil,
             qwen4PleSsdOffloadForced: nil,
             qwen4PleResidentBytes: nil,
@@ -603,4 +886,47 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         model.anePrefillSharedFractions = [0, 1.0 / 3.0, 1]
         return model
     }
+}
+
+/// Serves one model with Lightning MTP on and rejects every settings write
+/// the way the server rejects an MTP + DFlash pair.
+private final class RejectingSettingsURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            let path = request.url?.path ?? ""
+            var status = 200
+            let body: Data
+            switch path {
+            case "/admin/api/models":
+                body = Data(#"{"models":[{"id":"m","loaded":false,"is_loading":false,"estimated_size":0,"config_model_type":"qwen3_5","settings":{"mtp_enabled":true}}]}"#.utf8)
+            case "/admin/api/models/m/profiles":
+                body = Data(#"{"profiles":[]}"#.utf8)
+            case "/admin/api/profile-templates":
+                body = Data(#"{"templates":[]}"#.utf8)
+            case "/admin/api/global-settings":
+                body = try Data(contentsOf: URL(fileURLWithPath: #filePath)
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("Fixtures/global-settings.json"))
+            case "/admin/api/models/m/settings":
+                status = 400
+                body = Data(#"{"detail":"MTP and DFlash cannot both be enabled; choose one speculative-decoding path."}"#.utf8)
+            default:
+                status = 404
+                body = Data()
+            }
+            let response = HTTPURLResponse(url: request.url!, statusCode: status,
+                                           httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }

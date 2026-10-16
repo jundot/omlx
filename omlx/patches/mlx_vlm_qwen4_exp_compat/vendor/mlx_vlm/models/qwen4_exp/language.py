@@ -42,7 +42,6 @@ from ..qwen3_5.language import (
     Qwen3_5Attention,
     Qwen3_5GatedDeltaNet,
     _create_qwen3_5_attention_mask,
-    _create_qwen3_5_ssm_mask,
 )
 from ..qwen3_5 import language as q35_language
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
@@ -3211,7 +3210,10 @@ def _ple_require_owner(owner_pid=None):
         )
 
 
-_PLE_IO_POOL = ThreadPoolExecutor(max_workers=48, thread_name_prefix="ple-io")
+_PLE_IO_WORKERS = 48
+_PLE_IO_POOL = ThreadPoolExecutor(
+    max_workers=_PLE_IO_WORKERS, thread_name_prefix="ple-io"
+)
 _PLE_PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 # Slow gathers may indicate page eviction. Allow normal gather overhead and
 # rate-limit retries; elapsed time is a heuristic, not a residency check.
@@ -3305,7 +3307,8 @@ class _SafeTensorMMap:
             buffer=self._mapping,
             offset=self._data_start + start,
         )
-        copied = np.array(view[row_indices], copy=True)
+        # Integer-array indexing already copies the selected rows out of mmap.
+        copied = view[row_indices]
         if gather_start is not None:
             self._rearm_if_slow(time.perf_counter() - gather_start, row_indices.size)
         return copied, dtype
@@ -3337,28 +3340,32 @@ class _SafeTensorMMap:
             return True
         fd = self._file.fileno()
 
-        def touch(page: int) -> None:
-            offset = int(page) * _PLE_PAGE_SIZE
-            remaining = _PLE_PAGE_SIZE
-            while remaining > 0:
-                chunk = os.pread(fd, remaining, offset + (_PLE_PAGE_SIZE - remaining))
-                if not chunk:
-                    break
-                remaining -= len(chunk)
+        def touch(pages) -> None:
+            for page in pages:
+                offset = int(page) * _PLE_PAGE_SIZE
+                remaining = _PLE_PAGE_SIZE
+                while remaining > 0:
+                    chunk = os.pread(
+                        fd, remaining, offset + (_PLE_PAGE_SIZE - remaining)
+                    )
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
 
         # #3602 (Matt Barnson) uses submit/wait to drain failed page batches.
         # Also drain partial submission here before releasing the reader mutex;
         # otherwise close could recycle an FD still used by another page read.
         futures = []
         try:
-            for page in fresh.tolist():
-                futures.append(_PLE_IO_POOL.submit(touch, int(page)))
+            # Preserve page-read parallelism without one Future per page.
+            task_count = min(fresh.size, _PLE_IO_WORKERS)
+            for index in range(task_count):
+                futures.append(_PLE_IO_POOL.submit(touch, fresh[index::task_count]))
             for future in futures:
                 future.result()
         finally:
             wait(futures)
-        for page in fresh.tolist():
-            self._seen_pages[page] = 1
+        seen[fresh] = 1
         return False
 
     def _rearm_if_slow(self, elapsed: float, row_count: int) -> None:
@@ -4416,7 +4423,9 @@ class Qwen4ExpModel(nn.Module):
             cache = [None] * len(self.layers)
 
         fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
+        ssm_mask = q35_language._create_qwen3_5_ssm_mask(
+            hidden_states, cache[self.ssm_idx]
+        )
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
             ssm_mask = mask
 

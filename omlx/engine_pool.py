@@ -75,12 +75,14 @@ from .model_settings import (
 from .patches.qwen35_yarn import yarn_factor
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
+from .speculative.dflash import context_bytes_per_row, load_dflash_drafter
 from .utils.fatal import exit_if_gpu_submissions_ignored
 from .utils.generation_config import SAMPLING_SETTING_KEYS, load_sampling_defaults
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import (
-    dflash_batched_requested,
+    bundled_dflash_draft,
     dflash_batched_supported,
+    dflash_draft_for,
     lightning_mtp_supported,
 )
 from .utils.proc_memory import get_phys_footprint
@@ -240,7 +242,11 @@ def _settled_phys_footprint() -> int:
 
 
 def _is_metal_out_of_memory(exc: BaseException | None) -> bool:
-    while exc is not None:
+    # Track visited exceptions: a cause chain can loop (an exception raised
+    # ``from`` itself), and this runs on the event loop during a failed load.
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
         text = str(exc)
         if (
             "kIOGPUCommandBufferCallbackErrorOutOfMemory" in text
@@ -624,15 +630,17 @@ class EnginePool:
                         getattr(runtime_settings, "mtp_enabled", False)
                     ),
                 )
-        if dflash_batched_requested(runtime_settings) and dflash_batched_supported(
+        drafter_id = dflash_draft_for(runtime_settings, entry.model_path)
+        if drafter_id and dflash_batched_supported(
             entry.config_model_type, entry.engine_type
         ):
-            extra += self._dflash_drafter_estimated_bytes(runtime_settings)
+            extra += self._dflash_drafter_estimated_bytes(drafter_id, runtime_settings)
         return base + extra
 
-    def _dflash_drafter_estimated_bytes(self, runtime_settings: object) -> int:
+    def _dflash_drafter_estimated_bytes(
+        self, drafter_id: str, runtime_settings: object
+    ) -> int:
         """Weights of the batched DFlash drafter plus its per-row context rings."""
-        drafter_id = getattr(runtime_settings, "dflash_draft_model", None) or ""
         drafter_entry = self._entries.get(drafter_id)
         path = Path(drafter_entry.model_path if drafter_entry else drafter_id)
         try:
@@ -647,7 +655,14 @@ class EnginePool:
             # codebooks stay unquantized, so keep a third as headroom.
             weights = int(weights * max(bits / 16 + 0.05, 0.34))
         rows = int(getattr(self._scheduler_config, "max_num_seqs", 8) or 8)
-        return weights + rows * 48 * 1024 * 1024
+        try:
+            config = json.loads((path / "config.json").read_text())
+            row_bytes = context_bytes_per_row(
+                config, getattr(runtime_settings, "dflash_draft_window_size", None)
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            row_bytes = 48 * 1024 * 1024
+        return weights + rows * row_bytes
 
     def _resident_leaves_no_prompt_room(self, estimate: object, ceiling: int) -> bool:
         """Whether a resident load would sit above the prompt admission line.
@@ -1105,6 +1120,10 @@ class EnginePool:
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
+            add(
+                "qwen4_gdn_decode_wide_proj",
+                getattr(settings, "qwen4_gdn_decode_wide_proj", False),
+            )
             v41_offload, _, _ = self._deepseek_v41_engram_offload_status(
                 entry, settings
             )
@@ -1223,9 +1242,7 @@ class EnginePool:
         dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
         dflash_draft = data.get("dflash_draft_model")
         if dflash_enabled and not dflash_draft and entry is not None:
-            from .patches.dflash_mimo_v2 import resolve_bundled_mimo_draft
-
-            dflash_draft = resolve_bundled_mimo_draft(entry.model_path, dflash_draft)
+            dflash_draft = bundled_dflash_draft(entry.model_path)
         dflash_active = dflash_enabled and bool(dflash_draft)
         add("dflash_enabled", dflash_active)
         if dflash_active:
@@ -1240,30 +1257,10 @@ class EnginePool:
                     data.get("dflash_draft_quant_weight_bits", 4),
                 )
                 add(
-                    "dflash_draft_quant_activation_bits",
-                    data.get("dflash_draft_quant_activation_bits", 16),
-                )
-                add(
                     "dflash_draft_quant_group_size",
                     data.get("dflash_draft_quant_group_size", 64),
                 )
-            add("dflash_max_ctx", data.get("dflash_max_ctx"))
-            add("dflash_in_memory_cache", data.get("dflash_in_memory_cache", True))
-            add(
-                "dflash_in_memory_cache_max_entries",
-                data.get("dflash_in_memory_cache_max_entries", 4),
-            )
-            add(
-                "dflash_in_memory_cache_max_bytes",
-                data.get("dflash_in_memory_cache_max_bytes"),
-            )
-            add("dflash_ssd_cache", bool(data.get("dflash_ssd_cache", False)))
-            if data.get("dflash_ssd_cache", False):
-                add(
-                    "dflash_ssd_cache_max_bytes", data.get("dflash_ssd_cache_max_bytes")
-                )
             add("dflash_draft_window_size", data.get("dflash_draft_window_size"))
-            add("dflash_draft_sink_size", data.get("dflash_draft_sink_size"))
             add("dflash_block_size", data.get("dflash_block_size"))
             add("dflash_verify_mode", data.get("dflash_verify_mode"))
 
@@ -1319,24 +1316,20 @@ class EnginePool:
                     engine, "_prefill_memory_guard_managed_externally", False
                 ):
                     continue
-                # DFlash keeps its own config copy for the lazy fallback engine.
-                for host in (engine, getattr(engine, "_fallback_engine", None)):
-                    if host is None:
-                        continue
-                    config = getattr(host, "_scheduler_config", None)
-                    if config is not None:
-                        _set_concurrency_limits(config, value)
-                    core = getattr(getattr(host, "_engine", None), "engine", None)
-                    scheduler = getattr(core, "scheduler", None)
-                    if scheduler is None:
-                        continue
-                    _set_concurrency_limits(scheduler.config, value)
-                    executor = getattr(core, "_mlx_executor", None)
-                    if executor is None:
-                        continue
-                    # A shut-down executor means the engine is stopping.
-                    with suppress(RuntimeError):
-                        executor.submit(_set_decode_cap, scheduler, value)
+                config = getattr(engine, "_scheduler_config", None)
+                if config is not None:
+                    _set_concurrency_limits(config, value)
+                core = getattr(getattr(engine, "_engine", None), "engine", None)
+                scheduler = getattr(core, "scheduler", None)
+                if scheduler is None:
+                    continue
+                _set_concurrency_limits(scheduler.config, value)
+                executor = getattr(core, "_mlx_executor", None)
+                if executor is None:
+                    continue
+                # A shut-down executor means the engine is stopping.
+                with suppress(RuntimeError):
+                    executor.submit(_set_decode_cap, scheduler, value)
 
     def discover_models(
         self, model_dirs: str | list[str], pinned_models: list[str] | None = None
@@ -2851,50 +2844,6 @@ class EnginePool:
         candidates.sort()  # Sort by last_access (oldest first)
         return candidates[0][1]
 
-    async def _unload_other_dflash_engines(self, model_id: str) -> None:
-        """Unload other idle DFlash engines before starting a new one.
-
-        dflash-mlx installs target hooks on shared Python classes and owns a
-        process-global runtime cache manager, so multiple loaded DFlash engines
-        can leak state across model switches.
-        """
-        victims: list[str] = []
-        blocked: list[str] = []
-        for mid, e in self._entries.items():
-            if mid == model_id or e.engine is None:
-                continue
-            if type(e.engine).__name__ != "DFlashEngine":
-                continue
-            if e.is_loading or e.in_use > 0:
-                blocked.append(mid)
-                continue
-            try:
-                if e.engine.has_active_requests():
-                    blocked.append(mid)
-                    continue
-            except AttributeError:
-                pass
-            if e.is_pinned:
-                blocked.append(f"{mid} (pinned)")
-                continue
-            victims.append(mid)
-
-        if blocked:
-            raise RuntimeError(
-                "Cannot load DFlash model "
-                f"'{model_id}' while another DFlash engine is active: "
-                f"{', '.join(blocked)}"
-            )
-
-        for victim in victims:
-            logger.info(
-                "Unloading DFlash model '%s' before loading '%s' because "
-                "dflash runtime hooks/cache are process-global",
-                victim,
-                model_id,
-            )
-            await self._unload_engine(victim)
-
     @staticmethod
     def _resolve_scheduler_from_engine(engine: object) -> object | None:
         scheduler = getattr(engine, "scheduler", None)
@@ -3828,7 +3777,7 @@ class EnginePool:
             )
 
             # Wire the correct model_id / model_path into the shared scheduler
-            # config so every engine (Batched/VLM/DFlash/Embedding) sees the
+            # config so every engine (Batched/VLM/Embedding) sees the
             # right values when it builds `SchedulerConfig` internally.
             self._scheduler_config.model_name = model_id
             self._scheduler_config.model_path = entry.model_path
@@ -3844,9 +3793,7 @@ class EnginePool:
             # model families; let VLMBatchedEngine handle MTP-enabled VLMs.
             pass
 
-            # An external engine replaces every in-process engine. Otherwise
-            # DFlash takes priority over the engine type, since it has its
-            # own model loading pipeline.
+            # An external engine replaces every in-process engine.
             engine = self._external_engine_for(entry, model_settings, effective_type)
             deployment = deployment if effective_type == "batched" else None
             # Decision models never decode, so speculative decoding settings
@@ -3858,89 +3805,36 @@ class EnginePool:
                 and effective_type != "decision"
             ):
                 dflash_enabled = getattr(model_settings, "dflash_enabled", False)
-                dflash_draft = getattr(model_settings, "dflash_draft_model", None)
-                if dflash_enabled and not dflash_draft:
-                    from .patches.dflash_mimo_v2 import (
-                        resolve_bundled_mimo_draft,
-                    )
-
-                    dflash_draft = resolve_bundled_mimo_draft(
-                        entry.model_path,
-                        dflash_draft,
-                    )
-                if (
-                    dflash_enabled
-                    and dflash_draft
-                    and self._entry_is_diffusion_model(entry)
-                ):
+                dflash_draft = dflash_draft_for(model_settings, entry.model_path)
+                if dflash_enabled and self._entry_is_diffusion_model(entry):
                     logger.warning(
                         "DFlash is not supported for diffusion models; "
                         "loading %s with its native VLM engine",
                         model_id,
                     )
-                elif (
-                    dflash_enabled
-                    and dflash_draft
-                    and dflash_batched_supported(
-                        entry.config_model_type, effective_type
-                    )
-                ):
-                    # Qwen3.5-family VLM targets draft inside the batched
-                    # engine; the drafter is attached after start below.
-                    logger.info(
-                        "DFlash enabled for %s as a batched drafter, draft=%s",
-                        model_id,
-                        dflash_draft,
-                    )
-                elif dflash_enabled and dflash_draft:
-                    try:
-                        from .engine.dflash import DFlashEngine
-
-                        draft_entry = self._entries.get(dflash_draft)
-                        draft_path = (
-                            draft_entry.model_path if draft_entry else dflash_draft
-                        )
-                        engine = DFlashEngine(
-                            model_name=entry.model_path,
-                            draft_model_path=draft_path,
-                            draft_quant_enabled=getattr(
-                                model_settings, "dflash_draft_quant_enabled", False
-                            ),
-                            draft_quant_weight_bits=getattr(
-                                model_settings, "dflash_draft_quant_weight_bits", 4
-                            ),
-                            draft_quant_activation_bits=getattr(
-                                model_settings, "dflash_draft_quant_activation_bits", 16
-                            ),
-                            draft_quant_group_size=getattr(
-                                model_settings, "dflash_draft_quant_group_size", 64
-                            ),
-                            model_settings=model_settings,
-                            fallback_engine_type=effective_type,
-                            scheduler_config=self._scheduler_config,
-                            omlx_ssd_cache_dir=getattr(
-                                self._scheduler_config, "paged_ssd_cache_dir", None
-                            ),
-                        )
-                        logger.info(
-                            f"DFlash enabled for {model_id}, draft={draft_path}"
-                        )
-                    except ImportError:
-                        logger.warning(
-                            f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
-                            f"Falling back to default engine."
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"DFlash init failed for {model_id}: {e}. "
-                            f"Falling back to default engine."
-                        )
-                elif dflash_enabled:
+                elif dflash_enabled and not dflash_draft:
                     logger.warning(
                         "DFlash enabled for %s but no draft model is set; "
                         "loading without DFlash. Set dflash_draft_model to "
                         "enable it.",
                         model_id,
+                    )
+                elif dflash_enabled and not dflash_batched_supported(
+                    entry.config_model_type, effective_type
+                ):
+                    logger.warning(
+                        "DFlash is not supported for %s (model_type=%s, "
+                        "engine=%s); loading without DFlash",
+                        model_id,
+                        entry.config_model_type,
+                        effective_type,
+                    )
+                elif dflash_enabled:
+                    # The drafter is attached after start below.
+                    logger.info(
+                        "DFlash enabled for %s as a batched drafter, draft=%s",
+                        model_id,
+                        dflash_draft,
                     )
 
             # Per-model trust_remote_code (security opt-in, issue #926).
@@ -3963,7 +3857,7 @@ class EnginePool:
                     eviction_request=eviction_request,
                 )
 
-            # Create engine based on engine type (if DFlash not active)
+            # Create engine based on engine type
             if engine is None:
                 if deployment is not None:
                     from .engine.distributed import DistributedBatchedEngine
@@ -4036,12 +3930,6 @@ class EnginePool:
                         prefill_eviction_callback=prefill_eviction_callback,
                     )
 
-            _is_dflash_engine = (
-                engine is not None and type(engine).__name__ == "DFlashEngine"
-            )
-            if _is_dflash_engine:
-                await self._unload_other_dflash_engines(model_id)
-
             if isinstance(engine, SplashEngine):
                 self._starting_external[model_id] = engine
             try:
@@ -4051,53 +3939,7 @@ class EnginePool:
                     # start() already stopped Splash; its error carries the
                     # tail of the Splash log. There is no MLX fallback.
                     raise
-                if _is_dflash_engine:
-                    # DFlash engine failed to start -- fall back to the
-                    # model's natural engine type (VLM or Batched)
-                    logger.warning(
-                        f"DFlash start failed for {model_id}: {start_error}. "
-                        f"Falling back to {effective_type} engine."
-                    )
-                    try:
-                        await engine.stop()
-                    except Exception:
-                        pass
-                    gc.collect()
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        get_mlx_executor(),
-                        lambda: (mx.synchronize(), mx.clear_cache()),
-                    )
-
-                    if effective_type == "vlm":
-                        engine = VLMBatchedEngine(
-                            model_name=entry.model_path,
-                            trust_remote_code=trc,
-                            scheduler_config=self._scheduler_config,
-                            model_settings=model_settings,
-                            prefill_eviction_callback=prefill_eviction_callback,
-                        )
-                    else:
-                        engine = BatchedEngine(
-                            model_name=entry.model_path,
-                            trust_remote_code=trc,
-                            scheduler_config=self._scheduler_config,
-                            model_settings=model_settings,
-                            prefill_eviction_callback=prefill_eviction_callback,
-                        )
-                    try:
-                        await engine.start()
-                    except Exception as fallback_error:
-                        raise RuntimeError(
-                            f"DFlash load failed: {start_error}; "
-                            f"{effective_type} fallback also failed: {fallback_error}"
-                        ) from start_error
-                    logger.info(
-                        f"Successfully loaded {model_id} as {effective_type} "
-                        f"(fallback from DFlash)"
-                    )
-
-                elif force_lm and entry.engine_type == "vlm":
+                if force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
                     # load this VLM model -- fall back to VLMBatchedEngine.
                     logger.warning(
@@ -4169,6 +4011,7 @@ class EnginePool:
 
                     entry.model_type = "llm"
                     entry.engine_type = "batched"
+                    effective_type = "batched"
                     logger.info(
                         f"Successfully loaded {model_id} as LLM (fallback from VLM)"
                     )
@@ -4211,22 +4054,20 @@ class EnginePool:
 
             # Batched DFlash: load the block drafter and attach it to the
             # Lightning MTP verify path. Fail-soft like the VLM MTP drafter.
+            drafter_id = dflash_draft_for(model_settings, entry.model_path)
             if (
-                model_settings is not None
-                and dflash_batched_requested(model_settings)
+                drafter_id
                 and dflash_batched_supported(entry.config_model_type, effective_type)
                 and hasattr(engine, "set_dflash_drafter")
             ):
-                drafter_id = model_settings.dflash_draft_model
                 drafter_entry = self._entries.get(drafter_id)
                 drafter_path = drafter_entry.model_path if drafter_entry else drafter_id
 
                 def _load_dflash_sync(path: str = drafter_path):
-                    from .speculative.dflash_drafter import load_dflash_drafter
-
                     return load_dflash_drafter(
                         path,
-                        engine.vlm_model,
+                        engine.prepare_dflash_target(),
+                        tokenizer=engine.tokenizer,
                         block_size=getattr(model_settings, "dflash_block_size", None),
                         quant_enabled=bool(
                             getattr(model_settings, "dflash_draft_quant_enabled", False)
@@ -4238,6 +4079,10 @@ class EnginePool:
                         quant_group_size=int(
                             getattr(model_settings, "dflash_draft_quant_group_size", 0)
                             or 64
+                        ),
+                        verify_mode=getattr(model_settings, "dflash_verify_mode", None),
+                        window_size=getattr(
+                            model_settings, "dflash_draft_window_size", None
                         ),
                     )
 
@@ -4254,24 +4099,6 @@ class EnginePool:
                     drafter = None
                 if drafter is not None:
                     engine.set_dflash_drafter(drafter)
-                    ignored = [
-                        name
-                        for name, default in (
-                            ("dflash_verify_mode", None),
-                            ("dflash_max_ctx", None),
-                            ("dflash_draft_window_size", None),
-                            ("dflash_draft_sink_size", 0),
-                            ("dflash_ssd_cache", False),
-                        )
-                        if getattr(model_settings, name, default) != default
-                    ]
-                    if ignored:
-                        logger.info(
-                            "Batched DFlash ignores %s for %s (single-stream "
-                            "engine settings)",
-                            ", ".join(ignored),
-                            model_id,
-                        )
 
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.

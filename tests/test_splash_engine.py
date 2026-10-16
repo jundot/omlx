@@ -30,7 +30,11 @@ from omlx.admin.benchmark import (
     run_benchmark,
 )
 from omlx.admin.external_api import StreamStats
-from omlx.api.openai_models import ResponseFormat, ResponseFormatJsonSchema
+from omlx.api.openai_models import (
+    ChatCompletionRequest,
+    ResponseFormat,
+    ResponseFormatJsonSchema,
+)
 from omlx.api.responses_utils import ResponseStore
 from omlx.engine import splash as splash_mod
 from omlx.engine.base import GenerationOutput
@@ -117,9 +121,9 @@ def _binary(version="1.3.1", path="/opt/homebrew/bin/splash") -> SplashBinary:
     return SplashBinary(Path(path), version, auto_detected=True)
 
 
-def _engine(tmp_path, **options) -> SplashEngine:
+def _engine(tmp_path, version="1.3.1", **options) -> SplashEngine:
     model = tmp_path / "models" / "Qwen3.8-27B-4bit"
-    target = SplashTarget(_binary(), "Qwen3.8-27B", tmp_path / "draft")
+    target = SplashTarget(_binary(version), "Qwen3.8-27B", tmp_path / "draft")
     return SplashEngine(
         model_name=str(model),
         model_id="Qwen3.8-27B-4bit",
@@ -448,6 +452,34 @@ class TestRequestTranslation:
         assert body["response_format"] == {"type": "json_object"}
         assert body["seed"] == 7
         assert "stop" not in body
+
+    def _body_with(self, tmp_path, version, kwargs):
+        return _engine(tmp_path, version=version)._request_body(
+            max_tokens=100,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=0,
+            min_p=0.0,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+            kwargs=kwargs,
+        )
+
+    def test_request_body_passes_the_thinking_budget(self, tmp_path):
+        body = self._body_with(tmp_path, "1.3.2", {"thinking_budget": 4096})
+
+        assert body["thinking_token_budget"] == 4096
+
+    def test_request_body_leaves_an_unset_budget_to_splash(self, tmp_path):
+        body = self._body_with(tmp_path, "1.3.2", {"thinking_budget": None})
+
+        assert "thinking_token_budget" not in body
+
+    def test_splash_before_1_3_2_gets_no_budget_field(self, tmp_path):
+        # thinking_token_budget arrived in Splash 1.3.2.
+        body = self._body_with(tmp_path, "1.3.1", {"thinking_budget": 4096})
+
+        assert "thinking_token_budget" not in body
 
 
 # -- streaming -------------------------------------------------------------------
@@ -1482,3 +1514,135 @@ class TestSplashRuntimeCache:
         }
         assert (splash_row["total_size_bytes"], splash_row["num_files"]) == (500, 1)
         assert (splash_row["block_size"], splash_row["indexed_blocks"]) == (32, 40)
+
+
+# -- vision ----------------------------------------------------------------------
+
+VISION_CONFIG = {"model_type": "qwen3_5", "depth": 27}
+IMAGE = {
+    "type": "image_url",
+    "image_url": {"url": "data:image/png;base64," + "A" * 4000},
+}
+
+
+def _vision_engine(tmp_path) -> SplashEngine:
+    model = _write_model(tmp_path / "models" / "Qwen3.8-27B-4bit")
+    config = json.loads((model / "config.json").read_text())
+    (model / "config.json").write_text(
+        json.dumps({**config, "vision_config": VISION_CONFIG})
+    )
+    return _engine(tmp_path)
+
+
+class TestVision:
+    def test_text_only_checkpoint_stays_language_only(self, tmp_path):
+        _write_model(tmp_path / "models" / "Qwen3.8-27B-4bit")
+        engine = _engine(tmp_path)
+
+        assert not engine.accepts_image_input
+        assert "--language-only" in engine._serve_command(9000)
+        assert not srv._engine_accepts_images(engine)
+
+    def test_vision_checkpoint_loads_the_vision_tower(self, tmp_path):
+        engine = _vision_engine(tmp_path)
+
+        assert engine.accepts_image_input
+        assert "--language-only" not in engine._serve_command(9000)
+        assert srv._engine_accepts_images(engine)
+
+    def test_chat_request_keeps_image_parts_for_splash(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            srv, "get_engine_pool", lambda: SimpleNamespace(get_entry=lambda _: None)
+        )
+        engine = _vision_engine(tmp_path)
+        request = ChatCompletionRequest(
+            model="Qwen3.8-27B-4bit",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "What is this?"}, IMAGE],
+                }
+            ],
+        )
+
+        extracted = srv._extract_chat_messages(request, engine, None, None)
+
+        parts = extracted.messages[0]["content"]
+        assert isinstance(parts, list)
+        assert [p["type"] for p in parts] == ["text", "image_url"]
+
+    async def test_image_parts_reach_splash(self, tmp_path):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, content=_sse({"choices": [{"delta": {"content": "A cat"}}]})
+            )
+
+        _vision_engine(tmp_path)
+        engine = _engine_with_transport(tmp_path, handler)
+        message = {"role": "user", "content": [{"type": "text", "text": "?"}, IMAGE]}
+
+        outputs = [o async for o in engine.stream_chat([message])]
+
+        assert outputs[-1].text == "A cat"
+        assert seen["body"]["messages"] == [message]
+
+    async def test_audio_and_video_are_refused_before_splash(self, tmp_path):
+        def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+            raise AssertionError("the request must not reach Splash")
+
+        engine = _engine_with_transport(tmp_path, handler)
+        for part in (
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA"}},
+            {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}},
+        ):
+            message = {"role": "user", "content": [part]}
+            with pytest.raises(InvalidRequestError, match="text and image input only"):
+                [o async for o in engine.stream_chat([message])]
+
+    def test_token_count_fallback_skips_image_payloads(self, tmp_path):
+        engine = _vision_engine(tmp_path)
+
+        class Tokenizer:
+            def apply_chat_template(self, *args, **kwargs):
+                raise ValueError("no template")
+
+            def encode(self, text, **kwargs):
+                return list(text)
+
+        engine._tokenizer = Tokenizer()
+        message = {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}, IMAGE],
+        }
+
+        assert engine.count_chat_tokens([message]) == len("hello")
+
+    async def test_responses_input_image_reaches_splash_as_image_url(self, tmp_path):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, content=_sse({"choices": [{"delta": {"content": "ok"}}]})
+            )
+
+        _vision_engine(tmp_path)
+        engine = _engine_with_transport(tmp_path, handler)
+        url = "data:image/png;base64,AAAA"
+        message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "?"},
+                {"type": "input_image", "image_url": url, "detail": "auto"},
+            ],
+        }
+
+        [o async for o in engine.stream_chat([message])]
+
+        assert seen["body"]["messages"][0]["content"] == [
+            {"type": "text", "text": "?"},
+            {"type": "image_url", "image_url": {"url": url, "detail": "auto"}},
+        ]

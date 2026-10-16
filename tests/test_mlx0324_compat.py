@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression coverage for the pinned MLX 0.32.3 runtime."""
+"""Regression coverage for the pinned MLX 0.32.4 runtime."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ import mlx.core as mx
 import pytest
 
 
-def test_runtime_uses_exact_mlx_0323():
-    assert mx.__version__ == "0.32.3"
+def test_runtime_uses_exact_mlx_0324():
+    assert mx.__version__ == "0.32.4"
 
 
 @pytest.mark.parametrize("static", [False, True])

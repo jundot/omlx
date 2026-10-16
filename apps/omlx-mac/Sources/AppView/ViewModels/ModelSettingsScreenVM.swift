@@ -1,34 +1,45 @@
 import SwiftUI
 
+/// Sub-pages of the per-model settings screen. The top page (Basic and
+/// Generation Defaults) is `nil` in `AppServices.modelDetailPage`.
+enum ModelSettingsPage: Hashable, Sendable {
+    case profiles, acceleration, memory, advanced, experimental
+
+    var title: String {
+        switch self {
+        case .profiles:
+            return String(localized: "settings.section.profiles",
+                          defaultValue: "Profiles",
+                          comment: "Title of the per-model Profiles page and its row")
+        case .acceleration:
+            return String(localized: "settings.acceleration.section",
+                          defaultValue: "Acceleration",
+                          comment: "Section header above the Acceleration settings group")
+        case .memory:
+            return String(localized: "settings.memory.section",
+                          defaultValue: "Memory Saving",
+                          comment: "Title of the per-model Memory Saving page and its row")
+        case .advanced:
+            return String(localized: "settings.advanced.section",
+                          defaultValue: "Advanced Settings",
+                          comment: "Section header above the Advanced tab fields")
+        case .experimental:
+            return String(localized: "settings.advanced.experimental.section",
+                          defaultValue: "Experimental Features",
+                          comment: "Section header above the Experimental settings group")
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class ModelSettingsScreenVM {
-    enum Section: String, Hashable, CaseIterable, Sendable {
-        case profiles, basic, advanced
-
-        var label: String {
-            switch self {
-            case .profiles:
-                return String(localized: "settings.section.profiles",
-                              defaultValue: "Profiles",
-                              comment: "Segmented control label for the Profiles tab")
-            case .basic:
-                return String(localized: "settings.section.basic",
-                              defaultValue: "Basic",
-                              comment: "Segmented control label for the Basic tab")
-            case .advanced:
-                return String(localized: "settings.section.advanced",
-                              defaultValue: "Advanced",
-                              comment: "Segmented control label for the Advanced tab")
-            }
-        }
-    }
-
     enum Field: Sendable {
         case alias, modelType, contextLength, maxTokens
         case temperature, topP, topK, minP
         case repetitionPenalty, presencePenalty, ttl
-        case enableThinking, qwen4PleSsdOffload
+        case enableThinking, ssdNgramOffload
+        case deepseekV41CedPrefill, qwen4GdnDecodeWideProj
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case forceSampling, isPinned, isFavorite
@@ -50,12 +61,9 @@ final class ModelSettingsScreenVM {
         case qwen35AnePrefillCpuThreads, qwen35AnePrefillCpuSharedResource
         case indexCacheEnabled, indexCacheFreq
         case specprefillEnabled, specprefillDraftModel, specprefillKeepPct, specprefillThreshold
-        case dflashEnabled, dflashDraftModel, dflashMaxCtx
-        case dflashDraftQuantEnabled, dflashDraftQuantWeightBits
-        case dflashDraftQuantActivationBits, dflashDraftQuantGroupSize
-        case dflashVerifyMode, dflashDraftWindowSize, dflashDraftSinkSize, dflashBlockSize
-        case dflashInMemoryCache, dflashInMemoryCacheGib, dflashInMemoryCacheMaxEntries
-        case dflashSsdCache, dflashSsdCacheGib
+        case dflashEnabled, dflashDraftModel
+        case dflashDraftQuantEnabled, dflashDraftQuantWeightBits, dflashDraftQuantGroupSize
+        case dflashVerifyMode, dflashDraftWindowSize, dflashBlockSize
         case mtpEnabled, mtpAdaptiveMaxDepth
         case vlmMtpEnabled, vlmMtpDraftModel, vlmMtpDraftBlockSize
     }
@@ -157,20 +165,6 @@ final class ModelSettingsScreenVM {
         ]
     }
 
-    static var dflashDraftQuantActivationBitsOptions: [(String, String)] {
-        [
-            ("", String(localized: "settings.dflash.quant.activation.default",
-                        defaultValue: "default",
-                        comment: "DFlash draft quantization activation bits — use server default")),
-            ("16", String(localized: "settings.dflash.quant.activation.16",
-                          defaultValue: "16-bit",
-                          comment: "DFlash draft quantization activation bits option")),
-            ("32", String(localized: "settings.dflash.quant.activation.32",
-                          defaultValue: "32-bit",
-                          comment: "DFlash draft quantization activation bits option")),
-        ]
-    }
-
     static var dflashDraftQuantGroupSizeOptions: [(String, String)] {
         [
             ("", String(localized: "settings.dflash.quant.group.default",
@@ -204,12 +198,9 @@ final class ModelSettingsScreenVM {
             ("dflash", String(localized: "settings.dflash.verify_mode.dflash",
                               defaultValue: "dflash",
                               comment: "DFlash verify mode: standard dflash verifier")),
-            ("ddtree", String(localized: "settings.dflash.verify_mode.ddtree",
-                              defaultValue: "ddtree",
-                              comment: "DFlash verify mode: DDTree verifier")),
             ("off", String(localized: "settings.dflash.verify_mode.off",
                            defaultValue: "off",
-                           comment: "DFlash verify mode: disable speculative verify")),
+                           comment: "DFlash verify mode: always verify the whole block")),
         ]
     }
 
@@ -231,7 +222,8 @@ final class ModelSettingsScreenVM {
         "enable_thinking", "reasoning_effort", "preserve_thinking",
     ]
 
-    var section: Section = .basic
+    /// Web admin input range for the resident expert share, in percent.
+    static let moeResidentPercentRange: ClosedRange<Double> = 5...95
 
     var model: ModelDTO?
     /// Snapshot of every other model on the server, used to populate the
@@ -239,6 +231,7 @@ final class ModelSettingsScreenVM {
     var allModels: [ModelDTO] = []
     var modelID: String = ""
     var lastError: String?
+    var isImportingMtplxSidecar: Bool = false
 
     // Basic
     var alias: String = ""
@@ -258,6 +251,11 @@ final class ModelSettingsScreenVM {
     var qwen4PleSsdOffload: Bool = false
     var qwen4PleSsdOffloadSupported: Bool = false
     var qwen4PleSsdOffloadForced: Bool = false
+    var deepseekV41EngramSsdOffload: Bool = false
+    var deepseekV41EngramSsdOffloadSupported: Bool = false
+    var deepseekV41EngramSsdOffloadForced: Bool = false
+    var deepseekV41CedPrefillEnabled: Bool = false
+    var qwen4GdnDecodeWideProj: Bool = false
     var thinkingBudgetEnabled: Bool = false
     var thinkingBudgetTokens: String = "8192"
     var limitToolResults: Bool = false
@@ -282,6 +280,16 @@ final class ModelSettingsScreenVM {
 
     // Reasoning parser (free-form override; empty = auto)
     var reasoningParser: String = ""
+
+    var guidedGrammarEnabled: Bool = false
+    var guidedGrammar: String = ""
+
+    var moeExpertOffloadEnabled: Bool = false
+    /// Resident expert share in percent, as typed. The wire value is a fraction.
+    var moeExpertOffloadResidentPercent: String = "25"
+    /// Server fraction at the last load. An unchanged field sends it back even
+    /// when it is outside the UI range, as the web admin does.
+    private var loadedMoeResidentFraction: Double = 0.25
 
     // Chat-template kwargs — entries are the editor's view of the
     // (chat_template_kwargs, forced_ct_kwargs) server pair.
@@ -330,6 +338,7 @@ final class ModelSettingsScreenVM {
 
     // Header snapshot actions: reset / optimal (omlx.ai) / custom recipe.
     var isApplyingSettings: Bool = false
+    var isLoadingGenerationDefaults: Bool = false
     var pendingReset: Bool = false
     var applyOutcome: SettingsApplyOutcome?
     /// Error shown inside the snapshot sheet so the user can retry.
@@ -350,18 +359,10 @@ final class ModelSettingsScreenVM {
     var dflashDraftModel: String = ""
     var dflashDraftQuantEnabled: Bool = false
     var dflashDraftQuantWeightBits: String = "4"
-    var dflashDraftQuantActivationBits: String = ""
     var dflashDraftQuantGroupSize: String = ""
-    var dflashMaxCtx: String = ""
     var dflashVerifyMode: String = ""
     var dflashDraftWindowSize: String = ""
-    var dflashDraftSinkSize: String = "0"
     var dflashBlockSize: String = ""
-    var dflashInMemoryCache: Bool = false
-    var dflashInMemoryCacheGib: String = "8"
-    var dflashInMemoryCacheMaxEntries: String = "4"
-    var dflashSsdCache: Bool = false
-    var dflashSsdCacheGib: String = "20"
 
     // Experimental: native MTP
     var mtpEnabled: Bool = false
@@ -384,37 +385,25 @@ final class ModelSettingsScreenVM {
     var serverDefaultSampling: GlobalSettingsDTO.SamplingDTO?
     /// Display scope for the active profile (derived from `source_template`).
     var activeProfileScope: ProfileScope = .model
-    /// True when one or more profile-eligible fields have been edited
-    /// since the last load / apply / save. Flips the screen into the
-    /// "Working profile" state. Per-model fields (alias / modelType /
-    /// ttl / isPinned / trustRemoteCode) auto-save and never set this.
+    /// True when profile-eligible values differ from the last load / apply /
+    /// save, until the pending auto-save writes them. Per-model fields
+    /// (alias / modelType / ttl / isPinned / trustRemoteCode) save on commit
+    /// and never set this.
     var profileDirty: Bool = false
-    /// Model-specific profile values at the last load. Global templates drop
-    /// these keys, so edits to them need a model-scope save.
-    private var loadedModelSpecificSettings: [String: AnyCodable] = [:]
+    /// Profile values at the last load; nil before the first one.
+    private var loadedSettings: [String: AnyCodable]?
 
-    /// True when the working profile changes a setting that a global
-    /// template cannot store.
-    var hasModelSpecificEdits: Bool {
-        profileDirty && modelSpecificSettings() != loadedModelSpecificSettings
-    }
-
-    var defaultSaveAsScope: ProfileScope { hasModelSpecificEdits ? .model : .global }
-
-    private func modelSpecificSettings() -> [String: AnyCodable] {
-        currentSettingsDict().filter { !ProfileSettingsKey.templateKeys.contains($0.key) }
-    }
+    /// Pause after the last edit before profile fields save, so typing in a
+    /// number field does not write every keystroke.
+    @ObservationIgnored var autoSaveDelay: Duration = .milliseconds(800)
+    @ObservationIgnored private var autoSaveClient: OMLXClient?
+    @ObservationIgnored private var autoSaveTimer: Task<Void, Never>?
+    @ObservationIgnored private var autoSaveWrite: Task<Void, Never>?
 
     /// Record the current values as the clean, loaded state.
     func resetWorkingBaseline() {
-        loadedModelSpecificSettings = modelSpecificSettings()
+        loadedSettings = currentSettingsDict()
         profileDirty = false
-    }
-
-    private var globalProfileDropsEditsMessage: String {
-        String(localized: "profile.save.global_drops_model_settings",
-               defaultValue: "Global profiles keep sampling settings only. Save as a Model profile to keep Lightning MTP, TurboQuant, and other model settings.",
-               comment: "Error shown when saving to a global profile would drop model-specific settings")
     }
 
     /// State machine the banner and ProfileDetailCard render against.
@@ -450,12 +439,27 @@ final class ModelSettingsScreenVM {
         }
     }
 
-    var isDiffusionModel: Bool {
-        let type = (model?.configModelType ?? "")
+    private var normalizedConfigModelType: String {
+        (model?.configModelType ?? "")
             .lowercased()
             .replacingOccurrences(of: "-", with: "_")
-        return Self.diffusionConfigModelTypes.contains(type)
     }
+
+    var isDiffusionModel: Bool {
+        Self.diffusionConfigModelTypes.contains(normalizedConfigModelType)
+    }
+
+    /// LLM gate of the web admin: an unknown model type counts as an LLM.
+    var isLLMLike: Bool {
+        guard let type = model?.modelType, !type.isEmpty else { return true }
+        return type == "llm" || type == "vlm"
+    }
+
+    var showsGenerationSection: Bool { isLLMLike }
+
+    /// Acceleration, Memory Saving and Experimental only apply to the MLX
+    /// LLM engines.
+    var showsEnginePages: Bool { isLLMLike && !isDiffusionModel }
 
     var thinkingForced: Bool { model?.thinkingForced == true }
 
@@ -472,10 +476,51 @@ final class ModelSettingsScreenVM {
         model?.reasoningEffortOptions ?? []
     }
 
-    var isQwen4Exp: Bool {
-        (model?.configModelType ?? "")
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_") == "qwen4_exp"
+    var isQwen4Exp: Bool { normalizedConfigModelType == "qwen4_exp" }
+
+    var isDeepseekV41: Bool { normalizedConfigModelType == "deepseek_v41" }
+
+    /// One SSD N-gram Offload switch serves Qwen4 PLE and DeepSeek V4.1
+    /// Engram. Qwen4 is checked first, as in the web admin.
+    private var usesQwen4PleOffload: Bool { isQwen4Exp && qwen4PleSsdOffloadSupported }
+
+    var ssdNgramOffloadSupported: Bool {
+        usesQwen4PleOffload || (isDeepseekV41 && deepseekV41EngramSsdOffloadSupported)
+    }
+
+    var ssdNgramOffloadForced: Bool {
+        usesQwen4PleOffload ? qwen4PleSsdOffloadForced : deepseekV41EngramSsdOffloadForced
+    }
+
+    var ssdNgramOffload: Bool {
+        get { usesQwen4PleOffload ? qwen4PleSsdOffload : deepseekV41EngramSsdOffload }
+        set {
+            if usesQwen4PleOffload {
+                qwen4PleSsdOffload = newValue
+            } else {
+                deepseekV41EngramSsdOffload = newValue
+            }
+        }
+    }
+
+    var moeExpertOffloadSupported: Bool { model?.moeExpertOffloadSupported == true }
+
+    /// Wire fraction for the resident share, or nil when an edited value is
+    /// outside the UI range.
+    var moeExpertOffloadResidentFraction: Double? {
+        let text = moeExpertOffloadResidentPercent.trimmingCharacters(in: .whitespaces)
+        if text == Self.formatPct(loadedMoeResidentFraction * 100) {
+            return loadedMoeResidentFraction
+        }
+        guard let percent = Double(text), percent.isFinite,
+              Self.moeResidentPercentRange.contains(percent) else { return nil }
+        return percent / 100
+    }
+
+    var moeResidentRangeError: String {
+        String(localized: "settings.memory.moe_offload.resident.range_error",
+               defaultValue: "Enter a number from 5 to 95.",
+               comment: "Error shown when the MoE resident expert percent is outside 5-95")
     }
 
     var embeddingAudioSupported: Bool { model?.embeddingAudioSupported == true }
@@ -484,7 +529,8 @@ final class ModelSettingsScreenVM {
         switch field {
         case .topP, .topK, .minP, .repetitionPenalty, .presencePenalty:
             return true
-        case .enableThinking, .qwen4PleSsdOffload,
+        case .enableThinking, .ssdNgramOffload,
+             .deepseekV41CedPrefill, .qwen4GdnDecodeWideProj,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
@@ -516,19 +562,11 @@ final class ModelSettingsScreenVM {
             return true
         case .specprefillKeepPct, .specprefillThreshold:
             return true
-        case .dflashEnabled, .dflashDraftModel, .dflashMaxCtx:
+        case .dflashEnabled, .dflashDraftModel:
             return true
-        case .dflashDraftQuantEnabled, .dflashDraftQuantWeightBits:
+        case .dflashDraftQuantEnabled, .dflashDraftQuantWeightBits, .dflashDraftQuantGroupSize:
             return true
-        case .dflashDraftQuantActivationBits, .dflashDraftQuantGroupSize:
-            return true
-        case .dflashVerifyMode, .dflashDraftWindowSize, .dflashDraftSinkSize, .dflashBlockSize:
-            return true
-        case .dflashInMemoryCache, .dflashInMemoryCacheGib:
-            return true
-        case .dflashInMemoryCacheMaxEntries:
-            return true
-        case .dflashSsdCache, .dflashSsdCacheGib:
+        case .dflashVerifyMode, .dflashDraftWindowSize, .dflashBlockSize:
             return true
         case .mtpEnabled, .mtpAdaptiveMaxDepth, .vlmMtpEnabled, .vlmMtpDraftModel:
             return true
@@ -571,28 +609,52 @@ final class ModelSettingsScreenVM {
         )
     }
 
-    /// Binding helper for profile-eligible fields. Edits flip
-    /// `profileDirty` (which activates the Working banner) instead of
-    /// firing a per-field PUT. Network writes happen only when the user
-    /// chooses Apply / Save as new / Update.
+    /// Binding helper for profile-eligible fields. An edit updates
+    /// `profileDirty` and schedules one auto-save of all profile fields
+    /// instead of a per-field PUT.
     func bindProfile<T: Equatable>(_ binding: Binding<T>) -> Binding<T> {
         Binding(
             get: { binding.wrappedValue },
             set: { newValue in
                 let changed = binding.wrappedValue != newValue
                 binding.wrappedValue = newValue
-                if changed { self.profileDirty = true }
+                if changed { self.refreshProfileDirty() }
             }
         )
     }
 
-    /// Flip the working-dirty flag from a non-binding callsite (e.g. the
-    /// chat-template kwargs editor's add / remove buttons).
-    func markProfileDirty() { self.profileDirty = true }
+    /// Compare the working values with the last load and schedule an
+    /// auto-save when they differ.
+    func refreshProfileDirty() {
+        profileDirty = loadedSettings.map { currentSettingsDict() != $0 } ?? true
+        if profileDirty { scheduleAutoSave() }
+    }
+
+    /// Debounced write of the profile fields. Writes run one at a time, and
+    /// the task keeps the VM alive so leaving the screen does not drop it.
+    private func scheduleAutoSave() {
+        guard let client = autoSaveClient else { return }
+        autoSaveTimer?.cancel()
+        autoSaveTimer = Task {
+            try? await Task.sleep(for: autoSaveDelay)
+            guard !Task.isCancelled else { return }
+            await autoSaveWrite?.value
+            guard !Task.isCancelled, profileDirty else { return }
+            let write = Task { await saveWorkingToModel(client: client) }
+            autoSaveWrite = write
+            await write.value
+        }
+    }
+
+    /// Wait for a scheduled auto-save, including its write.
+    func waitForAutoSave() async {
+        await autoSaveTimer?.value
+    }
 
     private var loadSequence = 0
 
     func load(modelID: String, client: OMLXClient, preservingEdits: Bool = false) async {
+        autoSaveClient = client
         if preservingEdits && profileDirty { return }
         loadSequence += 1
         let sequence = loadSequence
@@ -635,6 +697,14 @@ final class ModelSettingsScreenVM {
                     m.qwen4PleSsdOffloadSupported ?? false
                 self.qwen4PleSsdOffload = self.qwen4PleSsdOffloadForced
                     || (s?.qwen4PleSsdOffload ?? false)
+                self.deepseekV41EngramSsdOffloadForced =
+                    m.deepseekV41EngramSsdOffloadForced ?? false
+                self.deepseekV41EngramSsdOffloadSupported =
+                    m.deepseekV41EngramSsdOffloadSupported ?? false
+                self.deepseekV41EngramSsdOffload = self.deepseekV41EngramSsdOffloadForced
+                    || (s?.deepseekV41EngramSsdOffload ?? false)
+                self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? false
+                self.qwen4GdnDecodeWideProj = s?.qwen4GdnDecodeWideProj ?? false
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
                 self.thinkingBudgetTokens = s?.thinkingBudgetTokens.map(String.init) ?? "8192"
                 self.limitToolResults = (s?.maxToolResultTokens ?? 0) > 0
@@ -651,6 +721,12 @@ final class ModelSettingsScreenVM {
                 self.embeddingAudioEnabled = s?.embeddingAudioEnabled ?? false
                 self.embeddingAudioMaxSeconds = s?.embeddingAudioMaxSeconds.map { Self.formatPct($0) } ?? ""
                 self.reasoningParser = s?.reasoningParser ?? ""
+                self.guidedGrammarEnabled = s?.guidedGrammarEnabled ?? false
+                self.guidedGrammar = s?.guidedGrammar ?? ""
+                self.moeExpertOffloadEnabled = m.moeExpertOffloadSupported == true
+                    && (s?.moeExpertOffloadEnabled ?? false)
+                self.loadedMoeResidentFraction = s?.moeExpertOffloadResidentFraction ?? 0.25
+                self.moeExpertOffloadResidentPercent = Self.formatPct(self.loadedMoeResidentFraction * 100)
                 self.chatTemplateEntries = diffusionCompatibleChatTemplateEntries(
                     ChatTemplateKwargsCodec.decode(
                         kwargs: s?.chatTemplateKwargs,
@@ -688,20 +764,10 @@ final class ModelSettingsScreenVM {
                 self.dflashDraftModel = s?.dflashDraftModel ?? ""
                 self.dflashDraftQuantEnabled = s?.dflashDraftQuantEnabled ?? false
                 self.dflashDraftQuantWeightBits = s?.dflashDraftQuantWeightBits.map(String.init) ?? "4"
-                self.dflashDraftQuantActivationBits = s?.dflashDraftQuantActivationBits.map(String.init) ?? ""
                 self.dflashDraftQuantGroupSize = s?.dflashDraftQuantGroupSize.map(String.init) ?? ""
-                self.dflashMaxCtx = s?.dflashMaxCtx.map(String.init) ?? ""
                 self.dflashVerifyMode = s?.dflashVerifyMode ?? ""
                 self.dflashDraftWindowSize = s?.dflashDraftWindowSize.map(String.init) ?? ""
-                self.dflashDraftSinkSize = s?.dflashDraftSinkSize.map(String.init) ?? "0"
                 self.dflashBlockSize = s?.dflashBlockSize.map(String.init) ?? ""
-                self.dflashInMemoryCache = s?.dflashInMemoryCache ?? false
-                self.dflashInMemoryCacheGib = DflashByteSize.bytesToGib(s?.dflashInMemoryCacheMaxBytes)
-                    .map(String.init) ?? "8"
-                self.dflashInMemoryCacheMaxEntries = s?.dflashInMemoryCacheMaxEntries.map(String.init) ?? "4"
-                self.dflashSsdCache = s?.dflashSsdCache ?? false
-                self.dflashSsdCacheGib = DflashByteSize.bytesToGib(s?.dflashSsdCacheMaxBytes)
-                    .map(String.init) ?? "20"
                 self.mtpEnabled = s?.mtpEnabled ?? false
                 self.mtpAdaptiveMaxDepth = s?.mtpAdaptiveMaxDepth.flatMap { (3...6).contains($0) ? String($0) : nil } ?? "3"
                 self.vlmMtpEnabled = s?.vlmMtpEnabled ?? false
@@ -782,10 +848,21 @@ final class ModelSettingsScreenVM {
             }
         case .ttl:                     patch.ttlSeconds = Int(ttlSeconds)
         case .enableThinking:          patch.enableThinking = enableThinking
-        case .qwen4PleSsdOffload:
-            guard isQwen4Exp, qwen4PleSsdOffloadSupported,
-                  !qwen4PleSsdOffloadForced else { return }
-            patch.qwen4PleSsdOffload = qwen4PleSsdOffload
+        case .ssdNgramOffload:
+            // A forced offload is a runtime decision, so sending nothing
+            // keeps the stored choice for when the model fits again.
+            guard ssdNgramOffloadSupported, !ssdNgramOffloadForced else { return }
+            if usesQwen4PleOffload {
+                patch.qwen4PleSsdOffload = qwen4PleSsdOffload
+            } else {
+                patch.deepseekV41EngramSsdOffload = deepseekV41EngramSsdOffload
+            }
+        case .deepseekV41CedPrefill:
+            guard isDeepseekV41 else { return }
+            patch.deepseekV41CedPrefillEnabled = deepseekV41CedPrefillEnabled
+        case .qwen4GdnDecodeWideProj:
+            guard isQwen4Exp else { return }
+            patch.qwen4GdnDecodeWideProj = qwen4GdnDecodeWideProj
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
         case .limitToolResults:
@@ -919,35 +996,15 @@ final class ModelSettingsScreenVM {
             patch.dflashDraftQuantEnabled = dflashDraftQuantEnabled
             if !dflashDraftQuantEnabled {
                 patch.dflashDraftQuantWeightBits = nil
-                patch.dflashDraftQuantActivationBits = nil
                 patch.dflashDraftQuantGroupSize = nil
             }
         case .dflashDraftQuantWeightBits:
             patch.dflashDraftQuantWeightBits = Int(dflashDraftQuantWeightBits)
-        case .dflashDraftQuantActivationBits:
-            patch.dflashDraftQuantActivationBits = Int(dflashDraftQuantActivationBits)
         case .dflashDraftQuantGroupSize:
             patch.dflashDraftQuantGroupSize = Int(dflashDraftQuantGroupSize)
-        case .dflashMaxCtx:            patch.dflashMaxCtx = Int(dflashMaxCtx)
         case .dflashVerifyMode:        patch.dflashVerifyMode = dflashVerifyMode.isEmpty ? nil : dflashVerifyMode
         case .dflashDraftWindowSize:   patch.dflashDraftWindowSize = Int(dflashDraftWindowSize)
-        case .dflashDraftSinkSize:     patch.dflashDraftSinkSize = Int(dflashDraftSinkSize)
         case .dflashBlockSize:         patch.dflashBlockSize = Int(dflashBlockSize)
-        case .dflashInMemoryCache:
-            patch.dflashInMemoryCache = dflashInMemoryCache
-            if !dflashInMemoryCache {
-                // Mirror the HTML editor: turning the L1 cache off also
-                // disables the L2 (SSD) sub-toggle.
-                dflashSsdCache = false
-                patch.dflashSsdCache = false
-            }
-        case .dflashInMemoryCacheGib:
-            patch.dflashInMemoryCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib))
-        case .dflashInMemoryCacheMaxEntries:
-            patch.dflashInMemoryCacheMaxEntries = Int(dflashInMemoryCacheMaxEntries)
-        case .dflashSsdCache:          patch.dflashSsdCache = dflashSsdCache
-        case .dflashSsdCacheGib:
-            patch.dflashSsdCacheMaxBytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib))
         case .mtpEnabled, .mtpAdaptiveMaxDepth:
             patch.mtpEnabled = mtpEnabled
             patch.mtpAdaptiveMaxDepth = Int(mtpAdaptiveMaxDepth) ?? 3
@@ -957,11 +1014,14 @@ final class ModelSettingsScreenVM {
         case .vlmMtpDraftBlockSize:    patch.vlmMtpDraftBlockSize = Int(vlmMtpDraftBlockSize)
         }
         if thinkingForced { patch.enableThinking = .some(nil) }
+        let targetModelID = modelID
         do {
-            _ = try await client.updateModelSettings(id: modelID, patch: patch)
+            _ = try await client.updateModelSettings(id: targetModelID, patch: patch)
             self.lastError = nil
         } catch {
-            self.lastError = error.omlxDescription
+            // Keep pending profile edits; their auto-save reloads afterwards.
+            await reportFailedSave(error, modelID: targetModelID, client: client,
+                                   preservingEdits: true)
         }
     }
 
@@ -1024,9 +1084,7 @@ final class ModelSettingsScreenVM {
         }
     }
 
-    /// Stage the best tuner result in the working profile. The user can then
-    /// update the active profile or save it as a new one without detaching the
-    /// model from its current profile via a direct settings write.
+    /// Stage the best tuner result like any other edit, so it auto-saves.
     func applyANETuningRecommendation() {
         guard let recommendation = aneTuningStatus?.recommendation else { return }
         qwen35AnePrefillEnabled = recommendation.enabled
@@ -1040,7 +1098,7 @@ final class ModelSettingsScreenVM {
         if let fraction = recommendation.mlpFraction { qwen35AnePrefillFraction = String(fraction) }
         if recommendation.backend == "k2" {
             if let fraction = recommendation.sharedFraction { qwen35AnePrefillSharedFraction = String(fraction) }
-            profileDirty = true
+            refreshProfileDirty()
             lastError = nil
             return
         }
@@ -1071,7 +1129,7 @@ final class ModelSettingsScreenVM {
         if let sharedResource = recommendation.cpuSharedResource {
             qwen35AnePrefillCpuSharedResource = sharedResource
         }
-        profileDirty = true
+        refreshProfileDirty()
         lastError = nil
     }
 
@@ -1096,12 +1154,12 @@ final class ModelSettingsScreenVM {
         chatTemplateEntries.append(
             ChatTemplateKwargEntry(kind: kind, value: defaultValue)
         )
-        markProfileDirty()
+        refreshProfileDirty()
     }
 
     func removeKwarg(id: UUID) {
         chatTemplateEntries.removeAll(where: { $0.id == id })
-        markProfileDirty()
+        refreshProfileDirty()
     }
 
     /// Options for SpecPrefill / DFlash draft-model dropdowns. Filters
@@ -1175,6 +1233,14 @@ final class ModelSettingsScreenVM {
 
     var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
+    /// The INT8 kernels run only on GPUs with native INT8 tensor ops
+    /// (M5-series or newer). A saved "on" keeps the row so it can be
+    /// turned off.
+    var showsQwenOqA8: Bool {
+        isQwenOqA8Model
+            && (model?.qwen35OqA8Supported == true || model?.settings?.qwen35OqA8Enabled == true)
+    }
+
     /// Native Lightning MTP can't co-exist with the other speculative
     /// decoders. TurboQuant KV supports its decode-shaped multi-row verify
     /// path, so it is intentionally not a conflict here.
@@ -1188,6 +1254,56 @@ final class ModelSettingsScreenVM {
             return String(localized: "settings.mtp.conflict.vlm_mtp",
                           defaultValue: "Disable VLM MTP before enabling Lightning MTP.",
                           comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
+        }
+        if moeExpertOffloadEnabled && model?.moeOffloadAllowsMtp != true {
+            return String(localized: "settings.mtp.conflict.moe_offload",
+                          defaultValue: "Disable MoE Expert Offload before enabling Lightning MTP.",
+                          comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because MoE expert offload is on")
+        }
+        return nil
+    }
+
+    /// Shown wherever VLM MTP owns the speculative path (DFlash, TurboQuant,
+    /// SpecPrefill).
+    static var vlmMtpOwnsSpeculativePathReason: String {
+        String(localized: "settings.speculative.conflict.vlm_mtp",
+               defaultValue: "Disable VLM MTP before enabling this feature.",
+               comment: "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on")
+    }
+
+    var dflashConflictReason: String? {
+        if moeExpertOffloadEnabled {
+            return String(localized: "settings.dflash.conflict.moe_offload",
+                          defaultValue: "Disable MoE Expert Offload before enabling DFlash.",
+                          comment: "Tooltip / sublabel shown when DFlash can't be enabled because MoE expert offload is on")
+        }
+        if mtpEnabled {
+            return String(localized: "settings.dflash.conflict.mtp",
+                          defaultValue: "Disable Lightning MTP before enabling DFlash.",
+                          comment: "Tooltip / sublabel shown when DFlash can't be enabled because Lightning MTP is on")
+        }
+        if vlmMtpEnabled { return Self.vlmMtpOwnsSpeculativePathReason }
+        return nil
+    }
+
+    /// Streamed experts cannot back a speculative decoder, except the
+    /// Lightning MTP head of families that keep it resident. Mirrors
+    /// `validate_moe_expert_offload` on the server.
+    var moeExpertOffloadConflictReason: String? {
+        if mtpEnabled && model?.moeOffloadAllowsMtp != true {
+            return String(localized: "settings.moe_offload.conflict.mtp",
+                          defaultValue: "Disable Lightning MTP before enabling MoE Expert Offload.",
+                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because Lightning MTP is on")
+        }
+        if vlmMtpEnabled {
+            return String(localized: "settings.moe_offload.conflict.vlm_mtp",
+                          defaultValue: "Disable VLM MTP before enabling MoE Expert Offload.",
+                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because VLM MTP is on")
+        }
+        if dflashEnabled {
+            return String(localized: "settings.moe_offload.conflict.dflash",
+                          defaultValue: "Disable DFlash before enabling MoE Expert Offload.",
+                          comment: "Tooltip / sublabel shown when MoE expert offload can't be enabled because DFlash is on")
         }
         return nil
     }
@@ -1211,10 +1327,39 @@ final class ModelSettingsScreenVM {
                       comment: "Tooltip / sublabel shown when ANE prefill can't be enabled because INT8 activation prefill is on")
     }
 
+    /// MTPLX checkpoints keep MTP weights in a sidecar until the server
+    /// imports them into the model index. Match the server-provided
+    /// compatibility marker rather than guessing from model names.
+    var canImportMtplxSidecar: Bool {
+        guard model?.mtpCompatible == false,
+              let reason = model?.mtpCompatibilityReason else {
+            return false
+        }
+        return reason.localizedCaseInsensitiveContains("MTPLX side-car")
+    }
+
+    func importMtplxSidecar(client: OMLXClient) async {
+        guard !isImportingMtplxSidecar, canImportMtplxSidecar else { return }
+        isImportingMtplxSidecar = true
+        defer { isImportingMtplxSidecar = false }
+
+        do {
+            _ = try await client.importMtplxSidecar(id: modelID)
+            await load(modelID: modelID, client: client, preservingEdits: true)
+        } catch {
+            lastError = error.omlxDescription
+        }
+    }
+
     /// VLM MTP wraps mlx-vlm's MTP loop and is mutually exclusive with the
     /// other speculative-decoding / KV-quant features. Mirrors the HTML
     /// editor's gating so the toggle disables itself and surfaces why.
     var vlmMtpConflictReason: String? {
+        if moeExpertOffloadEnabled {
+            return String(localized: "settings.vlm_mtp.conflict.moe_offload",
+                          defaultValue: "Disable MoE Expert Offload before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because MoE expert offload is on")
+        }
         if dflashEnabled {
             return String(localized: "settings.vlm_mtp.conflict.dflash",
                           defaultValue: "Disable DFlash before enabling VLM MTP.",
@@ -1237,8 +1382,8 @@ final class ModelSettingsScreenVM {
         }
         if vlmMtpProcessorConflict {
             return String(localized: "settings.vlm_mtp.conflict.processors",
-                          defaultValue: "Unset repetition / presence penalty before enabling VLM MTP.",
-                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because penalty settings are set")
+                          defaultValue: "Unset repetition / presence penalty and turn off Guided Grammar before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because penalty or grammar settings are set")
         }
         return nil
     }
@@ -1252,7 +1397,7 @@ final class ModelSettingsScreenVM {
     var vlmMtpProcessorConflict: Bool {
         if let rep = Double(repetitionPenalty), rep != 1.0 { return true }
         if let pres = Double(presencePenalty), pres != 0.0 { return true }
-        return false
+        return guidedGrammarEnabled
     }
 
     /// Sublabel / tooltip for the sampling rows locked while VLM MTP is on.
@@ -1260,6 +1405,195 @@ final class ModelSettingsScreenVM {
         String(localized: "settings.sampling.locked.vlm_mtp",
                defaultValue: "Disable VLM MTP to edit this setting.",
                comment: "Tooltip / sublabel shown when a penalty or thinking-budget row is locked because VLM MTP is on")
+    }
+
+    // MARK: - Page summaries
+
+    /// Trailing value of a page row: the first two enabled features, then a
+    /// count of the rest.
+    nonisolated static func summary(_ items: [String], empty: String) -> String {
+        switch items.count {
+        case 0: return empty
+        case 1, 2: return items.joined(separator: ", ")
+        default: return "\(items[0]), \(items[1]) +\(items.count - 2)"
+        }
+    }
+
+    private static var summaryOff: String {
+        String(localized: "settings.summary.off",
+               defaultValue: "Off",
+               comment: "Page row value when no feature on that page is enabled")
+    }
+
+    private static var summaryExternalEngine: String {
+        String(localized: "settings.summary.external_engine",
+               defaultValue: "Not used with external engine",
+               comment: "Page row value for MLX-only pages while an external engine serves the model")
+    }
+
+    func summary(for page: ModelSettingsPage) -> String {
+        switch page {
+        case .profiles:
+            // The pending auto-save does not count as a different profile.
+            guard let name = activeProfileName else {
+                return String(localized: "profile.banner.defaults.title",
+                              defaultValue: "No profile",
+                              comment: "Profile banner title when the model uses server defaults")
+            }
+            return profileDisplayName(scope: activeProfileScope, name: name)
+        case .acceleration, .memory, .experimental:
+            if !externalEngine.isEmpty { return Self.summaryExternalEngine }
+            return Self.summary(enabledFeatures(on: page), empty: Self.summaryOff)
+        case .advanced:
+            return Self.summary(enabledFeatures(on: .advanced), empty: Self.summaryOff)
+        }
+    }
+
+    /// Enabled features on a page, gated like the page's rows.
+    func enabledFeatures(on page: ModelSettingsPage) -> [String] {
+        var items: [String] = []
+        switch page {
+        case .profiles:
+            break
+        case .acceleration:
+            if mtpEnabled {
+                items.append(String(localized: "settings.acceleration.mtp.label",
+                                    defaultValue: "Lightning MTP",
+                                    comment: "Row label for the Lightning MTP toggle"))
+            }
+            if dflashEnabled {
+                items.append(String(localized: "settings.experimental.dflash.label",
+                                    defaultValue: "DFlash",
+                                    comment: "Row label for the DFlash toggle"))
+            }
+            if vlmMtpEnabled {
+                items.append(String(localized: "settings.experimental.vlm_mtp.label",
+                                    defaultValue: "VLM MTP",
+                                    comment: "Row label for the VLM MTP toggle"))
+            }
+            if isDeepseekV41 && deepseekV41CedPrefillEnabled {
+                items.append(String(localized: "settings.summary.ced_prefill",
+                                    defaultValue: "CED Prefill",
+                                    comment: "Short name of DeepSeek V4.1 CED prefill in the Acceleration row value"))
+            }
+            if isQwen4Exp && qwen4GdnDecodeWideProj {
+                items.append(String(localized: "settings.summary.qwen4_wide_decode",
+                                    defaultValue: "Extended Fused Decode",
+                                    comment: "Short name of Qwen4 extended fused decode in the Acceleration row value"))
+            }
+            if showsQwenOqA8 && qwen35OqA8Enabled {
+                items.append(String(localized: "settings.summary.qwen_oq_a8",
+                                    defaultValue: "INT8 Prefill",
+                                    comment: "Short name of Qwen INT8 activation prefill in the Acceleration row value"))
+            }
+        case .memory:
+            if ssdNgramOffloadSupported && ssdNgramOffload {
+                items.append(String(localized: "settings.memory.ssd_ngram_offload.label",
+                                    defaultValue: "SSD N-gram Offload",
+                                    comment: "Row label for the shared Qwen4 PLE / DeepSeek V4.1 Engram SSD offload toggle"))
+            }
+            if moeExpertOffloadSupported && moeExpertOffloadEnabled {
+                let percent = Self.formatPct((moeExpertOffloadResidentFraction ?? loadedMoeResidentFraction) * 100)
+                items.append(String(localized: "settings.summary.moe_offload",
+                                    defaultValue: "MoE Offload \(percent)%",
+                                    comment: "MoE expert offload in the Memory Saving row value; placeholder is the resident percent"))
+            }
+            if turboquantKvEnabled {
+                items.append(String(localized: "settings.summary.turboquant",
+                                    defaultValue: "TurboQuant \(turboquantKvBits)-bit",
+                                    comment: "TurboQuant KV in the Memory Saving row value; placeholder is the bit width"))
+            }
+        case .advanced:
+            if !isDiffusionModel, !externalEngine.isEmpty {
+                let label = model?.externalEngines?.first(where: { $0.id == externalEngine })?.label
+                items.append(label ?? externalEngine)
+            }
+            if trustRemoteCode {
+                items.append(String(localized: "settings.advanced.trust_remote_code.label",
+                                    defaultValue: "Trust Remote Code",
+                                    comment: "Row label for the security-sensitive trust-remote-code toggle"))
+            }
+            if isLLMLike && !isDiffusionModel {
+                if thinkingBudgetEnabled {
+                    items.append(String(localized: "settings.advanced.thinking_budget.label",
+                                        defaultValue: "Thinking Budget",
+                                        comment: "Row label for the thinking budget field"))
+                }
+                if limitToolResults {
+                    items.append(String(localized: "settings.summary.tool_result_limit",
+                                        defaultValue: "Tool Result Limit",
+                                        comment: "Short name of the tool-result token limit in the Advanced row value"))
+                }
+                if guidedGrammarEnabled {
+                    items.append(String(localized: "settings.advanced.guided_grammar.label",
+                                        defaultValue: "Guided Grammar",
+                                        comment: "Row label for the default guided grammar toggle"))
+                }
+                let parser = reasoningParser.trimmingCharacters(in: .whitespaces)
+                if !parser.isEmpty { items.append(parser) }
+            }
+            if isLLMLike && !chatTemplateEntries.isEmpty {
+                items.append(String(localized: "settings.summary.kwargs",
+                                    defaultValue: "\(chatTemplateEntries.count) kwargs",
+                                    comment: "Chat-template kwargs in the Advanced row value; placeholder is the entry count"))
+            }
+            if embeddingAudioSupported && embeddingAudioEnabled {
+                items.append(String(localized: "settings.advanced.embedding_audio.label",
+                                    defaultValue: "Audio Input",
+                                    comment: "Row label for the embedding audio-input toggle"))
+            }
+        case .experimental:
+            if model?.anePrefillBackend != nil && qwen35AnePrefillEnabled {
+                items.append(String(localized: "settings.summary.ane_prefill",
+                                    defaultValue: "ANE Prefill",
+                                    comment: "Short name of ANE prompt processing in the Experimental row value"))
+            }
+            if isDSAConfigModel && indexCacheEnabled {
+                items.append(String(localized: "settings.experimental.indexcache.label",
+                                    defaultValue: "IndexCache",
+                                    comment: "Row label for the DSA IndexCache toggle"))
+            }
+            if specprefillEnabled {
+                items.append(String(localized: "settings.experimental.specprefill.label",
+                                    defaultValue: "SpecPrefill",
+                                    comment: "Row label for the SpecPrefill toggle"))
+            }
+        }
+        return items
+    }
+
+    // MARK: - Generation defaults
+
+    func loadGenerationDefaults(client: OMLXClient) async {
+        guard !isLoadingGenerationDefaults else { return }
+        isLoadingGenerationDefaults = true
+        defer { isLoadingGenerationDefaults = false }
+        do {
+            applyGenerationDefaults(try await client.getGenerationConfig(id: modelID))
+        } catch OMLXClientError.http(let status, _) where status == 404 {
+            lastError = String(localized: "settings.generation.load_defaults.none",
+                               defaultValue: "No config defaults found for this model",
+                               comment: "Error when the model ships no generation defaults to load")
+        } catch {
+            lastError = error.omlxDescription
+        }
+    }
+
+    /// Stage the model's recommended values for Generation Defaults only.
+    /// Fields outside this section keep their values; the toolbar Reset
+    /// covers every setting.
+    func applyGenerationDefaults(_ config: GenerationConfigDTO) {
+        contextLength = config.maxContextWindow.map(String.init) ?? ""
+        temperature = config.temperature.map { String($0) } ?? ""
+        topP = config.topP.map { String($0) } ?? ""
+        topK = config.topK.map(String.init) ?? ""
+        repetitionPenalty = config.repetitionPenalty.map { String($0) } ?? ""
+        maxTokens = ""
+        minP = ""
+        presencePenalty = ""
+        forceSampling = false
+        refreshProfileDirty()
+        lastError = nil
     }
 
     // MARK: - Working profile dict assembly
@@ -1310,6 +1644,10 @@ final class ModelSettingsScreenVM {
             putInt(ProfileSettingsKey.thinkingBudgetTokens, thinkingBudgetTokens)
             putBool(ProfileSettingsKey.forceSampling, forceSampling)
             putString(ProfileSettingsKey.reasoningParser, reasoningParser)
+            putBool(ProfileSettingsKey.guidedGrammarEnabled, guidedGrammarEnabled)
+            if guidedGrammarEnabled {
+                putString(ProfileSettingsKey.guidedGrammar, guidedGrammar)
+            }
             // Server uses 0 as the "disable" sentinel; encode that exactly.
             out[ProfileSettingsKey.maxToolResultTokens] = AnyCodable(
                 limitToolResults ? (Int(toolResultLimitTokens) ?? 4096) : 0
@@ -1333,6 +1671,12 @@ final class ModelSettingsScreenVM {
 
         // Model-specific — experimental
         if !isDiffusion {
+            if moeExpertOffloadSupported {
+                putBool(ProfileSettingsKey.moeExpertOffloadEnabled, moeExpertOffloadEnabled)
+                if let fraction = moeExpertOffloadResidentFraction {
+                    out[ProfileSettingsKey.moeExpertOffloadResidentFraction] = AnyCodable(fraction)
+                }
+            }
             putBool(ProfileSettingsKey.turboquantKvEnabled, turboquantKvEnabled)
             if turboquantKvEnabled, let bits = Double(turboquantKvBits) {
                 out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
@@ -1383,27 +1727,13 @@ final class ModelSettingsScreenVM {
                 putBool(ProfileSettingsKey.dflashDraftQuantEnabled, dflashDraftQuantEnabled)
                 if dflashDraftQuantEnabled {
                     putInt(ProfileSettingsKey.dflashDraftQuantWeightBits, dflashDraftQuantWeightBits)
-                    putInt(ProfileSettingsKey.dflashDraftQuantActivationBits, dflashDraftQuantActivationBits)
                     putInt(ProfileSettingsKey.dflashDraftQuantGroupSize, dflashDraftQuantGroupSize)
                 }
-                putInt(ProfileSettingsKey.dflashMaxCtx, dflashMaxCtx)
                 if !dflashVerifyMode.isEmpty {
                     out[ProfileSettingsKey.dflashVerifyMode] = AnyCodable(dflashVerifyMode)
                 }
                 putInt(ProfileSettingsKey.dflashDraftWindowSize, dflashDraftWindowSize)
-                putInt(ProfileSettingsKey.dflashDraftSinkSize, dflashDraftSinkSize)
                 putInt(ProfileSettingsKey.dflashBlockSize, dflashBlockSize)
-                putBool(ProfileSettingsKey.dflashInMemoryCache, dflashInMemoryCache)
-                if dflashInMemoryCache {
-                    if let bytes = DflashByteSize.gibToBytes(Int(dflashInMemoryCacheGib)) {
-                        out[ProfileSettingsKey.dflashInMemoryCacheMaxBytes] = AnyCodable(Int(bytes))
-                    }
-                    putInt(ProfileSettingsKey.dflashInMemoryCacheMaxEntries, dflashInMemoryCacheMaxEntries)
-                }
-                putBool(ProfileSettingsKey.dflashSsdCache, dflashSsdCache)
-                if dflashSsdCache, let bytes = DflashByteSize.gibToBytes(Int(dflashSsdCacheGib)) {
-                    out[ProfileSettingsKey.dflashSsdCacheMaxBytes] = AnyCodable(Int(bytes))
-                }
             }
             putBool(ProfileSettingsKey.mtpEnabled, mtpEnabled)
             if mtpEnabled {
@@ -1604,6 +1934,97 @@ final class ModelSettingsScreenVM {
         return parts.joined(separator: " · ")
     }
 
+    /// Write the working values straight to the model's settings, like the
+    /// web admin's Save. No profile is needed; the server detaches the
+    /// active profile when the saved values no longer match it.
+    func saveWorkingToModel(client: OMLXClient) async {
+        let targetModelID = modelID
+        if let message = samplingValidationError() {
+            lastError = message
+            return
+        }
+        guard validateWorkingSettings() else { return }
+        let saved = currentSettingsDict()
+        do {
+            _ = try await client.updateModelSettings(id: targetModelID, settings: workingSettingsBody())
+            guard modelID == targetModelID else { return }
+            // Edits made during the request stay unsaved for the next write.
+            loadedSettings = saved
+            profileDirty = currentSettingsDict() != saved
+            await load(modelID: targetModelID, client: client, preservingEdits: true)
+        } catch {
+            await reportFailedSave(error, modelID: targetModelID, client: client,
+                                   preservingEdits: false)
+        }
+    }
+
+    /// The server validates the whole write before storing any of it, so a
+    /// rejected save leaves the stored values unchanged. Reload them so the
+    /// controls do not keep showing the rejected values.
+    private func reportFailedSave(_ error: Error, modelID targetModelID: String,
+                                  client: OMLXClient, preservingEdits: Bool) async {
+        let message = error.omlxDescription
+        if modelID == targetModelID, case .http? = error as? OMLXClientError {
+            await load(modelID: targetModelID, client: client, preservingEdits: preservingEdits)
+        }
+        lastError = message
+    }
+
+    /// PUT body for `saveWorkingToModel`. A profile omits empty fields,
+    /// but a settings write must send null to clear them.
+    func workingSettingsBody() -> [String: AnyCodable] {
+        var body = currentSettingsDict()
+        let clearable = [
+            ProfileSettingsKey.maxContextWindow, ProfileSettingsKey.maxTokens,
+            ProfileSettingsKey.temperature, ProfileSettingsKey.topP,
+            ProfileSettingsKey.topK, ProfileSettingsKey.minP,
+            ProfileSettingsKey.repetitionPenalty, ProfileSettingsKey.presencePenalty,
+            ProfileSettingsKey.reasoningParser, ProfileSettingsKey.guidedGrammar,
+            ProfileSettingsKey.chatTemplateKwargs, ProfileSettingsKey.forcedCtKwargs,
+        ]
+        for key in clearable where body[key] == nil {
+            body[key] = AnyCodable(NSNull())
+        }
+        if thinkingForced {
+            body[ProfileSettingsKey.enableThinking] = AnyCodable(NSNull())
+        }
+        if !isDiffusionModel {
+            // 0 is the server's "disabled" value for IndexCache.
+            if !indexCacheEnabled {
+                body[ProfileSettingsKey.indexCacheFreq] = AnyCodable(0)
+            }
+            body["mtp_fixed_depth"] = AnyCodable(NSNull())
+        }
+        return body
+    }
+
+    private func samplingValidationError() -> String? {
+        if case .failure(let error) = SamplingValidator.temperature(temperature) {
+            return error.message
+        }
+        guard !isDiffusionModel else { return nil }
+        if case .failure(let error) = SamplingValidator.topP(topP) { return error.message }
+        if case .failure(let error) = SamplingValidator.topK(topK) { return error.message }
+        if case .failure(let error) = SamplingValidator.minP(minP) { return error.message }
+        if case .failure(let error) = SamplingValidator.penalty(
+            repetitionPenalty,
+            name: String(localized: "settings.validator.repetition_penalty.name",
+                         defaultValue: "Repetition Penalty",
+                         comment: "Field name embedded in validation errors for repetition penalty")
+        ) {
+            return error.message
+        }
+        if case .failure(let error) = SamplingValidator.penalty(
+            presencePenalty,
+            name: String(localized: "settings.validator.presence_penalty.name",
+                         defaultValue: "Presence Penalty",
+                         comment: "Field name embedded in validation errors for presence penalty")
+        ) {
+            return error.message
+        }
+        return nil
+    }
+
     /// Save the current working settings as a new profile (model scope)
     /// or template (global scope), then activate it. Used by both the
     /// Active Profile banner's "Save as new" and a chip group's
@@ -1613,11 +2034,7 @@ final class ModelSettingsScreenVM {
         let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanName = "p-" + UUID().uuidString.lowercased().prefix(28)
         guard !displayName.isEmpty, scope != .preset else { return }
-        guard scope != .global || !hasModelSpecificEdits else {
-            lastError = globalProfileDropsEditsMessage
-            return
-        }
-        guard validateAneWorkingSettings() else { return }
+        guard validateWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1661,11 +2078,7 @@ final class ModelSettingsScreenVM {
     func updateProfileWithWorking(scope: ProfileScope, name: String, client: OMLXClient) async {
         let targetModelID = modelID
         guard scope != .preset else { return }
-        guard scope != .global || !hasModelSpecificEdits else {
-            lastError = globalProfileDropsEditsMessage
-            return
-        }
-        guard validateAneWorkingSettings() else { return }
+        guard validateWorkingSettings() else { return }
         let settings = currentSettingsDict()
         do {
             switch scope {
@@ -1698,6 +2111,15 @@ final class ModelSettingsScreenVM {
         } catch {
             self.lastError = error.omlxDescription
         }
+    }
+
+    private func validateWorkingSettings() -> Bool {
+        if moeExpertOffloadSupported, moeExpertOffloadEnabled,
+           moeExpertOffloadResidentFraction == nil {
+            lastError = moeResidentRangeError
+            return false
+        }
+        return validateAneWorkingSettings()
     }
 
     private func validateAneWorkingSettings() -> Bool {

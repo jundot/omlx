@@ -21,6 +21,7 @@ from mlx_lm.models.mla import MultiLinear
 from omlx.patches import glm53_kda_prework
 from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as _decode_kernels
 from omlx.patches.deepseek_v4.switch_layers import SwitchGLU, _sort_threshold
+from omlx.patches.glm_moe_dsa.sparse_mla_nax import nax_sparse_mla_available
 from omlx.patches.glm_moe_dsa.sparse_mla_nax import sparse_mla_attention_nax
 from omlx.patches.glm_moe_dsa.deepseek_v32 import (
     Model as DSV32Model,
@@ -43,7 +44,17 @@ from .config import ModelConfig, TextConfig
 from . import hc_prefill
 from .gated_delta import gated_delta_update
 from .linear import fused_quantized_matmul, linear_forward
-
+from .small_indexer import (
+    batched_windows,
+    small_scores,
+    expand_windows,
+    native_topk_required,
+)
+from .sparse_mla_decode import (
+    sparse_mla_decode,
+    sparse_mla_decode_batched,
+    supports_sparse_mla_mask,
+)
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
@@ -66,7 +77,15 @@ def _cache_parts(cache):
 # reproduce the reference op graph bit for bit; see decode_kernels.py.
 # They run on M3 and newer GPUs (decode_kernels.fused_decode_supported).
 _DECODE_FUSION = _decode_kernels.fused_decode_supported()
-_DECODE_BLOCK = 8
+_DECODE_BLOCK = DECODE_BLOCK_SIZE
+# Split-K decode/verify (small_indexer.py, sparse_mla_decode.py) on NAX GPUs.
+_SMALL_QUERY_VERIFY_ROWS = _DECODE_BLOCK
+_SMALL_QUERY_INDEXER = True
+_DSA_DECODE_FUSED = True
+# Native prefill scoring uses a 64-query/key matrix tile.
+_NATIVE_INDEXER_MATRIX_TILE_ROWS = 64
+# The native radix selector handles exactly this many pooled windows.
+_NATIVE_RADIX_TOPK_WINDOWS = 512
 
 # Decode and short verification start evaluating every this many layers.
 # A step is ~800 dependent dispatches whose Python graph build takes ~2.7 ms;
@@ -728,6 +747,76 @@ class Glm5NextLinearAttention(nn.Module):
         return linear_forward(self.o_proj, out)
 
 
+def _small_selector_ok(indexer, pool, batch_size, query_rows):
+    """Validate native selection and complete pool history before advancing it."""
+    from omlx.custom_kernels.glm_moe_dsa import fast
+
+    try:
+        if not fast.has_symbol("dsa_topk_indices"):
+            return False
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return False
+    ratio = getattr(pool, "ratio", None)
+    if ratio != indexer.index_kpool:
+        return False
+    before = indexer._processed(pool)
+    plen = indexer._pool_lengths(pool)
+    rem = getattr(pool, "remainder", None)
+    values = []
+    for v in (before, plen, rem):
+        if isinstance(v, list):
+            if len(v) != batch_size:
+                return False
+            values.append(v)
+        elif isinstance(v, int) and batch_size == 1:
+            values.append([v])
+        else:
+            return False
+    before, plen, rem = values
+    if any(
+        p < 0 or n != p // ratio or t != p % ratio for p, n, t in zip(before, plen, rem)
+    ):
+        return False
+    # The quotient formula is valid only after proving complete history above.
+    future_extent = max((p + query_rows) // ratio for p in before)
+    return min(indexer.index_topk // ratio, future_extent) == _NATIVE_RADIX_TOPK_WINDOWS
+
+
+def _batched_rows(pool, kv, batch_size: int, query_rows: int):
+    """Per-row ``processed`` for the batched path, or None when a row is
+    right-padded inside the block or the KV left padding is not per row."""
+    processed = Glm5NextIndexer._processed(pool)
+    if not isinstance(processed, list):
+        processed = [int(processed)] * batch_size
+    if len(processed) != batch_size:
+        return None
+    lengths = getattr(pool, "_lengths", None)
+    if isinstance(lengths, list) and (
+        len(lengths) != batch_size
+        or any(length - p < query_rows for length, p in zip(lengths, processed))
+    ):
+        return None
+    lp = getattr(kv, "left_padding", None)
+    if lp is not None and (not isinstance(lp, mx.array) or lp.shape != (batch_size,)):
+        return None
+    return processed
+
+
+def _row_lists(before, after, pool_lengths, batch_size: int, query_rows: int):
+    """(before, pool_lengths) per-row lists after the pool advanced, or None."""
+    if not isinstance(before, list):
+        before = [int(before)] * batch_size
+    if not isinstance(after, list):
+        after = [int(after)] * batch_size
+    if not isinstance(pool_lengths, list):
+        pool_lengths = [int(pool_lengths)] * batch_size
+    if not (len(before) == len(after) == len(pool_lengths) == batch_size):
+        return None
+    if any(a - b != query_rows for a, b in zip(after, before)):
+        return None
+    return before, pool_lengths
+
+
 class Glm5NextIndexer(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -792,8 +881,8 @@ class Glm5NextIndexer(nn.Module):
                 return None
             qt = q.transpose(0, 2, 1, 3)
             keys = pool_keys[:, None]
-            q_pad = (-qt.shape[2]) % 64
-            k_pad = (-keys.shape[2]) % 64
+            q_pad = (-qt.shape[2]) % _NATIVE_INDEXER_MATRIX_TILE_ROWS
+            k_pad = (-keys.shape[2]) % _NATIVE_INDEXER_MATRIX_TILE_ROWS
             if q_pad:
                 qt = mx.pad(qt, [(0, 0), (0, 0), (0, q_pad), (0, 0)])
                 weights = mx.pad(weights, [(0, 0), (0, q_pad), (0, 0)])
@@ -890,6 +979,82 @@ class Glm5NextIndexer(nn.Module):
             self.index_kpool - 1 if tail_on else 0,
             output_width,
         )
+
+    def small_windows(self, x, qr, cache, projected=None):
+        """Advance the pool and select top-k windows for one sequence.
+        Returns (windows [S, 512], tokens before, pooled windows), or None
+        for the dense bypass."""
+        batch_size, query_rows, _ = x.shape
+        q_raw, k_raw, w_raw = projected if projected is not None else (None, None, None)
+        if q_raw is None:
+            q_raw = linear_forward(self.wq_b, qr)
+        if k_raw is None:
+            k_raw = linear_forward(self.wk, x)
+        q = q_raw.reshape(batch_size, query_rows, self.n_heads, self.head_dim)
+        k = self.k_norm(k_raw).reshape(batch_size, query_rows, self.head_dim)
+        gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
+        before = self._processed(cache)
+        ready_k, ready_gate, _ = cache.accumulate_windows(k, gate_scores, before)
+        pool_keys = cache.update_and_fetch(self._compress_windows(ready_k, ready_gate))
+        after = self._processed(cache)
+        if getattr(self, "bypass_short", True) and after <= self.index_topk:
+            return None
+        weights = w_raw if w_raw is not None else linear_forward(self.weights_proj, x)
+        weights = (weights * self.weight_scale).astype(q.dtype)
+        scores = small_scores(q, pool_keys, weights, before, self.index_kpool)
+        select_k = min(self.index_topk // self.index_kpool, pool_keys.shape[1])
+        selected = native_topk_required(self._native_topk, scores, select_k)
+        return selected[0], before, pool_keys.shape[1]
+
+    def small_windows_batched(self, x, qr, cache, kv_cache, projected=None):
+        """Batched small_windows. Returns (windows [B, S, 512], rows [B, 3]
+        of (pooled windows, tokens before, KV left padding)), or None."""
+        batch_size, query_rows, _ = x.shape
+        q_raw, k_raw, w_raw = projected if projected is not None else (None, None, None)
+        if q_raw is None:
+            q_raw = linear_forward(self.wq_b, qr)
+        if k_raw is None:
+            k_raw = linear_forward(self.wk, x)
+        q = q_raw.reshape(batch_size, query_rows, self.n_heads, self.head_dim)
+        k = self.k_norm(k_raw).reshape(batch_size, query_rows, self.head_dim)
+        gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
+        before = self._processed(cache)
+        offset = (
+            mx.array(before, dtype=mx.int32) if isinstance(before, list) else before
+        )
+        ready_k, ready_gate, _ = cache.accumulate_windows(k, gate_scores, offset)
+        pool_keys = cache.update_and_fetch(self._compress_windows(ready_k, ready_gate))
+        after = self._processed(cache)
+        total_max = max(after) if isinstance(after, list) else after
+        if getattr(self, "bypass_short", True) and total_max <= self.index_topk:
+            return None
+        rows = _row_lists(
+            before, after, self._pool_lengths(cache), batch_size, query_rows
+        )
+        if rows is None:
+            # _batched_fused_ok admits only states where every row advances S.
+            raise RuntimeError("GLM-5.3 batched DSA: a row did not advance by S tokens")
+        before, plen = rows
+        weights = w_raw if w_raw is not None else linear_forward(self.weights_proj, x)
+        weights = (weights * self.weight_scale).astype(q.dtype)
+        selected, _ = batched_windows(
+            self, q, pool_keys, weights, before, plen, self._native_topk, cache
+        )
+        lp = getattr(kv_cache, "left_padding", None)
+        lp = (
+            mx.zeros((batch_size,), dtype=mx.int32)
+            if lp is None
+            else lp.astype(mx.int32)
+        )
+        rows = mx.stack(
+            [
+                mx.array(plen, dtype=mx.int32),
+                mx.array(before, dtype=mx.int32),
+                lp,
+            ],
+            axis=1,
+        )
+        return selected.astype(mx.int32), rows
 
     def __call__(
         self, x, qr, mask, cache=None, kv_cache=None, score_from=0, projected=None
@@ -1216,6 +1381,120 @@ class Glm5NextSparseAttention(nn.Module):
             out = mx.concatenate(outs, axis=2)
         return out.transpose(0, 2, 1, 3).reshape(q.shape[0], rows, -1)
 
+    def _decode_fused_ok(self, batch_size, query_rows, dense_rows, cache, q) -> bool:
+        idx_cache = cache[1] if cache is not None else None
+        return bool(
+            _SMALL_QUERY_INDEXER
+            and batch_size == 1
+            and 1 <= query_rows <= _SMALL_QUERY_VERIFY_ROWS
+            and not dense_rows
+            and idx_cache is not None
+            and cache[0] is not None
+            and q.shape[:3] == (batch_size, self.num_heads, query_rows)
+            and q.shape[-1] == self.q_head_dim
+            and not isinstance(self.indexer._processed(idx_cache), list)
+            and getattr(cache[0], "left_padding", None) is None
+            and q.dtype in (mx.float16, mx.bfloat16)
+            and self.indexer.index_kpool == 4
+            and self.indexer.index_kpool_always_select_tail
+            and self.indexer.head_dim % 4 == 0
+            and self.kv_lora_rank % 128 == 0
+            and self.num_heads % 16 == 0
+            and self.num_heads <= 64
+            and _small_selector_ok(self.indexer, idx_cache, batch_size, query_rows)
+            and nax_sparse_mla_available()
+        )
+
+    def _batched_fused_ok(self, batch_size, query_rows, dense_rows, cache, q) -> bool:
+        """Batched / left-padded counterpart of _decode_fused_ok."""
+        if not (
+            _SMALL_QUERY_INDEXER
+            and 1 <= query_rows <= _SMALL_QUERY_VERIFY_ROWS
+            and not dense_rows
+            and cache is not None
+            and cache[0] is not None
+            and cache[1] is not None
+            and getattr(cache[0], "keys", None) is not None
+            and cache[0].keys.shape[:2] == (batch_size, 1)
+            and cache[0].keys.shape[-1] == self.kv_lora_rank
+            and q.shape[:3] == (batch_size, self.num_heads, query_rows)
+            and q.shape[-1] == self.q_head_dim
+            and q.dtype in (mx.float16, mx.bfloat16)
+            and self.indexer.index_kpool == 4
+            and self.indexer.index_kpool_always_select_tail
+            and self.indexer.head_dim % 4 == 0
+            and self.num_heads % 16 == 0
+            and self.num_heads <= 64
+            and self.kv_lora_rank % 128 == 0
+        ):
+            return False
+        if _batched_rows(cache[1], cache[0], batch_size, query_rows) is None:
+            return False
+        return (
+            _small_selector_ok(self.indexer, cache[1], batch_size, query_rows)
+            and nax_sparse_mla_available()
+        )
+
+    def _decode_fused(
+        self, q, kv_latent, cache, windows, before, n_pool, q_latent=None, mask=None
+    ):
+        """Decode/verify attention over top-k windows in two kernels."""
+        batch_size, heads, query_rows, _ = q.shape
+        if q_latent is None:
+            q_latent = self.embed_q(q)
+        out = sparse_mla_decode(
+            q_latent.astype(kv_latent.dtype),
+            kv_latent,
+            windows,
+            before,
+            n_pool,
+            self.scale,
+            mask=mask,
+        )
+        if cache[1].pooled is not None:
+            deps = tuple(v for v in cache[1].state if isinstance(v, mx.array))
+            if deps:
+                cache[0].keys = mx.depends(cache[0].keys, deps)
+        out = self.unembed_out(out)
+        return self._finish(
+            out.transpose(0, 2, 1, 3).reshape(batch_size, query_rows, -1), None
+        )
+
+    def _decode_fused_batched(
+        self, q, kv_latent, cache, windows, rows, q_latent=None, mask=None
+    ):
+        """Batched decode/verify attention over each row's top-k windows."""
+        batch_size, heads, query_rows, _ = q.shape
+        if q_latent is None:
+            q_latent = self.embed_q(q)
+        kv_length = kv_latent.shape[2]
+        kv_buf = cache[0].keys
+        if not (
+            kv_buf.ndim == 4
+            and kv_buf.shape[:2] == (batch_size, 1)
+            and kv_buf.shape[2] >= kv_length
+            and kv_buf.shape[3] == kv_latent.shape[3]
+            and kv_buf.dtype == kv_latent.dtype
+        ):
+            kv_buf = kv_latent
+        out = sparse_mla_decode_batched(
+            q_latent.astype(kv_latent.dtype),
+            kv_buf,
+            kv_length,
+            windows,
+            rows,
+            self.scale,
+            mask=mask,
+        )
+        if cache[1].pooled is not None:
+            deps = tuple(v for v in cache[1].state if isinstance(v, mx.array))
+            if deps:
+                cache[0].keys = mx.depends(cache[0].keys, deps)
+        out = self.unembed_out(out)
+        return self._finish(
+            out.transpose(0, 2, 1, 3).reshape(batch_size, query_rows, -1), None
+        )
+
     def _finish(self, flat, out_dense):
         if out_dense is not None:
             flat = mx.concatenate([out_dense, flat], axis=1)
@@ -1279,15 +1558,105 @@ class Glm5NextSparseAttention(nn.Module):
         else:
             cache = [None] * 2
 
-        topk_indices = self.indexer(
-            x,
-            qr,
-            mask,
-            cache=cache[1],
-            kv_cache=cache[0],
-            score_from=dense_rows,
-            projected=indexer_projected,
+        split_k_inputs_ok = (
+            _DSA_DECODE_FUSED
+            and kv_latent.dtype in (mx.float16, mx.bfloat16)
+            and supports_sparse_mla_mask(mask, B, L, kv_latent.shape[2])
         )
+        scalar_small = self._decode_fused_ok(B, L, dense_rows, cache, q)
+        batch_small = not scalar_small and self._batched_fused_ok(
+            B, L, dense_rows, cache, q
+        )
+        small_inputs_ok = False
+        if (scalar_small or batch_small) and x.dtype == q.dtype and qr.dtype == q.dtype:
+            # Resolve missing projections before mutating the indexer pool.
+            # Unsupported actual outputs are reused by the general path.
+            parts = list(indexer_projected or (None, None, None))
+            for i, (layer, value) in enumerate(
+                (
+                    (self.indexer.wq_b, qr),
+                    (self.indexer.wk, x),
+                    (self.indexer.weights_proj, x),
+                )
+            ):
+                if parts[i] is None:
+                    parts[i] = linear_forward(layer, value)
+            indexer_projected = tuple(parts)
+            expected = (
+                self.indexer.n_heads * self.indexer.head_dim,
+                self.indexer.head_dim,
+                self.indexer.n_heads,
+            )
+            pooled = getattr(cache[1], "pooled", None)
+            small_inputs_ok = (
+                pooled is not None
+                and pooled.shape[0] == B
+                and pooled.shape[-1] == self.indexer.head_dim
+                and pooled.dtype == q.dtype
+                and all(
+                    value.dtype == q.dtype and value.shape == (B, L, width)
+                    for value, width in zip(parts, expected)
+                )
+            )
+        if small_inputs_ok and scalar_small:
+            picked = self.indexer.small_windows(
+                x, qr, cache[1], projected=indexer_projected
+            )
+            if picked is not None:
+                windows, before, plen = picked
+                if split_k_inputs_ok:
+                    return self._decode_fused(
+                        q,
+                        kv_latent,
+                        cache,
+                        windows,
+                        before,
+                        plen,
+                        q_latent=q_latent_early,
+                        mask=mask,
+                    )
+                topk_indices = expand_windows(self.indexer, windows[None], before, plen)
+            else:
+                # The pool advanced; None is dense bypass, never indexer retry.
+                topk_indices = None
+        elif small_inputs_ok and batch_small:
+            before = self.indexer._processed(cache[1])
+            picked = self.indexer.small_windows_batched(
+                x, qr, cache[1], cache[0], projected=indexer_projected
+            )
+            if picked is not None:
+                windows, rows = picked
+                if split_k_inputs_ok:
+                    return self._decode_fused_batched(
+                        q,
+                        kv_latent,
+                        cache,
+                        windows,
+                        rows,
+                        q_latent=q_latent_early,
+                        mask=mask,
+                    )
+                # Host metadata was validated before dispatch; avoid a device sync.
+                plen = self.indexer._pool_lengths(cache[1])
+                topk_indices = expand_windows(
+                    self.indexer,
+                    windows,
+                    before,
+                    plen,
+                    getattr(cache[0], "left_padding", None),
+                )
+            else:
+                topk_indices = None
+        else:
+            topk_indices = self.indexer(
+                x,
+                qr,
+                mask,
+                cache=cache[1],
+                kv_cache=cache[0],
+                score_from=dense_rows,
+                projected=indexer_projected,
+            )
         out_dense = None
         if dense_rows and topk_indices is not None:
             # The leading rows' selection was the causal prefix: dense SDPA over

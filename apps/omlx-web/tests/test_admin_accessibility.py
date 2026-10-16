@@ -1,4 +1,5 @@
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
@@ -88,3 +89,44 @@ def test_the_step_below_xs_reaches_the_compiled_stylesheet():
     # `caption` comes from theme.extend.fontSize, so a config change that drops
     # it would silently leave the 10px labels at the browser default.
     assert ".text-caption{font-size:10px}" in TAILWIND
+
+
+class _SwallowedTagParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.swallowed = []
+
+    def handle_starttag(self, tag, attrs):
+        if any("<" in name for name, _ in attrs):
+            self.swallowed.append(f"line {self.getpos()[0]}: <{tag}>")
+
+
+def test_start_tags_close_before_the_next_element():
+    # A start tag missing its ">" reads the next element as attribute names,
+    # which hides icons such as the copy-button SVG.
+    broken = []
+    for page in PAGES:
+        if page.suffix != ".html":
+            continue
+        parser = _SwallowedTagParser()
+        parser.feed(page.read_text(encoding="utf-8"))
+        broken += [f"{page.relative_to(ROOT)} {item}" for item in parser.swallowed]
+    assert not broken, "\n".join(broken)
+
+
+SWITCH = re.compile(r"<button\b[^>]*\bw-11 h-6\b[^>]*>", re.DOTALL)
+DTYPE = re.compile(r"<button\b[^>]*\boqDtype\b[^>]*>", re.DOTALL)
+
+
+def test_toggle_controls_expose_their_state():
+    # Switches and the dtype buttons paint their state in colour only, so a
+    # screen reader hears "button" whatever their state.
+    unexposed = []
+    for page in PAGES:
+        source = page.read_text(encoding="utf-8")
+        tags = [tag for tag in SWITCH.findall(source) if "aria-checked" not in tag]
+        tags += [tag for tag in DTYPE.findall(source) if "aria-pressed" not in tag]
+        unexposed += [
+            f"{page.relative_to(ROOT)} {' '.join(tag.split())}" for tag in tags
+        ]
+    assert not unexposed, "state is not exposed for:\n" + "\n".join(unexposed)

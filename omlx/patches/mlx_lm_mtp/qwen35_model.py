@@ -49,9 +49,9 @@ The patch is intentionally limited to ``mlx_lm.models.qwen3_5``; mlx-vlm's
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any, Optional
 
-from ..dflash_lifecycle import get_dflash_guard_base, set_dflash_guard_base
 from . import prompt_priming
 
 logger = logging.getLogger(__name__)
@@ -59,10 +59,9 @@ logger = logging.getLogger(__name__)
 def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
     """True iff ``cls.<attr>`` is the function we previously installed.
 
-    Used as a self-healing idempotency check: when another patch (e.g.
-    dflash's speculative hook) overwrites ``__call__`` between two
-    Lightning MTP loads in the same process, the marker disappears and the
-    caller knows to re-apply. Reading from ``cls.__dict__`` instead of
+    Used as a self-healing idempotency check: when another patch overwrites
+    ``__call__`` between two Lightning MTP loads in the same process, the
+    marker disappears and the caller knows to re-apply. Reading from ``cls.__dict__`` instead of
     ``getattr`` avoids resolving inherited attributes — only what is
     actually defined on this class counts.
     """
@@ -76,8 +75,8 @@ def apply() -> bool:
     Self-healing. Each sub-patcher decides for itself whether the class
     still carries our installed method (marker-based identity check)
     and re-applies if something has clobbered it since the last call.
-    No module-level "patched once" flag so dflash → mtp transitions in
-    the same process re-establish ownership (issue #1388).
+    No module-level "patched once" flag so a later load in the same process
+    re-establishes ownership (issue #1388).
     """
     try:
         from mlx_lm.models import qwen3_5 as q35
@@ -240,15 +239,6 @@ def _patch_gated_delta_net(q35: Any) -> None:
     if _is_our_method(cls, "__call__", "_omlx_mtp_call_marker"):
         return
 
-    # dflash coexistence (issue #2972): if the dflash batch-cache guard owns
-    # ``cls.__call__``, do not clobber it — that silently strips the resident
-    # DFlash engine's speculative hook and its generations degenerate into
-    # repetition loops. Instead install our body as the guard's fallback
-    # base: dflash traffic keeps its hook, MTP/batched traffic gets ours.
-    dflash_base = get_dflash_guard_base(cls)
-    if getattr(dflash_base, "_omlx_mtp_call_marker", False):
-        return  # our body already sits under the dflash guard
-
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.nn.layers.distributed import sum_gradients
@@ -365,12 +355,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
 
     cls._process_chunk = _process_chunk
     __call__._omlx_mtp_call_marker = True
-    if dflash_base is not None:
-        # Compose with the armed dflash guard instead of replacing it
-        # (issue #2972): our body becomes the guard's fallback base.
-        set_dflash_guard_base(cls, __call__)
-    else:
-        cls.__call__ = __call__
+    cls.__call__ = __call__
 
 
 # ---------------------------------------------------------------------------
@@ -386,11 +371,9 @@ def _patch_decoder_layer(q35: Any) -> None:
         if self.is_linear:
             h_in = self.input_layernorm(x)
             # n_confirmed is an MTP draft/verify concern and is always 0 on
-            # the stock and DFlash forward paths. Forward it only when it
-            # actually splits the sequence, so linear_attn implementations
-            # that don't accept the kwarg keep working — DFlash replaces
-            # linear_attn.__call__ with a hook that has no n_confirmed param.
-            # Mirrors the conditional in batch_generator._call_backbone.
+            # stock forwards. Forward it only when it actually splits the
+            # sequence, so linear_attn implementations without the kwarg keep
+            # working. Mirrors the conditional in batch_generator._call_backbone.
             if n_confirmed:
                 r = self.linear_attn(h_in, mask, cache, n_confirmed=n_confirmed)
             else:
@@ -423,6 +406,8 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         cache=None,
         input_embeddings=None,
         n_confirmed: int = 0,
+        capture_layer_ids=None,
+        capture_sink=None,
     ):
         import mlx.core as mx
 
@@ -453,11 +438,19 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         if pipeline_rank < pipeline_size - 1:
             hidden_states = mx.distributed.recv_like(hidden_states, pipeline_rank + 1)
 
-        for layer, c in zip(layers, cache):
+        wanted = set(capture_layer_ids or ())
+        if wanted and pipeline_size > 1:
+            raise ValueError("layer captures need the whole model on one rank")
+        captured = {}
+        for index, (layer, c) in enumerate(zip(layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
                 hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
             )
+            if index in wanted:
+                captured[index] = hidden_states
+        if capture_sink is not None:
+            capture_sink.extend(captured[i] for i in capture_layer_ids or ())
 
         if pipeline_rank != 0:
             hidden_states = mx.distributed.send(
@@ -537,12 +530,30 @@ def _patch_text_model(q35: Any) -> None:
         input_embeddings=None,
         return_hidden: bool = False,
         n_confirmed: int = 0,
+        capture_layer_ids=None,
     ):
+        drafter = getattr(self, "_omlx_drafter", None)
+        scope = getattr(drafter, "scope_uids", None)
+        # An ordinary decode step while a block drafter is attached keeps the
+        # committed token in the drafter context.
+        observe = bool(
+            capture_layer_ids is None
+            and not return_hidden
+            and scope
+            and inputs is not None
+            and inputs.ndim == 2
+            and tuple(inputs.shape) == (len(scope), 1)
+        )
+        if observe:
+            capture_layer_ids = list(drafter.target_layer_ids)
+        captured = [] if capture_layer_ids else None
         hidden = self.model(
             inputs,
             cache,
             input_embeddings=input_embeddings,
             n_confirmed=n_confirmed,
+            capture_layer_ids=capture_layer_ids,
+            capture_sink=captured,
         )
         normed = self.model.norm(hidden)
         if not return_hidden and not n_confirmed and input_embeddings is None:
@@ -558,9 +569,31 @@ def _patch_text_model(q35: Any) -> None:
             out = self.model.embed_tokens.as_linear(normed)
         else:
             out = self.lm_head(normed)
+        if observe:
+            drafter.observe(scope, captured)
+            return out
+        if captured is not None:
+            # Layer captures need an output object; a verify also carries
+            # the head's pre-norm hidden last. Rollback stays on
+            # mtp_partial_rollback (no gdn_states).
+            return SimpleNamespace(
+                logits=out,
+                hidden_states=captured + ([hidden] if return_hidden else []),
+                gdn_states=None,
+            )
         if return_hidden:
             return out, hidden
         return out
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        """Single-row rollback through ``mtp_partial_rollback``.
+
+        mlx-vlm's DFlash drafter bind requires this hook on the target.
+        """
+        accepted = int(accepted)
+        if not self.mtp_partial_rollback(caches, accepted, int(block_size) - 1):
+            raise RuntimeError("qwen3_5 cache rejected the speculative rollback")
+        return accepted
 
     def mtp_forward(
         self,
@@ -739,6 +772,7 @@ def _patch_text_model(q35: Any) -> None:
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_partial_rollback = mtp_partial_rollback
+    cls.rollback_speculative_cache = rollback_speculative_cache
     cls.sanitize = sanitize
     cls.quant_predicate = property(quant_predicate)
 
@@ -761,6 +795,7 @@ def _patch_outer_model(q35: Any) -> None:
         input_embeddings=None,
         return_hidden: bool = False,
         n_confirmed: int = 0,
+        capture_layer_ids=None,
     ):
         return self.language_model(
             inputs,
@@ -768,6 +803,7 @@ def _patch_outer_model(q35: Any) -> None:
             input_embeddings=input_embeddings,
             return_hidden=return_hidden,
             n_confirmed=n_confirmed,
+            capture_layer_ids=capture_layer_ids,
         )
 
     def mtp_forward(

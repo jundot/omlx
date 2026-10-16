@@ -1686,7 +1686,7 @@ def test_install_thinking_budget_support_does_not_need_the_http_stack():
 
 def test_thinking_close_pattern_and_utf8_piece_match_scheduler_rules():
     class Tokenizer:
-        chat_template = r"{{ '\n</think>\n\n' }}"
+        chat_template = r"{%- if '</think>' in content %}{{ '\n</think>\n\n' }}"
 
         def encode(self, text, add_special_tokens=False):
             return {"\n": [10], "\n\n": [11, 12]}[text]

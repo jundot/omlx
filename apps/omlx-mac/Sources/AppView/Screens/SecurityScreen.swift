@@ -6,6 +6,7 @@
 //                setup, and /admin/api/global-settings (`api_key` field)
 //                for updates to an already-configured key.
 //   • Authentication — `skip_api_key_verification` toggle (no-auth mode)
+//                and `allow_unauthenticated_inference` (keyless /v1 only)
 //   • Sub Keys — list + create + delete via /admin/api/sub-keys (POST/DELETE)
 //
 // The main key is rendered as a SecureField with an explicit show toggle
@@ -200,6 +201,9 @@ private struct AuthenticationSection: View {
     @Bindable var vm: SecurityScreenVM
     let client: OMLXClient
 
+    @Environment(\.omlxTheme) private var theme
+    @State private var confirmKeylessInference = false
+
     var body: some View {
         SectionHeader(String(localized: "security.section.authentication",
                               defaultValue: "Authentication",
@@ -208,17 +212,56 @@ private struct AuthenticationSection: View {
         ListGroup {
             Row(
                 label: String(localized: "security.auth.disable_verify",
-                              defaultValue: "Disable API Key Verification",
+                              defaultValue: "Disable All Authentication",
                               comment: "Row label for the toggle that disables API key verification"),
                 sublabel: String(localized: "security.auth.disable_verify.sub",
                                  defaultValue: "Allow unauthenticated /v1 and admin requests. Use for development only.",
-                                 comment: "Sublabel for the disable API key verification toggle"),
-                isLast: true
+                                 comment: "Sublabel for the disable API key verification toggle")
             ) {
                 RowSwitch(isOn: vm.bind($vm.skipApiKeyVerification, save: {
                     Task { await vm.saveSkipApiKeyVerification(client: client) }
                 }))
             }
+            Row(
+                label: String(localized: "security.auth.keyless_inference",
+                              defaultValue: "Allow Inference Without API Key",
+                              comment: "Row label for the toggle that allows keyless inference"),
+                sublabel: String(localized: "security.auth.keyless_inference.sub",
+                                 defaultValue: "Keyless access to inference, MCP tools, and web search. Admin still requires authentication.",
+                                 comment: "Sublabel for the keyless inference toggle"),
+                isLast: true
+            ) {
+                // Turning this on goes through the warning alert first.
+                RowSwitch(isOn: Binding(
+                    get: { vm.allowUnauthenticatedInference },
+                    set: { enabled in
+                        if enabled {
+                            confirmKeylessInference = true
+                        } else {
+                            Task { await vm.setAllowUnauthenticatedInference(false, client: client) }
+                        }
+                    }
+                ))
+                .tint(theme.redDot)
+            }
+        }
+        .alert(
+            String(localized: "security.auth.keyless_inference.confirm_title",
+                   defaultValue: "Allow inference without an API key?",
+                   comment: "Title of the warning shown before enabling keyless inference"),
+            isPresented: $confirmKeylessInference
+        ) {
+            Button(String(localized: "common.cancel", defaultValue: "Cancel"), role: .cancel) {}
+            Button(String(localized: "security.auth.keyless_inference.confirm_button",
+                          defaultValue: "I Understand",
+                          comment: "Button that accepts the keyless inference warning"),
+                   role: .destructive) {
+                Task { await vm.setAllowUnauthenticatedInference(true, client: client) }
+            }
+        } message: {
+            Text(String(localized: "security.auth.keyless_inference.confirm_message",
+                        defaultValue: "Anyone who can reach this server will be able to use inference APIs, MCP tools, and web search without an API key.\n\nBy turning this on, you acknowledge that the server will be exposed to attacks from the network, that you understand you are removing this security protection, and that you have put appropriate security measures in place.",
+                        comment: "Warning shown before enabling keyless inference"))
         }
     }
 }

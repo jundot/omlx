@@ -654,14 +654,15 @@ class TestUsesNativeReasoningContent:
             preserve_thinking_default=True,
         )
 
-    def test_detects_muse_glimmer(self):
+    @pytest.mark.parametrize("model_type", ["muse_glimmer", "muse_spark"])
+    def test_detects_muse_family(self, model_type):
         assert uses_native_reasoning_content(
             "any-name",
-            config_model_type="muse_glimmer",
+            config_model_type=model_type,
         )
         assert uses_native_reasoning_content(
             "any-name",
-            engine_model_type="muse_glimmer",
+            engine_model_type=model_type,
         )
 
     def test_plain_model_is_not_native(self):
@@ -3466,6 +3467,29 @@ class TestDropVoidAssistantMessages:
         assert result[0]["role"] == "user"
         assert "hello" in result[0]["content"]
         assert "world" in result[0]["content"]
+
+    def test_multimodal_void_drop_then_merge_consecutive_users(self):
+        """The VLM path must also merge users left adjacent by the drop."""
+        msgs = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "data:,a"}},
+                ],
+            ),
+            Message(role="assistant", content=""),
+            Message(role="user", content="world"),
+        ]
+        result = extract_multimodal_content(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [p["type"] for p in result[0]["content"]] == [
+            "text",
+            "image_url",
+            "text",
+        ]
+        assert result[0]["content"][2]["text"] == "world"
 
     def test_multiple_void_assistants_merge_surrounding_users(self):
         """Multiple void assistants should be dropped and adjacent users merged."""

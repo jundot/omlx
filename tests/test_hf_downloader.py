@@ -7,16 +7,19 @@ import os
 import shutil
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from huggingface_hub import HfApi
 from huggingface_hub.utils import HfHubHTTPError
 
 from omlx._hf_download_worker import _download_without_xet
 from omlx.admin import hf_downloader as hf_downloader_mod
+from omlx.admin import routes as admin_routes
 from omlx.admin.hf_downloader import (
     DownloadStatus,
     DownloadTask,
@@ -380,7 +383,7 @@ class TestHFDownloader:
             await _wait_for_downloads(downloader)
 
             assert task.status == DownloadStatus.FAILED
-            assert "gated" in task.error.lower()
+            assert "valid HF token" in task.error
 
             await downloader.shutdown()
 
@@ -1178,7 +1181,7 @@ class TestHFDownloaderRoutes:
         # Create a mock global settings
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         import omlx.admin.routes as routes_module
 
@@ -1237,7 +1240,7 @@ class TestHFDownloaderRoutes:
 
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1290,7 +1293,7 @@ class TestHFDownloaderRoutes:
         downloader = HFDownloader(model_dir=str(model_dir))
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1376,7 +1379,7 @@ class TestHFDownloaderRoutes:
         (model_path / "model.safetensors").write_bytes(b"x" * 8)
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1432,7 +1435,7 @@ class TestHFDownloaderRoutes:
         )
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1473,7 +1476,7 @@ class TestHFDownloaderRoutes:
 
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         orig = routes_module._get_global_settings
         routes_module._get_global_settings = lambda: mock_settings
@@ -1500,7 +1503,7 @@ class TestHFDownloaderRoutes:
 
         mock_settings = MagicMock()
         mock_settings.model.model_dir = str(model_dir_with_models)
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         orig = routes_module._get_global_settings
         routes_module._get_global_settings = lambda: mock_settings
@@ -1523,7 +1526,7 @@ class TestHFDownloaderRoutes:
         import omlx.admin.routes as routes_module
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1577,7 +1580,7 @@ class TestHFDownloaderRoutes:
         import omlx.admin.routes as routes_module
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1611,7 +1614,7 @@ class TestHFDownloaderRoutes:
         import omlx.admin.routes as routes_module
 
         mock_settings = MagicMock()
-        mock_settings.model.get_model_dirs.return_value = [model_dir_with_models]
+        mock_settings.get_effective_model_dirs.return_value = [model_dir_with_models]
 
         mock_pool = MagicMock()
         mock_pool.get_loaded_model_ids.return_value = []
@@ -1647,6 +1650,96 @@ class TestHFDownloaderRoutes:
             routes_module._get_global_settings = orig_settings
             routes_module._get_engine_pool = orig_pool
             routes_module._get_settings_manager = orig_mgr
+
+    @staticmethod
+    def _make_hf_cache_repo(hub, org, name):
+        """Create an HF Hub cache repo whose snapshot files link into blobs/."""
+        repo = hub / f"models--{org}--{name}"
+        (repo / "refs").mkdir(parents=True)
+        (repo / "refs" / "main").write_text("abc123")
+        (repo / "blobs").mkdir()
+        snapshot = repo / "snapshots" / "abc123"
+        snapshot.mkdir(parents=True)
+        for filename, data in (
+            ("config.json", b'{"model_type": "llama"}'),
+            ("model.safetensors", b"0" * 1000),
+        ):
+            blob = repo / "blobs" / filename
+            blob.write_bytes(data)
+            (snapshot / filename).symlink_to(blob)
+        return repo
+
+    @staticmethod
+    def _patch_route_state(model_dirs):
+        settings = MagicMock()
+        settings.get_effective_model_dirs.return_value = model_dirs
+        pool = MagicMock()
+        pool.get_loaded_model_ids.return_value = []
+        pool._entries = {}
+        settings_manager = MagicMock()
+        settings_manager.get_pinned_model_ids.return_value = []
+        patcher = patch.multiple(
+            admin_routes,
+            _get_global_settings=lambda: settings,
+            _get_engine_pool=lambda: pool,
+            _get_settings_manager=lambda: settings_manager,
+        )
+        return patcher, settings_manager
+
+    @pytest.mark.asyncio
+    async def test_hf_cache_repo_is_listed_and_deleted_whole(self, tmp_path):
+        """MLX repos in the HF Hub cache list and delete like discovery sees them."""
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        hub = tmp_path / "hub"
+        repo = self._make_hf_cache_repo(hub, "mlx-community", "Tiny-4bit")
+        plain = self._make_hf_cache_repo(hub, "acme", "PlainModel")
+        patcher, settings_manager = self._patch_route_state([models_dir, hub])
+
+        with patcher:
+            listed = (await admin_routes.list_hf_models(is_admin=True))["models"]
+            assert [(m["name"], m["source_type"], m["repo_id"]) for m in listed] == [
+                ("mlx-community--Tiny-4bit", "hf_cache", "mlx-community/Tiny-4bit")
+            ]
+            assert listed[0]["size"] == 1023
+
+            result = await admin_routes.delete_hf_model(
+                model_name="mlx-community--Tiny-4bit", is_admin=True
+            )
+            assert result["success"] is True
+            assert not repo.exists()
+            assert plain.exists()
+            settings_manager.delete_settings.assert_called_once_with(
+                "mlx-community--Tiny-4bit"
+            )
+
+            # Discovery skips non-MLX cache repos, so deletion does too.
+            with pytest.raises(HTTPException) as exc_info:
+                await admin_routes.delete_hf_model(
+                    model_name="acme--PlainModel", is_admin=True
+                )
+            assert exc_info.value.status_code == 404
+            assert plain.exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target_inside_hub", [False, True])
+    async def test_delete_refuses_symlinked_hf_cache_repo(
+        self, tmp_path, target_inside_hub
+    ):
+        """A cache repo entry that is a symlink is refused and its target kept."""
+        hub = tmp_path / "hub"
+        hub.mkdir()
+        target_parent = hub / "store" if target_inside_hub else tmp_path / "other"
+        target = self._make_hf_cache_repo(target_parent, "mlx-community", "Tiny-4bit")
+        (hub / target.name).symlink_to(target, target_is_directory=True)
+        patcher, _ = self._patch_route_state([hub])
+
+        with patcher, pytest.raises(HTTPException) as exc_info:
+            await admin_routes.delete_hf_model(
+                model_name="mlx-community--Tiny-4bit", is_admin=True
+            )
+        assert exc_info.value.status_code == 400
+        assert (target / "snapshots" / "abc123" / "model.safetensors").exists()
 
 
 # =============================================================================
@@ -4030,6 +4123,197 @@ class TestProgressFromWire:
                     assert task.progress >= progress
             task.status = DownloadStatus.COMPLETED
             await poll
+
+
+# =============================================================================
+# Re-downloads Over Outdated Files
+# =============================================================================
+
+
+_OLD_COMMIT = "a" * 40
+_NEW_COMMIT = "b" * 40
+
+
+def _dry_info(local_dir, filename, *, will_download=False):
+    from huggingface_hub import DryRunFileInfo
+
+    path = local_dir / filename
+    return DryRunFileInfo(
+        commit_hash=_NEW_COMMIT,
+        file_size=path.stat().st_size if path.exists() else 0,
+        filename=filename,
+        local_path=str(path),
+        is_cached=path.exists(),
+        will_download=will_download,
+    )
+
+
+def _write(path, size):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.truncate(size)
+
+
+class TestStaleLocalFiles:
+    """The dry run calls an outdated local file cached, so staleness comes
+    from the commit in the metadata the dry run leaves behind."""
+
+    def test_only_files_hub_will_replace_are_stale(self, tmp_path):
+        from huggingface_hub._local_folder import write_download_metadata
+
+        from omlx.admin.hf_downloader import _stale_local_files
+
+        for name in ("current.json", "outdated.safetensors", "bare.safetensors"):
+            _write(tmp_path / name, 100)
+        write_download_metadata(tmp_path, "current.json", _NEW_COMMIT, "e1")
+        write_download_metadata(tmp_path, "outdated.safetensors", _OLD_COMMIT, "e2")
+        _write(tmp_path / "forced.bin", 50)
+
+        stale = _stale_local_files(
+            tmp_path,
+            [
+                _dry_info(tmp_path, "current.json"),
+                _dry_info(tmp_path, "outdated.safetensors"),
+                _dry_info(tmp_path, "bare.safetensors"),  # no metadata
+                _dry_info(tmp_path, "forced.bin", will_download=True),
+                _dry_info(tmp_path, "missing.safetensors", will_download=True),
+            ],
+        )
+
+        assert {Path(p).name: size for p, (_, size) in stale.items()} == {
+            "outdated.safetensors": 100,
+            "bare.safetensors": 100,
+            "forced.bin": 50,
+        }
+
+
+class TestRedownloadProgress:
+    """Hub deletes an outdated file before refetching it. Its bytes must not
+    sit in the poll's baseline, or the directory shrinks below it, disk growth
+    reads zero, and every payload byte counts twice (wire, then disk)."""
+
+    OLD = 8_000
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        d = tmp_path / "models"
+        _write(d / "config.json", 2_000)
+        _write(d / "model.safetensors", self.OLD)
+        return d
+
+    def _stale(self, model_dir):
+        """Outdated files, plus the bytes hub keeps (config and its own
+        bookkeeping under .cache)."""
+        from omlx.admin.hf_downloader import _stale_local_files
+
+        stale = _stale_local_files(
+            model_dir, [_dry_info(model_dir, "model.safetensors")]
+        )
+        on_disk = HFDownloader._get_download_activity(model_dir).logical_size
+        return stale, on_disk - self.OLD
+
+    @pytest.mark.asyncio
+    async def test_wire_then_disk_counts_each_byte_once(self, model_dir, monkeypatch):
+        from omlx.admin.hf_downloader import _WireCounter
+
+        stale, kept = self._stale(model_dir)
+        total = kept + self.OLD
+        downloader, task = _downloading_task(
+            model_dir, task_id="t-redl", total_size=total
+        )
+        wire = _WireCounter()
+        monkeypatch.setattr(hf_downloader_mod, "_PROGRESS_POLL_INTERVAL", 0.01)
+        poll = asyncio.create_task(
+            downloader._poll_progress(task.task_id, model_dir, wire, stale)
+        )
+        try:
+            incomplete = model_dir / ".cache/huggingface/download/x.incomplete"
+
+            async def settle():
+                await asyncio.sleep(0.05)  # several poll iterations
+
+            # The outdated shard is still on disk: it is not progress.
+            wire.add(1_000)
+            await settle()
+            assert task.downloaded_size == kept + 1_000
+
+            # Hub deletes it and fetches the new payload over the wire.
+            (model_dir / "model.safetensors").unlink()
+            wire.add(3_000)
+            await settle()
+            assert task.downloaded_size == kept + 4_000
+
+            # Reconstruction writes what the wire already counted.
+            _write(incomplete, 4_000)
+            await settle()
+            assert task.downloaded_size == kept + 4_000
+            assert task.progress == pytest.approx((kept + 4_000) / total * 100)
+
+            # The finished file lands where the outdated one was.
+            _write(incomplete, self.OLD)
+            incomplete.rename(model_dir / "model.safetensors")
+            wire.add(3_800)  # xet compression: fewer wire bytes than the file
+            await settle()
+            assert task.downloaded_size == total
+        finally:
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+    @pytest.mark.asyncio
+    async def test_replacement_seen_in_one_poll_counts_as_progress(
+        self, model_dir, monkeypatch
+    ):
+        """Deleted and replaced between two polls: the new inode at the same
+        path is the refetched file, not the outdated one."""
+        stale, kept = self._stale(model_dir)
+        downloader, task = _downloading_task(
+            model_dir, task_id="t-swap", total_size=2 * (kept + self.OLD)
+        )
+        monkeypatch.setattr(hf_downloader_mod, "_PROGRESS_POLL_INTERVAL", 0.01)
+        poll = asyncio.create_task(
+            downloader._poll_progress(task.task_id, model_dir, None, stale)
+        )
+        try:
+            await asyncio.sleep(0.05)
+            assert task.downloaded_size == kept
+
+            fresh = model_dir / "fresh.tmp"
+            _write(fresh, self.OLD)
+            fresh.replace(model_dir / "model.safetensors")
+            await asyncio.sleep(0.05)
+            assert task.downloaded_size == kept + self.OLD
+        finally:
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+    @pytest.mark.asyncio
+    async def test_run_download_hands_outdated_files_to_the_poll(self, model_dir):
+        downloader = HFDownloader(model_dir=str(model_dir.parent))
+        target = model_dir.parent / "owner" / "model"
+        _write(target / "model.safetensors", self.OLD)
+        mock_api = MagicMock()
+        mock_api.model_info.return_value = MagicMock(siblings=[])
+        polled = {}
+
+        async def fake_poll(task_id, target_dir, wire=None, stale=None):
+            polled["stale"] = stale
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return [_dry_info(target, "model.safetensors")]
+            return str(target)
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ), patch.object(downloader, "_poll_progress", side_effect=fake_poll):
+            await downloader.start_download("owner/model")
+            await _wait_for_downloads(downloader)
+
+        assert list(polled["stale"]) == [str(target / "model.safetensors")]
 
 
 # =============================================================================

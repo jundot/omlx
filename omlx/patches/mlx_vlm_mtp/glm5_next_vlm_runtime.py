@@ -394,6 +394,12 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             and x.shape[0] == 1
             and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
         ):
+            shape = (x.shape, x.dtype)
+            if x.shape[1] > 1 and shape not in self._ffn_eager_shapes:
+                # Kernel self-checks cannot evaluate their canaries inside a
+                # compiled trace, so each verify shape runs eagerly once.
+                self._ffn_eager_shapes.add(shape)
+                return self._ffn_block(x)
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
@@ -429,7 +435,7 @@ def _patch_model_call(g5_lang: Any) -> None:
 
     def __call__(self, inputs, cache=None, inputs_embeds=None,
                  return_raw_hidden: bool = False, gdn_sink=None,
-                 hidden_sink=None):
+                 hidden_sink=None, capture_layer_ids=None, capture_sink=None):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
 
         if cache is None:
@@ -467,6 +473,8 @@ def _patch_model_call(g5_lang: Any) -> None:
         # layer, as Glm5NextModel.__call__ does.
         deferred_cls = g5_lang._HCDeferred
         defer = gdn_sink is None and h.shape[:2] == (1, 1)
+        wanted = set(capture_layer_ids or ())
+        captured = {}
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
@@ -476,12 +484,22 @@ def _patch_model_call(g5_lang: Any) -> None:
                 h = layer(h, mask=mask, cache=c, defer=i + 1 < n_layers)
             else:
                 h = layer(h, mask=mask, cache=c)
-            if pipeline is not None:
+            if i in wanted:
+                # Block drafters read a layer's output with the HC streams
+                # averaged. A deferred expand is materialized for the capture
+                # only; the next layer still consumes the deferral.
+                full = h.materialize() if isinstance(h, deferred_cls) else h
+                captured[i] = full.mean(axis=2)
+            if pipeline is not None and i in wanted:
+                pipeline.push(h, captured[i])
+            elif pipeline is not None:
                 pipeline.push(h)
             elif eval_every and (i + 1) % eval_every == 0 and i + 1 < n_layers:
                 mx.async_eval(h.arrays() if defer and isinstance(h, deferred_cls) else h)
         if pipeline is not None:
             pipeline.drain()
+        if capture_sink is not None:
+            capture_sink.extend(captured[i] for i in capture_layer_ids or ())
 
         # Collapse the mHC streams first: everything downstream (the final
         # norm, the lm_head, and the nextn head) consumes the ordinary
@@ -522,6 +540,9 @@ def _patch_language_model(g5_lang: Any) -> None:
 
         original_init(self, args, config)
         self._omlx_mtp_multi_request = True
+        # Every speculative verify on this model, drafter blocks included,
+        # fits the PoolingCache undo log.
+        self._omlx_mtp_max_verify_rows = _MAX_CHAIN_DEPTH + 1
 
         n_mtp = int(getattr(args, "num_nextn_predict_layers", 0) or 0)
         attach_enabled = bool(is_mtp_attach_enabled())
@@ -580,11 +601,30 @@ def _patch_language_model(g5_lang: Any) -> None:
         # this path (see _patch_linear_attention). Accept and discard, as the
         # Qwen VLM runtime does.
         kwargs.pop("n_confirmed", None)
+        # Block drafter layers, returned in the requested order.
+        requested = kwargs.pop("capture_layer_ids", None)
         if inputs is None:
             inputs = kwargs.get("input_ids")
 
         if not return_hidden:
-            out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+            drafter = getattr(self, "_omlx_drafter", None)
+            scope = getattr(drafter, "scope_uids", None)
+            # An ordinary decode step while a block drafter is attached keeps
+            # the committed token in the drafter context.
+            observe = (
+                requested is None
+                and scope
+                and inputs is not None
+                and inputs.ndim == 2
+                and tuple(inputs.shape) == (len(scope), 1)
+            )
+            if observe:
+                requested = list(drafter.target_layer_ids)
+            captured = [] if requested else None
+            out = self.model(
+                inputs, cache=cache, inputs_embeds=inputs_embeds,
+                capture_layer_ids=requested, capture_sink=captured,
+            )
             if inputs_embeds is None and prompt_priming.capture_eligible(self, cache):
                 prompt_priming.maybe_capture(self, inputs, out, cache)
             nlk = kwargs.get("num_logits_to_keep", 0)
@@ -594,7 +634,10 @@ def _patch_language_model(g5_lang: Any) -> None:
                 logits = self.model.embed_tokens.as_linear(out)
             else:
                 logits = g5_lang.linear_forward(self.lm_head, out)
-            return LanguageModelOutput(logits=logits)
+            if observe:
+                drafter.observe(scope, captured)
+                return LanguageModelOutput(logits=logits)
+            return LanguageModelOutput(logits=logits, hidden_states=captured)
 
         # MTP verify forward. Returning gdn_states is what routes
         # batch_generator._call_backbone onto the mlx-vlm rollback path
@@ -602,9 +645,11 @@ def _patch_language_model(g5_lang: Any) -> None:
         # the mlx-lm path and never rewinds the KDA recurrent state.
         gdn_sink: list = []
         hidden_sink: list = []
+        captured: list = []
         out = self.model(
             inputs, cache=cache, inputs_embeds=inputs_embeds,
             gdn_sink=gdn_sink, hidden_sink=hidden_sink,
+            capture_layer_ids=requested, capture_sink=captured,
         )
         if self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(out)
@@ -612,7 +657,7 @@ def _patch_language_model(g5_lang: Any) -> None:
             logits = g5_lang.linear_forward(self.lm_head, out)
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=hidden_sink,
+            hidden_states=captured + hidden_sink,
             gdn_states=gdn_sink,
             shared_kv_states={},
         )

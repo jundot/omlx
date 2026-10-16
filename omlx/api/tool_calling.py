@@ -315,6 +315,21 @@ def _matches_union_type(value: Any, types: list) -> bool | None:
         return None
 
 
+def _union_keyword_types(spec: dict) -> list[str] | None:
+    alts = [
+        alt
+        for group in (spec.get("oneOf"), spec.get("anyOf"))
+        if isinstance(group, list)
+        for alt in group
+    ]
+    # A $ref/enum/const alternative has no type to bound the value.
+    if alts and all(
+        isinstance(alt, dict) and isinstance(alt.get("type"), str) for alt in alts
+    ):
+        return [alt["type"] for alt in alts]
+    return None
+
+
 def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     """Convert an XML-extracted parameter value per its declared schema type.
 
@@ -330,11 +345,13 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             decoded = json.loads(val)
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return val
+        if not isinstance(raw_type, list) and isinstance(spec, dict):
+            raw_type = _union_keyword_types(spec)
         if isinstance(raw_type, list):
             # Plain 123 remains a string for ["string", "null"].
             matches = _matches_union_type(decoded, raw_type)
             return val if matches is False else decoded
-        # Undeclared params and oneOf/anyOf retain best-effort JSON parsing.
+        # Undeclared params and untyped unions keep best-effort JSON parsing.
         return decoded
     if val.strip().lower() == "null":
         return None
@@ -2040,10 +2057,14 @@ def _parse_tool_calls_impl(
                                 if not isinstance(spec, dict):
                                     continue
                                 value = arguments.get(key)
+                                raw_type = (
+                                    spec["type"]
+                                    if "type" in spec
+                                    else _union_keyword_types(spec)
+                                )
                                 union_mismatch = (
-                                    isinstance(spec.get("type"), list)
-                                    and _matches_union_type(value, spec["type"])
-                                    is False
+                                    isinstance(raw_type, list)
+                                    and _matches_union_type(value, raw_type) is False
                                 )
                                 untyped_string = "type" not in spec and isinstance(
                                     value, str

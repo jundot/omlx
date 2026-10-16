@@ -58,16 +58,8 @@
         'dflash_draft_model',
         'dflash_draft_quant_enabled',
         'dflash_draft_quant_weight_bits',
-        'dflash_draft_quant_activation_bits',
         'dflash_draft_quant_group_size',
-        'dflash_max_ctx',
-        'dflash_in_memory_cache',
-        'dflash_in_memory_cache_max_entries',
-        'dflash_in_memory_cache_max_bytes',
-        'dflash_ssd_cache',
-        'dflash_ssd_cache_max_bytes',
         'dflash_draft_window_size',
-        'dflash_draft_sink_size',
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
@@ -192,7 +184,7 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, qwen4_gdn_decode_wide_proj: false, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
@@ -202,7 +194,7 @@
                 usage: { usage_history: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
-                auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
+                auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, allow_unauthenticated_inference: false, sub_keys: [] },
                 claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
                 integrations: {
                     copilot_model: null,
@@ -1347,6 +1339,15 @@
                 }
             },
 
+            toggleUnauthenticatedInference() {
+                const auth = this.globalSettings.auth;
+                if (!auth.allow_unauthenticated_inference
+                    && !window.confirm(window.t('settings.auth.keyless_inference_confirm'))) {
+                    return;
+                }
+                auth.allow_unauthenticated_inference = !auth.allow_unauthenticated_inference;
+            },
+
             isLoopbackBindHost(value) {
                 const hosts = String(value || '')
                     .split(',')
@@ -1439,7 +1440,6 @@
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
-                            qwen4_gdn_decode_wide_proj: this.globalSettings.server.qwen4_gdn_decode_wide_proj,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -1483,6 +1483,7 @@
                             network_ca_bundle: this.globalSettings.network.ca_bundle,
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
+                            allow_unauthenticated_inference: this.globalSettings.auth.allow_unauthenticated_inference,
                             idle_timeout_seconds: this.globalSettings.idle_timeout?.idle_timeout_seconds ?? null,
                         }),
                     });
@@ -2156,6 +2157,10 @@
                         s.deepseek_v41_ced_prefill_enabled === true,
                     deepseek_v41_ced_prefill_supported:
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
+                    qwen4_gdn_decode_wide_proj:
+                        s.qwen4_gdn_decode_wide_proj === true,
+                    qwen4_gdn_decode_wide_proj_supported:
+                        String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'qwen4_exp',
                     deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
                         || s.deepseek_v41_engram_ssd_offload === true,
                     deepseek_v41_engram_ssd_offload_requested:
@@ -2207,25 +2212,12 @@
                     dflash_draft_model: s.dflash_draft_model || '',
                     dflash_draft_quant_enabled: s.dflash_draft_quant_enabled || false,
                     dflash_draft_quant_weight_bits: s.dflash_draft_quant_weight_bits || 4,
-                    dflash_draft_quant_activation_bits: s.dflash_draft_quant_activation_bits || 16,
                     dflash_draft_quant_group_size: s.dflash_draft_quant_group_size || 64,
-                    dflash_max_ctx: s.dflash_max_ctx ?? null,
-                    dflash_in_memory_cache: s.dflash_in_memory_cache !== false,
-                    dflash_in_memory_cache_max_entries: s.dflash_in_memory_cache_max_entries || 4,
-                    dflash_in_memory_cache_max_gib: s.dflash_in_memory_cache_max_bytes
-                        ? Math.round(s.dflash_in_memory_cache_max_bytes / (1024 ** 3))
-                        : 8,
-                    dflash_ssd_cache: s.dflash_ssd_cache || false,
-                    dflash_ssd_cache_max_gib: s.dflash_ssd_cache_max_bytes
-                        ? Math.round(s.dflash_ssd_cache_max_bytes / (1024 ** 3))
-                        : 20,
                     dflash_draft_window_size: s.dflash_draft_window_size ?? null,
-                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
                     dflash_block_size: s.dflash_block_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
-                    dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
                     mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
                         ? String(s.mtp_adaptive_max_depth) : '3',
@@ -3030,6 +3022,14 @@
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
+            // The kernels need native INT8 tensor ops (M5-series or newer).
+            // A saved "on" keeps the toggle so it can be turned off.
+            showsQwenOqA8(model) {
+                return this.isQwenOqA8Model(model)
+                    && (model?.qwen35_oq_a8_supported === true
+                        || model?.settings?.qwen35_oq_a8_enabled === true);
+            },
+
             validateQwenOqA8Settings() {
                 if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
                 // Both wrap the same MLP call, so the combination silently
@@ -3196,6 +3196,8 @@
                                         : !!this.modelSettings.qwen4_ple_ssd_offload,
                                 deepseek_v41_ced_prefill_enabled:
                                     !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
+                                qwen4_gdn_decode_wide_proj:
+                                    !!this.modelSettings.qwen4_gdn_decode_wide_proj,
                                 deepseek_v41_engram_ssd_offload:
                                     this.modelSettings.deepseek_v41_engram_ssd_offload_forced
                                         ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
@@ -3265,42 +3267,14 @@
                                 dflash_draft_quant_weight_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
                                     ? parseInt(this.modelSettings.dflash_draft_quant_weight_bits)
                                     : null,
-                                dflash_draft_quant_activation_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_activation_bits)
-                                    : null,
                                 dflash_draft_quant_group_size: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
                                     ? parseInt(this.modelSettings.dflash_draft_quant_group_size)
                                     : null,
-                                dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
-                                    ? parseInt(this.modelSettings.dflash_max_ctx)
-                                    : null,
-                                dflash_in_memory_cache: this.modelSettings.dflash_enabled
-                                    ? !!this.modelSettings.dflash_in_memory_cache
-                                    : true,
-                                dflash_in_memory_cache_max_entries: this.modelSettings.dflash_enabled
-                                    ? (parseInt(this.modelSettings.dflash_in_memory_cache_max_entries) || 4)
-                                    : 4,
-                                dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
-                                    ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
-                                    : 8 * (1024 ** 3),
-                                dflash_ssd_cache: this.modelSettings.dflash_enabled
-                                    && !!this.modelSettings.dflash_in_memory_cache
-                                    && !!this.modelSettings.dflash_ssd_cache_available
-                                    && !!this.modelSettings.dflash_ssd_cache,
-                                dflash_ssd_cache_max_bytes: this.modelSettings.dflash_enabled
-                                    ? Math.max(1, parseInt(this.modelSettings.dflash_ssd_cache_max_gib) || 20) * (1024 ** 3)
-                                    : 20 * (1024 ** 3),
                                 // Long-context tuning. Empty → oMLX default.
                                 dflash_draft_window_size: this.modelSettings.dflash_enabled
                                     && this.modelSettings.dflash_draft_window_size
                                     ? parseInt(this.modelSettings.dflash_draft_window_size)
                                     : null,
-                                dflash_draft_sink_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_draft_sink_size !== null
-                                    && this.modelSettings.dflash_draft_sink_size !== undefined
-                                    && this.modelSettings.dflash_draft_sink_size !== ''
-                                    ? parseInt(this.modelSettings.dflash_draft_sink_size)
-                                    : 0,
                                 dflash_block_size: this.modelSettings.dflash_enabled
                                     && this.modelSettings.dflash_block_size
                                     ? parseInt(this.modelSettings.dflash_block_size)
@@ -3367,16 +3341,8 @@
                                     dflash_draft_model: null,
                                     dflash_draft_quant_enabled: false,
                                     dflash_draft_quant_weight_bits: null,
-                                    dflash_draft_quant_activation_bits: null,
                                     dflash_draft_quant_group_size: null,
-                                    dflash_max_ctx: null,
-                                    dflash_in_memory_cache: true,
-                                    dflash_in_memory_cache_max_entries: 4,
-                                    dflash_in_memory_cache_max_bytes: 8 * (1024 ** 3),
-                                    dflash_ssd_cache: false,
-                                    dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
                                     dflash_draft_window_size: null,
-                                    dflash_draft_sink_size: null,
                                     dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
@@ -3641,16 +3607,8 @@
                         this.modelSettings.dflash_draft_model = null;
                         this.modelSettings.dflash_draft_quant_enabled = false;
                         this.modelSettings.dflash_draft_quant_weight_bits = null;
-                        this.modelSettings.dflash_draft_quant_activation_bits = null;
                         this.modelSettings.dflash_draft_quant_group_size = null;
-                        this.modelSettings.dflash_max_ctx = null;
-                        this.modelSettings.dflash_in_memory_cache = true;
-                        this.modelSettings.dflash_in_memory_cache_max_entries = 4;
-                        this.modelSettings.dflash_in_memory_cache_max_gib = 8;
-                        this.modelSettings.dflash_ssd_cache = false;
-                        this.modelSettings.dflash_ssd_cache_max_gib = 20;
                         this.modelSettings.dflash_draft_window_size = null;
-                        this.modelSettings.dflash_draft_sink_size = 0;
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
@@ -4578,31 +4536,6 @@
                 return String(n);
             },
 
-            formatDFlashSessionStats(totals) {
-                if (!totals || totals.requests <= 1) return '';
-
-                const parts = [];
-                if (totals.speculative_requests > 0) {
-                    parts.push(
-                        Math.round((totals.acceptance_ratio || 0) * 100) + '% ' +
-                        window.t('status.active_models.dflash_draft_share'),
-                        (totals.accepted_draft_tokens_per_cycle || 0).toFixed(2) + ' ' +
-                        window.t('status.active_models.dflash_accepted_draft_per_cycle'),
-                        (totals.tokens_per_cycle || 0).toFixed(2) + ' ' +
-                        window.t('status.active_models.dflash_output_per_cycle'),
-                        totals.speculative_requests + ' ' +
-                        window.t('status.active_models.dflash_speculative_requests'),
-                    );
-                }
-                if (totals.fallback_requests > 0) {
-                    parts.push(
-                        totals.fallback_requests + ' ' +
-                        window.t('status.active_models.dflash_fallback_requests'),
-                    );
-                }
-                return window.t('status.active_models.dflash_session') + ': ' + parts.join(' · ');
-            },
-
             formatDurationShort(seconds) {
                 if (seconds == null || !Number.isFinite(seconds)) return '—';
                 if (seconds < 1) return seconds.toFixed(1) + 's';
@@ -4756,6 +4689,11 @@
                 } else {
                     this._copyFallback(text);
                 }
+            },
+
+            // Name clients send for a model: its alias when set, as /v1/models lists it.
+            apiModelName(id) {
+                return this.managerModelInfo(id)?.settings?.model_alias || id;
             },
 
             _copyFallback(text) {

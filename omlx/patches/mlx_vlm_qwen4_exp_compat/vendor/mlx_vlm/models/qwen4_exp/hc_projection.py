@@ -2,10 +2,9 @@
 
 """Lossless one-dispatch Qwen4 hyperconnection input projection.
 
-The Metal arithmetic in this module is transcribed from MLX core at pinned
-commit ``ceab91938`` (``mlx/backend/metal/kernels/quantized.h``): its first
-320 rows use MLX's literal ``qmv_fast`` traversal and its final four rows use
-the literal standalone-N=4 general ``qmv`` traversal.  This preserves both raw
+The Metal arithmetic in this module follows MLX 0.32.4
+(``mlx/backend/metal/kernels/quantized.h``): both the first 320 rows and
+the final four rows use MLX's ``qmv_fast`` traversal. This preserves both raw
 projection outputs while avoiding the two-dispatch canonical implementation.
 
 MLX is Copyright © 2023 Apple Inc. and licensed under the MIT License:
@@ -71,7 +70,7 @@ inline float hc_load_vector(const device T* x, thread float* xt) {
     float sum = 0.0f;
     if (bits == 4) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 16.0f;
             xt[i + 2] = x[i + 2] / 256.0f;
@@ -79,8 +78,8 @@ inline float hc_load_vector(const device T* x, thread float* xt) {
         }
     } else if (bits == 5) {
         for (int i = 0; i < N; i += 8) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]
-                + x[i + 4] + x[i + 5] + x[i + 6] + x[i + 7];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3])
+                + float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 32.0f;
             xt[i + 2] = x[i + 2] / 4.0f;
@@ -92,7 +91,7 @@ inline float hc_load_vector(const device T* x, thread float* xt) {
         }
     } else if (bits == 6) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 64.0f;
             xt[i + 2] = x[i + 2] / 16.0f;
@@ -158,56 +157,6 @@ inline float hc_qdot(
     return scale * accum + sum * bias;
 }
 
-template <int N, int bits>
-inline float hc_qdot_safe(
-    const device uint8_t* w,
-    const thread float* xt,
-    float scale,
-    float bias,
-    float sum) {
-    float accum = 0.0f;
-    if (bits == 4) {
-        const device uint16_t* ws = (const device uint16_t*)w;
-        for (int i = 0; i < N / 4; ++i) {
-            accum +=
-                (xt[4 * i] * (ws[i] & 0x000f)
-                 + xt[4 * i + 1] * (ws[i] & 0x00f0)
-                 + xt[4 * i + 2] * (ws[i] & 0x0f00)
-                 + xt[4 * i + 3] * (ws[i] & 0xf000));
-        }
-    } else if (bits == 5) {
-        for (int i = 0; i < N / 8; ++i) {
-            xt += 8 * i;
-            w += 5 * i;
-            accum += (w[0] & 0x1f) * xt[0];
-            accum += (w[0] & 0xe0) * xt[1];
-            accum += (w[1] & 0x3) * (xt[1] * 256.0f);
-            accum += (w[1] & 0x7c) * xt[2];
-            accum += (w[1] & 0x80) * xt[3];
-            accum += (w[2] & 0xf) * (xt[3] * 256.0f);
-            accum += (w[2] & 0xf0) * xt[4];
-            accum += (w[3] & 0x1) * (xt[4] * 256.0f);
-            accum += (w[3] & 0x3e) * xt[5];
-            accum += (w[3] & 0xc0) * xt[6];
-            accum += (w[4] & 0x7) * (xt[6] * 256.0f);
-            accum += (w[4] & 0xf8) * xt[7];
-        }
-    } else if (bits == 6) {
-        for (int i = 0; i < N / 4; ++i) {
-            xt += 4 * i;
-            w += 3 * i;
-            accum += (w[0] & 0x3f) * xt[0];
-            accum += (w[0] & 0xc0) * xt[1];
-            accum += (w[1] & 0x0f) * (xt[1] * 256.0f);
-            accum += (w[1] & 0xf0) * xt[2];
-            accum += (w[2] & 0x03) * (xt[2] * 256.0f);
-            accum += (w[2] & 0xfc) * xt[3];
-        }
-    } else if (bits == 8) {
-        for (int i = 0; i < N; ++i) accum += xt[i] * w[i];
-    }
-    return scale * accum + sum * bias;
-}
 """
 
 
@@ -258,19 +207,18 @@ _SOURCE = r"""
     }
 
     if (sg != 0) return;
-    constexpr int PPT = 1;
-    constexpr int VPT = PF;
+    constexpr int PPT = 2;
+    constexpr int VPT = PF * PPT;
     constexpr int BLOCK = VPT * 32;
     constexpr int SCALE_STEP = GS / VPT;
     const device uint8_t* wp = (const device uint8_t*)inject_w
-        + int(lane) * BP;
+        + int(lane) * PPT * BP;
     const device T* sp = inject_s + int(lane) / SCALE_STEP;
     const device T* bp = inject_b + int(lane) / SCALE_STEP;
     const device T* xp = x + int(lane) * VPT;
     float result[4] = {0.0f};
     float xv[VPT];
-    int k = 0;
-    for (; k < K - BLOCK; k += BLOCK) {
+    for (int k = 0; k < K; k += BLOCK) {
         float sum = hc_load_vector<T, VPT, BITS>(xp, xv);
         for (int row = 0; row < 4; ++row) {
             result[row] += hc_qdot<VPT, BITS>(
@@ -285,14 +233,7 @@ _SOURCE = r"""
         bp += BLOCK / GS;
         xp += BLOCK;
     }
-    float sum = hc_load_vector<T, VPT, BITS>(xp, xv);
     for (int row = 0; row < 4; ++row) {
-        result[row] += hc_qdot_safe<VPT, BITS>(
-            wp + row * ROW_BYTES,
-            xv,
-            float(sp[row * GROUPS]),
-            float(bp[row * GROUPS]),
-            sum);
         result[row] = simd_sum(result[row]);
         if (lane == 0) combined[320 + row] = T(result[row]);
     }

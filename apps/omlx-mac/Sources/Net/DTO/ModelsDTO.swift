@@ -58,9 +58,6 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// Human-readable explanation when `dflashCompatible` is false. Surfaced
     /// as a tooltip on the disabled DFlash toggle.
     let dflashCompatibilityReason: String?
-    /// True when the global paged-SSD cache directory is configured. The
-    /// DFlash SSD-cache sub-toggle stays disabled when false.
-    let dflashSsdCacheAvailable: Bool?
     /// True when the model is structurally compatible with native MTP.
     let mtpCompatible: Bool?
     let mtpCompatibilityReason: String?
@@ -69,6 +66,18 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     let qwen4PleSsdOffloadForced: Bool?
     let qwen4PleResidentBytes: Int64?
     let qwen4PleMmapBytes: Int64?
+    /// DeepSeek V4.1 Engram counterpart of the Qwen4 PLE fields above.
+    var deepseekV41EngramSsdOffloadSupported: Bool? = nil
+    var deepseekV41EngramSsdOffloadForced: Bool? = nil
+    var deepseekV41EngramResidentBytes: Int64? = nil
+    var deepseekV41EngramMmapBytes: Int64? = nil
+    var moeExpertOffloadSupported: Bool? = nil
+    /// True for families whose MTP draft head stays resident while experts stream.
+    var moeOffloadAllowsMtp: Bool? = nil
+    /// True when this Mac can run the Qwen INT8 activation prefill kernels.
+    var qwen35OqA8Supported: Bool? = nil
+    /// "hf_cache" for models found in the shared Hugging Face Hub cache.
+    var sourceType: String? = nil
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -84,6 +93,8 @@ extension ModelDTO {
         }
         return actualSizeFormatted ?? estimatedSizeFormatted ?? ""
     }
+
+    var isInHFCache: Bool { sourceType == "hf_cache" }
 }
 
 /// One entry of `external_engines` in GET /admin/api/models.
@@ -109,6 +120,9 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let maxToolResultTokens: Int?
     let enableThinking: Bool?
     let qwen4PleSsdOffload: Bool?
+    var qwen4GdnDecodeWideProj: Bool? = nil
+    var deepseekV41EngramSsdOffload: Bool? = nil
+    var deepseekV41CedPrefillEnabled: Bool? = nil
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     let reasoningParser: String?
@@ -129,6 +143,10 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     // and override the request's `chat_template_kwargs`).
     let chatTemplateKwargs: [String: AnyCodable]?
     let forcedCtKwargs: [String]?
+    var guidedGrammarEnabled: Bool? = nil
+    var guidedGrammar: String? = nil
+    var moeExpertOffloadEnabled: Bool? = nil
+    var moeExpertOffloadResidentFraction: Double? = nil
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
     let turboquantKvBits: Double?
@@ -165,18 +183,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let dflashDraftModel: String?
     let dflashDraftQuantEnabled: Bool?
     let dflashDraftQuantWeightBits: Int?
-    let dflashDraftQuantActivationBits: Int?
     let dflashDraftQuantGroupSize: Int?
-    let dflashMaxCtx: Int?
-    let dflashInMemoryCache: Bool?
-    let dflashInMemoryCacheMaxEntries: Int?
-    /// Stored in bytes server-side; the editor row exposes a GiB-scaled
-    /// view via `DflashByteSize.gibToBytes` / `bytesToGib`.
-    let dflashInMemoryCacheMaxBytes: Int64?
-    let dflashSsdCache: Bool?
-    let dflashSsdCacheMaxBytes: Int64?
     let dflashDraftWindowSize: Int?
-    let dflashDraftSinkSize: Int?
     let dflashBlockSize: Int?
     let dflashVerifyMode: String?
     // Experimental: native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
@@ -205,6 +213,9 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var ttlSeconds: Int? = nil
     var enableThinking: Bool?? = nil // nil omits the key. .some(nil) sends JSON null.
     var qwen4PleSsdOffload: Bool? = nil
+    var qwen4GdnDecodeWideProj: Bool? = nil
+    var deepseekV41EngramSsdOffload: Bool? = nil
+    var deepseekV41CedPrefillEnabled: Bool? = nil
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
@@ -256,16 +267,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var dflashDraftModel: String? = nil
     var dflashDraftQuantEnabled: Bool? = nil
     var dflashDraftQuantWeightBits: Int? = nil
-    var dflashDraftQuantActivationBits: Int? = nil
     var dflashDraftQuantGroupSize: Int? = nil
-    var dflashMaxCtx: Int? = nil
-    var dflashInMemoryCache: Bool? = nil
-    var dflashInMemoryCacheMaxEntries: Int? = nil
-    var dflashInMemoryCacheMaxBytes: Int64? = nil
-    var dflashSsdCache: Bool? = nil
-    var dflashSsdCacheMaxBytes: Int64? = nil
     var dflashDraftWindowSize: Int? = nil
-    var dflashDraftSinkSize: Int? = nil
     var dflashBlockSize: Int? = nil
     var dflashVerifyMode: String? = nil
     // Experimental: native MTP
@@ -276,6 +279,17 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var vlmMtpEnabled: Bool? = nil
     var vlmMtpDraftModel: String? = nil
     var vlmMtpDraftBlockSize: Int? = nil
+}
+
+/// GET /admin/api/models/{id}/generation_config: the sampling values a new
+/// model starts with plus the native context window. Absent keys have no
+/// recommendation.
+struct GenerationConfigDTO: Decodable, Equatable, Sendable {
+    var maxContextWindow: Int? = nil
+    var temperature: Double? = nil
+    var topP: Double? = nil
+    var topK: Int? = nil
+    var repetitionPenalty: Double? = nil
 }
 
 /// Body for POST /admin/api/models/{id}/settings/recipe.

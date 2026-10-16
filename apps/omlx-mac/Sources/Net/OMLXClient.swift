@@ -159,8 +159,18 @@ final class OMLXClient: ObservableObject {
         try await put(AdminAPI.modelSettings(id), body: patch)
     }
 
+    /// Settings write with explicit JSON nulls, for clearing fields.
+    @discardableResult
+    func updateModelSettings(id: String, settings: [String: AnyCodable]) async throws -> SimpleStatusResponse {
+        try await put(AdminAPI.modelSettings(id), body: settings)
+    }
+
     func resetModelSettings(id: String) async throws -> SettingsApplyResultDTO {
         try await postEmpty(AdminAPI.modelSettingsReset(id))
+    }
+
+    func getGenerationConfig(id: String) async throws -> GenerationConfigDTO {
+        try await get(AdminAPI.modelGenerationConfig(id))
     }
 
     /// Server-side lookup of the best omlx.ai benchmarks for this device
@@ -175,6 +185,14 @@ final class OMLXClient: ObservableObject {
 
     func applyRecipe(id: String, recipe: String) async throws -> SettingsApplyResultDTO {
         try await post(AdminAPI.modelSettingsRecipe(id), body: ApplyRecipeRequest(recipe: recipe))
+    }
+
+    /// Normalize an MTPLX MTP sidecar into the model checkpoint so native
+    /// MTP can load it. The server validates the runtime contract before
+    /// changing the local model files.
+    @discardableResult
+    func importMtplxSidecar(id: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.importMtplx(id))
     }
 
     func listModelProfiles(id: String) async throws -> ProfileListResponse {

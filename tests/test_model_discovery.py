@@ -60,7 +60,14 @@ class TestIsHelperConfigModelType:
 
     @pytest.mark.parametrize(
         "config_model_type",
-        ["gemma4_assistant", "qwen3_5_mtp", "foo_mtp", "bar_assistant", "QWEN3_5_MTP"],
+        [
+            "gemma4_assistant",
+            "muse_glimmer_assistant",
+            "qwen3_5_mtp",
+            "foo_mtp",
+            "bar_assistant",
+            "QWEN3_5_MTP",
+        ],
     )
     def test_helper_types(self, config_model_type):
         assert is_helper_config_model_type(config_model_type) is True
@@ -420,13 +427,15 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
-    def test_detect_muse_glimmer_as_vlm(self, tmp_path):
-        """Meta Muse Glimmer 30B is served by mlx-vlm."""
+    @pytest.mark.parametrize("family", ["MuseGlimmer", "MuseSpark"])
+    def test_detect_muse_family_as_vlm(self, tmp_path, family):
+        """Meta Muse Glimmer and Muse Spark are served by mlx-vlm."""
+        model_type = "muse_glimmer" if family == "MuseGlimmer" else "muse_spark"
         config = {
-            "model_type": "muse_glimmer",
-            "architectures": ["MuseGlimmerForConditionalGeneration"],
-            "vision_config": {"model_type": "muse_glimmer_vision"},
-            "text_config": {"model_type": "muse_glimmer_text"},
+            "model_type": model_type,
+            "architectures": [f"{family}ForConditionalGeneration"],
+            "vision_config": {"model_type": f"{model_type}_vision"},
+            "text_config": {"model_type": f"{model_type}_text"},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"

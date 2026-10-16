@@ -18,14 +18,25 @@ from mlx.utils import tree_flatten
 from omlx.cache.type_registry import CacheTypeRegistry
 from mlx_lm.generate_utils import BatchCounters
 from mlx_lm.generate import BatchGenerator
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models import qwen3, qwen3_5
+from mlx_lm.models.cache import KVCache, make_prompt_cache
+from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
 from omlx.model_settings import ModelSettings
 from omlx.patches import mlx_lm_mtp
+from omlx.patches.laguna import laguna_model
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
-from omlx.patches.mlx_lm_mtp import batched_head, cache_rollback, fused_batch
+from omlx.patches.mlx_lm_mtp import (
+    batched_head,
+    cache_rollback,
+    fused_batch,
+    qwen35_model,
+)
 from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
 from omlx.patches.mlx_vlm_mtp import qwen35_verify_linear
+from omlx.patches.vlm_batch_kv_capacity import apply_batch_kv_capacity_patch
+from omlx.speculative import dflash as dd
 from omlx.utils.model_loading import (
     _has_mtp_heads,
     _is_mtp_compatible,
@@ -2610,6 +2621,15 @@ class TestRotatingCacheMtpUndo:
 
         self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]), num_drafts=8)
 
+    @pytest.mark.parametrize("num_drafts", [1, 3, 8])
+    def test_vlm_batch_rotating_kv_cache_undo(self, num_drafts):
+        """Gemma 4's sliding layers use mlx-vlm's own rotating cache."""
+        vlm_cache = pytest.importorskip("mlx_vlm.models.cache")
+
+        self._run_equivalence(
+            lambda: vlm_cache.BatchRotatingKVCache(8, [0]), num_drafts=num_drafts
+        )
+
     def test_unarmed_update_keeps_stock_semantics(self):
         import mlx.core as mx
 
@@ -3481,9 +3501,10 @@ class TableDrafter:
 
     target_layer_ids = [1, 3]
 
-    def __init__(self, depth, wrong_from=None):
+    def __init__(self, depth, wrong_from=None, adaptive=False):
         self.depth = depth
         self.wrong_from = wrong_from
+        self.adaptive = adaptive
         self.fed = {}
         self.released = []
         self.jobs = 0
@@ -3531,17 +3552,22 @@ class TableDrafter:
         self.released.extend(uids)
 
 
-def _drafted_counting_model(depth, wrong_from=None):
+def _drafted_counting_model(depth, wrong_from=None, adaptive=False):
     model = CapturingCountingModel()
     model._omlx_mtp_depth = depth
-    model._omlx_drafter = TableDrafter(depth, wrong_from=wrong_from)
+    model._omlx_drafter = TableDrafter(depth, wrong_from=wrong_from, adaptive=adaptive)
     return model
 
 
+def _verify_widths(model):
+    return [shape for shape, _ in model.captures if shape[1] > 1]
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
 @pytest.mark.parametrize("wrong_from", [None, 0, 2])
 @pytest.mark.parametrize("late_join", [False, True])
 def test_block_drafter_matches_standard_and_feeds_committed_context(
-    wrong_from, late_join
+    wrong_from, late_join, adaptive
 ):
     prompts = [[1, 2], [10, 11, 12], [30, 31]]
     limits = [12, 8, 15]
@@ -3549,7 +3575,7 @@ def test_block_drafter_matches_standard_and_feeds_committed_context(
     standard._omlx_mtp_decode_enabled = False
     expected, _ = generate(standard, prompts, limits, late_join=late_join)
 
-    model = _drafted_counting_model(5, wrong_from=wrong_from)
+    model = _drafted_counting_model(5, wrong_from=wrong_from, adaptive=adaptive)
     output, terminal = generate(model, prompts, limits, late_join=late_join)
     assert output == expected
     drafter = model._omlx_drafter
@@ -3558,9 +3584,11 @@ def test_block_drafter_matches_standard_and_feeds_committed_context(
     assert all(ids == drafter.target_layer_ids for _, ids in model.captures)
     # Each row's context holds exactly one hidden per committed position:
     # the last prompt token, then every emitted token except the newest
-    # one, which is still the anchor. Rejected drafts never enter it.
+    # one, which is still the anchor. Rejected drafts never enter it. An
+    # adaptive row may hand over to ordinary decode (calibration or park),
+    # whose pipelined step also forwards the newest token.
     for uid in terminal:
-        assert drafter.fed[uid] == len(output[uid])
+        assert drafter.fed[uid] - len(output[uid]) in ((0, 1) if adaptive else (0,))
     # Finished rows leave the drafter registry.
     assert sorted(drafter.released) == sorted(terminal)
 
@@ -3584,6 +3612,292 @@ def test_block_drafter_serves_sampled_rows_with_draft_distribution():
         1: "length",
     }
     assert model._omlx_drafter.jobs > 0
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize("rows", [1, 3])
+def test_block_drafter_depth_controller_narrows_verify_window(adaptive, rows):
+    """An adaptive drafter verifies the depths its controller picks."""
+    prompts = [[1, 2], [10, 11, 12], [30, 31]][:rows]
+    limits = [40] * rows
+    standard = CapturingCountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, prompts, limits)
+
+    model = _drafted_counting_model(7, wrong_from=1, adaptive=adaptive)
+    output, _ = generate(model, prompts, limits)
+    assert output == expected
+    shapes = _verify_widths(model)
+    # Rows that share a window keep verifying together.
+    assert {batch for batch, _ in shapes} == {rows}
+    widths = [width for _, width in shapes]
+    if not adaptive:
+        assert set(widths) == {8}
+    elif rows == 1:
+        # The singleton controller's warmup sweep measures every depth.
+        assert widths[:7] == [8, 7, 6, 5, 4, 3, 2]
+    else:
+        # The cohort policy measures each depth three times, deepest first.
+        assert widths[:6] == [8, 8, 8, 7, 7, 7]
+
+
+def test_block_drafter_clips_sampled_draft_distributions():
+    """A narrowed window verifies against the matching prefix of q."""
+    from omlx.utils.sampling import make_sampler
+
+    mx.random.seed(5)
+    model = _drafted_counting_model(5, wrong_from=0, adaptive=True)
+    output, terminal = generate(
+        model, [[1, 2], [10, 11]], [30, 30], samplers=[None, make_sampler(temp=0.7)]
+    )
+    assert output[0] == list(range(3, 33))
+    assert output[1] == list(range(12, 42))
+    assert {r.finish_reason for r in terminal.values()} == {"length"}
+    assert min(width for _, width in _verify_widths(model)) < 6
+
+
+def _tiny_qwen3(seed=0, layers=6, hidden=32, vocab=64):
+    mx.random.seed(seed)
+    model = qwen3.Model(
+        qwen3.ModelArgs(
+            model_type="qwen3",
+            hidden_size=hidden,
+            num_hidden_layers=layers,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=vocab,
+            max_position_embeddings=512,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+def _tiny_laguna(seed=0):
+    """Six-layer Laguna target whose sliding window wraps within a test."""
+    mx.random.seed(seed)
+    model = laguna_model.Model(
+        laguna_model.ModelArgs(
+            model_type="laguna",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=512,
+            sliding_window=6,
+            layer_types=["full_attention"] + ["sliding_attention"] * 5,
+            partial_rotary_factor=0.5,
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+def _tiny_qwen35_text():
+    assert qwen35_model.apply()
+    mx.random.seed(1)
+    model = qwen3_5.TextModel(
+        qwen3_5.TextModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 256,
+                "linear_num_value_heads": 2,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 3,
+                "full_attention_interval": 2,
+                "tie_word_embeddings": True,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 32,
+                "rope_theta": 1000.0,
+                "partial_rotary_factor": 0.5,
+                "max_position_embeddings": 128,
+            }
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+def test_qwen35_dflash_preparation_preserves_recurrent_rollback(monkeypatch):
+    from omlx.engine.batched import BatchedEngine
+    from omlx.patches.mlx_lm_mtp import drafter_target
+
+    model = _tiny_qwen35_text()
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._model = model
+    monkeypatch.setattr(
+        drafter_target,
+        "apply",
+        lambda model: pytest.fail("Qwen3.5 must retain its recurrent rollback"),
+    )
+    assert engine.prepare_dflash_target() is model
+
+    reference = make_prompt_cache(model)
+    cache = make_prompt_cache(model)
+    model(mx.array([[1, 2, 3, 4, 5]]), cache=reference)
+    model(mx.array([[1, 2, 3]]), cache=cache)
+    model(
+        mx.array([[4, 5, 6]]),
+        cache=cache,
+        return_hidden=True,
+        n_confirmed=1,
+        capture_layer_ids=[1],
+    )
+    assert model.rollback_speculative_cache(cache, None, 1, 3) == 1
+    expected = model(mx.array([[7]]), cache=reference)
+    actual = model(mx.array([[7]]), cache=cache)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+
+
+@pytest.mark.parametrize("family", ["qwen3", "qwen3_5"])
+def test_text_targets_return_drafter_layer_captures(family, apply_drafter_target):
+    """mlx-lm text targets return requested layer outputs in request order,
+    append the head hidden on verify, and feed the drafter on decode."""
+    if family == "qwen3":
+        model = _tiny_qwen3()
+        apply_drafter_target(model)
+    else:
+        model = _tiny_qwen35_text()
+    layers = len(model.model.layers)
+    tokens = mx.array([[1, 2, 3, 4, 5]])
+    plain = model(tokens, cache=make_prompt_cache(model))
+    every = model(
+        tokens, cache=make_prompt_cache(model), capture_layer_ids=list(range(layers))
+    )
+    assert mx.array_equal(every.logits, plain).item()
+    assert len(every.hidden_states) == layers
+
+    picked = model(tokens, cache=make_prompt_cache(model), capture_layer_ids=[2, 0])
+    for got, index in zip(picked.hidden_states, (2, 0)):
+        assert mx.array_equal(got, every.hidden_states[index]).item()
+
+    verify = model(
+        tokens,
+        cache=make_prompt_cache(model),
+        return_hidden=True,
+        n_confirmed=1,
+        capture_layer_ids=[1],
+    )
+    assert len(verify.hidden_states) == 2 and verify.gdn_states is None
+    assert mx.array_equal(verify.hidden_states[0], every.hidden_states[1]).item()
+
+    observed = []
+    model._omlx_drafter = SimpleNamespace(
+        scope_uids=(3,),
+        target_layer_ids=[layers - 1],
+        observe=lambda uids, caps: observed.append((uids, caps)),
+    )
+    try:
+        step = model(mx.array([[6]]), cache=make_prompt_cache(model))
+    finally:
+        model._omlx_drafter = None
+    assert isinstance(step, mx.array)
+    [(uids, caps)] = observed
+    assert uids == (3,) and caps[0].shape[:2] == (1, 1)
+
+
+@pytest.mark.parametrize("make_target", [_tiny_qwen3, _tiny_laguna])
+def test_plain_attention_target_drafts_like_plain_decode(
+    monkeypatch, apply_drafter_target, make_target
+):
+    """A Qwen3 or Laguna target with a DFlash2 drafter emits the plain decode
+    tokens, and rejected verify rows are trimmed from the KV caches, also
+    after Laguna's sliding window wraps."""
+    prompts, limits = [[1, 2, 3, 4]], [24]
+    plain_model = make_target(seed=3)
+    plain_model._omlx_mtp_decode_enabled = False
+    expected, _ = generate(plain_model, prompts, limits)
+
+    model = make_target(seed=3)
+    apply_drafter_target(model)
+    config = DFlash2Config.from_dict(
+        {
+            "model_type": "qwen3",
+            "hidden_size": 32,
+            "intermediate_size": 48,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": 64,
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 512,
+            "num_target_layers": 6,
+            "sliding_window": 16,
+            "layer_types": ["sliding_attention"],
+            "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+            "tie_word_embeddings": False,
+            "dflash_config": {
+                "block_size": 4,
+                "conv_group_size": 8,
+                "conv_kernel_size": 2,
+                "mask_token_id": 63,
+                "selector_rank": 8,
+                "selector_top_k": 4,
+                "target_layer_ids": [1, 3, 5],
+            },
+        }
+    )
+    mx.random.seed(4)
+    draft = DFlash2DraftModel(config)
+    draft.load_weights(
+        [
+            (key, mx.random.normal(value.shape) * 0.2)
+            for key, value in tree_flatten(draft.parameters())
+        ],
+        strict=False,
+    )
+    draft.bind(model)
+    drafter = dd.DFlashDrafter(draft, block_size=4, source_path="tiny", adaptive=False)
+    dd.attach_drafter(model, drafter)
+    assert model._omlx_mtp_multi_request is False
+    trims = []
+    rollback = type(model).mtp_partial_rollback
+
+    def counted(self, cache, accepted, num_drafts):
+        trims.append(num_drafts - accepted)
+        return rollback(self, cache, accepted, num_drafts)
+
+    monkeypatch.setattr(type(model), "mtp_partial_rollback", counted)
+    output, _ = generate(model, prompts, limits)
+    assert output == expected
+    assert any(trim > 0 for trim in trims)
+
+
+def test_clip_block_drafts_keeps_aligned_proposal_prefix():
+    ids = mx.array([[1, 2], [3, 4], [5, 6], [7, 8]], dtype=mx.int32)
+    logq = mx.log(mx.full((4, 2), 0.5))
+    state = bg._MtpState(uid=0)
+    state.drafts = mx.array([1, 3, 5, 7], dtype=mx.uint32)
+    state.draft_lps = []
+    state.draft_accept_lps = bg.SparseDraftQ(ids, logq, 64)
+    bg._clip_block_drafts(state, 2)
+    assert state.drafts.tolist() == [1, 3]
+    assert len(state.draft_accept_lps) == 2
+    assert state.draft_accept_lps.ids.tolist() == [[1, 2], [3, 4]]
+
+    state.drafts = mx.array([1, 3, 5], dtype=mx.uint32)
+    state.draft_accept_lps = [mx.full((64,), float(i)) for i in range(3)]
+    bg._clip_block_drafts(state, 1)
+    assert state.drafts.tolist() == [1]
+    assert [row[0].item() for row in state.draft_accept_lps] == [0.0]
+    bg._clip_block_drafts(state, 3)
+    assert state.drafts.tolist() == [1]
 
 
 @pytest.mark.parametrize("unequal_acceptance", [False, True])
@@ -3709,6 +4023,8 @@ def test_second_row_uses_stochastic_acceptance(monkeypatch):
 
 
 def test_failed_rollback_recovers_committed_tokens(monkeypatch):
+    # Reconcile reads capacity-managed caches; the scheduler patches at import.
+    apply_batch_kv_capacity_patch()
     model = CountingModel()
     # Force rejection without changing target logits by making every draft wrong.
     monkeypatch.setattr(
@@ -5389,7 +5705,7 @@ def _cache_rows(cache):
     return None
 
 
-@pytest.mark.parametrize("family", ["qwen_vlm", "qwen4"])
+@pytest.mark.parametrize("family", ["qwen_vlm", "qwen4", "glm5"])
 def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family):
     previous = mlx_lm_mtp.is_mtp_active()
     previous_depth = mlx_lm_mtp.get_mtp_depth()
@@ -5428,6 +5744,11 @@ def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family)
 
         monkeypatch.setattr(bg, "_materialize_mtp_boundary_emit", materialize)
         monkeypatch.setattr(bg, "_call_backbone", backbone)
+        monkeypatch.setattr(
+            fused_batch,
+            "copy",
+            SimpleNamespace(deepcopy=lambda cache: pytest.fail("batch cache copied")),
+        )
         actual, _ = generate(model, prompts, limits)
         assert actual == expected
         assert any(rows > 1 for rows in materialized)

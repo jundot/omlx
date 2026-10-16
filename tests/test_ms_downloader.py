@@ -127,6 +127,23 @@ class TestParseMsModelEntry:
         result = _parse_ms_model_entry(entry)
         assert result["name"] == "my-model"
 
+    @pytest.mark.parametrize(
+        "entry,expected_repo_id",
+        [
+            (
+                {"Owner": "mlx-community", "Name": "Qwen3.8-27B-4bit"},
+                "mlx-community/Qwen3.8-27B-4bit",
+            ),
+            (
+                {"Path": "qwen", "Owner": "other", "Name": "Qwen2.5-7B"},
+                "qwen/Qwen2.5-7B",
+            ),
+        ],
+    )
+    def test_repo_id_from_path_or_owner_key(self, entry, expected_repo_id):
+        result = _parse_ms_model_entry(entry)
+        assert result["repo_id"] == expected_repo_id
+
 
 # =============================================================================
 # MSDownloader Tests
@@ -909,17 +926,17 @@ class TestFetchModelConfig:
 
 class TestFetchModelDetailSize:
     @pytest.mark.asyncio
-    async def test_prefers_safetensor_model_size(self):
+    async def test_ignores_safetensor_element_count(self):
         resp = MagicMock()
         resp.status_code = 200
         resp.json.return_value = {
             "Data": {
-                "ModelInfos": {"safetensor": {"model_size": 193153024}},
-                "StorageSize": 712593982,
+                "ModelInfos": {"safetensor": {"model_size": 4665462000}},
+                "StorageSize": 16081491610,
             }
         }
         with patch("omlx.admin.ms_downloader.requests.get", return_value=resp):
-            assert await _fetch_model_detail_size("owner/m") == 193153024
+            assert await _fetch_model_detail_size("owner/m") == 16081491610
 
     @pytest.mark.asyncio
     async def test_falls_back_to_storage_size(self):

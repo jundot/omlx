@@ -149,7 +149,7 @@ final class MenubarStatsPoller {
                 }
 
                 return LiveActivity(
-                    menuBarTitle: "PP \(percentage)% · \(formatTokenCount(processedTokens))/\(formatTokenCount(totalTokens))",
+                    menuBarTitle: "PP \(percentage)% · \(CountFormat.compact(processedTokens))/\(CountFormat.compact(totalTokens))",
                     detail: detailParts.joined(separator: " · ")
                 )
             }
@@ -194,17 +194,6 @@ final class MenubarStatsPoller {
                     menuBarTitle: elapsed.map { "RUN \($0)" } ?? "RUN",
                     detail: detailParts.joined(separator: " · ")
                 )
-            }
-
-            private static func formatTokenCount(_ tokenCount: Int) -> String {
-                if tokenCount >= 1_000_000 {
-                    let millions = Double(tokenCount) / 1_000_000
-                    return String(format: millions >= 10 ? "%.0fM" : "%.1fM", millions)
-                }
-                if tokenCount >= 1_000 {
-                    return "\(Int((Double(tokenCount) / 1_000).rounded()))k"
-                }
-                return "\(tokenCount)"
             }
 
             private static func formatDuration(_ seconds: Double) -> String {

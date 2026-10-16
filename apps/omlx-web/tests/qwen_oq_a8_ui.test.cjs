@@ -30,12 +30,22 @@ for (const config_model_type of [
 }
 assert.equal(state.isQwenOqA8Model(null), false);
 
+// Hidden where the kernels cannot run, unless already on.
+assert.equal(state.showsQwenOqA8({config_model_type: 'qwen3_5', qwen35_oq_a8_supported: false}), false);
+assert.equal(state.showsQwenOqA8({config_model_type: 'qwen3_5', qwen35_oq_a8_supported: true}), true);
+assert.equal(state.showsQwenOqA8({
+    config_model_type: 'qwen3_5',
+    qwen35_oq_a8_supported: false,
+    settings: {qwen35_oq_a8_enabled: true},
+}), true);
+assert.equal(state.showsQwenOqA8({config_model_type: 'llama', qwen35_oq_a8_supported: true}), false);
+
 state.modelSettings.qwen35_oq_a8_enabled = true;
 state.modelSettings.qwen35_ane_prefill_enabled = true;
 assert.equal(state.validateQwenOqA8Settings(), 'js.error.ane_oq_a8_conflict');
 state.modelSettings.qwen35_ane_prefill_enabled = false;
 assert.equal(state.validateQwenOqA8Settings(), null);
-console.log('Architecture-only visibility and ANE conflict checks passed');
+console.log('oQ A8 visibility and ANE conflict checks passed');
 
 (async () => {
     const app = create();

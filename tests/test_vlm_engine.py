@@ -12,6 +12,7 @@ Tests cover:
 
 import base64
 import io
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -1900,6 +1901,67 @@ class TestGemma4AudioPatch:
         assert mx.allclose(rows[counts[0] :], encode(clips[1:]), atol=1e-5).item()
 
 
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestGemma4UnifiedImageProcessorOnLoad:
+    @staticmethod
+    def _model_dir(tmp_path, model_type="gemma4_unified"):
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+        return tmp_path
+
+    def test_load_keeps_configured_processor(self, tmp_path, monkeypatch):
+        import mlx_vlm.utils as vlm_utils
+        from mlx_vlm.models.gemma4_unified import Gemma4UnifiedImageProcessor
+
+        configured = Gemma4UnifiedImageProcessor(max_soft_tokens=1120)
+        model = SimpleNamespace(config=SimpleNamespace(eos_token_id=1))
+        processor = SimpleNamespace(image_processor=configured)
+        # Real mlx-vlm load(); only weight and tokenizer loading are stubbed.
+        monkeypatch.setattr(vlm_utils, "load_model", lambda *a, **kw: model)
+        monkeypatch.setattr(vlm_utils, "load_processor", lambda *a, **kw: processor)
+        original = vlm_utils.load_image_processor
+
+        model_dir = self._model_dir(tmp_path)
+        with vlm_module._preserve_gemma4_unified_image_processor_on_load(model_dir):
+            _, loaded = vlm_utils.load(model_dir, trust_remote_code=False)
+
+        assert loaded.image_processor is configured
+        assert vlm_utils.load_image_processor is original
+
+    def test_other_model_types_keep_the_loader(self, tmp_path):
+        import mlx_vlm.utils as vlm_utils
+
+        original = vlm_utils.load_image_processor
+        model_dir = self._model_dir(tmp_path, "gemma4")
+        with vlm_module._preserve_gemma4_unified_image_processor_on_load(model_dir):
+            assert vlm_utils.load_image_processor is original
+
+    @pytest.mark.asyncio
+    async def test_engine_start_applies_it(self, tmp_path, monkeypatch):
+        import mlx_vlm.utils as vlm_utils
+
+        from omlx.utils import model_loading
+
+        class LoadReachedError(Exception):
+            pass
+
+        def check_load(model_path, **kwargs):
+            assert vlm_utils.load_image_processor(model_path, **kwargs) is None
+            raise LoadReachedError
+
+        original = vlm_utils.load_image_processor
+        monkeypatch.setattr(vlm_utils, "load", check_load)
+        monkeypatch.setattr(
+            model_loading, "maybe_apply_pre_load_patches", lambda *a, **kw: None
+        )
+        monkeypatch.setattr(
+            model_loading, "maybe_load_custom_quantization", lambda *a, **kw: None
+        )
+        engine = vlm_module.VLMBatchedEngine(model_name=str(self._model_dir(tmp_path)))
+        with pytest.raises(LoadReachedError):
+            await engine.start()
+        assert vlm_utils.load_image_processor is original
+
+
 class TestFormatMessagesForVLMTemplate:
     """Tests for VLMBatchedEngine._format_messages_for_vlm_template()."""
 
@@ -3173,16 +3235,20 @@ class TestVLMEngineFrequencyPenalty:
     @pytest.mark.skipif(
         not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
     )
-    async def test_generate_forwards_preserve_reasoning(self):
-        """The non-streaming path must carry the flag the streaming path already does."""
+    async def test_generate_forwards_request_flags(self):
+        """The non-streaming path must carry the flags the streaming path already does."""
         engine = _make_loaded_engine(model_type="test-vlm")
         engine._engine = SimpleNamespace(
             generate=AsyncMock(return_value=self._fake_output())
         )
 
-        await engine.generate("a prompt", preserve_reasoning=True)
+        await engine.generate(
+            "a prompt", preserve_reasoning=True, skip_cache_store=True
+        )
 
-        assert engine._engine.generate.call_args.kwargs["preserve_reasoning"] is True
+        kwargs = engine._engine.generate.call_args.kwargs
+        assert kwargs["preserve_reasoning"] is True
+        assert kwargs["skip_cache_store"] is True
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(

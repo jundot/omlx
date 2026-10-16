@@ -18,8 +18,6 @@ from .base import BaseEngine, BaseNonStreamingEngine, GenerationOutput
 from .batched import BatchedEngine
 from .decision import DecisionEngine
 from .embedding import EmbeddingEngine
-
-from .dflash import DFlashEngine
 from .reranker import RerankerEngine
 from .stt import STTEngine
 from .sts import STSEngine
@@ -31,7 +29,6 @@ __all__ = [
     "BaseNonStreamingEngine",
     "GenerationOutput",
     "BatchedEngine",
-    "DFlashEngine",
     "VLMBatchedEngine",
     "EmbeddingEngine",
     "RerankerEngine",

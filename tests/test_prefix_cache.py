@@ -5001,14 +5001,14 @@ TYPES = ["ArraysCache", "KVCache", "CacheList"]
 ## MockModel: uses the existing one in this module
 
 
-def _make_cache(cache_dir, *, num_layers=None):
+def _make_cache(cache_dir, *, num_layers=None, ssd_only=False):
     if num_layers is None:
         num_layers = len(TYPES)
     ssd = PagedSSDCacheManager(
         cache_dir=cache_dir,
         max_size_bytes=1024**3,
-        hot_cache_max_bytes=64 * 1024**2,
-        hot_cache_only=True,
+        hot_cache_max_bytes=0 if ssd_only else 64 * 1024**2,
+        hot_cache_only=not ssd_only,
         expected_model_name="test-model",
         expected_num_layers=num_layers,
         expected_block_size=BLOCK_SIZE,
@@ -5268,6 +5268,52 @@ def test_bounded_restore_keeps_non_arrays_layers_intact(tmp_path, monkeypatch):
     # One droppable (ArraysCache) layer: blocks 1..2 dropped, same as the
     # arrays-only case; rotating payloads are never touched.
     assert sum(drops) == NUM_BLOCKS - 2
+    ssd.close()
+
+
+@pytest.mark.parametrize("ssd_only", [False, True])
+def test_single_array_recurrent_state_round_trips(tmp_path, ssd_only):
+    """LFM2 short-conv layers are ArraysCache(size=1): a lone conv state must
+    survive store/restore instead of degrading to the (1,) placeholder."""
+    types = ["KVCache", "ArraysCache"]
+    cache, ssd = _make_cache(tmp_path / "ssd", num_layers=len(types), ssd_only=ssd_only)
+    total = NUM_BLOCKS * BLOCK_SIZE
+
+    def data(n):
+        keys, values = _position_kv(n)
+        return [
+            {
+                "state": (keys, values),
+                "meta_state": (n,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            },
+            {
+                "state": (mx.full((1, 2, 16), float(n)),),
+                "meta_state": (),
+                "class_name": "ArraysCache",
+                "cache_type": "ArraysCache",
+            },
+        ]
+
+    snapshots = {BLOCK_SIZE * i: data(BLOCK_SIZE * i) for i in range(1, NUM_BLOCKS + 1)}
+    table = cache.store_cache(
+        "store",
+        list(range(total + 2)),
+        data(total + 2),
+        model_cache_config=ModelCacheConfig.from_type_list(
+            types, model_name="test-model"
+        ),
+        boundary_snapshots=snapshots,
+    )
+    assert table is not None and len(table.block_ids) == NUM_BLOCKS
+
+    restored, restored_tokens = _restore(cache, total, "restore")
+    assert restored_tokens == total
+    assert len(restored[1].cache) == 1
+    assert mx.array_equal(
+        restored[1].cache[0], mx.full((1, 2, 16), float(total))
+    ).item()
     ssd.close()
 
 

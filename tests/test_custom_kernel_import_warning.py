@@ -7,8 +7,11 @@ import block runs against a controlled ``_ext`` state.
 """
 
 import importlib
+import importlib.util
 import logging
+import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -57,7 +60,12 @@ def test_missing_native_extension_stays_silent(tmp_path, caplog, kernel):
     assert [r for r in caplog.records if r.name == f"{name}.fast"] == []
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS binaries")
 @pytest.mark.parametrize("kernel", custom_kernels.NATIVE_KERNEL_PACKAGES)
 def test_kernel_links_relative_mlx_rpath(kernel):
-    cmake = Path(custom_kernels.__file__).parent / kernel / "csrc" / "CMakeLists.txt"
-    assert "-Wl,-rpath,@loader_path/../../../mlx/lib" in cmake.read_text()
+    spec = importlib.util.find_spec(f"omlx.custom_kernels.{kernel}._ext")
+    if spec is None:
+        pytest.skip("native extension not built")
+    output = subprocess.check_output(["otool", "-l", spec.origin], text=True)
+    rpaths = re.findall(r"path (.+) \(offset \d+\)", output)
+    assert "@loader_path/../../../mlx/lib" in rpaths

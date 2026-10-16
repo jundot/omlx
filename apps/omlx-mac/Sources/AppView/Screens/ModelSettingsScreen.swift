@@ -1,21 +1,18 @@
-// PR 8 — per-model settings drilled into from ModelsScreen via the chevron.
+// Per-model settings, drilled into from ModelsScreen via the chevron.
 //
-// Sections (segmented at the top):
-//   • Profiles  — list per-model profiles + create / delete / apply,
-//                  list templates (read-only) + apply a template as a profile
-//   • Basic     — alias, model type, context window, max tokens, sampling
-//                  defaults (temperature, top_p, top_k, min_p,
-//                  repetition_penalty, presence_penalty), TTL
-//   • Advanced  — enable_thinking, thinking budget, limit tool result tokens,
-//                  force sampling, pin in memory
+// Layout follows System Settings: the top page keeps the settings people
+// change most (Basic, Generation Defaults) inline, and every other section
+// is a row that opens its own page (`ModelSettingsPage`):
+// - Profiles: preset / global / model profile chips
+// - Acceleration: Lightning MTP, DFlash, VLM MTP, family prefill/decode kernels
+// - Memory Saving: SSD N-gram offload, MoE expert offload, TurboQuant KV
+// - Advanced: external engine, trust remote code, thinking and tool limits,
+//   guided grammar, reasoning parser, kwargs, audio
+// - Experimental: ANE prompt processing, IndexCache, SpecPrefill
 //
-// Aliases (the design's 4th tab) is omitted: server has no /api/aliases
-// endpoint and `model_alias` is singular. Keeping the surface honest.
-//
-// Saves on every committed edit (Popup change / TextField submit / Toggle
-// flip), no explicit Save button — same UX as ServerScreen. The design's
-// Save / Cancel / Load Defaults buttons live as a top-right toolbar that
-// only does navigation back to Models.
+// Every edit saves to the model: per-model fields on commit, profile fields
+// after a short pause. Saving them as a profile is a manual action on the
+// Profiles page.
 
 import SwiftUI
 
@@ -26,44 +23,25 @@ struct ModelSettingsScreen: View {
     @State private var vm = ModelSettingsScreenVM()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .center, spacing: 0) {
-                Header(model: vm.model)
-                SnapshotActions(vm: vm, client: services.client)
-                    .padding(.trailing, 14)
-                    .padding(.bottom, 10)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                page
+                FooterBar(error: vm.lastError)
             }
-            .zIndex(1)
-
-            SectionPicker(selection: $vm.section)
-
-            switch vm.section {
-            case .profiles:
-                ProfilesTab(
-                    vm: vm,
-                    presetStore: services.presetBundle,
-                    client: services.client,
-                    serverDefaults: vm.serverDefaultSampling,
-                    // Deep-link to the Server tab's Default Profile
-                    // section. Setting the anchor *before* the section
-                    // means ContentScaffold's `.task(id:)` sees both
-                    // pieces in one go and scrolls without a noop pass.
-                    onEditServer: {
-                        services.requestedServerAnchor = .defaultProfile
-                        services.requestedSection = .server
-                    }
-                )
-            case .basic:
-                BasicTab(vm: vm, client: services.client)
-            case .advanced:
-                AdvancedTab(vm: vm, client: services.client)
-            }
-
-            FooterBar(error: vm.lastError)
+            .frame(maxWidth: 720, alignment: .topLeading)
+            .frame(maxWidth: .infinity, alignment: .top)
+            .padding(.bottom, 36)
         }
+        // A new page starts at the top instead of the previous offset.
+        .id(services.modelDetailPage)
+        .scrollContentBackground(.hidden)
+        .modifier(SnapshotPresentation(vm: vm, client: services.client))
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 backButton
+            }
+            ToolbarItem(placement: .primaryAction) {
+                SnapshotMenu(vm: vm, client: services.client)
             }
         }
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
@@ -73,13 +51,54 @@ struct ModelSettingsScreen: View {
     }
 
     @ViewBuilder
+    private var page: some View {
+        switch services.modelDetailPage {
+        case nil:
+            Header(model: vm.model)
+            TopPage(vm: vm, client: services.client) { services.modelDetailPage = $0 }
+        case .profiles:
+            ProfilesTab(
+                vm: vm,
+                presetStore: services.presetBundle,
+                client: services.client,
+                serverDefaults: vm.serverDefaultSampling,
+                // Deep-link to the Server tab's Default Profile
+                // section. Setting the anchor *before* the section
+                // means ContentScaffold's `.task(id:)` sees both
+                // pieces in one go and scrolls without a noop pass.
+                onEditServer: {
+                    services.requestedServerAnchor = .defaultProfile
+                    services.requestedSection = .server
+                }
+            )
+            .padding(.top, 14)
+        case .acceleration:
+            EnginePage(vm: vm) { AccelerationSection(vm: vm, client: services.client) }
+        case .memory:
+            EnginePage(vm: vm) { MemorySavingSection(vm: vm, client: services.client) }
+        case .advanced:
+            AdvancedPage(vm: vm, client: services.client)
+        case .experimental:
+            EnginePage(vm: vm) { ExperimentalSection(vm: vm, client: services.client) }
+        }
+    }
+
+    @ViewBuilder
     private var backButton: some View {
         Button {
-            services.modelDetailID = nil
+            if services.modelDetailPage != nil {
+                services.modelDetailPage = nil
+            } else {
+                services.modelDetailID = nil
+            }
         } label: {
-            Label(String(localized: "settings.header.back_to_models",
-                         defaultValue: "Back to Models",
-                         comment: "Back button label at the top of the per-model settings screen"),
+            Label(services.modelDetailPage == nil
+                  ? String(localized: "settings.header.back_to_models",
+                           defaultValue: "Back to Models",
+                           comment: "Back button label at the top of the per-model settings screen")
+                  : String(localized: "settings.header.back_to_model",
+                           defaultValue: "Back to Model Settings",
+                           comment: "Back button label on a per-model settings sub-page"),
                   systemImage: "chevron.left")
                 .labelStyle(.iconOnly)
         }
@@ -125,111 +144,92 @@ private struct Header: View {
 
 // MARK: - Snapshot actions (reset / optimal / recipe)
 
-private struct SnapshotActions: View {
+/// Toolbar pull-down for the whole-model snapshot actions. Every item opens
+/// a dialog first, so each title ends with an ellipsis.
+private struct SnapshotMenu: View {
     let vm: ModelSettingsScreenVM
     let client: OMLXClient
-    @Environment(\.omlxTheme) private var theme
-    @State private var hoveredAction: String?
 
     var body: some View {
         HStack(spacing: 6) {
             if vm.isApplyingSettings {
                 ProgressView().controlSize(.small)
             }
-            actionButton(String(localized: "settings.actions.reset",
-                          defaultValue: "Reset defaults",
-                          comment: "Header button that returns every setting of the model to its default"),
-                         systemImage: "arrow.counterclockwise") {
-                vm.pendingReset = true
+            Menu {
+                Button(String(localized: "settings.actions.optimal",
+                              defaultValue: "Apply Optimal Settings…",
+                              comment: "Menu item that lists the best omlx.ai benchmark settings for this device and model")) {
+                    Task { await vm.loadOptimalCandidates(client: client) }
+                }
+                Button(String(localized: "settings.actions.recipe",
+                              defaultValue: "Apply Custom Recipe…",
+                              comment: "Menu item that opens the paste-a-recipe sheet")) {
+                    vm.applyError = nil
+                    vm.applyOutcome = .recipeInput
+                }
+                Divider()
+                Button(String(localized: "settings.actions.reset",
+                              defaultValue: "Reset to Defaults…",
+                              comment: "Menu item that returns every setting of the model to its default"),
+                       role: .destructive) {
+                    vm.pendingReset = true
+                }
+            } label: {
+                Label(String(localized: "settings.actions.menu",
+                             defaultValue: "Settings Actions",
+                             comment: "Toolbar menu holding the reset, optimal and recipe actions"),
+                      systemImage: "ellipsis.circle")
             }
-            actionButton(String(localized: "settings.actions.optimal",
-                          defaultValue: "Apply optimal settings",
-                          comment: "Header button that lists the best omlx.ai benchmark settings for this device and model"),
-                         systemImage: "wand.and.stars") {
-                Task { await vm.loadOptimalCandidates(client: client) }
-            }
-            actionButton(String(localized: "settings.actions.recipe",
-                          defaultValue: "Apply custom recipe",
-                          comment: "Header button that opens the paste-a-recipe sheet"),
-                         systemImage: "doc.on.clipboard") {
-                vm.applyError = nil
-                vm.applyOutcome = .recipeInput
-            }
-        }
-        .buttonStyle(.omlx(.normal, size: .small))
-        .buttonBorderShape(.roundedRectangle(radius: 6))
-        .fixedSize(horizontal: true, vertical: false)
-        .disabled(vm.isApplyingSettings)
-        .overlay(alignment: .topTrailing) {
-            if let hoveredAction {
-                Text(hoveredAction)
-                    .font(.omlxText(12))
-                    .foregroundStyle(theme.text)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
-                    .shadow(color: .black.opacity(0.12), radius: 3, y: 2)
-                    .fixedSize()
-                    .offset(y: 34)
-                    .allowsHitTesting(false)
-                    .accessibilityHidden(true)
-            }
-        }
-        .confirmationDialog(
-            String(localized: "settings.actions.reset.confirm_title",
-                   defaultValue: "Reset every setting of this model?",
-                   comment: "Confirmation dialog title before resetting all model settings"),
-            isPresented: Binding(
-                get: { vm.pendingReset },
-                set: { if !$0 { vm.pendingReset = false } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button(String(localized: "settings.actions.reset.confirm_button",
-                          defaultValue: "Reset",
-                          comment: "Destructive button inside the reset-settings confirmation dialog"),
-                   role: .destructive) {
-                vm.pendingReset = false
-                Task { await vm.resetDefaults(client: client) }
-            }
-            Button(String(localized: "common.cancel",
-                          defaultValue: "Cancel",
-                          comment: "Generic cancel button"),
-                   role: .cancel) { vm.pendingReset = false }
-        } message: {
-            Text(String(localized: "settings.actions.reset.confirm_message",
-                        defaultValue: "Sampling, acceleration, pinned/default flags, aliases and the display name all return to their defaults.",
-                        comment: "Body text inside the reset-settings confirmation dialog"))
-        }
-        .sheet(isPresented: Binding(
-            get: { vm.applyOutcome != nil },
-            set: { if !$0 && !vm.isApplyingSettings { vm.applyOutcome = nil } }
-        )) {
-            SettingsApplySheet(vm: vm, client: client)
-                .environment(\.omlxTheme, theme)
+            .help(String(localized: "settings.actions.menu",
+                         defaultValue: "Settings Actions",
+                         comment: "Toolbar menu holding the reset, optimal and recipe actions"))
+            .disabled(vm.isApplyingSettings)
         }
     }
+}
 
-    private func actionButton(
-        _ title: String, systemImage: String, action: @escaping () -> Void
-    ) -> some View {
-        Button {
-            hoveredAction = nil
-            action()
-        } label: {
-            Label(title, systemImage: systemImage)
-                .labelStyle(.iconOnly)
-                .font(.omlxText(12))
-                .frame(width: 20, height: 22)
-        }
-        .accessibilityLabel(title)
-        .onHover { hovering in
-            if hovering {
-                hoveredAction = title
-            } else if hoveredAction == title {
-                hoveredAction = nil
+/// Reset confirmation and the optimal / recipe sheet, driven by VM state
+/// that `SnapshotMenu` sets.
+private struct SnapshotPresentation: ViewModifier {
+    let vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    @Environment(\.omlxTheme) private var theme
+
+    func body(content: Content) -> some View {
+        content
+            .confirmationDialog(
+                String(localized: "settings.actions.reset.confirm_title",
+                       defaultValue: "Reset every setting of this model?",
+                       comment: "Confirmation dialog title before resetting all model settings"),
+                isPresented: Binding(
+                    get: { vm.pendingReset },
+                    set: { if !$0 { vm.pendingReset = false } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button(String(localized: "settings.actions.reset.confirm_button",
+                              defaultValue: "Reset",
+                              comment: "Destructive button inside the reset-settings confirmation dialog"),
+                       role: .destructive) {
+                    vm.pendingReset = false
+                    Task { await vm.resetDefaults(client: client) }
+                }
+                Button(String(localized: "common.cancel",
+                              defaultValue: "Cancel",
+                              comment: "Generic cancel button"),
+                       role: .cancel) { vm.pendingReset = false }
+            } message: {
+                Text(String(localized: "settings.actions.reset.confirm_message",
+                            defaultValue: "Sampling, acceleration, pinned/default flags, aliases and the display name all return to their defaults.",
+                            comment: "Body text inside the reset-settings confirmation dialog"))
             }
-        }
+            .sheet(isPresented: Binding(
+                get: { vm.applyOutcome != nil },
+                set: { if !$0 && !vm.isApplyingSettings { vm.applyOutcome = nil } }
+            )) {
+                SettingsApplySheet(vm: vm, client: client)
+                    .environment(\.omlxTheme, theme)
+            }
     }
 }
 
@@ -553,26 +553,6 @@ private struct SettingsApplySheet: View {
     }
 }
 
-// MARK: - Section picker
-
-private struct SectionPicker: View {
-    @Binding var selection: ModelSettingsScreenVM.Section
-
-    var body: some View {
-        HStack {
-            Segmented(
-                selection: $selection,
-                options: ModelSettingsScreenVM.Section.allCases.map {
-                    ($0, $0.label)
-                }
-            )
-            Spacer()
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 6)
-    }
-}
-
 // MARK: - Profiles tab
 
 private struct ProfilesTab: View {
@@ -615,7 +595,7 @@ private struct ProfilesTab: View {
                         }
                     }
                 },
-                onSaveAsNew: { openSaveAs(scope: vm.defaultSaveAsScope) },
+                onSaveAsNew: { openSaveAs(scope: .model) },
                 onRevert: {
                     Task { await vm.revertWorking(client: client) }
                 }
@@ -665,7 +645,7 @@ private struct ProfilesTab: View {
                 activeName: vm.activeProfileState.activeName(in: .global),
                 basedOnName: vm.activeProfileState.basedOnName(in: .global),
                 previewName: preview?.scope == .global ? preview?.name : nil,
-                canSaveCurrent: vm.profileDirty,
+                canSaveCurrent: true,
                 onSelect: { previewChip(scope: .global, name: $0) },
                 onSaveCurrent: { openSaveAs(scope: .global) },
                 onRename: { original, renamed in
@@ -687,7 +667,7 @@ private struct ProfilesTab: View {
                 activeName: vm.activeProfileState.activeName(in: .model),
                 basedOnName: vm.activeProfileState.basedOnName(in: .model),
                 previewName: preview?.scope == .model ? preview?.name : nil,
-                canSaveCurrent: vm.profileDirty,
+                canSaveCurrent: true,
                 onSelect: { previewChip(scope: .model, name: $0) },
                 onSaveCurrent: { openSaveAs(scope: .model) },
                 onRename: { original, renamed in
@@ -755,7 +735,7 @@ private struct ProfilesTab: View {
                         self.preview = nil
                     }
                 },
-                onUpdateFromWorking: vm.profileDirty && preview.scope != .preset
+                onUpdateFromWorking: preview.scope != .preset
                     ? {
                         Task {
                             await vm.updateProfileWithWorking(
@@ -933,27 +913,75 @@ private extension ActiveProfileState {
 // of the Profiles tab. Replaced by ProfileGroup + ProfileViews.FlowLayout
 // when the working-profile redesign landed.
 
-// MARK: - Basic tab
+// MARK: - Top page
 
-private struct BasicTab: View {
+private struct TopPage: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    let open: (ModelSettingsPage) -> Void
+
+    var body: some View {
+        ListGroup {
+            pageRow(.profiles, symbol: "square.stack.3d.up.fill",
+                    gradient: SquircleGradient.models, isLast: true)
+        }
+
+        BasicSection(vm: vm, client: client)
+
+        if vm.showsGenerationSection {
+            GenerationSection(vm: vm, client: client)
+        }
+
+        // System Settings style: rows without a header that open a page.
+        ListGroup {
+            if vm.showsEnginePages {
+                pageRow(.acceleration, symbol: "bolt.fill",
+                        gradient: SquircleGradient.performance)
+                pageRow(.memory, symbol: "memorychip.fill",
+                        gradient: SquircleGradient.downloads)
+            }
+            pageRow(.advanced, symbol: "gearshape.fill",
+                    gradient: SquircleGradient.server,
+                    isLast: !vm.showsEnginePages)
+            if vm.showsEnginePages {
+                pageRow(.experimental, symbol: "flask.fill",
+                        gradient: SquircleGradient.quantization, isLast: true)
+            }
+        }
+        .padding(.top, 14)
+    }
+
+    private func pageRow(
+        _ page: ModelSettingsPage, symbol: String, gradient: [Color], isLast: Bool = false
+    ) -> some View {
+        let enginePage = page == .acceleration || page == .memory || page == .experimental
+        return NavRow(label: page.title,
+                      value: vm.summary(for: page),
+                      isLast: isLast,
+                      isDimmed: enginePage && !vm.externalEngine.isEmpty,
+                      action: { open(page) }) {
+            Squircle(systemSymbol: symbol, gradient: gradient)
+        }
+    }
+}
+
+private struct BasicSection: View {
     @Bindable var vm: ModelSettingsScreenVM
     let client: OMLXClient
 
     var body: some View {
-        BasicEditBanner(vm: vm, client: client)
         SectionHeader(String(localized: "settings.basic.section",
                              defaultValue: "Basic Settings",
                              comment: "Section header above the Basic tab fields"))
 
-        // Per-model fields (alias / modelType / TTL) auto-save on commit.
-        // Profile-eligible fields (sampling, penalties) write to the
-        // working profile instead — surfaced via the banner above.
+        // These are per-model fields (never stored in profiles), so each
+        // one saves on commit. Enable Thinking is the profile exception.
         ListGroup {
             Row(label: String(localized: "settings.basic.alias.label",
                               defaultValue: "Model Alias",
                               comment: "Row label for the model alias field"),
                 sublabel: String(localized: "settings.basic.alias.sub",
-                                 defaultValue: "Falls back to the model id",
+                                 defaultValue: "API requests can also call this model by its alias instead of the model name.",
                                  comment: "Sublabel for the model alias field")) {
                 TextInput(text: $vm.alias, placeholder: vm.modelID, mono: true, width: .controlMedium)
                     .onSubmit { Task { await vm.save(.alias, client: client) } }
@@ -967,11 +995,95 @@ private struct BasicTab: View {
                     options: ModelSettingsScreenVM.modelTypeOptions
                 )
             }
+            Row(label: String(localized: "settings.basic.ttl.label",
+                              defaultValue: "TTL",
+                              comment: "Row label for the idle-unload TTL field"),
+                sublabel: String(localized: "settings.basic.ttl.sub",
+                                 defaultValue: "Unloads the model automatically after it stays idle this long.",
+                                 comment: "Sublabel for the idle-unload TTL field")) {
+                TextInput(text: $vm.ttlSeconds,
+                          placeholder: String(localized: "settings.basic.ttl.placeholder",
+                                              defaultValue: "No TTL",
+                                              comment: "Placeholder shown when no TTL is configured"),
+                          mono: true, suffix: "s", width: .controlCompact)
+                    .onSubmit { Task { await vm.save(.ttl, client: client) } }
+            }
+            Row(label: String(localized: "settings.advanced.pin_memory.label",
+                              defaultValue: "Pin in memory",
+                              comment: "Row label for the pin-in-memory toggle"),
+                sublabel: String(localized: "settings.advanced.pin_memory.sub",
+                                 defaultValue: "Keep this model resident between requests",
+                                 comment: "Sublabel for the pin-in-memory toggle")) {
+                RowSwitch(isOn: vm.bind($vm.isPinned, save: {
+                    Task { await vm.save(.isPinned, client: client) }
+                }))
+            }
+            Row(label: String(localized: "settings.advanced.favorite.label",
+                              defaultValue: "Favorite",
+                              comment: "Row label for the favorite toggle"),
+                sublabel: String(localized: "settings.advanced.favorite.sub",
+                                 defaultValue: "List this model first in model lists",
+                                 comment: "Sublabel for the favorite toggle"),
+                isLast: !showsThinking) {
+                RowSwitch(isOn: vm.bind($vm.isFavorite, save: {
+                    Task { await vm.save(.isFavorite, client: client) }
+                }))
+            }
+            if showsThinking {
+                Row(label: String(localized: "settings.advanced.enable_thinking.label",
+                                  defaultValue: "Enable Thinking",
+                                  comment: "Row label for the enable-thinking toggle"),
+                    sublabel: vm.thinkingForced ? String(
+                        localized: "settings.k2.thinking_hint",
+                        defaultValue: "K2 uses reasoning effort. Use Thinking Budget to limit reasoning.")
+                        : String(localized: "settings.advanced.enable_thinking.sub",
+                                 defaultValue: "Enable reasoning/thinking mode for this model",
+                                 comment: "Sublabel for the enable-thinking toggle"),
+                    isLast: true) {
+                    RowSwitch(isOn: vm.thinkingForced ? .constant(true) : vm.bindProfile($vm.enableThinking))
+                        .disabled(vm.thinkingForced)
+                }
+            }
+        }
+    }
+
+    private var showsThinking: Bool { vm.isLLMLike && !vm.isDiffusionModel }
+}
+
+private struct GenerationSection: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+
+    var body: some View {
+        SectionHeader(
+            String(localized: "settings.generation.section",
+                   defaultValue: "Generation Defaults",
+                   comment: "Section header above the per-model sampling and length defaults"),
+            subtitle: String(localized: "settings.generation.subtitle",
+                             defaultValue: "Leave empty to use global defaults",
+                             comment: "Subtitle explaining that empty generation fields fall back to the server defaults")
+        ) {
+            HStack(spacing: 6) {
+                if vm.isLoadingGenerationDefaults {
+                    ProgressView().controlSize(.small)
+                }
+                Button(String(localized: "settings.generation.load_defaults",
+                              defaultValue: "Load Defaults",
+                              comment: "Button that fills Generation Defaults from the model's own config files")) {
+                    Task { await vm.loadGenerationDefaults(client: client) }
+                }
+                .buttonStyle(.omlx(.plain, size: .small))
+                .disabled(vm.isLoadingGenerationDefaults)
+            }
+        }
+
+        // Profile fields: edits auto-save after a short pause.
+        ListGroup {
             Row(label: String(localized: "settings.basic.context_window.label",
                               defaultValue: "Context Window",
                               comment: "Row label for the context window field"),
                 sublabel: String(localized: "settings.basic.context_window.sub",
-                                 defaultValue: "Maximum tokens per request",
+                                 defaultValue: "Sets the total context size the model can handle. Longer prompts are rejected.",
                                  comment: "Sublabel for the context window field")) {
                 TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
             }
@@ -979,7 +1091,7 @@ private struct BasicTab: View {
                               defaultValue: "Max Tokens",
                               comment: "Row label for the max generated tokens field"),
                 sublabel: String(localized: "settings.basic.max_tokens.sub",
-                                 defaultValue: "Cap on generated tokens (empty = default)",
+                                 defaultValue: "Limits how many tokens the model generates in one turn when the request does not set max_tokens.",
                                  comment: "Sublabel for the max generated tokens field")) {
                 TextInput(text: vm.bindProfile($vm.maxTokens),
                           placeholder: String(localized: "settings.basic.max_tokens.placeholder",
@@ -992,9 +1104,11 @@ private struct BasicTab: View {
                               comment: "Row label for the sampling temperature field"),
                 sublabel: String(localized: "settings.basic.temperature.sub",
                                  defaultValue: "Sampling randomness (≥ 0). 0 = deterministic.",
-                                 comment: "Sublabel describing the temperature field range")) {
+                                 comment: "Sublabel describing the temperature field range"),
+                isLast: vm.isDiffusionModel) {
                 TextInput(text: vm.bindProfile($vm.temperature), placeholder: "0.7", mono: true, width: .controlNarrow)
             }
+            // The diffusion lane ignores the remaining sampling controls.
             if !vm.isDiffusionModel {
                 Row(label: String(localized: "settings.basic.top_p.label",
                                   defaultValue: "Top P",
@@ -1044,143 +1158,55 @@ private struct BasicTab: View {
                         .disabled(vm.vlmMtpEnabled)
                         .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
                 }
-            }
-            Row(
-                label: String(localized: "settings.basic.ttl.label",
-                              defaultValue: "TTL",
-                              comment: "Row label for the idle-unload TTL field"),
-                sublabel: String(localized: "settings.basic.ttl.sub",
-                                 defaultValue: "Seconds before idle unload (empty = no TTL)",
-                                 comment: "Sublabel for the idle-unload TTL field"),
-                isLast: true
-            ) {
-                TextInput(text: $vm.ttlSeconds,
-                          placeholder: String(localized: "settings.basic.ttl.placeholder",
-                                              defaultValue: "No TTL",
-                                              comment: "Placeholder shown when no TTL is configured"),
-                          mono: true, suffix: "s", width: .controlCompact)
-                    .onSubmit { Task { await vm.save(.ttl, client: client) } }
-            }
-        }
-    }
-}
-
-/// Slim ActiveProfileBanner used above Basic / Advanced editors so the user
-/// can save without bouncing back to the Profiles tab. Renders nothing in
-/// the `named` (clean) state — no banner clutter when there's nothing to
-/// do.
-private struct BasicEditBanner: View {
-    var vm: ModelSettingsScreenVM
-    let client: OMLXClient
-
-    @State private var saveAsScope: ProfileScope = .global
-    @State private var saveAsName: String = ""
-    @State private var saveAsOpen: Bool = false
-
-    var body: some View {
-        switch vm.activeProfileState {
-        case .named:
-            EmptyView()
-        default:
-            VStack(alignment: .leading, spacing: 0) {
-                ActiveProfileBanner(
-                    state: vm.displayProfileState,
-                    isSlim: true,
-                    onUpdateBasedOn: {
-                        if case .working(let basedOn) = vm.activeProfileState, let basedOn {
-                            Task {
-                                await vm.updateProfileWithWorking(
-                                    scope: basedOn.scope, name: basedOn.name, client: client
-                                )
-                            }
-                        }
-                    },
-                    onSaveAsNew: {
-                        saveAsScope = vm.defaultSaveAsScope
-                        saveAsName = vm.suggestSaveAsName()
-                        saveAsOpen = true
-                    },
-                    onRevert: {
-                        Task { await vm.revertWorking(client: client) }
-                    }
-                )
-                if saveAsOpen {
-                    SaveAsPopover(
-                        name: $saveAsName,
-                        scope: $saveAsScope,
-                        onCommit: {
-                            Task {
-                                await vm.saveWorkingAs(
-                                    scope: saveAsScope, name: saveAsName, client: client
-                                )
-                                saveAsOpen = false
-                            }
-                        },
-                        onCancel: { saveAsOpen = false }
-                    )
+                Row(label: String(localized: "settings.advanced.force_sampling.label",
+                                  defaultValue: "Force Sampling",
+                                  comment: "Row label for the force-sampling toggle"),
+                    sublabel: String(localized: "settings.advanced.force_sampling.sub",
+                                     defaultValue: "Uses these Temperature, Top P and Top K values even when a client or agent requests different ones.",
+                                     comment: "Sublabel for the force-sampling toggle"),
+                    isLast: true) {
+                    RowSwitch(isOn: vm.bindProfile($vm.forceSampling))
                 }
             }
         }
     }
 }
 
-// MARK: - Advanced tab
+// MARK: - Advanced page
 
-private struct AdvancedTab: View {
+private struct AdvancedPage: View {
     @Bindable var vm: ModelSettingsScreenVM
     let client: OMLXClient
 
     @Environment(\.omlxTheme) private var theme
 
-    var body: some View {
-        BasicEditBanner(vm: vm, client: client)
-        SectionHeader(String(localized: "settings.advanced.section",
-                             defaultValue: "Advanced Settings",
-                             comment: "Section header above the Advanced tab fields"))
+    private var showsLLMRows: Bool { vm.isLLMLike && !vm.isDiffusionModel }
 
-        // Profile-eligible toggles use `bindProfile` — flipping them flips
-        // the working-dirty flag. `isPinned`, `trustRemoteCode` and
-        // `externalEngine` stay per-model (server excludes them from
-        // profiles) and auto-save.
+    var body: some View {
+        // Trust Remote Code and the external engine stay per-model (the
+        // server excludes them from profiles) and save on commit. The other
+        // rows are profile fields that auto-save after a short pause.
         ListGroup {
-            if !vm.isDiffusionModel, let engines = vm.model?.externalEngines, !engines.isEmpty {
+            if showsLLMRows, let engines = vm.model?.externalEngines, !engines.isEmpty {
                 ExternalEngineRow(vm: vm, client: client, engines: engines)
             }
-            if !vm.isDiffusionModel {
-                Row(label: String(localized: "settings.advanced.enable_thinking.label",
-                                  defaultValue: "Enable Thinking",
-                                  comment: "Row label for the enable-thinking toggle"),
-                    sublabel: vm.thinkingForced ? String(
-                        localized: "settings.k2.thinking_hint",
-                        defaultValue: "K2 uses reasoning effort. Use Thinking Budget to limit reasoning.")
-                        : String(localized: "settings.advanced.enable_thinking.sub",
-                                     defaultValue: "Enable reasoning/thinking mode for this model",
-                                     comment: "Sublabel for the enable-thinking toggle")) {
-                    RowSwitch(isOn: vm.thinkingForced ? .constant(true) : vm.bindProfile($vm.enableThinking))
-                        .disabled(vm.thinkingForced)
-                }
-                if vm.isQwen4Exp && vm.qwen4PleSsdOffloadSupported {
-                    Row(label: String(localized: "settings.advanced.qwen4_ssd_offload.label",
-                                      defaultValue: "SSD N-gram Offload (Qwen4 only)",
-                                      comment: "Row label for the Qwen4 PLE SSD mmap toggle"),
-                        sublabel: vm.qwen4PleSsdOffloadForced
-                            ? String(localized: "settings.advanced.qwen4_ssd_offload.forced",
-                                     defaultValue: "Required because resident loading exceeds the configured model-memory limit.",
-                                     comment: "Sublabel when Qwen4 PLE SSD offload is forced by memory limits")
-                            : String(localized: "settings.advanced.qwen4_ssd_offload.sub",
-                                     defaultValue: "Keep the PLE N-gram table on SSD to save memory. Prefill can be slower after context changes.",
-                                     comment: "Sublabel for the Qwen4 PLE SSD mmap toggle")) {
-                        RowSwitch(isOn: vm.bind(
-                            $vm.qwen4PleSsdOffload,
-                            save: {
-                                Task {
-                                    await vm.save(.qwen4PleSsdOffload, client: client)
-                                }
-                            }
-                        ))
-                        .disabled(vm.qwen4PleSsdOffloadForced)
-                    }
-                }
+            // Security-sensitive row — flagged red to match the HTML
+            // editor's visual treatment. HF custom-code execution gives
+            // the model author the ability to run arbitrary Python in
+            // the server process; never propagated via profiles.
+            Row(label: String(localized: "settings.advanced.trust_remote_code.label",
+                              defaultValue: "Trust Remote Code",
+                              comment: "Row label for the security-sensitive trust-remote-code toggle"),
+                sublabel: String(localized: "settings.advanced.trust_remote_code.sub",
+                                 defaultValue: "Execute HuggingFace custom model code. Only enable for models you trust. Per-model only — never inherited from profiles.",
+                                 comment: "Sublabel describing the security implications of trust-remote-code"),
+                isLast: !showsLLMRows) {
+                RowSwitch(isOn: vm.bind($vm.trustRemoteCode, save: {
+                    Task { await vm.save(.trustRemoteCode, client: client) }
+                }))
+                .tint(theme.redDot)
+            }
+            if showsLLMRows {
                 Row(label: String(localized: "settings.advanced.thinking_budget.label",
                                   defaultValue: "Thinking Budget",
                                   comment: "Row label for the thinking budget field"),
@@ -1210,51 +1236,67 @@ private struct AdvancedTab: View {
                         RowSwitch(isOn: vm.bindProfile($vm.limitToolResults))
                     }
                 }
-                Row(label: String(localized: "settings.advanced.force_sampling.label",
-                                  defaultValue: "Force Sampling",
-                                  comment: "Row label for the force-sampling toggle"),
-                    sublabel: String(localized: "settings.advanced.force_sampling.sub",
-                                     defaultValue: "Override request sampling parameters with configured values",
-                                     comment: "Sublabel for the force-sampling toggle")) {
-                    RowSwitch(isOn: vm.bindProfile($vm.forceSampling))
+                Row(label: String(localized: "settings.advanced.guided_grammar.label",
+                                  defaultValue: "Guided Grammar",
+                                  comment: "Row label for the default guided grammar toggle"),
+                    sublabel: vm.vlmMtpEnabled
+                        ? vm.vlmMtpProcessorLockedReason
+                        : String(localized: "settings.advanced.guided_grammar.sub",
+                                 defaultValue: "Apply an EBNF grammar by default for this model.",
+                                 comment: "Sublabel for the default guided grammar toggle")) {
+                    RowSwitch(isOn: vm.bindProfile(Binding(
+                        get: { vm.guidedGrammarEnabled },
+                        set: { on in
+                            vm.guidedGrammarEnabled = on
+                            if !on { vm.guidedGrammar = "" }
+                        }
+                    )))
+                    .disabled(vm.vlmMtpEnabled && !vm.guidedGrammarEnabled)
+                    .help(vm.vlmMtpEnabled ? vm.vlmMtpProcessorLockedReason : "")
+                }
+                if vm.guidedGrammarEnabled {
+                    FreeRow {
+                        GrammarEditor(text: vm.bindProfile($vm.guidedGrammar))
+                    }
                 }
                 Row(label: String(localized: "settings.advanced.reasoning_parser.label",
                                   defaultValue: "Reasoning Parser",
                                   comment: "Row label for the reasoning-parser override field"),
                     sublabel: String(localized: "settings.advanced.reasoning_parser.sub",
                                      defaultValue: "Override the chain-of-thought parser. Leave empty to use the model's default.",
-                                     comment: "Sublabel for the reasoning-parser override field")) {
+                                     comment: "Sublabel for the reasoning-parser override field"),
+                    isLast: true) {
                     TextInput(text: vm.bindProfile($vm.reasoningParser),
                               placeholder: "auto", mono: true, width: .controlCompact)
                 }
             }
-            Row(label: String(localized: "settings.advanced.pin_memory.label",
-                              defaultValue: "Pin in memory",
-                              comment: "Row label for the pin-in-memory toggle"),
-                sublabel: String(localized: "settings.advanced.pin_memory.sub",
-                                 defaultValue: "Keep this model resident between requests",
-                                 comment: "Sublabel for the pin-in-memory toggle")) {
-                RowSwitch(isOn: vm.bind($vm.isPinned, save: {
-                    Task { await vm.save(.isPinned, client: client) }
-                }))
-            }
-            Row(label: String(localized: "settings.advanced.favorite.label",
-                              defaultValue: "Favorite",
-                              comment: "Row label for the favorite toggle"),
-                sublabel: String(localized: "settings.advanced.favorite.sub",
-                                 defaultValue: "List this model first in model lists",
-                                 comment: "Sublabel for the favorite toggle")) {
-                RowSwitch(isOn: vm.bind($vm.isFavorite, save: {
-                    Task { await vm.save(.isFavorite, client: client) }
-                }))
-            }
-            if vm.embeddingAudioSupported {
+        }
+        .padding(.top, 14)
+
+        if vm.isLLMLike {
+            SectionHeader(
+                String(localized: "settings.advanced.chat_template.section",
+                       defaultValue: "Chat Template Kwargs",
+                       comment: "Section header above the chat-template kwargs editor"),
+                subtitle: String(localized: "settings.advanced.chat_template.subtitle",
+                                 defaultValue: "Forwarded to the model's chat template. Toggle Force to override per-request values.",
+                                 comment: "Subtitle for the chat-template kwargs section")
+            )
+            ChatTemplateKwargsEditor(vm: vm, client: client)
+        }
+
+        if vm.embeddingAudioSupported {
+            SectionHeader(String(localized: "settings.advanced.embedding_audio.section",
+                                 defaultValue: "Audio",
+                                 comment: "Section header above the embedding audio-input settings"))
+            ListGroup {
                 Row(label: String(localized: "settings.advanced.embedding_audio.label",
                                   defaultValue: "Audio Input",
                                   comment: "Row label for the embedding audio-input toggle"),
                     sublabel: String(localized: "settings.advanced.embedding_audio.sub",
                                      defaultValue: "Load the audio encoder so /v1/embeddings accepts audio items. Uses more memory even for text-only requests. Applies after the model reloads.",
-                                     comment: "Sublabel for the embedding audio-input toggle")) {
+                                     comment: "Sublabel for the embedding audio-input toggle"),
+                    isLast: !vm.embeddingAudioEnabled) {
                     RowSwitch(isOn: vm.bind($vm.embeddingAudioEnabled, save: {
                         Task { await vm.save(.embeddingAudioEnabled, client: client) }
                     }))
@@ -1265,76 +1307,165 @@ private struct AdvancedTab: View {
                                       comment: "Row label for the embedding audio length limit"),
                         sublabel: String(localized: "settings.advanced.embedding_audio_max_seconds.sub",
                                          defaultValue: "Longer audio is cut at this length (empty = 30 s). The model context caps it at about 5 minutes.",
-                                         comment: "Sublabel for the embedding audio length limit")) {
+                                         comment: "Sublabel for the embedding audio length limit"),
+                        isLast: true) {
                         TextInput(text: $vm.embeddingAudioMaxSeconds,
                                   placeholder: "30", mono: true, suffix: "s", width: .controlCompact)
                             .onSubmit { Task { await vm.save(.embeddingAudioMaxSeconds, client: client) } }
                     }
                 }
             }
-            // Security-sensitive row — flagged red to match the HTML
-            // editor's visual treatment. HF custom-code execution gives
-            // the model author the ability to run arbitrary Python in
-            // the server process; never propagated via profiles.
-            Row(label: String(localized: "settings.advanced.trust_remote_code.label",
-                              defaultValue: "Trust Remote Code",
-                              comment: "Row label for the security-sensitive trust-remote-code toggle"),
-                sublabel: String(localized: "settings.advanced.trust_remote_code.sub",
-                                 defaultValue: "Execute HuggingFace custom model code. Only enable for models you trust. Per-model only — never inherited from profiles.",
-                                 comment: "Sublabel describing the security implications of trust-remote-code"),
-                isLast: true) {
-                RowSwitch(isOn: vm.bind($vm.trustRemoteCode, save: {
-                    Task { await vm.save(.trustRemoteCode, client: client) }
-                }))
-                .tint(theme.redDot)
-            }
         }
+    }
+}
 
-        SectionHeader(
-            String(localized: "settings.advanced.chat_template.section",
-                   defaultValue: "Chat Template Kwargs",
-                   comment: "Section header above the chat-template kwargs editor"),
-            subtitle: String(localized: "settings.advanced.chat_template.subtitle",
-                             defaultValue: "Forwarded to the model's chat template. Toggle Force to override per-request values.",
-                             comment: "Subtitle for the chat-template kwargs section")
-        )
-        ChatTemplateKwargsEditor(vm: vm, client: client)
+/// Multi-line EBNF editor for the default guided grammar.
+private struct GrammarEditor: View {
+    @Binding var text: String
 
-        if !vm.isDiffusionModel {
-            SectionHeader(
-                String(localized: "settings.acceleration.section",
-                       defaultValue: "Acceleration",
-                       comment: "Section header above the Acceleration settings group"),
-                subtitle: String(localized: "settings.acceleration.subtitle",
-                                 defaultValue: "Decoding speedups for models that support them.",
-                                 comment: "Subtitle for the Acceleration settings section")
-            )
-            if !vm.externalEngine.isEmpty {
-                HintLine(text: Self.externalEngineNote, icon: "exclamationmark.triangle")
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        TextEditor(text: $text)
+            .font(.omlxMono(11))
+            .scrollContentBackground(.hidden)
+            .frame(height: 96)
+            .padding(6)
+            .background(theme.inputBg)
+            .overlay(alignment: .topLeading) {
+                if text.isEmpty {
+                    Text(verbatim: #"root ::= "YES""#)
+                        .font(.omlxMono(11))
+                        .foregroundStyle(theme.textTertiary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .allowsHitTesting(false)
+                }
             }
-            AccelerationSection(vm: vm, client: client)
-                .disabled(!vm.externalEngine.isEmpty)
-
-            SectionHeader(
-                String(localized: "settings.advanced.experimental.section",
-                       defaultValue: "Experimental",
-                       comment: "Section header above the Experimental settings group"),
-                subtitle: String(localized: "settings.advanced.experimental.subtitle",
-                                 defaultValue: "Speculative decoding, KV-cache quantization, and other research features.",
-                                 comment: "Subtitle for the Experimental settings section")
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(theme.inputBorder, lineWidth: 0.5)
             )
+    }
+}
+
+// MARK: - Engine pages
+
+/// Page of MLX engine settings. An external engine serving the model
+/// bypasses all of them, so the page says so and locks its rows.
+private struct EnginePage<Content: View>: View {
+    var vm: ModelSettingsScreenVM
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
             if !vm.externalEngine.isEmpty {
-                HintLine(text: Self.externalEngineNote, icon: "exclamationmark.triangle")
+                HintLine(text: String(localized: "settings.advanced.external_engine.section_note",
+                                      defaultValue: "These settings do not apply while an external engine serves this model.",
+                                      comment: "Note above MLX-only settings while an external engine serves the model"),
+                         icon: "exclamationmark.triangle")
+                    .padding(.horizontal, 28)
+                    .padding(.bottom, 8)
             }
-            ExperimentalSection(vm: vm, client: client)
+            content()
                 .disabled(!vm.externalEngine.isEmpty)
+        }
+        .padding(.top, 14)
+    }
+}
+
+private struct MemorySavingSection: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+
+    var body: some View {
+        ListGroup {
+            // Per-model residency choice: saves on commit and never enters
+            // a profile.
+            if vm.ssdNgramOffloadSupported {
+                Row(label: String(localized: "settings.memory.ssd_ngram_offload.label",
+                                  defaultValue: "SSD N-gram Offload",
+                                  comment: "Row label for the shared Qwen4 PLE / DeepSeek V4.1 Engram SSD offload toggle"),
+                    sublabel: vm.ssdNgramOffloadForced
+                        ? String(localized: "settings.advanced.qwen4_ssd_offload.forced",
+                                 defaultValue: "Required because resident loading exceeds the configured model-memory limit.",
+                                 comment: "Sublabel when SSD N-gram offload is forced by memory limits")
+                        : String(localized: "settings.memory.ssd_ngram_offload.sub",
+                                 defaultValue: "Keeps the large N-gram table (Qwen4 PLE or DeepSeek V4.1 Engram) on SSD and reads only the rows it needs. Saves memory, but speed depends on SSD reads. Changing this setting reloads the model.",
+                                 comment: "Sublabel for the shared SSD N-gram offload toggle")) {
+                    RowSwitch(isOn: vm.bind($vm.ssdNgramOffload, save: {
+                        Task { await vm.save(.ssdNgramOffload, client: client) }
+                    }))
+                    .disabled(vm.ssdNgramOffloadForced)
+                }
+            }
+            if vm.moeExpertOffloadSupported {
+                Row(label: String(localized: "settings.memory.moe_offload.label",
+                                  defaultValue: "MoE Expert Offload",
+                                  comment: "Row label for the MoE expert offload toggle"),
+                    sublabel: moeSublabel) {
+                    RowSwitch(isOn: vm.bindProfile($vm.moeExpertOffloadEnabled))
+                        .disabled(vm.moeExpertOffloadConflictReason != nil && !vm.moeExpertOffloadEnabled)
+                        .help(vm.moeExpertOffloadConflictReason ?? moeSpeculativeHint)
+                }
+                if vm.moeExpertOffloadEnabled {
+                    Row(label: String(localized: "settings.memory.moe_offload.resident.label",
+                                      defaultValue: "Resident Experts",
+                                      comment: "Row label for the share of MoE experts kept in memory"),
+                        sublabel: vm.moeExpertOffloadResidentFraction == nil
+                            ? vm.moeResidentRangeError
+                            : String(localized: "settings.memory.moe_offload.resident.sub",
+                                     defaultValue: "Share of expert weights kept in memory (5-95%).",
+                                     comment: "Sublabel for the MoE resident expert share")) {
+                        TextInput(text: vm.bindProfile($vm.moeExpertOffloadResidentPercent),
+                                  placeholder: "25", mono: true, suffix: "%", width: .controlCompact)
+                    }
+                }
+            }
+            Row(label: String(localized: "settings.experimental.turboquant.label",
+                              defaultValue: "TurboQuant KV Cache",
+                              comment: "Row label for the TurboQuant KV cache toggle"),
+                sublabel: turboquantSublabel,
+                isLast: true) {
+                HStack(spacing: 8) {
+                    if vm.turboquantKvEnabled {
+                        Popup(
+                            selection: vm.bindProfile($vm.turboquantKvBits),
+                            width: .controlCompact,
+                            options: ModelSettingsScreenVM.turboquantKvBitsOptions
+                        )
+                    }
+                    RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
+                        .disabled(vm.vlmMtpEnabled)
+                        .help(vm.vlmMtpEnabled ? ModelSettingsScreenVM.vlmMtpOwnsSpeculativePathReason : "")
+                }
+            }
         }
     }
 
-    private static let externalEngineNote = String(
-        localized: "settings.advanced.external_engine.section_note",
-        defaultValue: "These settings do not apply while an external engine serves this model.",
-        comment: "Note above MLX-only settings while an external engine serves the model")
+    private var moeSublabel: String {
+        if let reason = vm.moeExpertOffloadConflictReason { return reason }
+        return String(localized: "settings.memory.moe_offload.sub",
+                      defaultValue: "Stream Mixture-of-Experts weights from the checkpoint on demand, keeping only a fraction resident. Fits MoE models larger than memory; costs decode speed. Requires reload.",
+                      comment: "Sublabel for the MoE expert offload toggle")
+    }
+
+    private var moeSpeculativeHint: String {
+        vm.model?.moeOffloadAllowsMtp == true
+            ? String(localized: "settings.memory.moe_offload.speculative_mtp",
+                     defaultValue: "Can be combined with Lightning MTP: the draft head stays resident while backbone experts stream. Not with VLM MTP or DFlash.",
+                     comment: "Tooltip on MoE expert offload for families that keep the MTP head resident")
+            : String(localized: "settings.memory.moe_offload.speculative",
+                     defaultValue: "Cannot be combined with Lightning MTP, VLM MTP, or DFlash.",
+                     comment: "Tooltip on MoE expert offload listing the speculative decoders it excludes")
+    }
+
+    private var turboquantSublabel: String {
+        if vm.vlmMtpEnabled { return ModelSettingsScreenVM.vlmMtpOwnsSpeculativePathReason }
+        return String(localized: "settings.experimental.turboquant.sub",
+                      defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
+                      comment: "Sublabel describing TurboQuant KV cache")
+    }
 }
 
 /// "Use External Engine" toggle plus the engine to use. Engines that cannot
@@ -1632,19 +1763,13 @@ private struct EntryEditor: View {
 
 // MARK: - Acceleration section
 
-private var vlmMtpOwnsSpeculativePathReason: String {
-    String(localized: "settings.speculative.conflict.vlm_mtp",
-           defaultValue: "Disable VLM MTP before enabling this feature.",
-           comment: "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on")
-}
-
 private struct AccelerationSection: View {
     @Bindable var vm: ModelSettingsScreenVM
     let client: OMLXClient
 
     var body: some View {
-        // Profile-eligible like the experimental fields below — edits
-        // write to the working profile via bindProfile.
+        // Profile-eligible like the experimental fields: edits auto-save
+        // through bindProfile.
         ListGroup {
             // Lightning MTP
             Row(label: String(localized: "settings.acceleration.mtp.label",
@@ -1667,6 +1792,29 @@ private struct AccelerationSection: View {
                         width: .controlWide,
                         options: ModelSettingsScreenVM.mtpDepthOptions
                     )
+                }
+            }
+
+            if vm.canImportMtplxSidecar {
+                Row(label: String(localized: "settings.acceleration.mtplx_import.label",
+                                  defaultValue: "MTPLX Side-car",
+                                  comment: "Row label for the one-time MTPLX side-car import action"),
+                    sublabel: String(localized: "settings.acceleration.mtplx_import.sub",
+                                     defaultValue: "Import the model's MTP head into its checkpoint index to unlock Lightning MTP.",
+                                     comment: "Sublabel for the MTPLX side-car import action")) {
+                    Button {
+                        Task { await vm.importMtplxSidecar(client: client) }
+                    } label: {
+                        if vm.isImportingMtplxSidecar {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text(String(localized: "settings.acceleration.mtplx_import.button",
+                                        defaultValue: "Import MTPLX Side-car",
+                                        comment: "Button title that imports an MTPLX MTP side-car"))
+                        }
+                    }
+                    .buttonStyle(.omlx(.primary, size: .small))
+                    .disabled(vm.isImportingMtplxSidecar)
                 }
             }
 
@@ -1693,7 +1841,7 @@ private struct AccelerationSection: View {
                                   defaultValue: "Draft Quantization",
                                   comment: "Row label for the DFlash draft quantization toggle"),
                     sublabel: String(localized: "settings.experimental.dflash.draft_quant.sub",
-                                     defaultValue: "Enable quantization for the draft model (weight, activation bits & group size).",
+                                     defaultValue: "Enable quantization for the draft model (weight bits & group size).",
                                      comment: "Sublabel for the DFlash draft quantization toggle")) {
                     RowSwitch(isOn: vm.bindProfile($vm.dflashDraftQuantEnabled))
                 }
@@ -1707,15 +1855,6 @@ private struct AccelerationSection: View {
                             options: ModelSettingsScreenVM.dflashDraftQuantWeightBitsOptions
                         )
                     }
-                    Row(label: String(localized: "settings.experimental.dflash.draft_quant_activation.label",
-                                      defaultValue: "Activation Bits",
-                                      comment: "Row label for the DFlash draft quantization activation bits picker")) {
-                        Popup(
-                            selection: vm.bindProfile($vm.dflashDraftQuantActivationBits),
-                            width: .controlCompact,
-                            options: ModelSettingsScreenVM.dflashDraftQuantActivationBitsOptions
-                        )
-                    }
                     Row(label: String(localized: "settings.experimental.dflash.draft_quant_group.label",
                                       defaultValue: "Group Size",
                                       comment: "Row label for the DFlash draft quantization group size picker")) {
@@ -1726,23 +1865,11 @@ private struct AccelerationSection: View {
                         )
                     }
                 }
-                Row(label: String(localized: "settings.experimental.dflash.max_ctx.label",
-                                  defaultValue: "Max Context (fallback)",
-                                  comment: "Row label for the DFlash max-context fallback field"),
-                    sublabel: String(localized: "settings.experimental.dflash.max_ctx.sub",
-                                     defaultValue: "Prompts at or above this token count switch to BatchedEngine. Empty = unlimited.",
-                                     comment: "Sublabel describing the DFlash max-context fallback")) {
-                    TextInput(text: vm.bindProfile($vm.dflashMaxCtx),
-                              placeholder: String(localized: "settings.experimental.dflash.max_ctx.placeholder",
-                                                  defaultValue: "unlimited",
-                                                  comment: "Placeholder shown when DFlash max-context is unset (no cap)"),
-                              mono: true, suffix: "tk", width: .controlCompact)
-                }
                 Row(label: String(localized: "settings.experimental.dflash.verify_mode.label",
                                   defaultValue: "Verify Mode",
                                   comment: "Row label for the DFlash verifier algorithm picker"),
                     sublabel: String(localized: "settings.experimental.dflash.verify_mode.sub",
-                                     defaultValue: "Verifier algorithm. \"adaptive\" shrinks block size when acceptance drops; \"off\" disables speculative verify.",
+                                     defaultValue: "Verifier algorithm. \"adaptive\" picks how many drafts to verify each cycle from measured cost and acceptance; \"dflash\" and \"off\" verify the whole block.",
                                      comment: "Sublabel for the DFlash verify mode picker")) {
                     Popup(
                         selection: vm.bindProfile($vm.dflashVerifyMode),
@@ -1759,15 +1886,6 @@ private struct AccelerationSection: View {
                     TextInput(text: vm.bindProfile($vm.dflashDraftWindowSize),
                               placeholder: "2048", mono: true, width: .controlCompact)
                 }
-                Row(label: String(localized: "settings.experimental.dflash.sink_size.label",
-                                  defaultValue: "Draft Sink Size",
-                                  comment: "Row label for the DFlash attention-sink tokens field"),
-                    sublabel: String(localized: "settings.experimental.dflash.sink_size.sub",
-                                     defaultValue: "Attention-sink tokens always kept in the window. Empty = dflash default (0).",
-                                     comment: "Sublabel for the DFlash draft sink size field")) {
-                    TextInput(text: vm.bindProfile($vm.dflashDraftSinkSize),
-                              placeholder: "0", mono: true, width: .controlCompact)
-                }
                 Row(label: String(localized: "settings.experimental.dflash.block_size.label",
                                   defaultValue: "Runtime Block Size",
                                   comment: "Row label for the DFlash runtime block size field"),
@@ -1777,58 +1895,15 @@ private struct AccelerationSection: View {
                     TextInput(text: vm.bindProfile($vm.dflashBlockSize),
                               placeholder: "checkpoint", mono: true, width: .controlCompact)
                 }
-                Row(label: String(localized: "settings.experimental.dflash.mem_cache.label",
-                                  defaultValue: "DFlash in-memory cache",
-                                  comment: "Row label for the DFlash L1 in-memory cache toggle"),
-                    sublabel: String(localized: "settings.experimental.dflash.mem_cache.sub",
-                                     defaultValue: "DFlash L1 prefix snapshot cache in RAM.",
-                                     comment: "Sublabel for the DFlash L1 in-memory cache toggle")) {
-                    HStack(spacing: 8) {
-                        if vm.dflashInMemoryCache {
-                            TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheGib),
-                                      placeholder: "8", mono: true, suffix: "GiB", width: .controlCompact)
-                        }
-                        RowSwitch(isOn: vm.bindProfile($vm.dflashInMemoryCache))
-                    }
-                }
-                if vm.dflashInMemoryCache {
-                    Row(label: String(localized: "settings.experimental.dflash.mem_cache_entries.label",
-                                      defaultValue: "Cache Entries",
-                                      comment: "Row label for the DFlash L1 in-memory cache max entries field"),
-                        sublabel: String(localized: "settings.experimental.dflash.mem_cache_entries.sub",
-                                         defaultValue: "Maximum prefix snapshots kept in RAM. Each entry stores KV + draft GDN state.",
-                                         comment: "Sublabel for the DFlash L1 cache max entries field")) {
-                        TextInput(text: vm.bindProfile($vm.dflashInMemoryCacheMaxEntries),
-                                  placeholder: "4", mono: true, width: .controlCompact)
-                    }
-                }
-                Row(label: String(localized: "settings.experimental.dflash.ssd_cache.label",
-                                  defaultValue: "DFlash SSD cache",
-                                  comment: "Row label for the DFlash L2 SSD cache toggle"),
-                    sublabel: dflashSsdSublabel) {
-                    RowSwitch(isOn: vm.bindProfile($vm.dflashSsdCache))
-                        .disabled(!(vm.model?.dflashSsdCacheAvailable ?? false) || !vm.dflashInMemoryCache)
-                }
-                if vm.dflashSsdCache && (vm.model?.dflashSsdCacheAvailable ?? false) {
-                    Row(label: String(localized: "settings.experimental.dflash.ssd_cache_size.label",
-                                      defaultValue: "SSD Cache Size",
-                                      comment: "Row label for the DFlash L2 SSD cache disk budget field"),
-                        sublabel: String(localized: "settings.experimental.dflash.ssd_cache_size.sub",
-                                         defaultValue: "Disk budget for L2 spill; oldest entries are evicted when exceeded.",
-                                         comment: "Sublabel for the DFlash SSD cache size field")) {
-                        TextInput(text: vm.bindProfile($vm.dflashSsdCacheGib),
-                                  placeholder: "20", mono: true, suffix: "GiB", width: .controlCompact)
-                    }
-                }
             }
 
-            // VLM MTP - last row of the acceleration group. Reveals the
-            // draft-model picker and block-size field when enabled.
+            // VLM MTP reveals the draft-model picker and block-size field
+            // when enabled.
             Row(label: String(localized: "settings.experimental.vlm_mtp.label",
                               defaultValue: "VLM MTP",
                               comment: "Row label for the VLM MTP toggle"),
                 sublabel: vlmMtpSublabel,
-                isLast: !vm.vlmMtpEnabled) {
+                isLast: !vm.vlmMtpEnabled && !hasFamilyRows) {
                 RowSwitch(isOn: vm.bindProfile($vm.vlmMtpEnabled))
                     .disabled(vlmMtpToggleDisabled)
                     .help(vm.vlmMtpConflictReason ?? "")
@@ -1852,12 +1927,79 @@ private struct AccelerationSection: View {
                     sublabel: String(localized: "settings.experimental.vlm_mtp.block_size.sub",
                                      defaultValue: "Tokens drafted per round. Empty uses the mlx-vlm default.",
                                      comment: "Sublabel for the VLM MTP draft block-size field"),
-                    isLast: true) {
+                    isLast: !hasFamilyRows) {
                     TextInput(text: vm.bindProfile($vm.vlmMtpDraftBlockSize),
                               placeholder: "4", mono: true, width: .controlNarrow)
                 }
             }
+
+            // Family-specific kernels. CED prefill and extended fused decode
+            // are per-model choices outside profiles, so they save on commit.
+            if vm.isDeepseekV41 {
+                Row(label: String(localized: "settings.acceleration.ced_prefill.label",
+                                  defaultValue: "CED Prefill Acceleration (DeepSeek V4.1)",
+                                  comment: "Row label for the DeepSeek V4.1 CED prefill toggle"),
+                    sublabel: String(localized: "settings.acceleration.ced_prefill.sub",
+                                     defaultValue: "Improves prefill speed by approximately 74–79% in tested configurations. Uses the model’s Causal Encoder–Decoder architecture to reduce decoder prefill computation.",
+                                     comment: "Sublabel for the DeepSeek V4.1 CED prefill toggle"),
+                    isLast: !vm.isQwen4Exp && !vm.showsQwenOqA8) {
+                    RowSwitch(isOn: vm.bind($vm.deepseekV41CedPrefillEnabled, save: {
+                        Task { await vm.save(.deepseekV41CedPrefill, client: client) }
+                    }))
+                }
+            }
+            if vm.isQwen4Exp {
+                Row(label: String(localized: "settings.acceleration.qwen4_wide_decode.label",
+                                  defaultValue: "Qwen4 Extended Fused Decode",
+                                  comment: "Row label for the Qwen4 extended fused decode toggle"),
+                    sublabel: String(localized: "settings.acceleration.qwen4_wide_decode.sub",
+                                     defaultValue: "Speeds up decode on Qwen4 oQ2.5e, oQ2.7e, oQ6e, oQ8e and 8-bit community models (about 3-6% on an 8-bit model, up to 1.5 GiB more memory). No effect on oQ3e to oQ4e or fp16 builds, and little effect with Lightning MTP on.",
+                                     comment: "Sublabel for the Qwen4 extended fused decode toggle"),
+                    isLast: !vm.showsQwenOqA8) {
+                    RowSwitch(isOn: vm.bind($vm.qwen4GdnDecodeWideProj, save: {
+                        Task { await vm.save(.qwen4GdnDecodeWideProj, client: client) }
+                    }))
+                }
+            }
+            // The oQ A8 rows do not depend on an ANE backend: Qwen3.8
+            // Flash-Next has none, but still supports oQ A8.
+            if vm.showsQwenOqA8 {
+                Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
+                                  defaultValue: "Qwen INT8 Activation Prefill",
+                                  comment: "Row label for the oQ INT8-activation prefill kernels"),
+                    sublabel: qwenOqA8Sublabel,
+                    isLast: !vm.qwen35OqA8Enabled) {
+                    RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
+                        .disabled(vm.qwen35OqA8ConflictReason != nil)
+                        .help(vm.qwen35OqA8ConflictReason ?? "")
+                }
+                if vm.qwen35OqA8Enabled {
+                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
+                                      defaultValue: "Minimum Prompt Tokens",
+                                      comment: "Row label for the oQ A8 minimum prompt length"),
+                        sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
+                                         defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
+                                         comment: "Sublabel explaining the oQ A8 minimum prompt length"),
+                        isLast: true) {
+                        TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                                  placeholder: "128", mono: true,
+                                  isNumeric: true, range: 1...262_144,
+                                  step: 64, width: .controlCompact)
+                    }
+                }
+            }
         }
+    }
+
+    private var hasFamilyRows: Bool {
+        vm.isDeepseekV41 || vm.isQwen4Exp || vm.showsQwenOqA8
+    }
+
+    private var qwenOqA8Sublabel: String {
+        if let reason = vm.qwen35OqA8ConflictReason { return reason }
+        return String(localized: "settings.experimental.qwen_oq_a8.sub",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, and routed expert gate/up projections on Qwen3.8 Flash-Next. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      comment: "Sublabel describing the oQ INT8-activation prefill kernels")
     }
 
     private var mtpToggleDisabled: Bool {
@@ -1879,7 +2021,7 @@ private struct AccelerationSection: View {
     }
 
     private var dflashToggleDisabled: Bool {
-        !(vm.model?.dflashCompatible ?? true) || vm.vlmMtpEnabled
+        !(vm.model?.dflashCompatible ?? true) || vm.dflashConflictReason != nil
     }
 
     private var dflashHelp: String {
@@ -1887,7 +2029,7 @@ private struct AccelerationSection: View {
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
-        return vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : ""
+        return vm.dflashConflictReason ?? ""
     }
 
     private var dflashSublabel: String {
@@ -1895,26 +2037,10 @@ private struct AccelerationSection: View {
            !(vm.model?.dflashCompatible ?? true) {
             return reason
         }
-        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        if let reason = vm.dflashConflictReason { return reason }
         return String(localized: "settings.experimental.dflash.sub",
                       defaultValue: "Block-diffusion speculative decoding.",
                       comment: "Default sublabel for the DFlash toggle (used when the model is compatible)")
-    }
-
-    private var dflashSsdSublabel: String {
-        if !(vm.model?.dflashSsdCacheAvailable ?? false) {
-            return String(localized: "settings.experimental.dflash.ssd_cache.sub.unavailable",
-                          defaultValue: "Enable the global paged SSD cache directory first.",
-                          comment: "Sublabel for the DFlash SSD cache row when the global SSD cache directory isn't configured")
-        }
-        if !vm.dflashInMemoryCache {
-            return String(localized: "settings.experimental.dflash.ssd_cache.sub.needs_l1",
-                          defaultValue: "Requires the in-memory cache to be enabled.",
-                          comment: "Sublabel for the DFlash SSD cache row when the L1 in-memory cache is off")
-        }
-        return String(localized: "settings.experimental.dflash.ssd_cache.sub",
-                      defaultValue: "L2 spill of evicted L1 entries to disk.",
-                      comment: "Default sublabel for the DFlash SSD cache toggle")
     }
 
     private var vlmMtpToggleDisabled: Bool {
@@ -1939,8 +2065,8 @@ private struct ExperimentalSection: View {
 
     var body: some View {
         // Experimental fields, including Qwen ANE controls, are profile
-        // edits. Applying a profile persists the load-time settings and the
-        // engine picks them up when it reloads.
+        // fields. They auto-save and the engine picks them up when it
+        // reloads.
         ListGroup {
             if vm.model?.anePrefillBackend != nil {
                 if (vm.model?.anePrefillBackend == "k2") {
@@ -1961,31 +2087,6 @@ private struct ExperimentalSection: View {
                             Popup(selection: vm.bindProfile($vm.qwen35AnePrefillSharedFraction), width: .controlCompact,
                                   options: ModelSettingsScreenVM.aneFractionOptions(current: vm.qwen35AnePrefillSharedFraction, presets: vm.model?.anePrefillSharedFractions ?? []))
                         }
-                    }
-                }
-            }
-            // The oQ A8 rows do not depend on an ANE backend: Qwen3.8
-            // Flash-Next has none, but still supports oQ A8.
-            if vm.isQwenOqA8Model {
-                Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
-                                  defaultValue: "Qwen INT8 Activation Prefill",
-                                  comment: "Row label for the oQ INT8-activation prefill kernels"),
-                    sublabel: qwenOqA8Sublabel) {
-                    RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
-                        .disabled(vm.qwen35OqA8ConflictReason != nil)
-                        .help(vm.qwen35OqA8ConflictReason ?? "")
-                }
-                if vm.qwen35OqA8Enabled {
-                    Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
-                                      defaultValue: "Minimum Prompt Tokens",
-                                      comment: "Row label for the oQ A8 minimum prompt length"),
-                        sublabel: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.sub",
-                                         defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
-                                         comment: "Sublabel explaining the oQ A8 minimum prompt length")) {
-                        TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
-                                  placeholder: "128", mono: true,
-                                  isNumeric: true, range: 1...262_144,
-                                  step: 64, width: .controlCompact)
                     }
                 }
             }
@@ -2258,25 +2359,6 @@ private struct ExperimentalSection: View {
                 }
             }
 
-            // TurboQuant KV
-            Row(label: String(localized: "settings.experimental.turboquant.label",
-                              defaultValue: "TurboQuant KV Cache",
-                              comment: "Row label for the TurboQuant KV cache toggle"),
-                sublabel: turboquantSublabel) {
-                HStack(spacing: 8) {
-                    if vm.turboquantKvEnabled {
-                        Popup(
-                            selection: vm.bindProfile($vm.turboquantKvBits),
-                            width: .controlCompact,
-                            options: ModelSettingsScreenVM.turboquantKvBitsOptions
-                        )
-                    }
-                    RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
-                        .disabled(vm.vlmMtpEnabled)
-                        .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
-                }
-            }
-
             // IndexCache (DSA-only — surface to the user that the row
             // only applies to models whose config matches the DSA set).
             if vm.isDSAConfigModel {
@@ -2304,7 +2386,7 @@ private struct ExperimentalSection: View {
                 isLast: !vm.specprefillEnabled) {
                 RowSwitch(isOn: vm.bindProfile($vm.specprefillEnabled))
                     .disabled(vm.vlmMtpEnabled)
-                    .help(vm.vlmMtpEnabled ? vlmMtpOwnsSpeculativePathReason : "")
+                    .help(vm.vlmMtpEnabled ? ModelSettingsScreenVM.vlmMtpOwnsSpeculativePathReason : "")
             }
             if vm.specprefillEnabled {
                 Row(label: String(localized: "settings.experimental.specprefill.draft.label",
@@ -2342,25 +2424,11 @@ private struct ExperimentalSection: View {
         }
     }
 
-    private var turboquantSublabel: String {
-        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
-        return String(localized: "settings.experimental.turboquant.sub",
-                      defaultValue: "Quantize the KV cache during prefill. Saves memory at a small quality cost.",
-                      comment: "Sublabel describing TurboQuant KV cache")
-    }
-
     private var specprefillSublabel: String {
-        if vm.vlmMtpEnabled { return vlmMtpOwnsSpeculativePathReason }
+        if vm.vlmMtpEnabled { return ModelSettingsScreenVM.vlmMtpOwnsSpeculativePathReason }
         return String(localized: "settings.experimental.specprefill.sub",
                       defaultValue: "Attention-based sparse prefill for MoE/hybrid models.",
                       comment: "Sublabel describing SpecPrefill")
-    }
-
-    private var qwenOqA8Sublabel: String {
-        if let reason = vm.qwen35OqA8ConflictReason { return reason }
-        return String(localized: "settings.experimental.qwen_oq_a8.sub",
-                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, and routed expert gate/up projections on Qwen3.8 Flash-Next. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
-                      comment: "Sublabel describing the oQ INT8-activation prefill kernels")
     }
 
     private var qwenAnePrefillSublabel: String {

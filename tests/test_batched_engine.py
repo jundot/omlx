@@ -962,8 +962,8 @@ class TestBatchedEngineSpecPrefillForwarding:
         assert call_kwargs["specprefill_threshold"] == 100
 
     @pytest.mark.asyncio
-    async def test_generate_forwards_preserve_reasoning(self):
-        """The non-streaming path must carry the flag the streaming path already does."""
+    async def test_generate_forwards_request_flags(self):
+        """The non-streaming path must carry the flags the streaming path already does."""
         from omlx.engine.batched import BatchedEngine
 
         engine = BatchedEngine(model_name="test-model")
@@ -972,9 +972,13 @@ class TestBatchedEngineSpecPrefillForwarding:
             generate=AsyncMock(return_value=self._fake_output())
         )
 
-        await engine.generate("a prompt", preserve_reasoning=True)
+        await engine.generate(
+            "a prompt", preserve_reasoning=True, skip_cache_store=True
+        )
 
-        assert engine._engine.generate.call_args.kwargs["preserve_reasoning"] is True
+        kwargs = engine._engine.generate.call_args.kwargs
+        assert kwargs["preserve_reasoning"] is True
+        assert kwargs["skip_cache_store"] is True
 
     @pytest.mark.asyncio
     async def test_generate_forwards_tools(self):

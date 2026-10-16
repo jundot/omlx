@@ -65,8 +65,9 @@ brew update && brew upgrade omlx
 # 作为后台服务运行（崩溃时自动重启）
 brew services start omlx
 
-# 可选：MCP（Model Context Protocol）支持
+# 可选：MCP（Model Context Protocol）支持，安装后重启以加载
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+omlx restart
 ```
 
 ### 从源码安装
@@ -76,7 +77,7 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 make install                # 以 editable 模式安装（含 Web UI 和原生自定义内核）
 # 没有完整 Xcode 时，用 make install-no-kernels 安装不含内核的版本
-make mcp                    # 可选：添加 MCP（Model Context Protocol）支持
+make mcp                    # 可选：添加 MCP 支持，重启 `omlx serve` 后加载
 ```
 
 需要 macOS 15.0+ (Sequoia)、Python 3.11–3.13 和 Apple Silicon（M1/M2/M3/M4/M5）。
@@ -236,7 +237,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 文本嵌入 |
 | `POST /v1/rerank` | 文档重排序 |
-| `POST /v1/systemone` | 决策模型的类型化判断 (TypeSafe System One) |
+| `POST /v1/systemone` | 决策模型或聊天模型的类型化判断 (TypeSafe System One) |
 | `GET /v1/models` | 列出可用模型 |
 | `POST /tokenize`, `POST /detokenize` | 兼容 vLLM 的分词器 API（也可通过 `/v1` 访问） |
 

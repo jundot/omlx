@@ -67,8 +67,8 @@ inline float glm_load_vector(const device T* x, thread float* x_thread) {
   float sum = 0;
   if (bits == 3) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 8.0f;
       x_thread[i + 2] = x[i + 2] / 64.0f;
@@ -80,7 +80,7 @@ inline float glm_load_vector(const device T* x, thread float* x_thread) {
     }
   } else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 16.0f;
       x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -88,8 +88,8 @@ inline float glm_load_vector(const device T* x, thread float* x_thread) {
     }
   } else if (bits == 5) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 32.0f;
       x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -101,7 +101,7 @@ inline float glm_load_vector(const device T* x, thread float* x_thread) {
     }
   } else if (bits == 6) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 64.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -772,7 +772,7 @@ def _down_kernel(
 
 # MLX uses the same qmv_fast alignment rule for 3-bit and 4/5/6/8-bit weights.
 def _qmv_fast_ok(bits: int, group_size: int, n: int, k: int) -> bool:
-    """Shapes on which MLX routes a one-token product to qmv_fast."""
+    """MLX qmv_fast shapes with full output tiles for the fused kernels."""
     if bits not in (3, 4, 5, 6, 8) or group_size not in (32, 64, 128):
         return False
     pack_factor = 8 if bits in (3, 5) else (4 if bits == 6 else 32 // bits)

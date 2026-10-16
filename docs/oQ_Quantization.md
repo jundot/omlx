@@ -140,6 +140,8 @@ Measured with the refit added in [#4385](https://github.com/jundot/omlx/pull/438
 
 The refit also brings the output distribution closer to the original model's: the KL divergence from the original drops by 12% to 15% on general text for both models at both levels.
 
+Muse Spark Open NVFP4 checkpoints keep their NVFP4 routed experts unchanged at oQ4 and above, together with the per-expert tensor scales. oQ quantizes only the BF16 tensors (attention, the first and last MoE layers, embeddings, and the LM head). At oQ3 and below, oQ requantizes the routed experts and folds each expert's tensor scale into its weights, so the output is a plain affine checkpoint that mlx-lm also loads.
+
 ## Acknowledgments
 
 The importance matrix follows the imatrix approach used by llama.cpp. The least-squares refit was prompted by the 3-bit quantizer in @tacos8me's m5-ultra project.

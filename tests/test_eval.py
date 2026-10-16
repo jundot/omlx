@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for accuracy evaluation modules."""
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,7 +10,7 @@ from omlx.eval.base import BaseBenchmark
 from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
-from omlx.eval.livecodebench import _extract_code
+from omlx.eval.livecodebench import LiveCodeBenchBenchmark, _extract_code
 from omlx.eval.mmlu import MMLUBenchmark, _parse_choices
 from omlx.eval.truthfulqa import TruthfulQABenchmark
 
@@ -219,6 +220,12 @@ class TestGSM8K:
 # --- LiveCodeBench Tests ---
 
 
+@pytest.fixture(scope="module")
+def lcb_items():
+    bench = LiveCodeBenchBenchmark()
+    return {item["id"]: item for item in asyncio.run(bench.load_dataset())}
+
+
 class TestLiveCodeBench:
     def test_extract_code_python_block(self):
         response = "Here's my solution:\n```python\ndef solve():\n    print(42)\n```\nDone."
@@ -239,6 +246,30 @@ class TestLiveCodeBench:
     def test_extract_code_empty(self):
         code = _extract_code("")
         assert code == ""
+
+    def test_format_prompt_functional_shows_signature(self, lcb_items):
+        prompt = LiveCodeBenchBenchmark().format_prompt(lcb_items["2727"])[0]["content"]
+        assert "def countSeniors(self, details: List[str]) -> int:" in prompt
+        assert "Read input from stdin" not in prompt
+
+    def test_check_answer_functional_compares_return_value(self, lcb_items):
+        bench = LiveCodeBenchBenchmark()
+        item = lcb_items["2791"]
+        signature = (
+            "class Solution:\n"
+            "    def circularGameLosers(self, n: int, k: int) -> List[int]:\n"
+        )
+        gold = signature + (
+            "        seen = set()\n"
+            "        i, r = 0, 1\n"
+            "        while i not in seen:\n"
+            "            seen.add(i)\n"
+            "            i = (i + r * k) % n\n"
+            "            r += 1\n"
+            "        return [j + 1 for j in range(n) if j not in seen]\n"
+        )
+        assert bench.check_answer(gold, item) is True
+        assert bench.check_answer(signature + "        return []\n", item) is False
 
 
 # --- HumanEval Tests ---

@@ -1101,6 +1101,69 @@ class TestSchedulerAddRequest:
         assert (request.request_id in scheduler._cache_freshness_waits) is expected
         future.result.assert_not_called()
 
+    def test_admission_freshness_gate_waits_for_sub_block_tail_on_stateful_model(
+        self, mock_model, mock_tokenizer
+    ):
+        """A stateful model's tail-terminal block makes a sub-block prompt reusable.
+
+        Below one block there is no grid match, so without the tail path the
+        wait never fires and the repeat request looks up before the store's
+        tail is registered, re-prefilling from scratch (the <block_size cliff).
+        """
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.config.paged_cache_block_size = 2048
+        scheduler._boundary_snapshot_required = True
+        prompt = list(range(786))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(781)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is True
+        assert request.request_id in scheduler._cache_freshness_waits
+        future.result.assert_not_called()
+
+    def test_admission_freshness_gate_skips_tail_not_covering_the_prompt(
+        self, mock_model, mock_tokenizer
+    ):
+        """A store longer than the prompt cannot serve it from a tail block."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.block_aware_cache = MagicMock()
+        scheduler.config.paged_cache_block_size = 2048
+        scheduler._boundary_snapshot_required = True
+        prompt = list(range(1000))
+
+        future = MagicMock()
+        future.done.return_value = False
+        scheduler._inflight_store_futures["req-prev"] = future
+        scheduler._inflight_store_info["req-prev"] = (
+            scheduler_module._InflightStoreInfo(tokens=list(range(3149)))
+        )
+
+        request = Request(
+            request_id="req-next",
+            prompt=prompt,
+            sampling_params=SamplingParams(max_tokens=16),
+        )
+
+        scheduler.add_request(request)
+
+        assert scheduler._should_defer_for_cache_freshness(request) is False
+        assert request.request_id not in scheduler._cache_freshness_waits
+        future.result.assert_not_called()
+
     @pytest.mark.parametrize(
         ("prompt_len", "overlap", "store_len", "expected"),
         [
@@ -2320,6 +2383,49 @@ class TestSchedulerReset:
         assert len(scheduler._pending_async_removes) == 0
         assert len(scheduler._inflight_store_futures) == 0
 
+    @pytest.mark.parametrize("phase", ["decode", "prefill", "external_prefill"])
+    def test_reset_does_not_start_cancel_cache_store(
+        self, mock_model, mock_tokenizer, phase
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        request = Request(
+            request_id="cancel-before-reset",
+            prompt=[3, 4, 5],
+            sampling_params=SamplingParams(),
+        )
+        scheduler.add_request(request)
+        scheduler._abort_keeps_cache = MagicMock(return_value=True)
+        scheduler._cleanup_finished = MagicMock()
+        scheduler._submit_abort_store = MagicMock()
+        scheduler._prepare_abort_prefill_store = MagicMock(return_value=object())
+        if phase == "decode":
+            scheduler.running[request.request_id] = request
+            scheduler.request_id_to_uid[request.request_id] = 0
+            scheduler.uid_to_request_id[0] = request.request_id
+        elif phase == "prefill":
+            scheduler._prefill_states[request.request_id] = SimpleNamespace(cache=[])
+            scheduler.prefilling.append(request)
+        else:
+            request._abort_store_prepared = object()
+        scheduler.abort_request(request.request_id, keep_cache=True)
+
+        abort = scheduler._do_abort_request
+
+        def abort_with_late_cancel(request_id, **kwargs):
+            # A client can cancel after reset clears the pending flags.
+            scheduler.abort_request(request_id, keep_cache=True)
+            return abort(request_id, **kwargs)
+
+        with patch.object(
+            scheduler, "_do_abort_request", side_effect=abort_with_late_cancel
+        ):
+            scheduler.reset()
+
+        scheduler._cleanup_finished.assert_not_called()
+        scheduler._submit_abort_store.assert_not_called()
+        assert not scheduler._abort_keep_cache_ids
+        assert not scheduler.requests
+
     def test_reset_waits_for_store_worker_before_snapshot_and_cache_cleanup(
         self, mock_model, mock_tokenizer
     ):
@@ -2692,6 +2798,62 @@ class TestSchedulerSuppressTokens:
         round_token = captured["sampler"](round_logits)
         mx.eval(round_token)
         assert int(round_token.item()) == 2
+
+
+class TestSchedulerNoRepeatNgram:
+    @staticmethod
+    def _decode(model, tokenizer, rows):
+        scheduler = Scheduler(model=model, tokenizer=tokenizer)
+        requests = [
+            Request(request_id=f"r{i}", prompt=list(prompt), sampling_params=params)
+            for i, (prompt, params) in enumerate(rows)
+        ]
+        for request in requests:
+            scheduler.add_request(request)
+        for _ in range(200):
+            scheduler.step()
+            if not any(r.request_id in scheduler.requests for r in requests):
+                break
+        scheduler.shutdown()
+        return [list(r.output_token_ids) for r in requests]
+
+    def test_batched_greedy_decode_bans_only_its_own_row(self, mock_tokenizer):
+        from mlx_lm.models.llama import Model, ModelArgs
+
+        mx.random.seed(0)
+        model = Model(
+            ModelArgs(
+                model_type="llama",
+                hidden_size=32,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                rms_norm_eps=1e-5,
+                vocab_size=64,
+                tie_word_embeddings=True,
+            )
+        )
+        greedy = SamplingParams(max_tokens=40, temperature=0)
+        banned = SamplingParams(max_tokens=40, temperature=0, no_repeat_ngram_size=3)
+        short, long = [5, 9, 12], [7, 3, 30, 22, 14, 9, 41, 8, 17]
+
+        def repeated_trigrams(tokens):
+            trigrams = [tuple(tokens[i : i + 3]) for i in range(len(tokens) - 2)]
+            return len(trigrams) - len(set(trigrams))
+
+        loop, neighbour = self._decode(
+            model, mock_tokenizer, [(short, greedy), (long, greedy)]
+        )
+        fixed, same_neighbour = self._decode(
+            model, mock_tokenizer, [(short, banned), (long, greedy)]
+        )
+
+        # The tiny greedy model loops; with the ban, prompt plus output never
+        # repeats a trigram, and the other row of the batch is untouched.
+        assert repeated_trigrams(short + loop) > 10
+        assert len(fixed) > 10 and repeated_trigrams(short + fixed) == 0
+        assert same_neighbour == neighbour
 
 
 class TestSchedulerXtcSpecialTokens:
@@ -6028,23 +6190,36 @@ class TestStoreCacheAdmissionBackpressure:
         assert scheduler.running == {}
         scheduler._ensure_batch_generator.assert_not_called()
 
-    def test_memory_guard_fails_persistent_admission_stall(
-        self, mock_model, mock_tokenizer
+    @pytest.mark.parametrize("admission_paused", [False, True])
+    def test_memory_guard_times_out_only_after_decode_stalls(
+        self, mock_model, mock_tokenizer, admission_paused
     ):
-        """A persistent memory-gated head-of-line wait should fail cleanly."""
+        """Decode progress keeps a queued request alive until progress stops."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         request = self._make_request("req-stalled")
         self._queue_request(scheduler, request)
         running = self._make_request("req-running")
         scheduler.running[running.request_id] = running
         scheduler.requests[running.request_id] = running
+        scheduler.uid_to_request_id[1] = running.request_id
+        scheduler._admission_paused = admission_paused
         scheduler._prefill_memory_guard = True
         scheduler._memory_limit_bytes = 100
         scheduler._current_usage_bytes = MagicMock(return_value=101)
         scheduler._memory_admission_blocked_request_id = request.request_id
         scheduler._memory_admission_blocked_since = 0.0
 
+        with patch("omlx.scheduler.time.monotonic", return_value=30.0):
+            scheduler._process_batch_responses(
+                [SimpleNamespace(uid=1, token=42, finish_reason=None)]
+            )
         with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            scheduled, rejected = scheduler._schedule_waiting()
+        assert scheduled == []
+        assert rejected == []
+        assert list(scheduler.waiting) == [request]
+
+        with patch("omlx.scheduler.time.monotonic", return_value=91.0):
             scheduled, rejected = scheduler._schedule_waiting()
 
         assert scheduled == []
@@ -6264,10 +6439,24 @@ class TestStoreCacheAdmissionBackpressure:
         scheduler._pending_async_removes.append(
             (2, done_request.request_id, done_future)
         )
+        self._queue_request(scheduler, self._make_request("req-waiting"))
+        with patch("omlx.scheduler.time.monotonic", return_value=0.0):
+            assert (
+                scheduler._memory_admission_stall_output("store_cache_backpressure")
+                is None
+            )
 
-        with patch("omlx.scheduler._safe_sync_stream"):
+        with (
+            patch("omlx.scheduler._safe_sync_stream"),
+            patch("omlx.scheduler.time.monotonic", return_value=30.0),
+        ):
             drained = scheduler._drain_pending_async_removes()
 
+        with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+            assert (
+                scheduler._memory_admission_stall_output("store_cache_backpressure")
+                is None
+            )
         assert drained is True
         assert list(scheduler._pending_async_removes) == [
             (1, slow_request.request_id, slow_future)
@@ -7768,6 +7957,49 @@ class TestStopStringOutputBuffer:
         assert outputs[-1].output_text == expected
         assert outputs[-1].finish_reason == "stop"
         assert sum(output.finished for output in outputs) == 1
+
+    @pytest.mark.parametrize("terminal_reason", ["length", "stop"])
+    def test_deepseek_v41_calls_without_outer_close(
+        self, mock_model, monkeypatch, terminal_reason
+    ):
+        from omlx.patches.deepseek_v41 import output_parser
+
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = []
+        tokenizer = scheduler.tokenizer
+        pieces = [
+            "Prose.\n\n",
+            '<｜DSML｜ calls>\n<｜DSML｜ invoke name="get">\n',
+            '<｜DSML｜ parameter name="city" string="true">Seoul</｜DSML｜ parameter>\n',
+            "</｜DSML｜ invoke>\n",
+        ]
+        tokenizer.pieces = {**tokenizer.pieces, **dict(enumerate(pieces, 100))}
+        scheduler._build_state_machine(request)
+        monkeypatch.setattr(
+            output_parser,
+            "create_streaming_detokenizer",
+            lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
+        )
+        session = output_parser.DeepSeekV41OutputParserSession(tokenizer)
+        scheduler._output_parser_sessions[request.request_id] = session
+        scheduler._get_output_parser_session = lambda request_id: session
+        responses = [self._response(100 + i) for i in range(len(pieces))]
+        if terminal_reason == "stop":
+            responses.append(self._response(tokenizer.eos_token_id, "stop"))
+        else:
+            responses[-1].finish_reason = "length"
+
+        outputs, _ = scheduler._process_batch_responses(responses)
+
+        if terminal_reason == "stop":
+            assert outputs[-1].finish_reason == "tool_calls"
+            assert [call["name"] for call in outputs[-1].tool_calls] == ["get"]
+            assert outputs[-1].output_text == "Prose.\n\n"
+        else:
+            assert outputs[-1].finish_reason == "length"
+            assert not outputs[-1].tool_calls
+            assert outputs[-1].output_text == "".join(pieces)
 
     def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
         scheduler = self._setup(mock_model)

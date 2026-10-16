@@ -61,7 +61,6 @@ final class ModelsScreenSortingTests: XCTestCase {
             thinkingDefault: nil,
             dflashCompatible: nil,
             dflashCompatibilityReason: nil,
-            dflashSsdCacheAvailable: nil,
             mtpCompatible: nil,
             mtpCompatibilityReason: nil,
             qwen4PleSsdOffloadSupported: nil,

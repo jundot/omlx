@@ -1819,6 +1819,50 @@ class TestAsyncWriteAndTimeoutLoad:
             release_writer.set()
             manager.close()
 
+    def test_bounded_pending_writes_waits_for_the_writer(self, tmp_path, mx):
+        """A bounded store serializes no further block while the queue is full."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "bounded_pending",
+            max_size_bytes=100 * 1024**2,
+        )
+        release_writer = threading.Event()
+        write_block_file = manager._write_block_file
+
+        def blocked_write(*args, **kwargs):
+            assert release_writer.wait(timeout=5)
+            return write_block_file(*args, **kwargs)
+
+        manager._write_block_file = blocked_write
+        cache_data = [(mx.zeros((1, 4, 16, 32)), mx.ones((1, 4, 16, 32)))]
+        second_saved = threading.Event()
+
+        def save(block_hash):
+            return manager.save_block(
+                block_hash=block_hash,
+                cache_data=cache_data,
+                token_count=16,
+                model_name="test-model",
+                layer_cache_types=["KVCache"],
+                layer_meta_states=[(16,)],
+            )
+
+        def save_second():
+            save(b"bounded_second")
+            second_saved.set()
+
+        try:
+            with manager.bounded_pending_writes(1):
+                assert save(b"bounded_first")
+                thread = threading.Thread(target=save_second)
+                thread.start()
+                assert not second_saved.wait(timeout=0.2)
+                release_writer.set()
+                assert second_saved.wait(timeout=5)
+                thread.join(timeout=5)
+        finally:
+            release_writer.set()
+            manager.close()
+
     def test_staged_write_stays_out_of_hot_cache_bytes(self, tmp_path, mx):
         """With the hot cache off, queued writes never count as hot bytes."""
         manager = PagedSSDCacheManager(

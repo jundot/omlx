@@ -50,8 +50,10 @@ from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
+from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
+from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
@@ -824,17 +826,29 @@ def _strip_vision_config_if_orphaned(model_dir: Path):
         _nn.Module.load_weights = original_load_weights
 
 
+def _index_declares_sidecar_shard(model_dir: Path, sidecar: Path) -> bool:
+    """True when ``model.safetensors.index.json`` lists the resolved sidecar."""
+    index = model_dir / "model.safetensors.index.json"
+    try:
+        shards = set(json.loads(index.read_text())["weight_map"].values())
+    except Exception:
+        return False
+    return sidecar.relative_to(model_dir.resolve()).as_posix() in shards
+
+
 @contextlib.contextmanager
 def _load_optiq_vision_sidecar_on_load(model_dir: Path):
     """Include a config-declared OptiQ sidecar in mlx-vlm strict loading.
 
-    Pinned mlx-vlm only globs ``*.safetensors`` in the model root, while
-    current OptiQ VLM checkpoints keep their unquantized multimodal weights
-    under ``optiq/``. Root-level legacy sidecars remain a no-op because the
-    native glob already loads them.
+    mlx-vlm loads index-listed shards, or globs the model root without an index.
+    Inject only a subdirectory sidecar that the index does not list.
     """
     sidecar = _resolve_optiq_vision_sidecar(model_dir)
-    if sidecar is None or sidecar.parent == model_dir.resolve():
+    if (
+        sidecar is None
+        or sidecar.parent == model_dir.resolve()
+        or _index_declares_sidecar_shard(model_dir, sidecar)
+    ):
         yield
         return
 
@@ -966,6 +980,26 @@ def _gemma4_global_kv_from_per_layer_config(config: dict) -> dict[str, int]:
         if len(values) == 1:
             derived[legacy_key] = values.pop()
     return derived
+
+
+@contextlib.contextmanager
+def _preserve_gemma4_unified_image_processor_on_load(model_dir: Path):
+    """Keep the gemma4_unified image processor built from processor_config.json.
+
+    mlx-vlm's load() replaces it with a default one, dropping max_soft_tokens.
+    """
+    if _read_config_model_type(str(model_dir)) != "gemma4_unified":
+        yield
+        return
+
+    import mlx_vlm.utils as _vu
+
+    original = _vu.load_image_processor
+    _vu.load_image_processor = lambda *args, **kwargs: None
+    try:
+        yield
+    finally:
+        _vu.load_image_processor = original
 
 
 @contextlib.contextmanager
@@ -1859,7 +1893,7 @@ class VLMBatchedEngine(BaseEngine):
         # Phase 2A: attached but not yet wired into the decode path.
         self._vlm_mtp_drafter: Any | None = None
         # Holds the DFlash block drafter attached to Lightning MTP when
-        # dflash_enabled routes here instead of DFlashEngine.
+        # dflash_enabled.
         self._dflash_drafter: Any | None = None
         self._diffusion_family: str | None = None
         self._diffusion_lock = asyncio.Lock()
@@ -2083,6 +2117,9 @@ class VLMBatchedEngine(BaseEngine):
                 _strip_vision_config_if_orphaned(Path(self._model_name)),
                 _drop_gemma4_mlx_shared_kv_extras_on_load(Path(self._model_name)),
                 _derive_gemma4_global_kv_on_load(Path(self._model_name)),
+                _preserve_gemma4_unified_image_processor_on_load(
+                    Path(self._model_name)
+                ),
                 _force_minimax_m3_moe_sanitize_on_load(Path(self._model_name)),
                 _force_qwen4_exp_sanitize_on_load(Path(self._model_name)),
                 _remap_nested_visual_on_load(Path(self._model_name)),
@@ -2622,7 +2659,9 @@ class VLMBatchedEngine(BaseEngine):
 
             configure_qwen4_decode(
                 self._vlm_model,
-                wide_projections=scheduler_config.qwen4_gdn_decode_wide_proj,
+                wide_projections=bool(
+                    getattr(self._model_settings, "qwen4_gdn_decode_wide_proj", False)
+                ),
             )
             apply_qwen35_gdn_prework_patch()
         except Exception:
@@ -2886,10 +2925,19 @@ class VLMBatchedEngine(BaseEngine):
         """The loaded mlx-vlm model (target for external drafters)."""
         return self._vlm_model
 
+    def prepare_dflash_target(self) -> Any:
+        """Return the model a DFlash drafter binds to, ready for captures.
+
+        Language models without speculative rollback (Muse Glimmer) gain
+        layer captures and rollback here, before the drafter binds.
+        """
+        language_model = self._vlm_model.language_model
+        if not hasattr(language_model, "rollback_speculative_cache"):
+            drafter_target.apply(language_model)
+        return self._vlm_model
+
     def set_dflash_drafter(self, drafter: Any) -> None:
         """Attach a DFlash block drafter to the Lightning MTP decode path."""
-        from ..speculative.dflash_drafter import attach_drafter
-
         language_model = getattr(self._adapter, "_language_model", None)
         if language_model is None:
             raise RuntimeError("VLM engine has no language model for the drafter")
@@ -2931,6 +2979,9 @@ class VLMBatchedEngine(BaseEngine):
         # pass has already run. Mark unloaded first: the scheduler is no longer
         # reachable once _engine is cleared.
         self._loaded = False
+        language_model = getattr(self._adapter, "_language_model", None)
+        if self._dflash_drafter is not None and language_model is not None:
+            detach_drafter(language_model)
         _clear_teardown_references(
             self,
             none_attrs=(
@@ -4814,6 +4865,8 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
@@ -4822,6 +4875,7 @@ class VLMBatchedEngine(BaseEngine):
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
         )
 
         # SpecPrefill: forward per-request overrides to the engine, mirroring
@@ -4838,6 +4892,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
@@ -4929,6 +4984,8 @@ class VLMBatchedEngine(BaseEngine):
             xtc_threshold=kwargs.get("xtc_threshold", 0.1),
             repetition_penalty=repetition_penalty,
             repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
@@ -4937,6 +4994,7 @@ class VLMBatchedEngine(BaseEngine):
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),
             stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
         )
 
         # SpecPrefill: pass per-request overrides
@@ -5554,6 +5612,11 @@ class VLMBatchedEngine(BaseEngine):
             raise InvalidRequestError(
                 "SpecPrefill is not supported with diffusion models.",
                 field="specprefill",
+            )
+        if kwargs.get("no_repeat_ngram_size"):
+            raise InvalidRequestError(
+                "no_repeat_ngram_size is not supported with diffusion models.",
+                field="no_repeat_ngram_size",
             )
 
     def _diffusion_apply_chat_template(

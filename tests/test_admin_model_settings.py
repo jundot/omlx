@@ -431,6 +431,16 @@ def test_oq_a8_model_supported(config_type, expected):
     assert admin_routes._oq_a8_model_supported(config_type) is expected
 
 
+@pytest.mark.parametrize(
+    "config_type,kernels,expected",
+    [("qwen3_5", True, True), ("qwen3_5", False, False), ("llama", True, False)],
+)
+def test_model_options_report_oq_a8_support(config_type, kernels, expected):
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=kernels):
+        options = admin_routes._model_options({"config_model_type": config_type}, None)
+    assert options["qwen35_oq_a8_supported"] is expected
+
+
 @pytest.mark.asyncio
 async def test_oq_a8_needs_native_int8_kernels():
     """Nothing on this hardware would run faster, so the setting is refused
@@ -479,6 +489,24 @@ async def test_qwen4_ple_ssd_offload_is_ignored_for_other_models():
     )
 
     assert settings.qwen4_ple_ssd_offload is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_type", "expected"), [("qwen4_exp", True), ("qwen3_5_moe", False)]
+)
+async def test_qwen4_wide_decode_is_persisted_for_qwen4_only(model_type, expected):
+    pool, entry = _failed_pool()
+    entry.config_model_type = model_type
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen4_gdn_decode_wide_proj=True),
+    )
+
+    assert settings.qwen4_gdn_decode_wide_proj is expected
 
 
 @pytest.mark.asyncio
@@ -815,7 +843,7 @@ async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
         patch("omlx.admin.routes._get_engine_pool", return_value=pool),
         patch("omlx.admin.routes._get_settings_manager", return_value=manager),
         patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
-        patch("omlx.engine.dflash.is_dflash_compatible", return_value=(True, "")),
+        patch.object(admin_routes, "dflash_compatibility", return_value=(True, "")),
     ):
         for payload in (
             {"dflash_enabled": True},

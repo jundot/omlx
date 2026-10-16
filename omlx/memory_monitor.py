@@ -2109,10 +2109,9 @@ def _ane_prefill_transient_bytes(model: Any) -> int:
 def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
     """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
 
-    The engine-agnostic baseline used by engines that bypass the
-    ``Scheduler`` (currently ``DFlashEngine``'s primary speculative path) so
-    they can run the same prefill-peak estimate the scheduler-driven engines
-    get. Best-effort: on any extraction failure the monitor is left dim-less
+    The engine-agnostic baseline used by guards outside the ``Scheduler``
+    (the cluster rank guard) so they can run the same prefill-peak estimate
+    the scheduler-driven engines get. Best-effort: on any extraction failure the monitor is left dim-less
     and ``estimate_prefill_peak_bytes`` returns 0, making the guard a no-op
     rather than raising spuriously.
 
@@ -2184,8 +2183,8 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         )
 
         # Classify layer cache types for hybrid models. Mirrors
-        # Scheduler._set_model_info_for_monitor via the shared helper so the
-        # DFlash guard and the scheduler guard price the same layer groups.
+        # Scheduler._set_model_info_for_monitor via the shared helper so both
+        # guards price the same layer groups.
         cache_list = None
         num_kv_cache_layers = num_layers
         rotating_layer_specs: list[tuple[int, int]] = []
@@ -2263,8 +2262,8 @@ def raise_if_prefill_exceeds(
     push memory past ``hard_limit_bytes``.
 
     The shared front-door guard, taking token counts + watermarks directly so
-    an engine without a ``Scheduler`` (``DFlashEngine``) enforces with the
-    same math ``Scheduler.preflight_or_raise`` uses. No-op when the guard is
+    a guard without a ``Scheduler`` (the cluster rank guard) enforces with
+    the same math ``Scheduler.preflight_or_raise`` uses. No-op when the guard is
     disabled, no limit is set, the monitor is missing, or the request fits.
     The caller supplies ``current_usage_bytes`` so HTTP/event-loop preflight
     paths can use cached executor telemetry plus physical footprint without
@@ -2273,11 +2272,10 @@ def raise_if_prefill_exceeds(
 
     ``cached_tokens`` means prompt KV *already resident in current memory*
     (e.g. the scheduler's paged prefix cache) — not merely "tokens that hit
-    a cache". A cache whose hits re-allocate KV (DFlash prefix snapshots)
-    must pass 0.
+    a cache". A cache whose hits re-allocate KV must pass 0.
 
     The component ceilings are optional: callers that receive the
-    enforcer's breakdown (the DFlash prefill guard) pass them so the
+    enforcer's breakdown pass them so the
     rejection names the binding constraint the same way the scheduler's
     does. Callers that do not fall back to generic advice.
     """

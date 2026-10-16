@@ -70,6 +70,8 @@ _PENDING_WRITES_HARD_RAM_FRACTION = 0.30
 _PENDING_WRITES_SOFT_FLOOR = 32
 _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
+# A stalled writer must not wedge a bounded store; past this it queues anyway.
+_PENDING_WRITE_SLOT_TIMEOUT_SECONDS = 30.0
 # Startup keeps unreadable tmp files newer than this; another manager may
 # still be writing them.
 _STALE_TMP_CLEANUP_SECONDS = 600.0
@@ -1861,6 +1863,9 @@ class PagedSSDCacheManager(CacheManager):
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
         self._pending_write_hashes_lock = threading.Lock()
+        # Set by bounded_pending_writes(): save_block waits for the writer
+        # before serializing another block once this many are queued.
+        self._pending_write_limit: int | None = None
         # Lock ordering invariant: _hot_cache_lock -> _pending_write_hashes_lock.
         # Never acquire in reverse. Load path: _hot_cache_get (holds _hot_cache_lock,
         # releases), then _pending_write_buffer_get (holds _pending_write_hashes_lock).
@@ -3264,6 +3269,31 @@ class PagedSSDCacheManager(CacheManager):
                             p.unlink()
                 return False
 
+    @contextlib.contextmanager
+    def bounded_pending_writes(self, max_pending: int):
+        """Keep at most ``max_pending`` serialized blocks queued while active.
+
+        A store under memory pressure must not buffer a whole request's KV
+        in host RAM ahead of the writer.
+        """
+        previous = self._pending_write_limit
+        self._pending_write_limit = max(1, int(max_pending))
+        try:
+            yield
+        finally:
+            self._pending_write_limit = previous
+
+    def _wait_for_pending_write_slot(self) -> None:
+        limit = self._pending_write_limit
+        if limit is None:
+            return
+        deadline = time.monotonic() + _PENDING_WRITE_SLOT_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            with self._pending_write_hashes_lock:
+                if len(self._pending_write_hashes) < limit:
+                    return
+            time.sleep(0.002)
+
     def wait_for_pending_writes(self, timeout: float) -> bool:
         """Wait until queued SSD writes finish. Returns False on timeout."""
         deadline = time.monotonic() + timeout
@@ -3456,6 +3486,7 @@ class PagedSSDCacheManager(CacheManager):
                 return True
             return False
 
+        self._wait_for_pending_write_slot()
         file_path = self._get_file_path(block_hash)
 
         try:

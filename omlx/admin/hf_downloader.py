@@ -27,6 +27,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub._local_folder import read_download_metadata
 from huggingface_hub.utils import (
     GatedRepoError,
     HfHubHTTPError,
@@ -34,8 +35,8 @@ from huggingface_hub.utils import (
 )
 from huggingface_hub.utils import tqdm as _hf_tqdm
 
-# Private-module import; the pyproject floor (huggingface-hub>=1.19.0)
-# guarantees it exists. Re-verify the symbol when bumping the hub version.
+# Private-module imports (also read_download_metadata above); the pyproject floor
+# (huggingface-hub>=1.19.0) guarantees them. Re-verify both when bumping the hub.
 from huggingface_hub.utils._xet import abort_xet_session
 
 logger = logging.getLogger(__name__)
@@ -461,6 +462,45 @@ _BLOB_FETCH_BATCH_TIMEOUT = 15
 _BLOB_SIZE_CACHE_TTL = 3600.0
 _BLOB_SIZE_CACHE_MAX = 512
 _blob_size_cache: dict[str, tuple[int, float]] = {}
+
+
+def _stale_local_files(local_dir: Path, dry_result) -> dict[str, tuple[int, int]]:
+    """Map local files snapshot_download will refetch to (inode, size).
+
+    The dry run reports outdated files as cached; only kept files get the
+    target commit in their metadata.
+    """
+    stale: dict[str, tuple[int, int]] = {}
+    for info in dry_result:
+        # Keyed like _get_download_activity's scan of the same directory.
+        path = Path(local_dir) / info.filename
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if not info.will_download:
+            metadata = read_download_metadata(local_dir, info.filename)
+            if metadata is not None and metadata.commit_hash == info.commit_hash:
+                continue
+        stale[str(path)] = (stat.st_ino, stat.st_size)
+    return stale
+
+
+def _stale_bytes(stale: dict[str, tuple[int, int]], files: dict) -> int:
+    """Sum outdated bytes in one scan; forget files deleted or replaced (new inode)."""
+    total = 0
+    for path, (inode, size) in list(stale.items()):
+        if path not in files:
+            del stale[path]
+            continue
+        try:
+            if os.stat(path).st_ino != inode:
+                del stale[path]
+                continue
+        except OSError:
+            pass  # Deleted after the scan, which still counted it.
+        total += size
+    return total
 
 
 def _safetensors_parameters(safetensors) -> dict:
@@ -1473,6 +1513,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
                 size_estimated = False
+                stale: dict[str, tuple[int, int]] = {}
                 try:
                     dry_result = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -1483,6 +1524,16 @@ class HFDownloader(_QueuePersistenceMixin):
                         timeout=30,
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
+                    try:
+                        stale = await asyncio.to_thread(
+                            _stale_local_files, target_dir, dry_result
+                        )
+                    except Exception as e:  # noqa: BLE001 - progress only
+                        logger.debug(
+                            "Could not find outdated files for %s: %s",
+                            task.repo_id,
+                            e,
+                        )
                 except Exception as e:
                     if st_estimate:
                         task.total_size = st_estimate
@@ -1496,7 +1547,7 @@ class HFDownloader(_QueuePersistenceMixin):
 
                 wire_counter = _WireCounter()
                 self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, target_dir, wire_counter)
+                    self._poll_progress(task_id, target_dir, wire_counter, stale)
                 )
 
                 payload = asyncio.get_running_loop().run_in_executor(
@@ -1544,7 +1595,7 @@ class HFDownloader(_QueuePersistenceMixin):
                     # The HTTP worker refetches the payload, so xet's wire
                     # bytes do not carry over.
                     self._progress_tasks[task_id] = asyncio.create_task(
-                        self._poll_progress(task_id, target_dir, _WireCounter())
+                        self._poll_progress(task_id, target_dir, _WireCounter(), stale)
                     )
                     try:
                         await self._run_http_fallback(task_id, dl_kwargs)
@@ -1600,13 +1651,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 logger.error(
                     f"Failed to clean up cancelled download {task.repo_id}: {e}"
                 )
-        except RepositoryNotFoundError:
-            task.status = DownloadStatus.FAILED
-            task.error = (
-                f"Repository not found: {task.repo_id}. "
-                "This may be a gated model that requires HuggingFace authentication."
-            )
-            logger.error(f"Repository not found: {task.repo_id}")
+        # GatedRepoError subclasses RepositoryNotFoundError.
         except GatedRepoError:
             task.status = DownloadStatus.FAILED
             task.error = (
@@ -1614,6 +1659,13 @@ class HFDownloader(_QueuePersistenceMixin):
                 "Please provide a valid HF token with access."
             )
             logger.error(f"Gated repo access denied: {task.repo_id}")
+        except RepositoryNotFoundError:
+            task.status = DownloadStatus.FAILED
+            task.error = (
+                f"Repository not found: {task.repo_id}. "
+                "This may be a gated model that requires HuggingFace authentication."
+            )
+            logger.error(f"Repository not found: {task.repo_id}")
         except Exception as e:
             # Do not clobber an earlier terminal error or a user cancellation.
             if (
@@ -1704,7 +1756,11 @@ class HFDownloader(_QueuePersistenceMixin):
             await process.wait()
 
     async def _poll_progress(
-        self, task_id: str, target_dir: Path, wire: _WireCounter | None = None
+        self,
+        task_id: str,
+        target_dir: Path,
+        wire: _WireCounter | None = None,
+        stale: dict[str, tuple[int, int]] | None = None,
     ) -> None:
         """Poll the target directory to estimate download progress.
 
@@ -1717,8 +1773,13 @@ class HFDownloader(_QueuePersistenceMixin):
         The wire counter covers xet's fetch phase, where bytes arrive on the
         network long before they reach disk: it feeds progress, speed, and
         stall liveness.
+
+        ``stale`` files are left out of the disk reading. Hub deletes them
+        before refetching, which would otherwise hide disk growth.
         """
         wire = wire or _WireCounter()
+        # Own copy: _stale_bytes forgets replaced files as they go.
+        stale = dict(stale or {})
         task = self._tasks.get(task_id)
         if task is None:
             return
@@ -1733,7 +1794,9 @@ class HFDownloader(_QueuePersistenceMixin):
         wire_meter.add(wire.value, now=last_activity_at)
         last_wire = wire.value
         # A resume fetches only missing bytes, so wire bytes add to this.
-        base_logical = last_activity.logical_size
+        base_logical = last_activity.logical_size - _stale_bytes(
+            stale, last_activity.files
+        )
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -1744,10 +1807,11 @@ class HFDownloader(_QueuePersistenceMixin):
 
                 activity = self._get_download_activity(target_dir)
                 wire_now = wire.value
+                logical = activity.logical_size - _stale_bytes(stale, activity.files)
 
                 # Add wire bytes the disk has not caught up with yet.
-                disk_growth = max(0, activity.logical_size - base_logical)
-                reported = activity.logical_size + max(0, wire_now - disk_growth)
+                disk_growth = max(0, logical - base_logical)
+                reported = logical + max(0, wire_now - disk_growth)
                 if task.total_size > 0:
                     reported = min(reported, task.total_size)
                     # Cap at 99% until snapshot_download confirms completion

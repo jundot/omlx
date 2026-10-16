@@ -289,7 +289,9 @@ final class MenubarControllerPortTests: XCTestCase {
         let stats = try JSONDecoder().decode(MenubarStatsPoller.Stats.self, from: data)
         let activity = try XCTUnwrap(stats.liveActivity)
 
-        XCTAssertEqual(activity.menuBarTitle, "PP 38% · 12k/32k")
+        // Digits follow Locale.current; CountFormatTests pins the ladder.
+        XCTAssertEqual(activity.menuBarTitle,
+                       "PP 38% · \(CountFormat.compact(12_000))/\(CountFormat.compact(32_000))")
         XCTAssertEqual(activity.detail, "Laguna XS.2 · 321 tok/s · 47s left")
     }
 

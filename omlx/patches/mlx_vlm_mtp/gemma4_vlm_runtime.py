@@ -41,6 +41,7 @@ patched ``LanguageModel.__init__`` attaches the head for weight binding.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Any
 
@@ -175,12 +176,16 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
 
     original_init = cls.__init__
     original_call = cls.__call__
+    original_rollback = cls.rollback_speculative_cache
 
     def __init__(self, config):
         from . import is_mtp_attach_enabled
         from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 
         original_init(self, config)
+        # A block drafter speculates for single rows only: a ragged accept
+        # cannot roll back the batched sliding-window (rotating) caches.
+        self._omlx_drafter_single_row = True
         asst_cfg = getattr(config, "mtp_assistant_config", None)
         attach = bool(asst_cfg) and bool(is_mtp_attach_enabled())
         self._omlx_mtp_decode_enabled = bool(attach and is_mtp_active())
@@ -206,6 +211,9 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         has no SSM state) routes ``_chain_rollback`` to the stock
         ``rollback_speculative_cache``.
         """
+        drafter = getattr(self, "_omlx_drafter", None)
+        if drafter is not None:
+            return _drafter_call(self, drafter, inputs, inputs_embeds, mask, cache, kwargs)
         return_hidden = bool(kwargs.get("return_hidden", False))
         if not (return_hidden and getattr(self, "_omlx_mtp_decode_enabled", False)):
             return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
@@ -235,6 +243,84 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             gdn_states=[],
             shared_kv_states=sink,
         )
+
+    def _drafter_call(self, drafter, inputs, inputs_embeds, mask, cache, kwargs):
+        """Backbone forward with a DFlash block drafter attached.
+
+        A verify forward returns the drafter's layer captures followed by
+        the last layer's hidden. An ordinary decode step feeds the drafter.
+        ``gdn_states=[]`` (no recurrent state) routes rollback to the stock
+        ``rollback_speculative_cache``.
+        """
+        return_hidden = kwargs.pop("return_hidden", False)
+        kwargs.pop("n_confirmed", None)
+        if not return_hidden:
+            requested = kwargs.pop("capture_layer_ids", None)
+            scope = drafter.scope_uids
+            observe = bool(
+                requested is None
+                and scope
+                and inputs is not None
+                and inputs.ndim == 2
+                and tuple(inputs.shape) == (len(scope), 1)
+            )
+            if observe:
+                requested = list(drafter.target_layer_ids)
+            if not requested:
+                return original_call(
+                    self, inputs, inputs_embeds, mask, cache, **kwargs
+                )
+            # The stock forward returns captures in layer order; the drafter
+            # concatenates them in its own order.
+            layer_ids = sorted(set(requested))
+            out = original_call(
+                self,
+                inputs,
+                inputs_embeds,
+                mask,
+                cache,
+                capture_layer_ids=layer_ids,
+                **kwargs,
+            )
+            by_layer = dict(zip(layer_ids, out.hidden_states))
+            captures = [by_layer[i] for i in requested]
+            if observe:
+                drafter.observe(scope, captures)
+                return out
+            return dataclasses.replace(out, hidden_states=captures)
+        requested = list(kwargs.pop("capture_layer_ids", None) or [])
+        last = len(self.model.layers) - 1
+        layer_ids = sorted({*requested, last})
+        out = original_call(
+            self,
+            inputs,
+            inputs_embeds,
+            mask,
+            cache,
+            capture_layer_ids=layer_ids,
+            **kwargs,
+        )
+        by_layer = dict(zip(layer_ids, out.hidden_states))
+        return LanguageModelOutput(
+            logits=out.logits,
+            hidden_states=[by_layer[i] for i in requested] + [by_layer[last]],
+            gdn_states=[],
+        )
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        """Trim one row's rejected verify rows without a device read.
+
+        The stock hook reads the accepted count back from an ``mx.array``,
+        which waits for the draft already queued behind the verify.
+        """
+        if not isinstance(accepted, int):
+            return original_rollback(self, caches, gdn_states, accepted, block_size)
+        trim = int(block_size) - accepted - 1
+        if trim > 0:
+            for cache in caches:
+                if cache is not None and hasattr(cache, "trim"):
+                    cache.trim(trim)
+        return accepted
 
     def _mtp_query_position(self) -> int:
         """Current committed length = the drafter's constant query position.
@@ -327,6 +413,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
 
     cls.__init__ = __init__
     cls.__call__ = __call__
+    cls.rollback_speculative_cache = rollback_speculative_cache
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls._omlx_mtp_runtime_patched = True

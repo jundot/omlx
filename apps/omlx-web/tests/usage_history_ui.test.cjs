@@ -19,7 +19,7 @@ test('range and exact model are encoded; unloaded models and intensity remain us
     const urls = [];
     const view = component(async url => { urls.push(url); return {ok: true, json: async () => data}; });
     await view.load();
-    assert.equal(view.models[0], 'canonical model');
+    assert.equal(view.modelIds[0], 'canonical model');
     view.range = 'month'; view.model = 'canonical model';
     await view.load();
     assert.equal(urls[1], '/admin/api/usage?range=month&model=canonical+model');
@@ -62,18 +62,18 @@ test('retry/overflow state stays visible alongside committed history', async () 
 test('recording switched off shows the settings pointer, not the unavailable warning', async () => {
     let payload = {...data, enabled: false, models: [], totals: {requests: 0}, heatmap: []};
     const view = component(async () => ({ok: true, json: async () => payload}));
-    view.data = data; view.models = ['canonical model']; view.error = 'usage.delayed';
+    view.data = data; view.modelIds = ['canonical model']; view.error = 'usage.delayed';
     await view.load();
     assert.equal(view.disabled, true);
     assert.equal(view.data, null);
     assert.equal(view.error, '');
-    assert.equal(view.models.length, 0);
+    assert.equal(view.modelIds.length, 0);
     assert.equal(view.loading, false);
     payload = {...data, enabled: true};
     await view.load();
     assert.equal(view.disabled, false);
     assert.equal(view.data.totals.requests, 1);
-    assert.equal(view.models[0], 'canonical model');
+    assert.equal(view.modelIds[0], 'canonical model');
 });
 
 test('compact numbers follow the UI language, not the runtime locale', () => {

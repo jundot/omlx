@@ -50,7 +50,11 @@ from ..engine.splash import (
     find_splash_binary,
     inspect_splash_binary,
 )
-from ..model_discovery import REASONING_EFFORT_LEVELS
+from ..model_discovery import (
+    REASONING_EFFORT_LEVELS,
+    _is_hf_cache_mlx_compatible,
+    _resolve_hf_cache_entry,
+)
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
     EXCLUDED_FROM_PROFILES,
@@ -87,6 +91,7 @@ from ..utils.hardware import (
     get_total_memory_gb,
     parse_chip_info,
 )
+from ..utils.model_loading import dflash_compatibility
 from ..utils.network import is_loopback_bind
 from ..utils.release_check import normalize_update_channel, select_latest_release
 from ..websearch import (
@@ -361,6 +366,7 @@ class ModelSettingsRequest(BaseModel):
     preserve_thinking: bool | None = None
     cache_reasoning_output: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    qwen4_gdn_decode_wide_proj: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
@@ -409,16 +415,8 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_model: str | None = None
     dflash_draft_quant_enabled: bool | None = None
     dflash_draft_quant_weight_bits: int | None = None
-    dflash_draft_quant_activation_bits: int | None = None
     dflash_draft_quant_group_size: int | None = None
-    dflash_max_ctx: int | None = None
-    dflash_in_memory_cache: bool | None = None
-    dflash_in_memory_cache_max_entries: int | None = None
-    dflash_in_memory_cache_max_bytes: int | None = None
-    dflash_ssd_cache: bool | None = None
-    dflash_ssd_cache_max_bytes: int | None = None
     dflash_draft_window_size: int | None = None
-    dflash_draft_sink_size: int | None = None
     dflash_block_size: int | None = None
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
@@ -451,18 +449,12 @@ class ModelSettingsRequest(BaseModel):
     @field_validator("dflash_verify_mode")
     @classmethod
     def validate_dflash_verify_mode(cls, value: str | None) -> str | None:
-        if value not in (None, "", "dflash", "adaptive", "ddtree", "off"):
-            raise ValueError(
-                "dflash_verify_mode must be dflash, adaptive, ddtree, or off"
-            )
+        # Older clients may still send the removed "ddtree" mode.
+        if value == "ddtree":
+            return "adaptive"
+        if value not in (None, "", "dflash", "adaptive", "off"):
+            raise ValueError("dflash_verify_mode must be adaptive, dflash, or off")
         return value or None
-
-    @field_validator("dflash_in_memory_cache_max_entries")
-    @classmethod
-    def validate_dflash_cache_entries(cls, value: int | None) -> int | None:
-        if value is not None and value < 0:
-            raise ValueError("dflash_in_memory_cache_max_entries must be non-negative")
-        return 4 if value == 0 else value
 
     @field_validator("reasoning_parser")
     @classmethod
@@ -672,7 +664,6 @@ class GlobalSettingsRequest(BaseModel):
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
     gpu_keep_warm_interval: float | None = None
-    qwen4_gdn_decode_wide_proj: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -790,6 +781,7 @@ class GlobalSettingsRequest(BaseModel):
     # Auth settings
     api_key: str | None = None
     skip_api_key_verification: bool | None = None
+    allow_unauthenticated_inference: bool | None = None
 
     @field_validator("idle_timeout_seconds", mode="before")
     @classmethod
@@ -935,22 +927,13 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
 
 
 def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
-    """Resolve dflash compatibility for an engine_pool model dict.
-
-    Returns ``(False, "")`` when dflash-mlx is not installed so the UI hides
-    the compat hint instead of pointing the user at an unrelated reason.
-    """
+    """Resolve dflash compatibility for an engine_pool model dict."""
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
     if is_paro:
         return False, paro_reason
-    try:
-        from ..engine.dflash import is_dflash_compatible
-    except ImportError:
-        return False, ""
-    model_path = model_info.get("model_path") or ""
-    if not model_path:
-        return False, "model_path missing"
-    return is_dflash_compatible(model_path)
+    return dflash_compatibility(
+        model_info.get("config_model_type"), model_info.get("engine_type")
+    )
 
 
 def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list[dict]:
@@ -1001,11 +984,8 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_draft_model",
         "dflash_draft_quant_enabled",
         "dflash_draft_quant_weight_bits",
-        "dflash_draft_quant_activation_bits",
         "dflash_draft_quant_group_size",
-        "dflash_max_ctx",
         "dflash_draft_window_size",
-        "dflash_draft_sink_size",
         "dflash_block_size",
         "dflash_verify_mode",
         "vlm_mtp_draft_model",
@@ -1025,11 +1005,6 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["specprefill_enabled"] = False
     settings["external_engine"] = None
     settings["dflash_enabled"] = False
-    settings["dflash_in_memory_cache"] = True
-    settings["dflash_in_memory_cache_max_entries"] = 4
-    settings["dflash_in_memory_cache_max_bytes"] = 8 * 1024 * 1024 * 1024
-    settings["dflash_ssd_cache"] = False
-    settings["dflash_ssd_cache_max_bytes"] = 20 * 1024 * 1024 * 1024
     settings["mtp_enabled"] = False
     settings["vlm_mtp_enabled"] = False
 
@@ -1108,16 +1083,8 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_draft_model = None
     settings.dflash_draft_quant_enabled = None
     settings.dflash_draft_quant_weight_bits = None
-    settings.dflash_draft_quant_activation_bits = None
     settings.dflash_draft_quant_group_size = None
-    settings.dflash_max_ctx = None
-    settings.dflash_in_memory_cache = True
-    settings.dflash_in_memory_cache_max_entries = 4
-    settings.dflash_in_memory_cache_max_bytes = 8 * 1024 * 1024 * 1024
-    settings.dflash_ssd_cache = False
-    settings.dflash_ssd_cache_max_bytes = 20 * 1024 * 1024 * 1024
     settings.dflash_draft_window_size = None
-    settings.dflash_draft_sink_size = None
     settings.dflash_block_size = None
     settings.dflash_verify_mode = None
     settings.mtp_enabled = False
@@ -2301,6 +2268,10 @@ def _model_options(model_info: dict, settings) -> dict:
         "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],
         "ane_prefill_shared_fractions": [0, 1 / 3, 1] if ane_backend == "k2" else [],
         "embedding_audio_supported": model_type == "embedding_gemma2",
+        # Lets the settings UIs hide the toggle the save would reject.
+        "qwen35_oq_a8_supported": (
+            _oq_a8_model_supported(model_type) and _oq_a8_kernels_available()
+        ),
     }
 
 
@@ -2370,15 +2341,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         ):
             if ref:
                 referenced_drafts.add(ref)
-
-    # SSD cache dir is set on the scheduler_config when the user enables paged
-    # SSD caching; admin UI consumes it to gate the dflash SSD toggle.
-    ssd_cache_dir = getattr(
-        getattr(engine_pool, "_scheduler_config", None),
-        "paged_ssd_cache_dir",
-        None,
-    )
-    dflash_ssd_cache_available = bool(ssd_cache_dir)
 
     # Combine model info with settings
     models = []
@@ -2519,7 +2481,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "external_engines": external_engines,
             "dflash_compatible": compat_ok,
             "dflash_compatibility_reason": compat_reason,
-            "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
             "moe_expert_offload_supported": moe_offload_supported,
@@ -2580,7 +2541,6 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "external_engines": [],
                 "dflash_compatible": False,
                 "dflash_compatibility_reason": "",
-                "dflash_ssd_cache_available": False,
                 "mtp_compatible": False,
                 "mtp_compatibility_reason": "",
                 "is_paroquant": False,
@@ -2879,6 +2839,13 @@ async def update_model_settings(
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
         )
+    if "qwen4_gdn_decode_wide_proj" in sent:
+        is_qwen4_exp = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "qwen4_exp"
+        current_settings.qwen4_gdn_decode_wide_proj = bool(
+            request.qwen4_gdn_decode_wide_proj and is_qwen4_exp
+        )
     if "deepseek_v41_engram_ssd_offload" in sent:
         is_deepseek_v41 = (entry.config_model_type or "").replace(
             "-", "_"
@@ -3111,9 +3078,9 @@ async def update_model_settings(
             False if is_diffusion_model else bool(request.dflash_enabled)
         )
         if new_dflash_enabled:
-            from ..engine.dflash import is_dflash_compatible
-
-            compat_ok, compat_reason = is_dflash_compatible(entry.model_path)
+            compat_ok, compat_reason = dflash_compatibility(
+                entry.config_model_type, entry.engine_type
+            )
             if not compat_ok:
                 raise HTTPException(status_code=400, detail=compat_reason)
         current_settings.dflash_enabled = new_dflash_enabled
@@ -3131,80 +3098,17 @@ async def update_model_settings(
             if request.dflash_draft_quant_weight_bits is not None
             else None
         )
-    if "dflash_draft_quant_activation_bits" in sent:
-        current_settings.dflash_draft_quant_activation_bits = (
-            int(request.dflash_draft_quant_activation_bits)
-            if request.dflash_draft_quant_activation_bits is not None
-            else None
-        )
     if "dflash_draft_quant_group_size" in sent:
         current_settings.dflash_draft_quant_group_size = (
             int(request.dflash_draft_quant_group_size)
             if request.dflash_draft_quant_group_size is not None
             else None
         )
-    if "dflash_max_ctx" in sent:
-        # 0/None means "unlimited" — the engine treats None as no fallback threshold
-        value = request.dflash_max_ctx
-        current_settings.dflash_max_ctx = value if value and value > 0 else None
-    if "dflash_in_memory_cache" in sent:
-        current_settings.dflash_in_memory_cache = bool(request.dflash_in_memory_cache)
-    if "dflash_in_memory_cache_max_entries" in sent:
-        value = request.dflash_in_memory_cache_max_entries
-        current_settings.dflash_in_memory_cache_max_entries = (
-            int(value) if value and value > 0 else 4
-        )
-    if (
-        "dflash_in_memory_cache_max_bytes" in sent
-        and request.dflash_in_memory_cache_max_bytes
-    ):
-        current_settings.dflash_in_memory_cache_max_bytes = int(
-            request.dflash_in_memory_cache_max_bytes
-        )
-    if "dflash_ssd_cache" in sent:
-        ssd_requested = bool(request.dflash_ssd_cache)
-        if is_diffusion_model:
-            ssd_requested = False
-        elif ssd_requested:
-            in_mem_after = (
-                bool(request.dflash_in_memory_cache)
-                if "dflash_in_memory_cache" in sent
-                else current_settings.dflash_in_memory_cache
-            )
-            if not in_mem_after:
-                raise HTTPException(
-                    status_code=400,
-                    detail="DFlash SSD cache requires the in-memory cache to be enabled.",
-                )
-            ssd_dir = getattr(
-                getattr(_get_engine_pool(), "_scheduler_config", None),
-                "paged_ssd_cache_dir",
-                None,
-            )
-            if not ssd_dir:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "DFlash SSD cache requires oMLX paged SSD cache to be enabled "
-                        "(set --paged-ssd-cache-dir or configure it in settings)."
-                    ),
-                )
-        current_settings.dflash_ssd_cache = ssd_requested
-    if "dflash_ssd_cache_max_bytes" in sent and request.dflash_ssd_cache_max_bytes:
-        current_settings.dflash_ssd_cache_max_bytes = int(
-            request.dflash_ssd_cache_max_bytes
-        )
     if "dflash_draft_window_size" in sent:
-        # 0 / None / negative → use config.sliding_window when present.
+        # 0 / None / negative -> use the checkpoint's window.
         value = request.dflash_draft_window_size
         current_settings.dflash_draft_window_size = (
             int(value) if value and value > 0 else None
-        )
-    if "dflash_draft_sink_size" in sent:
-        # Negative / None → oMLX default 0 (no sink tokens).
-        value = request.dflash_draft_sink_size
-        current_settings.dflash_draft_sink_size = (
-            int(value) if value is not None and value >= 0 else 0
         )
     if "dflash_block_size" in sent:
         value = request.dflash_block_size
@@ -3471,14 +3375,10 @@ async def update_model_settings(
         or "dflash_draft_model" in sent
         or "dflash_draft_quant_enabled" in sent
         or "dflash_draft_quant_weight_bits" in sent
-        or "dflash_draft_quant_activation_bits" in sent
         or "dflash_draft_quant_group_size" in sent
-        or "dflash_max_ctx" in sent
-        or "dflash_in_memory_cache" in sent
-        or "dflash_in_memory_cache_max_entries" in sent
-        or "dflash_in_memory_cache_max_bytes" in sent
-        or "dflash_ssd_cache" in sent
-        or "dflash_ssd_cache_max_bytes" in sent
+        or "dflash_draft_window_size" in sent
+        or "dflash_block_size" in sent
+        or "dflash_verify_mode" in sent
         # trust_remote_code is plumbed at model load time; toggling it on
         # an already-loaded engine has no effect until reload.
         or "trust_remote_code" in sent
@@ -3870,14 +3770,6 @@ def _installed_model_refs() -> list[tuple[str, str | None]]:
     ]
 
 
-def _paged_ssd_cache_dir():
-    return getattr(
-        getattr(_get_engine_pool(), "_scheduler_config", None),
-        "paged_ssd_cache_dir",
-        None,
-    )
-
-
 def _resolve_draft(snapshot: dict, key: str, refs, *, use_path: bool) -> str | None:
     """Replace a draft reference with the installed id/path; return a problem."""
     value = snapshot.get(key)
@@ -3936,13 +3828,13 @@ def _feature_problem(
 ) -> str | None:
     """Return why ``group`` cannot run on ``entry``, patching ``snapshot`` in place.
 
-    Draft references are rewritten to installed paths, and DFlash SSD caching
-    is switched off (recorded in ``skipped``) when the local server has no
-    paged SSD cache; those adjustments do not reject the group.
+    Draft references are rewritten to installed paths; that adjustment does
+    not reject the group.
     """
     info = {
         "model_path": entry.model_path,
         "config_model_type": entry.config_model_type,
+        "engine_type": entry.engine_type,
     }
     name = group.name
     if name in _NOT_FOR_DIFFUSION and _entry_is_diffusion_model(entry):
@@ -3957,18 +3849,6 @@ def _feature_problem(
             )
             if problem:
                 return problem
-        if snapshot.get("dflash_ssd_cache"):
-            in_memory = snapshot.get(
-                "dflash_in_memory_cache", DEFAULTS["dflash_in_memory_cache"]
-            )
-            if not in_memory or not _paged_ssd_cache_dir():
-                snapshot["dflash_ssd_cache"] = False
-                skipped.append(
-                    {
-                        "feature": "dflash_ssd_cache",
-                        "reason": "requires the in-memory cache and an oMLX paged SSD cache",
-                    }
-                )
         return None
     if name == "specprefill":
         return _resolve_draft(snapshot, "specprefill_draft_model", refs, use_path=True)
@@ -4053,11 +3933,7 @@ async def _apply_settings_snapshot(
         refs = _installed_model_refs()
         for group in FEATURE_GROUPS:
             # Inactive controls can still require local validation.
-            if (
-                not group_enabled(cleaned, group)
-                and group.name != "ane_prefill"
-                and not (group.name == "dflash" and cleaned.get("dflash_ssd_cache"))
-            ):
+            if not group_enabled(cleaned, group) and group.name != "ane_prefill":
                 continue
             try:
                 reason = _feature_problem(entry, group, cleaned, refs, skipped)
@@ -4640,7 +4516,6 @@ def _global_settings_response(global_settings):
             "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
             "burst_decode_mode": global_settings.server.burst_decode_mode,
-            "qwen4_gdn_decode_wide_proj": global_settings.server.qwen4_gdn_decode_wide_proj,
             "preserve_mid_system_cache": getattr(
                 global_settings.server,
                 "preserve_mid_system_cache",
@@ -4743,6 +4618,9 @@ def _global_settings_response(global_settings):
             "api_key_set": bool(global_settings.auth.api_key),
             "api_key": global_settings.auth.api_key or "",
             "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
+            "allow_unauthenticated_inference": (
+                global_settings.auth.allow_unauthenticated_inference
+            ),
             "sub_keys": [sk.to_dict() for sk in global_settings.auth.sub_keys],
         },
         "claude_code": {
@@ -4954,18 +4832,6 @@ async def update_global_settings(
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
-    if request.qwen4_gdn_decode_wide_proj is not None:
-        global_settings.server.qwen4_gdn_decode_wide_proj = (
-            request.qwen4_gdn_decode_wide_proj
-        )
-        from ..server import _server_state
-
-        pool = _server_state.engine_pool
-        if pool is not None:
-            pool._scheduler_config.qwen4_gdn_decode_wide_proj = (
-                request.qwen4_gdn_decode_wide_proj
-            )
-
     if request.preserve_mid_system_cache is not None:
         global_settings.server.preserve_mid_system_cache = (
             request.preserve_mid_system_cache
@@ -5888,6 +5754,17 @@ async def update_global_settings(
         )
         runtime_applied.append("skip_api_key_verification")
 
+    if request.allow_unauthenticated_inference is not None:
+        if (
+            request.allow_unauthenticated_inference
+            and not global_settings.auth.allow_unauthenticated_inference
+        ):
+            logger.warning("Unauthenticated inference enabled via admin settings")
+        global_settings.auth.allow_unauthenticated_inference = (
+            request.allow_unauthenticated_inference
+        )
+        runtime_applied.append("allow_unauthenticated_inference")
+
     if pending_embedding_batch_size is not None:
         previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
         global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
@@ -6381,8 +6258,7 @@ def _build_runtime_cache_observability(
         core = getattr(async_core, "engine", None) if async_core is not None else None
         scheduler = getattr(core, "scheduler", None) if core is not None else None
         if scheduler is None and async_core is None:
-            # Engines without an AsyncEngineCore (DFlash) expose a scheduler
-            # through their fallback engine once it is active.
+            # Engines without an AsyncEngineCore may still expose a scheduler.
             scheduler = getattr(entry.engine, "scheduler", None)
 
         runtime_stats = None
@@ -6397,8 +6273,8 @@ def _build_runtime_cache_observability(
                 )
                 continue
         elif hasattr(entry.engine, "get_runtime_cache_stats"):
-            # DFlash primary mode: the engine adapts its dflash-mlx runtime
-            # cache (L1 in-memory + L2 snapshot dir) to the same shape.
+            # External engines (Splash) adapt their own cache stats to the
+            # same shape.
             try:
                 runtime_stats = entry.engine.get_runtime_cache_stats()
             except Exception as exc:  # noqa: BLE001
@@ -6799,8 +6675,8 @@ def _build_active_models_data() -> dict:
 
                     sched = getattr(core, "scheduler", None)
             else:
-                # Engines without an AsyncEngineCore (DFlash) still expose a
-                # scheduler once their fallback engine is active.
+                # Engines without an AsyncEngineCore may still expose a
+                # scheduler.
                 sched = getattr(entry.engine, "scheduler", None)
             if sched is not None and hasattr(sched, "snapshot_for_admin"):
                 snap = sched.snapshot_for_admin()
@@ -6819,8 +6695,8 @@ def _build_active_models_data() -> dict:
                     for idx, req in enumerate(waiting_queue, start=1)
                 ]
             if hasattr(entry.engine, "get_activity_snapshot"):
-                # Requests the engine tracks itself (non-streaming engines,
-                # DFlash primary mode). Counted on top of any scheduler
+                # Requests the engine tracks itself (non-streaming and
+                # external engines). Counted on top of any scheduler
                 # snapshot; the two sources never overlap.
                 snapshot = entry.engine.get_activity_snapshot()
                 activity_requests = snapshot.get("active_requests", 0)
@@ -6995,24 +6871,6 @@ def _build_active_models_data() -> dict:
         if is_loaded and effective_ttl is not None and idle_seconds is not None:
             ttl_remaining_seconds = max(0.0, effective_ttl - idle_seconds)
 
-        # DFlash observability (issue #2398): session speculation counters and
-        # the load-time precision pairing warning. None on non-DFlash engines.
-        dflash_info = None
-        if entry is not None and entry.engine is not None:
-            pairing = getattr(entry.engine, "pairing_warning", None)
-            speculation = None
-            get_speculation = getattr(entry.engine, "get_speculation_stats", None)
-            if callable(get_speculation):
-                try:
-                    speculation = get_speculation()
-                except Exception:
-                    logger.debug("get_speculation_stats failed", exc_info=True)
-            if speculation is not None or pairing:
-                dflash_info = {
-                    "speculation": speculation,
-                    "pairing_warning": pairing,
-                }
-
         models.append(
             {
                 "id": model_id,
@@ -7039,7 +6897,6 @@ def _build_active_models_data() -> dict:
                 "generating": generating,
                 "idle_seconds": idle_seconds,
                 "ttl_remaining_seconds": ttl_remaining_seconds,
-                "dflash": dflash_info,
                 "cluster": (
                     {**model_info["cluster"], "live": cluster_live}
                     if model_info.get("cluster")
@@ -7887,14 +7744,12 @@ async def get_hf_model_info(
 
 @router.get("/api/hf/models")
 async def list_hf_models(is_admin: bool = Depends(require_admin)):
-    """List models in all model directories with disk size info."""
+    """List models in the discovery directories with disk size info."""
     global_settings = _get_global_settings()
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
-
-    from ..model_discovery import _resolve_hf_cache_entry
+    model_dirs = global_settings.get_effective_model_dirs()
 
     def _add_model(
         model_path: Path,
@@ -7902,6 +7757,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
         *,
         source_repo_id: str | None = None,
         repo_id: str | None = None,
+        source_type: str = "local",
     ) -> None:
         if model_name in seen_names:
             return
@@ -7921,6 +7777,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 "size_formatted": format_size(total_size),
                 # Hub repo the folder came from, when its location reveals it.
                 "repo_id": repo_id or source_repo_id,
+                "source_type": source_type,
             }
         )
 
@@ -7940,11 +7797,14 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
-                    if (hf_resolved.snapshot_path / "config.json").exists():
+                    if _is_hf_cache_mlx_compatible(
+                        hf_resolved.snapshot_path, hf_resolved.source_repo_id
+                    ):
                         _add_model(
                             hf_resolved.snapshot_path,
                             hf_resolved.model_id,
                             source_repo_id=hf_resolved.source_repo_id,
+                            source_type="hf_cache",
                         )
                     continue
 
@@ -7967,16 +7827,16 @@ async def delete_hf_model(
     model_name: str,
     is_admin: bool = Depends(require_admin),
 ):
-    """Delete a downloaded model from disk and refresh the model pool."""
+    """Delete a model or HF cache entry from disk and refresh the model pool."""
     global_settings = _get_global_settings()
     engine_pool = _get_engine_pool()
 
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    model_dirs = global_settings.model.get_model_dirs(global_settings.base_path)
+    model_dirs = global_settings.get_effective_model_dirs()
 
-    # Search for model across all directories in both flat and org-folder layouts
+    # Search the discovery directories in flat, HF cache and org-folder layouts
     model_path = None
     parent_model_dir = None
     for model_dir in model_dirs:
@@ -7987,9 +7847,19 @@ async def delete_hf_model(
             model_path = candidate
             parent_model_dir = model_dir
             break
-        # Try two-level: search inside organization folders
         for subdir in model_dir.iterdir():
             if not subdir.is_dir() or subdir.name.startswith("."):
+                continue
+            hf_resolved = _resolve_hf_cache_entry(subdir)
+            if hf_resolved is not None:
+                # The repo dir owns the snapshot symlinks and their blobs, so
+                # it is removed as one unit.
+                if hf_resolved.model_id == model_name and _is_hf_cache_mlx_compatible(
+                    hf_resolved.snapshot_path, hf_resolved.source_repo_id
+                ):
+                    model_path = subdir
+                    parent_model_dir = model_dir
+                    break
                 continue
             candidate = subdir / model_name
             if candidate.is_dir() and (candidate / "config.json").exists():
@@ -8009,7 +7879,8 @@ async def delete_hf_model(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid model name")
 
-    if not model_path.is_dir():
+    # rmtree refuses a symlinked root, and the link target is not ours to delete.
+    if model_path.is_symlink() or not model_path.is_dir():
         raise HTTPException(status_code=400, detail="Not a model directory")
 
     # A download still writing here would recreate the tree.

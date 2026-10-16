@@ -76,6 +76,78 @@ def _is_qwen4_exp_config(config: dict) -> bool:
     )
 
 
+def _is_muse_spark_modelopt_nvfp4(config: dict) -> bool:
+    """Return whether *config* is a Muse Spark ModelOpt NVFP4 export."""
+    quant = config.get("quantization_config") or {}
+    return (
+        str(config.get("model_type", "")).lower() == "muse_spark"
+        and quant.get("quant_method") == "modelopt"
+        and quant.get("quant_algo") == "NVFP4"
+    )
+
+
+def _muse_spark_passthrough_capture_skip(
+    config: dict, oq_level: float, group_size: int
+) -> frozenset:
+    """Expert modules whose NVFP4 source tensors this level passes through.
+
+    Their imatrix is never used, so calibration does not capture them and
+    their expert coverage does not drive extra calibration rounds.
+    """
+    if not _is_muse_spark_modelopt_nvfp4(config):
+        return frozenset()
+    from omlx.patches.muse_spark.muse_spark_model import (
+        ModelArgs,
+        modelopt_nvfp4_expert_layers,
+    )
+
+    floor_config = {**config, "_oq_boost_map": {}}
+    names = set()
+    for i in modelopt_nvfp4_expert_layers(ModelArgs.from_dict(config)):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            name = f"language_model.model.layers.{i}.mlp.switch_mlp.{proj}"
+            bits, _, _ = _get_predicate_bits(
+                f"{name}.weight", floor_config, oq_level, group_size
+            )
+            if bits is not None and bits >= 4:
+                names.add(name)
+    return frozenset(names)
+
+
+def _muse_spark_folded_scales(
+    all_weights, config: dict, oq_level: float, group_size: int
+) -> frozenset:
+    """Tensor scales of the NVFP4 experts this level does not pass through.
+
+    Those experts are written dequantized or requantized, so their weights take
+    the per-expert tensor scale and no ``global_scale`` is written. The output
+    then holds plain affine experts that mlx-lm loads as well. Experts passed
+    through as NVFP4 keep their ``global_scale``.
+    """
+    if not _is_muse_spark_modelopt_nvfp4(config):
+        return frozenset()
+    names = set()
+    for name in all_weights.keys():
+        if not name.endswith(".global_scale"):
+            continue
+        weight = name[: -len("global_scale")] + "weight"
+        info = all_weights.source_quant_info(weight)
+        if info is None:
+            continue
+        bits, _, _ = _get_predicate_bits(weight, config, oq_level, group_size)
+        if bits is None or bits < info["bits"]:
+            names.add(name)
+    return frozenset(names)
+
+
+def _fold_nvfp4_tensor_scale(weight: mx.array, global_scale: mx.array) -> mx.array:
+    """Scale each expert of a dequantized NVFP4 weight to its real magnitude."""
+    from omlx.patches.muse_spark.muse_spark_model import _NVFP4_GLOBAL_SCALE
+
+    scale = global_scale.astype(mx.float32) * (1.0 / _NVFP4_GLOBAL_SCALE)
+    return (weight.astype(mx.float32) * scale[:, None, None]).astype(weight.dtype)
+
+
 def _configure_qwen4_exp_quantization_runtime(
     model_path: str | Path,
     config: dict,
@@ -786,7 +858,7 @@ def _base_bits_for_level(oq_level: int) -> int:
 
 
 def _bytes_per_group(mode: str) -> int:
-    if mode == "mxfp4":
+    if mode in ("mxfp4", "nvfp4"):
         return 1
     if mode == "mxfp8":
         return 2
@@ -2174,6 +2246,12 @@ class _TrackedTensor:
         """
         if isinstance(other, _TrackedTensor):
             return self._unreplayable(extra_sources=other.sources)
+        if transform == "mul":
+            # A scalar factor replays as a recipe op (e.g. an NVFP4 tensor
+            # scale turned into its amax). Anything else stays unreplayable.
+            if isinstance(other, (int, float)) and self.as_expr() is not None:
+                return self._with_recipe(self.shape, "mul", ("mul", float(other)))
+            return self._unreplayable()
         return self._clone(transform=transform)
 
     def __add__(self, other):
@@ -2264,6 +2342,8 @@ class _TrackedTensor:
             return ("astype", op[1], expr)
         if kind == "expand_dims":
             return ("expand_dims", op[1], expr)
+        if kind == "mul":
+            return ("mul", op[1], expr)
         return None
 
     def as_expr(self):
@@ -2834,6 +2914,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "reshape",
         "astype",
         "expand_dims",
+        "mul",
         "expr",
     )
     plan = {}
@@ -2955,8 +3036,9 @@ class _DiscoveredPlan:
         """Common pre-quantized source metadata for an output key, or None.
 
         Only meaningful for transforms that preserve the packed layout
-        (passthrough, stack, single-source reshape) where every source is
-        the same passthrough-capable format.
+        (passthrough, stack, single-source reshape, an even split off the
+        packed axis) where every source is the same passthrough-capable
+        format.
         """
         info = self._plan.get(key)
         if info is None or not hasattr(self._lazy, "source_quant_info"):
@@ -2970,8 +3052,10 @@ class _DiscoveredPlan:
             transform == "reshape" and len(recipe) == 1 and recipe[0][0] == "reshape"
         ):
             return None
-        if transform not in ("passthrough", "stack") and not (
-            transform == "reshape" and len(sources) == 1
+        if (
+            transform not in ("passthrough", "stack")
+            and not (transform == "reshape" and len(sources) == 1)
+            and not self._packed_split(info)
         ):
             return None
         first = self._lazy.source_quant_info(sources[0])
@@ -2981,6 +3065,21 @@ class _DiscoveredPlan:
             if self._lazy.source_quant_info(src) != first:
                 return None
         return first
+
+    @staticmethod
+    def _packed_split(info):
+        """(part, parts, axis) of an even split that keeps the packed axis."""
+        parts = info["transform"].split("_")
+        if len(parts) != 3 or parts[0] != "split" or len(info["sources"]) != 1:
+            return None
+        axis = info.get("axis") or 0
+        ndim = len(info["shape"])
+        if axis < 0:
+            axis += ndim
+        # Rows split cleanly; the last axis holds the packed values.
+        if axis >= ndim - 1:
+            return None
+        return int(parts[1]), int(parts[2]), axis
 
     def pop_packed(self, key):
         """Materialize a pre-quantized output tensor in mlx packed form.
@@ -2999,6 +3098,17 @@ class _DiscoveredPlan:
             w, s = self._lazy._load_packed(sources[0])
             lead = tuple(info["shape"][:-1])
             return mx.reshape(w, lead + (-1,)), mx.reshape(s, lead + (-1,))
+
+        split = self._packed_split(info)
+        if split is not None:
+            part, parts, axis = split
+            w, s = self._lazy._load_packed(sources[0])
+            w = mx.split(w, parts, axis=axis)[part]
+            s = mx.split(s, parts, axis=axis)[part]
+            # Copy the part so the whole fused source can be freed.
+            w, s = mx.contiguous(w), mx.contiguous(s)
+            mx.eval(w, s)
+            return w, s
 
         if transform == "stack":
             axis = info.get("axis", 0)
@@ -3060,6 +3170,8 @@ class _DiscoveredPlan:
                 arr = arr.astype(op[1])
             elif kind == "expand_dims":
                 arr = mx.expand_dims(arr, axis=op[1])
+            elif kind == "mul":
+                arr = arr * op[1]
             else:
                 raise ValueError(f"unsupported replay recipe op: {kind}")
             mx.eval(arr)
@@ -3093,7 +3205,7 @@ class _DiscoveredPlan:
             mx.clear_cache()
             return result
 
-        child_kinds = {"reshape", "slice", "transpose", "expand_dims", "astype"}
+        child_kinds = {"reshape", "slice", "transpose", "expand_dims", "astype", "mul"}
         if kind in child_kinds:
             arr = self._materialize_expr(expr[2])
             if kind == "reshape":
@@ -3104,6 +3216,8 @@ class _DiscoveredPlan:
                 result = mx.transpose(arr, axes=expr[1])
             elif kind == "expand_dims":
                 result = mx.expand_dims(arr, axis=expr[1])
+            elif kind == "mul":
+                result = arr * expr[1]
             else:
                 result = arr.astype(expr[1])
             mx.eval(result)
@@ -3213,7 +3327,8 @@ class _DiscoveredPlan:
             if len(parts) == 3:  # split_idx_total
                 idx, total = int(parts[1]), int(parts[2])
                 chunks = mx.split(arr, total, axis=axis)
-                result = chunks[idx]
+                # Copy the part: a view keeps the whole fused source alive.
+                result = mx.contiguous(chunks[idx])
                 mx.eval(result)
                 del arr, chunks
                 mx.clear_cache()
@@ -3284,6 +3399,9 @@ def validate_quantizable(config: dict) -> bool:
                     return True
             # QAT models record training-time quant_type but weights are fp16/bf16
             if _is_qat_unquantized_config(qc):
+                return True
+            # Muse Spark NVFP4 experts pass through; the rest is BF16.
+            if _is_muse_spark_modelopt_nvfp4(config):
                 return True
         return False
     return True
@@ -4134,6 +4252,14 @@ def _build_model_sanitizer(
                     )
 
                     apply_mlx_vlm_muse_glimmer_compat_patch()
+                if model_type == "muse_spark":
+                    from omlx.patches.mlx_vlm_muse_spark_compat import (
+                        apply_mlx_vlm_muse_spark_compat_patch,
+                    )
+                    from omlx.patches.muse_spark import apply_muse_spark_patch
+
+                    apply_muse_spark_patch()
+                    apply_mlx_vlm_muse_spark_compat_patch()
                 if model_type == "glm5_next":
                     from omlx.patches.mlx_vlm_glm5_next_compat import (
                         apply_mlx_vlm_glm5_next_compat_patch,
@@ -4295,6 +4421,12 @@ def _build_model_sanitizer(
                 )
 
                 _vlm_sanitize._omlx_cast_predicate = glm5_next_cast_predicate
+            if model_type == "muse_spark":
+                from omlx.patches.muse_spark.muse_spark_model import (
+                    cast_predicate as muse_spark_cast_predicate,
+                )
+
+                _vlm_sanitize._omlx_cast_predicate = muse_spark_cast_predicate
 
             logger.info(
                 f"Using mlx-vlm full sanitize chain for "
@@ -4706,6 +4838,9 @@ class _LazyTensorIndex:
             and config.get("model_type") in {"mimo_v2", "mimo_v2_flash"}
             and (config.get("quantization_config") or {}).get("store_dtype") == "mxfp4"
         )
+        self._modelopt_nvfp4_experts = bool(
+            config and _is_muse_spark_modelopt_nvfp4(config)
+        )
         self._index = {}
         for sf_path in weight_files:
             with open(sf_path, "rb") as f:
@@ -4845,6 +4980,13 @@ class _LazyTensorIndex:
                 ):
                     self._fp8_pairs[wk] = k
                     seen.add(wk)
+            elif self._modelopt_nvfp4_experts and k.endswith("_weight_scale"):
+                # Muse Spark fused experts: X (U8 E2M1 pairs) + X_weight_scale
+                # (E4M3 block scales). X_weight_scale_2 stays a plain tensor.
+                wk = k[: -len("_weight_scale")]
+                if wk in self._index and wk not in seen and self._index[wk][5] == "U8":
+                    self._fp8_pairs[wk] = k
+                    seen.add(wk)
         self._fp8_scale_keys = set(self._fp8_pairs.values())
         for wk, sk in self._fp8_pairs.items():
             info = self._classify_pair(wk, sk)
@@ -4865,6 +5007,17 @@ class _LazyTensorIndex:
         """
         w_shape, w_dtype = self._index[wk][4], self._index[wk][5]
         s_shape, s_dtype = self._index[sk][4], self._index[sk][5]
+        if self._modelopt_nvfp4_experts and sk.endswith("_weight_scale"):
+            cols = w_shape[-1] * 2
+            if (
+                w_dtype != "U8"
+                or s_dtype != "F8_E4M3"
+                or cols % 16
+                or tuple(s_shape) != (*w_shape[:-1], cols // 16)
+            ):
+                raise ValueError(f"Invalid ModelOpt NVFP4 weight/scale pair: {wk}")
+            # The E2M1 nibbles and E4M3 bytes are MLX's nvfp4 layout as-is.
+            return {"kind": "nvfp4", "bits": 4, "group_size": 16, "mode": "nvfp4"}
         if len(w_shape) != 2 or len(s_shape) != 2:
             return None
         rows, cols = w_shape
@@ -4943,6 +5096,18 @@ class _LazyTensorIndex:
                 bits=4,
                 mode="mxfp4",
             ).astype(mx.bfloat16)
+        elif info is not None and info["kind"] == "nvfp4":
+            # Block-scaled values only: the per-tensor scale is a separate
+            # checkpoint tensor that the model applies at run time. E2M1 x
+            # E4M3 products are exact in BF16.
+            weight = mx.dequantize(
+                weight_raw.view(mx.uint32),
+                scale_raw,
+                None,
+                group_size=16,
+                bits=4,
+                mode="nvfp4",
+            ).astype(mx.bfloat16)
         else:
             weight = _block_dequant_fp8(weight_raw, scale_raw, w_meta[5], s_meta[5])
         del weight_raw, scale_raw
@@ -4991,9 +5156,9 @@ class _LazyTensorIndex:
             if k in self._fp8_pairs:
                 dtype = "BF16"
                 info = self._src_quant.get(k)
-                if info is not None and info["kind"] == "mxfp4":
+                if info is not None and info["kind"] in ("mxfp4", "nvfp4"):
                     # FP4-packed bytes: logical width is 2 values per byte.
-                    shape = (shape[0], shape[1] * 2)
+                    shape = (*shape[:-1], shape[-1] * 2)
             result[k] = (shape, dtype)
         for k, entry in self._virtual.items():
             result[k] = (entry.shape, entry.dtype)
@@ -5440,6 +5605,20 @@ def _load_oqe_imatrix(path: Path) -> OQImatrixData:
 
 def _oqe_cache_matches(cache: OQImatrixData, expected: dict[str, Any]) -> bool:
     return all(cache.metadata.get(k) == v for k, v in expected.items())
+
+
+def _oqe_cache_covers_capture_skip(cache: OQImatrixData, config: dict) -> bool:
+    """Whether the cache captured every module this level requantizes.
+
+    A cache serves any level that skips at least the modules it skipped, so
+    one collection without skips (e.g. Muse Spark NVFP4 at oQ3e) also serves
+    levels that pass those experts through (oQ4e).
+    """
+    if "capture_skip_hash" in cache.metadata:
+        # Older caches stored only a hash, so their skip set is unknown.
+        return False
+    skipped = set(cache.metadata.get("capture_skip", ()))
+    return skipped <= set(config.get("_oq_imatrix_capture_skip", ()))
 
 
 def _oqe_cache_load_kind(cache: OQImatrixData) -> str | None:
@@ -6299,6 +6478,9 @@ def quantize_oq_streaming(
             f"{oq_level:g}",
         )
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
+    capture_skip = _muse_spark_passthrough_capture_skip(config, oq_level, group_size)
+    if capture_skip:
+        config["_oq_imatrix_capture_skip"] = capture_skip
 
     output.mkdir(parents=True, exist_ok=True)
 
@@ -6816,7 +6998,23 @@ def quantize_oq_streaming(
     total_bytes = _progress_total_bytes(all_weights, source)
     processed_bytes = 0
 
+    folded_scales = _muse_spark_folded_scales(
+        all_weights, config, oq_level, group_size
+    )
+    pending_scales = {}
+    consumed_scales = set()
+
     for tensor_name in tensor_names:
+        if tensor_name in folded_scales:
+            # Held for its weight below, which may also come first and take it.
+            if tensor_name not in consumed_scales:
+                scale = all_weights.pop(tensor_name)
+                pending_scales[tensor_name] = (
+                    scale[:] if isinstance(scale, _LazyTensor) else scale
+                )
+                processed_bytes += pending_scales[tensor_name].nbytes
+            continue
+
         # Pre-quantized source tensor at or below the target precision:
         # emit the packed mxfp4/mxfp8 form unchanged (no dequant-requant).
         handled_packed = False
@@ -6860,6 +7058,16 @@ def quantize_oq_streaming(
             w_mx = all_weights.pop(tensor_name)
             if isinstance(w_mx, _LazyTensor):
                 w_mx = w_mx[:]
+            scale_name = f"{tensor_name[: -len('weight')]}global_scale"
+            if tensor_name.endswith(".weight") and scale_name in folded_scales:
+                scale = pending_scales.pop(scale_name, None)
+                if scale is None:
+                    scale = all_weights.pop(scale_name)
+                    if isinstance(scale, _LazyTensor):
+                        scale = scale[:]
+                    consumed_scales.add(scale_name)
+                    processed_bytes += scale.nbytes
+                w_mx = _fold_nvfp4_tensor_scale(w_mx, scale)
             tensor_bytes = w_mx.nbytes
             shape = w_mx.shape
 
@@ -7044,6 +7252,7 @@ def quantize_oq_streaming(
         "_oq_use_budget_plan",
         "_oq_non_quantizable",
         "_oq_noncausal_attention",
+        "_oq_imatrix_capture_skip",
     ):
         output_config.pop(temp_key, None)
     if text_only:
@@ -7126,7 +7335,14 @@ _OQE_MAX_SAMPLE_MULTIPLIER = 8
 _OQE_MAX_ADAPTIVE_SAMPLES = 1024
 _OQE_MIN_EXPERT_COUNT = 16
 _OQE_MIN_EXPERT_COUNT_PERCENTILE = 5
-_OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear"}
+# ScaledSwitchLinear and NVFP4SwitchLinear: Muse Spark experts that carry an
+# NVFP4 tensor scale.
+_OQE_SWITCH_LINEAR_CLASSES = {
+    "SwitchLinear",
+    "QuantizedSwitchLinear",
+    "ScaledSwitchLinear",
+    "NVFP4SwitchLinear",
+}
 
 
 def _is_oqe_switch_module(module) -> bool:
@@ -7836,7 +8052,9 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
                 return result[0], result[1] if len(result) > 1 else None
             return result, None
         except (TypeError, ValueError, RuntimeError, AttributeError) as e:
-            last_exc = e
+            # The traceback references this frame, which holds the block. Kept
+            # as-is it forms a cycle that leaves a streamed layer resident.
+            last_exc = e.with_traceback(None)
             continue
     if last_exc is not None:
         logger.debug(
@@ -8054,6 +8272,14 @@ class _ImatrixCaptureWrapper(nn.Module):
                 raise exc
             return getattr(module, key)
 
+    # Parents may read parameters by key (Muse Spark checks
+    # ``"global_scale" in proj``), so key lookups reach the wrapped module.
+    def __contains__(self, key) -> bool:
+        return key in object.__getattribute__(self, "_module")
+
+    def __getitem__(self, key):
+        return object.__getattribute__(self, "_module")[key]
+
     def __call__(self, *args, **kwargs):
         if args:
             if (
@@ -8079,8 +8305,10 @@ class _ImatrixCaptureWrapper(nn.Module):
 class OQImatrixCollector:
     """Collect input activation energy for oQe weighted quantization."""
 
-    def __init__(self):
+    def __init__(self, skip: frozenset = frozenset()):
         self.entries: dict[str, OQImatrixEntry] = {}
+        # Full module names left uncaptured (e.g. tensors passed through).
+        self._skip = skip
         self._original_modules: dict[str, Any] = {}
         # Same modules keyed by entry name (with name_prefix) for hook lookups.
         self._prefixed_modules: dict[str, Any] = {}
@@ -8134,6 +8362,8 @@ class OQImatrixCollector:
                 self._saved_attributes.append((module, "fuse_in", module.fuse_in))
                 module.fuse_in = False
             if not name or not self._is_capture_module(module):
+                continue
+            if f"{name_prefix}{name}" in self._skip:
                 continue
             cls = type(module).__name__
             self.capture_module_classes[cls] = (
@@ -8507,7 +8737,9 @@ def _collect_imatrix_from_model(
     )
     layer_count = len(layers)
 
-    collector = OQImatrixCollector()
+    collector = OQImatrixCollector(
+        skip=config.get("_oq_imatrix_capture_skip", frozenset())
+    )
     installed = collector.install(model)
     if installed == 0:
         return {}, {
@@ -8793,7 +9025,7 @@ _STREAM_EMBED_KEY = "language_model.model.embed_tokens.weight"
 # and an explicit stream_calibration request for one fails fast (see
 # _resolve_stream_calibration). Keep this in lockstep with the sourcer above.
 _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
-    {"minimax_m3_vl", "qwen4_exp", "glm5_next"}
+    {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark"}
 )
 
 
@@ -8820,6 +9052,16 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
         from mlx_vlm.models.glm5_next.language import Glm5NextDecoderLayer
 
         layer_cls = Glm5NextDecoderLayer
+    elif _stream_source_model_type(config) == "muse_spark":
+        # Bare blocks keep BF16 SwitchLinear experts: the NVFP4 pairs are
+        # sourced dequantized and the block applies their tensor scales. The
+        # full config carries the ModelOpt layout the block needs for that.
+        from omlx.patches.muse_spark.muse_spark_model import (
+            ModelArgs,
+            streamed_decoder_layer,
+        )
+
+        return ModelArgs.from_dict(config), streamed_decoder_layer
     else:
         from mlx_vlm.models.minimax_m3_vl.config import TextConfig
         from mlx_vlm.models.minimax_m3_vl.language import MiniMaxDecoderLayer
@@ -8975,6 +9217,16 @@ def _streamed_embed_weight(source, config: dict):
     weight = dp.pop(_STREAM_EMBED_KEY)
     mx.eval(weight)
     return weight
+
+
+def _streamed_embed(embed_weight, calib_data, config: dict):
+    """Embed calibration tokens the way the text model does."""
+    embedded = embed_weight[calib_data]
+    if _stream_source_model_type(config) == "muse_spark":
+        # Muse Spark normalizes the token embeddings with a scaleless RMSNorm.
+        eps = float((config.get("text_config") or {}).get("rms_norm_eps", 1e-5))
+        embedded = mx.fast.rms_norm(embedded, None, eps)
+    return embedded
 
 
 def _stream_source_model_type(config: dict) -> str:
@@ -9176,7 +9428,7 @@ def _streamed_sensitivity_state(
     )
     if calib_data is None:
         return None
-    inputs = embed_weight[calib_data]
+    inputs = _streamed_embed(embed_weight, calib_data, config)
     if _stream_source_model_type(config) == "glm5_next":
         inputs, attention_mask = _streamed_glm5_next_state(config, inputs)
         mx.eval(inputs)
@@ -9476,7 +9728,7 @@ def _collect_imatrix_streaming(
         # AFTER the pre-load patches that could re-install the module.
         _qwen4_exp_apply_compat_patch()
     embed_weight = _streamed_embed_weight(source, config)
-    embedded = embed_weight[calib_data]
+    embedded = _streamed_embed(embed_weight, calib_data, config)
     mx.eval(embedded)
     sens_state = None
     if measure_sensitivity:
@@ -9533,7 +9785,9 @@ def _collect_imatrix_streaming(
         text_config.get("num_hidden_layers") or config.get("num_hidden_layers") or 0
     )
 
-    collector = OQImatrixCollector()
+    collector = OQImatrixCollector(
+        skip=config.get("_oq_imatrix_capture_skip", frozenset())
+    )
     installed = 0
     switch_capture_modules = 0
     capture_module_classes: dict[str, int] = {}
@@ -9970,7 +10224,9 @@ def _load_or_collect_imatrix(
     )
     if reuse_cache and path.exists():
         cache = _load_oqe_imatrix(path)
-        if _oqe_cache_matches(cache, expected):
+        if _oqe_cache_matches(cache, expected) and _oqe_cache_covers_capture_skip(
+            cache, config
+        ):
             cache_load_kind = _oqe_cache_load_kind(cache)
             if stream_calibration and cache_load_kind != "streaming":
                 # The source signature cannot distinguish a cache collected
@@ -10073,6 +10329,7 @@ def _load_or_collect_imatrix(
         )
     metadata = {
         **expected,
+        "capture_skip": sorted(config.get("_oq_imatrix_capture_skip", ())),
         "entry_count": len(entries),
         "load_kind": collection_metadata.get("load_kind", "resident"),
         "collection": collection_metadata,
@@ -10652,6 +10909,7 @@ def _build_streaming_proxy_for_sensitivity(
         "_oq_boost_map",
         "_oq_use_budget_plan",
         "_oq_non_quantizable",
+        "_oq_imatrix_capture_skip",
     ):
         output_config.pop(temp_key, None)
     if not preserve_mtp:

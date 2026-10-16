@@ -13,7 +13,7 @@ curl -H "Authorization: Bearer $OMLX_API_KEY" http://127.0.0.1:8000/admin/api/st
 - Only the main API key is accepted. Sub keys are for the inference API (`/v1/*`) and get 401 here. Rejected keys are logged by fingerprint, never in plain text.
 - `POST /admin/api/models/{model_id}/load` and `POST /admin/api/models/{model_id}/import-mtplx` also accept sub keys.
 - Browsers use a session cookie instead. `POST /admin/api/login` with `{"api_key": "...", "remember": false}` sets `omlx_admin_session`, valid for 24 hours, or 30 days with `"remember": true`. `POST /admin/api/logout` clears it.
-- With `skip_api_key_verification` enabled and a loopback-only bind, admin requests need no credentials.
+- With "Disable all authentication" (`skip_api_key_verification`) enabled and a loopback-only bind, admin requests need no credentials. "Allow inference without API key" (`allow_unauthenticated_inference`) does not affect admin authentication.
 - Failed authentication returns 401 with a JSON `detail`. A browser request without credentials (`Accept: text/html`) is redirected to the `/admin` login page instead, except in headless mode, where there is no login page.
 
 ## Full route list

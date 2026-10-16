@@ -70,6 +70,8 @@ LOG_TAIL_LINES = 5
 # snapshot offline with a local DFlash2 draft; 1.3.1 added mixed-bit ones.
 MIN_SPLASH_VERSION = (1, 3, 0)
 MIXED_QUANTIZATION_VERSION = (1, 3, 1)
+# Splash reads a per-request thinking_token_budget from 1.3.2 on.
+THINKING_BUDGET_VERSION = (1, 3, 2)
 SPLASH_MAX_CONTEXT = 262144
 SPLASH_INSTALL_HINT = (
     "Splash is not installed: brew install incoai/tap/splash (M3 or later), "
@@ -111,6 +113,10 @@ _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json
 _DRAFT_LOAD_RATIO = 1 / 3
 # Scratch Splash plans beside the weights: prefill, decode and lane states.
 _RUNTIME_RESERVE_BYTES = 3 * 1024**3
+# Content parts Splash takes beside text: images (it also reads PDFs, which
+# oMLX's request models do not carry).
+_SPLASH_MEDIA_TYPES = frozenset({"image_url", "input_image", "image"})
+_UNSUPPORTED_MEDIA_TYPES = frozenset({"video_url", "input_audio", "audio_url"})
 
 
 # -- Splash binary -------------------------------------------------------------
@@ -137,6 +143,10 @@ class SplashBinary:
     @property
     def loads_mixed_quantization(self) -> bool:
         return self.version_tuple >= MIXED_QUANTIZATION_VERSION
+
+    @property
+    def accepts_thinking_budget(self) -> bool:
+        return self.version_tuple >= THINKING_BUDGET_VERSION
 
 
 def _version_tuple(version: str) -> tuple[int, int, int] | None:
@@ -282,6 +292,11 @@ def splash_family(config: dict) -> str | None:
     return None
 
 
+def splash_has_vision(config: dict) -> bool:
+    """Whether the checkpoint carries a vision tower Splash can load."""
+    return isinstance(config.get("vision_config"), dict)
+
+
 def _is_affine_4bit_group64(quant: dict) -> bool:
     layers = [quant, *(value for value in quant.values() if isinstance(value, dict))]
     return all(
@@ -400,7 +415,8 @@ def splash_memory_estimate(
     """Memory for Splash to hold ``max_context`` tokens of context.
 
     The weights, the draft as Splash loads it, scratch, and KV pages for
-    ``max_context`` tokens. Splash's context limit is its whole KV pool, and
+    ``max_context`` tokens. The weights include the vision tower Splash loads
+    for image input. Splash's context limit is its whole KV pool, and
     concurrent requests that outgrow the pool wait for pages, so one window
     is enough. Splash spends a larger budget on its prefix cache.
     """
@@ -501,10 +517,15 @@ def splash_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """OpenAI-format messages for Splash.
 
     oMLX hands engines template-format tool calls, whose arguments may be a
-    dict; the OpenAI API Splash implements wants a JSON string.
+    dict; the OpenAI API Splash implements wants a JSON string. The Responses
+    API path keeps its ``input_image`` parts, which Splash's chat API takes
+    as ``image_url`` parts.
     """
     converted = []
     for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            message = {**message, "content": [_chat_part(p) for p in content]}
         calls = message.get("tool_calls")
         if not calls:
             converted.append(message)
@@ -518,6 +539,48 @@ def splash_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             fixed.append({**call, "type": "function", "function": function})
         converted.append({**message, "tool_calls": fixed})
     return converted
+
+
+def _chat_part(part: Any) -> Any:
+    """A Responses ``input_image`` part as a chat ``image_url`` part."""
+    if not isinstance(part, dict) or part.get("type") != "input_image":
+        return part
+    url = part.get("image_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    image_url = {"url": url}
+    if part.get("detail"):
+        image_url["detail"] = part["detail"]
+    return {"type": "image_url", "image_url": image_url}
+
+
+def _check_media(messages: list[dict[str, Any]]) -> None:
+    """Refuse content parts Splash cannot read before they reach it."""
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in _UNSUPPORTED_MEDIA_TYPES:
+                raise InvalidRequestError(
+                    "Splash models take text and image input only, "
+                    f"not {part['type']!r} content"
+                )
+
+
+def _text_of(content: Any) -> str:
+    """The text of message content, without media payloads."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+    texts = []
+    for part in content:
+        if not isinstance(part, dict):
+            texts.append(str(part))
+        elif part.get("type") not in _SPLASH_MEDIA_TYPES | _UNSUPPORTED_MEDIA_TYPES:
+            texts.append(str(part.get("text") or ""))
+    return "\n".join(texts)
 
 
 @dataclass
@@ -771,6 +834,7 @@ class SplashEngine(BaseEngine):
         self._status: dict[str, Any] | None = None
         self._status_task: asyncio.Task | None = None
         self._status_refresh: asyncio.Task | None = None
+        self._vision = splash_has_vision(_read_config(self._path) or {})
 
     # -- identity ------------------------------------------------------------------
 
@@ -785,6 +849,11 @@ class SplashEngine(BaseEngine):
     @property
     def model_type(self) -> str | None:
         return self._model_type
+
+    @property
+    def accepts_image_input(self) -> bool:
+        """Image content parts reach Splash for a checkpoint with a vision tower."""
+        return self._vision
 
     @property
     def log_path(self) -> Path:
@@ -850,8 +919,6 @@ class SplashEngine(BaseEngine):
             "--port",
             str(port),
             "--no-webui",
-            # Requests arrive as text: skip loading the vision tower.
-            "--language-only",
             # oMLX unloads idle models itself; Splash must not free weights
             # that oMLX still counts as loaded.
             "--idle-release",
@@ -859,6 +926,9 @@ class SplashEngine(BaseEngine):
             "--kv-format",
             options.kv_format,
         ]
+        if not self._vision:
+            # Text-only checkpoint: skip Splash's vision preparation.
+            command.append("--language-only")
         # Without a limit Splash fits its context to the memory budget; a
         # limit the budget cannot hold makes it refuse to start.
         if options.max_context:
@@ -1014,6 +1084,11 @@ class SplashEngine(BaseEngine):
         for key in ("frequency_penalty", "stop", "seed", "response_format"):
             if kwargs.get(key) is not None:
                 body[key] = kwargs[key]
+        # oMLX's resolved budget (request over model settings); the in-process
+        # engines enforce it in the scheduler, Splash enforces it itself.
+        budget = kwargs.get("thinking_budget")
+        if budget is not None and self._target.binary.accepts_thinking_budget:
+            body["thinking_token_budget"] = budget
         return body
 
     async def _stream(self, body: dict[str, Any]) -> AsyncIterator[GenerationOutput]:
@@ -1139,6 +1214,7 @@ class SplashEngine(BaseEngine):
             presence_penalty,
             kwargs,
         )
+        _check_media(messages)
         body["messages"] = splash_messages(messages)
         if tools:
             body["tools"] = tools
@@ -1172,8 +1248,9 @@ class SplashEngine(BaseEngine):
                 return len(ids["input_ids"] if hasattr(ids, "keys") else ids)
             except Exception:  # an effort value this template rejects
                 logger.debug("Splash: chat template token count failed", exc_info=True)
+        # Count the text only: an image's base64 payload is not prompt text.
         return sum(
-            len(self._tokenizer.encode(str(m.get("content", "")))) for m in messages
+            len(self._tokenizer.encode(_text_of(m.get("content")))) for m in messages
         )
 
     # -- plain completions -----------------------------------------------------------

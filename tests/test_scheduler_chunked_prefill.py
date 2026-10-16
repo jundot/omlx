@@ -179,6 +179,21 @@ def test_prefill_interrupts_mtp_cost_timing(chunked):
     assert abs(policy.cycle_time_ms("mtp", 2.025, 2.04) - 20) < 1e-6
 
 
+def test_prefill_progress_keeps_memory_admission_waiting():
+    scheduler, _ = _make_recording_scheduler("deepseek_v32")
+    state = _make_prefill_state(scheduler, _make_request("active"), n_remaining=4096)
+    scheduler.waiting.append(_make_request("waiting"))
+    with patch("omlx.scheduler.time.monotonic", return_value=0.0):
+        assert scheduler._memory_admission_stall_output("admission_paused") is None
+    with (
+        patch("omlx.scheduler._sync_and_clear_cache"),
+        patch("omlx.scheduler.time.monotonic", return_value=30.0),
+    ):
+        assert not scheduler._step_prefill_chunk(state)
+    with patch("omlx.scheduler.time.monotonic", return_value=61.0):
+        assert scheduler._memory_admission_stall_output("admission_paused") is None
+
+
 # ---------------------------------------------------------------------------
 # SchedulerConfig
 # ---------------------------------------------------------------------------

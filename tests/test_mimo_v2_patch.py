@@ -1290,6 +1290,28 @@ def test_decode_fast_forward_matches_reference(monkeypatch):
 
 
 @requires_nax
+def test_decode_fast_reports_drafter_layer_captures(monkeypatch, apply_drafter_target):
+    """The fused loop skips the decoder layer call; DFlash captures taken
+    through it must equal the reference loop's layer outputs."""
+    model = _decode_model(seed=5)
+    apply_drafter_target(model)
+    _per_row_router(monkeypatch, _load_patch_module())
+    tokens = mx.random.randint(0, 512, (1, 44))
+    cache = model.make_cache()
+    _forward(model, tokens[:, :40], cache, False, monkeypatch)
+    step = tokens[:, 40:44]
+    captures = {}
+    for fast in (False, True):
+        monkeypatch.setattr(df, "enabled", lambda fast=fast: fast)
+        out = model(step, cache=_clone(cache), capture_layer_ids=[3, 0])
+        mx.eval(out.logits, out.hidden_states)
+        captures[fast] = out.hidden_states
+    assert len(captures[True]) == 2
+    for ref, fast in zip(captures[False], captures[True]):
+        assert _mismatches(ref, fast) == 0
+
+
+@requires_nax
 def test_decode_fast_forward_matches_reference_batch_caches(monkeypatch):
     model = _decode_model(seed=4)
     _per_row_router(monkeypatch, _load_patch_module())

@@ -829,53 +829,6 @@ class TestDisabledWhenCeilingZero:
         assert scheduler._memory_metal_cap_bytes == metal_b
         assert scheduler._memory_hot_cache_reserved_bytes == hot_reserved_b
 
-    async def test_propagates_hot_cache_used_for_usage_side_exclusion(
-        self, mock_engine_pool
-    ):
-        """Targets whose usage read is raw phys_footprint (the DFlash primary
-        guard) need the used-bytes counterpart of the reservation, or the
-        hot cache is charged twice: once in the reserved ceiling, once in
-        phys. The enforcer propagates the exact used figure each tick."""
-        metal_b = 16 * 1024**3
-        hot_used_b = 3 * 1024**3
-        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
-        enforcer._hot_cache_reserved_bytes = lambda: hot_used_b + 512 * 1024**2
-        enforcer._hot_cache_used_bytes = lambda: hot_used_b
-        scheduler = MagicMock(spec=[])
-        scheduler._memory_hot_cache_used_bytes = 0
-        scheduler.batch_generator = None
-        engine = MagicMock(spec=[])
-        engine.scheduler = scheduler
-        entry = _make_entry("model-a", engine=engine)
-        mock_engine_pool._entries = {"model-a": entry}
-
-        enforcer._propagate_memory_limit()
-
-        assert scheduler._memory_hot_cache_used_bytes == hot_used_b
-
-    async def test_propagated_hot_cache_used_clamped_to_reservation(
-        self, mock_engine_pool
-    ):
-        """A transient overshoot (live hot-cache bytes past max_bytes) must not
-        exclude more usage than the reservation removed from the ceiling —
-        that would net-weaken the guard exactly under pressure."""
-        metal_b = 16 * 1024**3
-        reserved_b = 3 * 1024**3  # capped at max_bytes
-        enforcer = _make_enforcer(mock_engine_pool, ceiling=metal_b)
-        enforcer._hot_cache_reserved_bytes = lambda: reserved_b
-        enforcer._hot_cache_used_bytes = lambda: 5 * 1024**3  # overshoot
-        scheduler = MagicMock(spec=[])
-        scheduler._memory_hot_cache_used_bytes = 0
-        scheduler.batch_generator = None
-        engine = MagicMock(spec=[])
-        engine.scheduler = scheduler
-        entry = _make_entry("model-a", engine=engine)
-        mock_engine_pool._entries = {"model-a": entry}
-
-        enforcer._propagate_memory_limit()
-
-        assert scheduler._memory_hot_cache_used_bytes == reserved_b
-
 
 class TestPrefillMemoryGuardToggle:
     """Tests for prefill_memory_guard setter and Metal limit management."""
@@ -1092,6 +1045,67 @@ class TestDynamicCeilingReserve:
             result = enforcer._get_dynamic_ceiling()
 
         assert result == 64 * self.GB - tier_reserve_bytes("balanced", 64 * self.GB)
+
+    def _read_sequence(self, mock_engine_pool, samples):
+        """Dynamic ceilings for successive (phys, free, now) reads."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="safe"
+        )
+        ceilings = []
+        for phys, free, now in samples:
+            with (
+                patch("omlx.settings.get_system_memory", return_value=64 * self.GB),
+                patch(
+                    "omlx.process_memory_enforcer.get_phys_footprint",
+                    return_value=phys * self.GB,
+                ),
+                patch(
+                    "omlx.process_memory_enforcer.get_macos_vm_stats",
+                    return_value={**self.STATS, "free": free * self.GB},
+                ),
+                patch("omlx.process_memory_enforcer.time.monotonic", return_value=now),
+            ):
+                ceilings.append(enforcer._get_dynamic_ceiling())
+        return ceilings
+
+    def test_released_memory_counts_until_vm_stat_frees_it(self, mock_engine_pool):
+        """A Metal cache clear drops phys before vm_stat raises free (#4213)."""
+        ceilings = self._read_sequence(
+            mock_engine_pool,
+            [(40, 10, 0.0), (25, 10, 0.5), (25, 18, 0.8), (25, 25, 1.2)],
+        )
+        assert ceilings == [ceilings[0]] * 4
+
+    def test_release_credit_is_spent_and_expires(self, mock_engine_pool):
+        ceilings = self._read_sequence(
+            mock_engine_pool,
+            [
+                (40, 10, 0.0),
+                # Another app takes 4 GB of free memory.
+                (40, 6, 0.2),
+                # oMLX releases 10 GB, then allocates 6 GB of it again.
+                (30, 6, 0.4),
+                (36, 6, 0.6),
+                # A later release does not extend the first one's window.
+                (35, 6, 1.6),
+                (35, 6, 2.5),
+            ],
+        )
+        base = 54 * self.GB - tier_reserve_bytes("safe", 64 * self.GB)
+        assert ceilings == [
+            base,
+            base - 4 * self.GB,
+            base - 4 * self.GB,
+            base - 4 * self.GB,
+            base - 4 * self.GB,
+            base - 8 * self.GB,
+        ]
+
+    def test_free_rise_seen_before_release_adds_no_credit(self, mock_engine_pool):
+        ceilings = self._read_sequence(
+            mock_engine_pool, [(40, 10, 0.0), (40, 20, 0.3), (30, 20, 0.6)]
+        )
+        assert ceilings[2] == ceilings[0]
 
 
 class TestDynamicCeilingCustom:
@@ -1641,6 +1655,43 @@ class TestSingleModelMemoryPressure:
         assert entry.engine is not None
         assert entry.pending_unload_reason is None
         assert entry.abort_requested is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "usage_gb,requeued,requeue_calls,aborts",
+        [(11, 2, 1, 0), (11, 0, 1, 1), (13, 2, 0, 1)],
+    )
+    async def test_single_busy_model_requeues_before_aborting(
+        self, enforcer, usage_gb, requeued, requeue_calls, aborts
+    ):
+        """Hard pressure keeps the requests when the scheduler can requeue them;
+        a declined requeue or the emergency tier aborts as before."""
+
+        calls = []
+
+        class RequeueScheduler(MagicMock):
+            def request_memory_requeue(self):
+                calls.append(1)
+                return requeued
+
+        engine = MagicMock()
+        engine.scheduler = RequeueScheduler()
+        engine.has_active_requests.return_value = False
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = _cycling(
+                [usage_gb * 1024**3, usage_gb * 1024**3]
+            )
+            await enforcer._check_and_enforce()
+
+        assert len(calls) == requeue_calls
+        assert engine.abort_all_requests.await_count == aborts
+        enforcer._engine_pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_single_busy_model_pending_unload_at_emergency_pressure(
@@ -2260,23 +2311,6 @@ class TestUnresolvableSchedulerWarning:
         ]
         assert warnings == []
 
-    def test_no_warning_for_dflash_without_fallback(self, enforcer, caplog):
-        """DFlash normal mode has no scheduler until fallback is started."""
-
-        class DFlashEngine:
-            _fallback_engine = None
-
-        entry = _make_entry("model-dflash", engine=DFlashEngine())
-        enforcer._engine_pool._entries = {"model-dflash": entry}
-
-        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
-            enforcer._propagate_memory_limit()
-
-        warnings = [
-            r for r in caplog.records if "could not resolve scheduler" in r.getMessage()
-        ]
-        assert warnings == []
-
 
 class TestStoreCacheCapWalk:
     """Tests for _walk_store_cache_caps — store-cache gate adjustment (#1383)."""
@@ -2836,45 +2870,10 @@ class TestTwoWatermarkPressureLevels:
         assert abs(status["utilization"] - 0.88) < 0.01
 
 
-class TestDFlashGuardPropagation:
-    """The enforcer must reach DFlash's primary-mode guard target.
+class TestResolveScheduler:
+    """Scheduler resolution for engines that expose ``.scheduler`` directly."""
 
-    DFlash bypasses the scheduler: in primary mode it exposes a lightweight
-    ``_prefill_guard``; in fallback mode its ``scheduler`` property resolves
-    the fallback engine's real scheduler (covered by test_dflash_engine.py).
-    Without the ``_prefill_guard`` arm in ``_resolve_scheduler`` the watermarks
-    never reach a primary-mode DFlash and the prefill guard stays dead.
-    """
-
-    def test_resolves_primary_guard(self, enforcer):
-        guard = MagicMock(spec=[])
-        engine = MagicMock(spec=["_prefill_guard"])
-        engine._prefill_guard = guard
-        entry = _make_entry("dflash", engine=engine)
-        enforcer._engine_pool._entries = {"dflash": entry}
-
-        assert enforcer._resolve_scheduler(entry) is guard
-
-        enforcer._propagate_memory_limit()
-        assert guard._memory_hard_limit_bytes == 10 * 1024**3
-        assert guard._prefill_memory_guard == enforcer._prefill_memory_guard
-
-    def test_dflash_primary_does_not_warn(self, enforcer, caplog):
-        engine = MagicMock(spec=["_prefill_guard"])
-        engine._prefill_guard = MagicMock(spec=[])
-        entry = _make_entry("dflash", engine=engine)
-        enforcer._engine_pool._entries = {"dflash": entry}
-
-        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
-            enforcer._propagate_memory_limit()
-
-        assert not [
-            r for r in caplog.records if "could not resolve scheduler" in r.message
-        ]
-
-    def test_non_dflash_resolution_unchanged(self, enforcer):
-        """A standard engine with a direct ``.scheduler`` still resolves via the
-        existing chain — the DFlash arm must not interfere."""
+    def test_direct_scheduler_resolves(self, enforcer):
         scheduler = MagicMock(spec=[])
         engine = MagicMock(spec=["scheduler"])
         engine.scheduler = scheduler

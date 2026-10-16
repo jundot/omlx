@@ -44,6 +44,8 @@
                                             @click="if (!accExternalEnabled) accEnableThinking = !accEnableThinking"
                                             :disabled="accExternalEnabled"
                                             :class="[accEnableThinking ? 'bg-black' : 'bg-neutral-200', accExternalEnabled ? 'opacity-40 cursor-not-allowed' : '']"
+                                            role="switch"
+                                            :aria-checked="accEnableThinking ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="accEnableThinking ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -89,6 +91,8 @@
                                             <button type="button"
                                                     @click="accSamplingProfile = accSamplingProfile === 'model_settings' ? 'deterministic' : 'model_settings'"
                                                     :class="accSamplingProfile === 'model_settings' ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="accSamplingProfile === 'model_settings' ? 'true' : 'false'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="accSamplingProfile === 'model_settings' ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>

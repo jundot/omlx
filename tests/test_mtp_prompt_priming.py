@@ -16,6 +16,9 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
+from mlx_lm.models.cache import KVCache
+
+from omlx.patches.deepseek_v4.cache_extras import PoolingCache
 from omlx.patches.mlx_lm_mtp import prompt_priming
 from omlx.prefill.packed import PackedBatch, PackedRow, PackedRows
 
@@ -227,6 +230,96 @@ def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
     cache._on_hash_map_cleared()
     assert not cache._mtp_prefix_snapshots
     assert not cache._prefix_index
+
+
+POOL_TOKENS = list(range(100, 140))
+
+
+class PooledHead:
+    """glm5_next-shaped head: a ``[KVCache, PoolingCache(4)]`` pair."""
+
+    _omlx_mtp_decode_enabled = True
+    _omlx_mtp_chain = True
+    mtp = object()
+
+    def make_mtp_cache(self):
+        return [KVCache(), PoolingCache(4)]
+
+    def mtp_forward(self, hidden, tokens, cache, logits_keep=0):
+        x = hidden + tokens[..., None].astype(hidden.dtype)
+        cache[0].update_and_fetch(x[:, None], x[:, None])
+        ready, gate, _ = cache[1].accumulate_windows(x, 1 - x, 0)
+        if ready.size:
+            windows = mx.unflatten(ready + gate, 1, (-1, 4))
+            cache[1].update_and_fetch(windows.mean(axis=2))
+
+
+def _pooled_run(prefix_cache, request_id, chunks, *, cached=0, tail=None):
+    """Prefill chunks in scheduler order, then fold the activation seam."""
+    host = PooledHead()
+    warm = prompt_priming.prepare_prefix_context(
+        host,
+        request_id=request_id,
+        prompt_tokens=POOL_TOKENS,
+        cached_tokens=cached,
+        prefix_cache=prefix_cache,
+    )
+    end = cached
+    for n in chunks:
+        if end == tail:
+            prompt_priming.capture_tail_boundary(host, request_id, tail)
+        tokens = mx.array([POOL_TOKENS[end : end + n]])
+        end += n
+        hidden = tokens[..., None].astype(mx.float32)
+        prompt_priming.maybe_capture(
+            host, tokens, hidden, [SimpleNamespace(offset=end)]
+        )
+    main_tok = mx.array([POOL_TOKENS[end]])
+    return warm, prompt_priming.take_primed(host, [], main_tok, cache_offset=end + 1)
+
+
+def _pooled_reference(pairs):
+    cache = PooledHead().make_mtp_cache()
+    hidden = mx.array(POOL_TOKENS[:pairs], dtype=mx.float32)[None, :, None]
+    tokens = mx.array([POOL_TOKENS[1 : pairs + 1]])
+    PooledHead().mtp_forward(hidden, tokens, cache)
+    return cache
+
+
+def _pooled_state(cache):
+    kv, pool = cache
+    rem = pool.remainder
+    return (
+        kv.keys[..., : kv.offset, :].tolist(),
+        pool.pooled.tolist(),
+        pool.buf_kv[:, :rem].tolist(),
+        pool.buf_gate[:, :rem].tolist(),
+    )
+
+
+def test_pooled_head_snapshot_publishes_and_restores_at_tail_boundary():
+    # The seam leaves the head at 21 pairs. Rewinding it to C-1 = 19 crosses a
+    # completed pooled window, so the snapshot must be taken at tail capture.
+    sidecar = _MemoryMtpPrefixCache()
+    _, cold = _pooled_run(sidecar, "cold", (16, 4, 1), tail=20)
+    snapshot = sidecar.snapshots[sidecar._key(POOL_TOKENS, 20)]
+    expected = _pooled_state(_pooled_reference(19))
+    assert _pooled_state(snapshot.mtp_cache) == expected
+
+    restored, warm = _pooled_run(sidecar, "warm", (1,), cached=20)
+    assert restored and warm[1] == cold[1] == 21
+    assert _pooled_state(warm[0]) == _pooled_state(cold[0])
+    assert _pooled_state(snapshot.mtp_cache) == expected
+
+
+def test_pooled_head_keeps_older_snapshot_when_newer_boundary_cannot_rewind():
+    # Block 32 lies 4 tokens behind the head after chunk 2, beyond the pooled
+    # remainder and with no undo log for a 20-token update.
+    sidecar = _MemoryMtpPrefixCache()
+    _pooled_run(sidecar, "cold", (16, 20))
+    assert list(sidecar.snapshots) == [sidecar._key(POOL_TOKENS, 16)]
+    snapshot = sidecar.snapshots[sidecar._key(POOL_TOKENS, 16)]
+    assert _pooled_state(snapshot.mtp_cache) == _pooled_state(_pooled_reference(15))
 
 
 @pytest.fixture(autouse=True)
