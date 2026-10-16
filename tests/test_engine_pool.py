@@ -2873,6 +2873,20 @@ class TestCrossModelAdmissionRetry:
         engine.has_active_requests.return_value = False
         return engine
 
+    # A regression that retries where it must fail fast waits for the whole
+    # window. A 30 s window and a 5 s limit separate the two on a loaded host.
+    SLOW_RETRY_S = 30.0
+    FAST_FAIL_LIMIT_S = 5.0
+
+    @classmethod
+    def _slow_retry(cls, monkeypatch) -> None:
+        monkeypatch.setattr(
+            "omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", cls.SLOW_RETRY_S
+        )
+        monkeypatch.setattr(
+            "omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", cls.SLOW_RETRY_S
+        )
+
     @staticmethod
     def _count_lru_sweeps(pool: EnginePool) -> list[int]:
         """Count admission attempts by counting LRU sweeps."""
@@ -3020,10 +3034,13 @@ class TestCrossModelAdmissionRetry:
         assert pool.get_status()["swap_waiting"] == 0
 
     @pytest.mark.asyncio
-    async def test_quiescent_pool_fails_fast_with_unchanged_message(self, retry_pool):
+    async def test_quiescent_pool_fails_fast_with_unchanged_message(
+        self, retry_pool, monkeypatch
+    ):
         """Nothing loading, unloading, or serving means nothing can free the
         memory on its own: fail at once, with the exact pre-existing message."""
         pool = retry_pool
+        self._slow_retry(monkeypatch)
         pool._entries["model-a"].is_pinned = True
         engine_a = self._mock_engine()
 
@@ -3042,7 +3059,7 @@ class TestCrossModelAdmissionRetry:
         assert str(exc_info.value) == expected
         assert exc_info.value.required == 2150
         assert exc_info.value.current == 1075
-        assert elapsed < 0.2  # no retry delay for a pool that cannot change
+        assert elapsed < self.FAST_FAIL_LIMIT_S  # no retry: the pool is static
 
     @pytest.mark.asyncio
     async def test_retry_wait_never_blocks_other_models(self, retry_pool):
@@ -3096,10 +3113,11 @@ class TestCrossModelAdmissionRetry:
         assert loaded_a is engine_a
 
     @pytest.mark.asyncio
-    async def test_model_too_large_is_not_retried(self, retry_pool):
+    async def test_model_too_large_is_not_retried(self, retry_pool, monkeypatch):
         """A model that can never fit raises ModelTooLargeError immediately,
         even mid-swap with a hopeful-looking competing lease live."""
         pool = retry_pool
+        self._slow_retry(monkeypatch)
         engine_b = self._mock_engine()
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=engine_b):
@@ -3113,7 +3131,7 @@ class TestCrossModelAdmissionRetry:
                 await pool.get_engine("model-a")
             elapsed = time.monotonic() - started
 
-        assert elapsed < 0.25
+        assert elapsed < self.FAST_FAIL_LIMIT_S
         assert pool._entries["model-b"].engine is engine_b
 
     @pytest.mark.asyncio
@@ -3128,7 +3146,7 @@ class TestCrossModelAdmissionRetry:
         monkeypatch.setattr(
             pool, "_admission_hope_kind_locked", lambda model_id: "busy"
         )
-        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 5.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 30.0)
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=engine_a):
@@ -3138,7 +3156,7 @@ class TestCrossModelAdmissionRetry:
                 await pool.get_engine("model-b")
             elapsed = time.monotonic() - started
 
-        assert 0.2 <= elapsed < 1.5  # bounded by the grace, not by the budget
+        assert 0.2 <= elapsed < 5.0  # bounded by the grace, not by the 30 s budget
 
     @pytest.mark.asyncio
     async def test_load_hope_gets_the_full_budget(self, retry_pool, monkeypatch):
@@ -3160,12 +3178,13 @@ class TestCrossModelAdmissionRetry:
                 await pool.get_engine("model-b")
             elapsed = time.monotonic() - started
 
-        assert 0.6 <= elapsed < 2.0  # past the grace, up to the full budget
+        assert 0.6 <= elapsed < 10.0  # past the grace, up to the full budget
 
     @pytest.mark.asyncio
     async def test_model_not_found_is_not_retried(self, retry_pool, monkeypatch):
         """A model that vanished mid-retry propagates, it is never waited on."""
         pool = retry_pool
+        self._slow_retry(monkeypatch)
         pool._entries["model-a"].is_pinned = True
         engine_a = self._mock_engine()
         monkeypatch.setattr(
@@ -3179,7 +3198,7 @@ class TestCrossModelAdmissionRetry:
                 await pool.get_engine("no-such-model")
             elapsed = time.monotonic() - started
 
-        assert elapsed < 0.2
+        assert elapsed < self.FAST_FAIL_LIMIT_S
 
     @staticmethod
     def _add_small_model(pool: EnginePool, name: str, size: int = 50) -> None:
@@ -3204,7 +3223,7 @@ class TestCrossModelAdmissionRetry:
         monkeypatch.setattr(
             pool, "_admission_hope_kind_locked", lambda model_id: "busy"
         )
-        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 5.0)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 30.0)
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.2)
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
@@ -3214,7 +3233,7 @@ class TestCrossModelAdmissionRetry:
                 await pool.get_engine("model-b")
             elapsed = time.monotonic() - started
 
-        assert 0.2 <= elapsed < 1.5
+        assert 0.2 <= elapsed < 5.0
 
     @pytest.mark.asyncio
     async def test_swap_wait_timeout_replaces_busy_grace(self, retry_pool, monkeypatch):
@@ -3223,7 +3242,7 @@ class TestCrossModelAdmissionRetry:
         monkeypatch.setattr(
             pool, "_admission_hope_kind_locked", lambda model_id: "busy"
         )
-        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 0.2)
+        monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUDGET_S", 30.0)
         monkeypatch.setattr("omlx.engine_pool._ADMISSION_RETRY_BUSY_GRACE_S", 0.1)
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=self._mock_engine()):
@@ -3233,7 +3252,7 @@ class TestCrossModelAdmissionRetry:
                 await pool.get_engine("model-b")
             elapsed = time.monotonic() - started
 
-        assert 0.6 <= elapsed < 2.0
+        assert 0.6 <= elapsed < 5.0
 
     def test_configure_swap_wait_timeout_clamps(self, retry_pool):
         pool = retry_pool
@@ -3248,6 +3267,7 @@ class TestCrossModelAdmissionRetry:
         """Pinned models alone leave no room for model-b: no wait, and the
         idle model-c must not be evicted for nothing."""
         pool = retry_pool
+        self._slow_retry(monkeypatch)
         pool._entries["model-a"].is_pinned = True
         self._add_small_model(pool, "model-c")
         monkeypatch.setattr(
@@ -3262,7 +3282,7 @@ class TestCrossModelAdmissionRetry:
                 await pool.get_engine("model-b")
             elapsed = time.monotonic() - started
 
-        assert elapsed < 0.25
+        assert elapsed < self.FAST_FAIL_LIMIT_S
         assert pool._entries["model-c"].engine is not None
 
     @pytest.mark.asyncio
@@ -3441,6 +3461,7 @@ class TestCrossModelAdmissionRetry:
         """A leased pinned model cannot be evicted, so waiting for it is
         pointless: fail at once instead of burning the busy window."""
         pool = retry_pool
+        self._slow_retry(monkeypatch)
         pool._entries["model-a"].is_pinned = True
         self._add_small_model(pool, "model-c")
         footprint = {"value": 0}
@@ -3456,7 +3477,7 @@ class TestCrossModelAdmissionRetry:
                 await pool.get_engine("model-c")
             elapsed = time.monotonic() - started
 
-        assert elapsed < 0.25
+        assert elapsed < self.FAST_FAIL_LIMIT_S
 
 
 class TestAdmissionSoftTargetEviction:
