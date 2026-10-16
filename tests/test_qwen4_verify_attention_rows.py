@@ -212,7 +212,7 @@ def _bit_equal(a: mx.array, b: mx.array) -> bool:
 # path gave row 0 of a two-row window the 16384-key plan); 24000: the served
 # 24K case.
 @pytest.mark.parametrize("context", [2060, 16382, 24000])
-@pytest.mark.parametrize("rows", [2, 3, 8])
+@pytest.mark.parametrize("rows", [2, 3, 8, 16])
 def test_masked_verify_rows_equal_serial_decode_steps(monkeypatch, context, rows):
     attn = _attention(seed=3)
     cache = _prefill(attn, context, seed=4)
@@ -273,7 +273,7 @@ def test_masked_verify_rollback_then_decode_matches_serial():
 # windows at 1020/1022 put rows on both sides of its two-pass switch at 1024
 # keys, which a shared multi-row call would hide.
 @pytest.mark.parametrize("context", [700, 1020, 1022])
-@pytest.mark.parametrize("rows", [2, 3, 4, 8])
+@pytest.mark.parametrize("rows", [2, 3, 4, 8, 16])
 def test_dense_verify_rows_equal_serial_decode_steps(context, rows):
     attn = _attention(seed=8)
     cache = _prefill(attn, context, seed=9)

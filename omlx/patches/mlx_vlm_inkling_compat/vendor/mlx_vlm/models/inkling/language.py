@@ -9,22 +9,12 @@
 #   short-conv states and attend to padded keys.
 # - explicit error when a config with dense MLP layers lacks
 #   dense_intermediate_size (upstream crashes with an opaque TypeError).
-import os  # OMLX: sliding-window slice kill switch
 from functools import partial
 from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
-
-# OMLX: compute-only optimization — sliding layers (35 of 42 on Inkling
-# Small) never attend past their 512-token window, but upstream runs SDPA
-# over the FULL cached sequence and cuts via the additive mask, making
-# every sliding layer O(S) per decoded token. Slicing K/V to the window
-# before SDPA is numerically equivalent (masked keys carry -1e30 and
-# contribute exactly 0 after softmax; distances are shift-invariant).
-# Kill switch for A/B measurement: OMLX_INKLING_SLIDING_SLICE=0.
-_SLIDING_WINDOW_SLICE = os.environ.get("OMLX_INKLING_SLIDING_SLICE", "1") != "0"
 
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, KVCache
@@ -447,11 +437,13 @@ class InklingAttention(nn.Module):
 
         # OMLX: sliding layers only attend the last (sliding + L - 1)
         # keys; slice K/V to that window so per-token cost stays O(window)
-        # instead of O(S). Distances are shift-invariant under the uniform
-        # cut; log-tau never applies here (log_floor is None on sliding
-        # layers), and the padding bounds below shift with ``cut``.
+        # instead of O(S). Upstream runs SDPA over the full sequence and
+        # cuts via the additive mask; masked keys carry -1e30 and contribute
+        # exactly 0 after softmax. Distances are shift-invariant under the
+        # uniform cut; log-tau never applies here (log_floor is None on
+        # sliding layers), and the padding bounds below shift with ``cut``.
         cut = 0
-        if _SLIDING_WINDOW_SLICE and self.sliding > 0 and S > self.sliding + L - 1:
+        if self.sliding > 0 and S > self.sliding + L - 1:
             cut = S - (self.sliding + L - 1)
             k = k[:, :, cut:, :]
             v = v[:, :, cut:, :]

@@ -21,9 +21,30 @@ _NATIVE_REASONING_MODEL_TYPES = {
     # Muse Glimmer's chat template renders history reasoning_content into
     # <|start|>assistant to=self<|message|> blocks.
     "muse_glimmer",
+    "muse_spark",
     # K2 requires a reasoning field for every assistant turn.
     "k2_horizon",
 }
+
+
+_LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
+def find_lone_surrogate(value: Any, path: str = "") -> str | None:
+    """Return the path of the first string with an unpaired UTF-16 surrogate."""
+    if isinstance(value, str):
+        return (path or "body") if _LONE_SURROGATE_RE.search(value) else None
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = find_lone_surrogate(item, f"{path}.{key}" if path else str(key))
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            found = find_lone_surrogate(item, f"{path}[{i}]")
+            if found:
+                return found
+    return None
 
 
 def uses_native_reasoning_content(
@@ -264,7 +285,8 @@ def _extract_multimodal_content_list(content: list) -> list:
                         }
                     )
             elif item_type in ("video_url", "input_video"):
-                video_url_value = item.get("video_url", item.get("input_video"))
+                # model_dump() keeps video_url=None on input_video parts.
+                video_url_value = item.get("video_url") or item.get("input_video")
                 url = None
                 if isinstance(video_url_value, str):
                     url = video_url_value
@@ -744,7 +766,6 @@ def prepare_system_messages_for_template(
     tools: list[dict] | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     is_partial: bool = False,
-    merge_consecutive_roles: bool = True,
     unsupported_mid_system_policy: str = "strict",
 ) -> list[dict]:
     """Preserve cache-friendly mid-system turns when the template supports them.
@@ -758,10 +779,7 @@ def prepare_system_messages_for_template(
         unsupported_mid_system_policy = "strict"
 
     def strict_fallback() -> list[dict]:
-        prepared = _consolidate_system_messages(messages)
-        if merge_consecutive_roles:
-            prepared = _merge_consecutive_roles(prepared)
-        return prepared
+        return _merge_consecutive_roles(_consolidate_system_messages(messages))
 
     def unsupported_fallback() -> list[dict]:
         if unsupported_mid_system_policy == "user_note_safe":
@@ -771,9 +789,7 @@ def prepare_system_messages_for_template(
                 # consecutive system messages so strict templates (Qwen3.6+)
                 # that require a single leading system message don't fail.
                 prepared = _merge_consecutive_system_messages(prepared)
-                if merge_consecutive_roles:
-                    prepared = _merge_consecutive_roles(prepared)
-                return prepared
+                return _merge_consecutive_roles(prepared)
         return strict_fallback()
 
     if not is_partial and has_nonleading_system_message(messages):
@@ -1320,7 +1336,7 @@ def extract_multimodal_content(
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
         processed_messages = _consolidate_system_messages(processed_messages)
-    return processed_messages
+    return _merge_consecutive_roles(processed_messages)
 
 
 # =============================================================================

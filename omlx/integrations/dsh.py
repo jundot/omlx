@@ -361,6 +361,24 @@ def _append_entry(lines: list[str], entry: list[str]) -> list[str]:
 class _PatchLoader(yaml.SafeLoader):
     """SafeLoader that tolerates the ``!!js`` tags the patch layer allows."""
 
+    def construct_mapping(self, node, deep=False):  # type: ignore[no-untyped-def]
+        # The harness parser (js-yaml) rejects duplicate keys; PyYAML keeps the last.
+        seen: set[str] = set()
+        for key_node, _ in node.value:
+            if not isinstance(key_node, yaml.ScalarNode):
+                continue
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
+            if key_node.value in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key_node.value!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key_node.value)
+        return super().construct_mapping(node, deep=deep)
+
 
 def _unknown_tag(loader, tag_suffix, node):  # type: ignore[no-untyped-def]
     if isinstance(node, yaml.ScalarNode):
@@ -394,8 +412,9 @@ def _upsert_entry(
     bounds = _find_entry_bounds(lines, entry_id, entry_name)
     if bounds is None:
         header = [comment, f"- id: {entry_id}", f'  name: "{entry_name}"', "  config:"]
-        lines = _append_entry(lines, header + render_body(2))
-        return lines, len(lines) - len(header) + 3, 2, len(lines)
+        body = render_body(2)
+        lines = _append_entry(lines, header + body)
+        return lines, len(lines) - len(body) - 1, 2, len(lines)
     start, end = bounds
     lines, cfg_idx, cfg_indent, cfg_end = _ensure_block(
         lines, start, _entry_content_end(lines, start, end), "config", 2, render_body
@@ -507,10 +526,15 @@ def _validate_patch(
             raise ValueError("agent-default-model was not rewritten")
 
 
-def _write_config(path: Path, text: str) -> None:
+def _write_config(path: Path, text: str, *, secret: bool = False) -> None:
     """Back up, then write — dsh's own messages, naming the file in the warning."""
-    backup_then_write(path, text, failure=f"could not create backup for {path}",
-                      note="Config updated")
+    backup_then_write(
+        path,
+        text,
+        failure=f"could not create backup for {path}",
+        note="Config updated",
+        mode=0o600 if secret else None,
+    )
 
 
 def write_dsh_patch(
@@ -594,8 +618,9 @@ def write_credentials_ref(credentials_path: Path, ref_name: str, value: str) -> 
         )
 
     # The harness refuses to load a credential store with group/other bits.
+    # Create it 0600 so the key is never world-readable, even briefly.
     credentials_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _write_config(credentials_path, text)
+    _write_config(credentials_path, text, secret=True)
     credentials_path.chmod(0o600)
 
 

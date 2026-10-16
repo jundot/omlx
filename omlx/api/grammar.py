@@ -54,6 +54,28 @@ def create_grammar_compiler(tokenizer, model, *, cache_limit_bytes=-1):
     return xgr.GrammarCompiler(tokenizer_info, cache_limit_bytes=cache_limit_bytes)
 
 
+def mark_grammar_thinking_phase(
+    compiled_grammar, *, enabled: bool, optional: bool = False
+):
+    """Record whether oMLX compiled a separate reasoning phase.
+
+    Metadata travels with the Python CompiledGrammar wrapper through every
+    engine path. Bare or externally compiled grammars are conservative by
+    default: their accepted tokens need not include a forced thinking close.
+    An optional phase is opened by the model, not by the prompt, so a thinking
+    budget must wait for the opener before it counts.
+    """
+    from .._torch_stub import install as _install_torch_stub
+
+    _install_torch_stub()
+    import xgrammar as xgr
+
+    if isinstance(compiled_grammar, xgr.CompiledGrammar):
+        compiled_grammar._omlx_has_thinking_phase = enabled
+        compiled_grammar._omlx_thinking_phase_optional = optional
+    return compiled_grammar
+
+
 class GrammarConstraintProcessor:
     """Logits processor that enforces grammar constraints via xgrammar bitmask.
 
@@ -102,6 +124,10 @@ class GrammarConstraintProcessor:
 
         mx_bitmask = mx.array(self._bitmask)
         return self._apply_mask(mx_bitmask, logits, self._vocab_size)
+
+    def discard_pending(self) -> None:
+        """Forget the in-flight token; its row was dropped before it was sent."""
+        self._pending = False
 
     def accept_token(self, token_id: int) -> None:
         """Accept a generated token to advance matcher state."""

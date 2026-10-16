@@ -315,7 +315,7 @@ private struct RuntimeCacheSection: View {
 }
 
 /// Bytes → human-readable string. Mirrors `formatByteCount` in
-/// `omlx/admin/static/js/dashboard.js` — 1024-scaled, one decimal place.
+/// `apps/omlx-web/omlx_web/static/js/dashboard.js` — 1024-scaled, one decimal place.
 private func formatByteCount(_ bytes: Int64) -> String {
     let b = Double(max(0, bytes))
     if b >= 1024 * 1024 * 1024 { return String(format: "%.1f GB", b / (1024 * 1024 * 1024)) }
@@ -335,13 +335,13 @@ private struct StatTilesRow: View {
                 label: String(localized: "status.tile.total",
                               defaultValue: "Total Prefill Tokens",
                               comment: "Stat tile label for total prefill tokens processed"),
-                value: stats.map { fmtNum($0.totalPromptTokens) } ?? "—"
+                value: stats.map { CountFormat.compact($0.totalPromptTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cached",
                               defaultValue: "Cached Tokens",
                               comment: "Stat tile label for cached tokens"),
-                value: stats.map { fmtNum($0.totalCachedTokens) } ?? "—"
+                value: stats.map { CountFormat.compact($0.totalCachedTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cache_efficiency",
@@ -770,14 +770,4 @@ private struct UpdatesSection: View {
                       defaultValue: "Last checked \(formatter.string(from: date))",
                       comment: "Last-checked text when the last check was before today; placeholder is the formatted date and time")
     }
-}
-
-// MARK: - Helpers
-
-private func fmtNum(_ n: Int) -> String {
-    let v = Double(n)
-    if v >= 1e9 { return String(format: "%.2fB", v / 1e9) }
-    if v >= 1e6 { return String(format: "%.2fM", v / 1e6) }
-    if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
-    return String(n)
 }

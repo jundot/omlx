@@ -244,26 +244,15 @@ class _GLUStoreView:
 
 
 # One reader pool for the whole process. A miss is IO, not compute: the
-# useful width is the storage queue depth, so the default is wider than the
-# core count. ``OMLX_MOE_OFFLOAD_IO_WORKERS`` <= 1 (or unparseable) keeps the
-# serial path and creates no threads at all;
-# ``OMLX_MOE_OFFLOAD_IO_BATCH`` caps how many experts' payloads may be in
-# flight, which is what bounds the extra host memory the pipeline holds.
+# useful width is the storage queue depth, so it is wider than the core
+# count. ``_IO_WORKERS`` <= 1 keeps the serial path and creates no threads.
+# At most 4 x workers experts' payloads are in flight, which is what bounds
+# the extra host memory the pipeline holds.
 _IO_WORKERS = 12
 _IO_LOCK = threading.Lock()
 _IO_POOL: ThreadPoolExecutor | None = None
 _IO_BATCH = 0
 _IO_CONFIGURED = False
-
-
-def _env_int(name: str, default: int, invalid: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return invalid
 
 
 def _io_pool() -> ThreadPoolExecutor | None:
@@ -272,12 +261,9 @@ def _io_pool() -> ThreadPoolExecutor | None:
     with _IO_LOCK:
         if not _IO_CONFIGURED:
             _IO_CONFIGURED = True
-            workers = _env_int("OMLX_MOE_OFFLOAD_IO_WORKERS", _IO_WORKERS, 0)
+            workers = _IO_WORKERS
             if workers > 1:
-                _IO_BATCH = max(
-                    1,
-                    _env_int("OMLX_MOE_OFFLOAD_IO_BATCH", 4 * workers, 4 * workers),
-                )
+                _IO_BATCH = 4 * workers
                 _IO_POOL = ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix="omlx-moe-io"
                 )
@@ -291,13 +277,17 @@ def _io_batch() -> int:
 
 
 def _shutdown_io_pool() -> None:
-    """Drop the pool; the next fetch re-reads the environment (tests)."""
+    """Drop the pool; the next fetch rebuilds it from ``_IO_WORKERS`` (tests)."""
     global _IO_POOL, _IO_BATCH, _IO_CONFIGURED
     with _IO_LOCK:
         pool, _IO_POOL, _IO_BATCH, _IO_CONFIGURED = _IO_POOL, None, 0, False
     if pool is not None:
         pool.shutdown(wait=True)
 
+
+# Eviction score decay (the best setting of a replayed-trace grid).
+_SCORE_DECAY = 0.7
+_SCORE_DECAY_EVERY = 4
 
 # Poll interval while the overlap path waits on reads (see _GpuKeepalive).
 _KEEPALIVE_PERIOD_S = 50e-6
@@ -346,8 +336,20 @@ def _gpu_keepalive() -> _GpuKeepalive:
     return ka
 
 
+def _drain(pending: dict) -> None:
+    """Cancel or finish unused reads, so no read outlives the shard descriptors."""
+    futures = [f for group in pending.values() for _, _, _, f in group]
+    for future in futures:
+        future.cancel()
+    if futures:
+        wait(futures)
+
+
 class ExpertCache:
-    """Contiguous resident slots over one layer's experts, LRU eviction.
+    """Contiguous resident slots over one layer's experts.
+
+    A miss evicts the expert with the lowest decayed routing count (+1 per
+    route, x``_SCORE_DECAY`` every ``_SCORE_DECAY_EVERY`` calls).
 
     Holds no reference to the wrapped module's expert tensors — only the
     resident slots and the store view. That is the difference between saving
@@ -357,26 +359,23 @@ class ExpertCache:
 
     moe_offload_cache = True  # walked by materialize_offload_state / stats
 
-    def __init__(self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView):
+    def __init__(
+        self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView, floor: int = 1
+    ):
         self.n_experts = glu.gate_proj["weight"].shape[0]
-        self.capacity = min(capacity, self.n_experts)
+        self.full_capacity = min(capacity, self.n_experts)
+        # The capacity release_slots() shrinks to: the routing top-k floor.
+        self.floor = min(max(floor, 1), self.full_capacity)
         self.projs = _PROJS
         self.disk = disk
-        self.resident: dict[str, list] = {}
-        for name in self.projs:
-            lin = getattr(glu, name)
-            has_b = lin.get("biases") is not None
-            w, s = lin["weight"], lin["scales"]
-            b = lin["biases"] if has_b else None
-            self.resident[name] = [
-                mx.zeros((self.capacity,) + w.shape[1:], dtype=w.dtype),
-                mx.zeros((self.capacity,) + s.shape[1:], dtype=s.dtype),
-                (
-                    None
-                    if b is None
-                    else mx.zeros((self.capacity,) + b.shape[1:], dtype=b.dtype)
-                ),
+        self._slot_specs = {
+            name: [
+                None if lin.get(f) is None else (lin[f].shape[1:], lin[f].dtype)
+                for f in ("weight", "scales", "biases")
             ]
+            for name in self.projs
+            for lin in (getattr(glu, name),)
+        }
         # Per-projection quantization metadata: mixed-bit checkpoints (e.g.
         # oQ profiles with 8-bit down_proj over 4-bit gate/up) are valid and
         # must not inherit gate_proj's parameters.
@@ -388,11 +387,41 @@ class ExpertCache:
             )
             for name in self.projs
         }
-        self.slot_of: dict[int, int] = {}  # expert id -> slot, LRU ordered
-        self.free = list(range(self.capacity))
-        self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
+        self.score = np.zeros(self.n_experts, dtype=np.float32)
+        self._calls = 0
         self.hits = self.misses = 0
+        self.fetched_bytes = 0
+        self._allocate(self.full_capacity)
+        self.expert_bytes = sum(plan.nbytes for _, _, plan in self._plans(0))
+
+    def _allocate(self, capacity: int) -> None:
+        """Replace the slots with ``capacity`` empty ones, dropping every expert."""
+        self.capacity = capacity
+        self.resident: dict[str, list] = {
+            name: [
+                None if spec is None else mx.zeros((capacity,) + spec[0], dtype=spec[1])
+                for spec in specs
+            ]
+            for name, specs in self._slot_specs.items()
+        }
+        self.slot_of: dict[int, int] = {}  # Expert id -> slot
+        self.slot_expert = np.full(capacity, -1, dtype=np.int64)
+        self.free = list(range(capacity))
+        self.map = mx.full((self.n_experts,), -1, dtype=mx.int32)
         self.warm = False
+
+    def release_slots(self) -> int:
+        """Shrink to ``floor`` empty slots; return the slot bytes given up."""
+        if self.capacity <= self.floor:
+            return 0
+        freed = (self.capacity - self.floor) * self.expert_bytes
+        self._allocate(self.floor)
+        return freed
+
+    def restore_slots(self) -> None:
+        """Return to the full capacity after :meth:`release_slots`."""
+        if self.capacity < self.full_capacity:
+            self._allocate(self.full_capacity)
 
     def _plans(self, e: int) -> list:
         """Read plans for expert ``e``'s tensors, in slot-write order."""
@@ -405,14 +434,27 @@ class ExpertCache:
                 out.append((name, 2, self.disk.plan(name, "biases", e)))
         return out
 
-    def _reserve(self) -> int:
-        """Claim a slot, evicting the LRU expert if none is free."""
+    def _submit(self, pool, e: int) -> list:
+        """Start reading expert ``e``; a task per tensor keeps its reads parallel."""
+        return [
+            (name, field, plan, pool.submit(CheckpointExpertStore.read, plan))
+            for name, field, plan in self._plans(e)
+        ]
+
+    def _reserve(self, protected=frozenset()) -> int:
+        """Claim a slot, evicting the lowest-count expert outside ``protected``."""
         if self.free:
-            slot = self.free.pop()
-        else:
-            old_e = next(iter(self.slot_of))  # LRU victim
-            slot = self.slot_of.pop(old_e)
-            self.map[old_e] = -1
+            return self.free.pop()
+        scores = self.score[self.slot_expert]
+        for e in protected:
+            slot = self.slot_of.get(e)
+            if slot is not None:
+                scores[slot] = np.inf
+        slot = int(np.argmin(scores))
+        old_e = int(self.slot_expert[slot])
+        del self.slot_of[old_e]
+        self.slot_expert[slot] = -1
+        self.map[old_e] = -1
         return slot
 
     def _write(self, slot: int, payload: list) -> None:
@@ -420,13 +462,15 @@ class ExpertCache:
         for name, field, plan, raw in payload:
             self.resident[name][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
 
-    def _install(self, e: int, payload: list | None = None) -> int:
+    def _install(
+        self, e: int, payload: list | None = None, protected=frozenset()
+    ) -> int:
         if payload is None:
             payload = [
                 (n, f, pl, CheckpointExpertStore.read(pl))
                 for n, f, pl in self._plans(e)
             ]
-        slot = self._reserve()
+        slot = self._reserve(protected)
         try:
             self._write(slot, payload)
         except BaseException:
@@ -434,35 +478,38 @@ class ExpertCache:
             self.free.append(slot)
             raise
         self.slot_of[e] = slot
+        self.slot_expert[slot] = e
         self.map[e] = slot
+        self.fetched_bytes += self.expert_bytes
         self.warm = len(self.slot_of) == self.n_experts
         return slot
 
     def ensure(self, idx: mx.array) -> None:
-        """Make every expert in ``idx`` resident.
+        """Make every expert in ``idx`` resident; misses never evict the call's experts.
 
-        Two passes. The first classifies the call's misses without touching
-        any cache state and starts their reads on the IO pool, at most
-        ``OMLX_MOE_OFFLOAD_IO_BATCH`` experts in flight; the second is the
-        serial install loop, which takes bytes from the pipeline instead of
-        reading them itself (an expert the first pass did not queue, because
-        eviction unseated it in the meantime, falls back to a serial read).
-        Every mutation — ``slot_of``, ``free``, ``map``, the counters, the
-        slots — happens on the calling thread in the serial order, so LRU
-        victims, hit/miss counts and resident bytes are identical to the
-        serial path. Concurrent ``ensure`` calls on one cache stay
-        unsupported, exactly as before.
-
-        The ``.tolist()`` is a device->host readback and therefore a sync per
-        MoE layer per step. Removing it needs prefetch (resolve layer L+1's
-        residency during layer L's compute) — deliberately not in v1.
+        Reads run on the IO pool; slot writes and eviction stay on this thread.
         """
         if self.warm:  # nothing can miss; skip it
             return
-        self._ensure_ids(set(int(e) for e in idx.reshape(-1).tolist()))
+        self._ensure_ids(idx.reshape(-1).tolist())
 
-    def _ensure_ids(self, needed: set, on_slow_read=None) -> bool:
-        """:meth:`ensure` for a route set already read back from the device.
+    def _read_ahead(self, ids, limit: int) -> dict:
+        """Start the first ``limit`` misses' reads without touching cache state.
+
+        Pass the result to :meth:`_ensure_ids` as ``pending``."""
+        pool = _io_pool()
+        out: dict[int, list] = {}
+        if pool is None:
+            return out
+        for e in dict.fromkeys(int(e) for e in ids):
+            if len(out) >= limit:
+                break
+            if e not in self.slot_of:
+                out[e] = self._submit(pool, e)
+        return out
+
+    def _ensure_ids(self, ids, on_slow_read=None, pending=None) -> bool:
+        """:meth:`ensure` for routes already read back from the device.
 
         With ``on_slow_read`` (the decode overlap path), the call checks once,
         at its first miss and before any slot write, whether that expert's
@@ -471,46 +518,46 @@ class ExpertCache:
         is evaluated right before the first slot write, and the rest of the
         call's reads are waited on with the GPU kept busy (see
         :meth:`OffloadSwitchGLU._forward_overlap`). Returns whether that
-        happened.
+        happened. ``pending`` holds reads from :meth:`_read_ahead`.
         """
+        pending = dict(pending or {})
+        needed = list(dict.fromkeys(int(e) for e in ids))
+        if len(needed) > self.capacity:
+            _drain(pending)
+            raise ValueError("Expert cache capacity is smaller than the call's routes")
+        np.add.at(self.score, np.asarray(ids, dtype=np.int64), 1.0)
+        self._calls += 1
+        if self._calls % _SCORE_DECAY_EVERY == 0:
+            self.score *= _SCORE_DECAY
+        misses = [e for e in needed if e not in self.slot_of]
+        self.hits += len(needed) - len(misses)
+        if not misses:
+            _drain(pending)
+            return False
+        protected = frozenset(needed)
         pool = _io_pool()
-        queue = [e for e in needed if e not in self.slot_of] if pool is not None else []
         window = _io_batch()
-        pending: dict[int, list] = {}
         sent = 0
         keepalive = barrier = None
         slow = False
 
         def prefetch(upto: int) -> None:
             nonlocal sent
-            while sent < min(upto, len(queue)):
-                e = queue[sent]
+            if pool is None:
+                return
+            while sent < min(upto, len(misses)):
+                e = misses[sent]
                 sent += 1
-                pending[e] = []
-                for name, field, plan in self._plans(e):
-                    pending[e].append(
-                        (
-                            name,
-                            field,
-                            plan,
-                            pool.submit(CheckpointExpertStore.read, plan),
-                        )
-                    )
+                if e not in pending:
+                    pending[e] = self._submit(pool, e)
 
         try:
             prefetch(window)
             deadline = time.perf_counter() + _OVERLAP_GRACE_S
-            done = 0
-            for e in needed:
-                if e in self.slot_of:
-                    slot = self.slot_of.pop(e)  # re-insert: LRU order
-                    self.slot_of[e] = slot
-                    self.hits += 1
-                    continue
+            for done, e in enumerate(misses):
                 self.misses += 1
-                # Refill an exhausted window before falling back to a serial read.
-                if sent < len(queue) and queue[sent] == e:
-                    prefetch(done + window)
+                # Count the current payload in the window until its writes finish.
+                prefetch(done + window)
                 group = pending.get(e)
                 if on_slow_read is not None:  # the first miss: nothing written yet
                     futures = [f for _, _, _, f in group or ()]
@@ -521,10 +568,8 @@ class ExpertCache:
                         keepalive = _gpu_keepalive()
                     on_slow_read = None
                 if group is None:
-                    self._install(e)
+                    self._install(e, protected=protected)
                     continue
-                # Count the current payload in the window until its writes finish.
-                prefetch(done + window)
                 if keepalive is not None:
                     keepalive.wait([f for _, _, _, f in group])
                 if barrier is not None:
@@ -533,16 +578,11 @@ class ExpertCache:
                 self._install(
                     e,
                     [(name, field, plan, f.result()) for name, field, plan, f in group],
+                    protected,
                 )
                 del pending[e], group
-                done += 1
         finally:
-            # Finish reads before the store's shard descriptors can be released.
-            futures = [f for group in pending.values() for _, _, _, f in group]
-            for future in futures:
-                future.cancel()
-            if futures:
-                wait(futures)
+            _drain(pending)
         # No mx.eval here: installs are already-materialized host arrays, and
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the
@@ -575,17 +615,54 @@ class ExpertCache:
 _SORT_MIN_ROUTES = 64
 
 
+def _pad_floor(capacity: int) -> int:
+    # GatherQMM uses sorted QMM only when B >= 16 and B / E >= 4
+    # (E = resident slots); below that, padding would change kernels.
+    return max(16, 4 * capacity)
+
+
+def _expert_route_chunks(
+    run_starts: np.ndarray, n_routes: int, capacity: int
+) -> list[tuple[int, int]]:
+    """Chunks of at most ``capacity`` experts, power-of-two sized if that pads less."""
+    cuts = run_starts[::capacity].tolist() + [n_routes]
+    whole = list(zip(cuts[:-1], cuts[1:]))
+    floor = _pad_floor(capacity)
+    if any(end - start < floor for start, end in whole):
+        return whole
+    packed = []
+    start = 0
+    while start < n_routes:
+        first = int(np.searchsorted(run_starts, start, side="right")) - 1
+        last = first + capacity
+        limit = int(run_starts[last]) if last < len(run_starts) else n_routes
+        size = 1 << ((limit - start).bit_length() - 1)
+        tail = n_routes - start - size
+        if 0 < tail < floor:
+            size = size // 2 if size // 2 >= floor else limit - start
+        if size < floor:
+            return whole
+        packed.append((start, start + size))
+        start += size
+
+    def padded_rows(chunks):
+        return sum(1 << (end - start - 1).bit_length() for start, end in chunks)
+
+    return packed if padded_rows(packed) < padded_rows(whole) else whole
+
+
 class OffloadSwitchGLU(nn.Module):
     """SwitchGLU whose experts live in an :class:`ExpertCache`."""
 
-    def __init__(self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView):
+    def __init__(
+        self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView, floor: int = 1
+    ):
         super().__init__()
-        self.cache = ExpertCache(glu, capacity, disk)
+        self.cache = ExpertCache(glu, capacity, disk, floor)
         self.activation = glu.activation
         # Fetch/compute overlap in decode: the GPU stays busy while slow
-        # reads of missing experts are pending. OMLX_MOE_OFFLOAD_OVERLAP=0
-        # keeps the serial order (read, then compute) for every step.
-        self._overlap = os.environ.get("OMLX_MOE_OFFLOAD_OVERLAP", "1") != "0"
+        # reads of missing experts are pending.
+        self._overlap = True
 
     def _glu(self, x: mx.array, slots: mx.array) -> mx.array:
         c = self.cache
@@ -640,7 +717,7 @@ class OffloadSwitchGLU(nn.Module):
                 mx.async_eval(y_hit)
             return y_hit
 
-        slow = c._ensure_ids(set(flat), on_slow_read)
+        slow = c._ensure_ids(flat, on_slow_read)
         if y_hit is None:  # fast reads, or no resident route: one gather
             out = self._glu(mx.expand_dims(x, (-2, -3)), mx.take(c.map, indices))
             out = out.squeeze(-2)
@@ -688,10 +765,10 @@ class OffloadSwitchGLU(nn.Module):
         """Over-capacity prefill: chunk the routes on expert boundaries.
 
         ``ids[t * k + j]`` is the expert of token ``t``'s ``j``-th route. The
-        routes are sorted by expert and cut into chunks holding every route
-        of up to ``capacity`` distinct experts, the same shape as the
-        DeepSeek V4.1 adapter's sorted prefill: an expert's routes all land
-        in one chunk, so each expert is installed at most once per call
+        routes are sorted by expert, resident experts first, and cut into
+        chunks of up to ``capacity`` distinct experts (see
+        :func:`_expert_route_chunks`), the same shape as the DeepSeek V4.1
+        adapter's sorted prefill: each expert is installed at most once per call
         (the token-chunked path re-fetched an expert in every chunk that
         touched it, evicting on the way). Routes within a chunk are
         independent — the cross-expert weighted sum happens in the caller —
@@ -699,52 +776,65 @@ class OffloadSwitchGLU(nn.Module):
         the resident model would choose for the whole call (sorted at or
         above the stock threshold, else unsorted), and the outputs are put
         back in route order once at the end. Each chunk is evaluated before
-        the next is built, which bounds the prefill transient.
+        the next is built, which bounds the prefill transient. The next
+        chunk's first reads start before that eval; their slot writes wait.
         """
         c = self.cache
         d_model = flat_x.shape[-1]
         ids_np = np.asarray(ids, dtype=np.int64)
-        order = np.argsort(ids_np, kind="stable")  # routes grouped by expert
+        resident = np.zeros(c.n_experts, dtype=np.bool_)
+        resident[c.slot_expert[c.slot_expert >= 0]] = True
+        # Resident experts first: a miss evicts only experts already used.
+        rank = ids_np + (~resident[ids_np]) * c.n_experts
+        order = np.argsort(rank, kind="stable")  # routes grouped by expert
         sorted_ids = ids_np[order]
         # every position where a new expert's run begins, chunked by capacity
         run_starts = np.flatnonzero(np.diff(sorted_ids)) + 1
         run_starts = np.concatenate(([0], run_starts))
-        cuts = run_starts[:: c.capacity].tolist() + [len(ids)]
+        chunks = _expert_route_chunks(run_starts, len(ids), c.capacity)
         outs = []
-        for start, end in zip(cuts[:-1], cuts[1:]):
-            chunk_ids = sorted_ids[start:end]
-            c.ensure(mx.array(np.unique(chunk_ids), dtype=mx.int32))
-            n_routes = end - start
-            padded_routes = n_routes
-            # GatherQMM uses sorted QMM only when B >= 16 and B / E >= 4
-            # (E = resident slots); below that, padding would change kernels.
-            if n_routes >= max(16, 4 * c.capacity):
-                # Power-of-two sizes repeat across layers, so the Metal pool
-                # reuses those buffers instead of keeping one per size.
-                padded_routes = 1 << (n_routes - 1).bit_length()
-            token_ids = order[start:end] // k
-            if padded_routes != n_routes:
-                chunk_ids = np.pad(
-                    chunk_ids, (0, padded_routes - n_routes), mode="edge"
-                )
-                token_ids = np.pad(
-                    token_ids, (0, padded_routes - n_routes), mode="edge"
-                )
-            slots = mx.take(c.map, mx.array(chunk_ids, dtype=mx.int32))
-            slots = slots.reshape(-1, 1)
-            t_idx = mx.array(token_ids, dtype=mx.int32)
-            xe = mx.expand_dims(mx.take(flat_x, t_idx, axis=0), (-2, -3))
-            inv = None
-            if do_sort:
-                xe, slots, inv = _gather_sort(xe, slots)
-            up = c.qmm("up_proj", xe, slots, do_sort)
-            gate = c.qmm("gate_proj", xe, slots, do_sort)
-            o = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
-            if do_sort:
-                o = _scatter_unsort(o, inv, (padded_routes, 1))
-            o = o.squeeze(-2)[:n_routes, 0, :]
-            mx.eval(o)
-            outs.append(o)
+        ahead: dict = {}
+        try:
+            for n, (start, end) in enumerate(chunks):
+                chunk_ids = sorted_ids[start:end]
+                c._ensure_ids(np.unique(chunk_ids).tolist(), pending=ahead)
+                ahead = {}
+                n_routes = end - start
+                padded_routes = n_routes
+                if n_routes >= _pad_floor(c.capacity):
+                    # Power-of-two sizes repeat across layers, so the Metal pool
+                    # reuses those buffers instead of keeping one per size.
+                    padded_routes = 1 << (n_routes - 1).bit_length()
+                token_ids = order[start:end] // k
+                if padded_routes != n_routes:
+                    chunk_ids = np.pad(
+                        chunk_ids, (0, padded_routes - n_routes), mode="edge"
+                    )
+                    token_ids = np.pad(
+                        token_ids, (0, padded_routes - n_routes), mode="edge"
+                    )
+                slots = mx.take(c.map, mx.array(chunk_ids, dtype=mx.int32))
+                slots = slots.reshape(-1, 1)
+                t_idx = mx.array(token_ids, dtype=mx.int32)
+                xe = mx.expand_dims(mx.take(flat_x, t_idx, axis=0), (-2, -3))
+                inv = None
+                if do_sort:
+                    xe, slots, inv = _gather_sort(xe, slots)
+                up = c.qmm("up_proj", xe, slots, do_sort)
+                gate = c.qmm("gate_proj", xe, slots, do_sort)
+                o = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
+                if do_sort:
+                    o = _scatter_unsort(o, inv, (padded_routes, 1))
+                o = o.squeeze(-2)[:n_routes, 0, :]
+                if n + 1 < len(chunks):
+                    s1, e1 = chunks[n + 1]
+                    ahead = c._read_ahead(
+                        np.unique(sorted_ids[s1:e1]).tolist(), _io_batch()
+                    )
+                mx.eval(o)
+                outs.append(o)
+        finally:
+            _drain(ahead)
         out = mx.concatenate(outs, axis=0)
         inverse = mx.array(np.argsort(order, kind="stable"), dtype=mx.int32)
         return mx.take(out, inverse, axis=0).reshape(-1, k, d_model)
@@ -948,10 +1038,9 @@ def apply_moe_expert_offload(
 ) -> int:
     """Replace covered SwitchGLU instances with offloaded ones.
 
-    Returns the number of layers wrapped (0 when disabled via
-    ``OMLX_MOE_EXPERT_OFFLOAD=0``, the model has no stock SwitchGLU, or the
-    checkpoint does not cover them). Must run before lazy weights are
-    materialized for the memory saving to exist.
+    Returns the number of layers wrapped (0 when the model has no stock
+    SwitchGLU or the checkpoint does not cover them). Must run before lazy
+    weights are materialized for the memory saving to exist.
 
     ``mtp_resident`` keeps the embedded MTP draft head's experts resident
     (glm5_next Lightning MTP + offload; see
@@ -959,8 +1048,6 @@ def apply_moe_expert_offload(
     ``mtp.*`` is skipped by the generic traversal below). Other families
     reject the combination at validation.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
-        return 0
     model_dir = _resolve_model_dir(model_path)
     if model_dir is None:
         return 0
@@ -1017,7 +1104,7 @@ def apply_moe_expert_offload(
         )
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
-        new = OffloadSwitchGLU(glu, capacity, view)
+        new = OffloadSwitchGLU(glu, capacity, view, minimum)
         if isinstance(parent, nn.Module):
             setattr(parent, key, new)  # registers via Module.__setattr__
         else:
@@ -1061,8 +1148,6 @@ def estimate_offload_admission_bytes(
     do not under-report the resident share. Falls back to ``full_size`` on
     any failure — admission must never get more permissive by accident.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
-        return full_size
     try:
         model_dir = _resolve_model_dir(model_path)
         if model_dir is None:
@@ -1164,34 +1249,20 @@ def materialize_offload_state(model) -> int:
     moment the VLM path ran with offload enabled. Call this right after
     ``apply_moe_expert_offload``; returns the number of layers materialized.
     """
+    caches = moe_offload_caches(model)
     arrays = []
-    layers = 0
-    stack = [model]
-    seen = set()
-    while stack:
-        obj = stack.pop()
-        if id(obj) in seen:
-            continue
-        seen.add(id(obj))
-        cache = getattr(obj, "cache", None)
-        if getattr(cache, "moe_offload_cache", False):
-            layers += 1
-            arrays.append(cache.map)
-            for triple in cache.resident.values():
-                arrays.extend(a for a in triple if a is not None)
-            continue
-        if isinstance(obj, dict):
-            stack.extend(obj.values())
-        elif isinstance(obj, (list, tuple)):
-            stack.extend(obj)
+    for cache in caches:
+        arrays.append(cache.map)
+        for triple in cache.resident.values():
+            arrays.extend(a for a in triple if a is not None)
     if arrays:
         mx.eval(*arrays)
-    return layers
+    return len(caches)
 
 
-def moe_offload_stats(model) -> dict:
-    """Aggregate hit/miss counters over all offloaded layers."""
-    hits = misses = layers = 0
+def moe_offload_caches(model) -> list:
+    """Every offload cache under ``model``, in no particular order."""
+    caches = []
     stack = [model]
     seen = set()
     while stack:
@@ -1201,20 +1272,42 @@ def moe_offload_stats(model) -> dict:
         seen.add(id(obj))
         cache = getattr(obj, "cache", None)
         if getattr(cache, "moe_offload_cache", False):
-            hits += cache.hits
-            misses += cache.misses
-            layers += 1
+            caches.append(cache)
             continue
         if isinstance(obj, dict):
             stack.extend(obj.values())
         elif isinstance(obj, (list, tuple)):
             stack.extend(obj)
+    return caches
+
+
+def release_moe_offload_slots(caches) -> int:
+    """Shrink every cache to its floor for a prefill; return the bytes given up.
+
+    Expert-major prefill streams almost every expert anyway; decode restores them."""
+    return sum(c.release_slots() for c in caches if hasattr(c, "release_slots"))
+
+
+def restore_moe_offload_slots(caches) -> None:
+    """Return every cache shrunk by :func:`release_moe_offload_slots` to full size."""
+    for c in caches:
+        if hasattr(c, "restore_slots"):
+            c.restore_slots()
+
+
+def moe_offload_stats(model=None, caches=None) -> dict:
+    """Aggregate hit/miss/byte counters over all offloaded layers."""
+    if caches is None:
+        caches = moe_offload_caches(model)
+    hits = sum(c.hits for c in caches)
+    misses = sum(c.misses for c in caches)
     total = hits + misses
     return {
-        "layers": layers,
+        "layers": len(caches),
         "hits": hits,
         "misses": misses,
         "hit_rate": (hits / total) if total else None,
+        "fetched_bytes": sum(getattr(c, "fetched_bytes", 0) for c in caches),
     }
 
 
@@ -1223,5 +1316,8 @@ __all__ = [
     "OffloadSwitchGLU",
     "apply_moe_expert_offload",
     "materialize_offload_state",
+    "moe_offload_caches",
     "moe_offload_stats",
+    "release_moe_offload_slots",
+    "restore_moe_offload_slots",
 ]

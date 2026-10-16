@@ -65,7 +65,7 @@ inline float omlx_qdot16(uint2 w, thread const float* x, float scale) {
 struct OmlxSigmoid {
   template <typename U>
   U operator()(U x) thread {
-    auto y = 1 / (1 + metal::exp(metal::abs(x)));
+    auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
     return (x < 0) ? y : 1 - y;
   }
 };

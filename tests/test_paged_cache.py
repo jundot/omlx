@@ -528,6 +528,19 @@ class TestPagedCacheManager:
         assert manager.free_blocks == initial_free + 1
         assert block_id not in manager.allocated_blocks
 
+    def test_free_block_clears_hash_and_token_count(self):
+        """Free-queue blocks must carry no stale hash or token_count."""
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        block.block_hash = compute_block_hash(None, [1, 2, 3])
+        block.token_count = 3
+
+        assert manager.free_block(block.block_id) is True
+        assert block.block_hash is None
+        assert block.token_count == 0
+        assert manager.cold_block_count == 0
+
     def test_free_block_shared(self):
         """Test freeing a shared block only decrements ref_count."""
         manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
@@ -541,6 +554,50 @@ class TestPagedCacheManager:
         assert result is False  # Not actually freed
         assert block.ref_count == 1
         assert manager.free_blocks == initial_free  # No change
+
+    def test_evict_block_permanently_no_double_enqueue(self):
+        """Evicting a block already in the free queue must not re-link it.
+
+        get_evictable_blocks() walks the free queue, so most evictees are
+        already linked; a second append corrupts the chain — num_free_blocks
+        over-counts and two popleft()s can hand out the same block.
+        """
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        manager.register_block_hash(block, [1, 2, 3])
+        block_id = block.block_id
+        queue_before = manager.free_block_queue.num_free_blocks
+
+        # Free puts it in the queue; evict walks the same queue.
+        assert manager.free_block(block_id) is True
+        assert manager.evict_block_permanently(block_id) is True
+
+        assert manager.free_block_queue.num_free_blocks == queue_before + 1
+        assert block.block_hash is None
+
+        # The queue must still hand out distinct blocks: drain everything
+        # and check for duplicates.
+        seen = set()
+        while manager.free_block_queue.num_free_blocks > 0:
+            drained = manager.free_block_queue.popleft()
+            assert drained.block_id not in seen
+            seen.add(drained.block_id)
+
+    def test_evict_block_permanently_enqueues_unqueued_block(self):
+        """An allocated block with ref 0 (not in the queue) gets enqueued."""
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        block_id = block.block_id
+        # Simulate a ref-0 allocated block outside the free queue.
+        manager.allocated_blocks[block_id] = block
+        block.ref_count = 0
+        queue_before = manager.free_block_queue.num_free_blocks
+
+        assert manager.evict_block_permanently(block_id) is True
+        assert manager.free_block_queue.num_free_blocks == queue_before + 1
+        assert block.next_free_block is not None
 
     def test_increment_ref(self):
         """Test incrementing reference count."""

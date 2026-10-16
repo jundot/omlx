@@ -2,6 +2,7 @@
 """Join recovery across process restarts and unreachable coordinators."""
 
 import errno
+import io
 import json
 import socket
 import stat
@@ -299,7 +300,13 @@ def test_redirect_after_delivered_request_keeps_cancellation_proof(tmp_path):
         def log_message(self, *args):
             pass
 
-    server = HTTPServer(("127.0.0.1", 0), RedirectHandler)
+    class LoopbackServer(HTTPServer):
+        def server_bind(self):
+            # Skip HTTPServer's reverse DNS lookup; it can stall CI runners.
+            super(HTTPServer, self).server_bind()
+            self.server_name, self.server_port = self.server_address[:2]
+
+    server = LoopbackServer(("127.0.0.1", 0), RedirectHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     joiner._http_post = _default_http_post
@@ -313,3 +320,208 @@ def test_redirect_after_delivered_request_keeps_cancellation_proof(tmp_path):
         server.shutdown()
         thread.join()
         server.server_close()
+
+
+@pytest.mark.parametrize(
+    "status, body, terminal",
+    [
+        (404, b'{"detail": "no pending join request"}', True),
+        (404, b'{"detail": "Not Found"}', False),
+        (404, b"<html>Not Found</html>", False),
+        (404, b"", False),
+        (404, b"null", False),
+        (404, b'{"detail": ["no pending join request"]}', False),
+        (404, b"\xff", False),
+        (
+            404,
+            b'{"detail": "no pending join request", "padding": "' + b"x" * 4096 + b'"}',
+            False,
+        ),
+        (403, b'{"detail": "invalid cancellation token"}', True),
+        (409, b'{"detail": "no pending join request"}', False),
+        (500, b'{"detail": "no pending join request"}', False),
+    ],
+    ids=[
+        "missing-request",
+        "missing-endpoint",
+        "html",
+        "empty",
+        "null",
+        "wrong-detail-type",
+        "invalid-utf8",
+        "oversized",
+        "superseded",
+        "conflict",
+        "server-error",
+    ],
+)
+def test_withdrawal_http_response_requires_explicit_missing_request(
+    tmp_path, status, body, terminal
+):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    original_post = joiner._http_post
+    joiner.ui_session.begin("coordinator:8000")
+    token = joiner.ui_session.attempt["cancel_token"]
+    coordinator.deny(joiner.node_id)
+
+    def http_post(url, payload, timeout):
+        if url.endswith("/request/cancel"):
+            raise HTTPError(url, status, "response", {}, io.BytesIO(body))
+        return original_post(url, payload, timeout)
+
+    joiner._http_post = http_post
+    cancelled = joiner.ui_session.cancel()
+    assert cancelled["state"] == "idle"
+    assert cancelled["cleanup_pending"] is not terminal
+    restored = _restart(tmp_path, joiner)
+    assert restored.ui_session.snapshot()["cleanup_pending"] is not terminal
+    if terminal:
+        restored.ui_session.begin("coordinator:8000")
+        assert restored.ui_session.attempt["cancel_token"] != token
+    else:
+        assert restored.ui_session.withdrawals[0]["cancel_token"] == token
+        with pytest.raises(PairingRequestError, match="not confirmed cleanup"):
+            restored.ui_session.begin("coordinator:8000")
+        assert restored.ui_session.withdrawals[0]["cancel_token"] == token
+
+
+def test_current_coordinator_missing_request_returns_success(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    joiner.ui_session.begin("coordinator:8000")
+    coordinator.deny(joiner.node_id)
+    assert joiner.ui_session.cancel()["cleanup_pending"] is False
+    assert _restart(tmp_path, joiner).ui_session.snapshot()["cleanup_pending"] is False
+
+
+def test_withdrawal_404_body_read_failure_retains_proof(tmp_path):
+    _, joiner, *_ = _loopback_pair(tmp_path)
+    joiner.ui_session.begin("coordinator:8000")
+    token = joiner.ui_session.attempt["cancel_token"]
+
+    class BrokenBody(io.BytesIO):
+        def read(self, *args):
+            raise OSError("response body unavailable")
+
+    def http_post(url, payload, timeout):
+        raise HTTPError(url, 404, "Not Found", {}, BrokenBody())
+
+    joiner._http_post = http_post
+    assert joiner.ui_session.cancel()["cleanup_pending"] is True
+    restored = _restart(tmp_path, joiner)
+    assert restored.ui_session.withdrawals[0]["cancel_token"] == token
+
+
+def test_forget_cleanup_preserves_approved_pairing_and_survives_restart(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    shown = joiner.ui_session.begin("coordinator:8000")
+    coordinator.approve(joiner.node_id, shown["code"])
+    assert joiner.ui_session.poll()["state"] == "approved"
+    session = joiner.ui_session
+    session.withdrawals = [{"coordinator_addr": "old:8000", "cancel_token": "a" * 64}]
+    session._save()
+    attempt = dict(session.attempt)
+    peers = joiner.paired_devices()
+
+    def no_network(*args):
+        pytest.fail("forget cleanup must not contact any peer")
+
+    joiner._http_post = no_network
+    joiner._http_get = no_network
+    result = session.forget_cleanup()
+    assert result["cleanup_pending"] is False
+    assert result["state"] == "approved"
+    assert session.attempt == attempt
+    assert joiner.paired_devices() == peers
+    assert _restart(tmp_path, joiner).ui_session.snapshot()["cleanup_pending"] is False
+    assert session.forget_cleanup()["cleanup_pending"] is False
+
+
+def test_forget_cleanup_save_failure_restores_pending_proof(tmp_path, monkeypatch):
+    _, joiner, *_ = _loopback_pair(tmp_path)
+    session = joiner.ui_session
+    proof = {"coordinator_addr": "old:8000", "cancel_token": "a" * 64}
+    session.withdrawals = [proof]
+    session._save()
+    saved = session.path.read_bytes()
+
+    def fail_save():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(session, "_save", fail_save)
+    with pytest.raises(OSError, match="disk full"):
+        session.forget_cleanup()
+    assert session.withdrawals == [proof]
+    assert session.path.read_bytes() == saved
+
+
+def test_forget_cleanup_endpoint_is_admin_only_and_reports_storage_failure(
+    tmp_path, monkeypatch
+):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from omlx.cluster import pairing_routes
+
+    _, joiner, *_ = _loopback_pair(tmp_path)
+    monkeypatch.setattr(pairing_routes, "_get_pairing_manager", lambda: joiner)
+    path = "/api/cluster/pair/join/cleanup"
+    assert path not in {route.path for route in pairing_routes.pair_router.routes}
+    app = FastAPI()
+    app.include_router(pairing_routes.pair_admin_router)
+    client = TestClient(app)
+    assert client.delete(path).json()["cleanup_pending"] is False
+    joiner.ui_session.withdrawals = [
+        {"coordinator_addr": "old:8000", "cancel_token": "a" * 64}
+    ]
+
+    def fail_save():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(joiner.ui_session, "_save", fail_save)
+    assert client.delete(path).status_code == 503
+    assert joiner.ui_session.withdrawals
+
+
+def test_forget_cleanup_serializes_with_inflight_retry(tmp_path):
+    import threading
+
+    _, joiner, *_ = _loopback_pair(tmp_path)
+    session = joiner.ui_session
+    session.withdrawals = [{"coordinator_addr": "old:8000", "cancel_token": "a" * 64}]
+    session._save()
+    entered = threading.Event()
+    release = threading.Event()
+    forgotten = threading.Event()
+    errors = []
+
+    def http_post(*args):
+        entered.set()
+        assert release.wait(5)
+        raise OSError("peer offline")
+
+    def forget():
+        try:
+            session.forget_cleanup()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            forgotten.set()
+
+    joiner._http_post = http_post
+    retry = threading.Thread(target=session._retry_withdrawal)
+    retry.start()
+    assert entered.wait(5)
+    worker = threading.Thread(target=forget)
+    worker.start()
+    try:
+        assert not forgotten.wait(0.05)
+    finally:
+        release.set()
+        retry.join(5)
+        worker.join(5)
+    assert not retry.is_alive()
+    assert not worker.is_alive()
+    assert not errors
+    assert forgotten.is_set()
+    assert session.snapshot()["cleanup_pending"] is False
+    assert _restart(tmp_path, joiner).ui_session.snapshot()["cleanup_pending"] is False

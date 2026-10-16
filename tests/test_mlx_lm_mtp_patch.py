@@ -18,14 +18,25 @@ from mlx.utils import tree_flatten
 from omlx.cache.type_registry import CacheTypeRegistry
 from mlx_lm.generate_utils import BatchCounters
 from mlx_lm.generate import BatchGenerator
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models import qwen3, qwen3_5
+from mlx_lm.models.cache import KVCache, make_prompt_cache
+from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
 from omlx.model_settings import ModelSettings
 from omlx.patches import mlx_lm_mtp
+from omlx.patches.laguna import laguna_model
 from omlx.patches.mlx_lm_mtp import batch_generator as bg
-from omlx.patches.mlx_lm_mtp import batched_head, cache_rollback
+from omlx.patches.mlx_lm_mtp import (
+    batched_head,
+    cache_rollback,
+    fused_batch,
+    qwen35_model,
+)
 from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
 from omlx.patches.mlx_vlm_mtp import qwen35_verify_linear
+from omlx.patches.vlm_batch_kv_capacity import apply_batch_kv_capacity_patch
+from omlx.speculative import dflash as dd
 from omlx.utils.model_loading import (
     _has_mtp_heads,
     _is_mtp_compatible,
@@ -82,7 +93,9 @@ class TestCacheRollback:
 
 class TestMtpBoundaryCommit:
     @staticmethod
-    def _run_full_accept_cycle(monkeypatch, *, emitted, drafts, clamp=None):
+    def _run_full_accept_cycle(
+        monkeypatch, *, emitted, drafts, clamp=None, context_copy=None
+    ):
         import mlx.core as mx
 
         from omlx.patches.mlx_lm_mtp import batch_generator as bg
@@ -104,6 +117,8 @@ class TestMtpBoundaryCommit:
             drafts=mx.array(draft_ids, dtype=mx.uint32),
             draft_lps=[mx.zeros((32,)) for _ in draft_ids],
         )
+        if context_copy is not None:
+            state.context_copy = context_copy
 
         def logits_for(targets):
             rows = []
@@ -180,6 +195,29 @@ class TestMtpBoundaryCommit:
         assert emitted_sources[-1] == boundary_source
         assert len(batch.tokens[0]) == 4
         assert cache.offset == 4
+
+    def test_boundary_emit_replaces_copied_drafts(self, monkeypatch):
+        from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+        copier = SimpleNamespace(
+            extend=lambda history, committed: False,
+            propose=lambda limit: [1, 2],
+            observe=lambda accepted, drafted=None: None,
+        )
+        original = bg._materialize_mtp_boundary_emit
+        copy_labels = []
+
+        def materialize(batch, state):
+            copy_labels.append(state.copy_drafts)
+            original(batch, state)
+
+        monkeypatch.setattr(bg, "_materialize_mtp_boundary_emit", materialize)
+        _batch, state, _cache = self._run_full_accept_cycle(
+            monkeypatch, emitted=2, drafts=1, context_copy=copier
+        )
+
+        assert copy_labels == [True]
+        assert state.copy_drafts is False
 
 
 class TestQwen35Model:
@@ -2583,6 +2621,15 @@ class TestRotatingCacheMtpUndo:
 
         self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]), num_drafts=8)
 
+    @pytest.mark.parametrize("num_drafts", [1, 3, 8])
+    def test_vlm_batch_rotating_kv_cache_undo(self, num_drafts):
+        """Gemma 4's sliding layers use mlx-vlm's own rotating cache."""
+        vlm_cache = pytest.importorskip("mlx_vlm.models.cache")
+
+        self._run_equivalence(
+            lambda: vlm_cache.BatchRotatingKVCache(8, [0]), num_drafts=num_drafts
+        )
+
     def test_unarmed_update_keeps_stock_semantics(self):
         import mlx.core as mx
 
@@ -2791,8 +2838,12 @@ def _quiet_prefill_tracker():
     from omlx.prefill_progress import get_prefill_tracker
 
     get_prefill_tracker().clear()
+    # Batch parking verdicts outlive a cohort (per model object); a model a
+    # fixture reuses must not start a test parked by an earlier one.
+    bg._BATCH_PARK_MEMORY.clear()
     yield
     get_prefill_tracker().clear()
+    bg._BATCH_PARK_MEMORY.clear()
 
 
 class TestLoopTaxHygiene:
@@ -3450,9 +3501,10 @@ class TableDrafter:
 
     target_layer_ids = [1, 3]
 
-    def __init__(self, depth, wrong_from=None):
+    def __init__(self, depth, wrong_from=None, adaptive=False):
         self.depth = depth
         self.wrong_from = wrong_from
+        self.adaptive = adaptive
         self.fed = {}
         self.released = []
         self.jobs = 0
@@ -3500,17 +3552,22 @@ class TableDrafter:
         self.released.extend(uids)
 
 
-def _drafted_counting_model(depth, wrong_from=None):
+def _drafted_counting_model(depth, wrong_from=None, adaptive=False):
     model = CapturingCountingModel()
     model._omlx_mtp_depth = depth
-    model._omlx_drafter = TableDrafter(depth, wrong_from=wrong_from)
+    model._omlx_drafter = TableDrafter(depth, wrong_from=wrong_from, adaptive=adaptive)
     return model
 
 
+def _verify_widths(model):
+    return [shape for shape, _ in model.captures if shape[1] > 1]
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
 @pytest.mark.parametrize("wrong_from", [None, 0, 2])
 @pytest.mark.parametrize("late_join", [False, True])
 def test_block_drafter_matches_standard_and_feeds_committed_context(
-    wrong_from, late_join
+    wrong_from, late_join, adaptive
 ):
     prompts = [[1, 2], [10, 11, 12], [30, 31]]
     limits = [12, 8, 15]
@@ -3518,7 +3575,7 @@ def test_block_drafter_matches_standard_and_feeds_committed_context(
     standard._omlx_mtp_decode_enabled = False
     expected, _ = generate(standard, prompts, limits, late_join=late_join)
 
-    model = _drafted_counting_model(5, wrong_from=wrong_from)
+    model = _drafted_counting_model(5, wrong_from=wrong_from, adaptive=adaptive)
     output, terminal = generate(model, prompts, limits, late_join=late_join)
     assert output == expected
     drafter = model._omlx_drafter
@@ -3527,9 +3584,11 @@ def test_block_drafter_matches_standard_and_feeds_committed_context(
     assert all(ids == drafter.target_layer_ids for _, ids in model.captures)
     # Each row's context holds exactly one hidden per committed position:
     # the last prompt token, then every emitted token except the newest
-    # one, which is still the anchor. Rejected drafts never enter it.
+    # one, which is still the anchor. Rejected drafts never enter it. An
+    # adaptive row may hand over to ordinary decode (calibration or park),
+    # whose pipelined step also forwards the newest token.
     for uid in terminal:
-        assert drafter.fed[uid] == len(output[uid])
+        assert drafter.fed[uid] - len(output[uid]) in ((0, 1) if adaptive else (0,))
     # Finished rows leave the drafter registry.
     assert sorted(drafter.released) == sorted(terminal)
 
@@ -3553,6 +3612,292 @@ def test_block_drafter_serves_sampled_rows_with_draft_distribution():
         1: "length",
     }
     assert model._omlx_drafter.jobs > 0
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+@pytest.mark.parametrize("rows", [1, 3])
+def test_block_drafter_depth_controller_narrows_verify_window(adaptive, rows):
+    """An adaptive drafter verifies the depths its controller picks."""
+    prompts = [[1, 2], [10, 11, 12], [30, 31]][:rows]
+    limits = [40] * rows
+    standard = CapturingCountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, prompts, limits)
+
+    model = _drafted_counting_model(7, wrong_from=1, adaptive=adaptive)
+    output, _ = generate(model, prompts, limits)
+    assert output == expected
+    shapes = _verify_widths(model)
+    # Rows that share a window keep verifying together.
+    assert {batch for batch, _ in shapes} == {rows}
+    widths = [width for _, width in shapes]
+    if not adaptive:
+        assert set(widths) == {8}
+    elif rows == 1:
+        # The singleton controller's warmup sweep measures every depth.
+        assert widths[:7] == [8, 7, 6, 5, 4, 3, 2]
+    else:
+        # The cohort policy measures each depth three times, deepest first.
+        assert widths[:6] == [8, 8, 8, 7, 7, 7]
+
+
+def test_block_drafter_clips_sampled_draft_distributions():
+    """A narrowed window verifies against the matching prefix of q."""
+    from omlx.utils.sampling import make_sampler
+
+    mx.random.seed(5)
+    model = _drafted_counting_model(5, wrong_from=0, adaptive=True)
+    output, terminal = generate(
+        model, [[1, 2], [10, 11]], [30, 30], samplers=[None, make_sampler(temp=0.7)]
+    )
+    assert output[0] == list(range(3, 33))
+    assert output[1] == list(range(12, 42))
+    assert {r.finish_reason for r in terminal.values()} == {"length"}
+    assert min(width for _, width in _verify_widths(model)) < 6
+
+
+def _tiny_qwen3(seed=0, layers=6, hidden=32, vocab=64):
+    mx.random.seed(seed)
+    model = qwen3.Model(
+        qwen3.ModelArgs(
+            model_type="qwen3",
+            hidden_size=hidden,
+            num_hidden_layers=layers,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=vocab,
+            max_position_embeddings=512,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+def _tiny_laguna(seed=0):
+    """Six-layer Laguna target whose sliding window wraps within a test."""
+    mx.random.seed(seed)
+    model = laguna_model.Model(
+        laguna_model.ModelArgs(
+            model_type="laguna",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=512,
+            sliding_window=6,
+            layer_types=["full_attention"] + ["sliding_attention"] * 5,
+            partial_rotary_factor=0.5,
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+def _tiny_qwen35_text():
+    assert qwen35_model.apply()
+    mx.random.seed(1)
+    model = qwen3_5.TextModel(
+        qwen3_5.TextModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 256,
+                "linear_num_value_heads": 2,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 3,
+                "full_attention_interval": 2,
+                "tie_word_embeddings": True,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 32,
+                "rope_theta": 1000.0,
+                "partial_rotary_factor": 0.5,
+                "max_position_embeddings": 128,
+            }
+        )
+    )
+    mx.eval(model.parameters())
+    return model
+
+
+def test_qwen35_dflash_preparation_preserves_recurrent_rollback(monkeypatch):
+    from omlx.engine.batched import BatchedEngine
+    from omlx.patches.mlx_lm_mtp import drafter_target
+
+    model = _tiny_qwen35_text()
+    engine = BatchedEngine.__new__(BatchedEngine)
+    engine._model = model
+    monkeypatch.setattr(
+        drafter_target,
+        "apply",
+        lambda model: pytest.fail("Qwen3.5 must retain its recurrent rollback"),
+    )
+    assert engine.prepare_dflash_target() is model
+
+    reference = make_prompt_cache(model)
+    cache = make_prompt_cache(model)
+    model(mx.array([[1, 2, 3, 4, 5]]), cache=reference)
+    model(mx.array([[1, 2, 3]]), cache=cache)
+    model(
+        mx.array([[4, 5, 6]]),
+        cache=cache,
+        return_hidden=True,
+        n_confirmed=1,
+        capture_layer_ids=[1],
+    )
+    assert model.rollback_speculative_cache(cache, None, 1, 3) == 1
+    expected = model(mx.array([[7]]), cache=reference)
+    actual = model(mx.array([[7]]), cache=cache)
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+
+
+@pytest.mark.parametrize("family", ["qwen3", "qwen3_5"])
+def test_text_targets_return_drafter_layer_captures(family, apply_drafter_target):
+    """mlx-lm text targets return requested layer outputs in request order,
+    append the head hidden on verify, and feed the drafter on decode."""
+    if family == "qwen3":
+        model = _tiny_qwen3()
+        apply_drafter_target(model)
+    else:
+        model = _tiny_qwen35_text()
+    layers = len(model.model.layers)
+    tokens = mx.array([[1, 2, 3, 4, 5]])
+    plain = model(tokens, cache=make_prompt_cache(model))
+    every = model(
+        tokens, cache=make_prompt_cache(model), capture_layer_ids=list(range(layers))
+    )
+    assert mx.array_equal(every.logits, plain).item()
+    assert len(every.hidden_states) == layers
+
+    picked = model(tokens, cache=make_prompt_cache(model), capture_layer_ids=[2, 0])
+    for got, index in zip(picked.hidden_states, (2, 0)):
+        assert mx.array_equal(got, every.hidden_states[index]).item()
+
+    verify = model(
+        tokens,
+        cache=make_prompt_cache(model),
+        return_hidden=True,
+        n_confirmed=1,
+        capture_layer_ids=[1],
+    )
+    assert len(verify.hidden_states) == 2 and verify.gdn_states is None
+    assert mx.array_equal(verify.hidden_states[0], every.hidden_states[1]).item()
+
+    observed = []
+    model._omlx_drafter = SimpleNamespace(
+        scope_uids=(3,),
+        target_layer_ids=[layers - 1],
+        observe=lambda uids, caps: observed.append((uids, caps)),
+    )
+    try:
+        step = model(mx.array([[6]]), cache=make_prompt_cache(model))
+    finally:
+        model._omlx_drafter = None
+    assert isinstance(step, mx.array)
+    [(uids, caps)] = observed
+    assert uids == (3,) and caps[0].shape[:2] == (1, 1)
+
+
+@pytest.mark.parametrize("make_target", [_tiny_qwen3, _tiny_laguna])
+def test_plain_attention_target_drafts_like_plain_decode(
+    monkeypatch, apply_drafter_target, make_target
+):
+    """A Qwen3 or Laguna target with a DFlash2 drafter emits the plain decode
+    tokens, and rejected verify rows are trimmed from the KV caches, also
+    after Laguna's sliding window wraps."""
+    prompts, limits = [[1, 2, 3, 4]], [24]
+    plain_model = make_target(seed=3)
+    plain_model._omlx_mtp_decode_enabled = False
+    expected, _ = generate(plain_model, prompts, limits)
+
+    model = make_target(seed=3)
+    apply_drafter_target(model)
+    config = DFlash2Config.from_dict(
+        {
+            "model_type": "qwen3",
+            "hidden_size": 32,
+            "intermediate_size": 48,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": 64,
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 512,
+            "num_target_layers": 6,
+            "sliding_window": 16,
+            "layer_types": ["sliding_attention"],
+            "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+            "tie_word_embeddings": False,
+            "dflash_config": {
+                "block_size": 4,
+                "conv_group_size": 8,
+                "conv_kernel_size": 2,
+                "mask_token_id": 63,
+                "selector_rank": 8,
+                "selector_top_k": 4,
+                "target_layer_ids": [1, 3, 5],
+            },
+        }
+    )
+    mx.random.seed(4)
+    draft = DFlash2DraftModel(config)
+    draft.load_weights(
+        [
+            (key, mx.random.normal(value.shape) * 0.2)
+            for key, value in tree_flatten(draft.parameters())
+        ],
+        strict=False,
+    )
+    draft.bind(model)
+    drafter = dd.DFlashDrafter(draft, block_size=4, source_path="tiny", adaptive=False)
+    dd.attach_drafter(model, drafter)
+    assert model._omlx_mtp_multi_request is False
+    trims = []
+    rollback = type(model).mtp_partial_rollback
+
+    def counted(self, cache, accepted, num_drafts):
+        trims.append(num_drafts - accepted)
+        return rollback(self, cache, accepted, num_drafts)
+
+    monkeypatch.setattr(type(model), "mtp_partial_rollback", counted)
+    output, _ = generate(model, prompts, limits)
+    assert output == expected
+    assert any(trim > 0 for trim in trims)
+
+
+def test_clip_block_drafts_keeps_aligned_proposal_prefix():
+    ids = mx.array([[1, 2], [3, 4], [5, 6], [7, 8]], dtype=mx.int32)
+    logq = mx.log(mx.full((4, 2), 0.5))
+    state = bg._MtpState(uid=0)
+    state.drafts = mx.array([1, 3, 5, 7], dtype=mx.uint32)
+    state.draft_lps = []
+    state.draft_accept_lps = bg.SparseDraftQ(ids, logq, 64)
+    bg._clip_block_drafts(state, 2)
+    assert state.drafts.tolist() == [1, 3]
+    assert len(state.draft_accept_lps) == 2
+    assert state.draft_accept_lps.ids.tolist() == [[1, 2], [3, 4]]
+
+    state.drafts = mx.array([1, 3, 5], dtype=mx.uint32)
+    state.draft_accept_lps = [mx.full((64,), float(i)) for i in range(3)]
+    bg._clip_block_drafts(state, 1)
+    assert state.drafts.tolist() == [1]
+    assert [row[0].item() for row in state.draft_accept_lps] == [0.0]
+    bg._clip_block_drafts(state, 3)
+    assert state.drafts.tolist() == [1]
 
 
 @pytest.mark.parametrize("unequal_acceptance", [False, True])
@@ -3678,6 +4023,8 @@ def test_second_row_uses_stochastic_acceptance(monkeypatch):
 
 
 def test_failed_rollback_recovers_committed_tokens(monkeypatch):
+    # Reconcile reads capacity-managed caches; the scheduler patches at import.
+    apply_batch_kv_capacity_patch()
     model = CountingModel()
     # Force rejection without changing target logits by making every draft wrong.
     monkeypatch.setattr(
@@ -4034,6 +4381,42 @@ def test_sparse_stochastic_acceptance_preserves_filtered_target_marginal():
         mx.set_default_device(previous_device)
 
 
+@pytest.mark.parametrize("top_k", [0, 3])
+@pytest.mark.parametrize("copied", [3, 1, 0])
+def test_copied_drafts_preserve_filtered_target_marginal(top_k, copied):
+    """A context copy is a deterministic draft; with its one-hot q the emitted
+    token still follows the filtered target, whether the copied token is the
+    likely one (3), an unlikely one (1) or, at top-k 3, outside the support (0).
+    """
+    from omlx.utils.sampling import make_sampler
+
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.random.seed(787 + copied)
+        sampler = make_sampler(temp=0.6, top_k=top_k)
+        target = mx.array([0.05, 0.1, 0.3, 0.55])
+        lp = mx.broadcast_to(mx.log(target), (3, 4))
+        scaled = mx.log(target) / 0.6
+        if top_k:
+            scaled = mx.where(mx.arange(4) == 0, -float("inf"), scaled)
+        filtered = mx.softmax(scaled, axis=-1)
+        drafts = mx.array([copied, copied], dtype=mx.uint32)
+        q = bg._copy_draft_q([copied, copied], 4)
+        counts = mx.zeros((4,), dtype=mx.int32)
+        for _ in range(64):
+            samples = []
+            for _ in range(64):
+                result = bg._stochastic_verify_tokens(sampler, lp, drafts, q)
+                samples.append(mx.where(result[0] > 0, result[1], result[3]))
+            emitted = mx.stack(samples)
+            counts += (emitted[:, None] == mx.arange(4)).sum(axis=0)
+            mx.eval(counts)
+        assert mx.all(mx.abs(counts / 4096 - filtered) < 0.03), counts.tolist()
+    finally:
+        mx.set_default_device(previous_device)
+
+
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("temperature", [0.7, 1.0])
 def test_acceptance_density_matches_low_precision_sampler(dtype, temperature):
@@ -4150,12 +4533,14 @@ def _model(family):
 
         return nh.Model(nh.ModelArgs.from_dict(TINY_CONFIG))
     if family == "glm":
+        from test_glm_moe_dsa_patch import _glm_generate_patch_installed
         from test_glm_mtp_patch import TINY_CFG
 
         from omlx.patches.glm_moe_dsa import apply_glm_moe_dsa_patch
         from omlx.patches.mlx_lm_mtp import glm_moe_dsa_model
 
-        apply_glm_moe_dsa_patch()
+        with _glm_generate_patch_installed():
+            apply_glm_moe_dsa_patch()
         glm_moe_dsa_model.apply()
         from mlx_lm.models.glm_moe_dsa import Model, ModelArgs
 
@@ -4307,6 +4692,8 @@ def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=40):
     that singleton with the pending prompt. A one-token prompt splits into
     generation at once, like the scheduler's externally prefilled inserts.
     """
+    # Shared MTP must activate: no parking verdict from an earlier run.
+    bg._BATCH_PARK_MEMORY.clear()
     gen = BatchGenerator(
         model,
         sampler=lambda lp: mx.argmax(lp, -1),
@@ -4515,6 +4902,145 @@ def test_multi_request_mtp_or_singleton_only_matches_standard(
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
         mlx_lm_mtp.set_mtp_depth(depth)
+
+
+@pytest.mark.parametrize("family", ["qwen", "qwen4", "v41"])
+def test_context_copy_drafts_keep_greedy_output(family, monkeypatch):
+    """Copied drafts never change greedy output, whichever of them is wrong.
+
+    The proposer is replaced by the true continuation with one token flipped
+    at a position that moves every cycle, so the widest windows (16 rows, or
+    the DSpark block depth) are verified with accepted lengths from none to all.
+    """
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        mx.random.seed(173)
+        model = _model(family)
+        mx.eval(model.parameters())
+        host = getattr(
+            model, "_language_model", getattr(model, "language_model", model)
+        )
+        widest = host._omlx_mtp_depth if family == "v41" else context_copy.MAX_COPY
+        # ``widest``: nothing flipped.
+        flips = sorted({0, 1, min(7, widest), widest - 1, widest})
+        prompt = [3, 4, 5, 6, 7, 8, 9, 10]
+        host._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, [prompt], [64])
+        host._omlx_mtp_decode_enabled = True
+        accepted = []
+
+        def propose(self, limit):
+            done = len(self._ids) - len(prompt)
+            copied = list(expected[0][done : done + min(limit, widest)])
+            wrong = flips[len(accepted) % len(flips)]
+            if wrong < len(copied):
+                copied[wrong] ^= 1
+            return copied if len(copied) >= 2 else []
+
+        def observe(self, count, drafted):
+            accepted.append(count)
+
+        monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
+        monkeypatch.setattr(context_copy.ContextCopy, "observe", observe)
+        actual, _ = generate(model, [prompt], [64])
+        assert actual == expected
+        assert set(flips) <= set(accepted)
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_dspark_keeps_its_block_over_shorter_copies(monkeypatch):
+    """A copy shorter than the DSpark block would replace a better draft."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        model = _model("v41")
+        model.configure_mtp(True, 3)
+        prompt = [3, 4, 5, 6, 7, 8, 9, 10]
+        model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, [prompt], [24])
+        model._omlx_mtp_decode_enabled = True
+        copies = []
+        monkeypatch.setattr(
+            context_copy.ContextCopy, "propose", lambda self, limit: [1, 2][:limit]
+        )
+        monkeypatch.setattr(
+            context_copy.ContextCopy,
+            "observe",
+            lambda self, accepted, drafted: copies.append(drafted),
+        )
+        actual, _ = generate(model, [prompt], [24])
+        assert actual == expected
+        assert not copies
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_batch_policy_skips_copied_windows(monkeypatch):
+    """Copied windows are not draft-depth decisions for the batch policy."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+    from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        model = _model("v41")
+        prompts = [[3, 4, 5, 6, 7, 8, 9, 10], [5, 6, 7, 8, 9, 10, 11]]
+        model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, [24, 24])
+        model._omlx_mtp_decode_enabled = True
+        prompt_of = {tuple(p[:3]): i for i, p in enumerate(prompts)}
+
+        def propose(self, limit):
+            row = prompt_of[tuple(self._ids[:3])]
+            done = len(self._ids) - len(prompts[row])
+            return list(expected[row][done : done + limit])
+
+        copied_cycles, decisions = [], []
+        verify = bg._run_verify_cycle_batched
+        mtp = BatchPolicy.observe_mtp
+
+        def verify_batched(gen_batch, batch_state):
+            states = [batch_state.states[uid] for uid in gen_batch.uids]
+            copied_cycles.append(any(state.copy_drafts for state in states))
+            return verify(gen_batch, batch_state)
+
+        def observe_mtp(self, depth, accepted, milliseconds, *, stable):
+            decisions.append(copied_cycles[-1])
+            mtp(self, depth, accepted, milliseconds, stable=stable)
+
+        monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
+        monkeypatch.setattr(bg, "_run_verify_cycle_batched", verify_batched)
+        monkeypatch.setattr(BatchPolicy, "observe_mtp", observe_mtp)
+        actual, _ = generate(model, prompts, [24, 24])
+        assert actual == expected
+        assert any(copied_cycles) and decisions
+        assert not any(decisions)
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+@pytest.mark.parametrize("wide_window", [False, True])
+def test_context_copy_width_follows_the_targets_verify_window(wide_window):
+    """A verbatim run after a whole accept copies 15 tokens only for a target
+    that verifies 16-row windows; other targets (GLM-5.3 rolls back at most
+    8 rows) keep 7-token copies."""
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    source = list(range(1000, 1200))
+    history = source + source[:100]  # the tail repeats the source verbatim
+    copier = context_copy.ContextCopy(wide_window=wide_window)
+    copier.extend(history, [])
+    assert copier.propose(64) == source[100:107]
+    copier.observe(7, 7)
+    copier.extend(history + source[100:107], [])
+    expected = 15 if wide_window else 7
+    assert copier.propose(64) == source[107 : 107 + expected]
 
 
 @pytest.mark.parametrize("size", [2, 4])
@@ -5179,7 +5705,7 @@ def _cache_rows(cache):
     return None
 
 
-@pytest.mark.parametrize("family", ["qwen_vlm", "qwen4"])
+@pytest.mark.parametrize("family", ["qwen_vlm", "qwen4", "glm5"])
 def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family):
     previous = mlx_lm_mtp.is_mtp_active()
     previous_depth = mlx_lm_mtp.get_mtp_depth()
@@ -5218,6 +5744,11 @@ def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family)
 
         monkeypatch.setattr(bg, "_materialize_mtp_boundary_emit", materialize)
         monkeypatch.setattr(bg, "_call_backbone", backbone)
+        monkeypatch.setattr(
+            fused_batch,
+            "copy",
+            SimpleNamespace(deepcopy=lambda cache: pytest.fail("batch cache copied")),
+        )
         actual, _ = generate(model, prompts, limits)
         assert actual == expected
         assert any(rows > 1 for rows in materialized)
@@ -5588,10 +6119,134 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
         caps.append((ops, mb))
         return previous
 
+    target = SimpleNamespace(model_type="qwen3_5")
     monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
     monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: raised)
-    with pytest.raises(RuntimeError), bg._spec_command_buffers():
+    with pytest.raises(RuntimeError), bg._spec_command_buffers(target):
         inside = caps[-1]
         raise RuntimeError("step failed")
     assert inside == (bg._SPEC_BUFFER_CAPS if raised else (50, 50))
     assert caps[-1] == (50, 50)
+
+
+@pytest.mark.parametrize(
+    "model_type,gpu,enabled,detected",
+    [
+        ("qwen3_5_moe", True, True, True),
+        ("glm5_next", True, False, False),
+        (None, True, False, False),
+        ("qwen3_5", False, False, True),
+    ],
+)
+def test_spec_caps_target(monkeypatch, model_type, gpu, enabled, detected):
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    target = SimpleNamespace(model_type=model_type)
+    calls, detections = [], []
+
+    def fake_set(ops, mb):
+        calls.append((ops, mb))
+        return (50, 50)
+
+    def fake_gpu():
+        detections.append(True)
+        return gpu
+
+    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", fake_gpu)
+    monkeypatch.setattr(fast, "set_command_buffer_caps", fake_set)
+    with bg._spec_command_buffers(target):
+        assert calls == ([bg._SPEC_BUFFER_CAPS] if enabled else [])
+    assert calls == ([bg._SPEC_BUFFER_CAPS, (50, 50)] if enabled else [])
+    assert bool(detections) is detected
+
+
+def test_batch_park_verdict_outlives_its_cohort():
+    """MTP parked at k rows keeps new cohorts of k or more rows parked for what
+    is left of the park, until a cohort where MTP holds up clears it."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    lost = BatchPolicy(range(4), 3)
+    lost.park()
+    memory.parked(lost)
+    for _ in range(28):
+        memory.tick()
+    wider, narrower = BatchPolicy(range(8), 3), BatchPolicy(range(2), 3)
+    memory.seed(wider)
+    memory.seed(narrower)
+    # 128 - 28 steps of the park are left; the next park doubles once.
+    assert wider.remaining == 100 and wider.cooldown == 256
+    assert narrower.remaining == 0
+    fixed = BatchPolicy(range(8), 3, fixed=True)
+    memory.seed(fixed)
+    assert not fixed.needs_standard()
+
+    short = BatchPolicy(range(8), 3)
+    short.decisions = 31
+    memory.retired(short)
+    again = BatchPolicy(range(4), 3)
+    memory.seed(again)
+    assert again.remaining == 100
+    held = BatchPolicy(range(8), 3)
+    held.decisions = 32
+    memory.retired(held)
+    fresh = BatchPolicy(range(8), 3)
+    memory.seed(fresh)
+    assert fresh.remaining == 0
+
+
+def test_batch_park_expires_while_cohorts_come_and_go():
+    """A park ends on the model's step clock, not per cohort: with a cohort
+    change every 50-150 steps and MTP winning once measured again, new
+    cohorts measure MTP after the park and keep running it."""
+    import random
+
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    lost = BatchPolicy(range(8), 3)
+    lost.park()
+    memory.parked(lost)
+    rng = random.Random(0)
+    steps = mtp_cycles = 0
+    first_mtp = None
+    while steps < 6000:
+        policy = BatchPolicy(range(8), 3)
+        memory.seed(policy)
+        for _ in range(rng.randint(50, 150)):
+            memory.tick()
+            steps += 1
+            if policy.needs_standard():
+                policy.observe_standard(10.0)
+                continue
+            # Every draft accepted at 6 ms a cycle: MTP clearly wins.
+            policy.observe_mtp(policy.cur, [policy.cur] * 8, 6.0, stable=True)
+            mtp_cycles += 1
+            first_mtp = steps if first_mtp is None else first_mtp
+            assert not policy.should_park()
+        memory.retired(policy)
+    # The 128-step park, then one cohort's calibration (2 warmup + 3 samples).
+    assert first_mtp is not None and first_mtp <= 128 + 150 + 5
+    assert mtp_cycles > 0.9 * (6000 - first_mtp) - 5 * 6000 / 50
+
+
+def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
+    """A fallback rebuilds rows that draft deeper than the lowered policy depth."""
+    advance = fused_batch.advance
+    fired = []
+
+    def fall_back_once(batch, batch_state):
+        if not fired and batch._omlx_mtp_batch_policy.cur < 2:
+            fired.append(True)
+            raise bg._MtpStepFallback("test")
+        return advance(batch, batch_state)
+
+    monkeypatch.setattr(fused_batch, "advance", fall_back_once)
+    model = CountingModel()
+    prompts, limits = [[1, 2], [10, 11, 12]], [60, 60]
+    model._omlx_mtp_decode_enabled = False
+    expected, _ = generate(model, prompts, limits)
+    model._omlx_mtp_decode_enabled = True
+    actual, _ = generate(model, prompts, limits)
+    assert fired
+    assert actual == expected

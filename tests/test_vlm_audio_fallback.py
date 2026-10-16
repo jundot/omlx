@@ -49,6 +49,7 @@ def _build_model_dir(
     name: str,
     has_audio_config: bool,
     has_audio_weights: bool,
+    audio_key_prefix: str = "",
 ) -> Path:
     model_dir = tmp_path / name
     model_dir.mkdir()
@@ -69,8 +70,10 @@ def _build_model_dir(
 
     keys = ["language_model.model.layers.0.self_attn.q_proj.weight"]
     if has_audio_weights:
-        keys.append("audio_tower.layers.0.feed_forward1.linear.weight")
-        keys.append("embed_audio.embedding_projection.weight")
+        keys.append(
+            f"{audio_key_prefix}audio_tower.layers.0.feed_forward1.linear.weight"
+        )
+        keys.append(f"{audio_key_prefix}embed_audio.embedding_projection.weight")
     _write_safetensors(model_dir / "model.safetensors", keys)
 
     return model_dir
@@ -141,6 +144,33 @@ class TestHasAudioWeights:
         empty.mkdir()
         assert _has_audio_weights(empty) is False
 
+    def test_returns_true_for_hf_prefixed_audio_tower(self, tmp_path: Path):
+        # google/gemma-4-E4B-it* ship HF names; sanitize strips `model.` later.
+        model_dir = tmp_path / "hf"
+        model_dir.mkdir()
+        _write_safetensors(
+            model_dir / "model.safetensors",
+            [
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.audio_tower.layers.0.lconv1d.depthwise_conv1d.weight",
+                "model.embed_audio.embedding_projection.weight",
+            ],
+        )
+        assert _has_audio_weights(model_dir) is True
+
+    def test_returns_true_for_hf_prefixed_embed_audio_only(self, tmp_path: Path):
+        # gemma4_unified has no audio tower; embed_audio is its audio path.
+        model_dir = tmp_path / "hf_unified"
+        model_dir.mkdir()
+        _write_safetensors(
+            model_dir / "model.safetensors",
+            [
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.embed_audio.embedding_projection.weight",
+            ],
+        )
+        assert _has_audio_weights(model_dir) is True
+
 
 # ---------------------------------------------------------------------------
 # _strip_audio_config_if_orphaned
@@ -163,6 +193,16 @@ class TestStripAudioConfigIfOrphaned:
         model_dir = _build_model_dir(
             tmp_path, name="full",
             has_audio_config=True, has_audio_weights=True,
+        )
+        with _strip_audio_config_if_orphaned(model_dir):
+            cfg = _vu.load_config(model_dir)
+        assert cfg.get("audio_config") is not None
+
+    def test_passthrough_when_audio_weights_use_hf_names(self, tmp_path: Path):
+        model_dir = _build_model_dir(
+            tmp_path, name="hf_full",
+            has_audio_config=True, has_audio_weights=True,
+            audio_key_prefix="model.",
         )
         with _strip_audio_config_if_orphaned(model_dir):
             cfg = _vu.load_config(model_dir)

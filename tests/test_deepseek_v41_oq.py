@@ -473,7 +473,7 @@ def test_official_oq3_streams_affine_weights_and_unified_engram(
         spec = config["omlx_deepseek_v41"]
         assert spec["quantized_modules"][name]["bits"] == 3
         assert spec["quantized_modules"][name]["quantize_input"] is False
-        assert all(table["bits"] == 3 for table in spec["engram_tables"].values())
+        assert all(table["bits"] == 4 for table in spec["engram_tables"].values())
         assert spec["engram_in_index"]
         assert not (output / "conversion.inprogress.json").exists()
         assert not (output / "engram").exists()
@@ -501,9 +501,9 @@ def test_ui_source_filter_excludes_converted_v41():
     )
 
 
-@pytest.mark.parametrize("level", [3, 4])
+@pytest.mark.parametrize("level", [2.5, 3, 4])
 def test_v41_estimate_uses_independent_engram_budget(tmp_path, level):
-    from omlx.oq import estimate_bpw_and_size
+    from omlx.oq import _OQ_BPW_TARGETS, estimate_bpw_and_size
 
     source = tmp_path / "source"
     source.mkdir()
@@ -519,9 +519,9 @@ def test_v41_estimate_uses_independent_engram_budget(tmp_path, level):
         json.dumps({"weight_map": {k: "model.safetensors" for k in weights}})
     )
     result = estimate_bpw_and_size(str(source), level)
-    assert result["engram_size_bytes"] == 8192 * level // 8 + 8192 // 32 * 4
+    assert result["engram_size_bytes"] == 8192 * 4 // 8 + 8192 // 32 * 4
     assert result["remaining_size_bytes"] == (
-        math.ceil(4096 * 3.7 / 8) if level == 3 else 8192
+        math.ceil(4096 * _OQ_BPW_TARGETS[level][1] / 8) if level < 4 else 8192
     )
     assert (
         result["output_size_bytes"]
@@ -530,8 +530,9 @@ def test_v41_estimate_uses_independent_engram_budget(tmp_path, level):
     assert result["memory_streaming_bytes"] > 0
 
 
+@pytest.mark.parametrize("level", [2.5, 3])
 def test_official_oq3_reuses_signed_imatrix_and_applies_real_plan(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, level
 ):
     from test_deepseek_v41 import write_checkpoint
 
@@ -571,7 +572,7 @@ def test_official_oq3_reuses_signed_imatrix_and_applies_real_plan(
         oq.quantize_oq_streaming(
             str(source),
             str(output),
-            3,
+            level,
             enhanced=True,
             target_bpw=32,
             hard_cap_bpw=32,
@@ -589,7 +590,8 @@ def test_official_oq3_reuses_signed_imatrix_and_applies_real_plan(
             == report["calibration"]["tensor_bytes"]
         )
         saved = json.loads((output / "config.json").read_text())["omlx_deepseek_v41"]
-        assert saved["quantized_modules"][name]["bits"] in (3, 4, 6, 8)
+        assert saved["quantized_modules"][name]["bits"] in (2, 3, 4, 6, 8)
+        assert all(table["bits"] == 4 for table in saved["engram_tables"].values())
 
 
 def test_expert_requantization_cancellation_does_not_process_remaining_experts():

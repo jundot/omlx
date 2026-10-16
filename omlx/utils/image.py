@@ -21,9 +21,11 @@ from PIL import Image, ImageOps
 
 from ..exceptions import InvalidRequestError
 from ..settings import get_settings
+from .video import _video_url
 
 DEFAULT_MAX_IMAGE_BYTES = 50 * 1024 * 1024  # 50 MiB
 DEFAULT_MAX_IMAGE_SIDE_LENGTH = 2048  # 2048 px
+DEFAULT_MAX_AUDIO_BYTES = 100 * 1024 * 1024  # 100 MiB
 
 
 def get_max_image_bytes() -> int:
@@ -33,6 +35,23 @@ def get_max_image_bytes() -> int:
     except RuntimeError:
         return DEFAULT_MAX_IMAGE_BYTES
     return settings.server.max_image_upload_bytes()
+
+
+def get_max_audio_bytes() -> int:
+    """Return the resolved audio payload limit in bytes.
+
+    Mirrors api.audio_routes._max_audio_upload_bytes: an unconfigured or
+    invalid max_audio_upload_size falls back to the 100 MiB default rather
+    than disabling the limit.
+    """
+    try:
+        settings = get_settings()
+    except RuntimeError:
+        return DEFAULT_MAX_AUDIO_BYTES
+    try:
+        return settings.server.max_audio_upload_bytes()
+    except (AttributeError, TypeError, ValueError):
+        return DEFAULT_MAX_AUDIO_BYTES
 
 
 def get_max_image_side_length() -> int:
@@ -115,10 +134,31 @@ def _decode_input_audio_data(data: str, *, field: str = "input_audio.data") -> b
     else:
         encoded = stripped
 
+    # Enforce the same configured limit as the /v1/audio upload endpoints:
+    # the inline chat path must not be an unbounded decode surface just
+    # because it bypasses multipart upload handling. Check the encoded
+    # length first (4/3 expansion) so oversized payloads are rejected
+    # before the decode allocates.
+    max_bytes = get_max_audio_bytes()
+    if max_bytes > 0:
+        max_encoded_len = int(math.ceil(max_bytes * 4 / 3)) + 1024
+        if len(encoded) > max_encoded_len:
+            raise InvalidRequestError(
+                f"{field} audio payload exceeds the maximum allowed limit of {max_bytes} bytes.",
+                field=field,
+            )
+
     try:
-        return base64.b64decode(encoded, validate=True)
+        decoded = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise InvalidRequestError(_AUDIO_INPUT_ERROR, field=field) from exc
+
+    if max_bytes > 0 and len(decoded) > max_bytes:
+        raise InvalidRequestError(
+            f"{field} audio payload ({len(decoded)} bytes) exceeds the maximum allowed limit of {max_bytes} bytes.",
+            field=field,
+        )
+    return decoded
 
 
 def validate_image_data_uri(value: str, *, field: str = "image") -> str:
@@ -264,6 +304,31 @@ def _load_image_bytes(
 def extract_images_from_messages(
     messages: List[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Image.Image], List]:
+    """Extract images and audio; video parts are rejected.
+
+    See :func:`extract_media_from_messages` for models with native video input.
+    """
+    return _extract_media(messages, videos=None)
+
+
+def extract_media_from_messages(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[Image.Image], list, list[str]]:
+    """Like :func:`extract_images_from_messages`, but also collects videos.
+
+    Returns ``(text_messages, images, audio, videos)``, where ``videos`` holds
+    the inline ``data:video/...`` URIs in order of appearance. Decoding is left
+    to the caller, which needs the clip as a file for frame sampling.
+    """
+    videos: list[str] = []
+    text_messages, images, audio = _extract_media(messages, videos=videos)
+    return text_messages, images, audio, videos
+
+
+def _extract_media(
+    messages: list[dict[str, Any]],
+    videos: list[str] | None,
+) -> tuple[list[dict[str, Any]], list[Image.Image], list]:
     """
     Extract images and audio from OpenAI-format messages.
 
@@ -275,6 +340,8 @@ def extract_images_from_messages(
         messages: List of OpenAI-format chat messages. Each message may have
             content as a string or a list of content parts
             (text/image_url/input_audio).
+        videos: List that receives video data URIs in order of appearance, or
+            ``None`` to reject video parts.
 
     Returns:
         Tuple of (text_messages, images, audio):
@@ -374,10 +441,18 @@ def extract_images_from_messages(
                         audio.append(data)
 
             elif part_type in ("video", "video_url", "input_video"):
-                raise InvalidRequestError(
-                    "Video input is not supported by oMLX.",
-                    field="messages",
-                )
+                if videos is None:
+                    raise InvalidRequestError(
+                        "Video input is not supported by oMLX.",
+                        field="messages",
+                    )
+                url = _video_url(part)
+                if not url:
+                    raise InvalidRequestError(
+                        "Video content part is missing video_url.",
+                        field="messages",
+                    )
+                videos.append(url)
 
         new_msg = {"role": role, "content": "\n".join(text_parts) if text_parts else ""}
         # Preserve extra fields

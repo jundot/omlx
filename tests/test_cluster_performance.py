@@ -29,6 +29,7 @@ from omlx.cluster.runtime_optimizations import (
     _agree_across_ranks,
     install_runtime_optimizations,
     pipeline_prefill_schedule,
+    wait_for_pipeline_peers_on_host,
 )
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
@@ -638,6 +639,35 @@ def test_staggered_prompt_matches_stock_chunking_padding_and_cache_lifecycle(
     assert [len(chunk[0]) for chunk in patched.model.seen] == [8, 1]
     assert patched.tokens == stock.tokens == prompts
     assert patched.prompt_cache[0].events == stock.prompt_cache[0].events
+
+
+class _StagedPipeline:
+    pipeline_size = 2
+
+    def __call__(self, inputs, cache=None):
+        hidden = mx.distributed.recv_like(inputs, 1)
+        return mx.distributed.all_gather(mx.distributed.send(hidden, 1))
+
+
+def test_peer_transfers_finish_on_host_around_prefill(monkeypatch):
+    """#4547: Metal counts a GPU-side wait on a peer toward its ~5 s timeout."""
+
+    evaluated = []
+    monkeypatch.setattr(mx, "eval", lambda *values: evaluated.extend(values))
+    for name in ("send", "recv", "recv_like", "all_gather"):
+        monkeypatch.setattr(mx.distributed, name, lambda *a, _n=name, **k: (_n,))
+    model = SimpleNamespace(model=_StagedPipeline())
+
+    def forward(tokens):
+        evaluated.clear()
+        model.model(mx.zeros((1, tokens), dtype=mx.int32))
+        return [v[0] if isinstance(v, tuple) else "inputs" for v in evaluated]
+
+    with wait_for_pipeline_peers_on_host(model):
+        assert forward(8) == ["recv_like", "send"]
+        for _ in range(3):
+            assert forward(1) == ["inputs", "recv_like", "send", "all_gather"]
+        assert forward(1) == []
 
 
 def test_sampling_rank_optimization_keeps_normal_path_for_unvalidated_model():

@@ -66,6 +66,8 @@ _BM = 64
 _BN = 64
 # Hidden columns per stream in one up-projection tile (4 streams x 16 = 64).
 UP_COLS = 16
+# Each K step loads one quantization group's scale and bias.
+GROUP_SIZE = 64
 
 _NAX_HEADER = r"""
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -316,7 +318,7 @@ inline void hcn_gemm(
 // on the same bf16 expressions.
 template <typename T>
 inline T hcn_sigmoid(T x) {
-  auto y = 1 / (1 + metal::exp(metal::abs(x)));
+  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
   return (x < 0) ? y : 1 - y;
 }
 """
@@ -329,7 +331,7 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
     float sum = 0.0f;
     if (bits == 4) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 16.0f;
             xt[i + 2] = x[i + 2] / 256.0f;
@@ -337,8 +339,8 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
         }
     } else if (bits == 5) {
         for (int i = 0; i < N; i += 8) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]
-                + x[i + 4] + x[i + 5] + x[i + 6] + x[i + 7];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3])
+                + float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 32.0f;
             xt[i + 2] = x[i + 2] / 4.0f;
@@ -350,7 +352,7 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
         }
     } else if (bits == 6) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 64.0f;
             xt[i + 2] = x[i + 2] / 16.0f;

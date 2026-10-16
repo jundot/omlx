@@ -388,7 +388,7 @@ def load(model_name: str | Path):
     import mlx_vlm.utils as vlm_utils
 
     original_load_config = vlm_utils.load_config
-    original_transform = vlm_utils._transform_compressed_tensors_weights
+    original_transform = vlm_utils.transform_quantized_weights
 
     def load_config_without_generic_quantization(path, *args, **kwargs):
         loaded = original_load_config(path, *args, **kwargs)
@@ -406,11 +406,11 @@ def load(model_name: str | Path):
 
     _ACTIVE_RULES = rules
     vlm_utils.load_config = load_config_without_generic_quantization
-    vlm_utils._transform_compressed_tensors_weights = transform_without_scale_folding
+    vlm_utils.transform_quantized_weights = transform_without_scale_folding
     try:
         logger.info("Using exact-weight mixed ModelOpt loader for %s", model_path)
         return vlm_utils.load(model_path, trust_remote_code=False, strict=True)
     finally:
-        vlm_utils._transform_compressed_tensors_weights = original_transform
+        vlm_utils.transform_quantized_weights = original_transform
         vlm_utils.load_config = original_load_config
         _ACTIVE_RULES = None

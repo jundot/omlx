@@ -16,6 +16,7 @@ from omlx.utils.image import (
     compute_image_hash,
     compute_per_image_hashes,
     extract_images_from_messages,
+    extract_media_from_messages,
     load_image,
 )
 
@@ -326,6 +327,31 @@ class TestExtractImagesFromMessages:
         assert len(audio) == 1
         assert hasattr(audio[0], "read")
 
+    def test_input_audio_rejects_oversized_payload(self, monkeypatch):
+        """Inline input_audio.data enforces the configured audio limit."""
+        import base64 as b64mod
+
+        from omlx.utils import image as image_mod
+
+        monkeypatch.setattr(image_mod, "get_max_audio_bytes", lambda: 1024)
+        raw = b"\x00\x01" * 4096  # 8 KiB decoded, well past the 1 KiB limit
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": b64mod.b64encode(raw).decode(),
+                            "format": "wav",
+                        },
+                    },
+                ],
+            },
+        ]
+        with pytest.raises(InvalidRequestError, match="exceeds the maximum"):
+            extract_images_from_messages(messages)
+
     def test_input_audio_bytes_data(self):
         """Messages with bytes input_audio.data extract audio."""
         raw_bytes = b"\x00\x01\x02\x03" * 16
@@ -441,6 +467,35 @@ def test_video_input_is_rejected():
 
     with pytest.raises(InvalidRequestError, match="Video input is not supported"):
         extract_images_from_messages(messages)
+
+
+def test_extract_media_keeps_video_uris_in_order():
+    first = "data:video/mp4;base64,AAAA"
+    second = "data:video/quicktime;base64,BBBB"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": first}},
+                {"type": "text", "text": "Compare"},
+                {"type": "video_url", "video_url": second},
+            ],
+        }
+    ]
+
+    text_msgs, images, audio, videos = extract_media_from_messages(messages)
+
+    assert videos == [first, second]
+    assert images == []
+    assert audio == []
+    assert text_msgs == [{"role": "user", "content": "Compare"}]
+
+
+def test_extract_media_rejects_video_part_without_url():
+    messages = [{"role": "user", "content": [{"type": "video_url"}]}]
+
+    with pytest.raises(InvalidRequestError, match="missing video_url"):
+        extract_media_from_messages(messages)
 
 
 # =============================================================================

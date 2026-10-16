@@ -661,18 +661,22 @@ def test_parallel_pages_preserve_order_short_reads_and_warm_hits(tmp_path, monke
     assert reader._seen_pages is None
 
 
-def test_decode_rows_skip_page_prefetch(tmp_path, monkeypatch):
+def test_decode_rows_prefetch_their_pages(tmp_path, monkeypatch):
     reader, raw = page_table(tmp_path)
+    original = storage.os.pread
+    calls = []
 
-    def unexpected(*args):
-        raise AssertionError("Decode rows must retain the direct mmap path")
+    def counted(fd, count, offset):
+        calls.append(offset)
+        return original(fd, count, offset)
 
-    monkeypatch.setattr(storage.os, "pread", unexpected)
+    monkeypatch.setattr(storage.os, "pread", counted)
     try:
+        # One decode token selects 24 Engram rows per table.
         ids = np.arange(24)
         actual, _ = reader.read("w", ids)
         np.testing.assert_array_equal(actual, raw[ids])
-        assert reader._seen_pages is None
+        assert calls
     finally:
         reader.close()
 

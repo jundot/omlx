@@ -8,6 +8,8 @@ quantized projection has the serial step's bits; stock multi-row kernels
 
 from __future__ import annotations
 
+import inspect
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -19,8 +21,10 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 
 @pytest.fixture(autouse=True)
 def disarm():
+    row_exact_qmv._UNROLLED_VERDICTS.clear()
     yield
     qwen35_verify_qmm.set_verify_qmm_armed(False)
+    row_exact_qmv._UNROLLED_VERDICTS.clear()
 
 
 def _linear(k, n, bits, group_size, seed):
@@ -61,12 +65,30 @@ SHAPES = [
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-@pytest.mark.parametrize("rows", [3, 8])
+@pytest.mark.parametrize("rows", [3, 8, 16])
 def test_rows_equal_one_row_quantized_matmul(shape, rows):
     k, n, bits, group_size = shape
     linear = _linear(k, n, bits, group_size, seed=k + n + rows)
     x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
     assert _bit_equal(row_exact_qmv.quantized_linear(linear, x), _serial(linear, x))
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("bits", [4, 5, 6])
+@pytest.mark.parametrize("k", [512, 640])
+@pytest.mark.parametrize("n", [8, 12])
+def test_bias_sum_widens_inputs_before_accumulation(dtype, bits, k, n):
+    linear = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=bits)
+    linear.weight = mx.zeros((n, k * bits // 32), dtype=mx.uint32)
+    linear.scales = mx.ones((n, k // 64), dtype=dtype)
+    linear.biases = mx.ones((n, k // 64), dtype=dtype)
+    denominator = 2048 if dtype == mx.float16 else 256
+    # Adding the first two terms in the input dtype loses the small term.
+    row = [1, 1 / denominator, -1, 0] * (k // 4)
+    x = mx.array([[row, row, row]], dtype=dtype)
+    expected = mx.full((1, 3, n), k / (4 * denominator), dtype=dtype)
+    assert _bit_equal(_serial(linear, x), expected)
+    assert _bit_equal(row_exact_qmv.quantized_linear(linear, x), expected)
 
 
 @pytest.mark.parametrize(
@@ -86,6 +108,42 @@ def test_grouped_rows_equal_one_row_quantized_matmul(k, sizes, bits, group_size,
     assert len(outputs) == len(linears)
     for linear, output in zip(linears, outputs):
         assert _bit_equal(output, _serial(linear, x))
+
+
+@pytest.mark.parametrize("rows", [5, 7, 11, 13])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_partial_shared_row_tiles_equal_serial(rows, dtype, grouped):
+    linears = [_linear(2560, n, 8, 64, seed=rows + n) for n in (65536, 16)]
+    for linear in linears:
+        linear.scales = linear.scales.astype(dtype)
+        linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((1, rows, 2560)).astype(dtype)
+    if grouped:
+        assert row_exact_qmv._group_plan(linears, x, rows) is not None
+        outputs = row_exact_qmv.quantized_linears(linears, x)
+    else:
+        linears[0]["bias"] = mx.random.normal((65536,)).astype(dtype)
+        outputs = [row_exact_qmv.quantized_linear(linears[0], x)]
+    for linear, output in zip(linears, outputs):
+        expected = _serial(linear, x)
+        assert output.shape == expected.shape and output.dtype == dtype
+        assert _bit_equal(output, expected)
+
+
+def test_partial_row_tile_plan_reads_current_weights():
+    linear = _linear(2560, 65536, 8, 64, seed=7)
+    x = mx.random.normal((1, 7, 2560)).astype(mx.bfloat16)
+    first = row_exact_qmv.quantized_linear(linear, x)
+    mx.eval(first)
+    linear.weight, linear.scales, linear.biases = mx.quantize(
+        (mx.random.normal((65536, 2560)) * 0.05).astype(mx.bfloat16),
+        group_size=64,
+        bits=8,
+    )
+    current = row_exact_qmv.quantized_linear(linear, x)
+    assert _bit_equal(current, _serial(linear, x))
+    assert not _bit_equal(first, current)
 
 
 def test_row_exact_arming_routes_multi_row_quantized_linear():
@@ -138,16 +196,30 @@ def test_one_row_qmv_equals_quantized_matmul(k, n, bits, group_size, dtype, rps)
     "k, n, rps",
     [
         (640, 2560, 1),  # stock runs qmv, not qmv_fast (K off the 256 block)
-        (2560, 12, 1),  # stock runs qmv (N % 8)
+        (2560, 1, 1),  # the two-column tile does not divide N
         (2560, 40, 8),  # the 16-column tile does not divide N
     ],
 )
-def test_one_row_qmv_declines_shapes_stock_does_not_run_fast(k, n, rps):
+def test_one_row_qmv_declines_unsupported_layouts(k, n, rps):
     weight, scales, biases = _quantized(k, n, 8, 64, mx.bfloat16, 1)
     assert (
         row_exact_qmv.one_row_qmv(weight, scales, biases, 8, 64, "affine", mx.bfloat16, rps)
         is None
     )
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("rps", [1, 2])
+def test_one_row_qmv_partial_outputs_equal_quantized_matmul(dtype, rps):
+    weight, scales, biases = _quantized(512, 12, 4, 64, dtype, 5)
+    x = mx.random.normal((1, 1, 512)).astype(dtype)
+    launch = row_exact_qmv.one_row_qmv(
+        weight, scales, biases, 4, 64, "affine", dtype, rps
+    )
+    assert launch is not None
+    expected = mx.quantized_matmul(x, weight, scales, biases, group_size=64, bits=4)
+    view = mx.uint32 if dtype == mx.float32 else mx.uint16
+    assert mx.array_equal(launch(x).view(view), expected.view(view)).item()
 
 
 # Every (columns per simdgroup, rows per threadgroup) tile gives each row the
@@ -190,3 +262,116 @@ def test_rows_qmv_every_geometry_equals_one_row_quantized_matmul(
                 rps,
                 per_group,
             )
+
+
+# The unrolled tile keeps the rolled tile's per-accumulator order, so every
+# tile inside its register envelope gives each row the one-row bits (at the
+# DeltaNet verify shapes and bit widths, and past the 4-row blocks).
+@pytest.mark.parametrize(
+    "k, n, bits, group_size",
+    [
+        (2560, 16480, 6, 64),  # DeltaNet stacked in-projection (oQ5e)
+        (2560, 16480, 8, 64),  # its 8-bit layer
+        (6144, 2560, 5, 128),  # DeltaNet out-projection
+        (2560, 1024, 4, 64),
+    ],
+)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8])
+def test_unrolled_rows_qmv_tiles_equal_one_row_quantized_matmul(
+    k, n, bits, group_size, dtype, rows
+):
+    weight, scales, biases = _quantized(k, n, bits, group_size, dtype, k + n + rows)
+    x = mx.random.normal((1, rows, k)).astype(dtype)
+    expected = mx.concatenate(
+        [
+            mx.quantized_matmul(
+                x[:, r : r + 1], weight, scales, biases, transpose=True,
+                group_size=group_size, bits=bits,
+            )
+            for r in range(rows)
+        ],
+        axis=1,
+    )
+    view = mx.uint32 if dtype == mx.float32 else mx.uint16
+    tiles = [
+        (rps, per_group)
+        for rps in (1, 2, 4, 8)
+        for per_group in range(1, rows + 1)
+        if rows % per_group == 0 and row_exact_qmv.unrolled_tile_ok(bits, rps, per_group)
+    ]
+    for tile in tiles:
+        launch = row_exact_qmv.rows_qmv(
+            weight, scales, biases, bits, group_size, "affine", dtype,
+            lambda _, g=tile: g, unrolled=True,
+        )
+        observed = launch(x)
+        assert observed.shape == expected.shape and observed.dtype == dtype
+        assert mx.array_equal(observed.view(view), expected.view(view)).item(), tile
+
+
+# Tiles past the envelope compiled to wrong bits (5-bit 8x4, 4-bit 2x8).
+@pytest.mark.parametrize("k, n, bits, group_size, tile", [
+    (6144, 2560, 5, 128, (8, 4)),
+    (2560, 1024, 4, 64, (2, 8)),
+])
+def test_unrolled_rows_qmv_refuses_tiles_past_the_register_envelope(
+    k, n, bits, group_size, tile
+):
+    weight, scales, biases = _quantized(k, n, bits, group_size, mx.bfloat16, 3)
+    launch = row_exact_qmv.rows_qmv(
+        weight, scales, biases, bits, group_size, "affine", mx.bfloat16,
+        lambda _: tile, unrolled=True,
+    )
+    with pytest.raises(ValueError):
+        launch(mx.zeros((1, 8, k), dtype=mx.bfloat16))
+
+
+def _miscompiled(factory):
+    """``factory`` whose unrolled kernels return every output off by one, as a
+    GPU whose compiler gets the unrolled tile wrong would."""
+    signature = inspect.signature(factory)
+
+    def make(*args, **kwargs):
+        kernel = factory(*args, **kwargs)
+        if not signature.bind(*args, **kwargs).arguments.get("unrolled", False):
+            return kernel
+        return lambda **kw: [y + 1 for y in kernel(**kw)]
+
+    return make
+
+
+# A GPU that computes an unrolled tile wrong (an M3 Ultra did at 4-bit gs64)
+# must still get one-row bits: the first launch of each shape is checked and
+# falls back to the rolled tile.
+def test_rows_qmv_falls_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypatch):
+    k, n, bits, group_size, rows = 2560, 1024, 4, 64, 4
+    weight, scales, biases = _quantized(k, n, bits, group_size, mx.bfloat16, 5)
+    x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
+    expected = mx.concatenate(
+        [
+            mx.quantized_matmul(
+                x[:, r : r + 1], weight, scales, biases, transpose=True,
+                group_size=group_size, bits=bits,
+            )
+            for r in range(rows)
+        ],
+        axis=1,
+    )
+    monkeypatch.setattr(row_exact_qmv, "_kernel", _miscompiled(row_exact_qmv._kernel))
+    launch = row_exact_qmv.rows_qmv(
+        weight, scales, biases, bits, group_size, "affine", mx.bfloat16,
+        lambda _: (2, 2), unrolled=True,
+    )
+    assert _bit_equal(launch(x), expected)
+    assert list(row_exact_qmv._UNROLLED_VERDICTS.values()) == [False]
+
+
+def test_grouped_tiles_fall_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypatch):
+    linears = [_linear(2560, n, 4, 64, seed) for seed, n in enumerate((1024, 512))]
+    x = mx.random.normal((1, 4, 2560)).astype(mx.bfloat16)
+    monkeypatch.setattr(row_exact_qmv, "_group_kernel", _miscompiled(row_exact_qmv._group_kernel))
+    outputs = row_exact_qmv.quantized_linears_tiled(linears, x, 2, 4, True)
+    for linear, observed in zip(linears, outputs):
+        assert _bit_equal(observed, _serial(linear, x))
+    assert list(row_exact_qmv._UNROLLED_VERDICTS.values()) == [False]

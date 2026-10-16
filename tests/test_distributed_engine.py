@@ -426,6 +426,19 @@ def test_model_thinking_budget_is_supported_by_distributed_engine():
     engine._validate_model_settings()
 
 
+def test_qwen35_ane_prefill_rejected_by_distributed_engine():
+    # ANE-prefill settings are never forwarded to cluster workers, so without
+    # this gate the flag silently no-ops instead of erroring — a user could
+    # believe ANE is active on a cluster deployment and get nothing.
+    engine = DistributedBatchedEngine(
+        _deployment(),
+        model_settings=SimpleNamespace(qwen35_ane_prefill_enabled=True),
+    )
+
+    with pytest.raises(ValueError, match="qwen35_ane_prefill_enabled"):
+        engine._validate_model_settings()
+
+
 @pytest.mark.asyncio
 async def test_distributed_generate_translates_backend_completion():
     def handler(request):
@@ -1368,3 +1381,16 @@ def test_stale_marker_reports_zero_rank_side_active_requests(tmp_path, monkeypat
     assert engine.rank_side_active_requests() == 0
 
 
+
+
+@pytest.mark.asyncio
+async def test_local_stop_passes_scope_to_supervisor(monkeypatch):
+    engine = _ready_engine(lambda request: httpx.Response(200, json={}))
+    calls = []
+    monkeypatch.setattr(
+        engine._supervisor, "stop", lambda **kwargs: calls.append(kwargs)
+    )
+    await engine.stop(local_only=True)
+    assert calls == [{"local_only": True}]
+    assert engine._client is None
+    assert not engine._loaded

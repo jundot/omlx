@@ -371,6 +371,9 @@ async def cluster_devices(is_admin: bool = Depends(require_admin)):
     # their node_ids from the discovered list below.
     for row in paired:
         _enrich_paired_row(row, observed_records.get(row.get("node_id")))
+        if service is not None:
+            health = service.address_health(row["node_id"])
+            row["address_health"] = health
 
     # Nothing flips the discovery service's in-memory ``PeerRecord.paired``
     # the moment pairing completes, so a stale (possibly dead) record for a

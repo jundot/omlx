@@ -591,6 +591,40 @@ class TestRunSingleTest:
         assert metrics["gen_tps"] is None
         assert metrics["tpot_ms"] is None
 
+    @pytest.mark.asyncio
+    async def test_early_stop_burst_has_no_decode_rate(self):
+        """Two queued MTP tokens then EOS must not report a burst rate as tg."""
+
+        class EarlyStopEngine:
+            async def stream_generate(self, **kwargs):
+                for count, at in ((1, 1.0), (2, 1.0004)):
+                    yield SimpleNamespace(
+                        completion_tokens=count,
+                        prompt_tokens=1024,
+                        cached_tokens=0,
+                        generated_at=at,
+                        generated_until=at,
+                    )
+                yield SimpleNamespace(
+                    completion_tokens=2,
+                    prompt_tokens=1024,
+                    cached_tokens=0,
+                    finished=True,
+                    finish_reason="stop",
+                )
+
+        with patch("omlx.admin.benchmark.time.perf_counter", side_effect=[0.0, 1.05]):
+            metrics = await _run_single_test(
+                EarlyStopEngine(),
+                prompt=[0] * 1024,
+                max_tokens=128,
+                pp_len=1024,
+            )
+
+        assert metrics["completion_tokens"] == 2
+        assert metrics["gen_tps"] is None
+        assert metrics["tpot_ms"] is None
+
 
 class TestRunBatchTest:
     @pytest.mark.asyncio
@@ -1087,16 +1121,16 @@ class TestFilterUploadedSettings:
                 qwen35_oq_a8_min_tokens=64,
                 moe_expert_offload_enabled=True,
                 moe_expert_offload_resident_fraction=0.5,
-                dflash_in_memory_cache_max_bytes=123,
-                dflash_ssd_cache_max_bytes=456,
+                dflash_draft_window_size=4096,
+                dflash_block_size=8,
             )
         )
         assert out["qwen35_oq_a8_enabled"] is True
         assert out["qwen35_oq_a8_min_tokens"] == 64
         assert out["moe_expert_offload_enabled"] is True
         assert out["moe_expert_offload_resident_fraction"] == 0.5
-        assert out["dflash_in_memory_cache_max_bytes"] == 123
-        assert out["dflash_ssd_cache_max_bytes"] == 456
+        assert out["dflash_draft_window_size"] == 4096
+        assert out["dflash_block_size"] == 8
 
     def test_full_snapshot_stays_under_the_size_cap(self):
         from omlx.admin import benchmark as bench
@@ -1126,11 +1160,8 @@ class TestFilterUploadedSettings:
                 dflash_draft_model="/models/z-lab/Qwen3.8-27B-DFlash2-b16",
                 dflash_draft_quant_enabled=True,
                 dflash_draft_quant_weight_bits=4,
-                dflash_draft_quant_activation_bits=8,
                 dflash_draft_quant_group_size=64,
-                dflash_max_ctx=131072,
                 dflash_draft_window_size=4096,
-                dflash_draft_sink_size=4,
                 dflash_block_size=16,
                 dflash_verify_mode="adaptive",
                 vlm_mtp_draft_model="gemma-4-26B-A4B-it-assistant",

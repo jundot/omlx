@@ -1,5 +1,6 @@
 #include "deepseek_v41_packed_attention.h"
 
+#include <algorithm>
 #include <dlfcn.h>
 #include <filesystem>
 #include <sstream>
@@ -163,10 +164,24 @@ class DeepseekV41PackedAttentionPrimitive : public Primitive {
         "_wm",
         wm);
 
+    // Prefill reads Q fragments directly into registers; short verification
+    // blocks keep the staged kernel.
+    if (qL > 8) {
+      base_name += "_directq";
+    }
+
+    // Long prefill chunks decode each KV row once into temporary BF16 rows.
+    // The scratch is bounded, so very long contexts keep reading packed rows.
+    const size_t unpack_bytes =
+        size_t(B) * (localL + std::max(pooledL, 1)) * dim * sizeof(uint16_t);
+    const bool unpack_kv = qL >= 256 && unpack_bytes <= 80 * 1024 * 1024;
+    if (unpack_kv) {
+      base_name += "_unpacked";
+    }
+
     auto lib = d.get_library("omlx_glm_kernels", current_binary_dir());
     auto& compute_encoder = metal::get_command_encoder(s);
     auto kernel = d.get_kernel(base_name, lib);
-    compute_encoder.set_compute_pipeline_state(kernel);
 
     DeepseekV4SparseAttentionParams params{
         /* int B = */ B,
@@ -194,9 +209,37 @@ class DeepseekV41PackedAttentionPrimitive : public Primitive {
         /* int64_t O_strides[3] = */ {
             o.strides(0), o.strides(1), o.strides(2)}};
 
+    auto local_input = local_kv;
+    auto pooled_input = pooled;
+    if (unpack_kv) {
+      local_input = array(Shape{B, localL, dim}, bfloat16, nullptr, {});
+      pooled_input =
+          array(Shape{B, std::max(pooledL, 1), dim}, bfloat16, nullptr, {});
+      local_input.set_data(allocator::malloc(local_input.nbytes()));
+      pooled_input.set_data(allocator::malloc(pooled_input.nbytes()));
+      compute_encoder.add_temporary(local_input);
+      compute_encoder.add_temporary(pooled_input);
+      auto unpack_kernel = d.get_kernel("deepseek_v41_prefill_unpack_kv", lib);
+      compute_encoder.set_compute_pipeline_state(unpack_kernel);
+      compute_encoder.set_input_array(local_kv, 0);
+      compute_encoder.set_input_array(pooled, 1);
+      compute_encoder.set_output_array(local_input, 2);
+      compute_encoder.set_output_array(pooled_input, 3);
+      compute_encoder.set_bytes(params, 4);
+      compute_encoder.dispatch_threads(
+          MTL::Size(size_t(B) * (localL + pooledL) * dim, 1, 1),
+          MTL::Size(256, 1, 1));
+      // Attention receives byte pointers and strides, with the original shape
+      // and masking metadata; only the row representation has changed.
+      params.Local_strides[0] = int64_t(localL) * dim * sizeof(uint16_t);
+      params.Local_strides[2] = dim * sizeof(uint16_t);
+      params.Pooled_strides[0] = int64_t(pooledL) * dim * sizeof(uint16_t);
+      params.Pooled_strides[1] = dim * sizeof(uint16_t);
+    }
+    compute_encoder.set_compute_pipeline_state(kernel);
     compute_encoder.set_input_array(q, 0);
-    compute_encoder.set_input_array(local_kv, 1);
-    compute_encoder.set_input_array(pooled, 2);
+    compute_encoder.set_input_array(local_input, 1);
+    compute_encoder.set_input_array(pooled_input, 2);
     compute_encoder.set_input_array(topk, 3);
     compute_encoder.set_input_array(sinks, 4);
     compute_encoder.set_output_array(o, 5);

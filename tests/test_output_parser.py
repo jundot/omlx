@@ -1649,6 +1649,18 @@ class TestMuseGlimmerOutputParserSession:
         assert "more text" in combined
         assert not stopped
 
+    @pytest.mark.parametrize(
+        ("model_name", "model_config"),
+        [
+            ("any-name", {"model_type": "muse_spark"}),
+            ("Muse-Spark-1.2-816B-A42B-NVFP4-open-hf", None),
+        ],
+    )
+    def test_muse_spark_uses_channel_parser(self, model_name, model_config):
+        factory = detect_output_parser(model_name, InklingTokenizer({}), model_config)
+        assert factory is not None
+        assert factory.kind == "muse_glimmer"
+
     def test_non_muse_model_not_claimed(self):
         tokenizer = InklingTokenizer({})
         factory = detect_output_parser(

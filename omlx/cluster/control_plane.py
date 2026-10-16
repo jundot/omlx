@@ -6,7 +6,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
-import os
 import pickle
 import secrets
 import socket
@@ -312,13 +311,8 @@ class RankControlPlane(AbstractContextManager["RankControlPlane"]):
         raise TimeoutError(f"rank-control coordinator was unreachable: {last_error}")
 
     def _connect_to_coordinator(self) -> None:
-        mode = os.environ.get("OMLX_CLUSTER_CONTROL_TRANSPORT", "auto").strip().lower()
         proxy_available = should_proxy_control_socket(self.host)
         deadline = time.monotonic() + self._connect_timeout
-        if mode == "system-proxy":
-            self._connect_via_proxy(deadline=deadline)
-            return
-
         try:
             self._connect_direct(deadline=deadline, allow_proxy=proxy_available)
         except OSError as exc:

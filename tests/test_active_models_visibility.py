@@ -1,5 +1,3 @@
-import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -28,6 +26,7 @@ class FakePool:
                     "loading_started_at": self.loading_started_at,
                     "estimated_size": 1024,
                     "pinned": False,
+                    "last_access": 100.0,
                 }
             ],
         }
@@ -74,6 +73,7 @@ def test_active_models_generation_includes_activity_and_waiting_rows():
     assert data["total_active_requests"] == 2
     assert model["active_requests"] == 2
     assert model["waiting_requests"] == 1
+    assert model["idle_seconds"] == 0.0
     assert model["prefilling"] == [
         {"request_id": "prefill-1", "processed": 10, "total": 20}
     ]
@@ -126,6 +126,7 @@ def test_active_models_does_not_count_waiting_collectors_as_active():
     assert data["total_waiting_requests"] == 1
     assert model["active_requests"] == 0
     assert model["waiting_requests"] == 1
+    assert model["idle_seconds"] == 0.0
     assert model["generating"] == []
 
 
@@ -240,9 +241,9 @@ def _make_settings_manager(ttl_seconds=None):
 class FakeIdlePool:
     """Pool with a single loaded idle model that has last_access set."""
 
-    def __init__(self, last_access=100.0):
+    def __init__(self, last_access=100.0, in_use=0):
         self._entries = {
-            "model-a": SimpleNamespace(engine=object()),  # engine is not None → loaded
+            "model-a": SimpleNamespace(engine=object(), in_use=in_use),  # engine is not None → loaded
         }
         self._last_access = last_access
 
@@ -301,6 +302,32 @@ def test_idle_seconds_none_when_no_last_access():
         data = admin_routes._build_active_models_data()
 
     assert data["models"][0]["idle_seconds"] is None
+
+
+def test_idle_seconds_zero_while_lease_is_held():
+    """A leased model is busy: no idle time and the full TTL remains."""
+    with (
+        patch("omlx.admin.routes._get_server_state", return_value=None),
+        patch.object(
+            admin_routes,
+            "_get_engine_pool",
+            return_value=FakeIdlePool(last_access=100.0, in_use=1),
+        ),
+        patch.object(
+            admin_routes,
+            "_get_settings_manager",
+            return_value=_make_settings_manager(ttl_seconds=30),
+        ),
+        patch.object(admin_routes, "_get_global_settings", return_value=None),
+        patch("omlx.prefill_progress.get_prefill_tracker", return_value=EmptyPrefillTracker()),
+        patch("time.time", return_value=115.0),
+        patch("time.monotonic", return_value=115.0),
+    ):
+        data = admin_routes._build_active_models_data()
+
+    model = data["models"][0]
+    assert model["idle_seconds"] == 0.0
+    assert model["ttl_remaining_seconds"] == 30.0
 
 
 def test_ttl_remaining_from_per_model_setting():
@@ -439,18 +466,14 @@ def test_idle_and_ttl_not_computed_for_loading_model():
     assert model["ttl_remaining_seconds"] is None
 
 
-# ── DFlash engine visibility (#2396) ──────────────────────────────────────
+# ── engines without an AsyncEngineCore (#2396) ────────────────────────────
 
 
-class FakeDFlashPool:
-    """Pool whose engine has no AsyncEngineCore, mirroring DFlashEngine.
-
-    ``scheduler`` stands in for DFlashEngine's property that surfaces the
-    fallback engine's scheduler (None while in primary mode).
-    """
+class FakeCorelessPool:
+    """Pool whose engine has no AsyncEngineCore; ``scheduler`` may be None."""
 
     def __init__(self, engine):
-        self._entries = {"dflash-model": SimpleNamespace(engine=engine)}
+        self._entries = {"coreless-model": SimpleNamespace(engine=engine)}
 
     def get_status(self):
         return {
@@ -458,7 +481,7 @@ class FakeDFlashPool:
             "final_ceiling": 2048,
             "models": [
                 {
-                    "id": "dflash-model",
+                    "id": "coreless-model",
                     "loaded": True,
                     "is_loading": False,
                     "estimated_size": 1024,
@@ -483,8 +506,8 @@ def _build_with_pool(pool):
         return admin_routes._build_active_models_data()
 
 
-def test_active_models_dflash_primary_counts_activity():
-    """Primary mode: no scheduler anywhere, activity snapshot drives the count."""
+def test_active_models_coreless_engine_counts_activity():
+    """No scheduler anywhere: the activity snapshot drives the count."""
 
     class Engine:
         scheduler = None
@@ -503,7 +526,7 @@ def test_active_models_dflash_primary_counts_activity():
                 ],
             }
 
-    data = _build_with_pool(FakeDFlashPool(Engine()))
+    data = _build_with_pool(FakeCorelessPool(Engine()))
 
     model = data["models"][0]
     assert data["total_active_requests"] == 1
@@ -511,9 +534,65 @@ def test_active_models_dflash_primary_counts_activity():
     assert model["activities"][0]["detail"] == "generating"
 
 
+class FakeLivePool:
+    """Fake EnginePool whose engine reports its own live request rows."""
+
+    def __init__(self, engine):
+        self._entries = {"live-model": SimpleNamespace(engine=engine)}
+
+    def get_status(self):
+        return {
+            "current_model_memory": 1024,
+            "final_ceiling": 2048,
+            "models": [
+                {
+                    "id": "live-model",
+                    "loaded": True,
+                    "is_loading": False,
+                    "estimated_size": 1024,
+                    "pinned": False,
+                }
+            ],
+        }
+
+
+def test_active_models_includes_engine_live_request_rows():
+    """Engines without an oMLX scheduler (Splash) supply their own rows."""
+    prefill_row = {
+        "request_id": "req-pp-1",
+        "processed": 50,
+        "total": 100,
+        "speed": 100.0,
+        "eta": 0.5,
+        "elapsed": 1.2,
+        "detail": None,
+    }
+    generating_row = {
+        "request_id": "req-gen-1",
+        "elapsed_seconds": 2.5,
+        "generated_tokens": 30,
+        "tokens_per_second": 12.0,
+        "last_activity_age_seconds": 0.1,
+        "prompt_tokens": 100,
+        "max_tokens": 256,
+    }
+
+    class Engine:
+        def get_live_requests(self):
+            return {"prefilling": [prefill_row], "generating": [generating_row]}
+
+    data = _build_with_pool(FakeLivePool(Engine()))
+
+    model = data["models"][0]
+    assert data["total_active_requests"] == 2
+    assert model["active_requests"] == 2
+    assert model["prefilling"] == [prefill_row]
+    assert model["generating"] == [generating_row]
+
+
 def test_active_models_resolves_scheduler_property_without_async_core():
-    """Fallback mode: the engine exposes a scheduler property instead of an
-    AsyncEngineCore, and the snapshot path must still be taken."""
+    """The engine exposes a scheduler property instead of an AsyncEngineCore,
+    and the snapshot path must still be taken."""
     running_request = SimpleNamespace(
         request_id="gen-1",
         generation_started_at=100.0,
@@ -534,85 +613,10 @@ def test_active_models_resolves_scheduler_property_without_async_core():
         def get_activity_snapshot(self):
             return {"active_requests": 0, "activities": []}
 
-    data = _build_with_pool(FakeDFlashPool(Engine()))
+    data = _build_with_pool(FakeCorelessPool(Engine()))
 
     model = data["models"][0]
     assert data["total_active_requests"] == 1
     assert model["active_requests"] == 1
     assert model["generating"][0]["request_id"] == "gen-1"
     assert model["activities"] == []
-
-
-def test_active_models_surfaces_dflash_guardrail_stats():
-    """DFlash warning and exact speculation counters reach the dashboard API."""
-
-    speculation = {
-        "last": {
-            "generation_tokens": 768,
-            "cycles": 377,
-            "acceptance_ratio": 391 / 768,
-            "accepted_draft_tokens": 391,
-            "tokens_per_cycle": 768 / 377,
-            "accepted_draft_tokens_per_cycle": 391 / 377,
-            "fallback_ar": False,
-            "fallback_reason": None,
-        },
-        "totals": {
-            "requests": 1,
-            "speculative_requests": 1,
-            "fallback_requests": 0,
-            "generation_tokens": 768,
-            "accepted_draft_tokens": 391,
-            "cycles": 377,
-            "acceptance_ratio": 391 / 768,
-            "tokens_per_cycle": 768 / 377,
-            "accepted_draft_tokens_per_cycle": 391 / 377,
-        },
-    }
-
-    class Engine:
-        scheduler = None
-        pairing_warning = "Possible DFlash precision mismatch"
-
-        def get_activity_snapshot(self):
-            return {"active_requests": 0, "activities": []}
-
-        def get_speculation_stats(self):
-            return speculation
-
-    data = _build_with_pool(FakeDFlashPool(Engine()))
-
-    assert data["models"][0]["dflash"] == {
-        "speculation": speculation,
-        "pairing_warning": "Possible DFlash precision mismatch",
-    }
-
-
-def test_dflash_dashboard_localizes_metrics_and_shows_session_fallbacks():
-    root = Path(__file__).resolve().parents[1]
-    template = (
-        root / "omlx/admin/templates/dashboard/blocks/_active_models.html"
-    ).read_text(encoding="utf-8")
-    dashboard_js = (root / "omlx/admin/static/js/dashboard.js").read_text(
-        encoding="utf-8"
-    )
-    i18n_dir = root / "omlx/admin/i18n"
-    keys = {
-        "status.active_models.dflash_fallback_ar",
-        "status.active_models.dflash_draft_share",
-        "status.active_models.dflash_accepted_draft_per_cycle",
-        "status.active_models.dflash_output_per_cycle",
-        "status.active_models.dflash_draft_tokens_last_request",
-        "status.active_models.dflash_session",
-        "status.active_models.dflash_speculative_requests",
-        "status.active_models.dflash_fallback_requests",
-    }
-
-    assert "m.dflash.speculation.totals.requests > 1" in template
-    assert "formatDFlashSessionStats(m.dflash.speculation.totals)" in template
-    assert "totals.fallback_requests > 0" in dashboard_js
-    for key in keys:
-        assert key in template + dashboard_js
-    for locale_path in i18n_dir.glob("*.json"):
-        locale = json.loads(locale_path.read_text(encoding="utf-8"))
-        assert not keys - locale.keys(), f"{locale_path.name} is missing DFlash keys"

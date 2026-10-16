@@ -768,10 +768,16 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     # that offered pipeline for Qwen3.5/3.6-family VLMs and then failed at load.
     from omlx.model_discovery import _has_vision_subconfig
 
-    if _has_vision_subconfig(config):
+    if _has_vision_subconfig(config) and model_type not in _MLX_LM_TEXT_PIPELINE_TYPES:
         return False
     return _declares_pipeline(model_type)
 
+
+# VLM-shaped checkpoints whose DISTRIBUTED load goes through mlx-lm: the cluster
+# worker never uses mlx-vlm and mlx-lm's ``sanitize`` drops the vision tower, so
+# the vision guard above is a false positive for them (oMLX #3662). Qwen3.5/3.6/3.8
+# dense ships its vision config next to the text weights.
+_MLX_LM_TEXT_PIPELINE_TYPES = frozenset({"qwen3_5"})
 
 # Only about seven of mlx-lm's ~120 architectures can be pipelined, so the
 # answer is nearly always no — worth knowing before staging a hundred
@@ -866,7 +872,7 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
                 )
                 denominator = num_layers * index_pool
                 return (numerator + denominator - 1) // denominator
-        return (kv_lora_rank + rope_dim) * dtype_size
+        return _hybrid_kv_average((kv_lora_rank + rope_dim) * dtype_size, config)
 
     heads = _config_int(config, "num_attention_heads", 0)
     kv_heads = _config_int(config, "num_key_value_heads", heads)
@@ -878,7 +884,42 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
         return 0
     if kv_heads <= 0 or head_dim <= 0:
         return 0
-    return kv_heads * head_dim * 2 * dtype_size
+    return _hybrid_kv_average(kv_heads * head_dim * 2 * dtype_size, config)
+
+
+def _hybrid_kv_average(per_layer: int, config: dict[str, Any]) -> int:
+    """Average per-layer KV bytes when only the attention layers grow a cache.
+
+    Hybrid checkpoints often omit ``layer_types``; the fallbacks mirror MLX-LM.
+    """
+
+    text_config = config.get("text_config")
+    layer_config = text_config if isinstance(text_config, dict) else config
+    layer_types = layer_config.get("layer_types")
+    linear = layer_config.get("linear_attn_config")
+    kda = linear.get("kda_layers") if isinstance(linear, dict) else None
+    total = _config_int(config, "num_hidden_layers", 0)
+    interval = _config_int(config, "full_attention_interval", 0)
+    group = _config_int(config, "layer_group_size", 0)
+    if (
+        isinstance(layer_types, list)
+        and layer_types
+        and all(isinstance(t, str) for t in layer_types)
+    ):
+        total = len(layer_types)
+        full = sum(t != "linear_attention" for t in layer_types)
+    elif isinstance(kda, list):
+        full = total - len(kda)
+    elif interval > 1:
+        full = total // interval
+    elif group > 1 and str(config.get("model_type", "")).startswith("bailing"):
+        # Attention closes each group and fills the leftover tail.
+        full = total // group + total % group
+    else:
+        return per_layer
+    if 0 < full < total:
+        return (per_layer * full + total - 1) // total
+    return per_layer
 
 
 def _attention_head_count(model_path: Path) -> int:

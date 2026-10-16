@@ -1,0 +1,311 @@
+{# Recommended source of the Model Downloader: oQ builds priced against this Mac. #}
+{% macro badges(item) %}
+<span class="badge bg-neutral-50 text-neutral-700 border-neutral-200" x-text="'oQ' + {{ item }}.level + 'e'"></span>
+<span x-show="{{ item }}.vision" class="badge bg-sky-50 text-sky-700 border-sky-200">{{ t('models.recommend.badge.vision') }}</span>
+<span x-show="{{ item }}.audio" class="badge bg-sky-50 text-sky-700 border-sky-200">{{ t('models.recommend.badge.audio') }}</span>
+<span x-show="{{ item }}.mtp" class="badge bg-violet-50 text-violet-700 border-violet-200">{{ t('models.recommend.badge.mtp') }}</span>
+<span x-show="{{ item }}.table_on_ssd" class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('models.recommend.badge.table_on_ssd') }}</span>
+{% endmacro %}
+
+{% macro meters(item) %}
+<div>
+    <div class="text-xs text-neutral-500 mb-1.5">{{ t('models.recommend.smarts') }}</div>
+    <div class="flex items-center gap-1">
+        <template x-for="dot in recDots({{ item }}.smarts_level)">
+            <span class="w-2 h-2 rounded-full"
+                  :class="dot === 'full' ? 'bg-neutral-500' : (dot === 'half' ? 'rec-dot-half' : 'bg-neutral-200')"></span>
+        </template>
+    </div>
+</div>
+<div>
+    <div class="text-xs text-neutral-500 mb-1.5">{{ t('models.recommend.speed') }} · <span class="text-neutral-900 font-medium" x-text="window.t('models.recommend.speed_level.' + {{ item }}.speed_level)"></span></div>
+    <div class="flex items-center gap-1">
+        <template x-for="dot in recDots({{ item }}.speed_level)">
+            <span class="w-2 h-2 rounded-full" :class="dot === 'full' ? 'bg-neutral-500' : 'bg-neutral-200'"></span>
+        </template>
+    </div>
+</div>
+{% endmacro %}
+
+{% macro download_action(item, row) %}
+<template x-if="recState({{ item }}.repo_id) === 'downloaded'">
+    <span class="badge bg-green-50 text-green-700 border-green-200">{{ t('models.recommend.downloaded') }}</span>
+</template>
+<template x-if="recState({{ item }}.repo_id) === 'downloading'">
+    <div class="w-32">
+        <div class="flex justify-between text-xs text-neutral-500 mb-1">
+            <span>{{ t('models.recommend.downloading') }}</span>
+            <span x-text="Math.round(recTask({{ item }}.repo_id)?.progress || 0) + '%'"></span>
+        </div>
+        <div class="h-1.5 rounded-full bg-neutral-100 overflow-hidden">
+            <div class="h-full bg-neutral-900 transition-all" :style="'width: ' + (recTask({{ item }}.repo_id)?.progress || 0) + '%'"></div>
+        </div>
+    </div>
+</template>
+<template x-if="recState({{ item }}.repo_id) === 'idle'">
+    <button type="button" @click="downloadRecommended({{ item }}.repo_id)"
+            :disabled="hfDownloading || recDiskShort({{ item }})"
+            :title="recDiskShort({{ item }}) ? window.t('models.recommend.not_enough_space') : ''"
+            class="inline-flex items-center gap-1.5 font-medium bg-neutral-900 text-white hover:bg-neutral-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed {{ 'px-3 py-1.5 text-xs rounded-lg' if row else 'px-4 py-2 text-sm rounded-full' }}">
+        <i data-lucide="download" class="w-4 h-4"></i>{{ t('models.recommend.download') }}
+    </button>
+</template>
+{% endmacro %}
+
+{% macro model_row(item, note, extra='') %}
+<div class="flex flex-wrap lg:flex-nowrap items-center gap-x-6 gap-y-3 px-5 py-4 border-b border-neutral-100 last:border-0">
+    <div class="min-w-0 flex-1 basis-64">
+        <div class="flex items-center gap-1.5 flex-wrap">
+            <span class="font-semibold text-sm text-neutral-900 mr-1" x-text="{{ item }}.name"></span>
+            {{ badges(item) }}
+            {{ extra | safe }}
+        </div>
+        <p class="text-xs text-neutral-500 mt-1" x-text="recArch({{ item }}) + ' · ' + recDownloadsText({{ item }}) + ' · ' + ({{ note }})"></p>
+    </div>
+    <div class="flex gap-6 shrink-0">{{ meters(item) }}</div>
+    <div class="w-44 shrink-0">
+        <div class="flex justify-between text-xs text-neutral-500 mb-1.5">
+            <span x-text="recGB({{ item }}.resident_bytes)"></span>
+            <span x-text="'~' + recContext({{ item }}.max_context)"></span>
+        </div>
+        <div class="h-1.5 rounded-full bg-neutral-100 overflow-hidden">
+            <div class="h-full" :class="recMemoryBarClass({{ item }})" :style="'width: ' + recMemoryShare({{ item }}) + '%'"></div>
+        </div>
+    </div>
+    <div class="w-32 flex justify-end shrink-0">{{ download_action(item, True) }}</div>
+</div>
+{% endmacro %}
+
+<div x-show="downloaderSource === 'recommended'" x-cloak>
+    <div x-show="hfError" x-cloak class="mb-6 px-4 py-2.5 bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl" x-text="hfError"></div>
+    <div x-show="hfSuccess" x-cloak class="mb-6 px-4 py-2.5 bg-green-50 border border-green-200 text-green-700 text-sm rounded-xl" x-text="hfSuccess"></div>
+
+    <div x-show="recommendationsLoading && !recommendations" x-cloak class="bg-white rounded-2xl border border-neutral-200 px-6 py-12 text-center">
+        <div class="inline-block w-5 h-5 border-2 border-neutral-300 border-t-neutral-600 rounded-full animate-spin mb-3"></div>
+        <p class="text-sm text-neutral-500">{{ t('models.recommend.loading') }}</p>
+    </div>
+
+    <div x-show="recommendationsError && !recommendations" x-cloak class="bg-white rounded-2xl border border-neutral-200 px-6 py-12 text-center">
+        <p class="text-sm text-neutral-500" x-text="recommendationsError"></p>
+        <button type="button" @click="loadRecommendations(true)"
+                class="mt-3 px-4 py-2 text-xs font-medium text-neutral-600 hover:text-neutral-800 bg-neutral-100 hover:bg-neutral-200 rounded-full transition-colors">
+            {{ t('models.recommend.retry') }}
+        </button>
+    </div>
+
+    <template x-if="recommendations">
+        <div>
+            <div x-show="recommendations.stale" class="mb-6 px-4 py-2.5 bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-xl flex items-center gap-2">
+                <i data-lucide="alert-triangle" class="w-4 h-4 shrink-0"></i>
+                <span>{{ t('models.recommend.stale') }}</span>
+            </div>
+
+            <!-- Your Mac -->
+            <section class="bg-white rounded-2xl border border-neutral-200 p-6">
+                <div class="flex flex-wrap items-start justify-between gap-6">
+                    <div class="flex items-center gap-4">
+                        <div class="w-12 h-12 rounded-xl bg-neutral-900 text-white grid place-items-center">
+                            <i data-lucide="cpu" class="w-6 h-6"></i>
+                        </div>
+                        <div>
+                            <div class="text-xs text-neutral-500">{{ t('models.recommend.your_mac') }}</div>
+                            <div class="text-lg font-semibold text-neutral-900" x-text="recChipLine()"></div>
+                            <div class="text-sm text-neutral-500" x-text="recMemoryLine()"></div>
+                        </div>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-xs text-neutral-500">{{ t('models.recommend.usable_label') }}</div>
+                        <div class="text-2xl font-bold tracking-tight text-neutral-900" x-text="recGB(recommendations.memory.scenarios.now.usable_bytes)"></div>
+                    </div>
+                </div>
+                <div class="mt-5 h-3 rounded-full overflow-hidden flex bg-neutral-100">
+                    <template x-for="segment in recMemorySegments()" :key="segment.key">
+                        <div class="h-full" :class="segment.cls" :style="'width: ' + segment.percent + '%'"
+                             :title="window.t(segment.label) + ' ' + recGB(segment.bytes)"></div>
+                    </template>
+                </div>
+                <div class="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-neutral-500">
+                    <template x-for="segment in recMemorySegments()" :key="segment.key">
+                        <span class="inline-flex items-center gap-1.5">
+                            <span class="w-2.5 h-2.5 rounded-sm" :class="segment.cls"></span>
+                            <span x-text="window.t(segment.label)"></span>
+                            <span class="text-neutral-900 font-medium" x-text="recGB(segment.bytes)"></span>
+                        </span>
+                    </template>
+                </div>
+                <div class="mt-4 pt-4 border-t border-neutral-100 flex flex-wrap items-center gap-2">
+                    <span class="badge bg-neutral-50 text-neutral-700 border-neutral-200"
+                          x-text="window.t('models.recommend.chip.memory_guard').replace('{tier}', window.t('settings.resource.guard_tier.' + recommendations.memory.tier))"></span>
+                    <span class="badge"
+                          :class="recommendations.memory.binding === 'metal' ? 'bg-amber-50 text-amber-700 border-amber-200' : 'bg-neutral-50 text-neutral-700 border-neutral-200'"
+                          x-text="recGpuLimitText()"></span>
+                    <span class="badge bg-neutral-50 text-neutral-700 border-neutral-200"
+                          x-text="window.t('models.recommend.chip.free_space').replace('{size}', recGB(recommendations.disk.free_bytes))"></span>
+                    <span class="text-xs text-neutral-400 ml-1">{{ t('models.recommend.estimates_note') }}</span>
+                </div>
+            </section>
+
+            <!-- Best for your Mac -->
+            <section class="mt-10">
+                <div class="flex items-center gap-2 mb-1">
+                    <span class="w-7 h-7 rounded-lg grid place-items-center bg-neutral-900 text-white"><i data-lucide="star" class="w-4 h-4"></i></span>
+                    <h3 class="text-lg font-semibold text-neutral-900">{{ t('models.recommend.best.title') }}</h3>
+                </div>
+                <p class="text-sm text-neutral-500 mb-4 ml-9">{{ t('models.recommend.best.subtitle') }}</p>
+                <div x-show="!recommendations.sections.best.length" class="bg-white rounded-2xl border border-neutral-200 px-5 py-6 text-sm text-neutral-500">{{ t('models.recommend.best.empty') }}</div>
+                <div x-show="recommendations.sections.best.length" class="grid md:grid-cols-3 gap-4 pt-2">
+                    <template x-for="(item, index) in recommendations.sections.best" :key="item.repo_id">
+                        <div class="relative bg-white rounded-2xl border p-5 flex flex-col gap-4"
+                             :class="index === 0 ? 'border-neutral-900' : 'border-neutral-200'">
+                            <span x-show="index === 0" class="absolute -top-2.5 left-5 badge bg-neutral-900 text-white border-neutral-900">
+                                <i data-lucide="star" class="w-3 h-3"></i>{{ t('models.recommend.best.badge') }}
+                            </span>
+                            <div>
+                                <h4 class="text-base font-semibold text-neutral-900 break-words" x-text="item.name"></h4>
+                                <p class="text-xs text-neutral-500 mt-0.5" x-text="recArch(item) + ' · ' + window.t('models.recommend.meta.context').replace('{context}', recContext(item.model_max_context)) + ' · ' + recDownloadsText(item)"></p>
+                                <div class="flex flex-wrap gap-1 mt-2">{{ badges('item') }}</div>
+                            </div>
+                            <div class="grid grid-cols-2 gap-3">{{ meters('item') }}</div>
+                            <div>
+                                <div class="flex justify-between gap-2 text-xs text-neutral-500 mb-1.5">
+                                    <span x-text="window.t('models.recommend.memory_use').replace('{size}', recGB(item.resident_bytes)).replace('{usable}', recGB(recommendations.memory.scenarios.now.usable_bytes))"></span>
+                                    <span x-text="window.t('models.recommend.chat_tokens').replace('{tokens}', recContext(item.max_context))"></span>
+                                </div>
+                                <div class="h-1.5 rounded-full bg-neutral-100 overflow-hidden">
+                                    <div class="h-full" :class="recMemoryBarClass(item)" :style="'width: ' + recMemoryShare(item) + '%'"></div>
+                                </div>
+                                <p x-show="item.table_on_ssd" class="mt-2 text-xs text-amber-700"
+                                   x-text="window.t('models.recommend.table_on_ssd').replace('{size}', recGB(item.table_bytes))"></p>
+                            </div>
+                            <div class="flex items-center justify-between gap-2 pt-3 border-t border-neutral-100 mt-auto">
+                                <span class="text-xs text-neutral-500" x-text="window.t('models.recommend.download_size').replace('{size}', recGB(item.download_bytes))"></span>
+                                {{ download_action('item', False) }}
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </section>
+
+            <!-- Smarter, but slower -->
+            <section x-show="recommendations.sections.best.length" class="mt-10">
+                <div class="flex items-center gap-2 mb-1">
+                    <span class="w-7 h-7 rounded-lg grid place-items-center bg-neutral-600 text-white"><i data-lucide="lightbulb" class="w-4 h-4"></i></span>
+                    <h3 class="text-lg font-semibold text-neutral-900">{{ t('models.recommend.smarter.title') }}</h3>
+                </div>
+                <p class="text-sm text-neutral-500 mb-4 ml-9">{{ t('models.recommend.smarter.subtitle') }}</p>
+                <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                    <div class="px-5 pt-4 pb-1">
+                        <div class="text-xs font-semibold text-neutral-900">{{ t('models.recommend.bigger.title') }}</div>
+                        <div class="text-xs text-neutral-500">{{ t('models.recommend.bigger.subtitle') }}</div>
+                    </div>
+                    <template x-for="item in recommendations.sections.bigger" :key="item.repo_id">
+                        {{ model_row('item', "recNote('bigger', item)") }}
+                    </template>
+                    <div x-show="!recommendations.sections.bigger.length" class="px-5 py-3 text-xs text-neutral-500" x-text="recBiggerEmptyText()"></div>
+                    <div class="border-t border-neutral-100"></div>
+                    <div class="px-5 pt-4 pb-1">
+                        <div class="text-xs font-semibold text-neutral-900">{{ t('models.recommend.precise.title') }}</div>
+                        <div class="text-xs text-neutral-500">{{ t('models.recommend.precise.subtitle') }}</div>
+                    </div>
+                    <template x-for="item in recommendations.sections.precise" :key="item.repo_id">
+                        {{ model_row('item', "recNote('precise', item)") }}
+                    </template>
+                    <div x-show="!recommendations.sections.precise.length" class="px-5 py-3 text-xs text-neutral-500">{{ t('models.recommend.precise.empty') }}</div>
+                </div>
+            </section>
+
+            <!-- Faster, but less capable -->
+            <section x-show="recommendations.sections.best.length" class="mt-10">
+                <div class="flex items-center gap-2 mb-1">
+                    <span class="w-7 h-7 rounded-lg grid place-items-center bg-neutral-600 text-white"><i data-lucide="zap" class="w-4 h-4"></i></span>
+                    <h3 class="text-lg font-semibold text-neutral-900">{{ t('models.recommend.faster.title') }}</h3>
+                </div>
+                <p class="text-sm text-neutral-500 mb-4 ml-9">{{ t('models.recommend.faster.subtitle') }}</p>
+                <div x-show="!recommendations.sections.faster.length" class="bg-white rounded-2xl border border-neutral-200 px-5 py-6 text-sm text-neutral-500">{{ t('models.recommend.faster.empty') }}</div>
+                <div x-show="recommendations.sections.faster.length" class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                    <template x-for="item in recommendations.sections.faster" :key="item.repo_id">
+                        {{ model_row('item', "recNote('faster', item)") }}
+                    </template>
+                </div>
+            </section>
+
+            <!-- Unlock bigger models -->
+            <section class="mt-12 rounded-2xl border border-dashed border-neutral-300 bg-white p-5">
+                <button type="button" class="w-full flex items-start justify-between gap-4 text-left" @click="recommendationsUnlockOpen = !recUnlockOpen()">
+                    <div>
+                        <div class="flex items-center gap-2">
+                            <span class="w-7 h-7 rounded-lg grid place-items-center bg-amber-50 border border-amber-200 text-amber-700"><i data-lucide="lock-open" class="w-4 h-4"></i></span>
+                            <h3 class="text-lg font-semibold text-neutral-900">{{ t('models.recommend.unlock.title') }}</h3>
+                            <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('models.recommend.unlock.badge') }}</span>
+                        </div>
+                        <p class="text-sm text-neutral-600 mt-1 ml-9">{{ t('models.recommend.unlock.subtitle') }}</p>
+                    </div>
+                    <span class="text-sm text-neutral-500 mt-1 shrink-0" x-text="recUnlockOpen() ? window.t('models.recommend.unlock.hide') : window.t('models.recommend.unlock.show')"></span>
+                </button>
+                <div x-show="recUnlockOpen()">
+                    <p x-show="!recUnlockGain('both')" class="text-sm text-neutral-600 mt-3 ml-9">{{ t('models.recommend.unlock.max') }}</p>
+                    <div x-show="recUnlockGain('both')">
+                        <div x-show="recommendations.memory.total_bytes <= 16 * 1024 ** 3"
+                             class="mt-4 px-4 py-2.5 bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl"
+                             x-text="window.t('models.recommend.unlock.small_mac').replace('{memory}', recGB(recommendations.memory.total_bytes))"></div>
+                        <div class="grid md:grid-cols-2 gap-3 mt-4">
+                            <div class="bg-neutral-50 rounded-xl border border-neutral-200 p-4">
+                                <div class="flex items-center justify-between gap-2">
+                                    <span class="text-sm font-semibold text-neutral-900">{{ t('models.recommend.unlock.guard.title') }}</span>
+                                    <span class="text-xs" :class="recUnlockGain('memory_guard') ? 'text-emerald-700' : 'text-neutral-400'"
+                                          x-text="recUnlockGain('memory_guard') ? '+' + recGB(recUnlockGain('memory_guard')) : window.t('models.recommend.unlock.no_gain')"></span>
+                                </div>
+                                <template x-if="recommendations.memory.tier !== 'aggressive'">
+                                    <div>
+                                        <p class="text-xs text-neutral-500 mt-1"
+                                           x-text="recommendations.memory.tier === 'custom'
+                                               ? window.t('models.recommend.unlock.guard.body_custom').replace('{size}', recGB(recommendations.memory.static_ceiling_bytes)).replace('{to}', recGB(recAggressiveReserve()))
+                                               : window.t('models.recommend.unlock.guard.body').replace('{from}', recGB(recommendations.memory.reserve_bytes)).replace('{to}', recGB(recAggressiveReserve()))"></p>
+                                        <button type="button" @click="recSetAggressive()" :disabled="recommendationsApplying"
+                                                class="mt-3 px-3 py-1.5 text-xs font-medium rounded-full border border-neutral-200 text-neutral-700 hover:bg-neutral-100 transition-colors disabled:opacity-50">
+                                            {{ t('models.recommend.unlock.guard.button') }}
+                                        </button>
+                                    </div>
+                                </template>
+                                <p x-show="recommendations.memory.tier === 'aggressive'" class="text-xs text-neutral-500 mt-1">{{ t('models.recommend.unlock.guard.done') }}</p>
+                            </div>
+                            <div class="bg-neutral-50 rounded-xl border border-neutral-200 p-4">
+                                <div class="flex items-center justify-between gap-2">
+                                    <span class="text-sm font-semibold text-neutral-900">{{ t('models.recommend.unlock.wired.title') }}</span>
+                                    <span class="text-xs" :class="recUnlockGain('wired_limit') ? 'text-emerald-700' : 'text-neutral-400'"
+                                          x-text="recUnlockGain('wired_limit') ? '+' + recGB(recUnlockGain('wired_limit')) : window.t('models.recommend.unlock.no_gain')"></span>
+                                </div>
+                                <template x-if="recWiredCommand()">
+                                    <div>
+                                        <p class="text-xs text-neutral-500 mt-1"
+                                           x-text="window.t('models.recommend.unlock.wired.body').replace('{percent}', recMetalPercent())"></p>
+                                        <div class="mt-3 flex items-center gap-2 min-w-0">
+                                            <code class="px-2.5 py-1 rounded-md bg-neutral-900 text-white text-xs truncate" x-text="recWiredCommand()"></code>
+                                            <button type="button" @click="copyWiredLimitCommand(recWiredCommand())"
+                                                    class="p-1.5 rounded-lg transition-colors"
+                                                    :class="wiredLimitCopied ? 'text-green-600' : 'text-neutral-400 hover:text-neutral-700 hover:bg-neutral-100'"
+                                                    :title="wiredLimitCopied ? window.t('models.recommend.unlock.copied') : window.t('models.recommend.unlock.copy')">
+                                                <i x-show="!wiredLimitCopied" data-lucide="copy" class="w-4 h-4"></i>
+                                                <i x-show="wiredLimitCopied" data-lucide="check" class="w-4 h-4"></i>
+                                            </button>
+                                        </div>
+                                    </div>
+                                </template>
+                                <p x-show="!recWiredCommand()" class="text-xs text-neutral-500 mt-1">{{ t('models.recommend.unlock.wired.done') }}</p>
+                            </div>
+                        </div>
+                        <p class="text-xs text-neutral-600 mt-3" x-text="recUnlockSummary()"></p>
+                        <div class="mt-4 rounded-xl border border-neutral-200 overflow-hidden">
+                            <template x-for="item in recommendations.sections.unlock" :key="item.kind + item.repo_id">
+                                {{ model_row('item', "recNote('unlock', item)", '<template x-for="need in item.needs"><span class="badge bg-amber-50 text-amber-700 border-amber-200" x-text="window.t(\'models.recommend.unlock.needs_\' + need)"></span></template>') }}
+                            </template>
+                            <div x-show="!recommendations.sections.unlock.length" class="px-5 py-5 text-sm text-neutral-500">{{ t('models.recommend.unlock.none') }}</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <p class="text-xs text-neutral-400 mt-6" x-text="window.t('models.recommend.footer').replace('{author}', recommendations.author)"></p>
+        </div>
+    </template>
+</div>

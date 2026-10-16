@@ -16,8 +16,6 @@ def _fresh_nax_state(monkeypatch):
     monkeypatch.setattr(fast, "_nax_available_cache", None)
     monkeypatch.setattr(fast, "_stock_nax_cache", None)
     monkeypatch.setattr(fast, "_qmm_nax_cache", None)
-    monkeypatch.delenv("OMLX_NAX", raising=False)
-    monkeypatch.delenv("OMLX_QWEN35_QMM_NAX", raising=False)
     yield
 
 
@@ -38,13 +36,6 @@ def _fresh_nax_state(monkeypatch):
 )
 def test_nax_fallback_mirrors_mlx_gate(version, arch, expected):
     assert fast._nax_available_fallback(version, arch) is expected
-
-
-def test_is_nax_available_env_override(monkeypatch):
-    monkeypatch.setenv("OMLX_NAX", "1")
-    assert fast.is_nax_available() is True
-    monkeypatch.setenv("OMLX_NAX", "0")
-    assert fast.is_nax_available() is False
 
 
 def test_is_nax_available_uses_fallback_without_ext(monkeypatch):
@@ -91,7 +82,7 @@ def test_nax_shim_reexports_fast_impl():
 
 def test_qmm_nax_kwargs_empty_for_pre_nax_ext(monkeypatch):
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", False)
-    assert fast._qmm_nax_kwargs() == {}
+    assert fast._qmm_nax_kwargs(4) == {}
 
 
 def test_qmm_nax_kwargs_on_nax_machine(monkeypatch):
@@ -101,20 +92,9 @@ def test_qmm_nax_kwargs_on_nax_machine(monkeypatch):
     )
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
-    kwargs = fast._qmm_nax_kwargs()
+    kwargs = fast._qmm_nax_kwargs(4)
     assert kwargs["use_nax"] is True
     assert kwargs["nax_variant"] == fast.QMM_NAX_VARIANT
-
-
-def test_qmm_nax_env_kill_switch(monkeypatch):
-    fake_ext = types.SimpleNamespace(
-        is_nax_available=lambda: True,
-        nax_qmm_kernels_built=lambda: True,
-    )
-    monkeypatch.setattr(fast, "_ext", fake_ext)
-    monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
-    monkeypatch.setenv("OMLX_QWEN35_QMM_NAX", "0")
-    assert fast._qmm_nax_kwargs()["use_nax"] is False
 
 
 def test_qmm_nax_disabled_without_kernels(monkeypatch):
@@ -124,7 +104,33 @@ def test_qmm_nax_disabled_without_kernels(monkeypatch):
     )
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
-    assert fast._qmm_nax_kwargs()["use_nax"] is False
+    assert fast._qmm_nax_kwargs(4)["use_nax"] is False
+
+
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_qmm_nax_kwargs_supported_bits_use_nax(monkeypatch, bits):
+    fake_ext = types.SimpleNamespace(
+        is_nax_available=lambda: True,
+        nax_qmm_kernels_built=lambda: True,
+    )
+    monkeypatch.setattr(fast, "_ext", fake_ext)
+    monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
+    assert fast._qmm_nax_kwargs(bits)["use_nax"] is True
+
+
+def test_qmm_nax_kwargs_never_requests_nax_for_bits2(monkeypatch):
+    # qwen35_qmm_nax.metal only defines kernels for bits 4/5/6/8. Routing a
+    # q2 call through NAX anyway fails the kernel lookup and latches
+    # nax_qmm_runtime_ok=false process-wide, permanently demoting every
+    # q4/q5/q6/q8 layer for the rest of the process — bits==2 must never
+    # even attempt NAX, regardless of hardware/build availability.
+    fake_ext = types.SimpleNamespace(
+        is_nax_available=lambda: True,
+        nax_qmm_kernels_built=lambda: True,
+    )
+    monkeypatch.setattr(fast, "_ext", fake_ext)
+    monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
+    assert fast._qmm_nax_kwargs(2) == {}
 
 
 def test_ane_hybrid_nax_capability_reports_native_state(monkeypatch):
@@ -136,16 +142,6 @@ def test_ane_hybrid_nax_capability_reports_native_state(monkeypatch):
 def test_ane_hybrid_nax_capability_is_false_for_older_extension(monkeypatch):
     monkeypatch.setattr(fast, "_ext", types.SimpleNamespace())
     assert fast.qwen35_ane_hybrid_nax_enabled() is False
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [("0", 0), ("5", 5), ("6", 0), ("-1", 0), ("junk", 0), (" 2 ", 2)],
-)
-def test_qmm_nax_variant_env_is_validated(monkeypatch, raw, expected):
-    monkeypatch.setenv("OMLX_QWEN35_QMM_NAX_VARIANT", raw)
-    monkeypatch.setattr(fast, "_qmm_nax_variant_warned", False)
-    assert fast._resolve_qmm_nax_variant() == expected
 
 
 def _nax_qmm_ready() -> bool:
