@@ -27,6 +27,7 @@ from omlx.patches.deepseek_v4.verify_attention import (
     exact_local_scores,
     exact_local_values,
     rowwise_gemm,
+    steel_rowwise_available,
 )
 from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_prefill
 
@@ -1989,6 +1990,12 @@ class SparseCompressedAttention(nn.Module):
                         use_ring_kernel = (
                             fast.is_native_available()
                             and fast.has_symbol("ring_gemm")
+                            # The ring GEMM is bitwise-equal to the native
+                            # Steel rowwise path, not to MLX's generic bf16
+                            # matmul.  Only take it where rowwise_gemm would
+                            # also dispatch to Steel, or verify rows drift
+                            # from decode bits by one ULP (applegpu_g17s).
+                            and steel_rowwise_available()
                         )
                     except Exception:
                         use_ring_kernel = False
