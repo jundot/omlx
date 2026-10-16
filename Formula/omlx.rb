@@ -25,11 +25,14 @@ class Omlx < Formula
     skip_clean "libexec" if MacOS.version >= "27"
   end
 
-  # mlx-audio pins mlx-lm==0.31.1 which conflicts with omlx's git-pinned
-  # mlx-lm. Fetch source separately so we can patch the pin before install.
+  # This resource installs the same mlx-audio revision pyproject.toml pins
+  # (packaging/build.py carries the same pin), so bump both together: a
+  # resource left behind reinstalls an older mlx-audio over the revision
+  # omlx's own install resolved — the 0.4.3 keg that violated mlx-vlm's
+  # `mlx-audio>=0.5.2` requirement in #3916.
   resource "mlx-audio" do
     url "https://github.com/Blaizzy/mlx-audio.git",
-      revision: "51753266e0a4f766fd5e6fbc46652224efc23981"
+      revision: "94c7716212b2228f178d2f9c7619a591fd1b0b78"
   end
 
   # Kokoro's English G2P path uses misaki + spaCy. Bundle the spaCy
@@ -114,8 +117,9 @@ class Omlx < Formula
       ENV.append "CMAKE_ARGS", "-DPython_EXECUTABLE=#{libexec}/bin/python"
     end
 
-    # Install omlx (with optional grammar extra for structured output)
-    install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
+    # Install omlx with the [audio] extra (mlx-audio 0.5.x moved the audio
+    # stack out of its own "all" extra) plus the optional grammar extra.
+    install_spec = build.with?("grammar") ? "#{buildpath}[audio,grammar]" : "#{buildpath}[audio]"
     system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")
@@ -126,9 +130,11 @@ class Omlx < Formula
       end
     end
 
-    # Install mlx-audio with patched mlx-lm pin to avoid version conflict
+    # Reinstall mlx-audio from the resource pinned above. Its revision must
+    # stay equal to pyproject.toml's mlx-audio pin (asserted by
+    # tests/test_homebrew_formula.py); upstream 0.5.x also dropped the
+    # mlx-lm==0.31.1 pin this stage used to inreplace away.
     resource("mlx-audio").stage do
-      inreplace "pyproject.toml", '"mlx-lm==0.31.1"', '"mlx-lm>=0.31.1"'
       system(*pip_install, ".[all]")
     end
 
