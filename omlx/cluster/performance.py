@@ -307,22 +307,24 @@ def tune_execution_settings(
     evicts. The next request then starts at different token offsets and blocks
     forever in the first unmatched collective.
 
-    Keep exactly one shared conversation prefix and disable byte-based
-    eviction. The sequence-count policy is deterministic across ranks and one
-    slot still accelerates the common follow-up-chat path. This correctness
-    invariant applies even when the user disables the other automatic tuning.
+    The invariant only forbids BYTE-based accounting. Count-based LRU is
+    coherent for any slot count: eviction order is pure recency over the
+    request-event stream, which is identical on every rank of a deployment
+    (#3062). Pinning exactly one slot was stricter than necessary and made the
+    configured size a no-op — any interleaved request evicted the session's
+    working prefix, so long conversations reprefilled on every turn.
     """
 
-    synchronized_cache = {
-        "prompt_cache_size": 1,
-        "prompt_cache_bytes": None,
-    }
+    # Byte eviction stays off everywhere; the configured slot COUNT is
+    # honored (tier-capped below) because recency order is rank-identical.
+    coherent_cache = {"prompt_cache_bytes": None}
     if not settings.auto_tune or not assignments:
         return replace(
             settings,
-            **synchronized_cache,
+            **coherent_cache,
             tuning_reason=(
-                f"{settings.tuning_reason}; synchronized single-prefix cache"
+                f"{settings.tuning_reason}; coherent count-based prompt cache "
+                "(byte eviction disabled)"
             ),
         )
     minimum_headroom = min(
@@ -350,6 +352,7 @@ def tune_execution_settings(
     decode = min(settings.decode_concurrency, caps[0])
     prompt = min(settings.prompt_concurrency, caps[1], decode)
     prefill = min(settings.prefill_step_size, caps[2])
+    cache_size = min(settings.prompt_cache_size, caps[3])
     microbatch = min(settings.pipeline_microbatch_size, caps[4], decode)
     connections = settings.ring_connections_per_ip if backend == "ring" else 1
     return replace(
@@ -357,13 +360,14 @@ def tune_execution_settings(
         decode_concurrency=decode,
         prompt_concurrency=prompt,
         prefill_step_size=prefill,
-        **synchronized_cache,
+        **coherent_cache,
+        prompt_cache_size=cache_size,
         pipeline_microbatch_size=microbatch,
         ring_connections_per_ip=connections,
         tuning_reason=(
             f"{settings.profile} profile auto-tuned for {tier}; "
             f"minimum stage headroom {minimum_headroom / _GIB:.2f} GiB; "
-            "synchronized single-prefix cache"
+            "coherent count-based prompt cache (byte eviction disabled)"
         ),
     )
 
