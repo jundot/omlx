@@ -135,7 +135,12 @@ def test_choosing_tp_without_transport_data_warns_rather_than_pretending():
 
 def test_backend_follows_the_fabric():
     assert choose_backend([_link("rdma")])[0] == "jaccl"
-    assert choose_backend([_link("thunderbolt")])[0] == "jaccl-ring"
+    # #3037: plain Thunderbolt WITHOUT RDMA devices is the TCP ring, like
+    # mlx.distributed_config's own automatic path — jaccl-ring's hostfile
+    # requires RDMA devices on every host, so naming it for TB4 (or TB5 with
+    # RDMA off) selects a backend the hardware cannot initialise.
+    assert choose_backend([_link("thunderbolt")])[0] == "ring"
+    assert "TCP ring" in choose_backend([_link("thunderbolt")])[1]
     assert choose_backend([_link("ethernet")])[0] == "ring"
     assert choose_backend([])[0] == "ring"
     # Every branch explains itself; the dashboard shows this to the user.

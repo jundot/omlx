@@ -345,6 +345,18 @@ def _optional_string(value: Any) -> str | None:
     return rendered or None
 
 
+def _speed_gbps(value: Any) -> int | None:
+    """Parse a system_profiler speed field ("Up to 120 Gb/s", 40) to Gb/s."""
+
+    if value is None:
+        return None
+    match = re.search(r"(\d+)\s*Gb/s", str(value), re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    match = re.match(r"^\s*(\d+)\s*$", str(value))
+    return int(match.group(1)) if match else None
+
+
 def parse_route(
     result: CommandResult,
     *,
@@ -525,7 +537,27 @@ def collect_cluster_status(
         if warning
     ]
     if rdma_status == "enabled" and not rdma_devices:
-        warnings.append("RDMA is enabled, but ibv_devices reported no RDMA interfaces.")
+        # "Enabled with no devices" is terminal on Thunderbolt 4 — RDMA over
+        # Thunderbolt needs TB5 — so a fully-TB4 machine gets an explanation,
+        # not a fault to fix (#3037).
+        port_speeds = [
+            speed
+            for port in ports
+            if port.peer_connected
+            for speed in [_speed_gbps(port.speed)]
+            if speed is not None
+        ]
+        tb4_only = bool(port_speeds) and all(
+            speed <= 40 for speed in port_speeds
+        )
+        if tb4_only:
+            warnings.append(
+                "RDMA is enabled, but this Mac has no RDMA interfaces — "
+                "expected on Thunderbolt 4 (RDMA needs Thunderbolt 5 on both "
+                "ends); the cluster will use TCP over the Thunderbolt link."
+            )
+        else:
+            warnings.append("RDMA is enabled, but ibv_devices reported no RDMA interfaces.")
     if not linux and rdma_status == "enabled" and not peer_connected:
         warnings.append("RDMA is enabled, but no Thunderbolt peer is connected.")
     if route is not None and route.interface and not route.uses_rdma_interface:

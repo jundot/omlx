@@ -414,3 +414,59 @@ def test_linux_probe_accepts_dgx_spark_roce_device_names():
         "rocep1s0f1": "enp1s0f1np1",
         "roceP2p1s0f1": "enP2p1s0f1np1",
     }
+
+
+TB4_CONNECTED_THUNDERBOLT = json.dumps(
+    {
+        "SPThunderboltDataType": [
+            {
+                "_name": "thunderboltusb4_bus_0",
+                "device_name_key": "MacBook Pro",
+                "receptacle_1_tag": {
+                    "current_speed_key": "Up to 40 Gb/s",
+                    "receptacle_id_key": "1",
+                    "receptacle_status_key": "receptacle_device_connected",
+                    "device_name_key": "Mac Studio",
+                },
+            }
+        ]
+    }
+)
+
+
+def test_tb4_enabled_without_devices_is_explained_not_flagged(monkeypatch):
+    """#3037 D3: on TB4, "rdma_ctl enabled + no devices" is terminal hardware
+    reality — the probe must say so, not frame it as a fault to fix."""
+
+    _patch_hardware(monkeypatch)
+    runner = FakeRunner(
+        {
+            "rdma_ctl": (0, "enabled\n", ""),
+            "ibv_devices": (0, "    device            node GUID\n    ------          ----------------\n", ""),
+            "ipconfig": (1, "", ""),
+            "system_profiler": (0, TB4_CONNECTED_THUNDERBOLT, ""),
+        }
+    )
+
+    status = probe.collect_cluster_status(runner=runner)
+
+    assert any(
+        "expected on Thunderbolt 4" in item for item in status.warnings
+    )
+    assert not any("ibv_devices reported no RDMA" in item for item in status.warnings)
+
+
+def test_tb5_enabled_without_devices_keeps_the_fault_warning(monkeypatch):
+    _patch_hardware(monkeypatch)
+    runner = FakeRunner(
+        {
+            "rdma_ctl": (0, "enabled\n", ""),
+            "ibv_devices": (0, "    device            node GUID\n    ------          ----------------\n", ""),
+            "ipconfig": (1, "", ""),
+            "system_profiler": (0, CONNECTED_THUNDERBOLT, ""),
+        }
+    )
+
+    status = probe.collect_cluster_status(runner=runner)
+
+    assert any("ibv_devices reported no RDMA" in item for item in status.warnings)

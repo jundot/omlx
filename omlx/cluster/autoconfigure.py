@@ -345,16 +345,23 @@ def choose_parallelism(
 def choose_backend(transports: Sequence[Any]) -> tuple[str, str]:
     """Pick the collective backend from detected transports, with a reason.
 
-    Mirrors what ``mlx.distributed_config`` does: RDMA over Thunderbolt is the
-    fast path, plain Thunderbolt rings use jaccl-ring, and everything else falls
-    back to the TCP ring.
+    Mirrors what ``mlx.distributed_config``'s automatic path does: RDMA over
+    Thunderbolt is the fast path (jaccl/jaccl-ring), and a plain Thunderbolt
+    ring WITHOUT RDMA devices falls back to the TCP ring — jaccl-ring's
+    hostfile still requires RDMA devices on every host, so selecting it for
+    a TB4 pair (or TB5 with RDMA off) names a backend the hardware cannot
+    initialise (#3037).
     """
 
     kinds = {getattr(transport, "kind", "unknown") for transport in transports}
     if "rdma" in kinds:
         return "jaccl", "RDMA over Thunderbolt detected"
     if "thunderbolt" in kinds:
-        return "jaccl-ring", "Thunderbolt link detected, without RDMA"
+        return (
+            "ring",
+            "Thunderbolt link detected without RDMA devices; using the TCP "
+            "ring (jaccl-ring needs RDMA devices on every host)",
+        )
     if not transports:
         return "ring", "no transport detected; using the TCP ring backend"
     return "ring", "Ethernet link; using the TCP ring backend"
