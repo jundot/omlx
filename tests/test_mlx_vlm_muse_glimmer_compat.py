@@ -10,7 +10,10 @@ contract (dict tool arguments, to=self reasoning, reasoning_strength).
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -79,6 +82,111 @@ def _tiny_config():
         out_hidden_size=32,
         projector_hidden_size=16,
     )
+
+
+@pytest.fixture(params=["native", "vendor"])
+def dflash_target(request, applied, monkeypatch):
+    """Exercise both implementations, regardless of which was imported first.
+
+    Each module owns fresh model/layer classes, so preparing a target cannot
+    leave class patches behind for another test.
+    """
+    import mlx_vlm
+
+    if request.param == "native":
+        path = Path(mlx_vlm.__file__).parent / "models/muse_glimmer/language.py"
+    else:
+        path = (
+            Path(__file__).parents[1]
+            / "omlx/patches/mlx_vlm_muse_glimmer_compat/vendor"
+            / "mlx_vlm/models/muse_glimmer/language.py"
+        )
+    name = f"mlx_vlm.models.muse_glimmer._test_dflash_{request.param}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    mx.random.seed(0)
+    model = module.LanguageModel(_tiny_config().text_config)
+    mx.eval(model.parameters())
+    return model
+
+
+def _prepare_dflash_target(model):
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+    engine._vlm_model = SimpleNamespace(language_model=model)
+    assert engine.prepare_dflash_target() is engine._vlm_model
+    return engine
+
+
+def test_dflash_preparation_captures_and_observes(dflash_target):
+    from omlx.patches.mlx_lm_mtp.batch_generator import _call_backbone_captured
+    from omlx.speculative.dflash import attach_drafter
+
+    model = dflash_target
+    tokens = mx.array([[1, 2, 3]])
+    plain = model(tokens, cache=model.make_cache()).logits
+    engine = _prepare_dflash_target(model)
+    prepared_call = type(model).__call__
+    engine.prepare_dflash_target()
+    assert type(model).__call__ is prepared_call
+
+    observed = []
+    attach_drafter(
+        model,
+        SimpleNamespace(
+            depth=3,
+            scope_uids=(7,),
+            target_layer_ids=[1, 0],
+            observe=lambda uids, caps: observed.append((uids, caps)),
+        ),
+    )
+    # Muse's rotating caches only support single-row speculation.
+    assert model._omlx_mtp_multi_request is False
+    every = model(tokens, cache=model.make_cache(), capture_layer_ids=[0, 1])
+    logits, hidden, _, captured = _call_backbone_captured(
+        model, tokens, model.make_cache(), capture_layer_ids=[1, 0]
+    )
+    assert mx.allclose(logits, plain, atol=1e-5, rtol=1e-5).item()
+    assert len(captured) == 2
+    for got, expected in zip(captured, reversed(every.hidden_states)):
+        assert mx.array_equal(got, expected).item()
+    assert mx.array_equal(hidden, every.hidden_states[-1]).item()
+
+    model(mx.array([[4]]), cache=model.make_cache())
+    [(uids, caps)] = observed
+    assert uids == (7,) and len(caps) == 2
+    assert all(cap.shape[:2] == (1, 1) for cap in caps)
+
+
+def test_dflash_rejection_after_sliding_window_wrap(dflash_target):
+    from omlx.patches.mlx_lm_mtp import cache_rollback
+    from omlx.patches.mlx_lm_mtp.batch_generator import _call_backbone_captured
+
+    cache_rollback.apply()
+    model = dflash_target
+    _prepare_dflash_target(model)
+    reference, cache = model.make_cache(), model.make_cache()
+    # Fill and wrap the eight-token sliding cache before speculating.
+    prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
+    model(prompt, cache=reference)
+    model(prompt, cache=cache)
+    model(mx.array([[11, 12]]), cache=reference)
+    _call_backbone_captured(
+        model, mx.array([[11, 12, 13, 14]]), cache, capture_layer_ids=[0, 1]
+    )
+    # Anchor 11 and one draft 12 are accepted; 13 and 14 must disappear.
+    assert model.rollback_speculative_cache(cache, None, 1, 4) == 1
+    expected = model(mx.array([[15]]), cache=reference).logits
+    actual = model(mx.array([[15]]), cache=cache).logits
+    assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+    for got, ref in zip(cache, reference):
+        assert got.offset == ref.offset
+        for a, b in zip(got.state, ref.state):
+            if isinstance(a, mx.array):
+                assert mx.allclose(a, b, atol=1e-5, rtol=1e-5).item()
 
 
 def test_vendor_module_resolves(applied):
