@@ -150,7 +150,7 @@ def _install_route_doubles(monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: ModelLayout(
+        lambda path, **kwargs: ModelLayout(
             source=path,
             fixed_weight_bytes=1,
             layer_weight_bytes=(10, 10, 10, 10),
