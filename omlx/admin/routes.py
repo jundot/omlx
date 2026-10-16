@@ -701,7 +701,6 @@ class GlobalSettingsRequest(BaseModel):
     gdn_ssd_pending_max_size: str | None = None
     gdn_sidecar_precision: str | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
-    decision_prefix_cache_max_size: str | None = None  # "0" = disabled, "512MB"
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
 
     # MCP settings
@@ -870,42 +869,6 @@ def _format_cache_size(size_bytes: int) -> str:
         return f"{gb:.0f}GB"
     mb = size_bytes / (1024**2)
     return f"{mb:.0f}MB"
-
-
-def _parse_decision_prefix_cache_max_size(value: str) -> int:
-    """Parse the per-model decision prefix cache size; '0' disables it."""
-    from ..config import parse_size
-
-    try:
-        size = parse_size(value.strip())
-    except ValueError as exc:
-        raise ValueError(f"Invalid decision_prefix_cache_max_size: {exc}") from exc
-    if size < 0:
-        raise ValueError(
-            "Invalid decision_prefix_cache_max_size: must be '0' to disable "
-            "or a non-negative size"
-        )
-    return size
-
-
-def _apply_decision_prefix_cache(pool: Any, global_settings: Any) -> bool:
-    """Size the decision prefix cache of decision models, loaded and future."""
-    from ..engine.decision import DecisionEngine
-
-    pool_config = getattr(pool, "_scheduler_config", None)
-    if pool_config is None:
-        return False
-    max_bytes = (
-        global_settings.cache.get_decision_prefix_cache_max_size_bytes()
-        if global_settings.cache.enabled
-        else 0
-    )
-    pool_config.decision_prefix_cache_max_size = max_bytes
-    for entry in getattr(pool, "_entries", {}).values():
-        engine = getattr(entry, "engine", None)
-        if isinstance(engine, DecisionEngine):
-            engine.set_prefix_cache_max_size(max_bytes)
-    return True
 
 
 def _parse_hot_cache_max_size(value: str) -> int:
@@ -1458,7 +1421,6 @@ async def _apply_cache_settings_runtime(
     pool._scheduler_config.gdn_sidecar_state_dtype = (
         global_settings.cache.gdn_sidecar_state_dtype
     )
-    _apply_decision_prefix_cache(pool, global_settings)
     pool._scheduler_config.initial_cache_blocks = (
         global_settings.cache.initial_cache_blocks
     )
@@ -4618,9 +4580,6 @@ def _global_settings_response(global_settings):
             "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
             "gdn_sidecar_precision": global_settings.cache.gdn_sidecar_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
-            "decision_prefix_cache_max_size": (
-                global_settings.cache.decision_prefix_cache_max_size
-            ),
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
         "mcp": {
@@ -5162,13 +5121,6 @@ async def update_global_settings(
             _parse_hot_cache_max_size(request.hot_cache_max_size)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if request.decision_prefix_cache_max_size is not None:
-        try:
-            _parse_decision_prefix_cache_max_size(
-                request.decision_prefix_cache_max_size
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if request.initial_cache_blocks is not None and request.initial_cache_blocks <= 0:
         raise HTTPException(
             status_code=400,
@@ -5326,18 +5278,6 @@ async def update_global_settings(
         if request.hot_cache_max_size != global_settings.cache.hot_cache_max_size:
             global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
             cache_changed = True
-    if (
-        request.decision_prefix_cache_max_size is not None
-        and request.decision_prefix_cache_max_size
-        != global_settings.cache.decision_prefix_cache_max_size
-    ):
-        global_settings.cache.decision_prefix_cache_max_size = (
-            request.decision_prefix_cache_max_size
-        )
-        from ..server import _server_state
-
-        if _apply_decision_prefix_cache(_server_state.engine_pool, global_settings):
-            runtime_applied.append("decision_prefix_cache")
     if request.initial_cache_blocks is not None:
         if (
             request.initial_cache_blocks

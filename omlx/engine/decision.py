@@ -32,6 +32,11 @@ logger = logging.getLogger(__name__)
 
 _MODEL_CLASSES = {"clef": ClefModel, "openjev": OpenJevModel, "d3": D3Model}
 
+# Memory bound of each decision model's prefix cache, the same as the VLM
+# vision feature cache. A Clef-Flash prefix of about 1.2K tokens takes about
+# 100 MB, so this keeps about ten.
+DECISION_PREFIX_CACHE_BYTES = 1024**3
+
 
 class DecisionEngine(BaseNonStreamingEngine):
     """Engine for ``/v1/systemone`` decision models."""
@@ -48,8 +53,10 @@ class DecisionEngine(BaseNonStreamingEngine):
         self._prefill_step = max(
             1, int(getattr(scheduler_config, "prefill_step_size", 0) or 2048)
         )
-        self._prefix_cache_bytes = max(
-            0, int(getattr(scheduler_config, "decision_prefix_cache_max_size", 0) or 0)
+        # Like the prefix cache of LLMs and VLMs, prefix reuse is on while the
+        # oMLX cache is enabled (paged_ssd_cache_dir is set).
+        self._prefix_cache_enabled = bool(
+            getattr(scheduler_config, "paged_ssd_cache_dir", None)
         )
         self._model: ClefModel | OpenJevModel | D3Model | None = None
         self._kind: str | None = None
@@ -87,8 +94,11 @@ class DecisionEngine(BaseNonStreamingEngine):
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), model.load)
+        # Only models that continue requests from cached prefixes get one (Clef
+        # and OpenJev; d3 reads its prompt with non-causal attention).
+        if self._prefix_cache_enabled and getattr(model, "prefix_reuse", False):
+            model.backbone.prefix_cache = PrefixCache(DECISION_PREFIX_CACHE_BYTES)
         self._model = model
-        self.set_prefix_cache_max_size(self._prefix_cache_bytes)
         self._kind = kind
         logger.info(f"Decision engine started: {self._model_name}")
 
@@ -105,26 +115,6 @@ class DecisionEngine(BaseNonStreamingEngine):
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
         logger.info(f"Decision engine stopped: {self._model_name}")
-
-    def set_prefix_cache_max_size(self, max_bytes: int) -> None:
-        """Size the prefix cache of the loaded model; 0 drops it and its entries.
-
-        Only models that continue requests from cached prefixes get one (Clef
-        and OpenJev; d3 reads its prompt with non-causal attention).
-        """
-        self._prefix_cache_bytes = max(0, int(max_bytes))
-        model = self._model
-        if model is None or not getattr(model, "prefix_reuse", False):
-            return
-        cache = model.backbone.prefix_cache
-        if not self._prefix_cache_bytes:
-            model.backbone.prefix_cache = None
-            if cache is not None:
-                cache.clear()
-        elif cache is None:
-            model.backbone.prefix_cache = PrefixCache(self._prefix_cache_bytes)
-        else:
-            cache.resize(self._prefix_cache_bytes)
 
     def _require_model(self) -> ClefModel | OpenJevModel | D3Model:
         if self._model is None:

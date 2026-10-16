@@ -1399,7 +1399,6 @@ class TestHasCliOverrides:
             ("paged_ssd_cache_dir", "/tmp/cache"),
             ("paged_ssd_cache_max_size", "2GB"),
             ("hot_cache_max_size", "1GB"),
-            ("decision_prefix_cache_max_size", "512MB"),
             ("no_cache", True),
             ("initial_cache_blocks", 64),
         ],

@@ -558,11 +558,9 @@ def test_prefix_cache_evicts_least_recently_used_entries_by_size():
         "hits": 1,
         "misses": 2,
     }
-    store.resize(50)
-    assert (len(store), store.nbytes, store.max_bytes) == (1, 30, 50)
 
 
-async def test_decision_engine_keeps_a_prefix_cache_only_when_configured(
+async def test_decision_engine_keeps_a_prefix_cache_while_caching_is_enabled(
     monkeypatch, tmp_path
 ):
     from omlx.engine import decision as engine_module
@@ -583,13 +581,13 @@ async def test_decision_engine_keeps_a_prefix_cache_only_when_configured(
 
     monkeypatch.setattr(engine_module, "decision_kind", lambda path: "clef")
     monkeypatch.setitem(engine_module._MODEL_CLASSES, "clef", FakeClef)
+    cached = SchedulerConfig(paged_ssd_cache_dir=str(tmp_path / "cache"))
+    # Like the other oMLX caches, it is off while caching is disabled
+    # (--no-cache or the cache switch leave paged_ssd_cache_dir unset).
     off = engine_module.DecisionEngine(
         str(tmp_path), scheduler_config=SchedulerConfig()
     )
-    on = engine_module.DecisionEngine(
-        str(tmp_path),
-        scheduler_config=SchedulerConfig(decision_prefix_cache_max_size=1 << 20),
-    )
+    on = engine_module.DecisionEngine(str(tmp_path), scheduler_config=cached)
     await off.start()
     await on.start()
 
@@ -598,25 +596,17 @@ async def test_decision_engine_keeps_a_prefix_cache_only_when_configured(
     assert on.get_stats()["prefix_cache"] == {
         "entries": 0,
         "bytes": 0,
-        "max_bytes": 1 << 20,
+        "max_bytes": engine_module.DECISION_PREFIX_CACHE_BYTES,
         "hits": 0,
         "misses": 0,
     }
-    on.set_prefix_cache_max_size(1 << 10)
-    assert on.get_stats()["prefix_cache"]["max_bytes"] == 1 << 10
-    on.set_prefix_cache_max_size(0)
-    assert on._model.backbone.prefix_cache is None
-    on.set_prefix_cache_max_size(1 << 20)
     backbone = on._model.backbone
     await on.stop()
     assert backbone.prefix_cache is None
 
     # A model that reads its prompt non-causally (d3) never gets one.
     monkeypatch.setitem(engine_module._MODEL_CLASSES, "clef", FakeModel)
-    plain = engine_module.DecisionEngine(
-        str(tmp_path),
-        scheduler_config=SchedulerConfig(decision_prefix_cache_max_size=1 << 20),
-    )
+    plain = engine_module.DecisionEngine(str(tmp_path), scheduler_config=cached)
     await plain.start()
     assert plain._model.backbone.prefix_cache is None
     assert "prefix_cache" not in plain.get_stats()

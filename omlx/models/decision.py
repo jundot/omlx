@@ -101,8 +101,8 @@ class PrefixCache:
     asked different questions, continue from a copy of the stored layer
     caches instead of prefilling it again. Entries are evicted once their
     total size exceeds ``max_bytes``; a larger entry is not stored. Requests
-    use it on the MLX executor while stats and resizing come from the event
-    loop, so a lock guards the entries.
+    use it on the MLX executor while stats come from the event loop, so a
+    lock guards the entries.
     """
 
     def __init__(self, max_bytes: int):
@@ -138,21 +138,10 @@ class PrefixCache:
             self.nbytes += entry.nbytes
             self._evict()
 
-    def resize(self, max_bytes: int) -> None:
-        """Change the size limit, evicting the oldest entries above it."""
-        with self._lock:
-            self.max_bytes = max_bytes
-            self._evict()
-
     def _evict(self) -> None:
         while self.nbytes > self.max_bytes:
             _, evicted = self._entries.popitem(last=False)
             self.nbytes -= evicted.nbytes
-
-    def clear(self) -> None:
-        with self._lock:
-            self._entries.clear()
-            self.nbytes = 0
 
     def stats(self) -> dict[str, int]:
         with self._lock:

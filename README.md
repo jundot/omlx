@@ -182,6 +182,8 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 - **Hot tier (RAM)**: Frequently accessed blocks stay in memory for fast access.
 - **Cold tier (SSD)**: When the hot cache fills up, blocks are offloaded to SSD in safetensors format. On the next request with a matching prefix, they're restored from disk instead of recomputed from scratch - even after a server restart.
 
+While the cache is enabled, decision models (Clef, OpenJev) also reuse the system prompt, images and state that `/v1/systemone` requests repeat with other questions, kept in memory per model up to 1 GB.
+
 <p align="center">
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
 </p>
@@ -343,10 +345,6 @@ omlx serve --model-dir ~/models --paged-ssd-cache-dir ~/.omlx/cache
 
 # Set in-memory hot cache size
 omlx serve --model-dir ~/models --hot-cache-max-size 20%
-
-# Let decision models (Clef, OpenJev) reuse the system prompt, images and state when
-# /v1/systemone requests repeat them with other questions (per model, default 0 = off)
-omlx serve --model-dir ~/models --decision-prefix-cache-max-size 512MB
 
 # Adjust max concurrent requests (default: 8)
 omlx serve --model-dir ~/models --max-concurrent-requests 16
