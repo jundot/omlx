@@ -24,17 +24,18 @@ def test_viewport_does_not_lock_zoom():
 
 
 @pytest.fixture
-def keyboard_page():
+def keyboard_page(request):
     playwright = pytest.importorskip("playwright.sync_api")
     from jinja2 import Environment, FileSystemLoader
 
-    locale = json.loads((I18N / "en.json").read_text())
+    locale_name = getattr(request, "param", "en")
+    locale = json.loads((I18N / f"{locale_name}.json").read_text())
     env = Environment(loader=FileSystemLoader(TEMPLATES), autoescape=True)
     env.globals.update(
         t=lambda key: locale.get(key, key),
         static=lambda path: f"/admin/static/{path}",
         locale_json=json.dumps(locale),
-        current_lang="en",
+        current_lang=locale_name,
         version="test",
     )
     rendered = env.get_template("dashboard.html").render()
@@ -198,3 +199,28 @@ def test_dashboard_modal_keyboard_navigation(keyboard_page, viewport):
     page.keyboard.press("Escape")
     expect(mirror).not_to_be_visible()
     expect(mirror_opener).to_be_focused()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("keyboard_page", ["uk"], indirect=True)
+@pytest.mark.parametrize("viewport", [(1440, 1000), (390, 844)])
+def test_model_settings_header_handles_long_ukrainian_name(keyboard_page, viewport):
+    page, expect = keyboard_page
+    page.set_viewport_size(dict(zip(("width", "height"), viewport)))
+    page.evaluate("""() => {
+        const data = Alpine.$data(document.querySelector('[x-data="dashboard()"]'));
+        const name = 'symrex/Qwen3.6-35B-A3B-Uncensored-Genesis-Hermes-V13-dequantized-oQ4e-fp16-mtp';
+        data.selectedModel = {id: name, name, display_name: name, settings: {}};
+        data.modelSettings = data.buildModelSettingsState(data.selectedModel, {});
+        data.showModelSettingsModal = true;
+    }""")
+    dialog = page.locator("#model-settings-modal-title").locator(
+        "xpath=ancestor::dialog"
+    )
+    expect(dialog).to_be_visible()
+    title_box = page.locator("#model-settings-modal-title").bounding_box()
+    panel_box = dialog.locator(".relative.bg-white").bounding_box()
+    assert title_box and panel_box
+    # Translated action buttons must not squeeze the model name into a narrow
+    # column when the long identifier is displayed in the modal heading.
+    assert title_box["width"] >= panel_box["width"] * 0.75

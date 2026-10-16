@@ -83,7 +83,7 @@ class TestChatImageUpload:
 
     @pytest.mark.parametrize(
         "lang_file",
-        ["en.json", "ko.json", "zh.json", "zh-TW.json", "ja.json"],
+        ["en.json", "ko.json", "zh.json", "zh-TW.json", "ja.json", "uk.json"],
     )
     def test_i18n_image_keys_present(self, lang_file):
         """All image-related i18n keys exist in every language file"""
