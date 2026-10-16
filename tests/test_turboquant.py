@@ -1897,6 +1897,71 @@ def test_restored_tq_prefix_short_suffix_stays_quantized(restored_prefill, path)
     assert decode_cache[0] is cache[0]
 
 
+@pytest.mark.parametrize("path", ["external", "resumable"])
+def test_restored_tq_prefix_one_chunk_suffix_past_tiled_threshold_prefills_dense(
+    restored_prefill, path
+):
+    """A one-chunk suffix whose total length crosses the long-prefill
+    threshold would attend through tiled quantized attention, so it takes the
+    dense copy too; decode still gets the original TQ cache, prefix intact."""
+    cache = _restored_tq_cache()
+    restored, plain = cache
+    prefix_codes = _tq_state_tokens(restored, 0, _RESTORE_PREFIX)
+    suffix = _RESTORE_STEP + 1
+    with (
+        patch("omlx.patches.turboquant_attention._LONG_PREFILL_QUANTIZED_THRESHOLD", 8),
+        patch("omlx.scheduler._RESTORED_TQ_DENSE_MIN_SUFFIX_TOKENS", 4),
+    ):
+        decode_cache = _run_restored_prefill(
+            restored_prefill.scheduler, path, cache, suffix
+        )
+
+    assert restored_prefill.seen == [["KVCache", "KVCache"]]
+    assert decode_cache[0] is restored and decode_cache[1] is plain
+    assert restored.offset == _RESTORE_PREFIX + suffix - 1
+    for want, got in zip(
+        prefix_codes, _tq_state_tokens(restored, 0, _RESTORE_PREFIX), strict=True
+    ):
+        assert mx.array_equal(want, got).item()
+
+
+def test_restored_tq_prefix_suffix_below_dense_minimum_stays_quantized(
+    restored_prefill,
+):
+    """Past the threshold, a suffix too short to repay the dequantize stays on
+    the quantized path."""
+    cache = _restored_tq_cache()
+    with (
+        patch("omlx.patches.turboquant_attention._LONG_PREFILL_QUANTIZED_THRESHOLD", 8),
+        patch("omlx.scheduler._RESTORED_TQ_DENSE_MIN_SUFFIX_TOKENS", _RESTORE_STEP + 1),
+    ):
+        decode_cache = _run_restored_prefill(
+            restored_prefill.scheduler, "external", cache, _RESTORE_STEP + 1
+        )
+    assert restored_prefill.seen == [["TurboQuantKVCache", "KVCache"]]
+    assert decode_cache[0] is cache[0]
+
+
+def test_restored_tq_prefix_one_chunk_suffix_below_tiled_threshold_stays_quantized(
+    restored_prefill,
+):
+    """Below the threshold the quantized path is dequantize + SDPA already."""
+    cache = _restored_tq_cache()
+    suffix = _RESTORE_STEP + 1
+    with (
+        patch(
+            "omlx.patches.turboquant_attention._LONG_PREFILL_QUANTIZED_THRESHOLD",
+            _RESTORE_PREFIX + suffix - 1,
+        ),
+        patch("omlx.scheduler._RESTORED_TQ_DENSE_MIN_SUFFIX_TOKENS", 4),
+    ):
+        decode_cache = _run_restored_prefill(
+            restored_prefill.scheduler, "external", cache, suffix
+        )
+    assert restored_prefill.seen == [["TurboQuantKVCache", "KVCache"]]
+    assert decode_cache[0] is cache[0]
+
+
 def test_restored_tq_prefix_stays_quantized_without_memory(restored_prefill):
     scheduler = restored_prefill.scheduler
     cache = _restored_tq_cache()

@@ -1518,8 +1518,14 @@ def _grow_kv_capacity(cache_obj: Any, capacity: int) -> list[mx.array]:
 
 
 # Holds the restored TurboQuant cache on the dense layer that replaces it
-# during a long suffix prefill.
+# during a dense suffix prefill.
 _RESTORED_TQ_PREFIX_ATTR = "_omlx_restored_turboquant_prefix"
+
+# Shortest one-chunk suffix that takes the dense copy once prefix + suffix
+# crosses the tiled quantized-attention threshold. Dequantizing and the tiled
+# path's extra cost both grow linearly with the prefix, so the break-even
+# suffix barely moves with it: 40-55 tokens at 8k-32k (M4 Pro, 4-bit K/V).
+_RESTORED_TQ_DENSE_MIN_SUFFIX_TOKENS = 64
 
 
 def _dense_kv_template(prompt_cache: list[Any], model: Any) -> tuple[type, Any]:
@@ -3968,12 +3974,15 @@ class Scheduler:
         prefill_tokens: int,
         request_id: str | None = None,
     ) -> int:
-        """Prefill a long suffix over a dense copy of a restored TQ prefix.
+        """Prefill a suffix over a dense copy of a restored TQ prefix.
 
         Prefilling over restored TurboQuant layers runs every chunk through
-        the slower tiled quantized attention. A suffix longer than one chunk
-        dequantizes each layer once instead, if the dense copy fits under the
-        prefill peak target. Returns the number of layers converted.
+        the slower tiled quantized attention once prefix + chunk passes
+        ``_LONG_PREFILL_QUANTIZED_THRESHOLD``. A suffix longer than one chunk,
+        or a one-chunk suffix of at least ``_RESTORED_TQ_DENSE_MIN_SUFFIX_TOKENS``
+        that crosses that threshold, dequantizes each layer once instead, if
+        the dense copy fits under the prefill peak target. Returns the number
+        of layers converted.
         """
         if getattr(self, "_turboquant_kv_bits", None) is None or not prompt_cache:
             return 0
@@ -3988,7 +3997,17 @@ class Scheduler:
             return 0
         prefill_tokens = int(prefill_tokens)
         if prefill_tokens <= self._prefill_step_size_for_progress(0, prefill_tokens):
-            return 0
+            # One chunk: below the threshold the quantized path already
+            # dequantizes once for SDPA, so only a tiled chunk gains.
+            from .patches import turboquant_attention as _tq_attention
+
+            prefix = max(int(c.offset) for _, c in restored)
+            if (
+                prefill_tokens < _RESTORED_TQ_DENSE_MIN_SUFFIX_TOKENS
+                or prefix + prefill_tokens
+                <= _tq_attention._LONG_PREFILL_QUANTIZED_THRESHOLD
+            ):
+                return 0
         # The end-of-prefill conversion must run, or the layers stay dense.
         if not self._turboquant_eligible(prompt_cache):
             return 0
@@ -4190,7 +4209,8 @@ class Scheduler:
 
         # Fresh TurboQuant requests run fp16 during the cold prefill loop and
         # are quantized once at the end. A restored TurboQuant prefix runs a
-        # long suffix over a dense copy. Rotating/sliding-window layers remain
+        # suffix that would attend through tiled quantized attention over a
+        # dense copy. Rotating/sliding-window layers remain
         # native pass-through caches; only full-attention KVCache layers are
         # converted.
         Scheduler._dequantize_restored_turboquant_prefix(
