@@ -20,6 +20,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from contextlib import contextmanager
 from typing import Any
 
 import mlx.core as mx
@@ -107,6 +108,52 @@ def quantize_drafter(model: nn.Module, *, bits: int, group_size: int) -> int:
     return quantized
 
 
+def _target_layer_count(target_model: Any) -> int:
+    """Decoder layers of the mlx-vlm target the drafter reads hidden states from."""
+    language = getattr(target_model, "language_model", target_model)
+    inner = getattr(language, "model", language)
+    return len(getattr(inner, "layers", ()) or ())
+
+
+@contextmanager
+def _default_num_target_layers(count: int):
+    """Supply ``num_target_layers`` to DFlash2 configs that omit it.
+
+    Some converted DFlash2 checkpoints (e.g. mlx-community's
+    Qwen3.6-35B-A3B-DFlash2-4bit) drop the field; DFlash2Config then
+    validates ``target_layer_ids`` against a missing bound and rejects a
+    valid drafter. The target's layer count is the value the original
+    checkpoint states, so it fills only that gap.
+    """
+    try:
+        from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+    except ImportError:
+        yield
+        return
+    original = DFlash2Config.__dict__["from_dict"]
+
+    def from_dict(cls, params):
+        dflash = params.get("dflash_config") if isinstance(params, dict) else None
+        if (
+            count > 0
+            and isinstance(params, dict)
+            and "num_target_layers" not in params
+            and not (isinstance(dflash, dict) and "num_target_layers" in dflash)
+        ):
+            params = {**params, "num_target_layers": count}
+            logger.info(
+                "DFlash2 config has no num_target_layers; using the target's %d layers",
+                count,
+            )
+        return original.__func__(cls, params)
+
+    DFlash2Config.from_dict = classmethod(from_dict)
+    try:
+        yield
+    finally:
+        DFlash2Config.from_dict = original
+
+
 def load_dflash_drafter(
     path: str,
     target_model: Any,
@@ -126,7 +173,8 @@ def load_dflash_drafter(
     checkpoint's context window.
     """
     adaptive = resolve_verify_mode(verify_mode)
-    model, kind = load_drafter(path, kind="dflash")
+    with _default_num_target_layers(_target_layer_count(target_model)):
+        model, kind = load_drafter(path, kind="dflash")
     if kind != "dflash":
         raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
     if quant_enabled and not getattr(model.config, "quantization", None):

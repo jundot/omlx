@@ -4092,9 +4092,14 @@ class EnginePool:
                         get_mlx_executor(), _load_dflash_sync
                     )
                 except Exception as e:
-                    logger.warning(
-                        f"DFlash drafter load raised for {model_id} "
-                        f"(drafter={drafter_id}): {e} -- toggle ignored"
+                    # The model still serves, but with no speculative decoding at
+                    # all (MTP was turned off in favour of DFlash), so this costs
+                    # a large share of decode speed: say so plainly.
+                    logger.error(
+                        f"DFlash drafter failed to load for {model_id} "
+                        f"(drafter={drafter_id}): {e}. Speculative decoding is "
+                        "OFF for this model; fix or replace the drafter, or "
+                        "disable DFlash to use its MTP head."
                     )
                     drafter = None
                 if drafter is not None:
