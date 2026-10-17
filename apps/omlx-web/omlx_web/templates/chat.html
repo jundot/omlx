@@ -3603,7 +3603,7 @@
                 }
                 const scalarKeys = [
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
-                    'repetition_penalty', 'presence_penalty',
+                    'repetition_penalty', 'presence_penalty', 'repetition_context_size',
                 ];
                 for (const key of scalarKeys) {
                     if (generation[key] != null) s[key] = generation[key];
@@ -3762,7 +3762,7 @@
                 const s = this.modelSettings;
                 const scalarKeys = [
                     'temperature', 'max_tokens', 'top_p', 'top_k', 'min_p',
-                    'repetition_penalty', 'presence_penalty'
+                    'repetition_penalty', 'presence_penalty', 'repetition_context_size'
                 ];
                 const source = this.samplingSource();
                 for (const key of scalarKeys) {

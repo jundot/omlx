@@ -1248,6 +1248,8 @@
   "modal.model_settings.temperature": "Teplota",
   "modal.model_settings.repetition_penalty": "Presence penalty",
   "modal.model_settings.repetition_penalty_short": "Postih opakov.",
+  "modal.model_settings.repetition_context_size": "Velikost kontextu opakování",
+  "modal.model_settings.repetition_context_size_hint": "Počet předchozích tokenů zohledněných při trestu za opakování. Výchozí hodnota: 20.",
   "modal.model_settings.min_p": "Min P",
   "modal.model_settings.presence_penalty": "Postih za přítomnost",
   "modal.model_settings.top_p": "Top P",
