@@ -347,3 +347,41 @@ extension Font {
         .system(size: size, weight: weight, design: .monospaced)
     }
 }
+
+// MARK: - Type ramp
+
+/// The app's type ramp, in points: six text steps plus a display step.
+///
+/// Every `.omlxText` / `.omlxMono` / `.omlxDisplay` call names one of these
+/// rather than typing a size, so a screen states which step of the scale it
+/// wants and a number cannot drift back into a view. Each step is one of the
+/// sizes the app already used most; sizes in between move to the nearest step.
+///
+/// | step       | value | use |
+/// |------------|-------|-----|
+/// | `aux`      | 12    | captions, timestamps, badges, table secondary cells |
+/// | `body`     | 14    | body copy, form labels, table primary cells |
+/// | `emphasis` | 16    | group and card titles |
+/// | `section`  | 18    | section headings, drawer and sheet titles |
+/// | `page`     | 24    | page titles |
+/// | `kpi`      | 32    | metric figures |
+/// | `display`  | 48    | Welcome hero |
+enum DesignTokens {
+    /// The type levels.
+    enum FontSize {
+        /// Captions, timestamps, table secondary cells, badges.
+        static let aux: CGFloat = 12
+        /// Body copy, form labels, table primary cells.
+        static let body: CGFloat = 14
+        /// Group and card titles.
+        static let emphasis: CGFloat = 16
+        /// Section headings, drawer and sheet titles.
+        static let section: CGFloat = 18
+        /// Page title.
+        static let page: CGFloat = 24
+        /// Metric figures.
+        static let kpi: CGFloat = 32
+        /// Welcome hero.
+        static let display: CGFloat = 48
+    }
+}
