@@ -1590,6 +1590,38 @@ class TestMetalWiredLimit:
             enforcer.start()
         mock_mx.set_wired_limit.assert_not_called()
 
+    @pytest.mark.parametrize("collector_disabled", [False, True])
+    def test_start_reports_wired_collector_state(self, mock_engine_pool, caplog,
+                                                 collector_disabled):
+        """#4040: a GPU idle gap makes macOS unwire pinned memory, so users
+        need to know the collector is active and how to turn it off."""
+        enforcer = ProcessMemoryEnforcer(
+            engine_pool=mock_engine_pool, memory_guard_tier="balanced"
+        )
+        with caplog.at_level("WARNING", logger="omlx.process_memory_enforcer"):
+            with (
+                patch("omlx.settings.get_system_memory", return_value=48 * 1024**3),
+                patch(
+                    "omlx.process_memory_enforcer.get_effective_metal_cap_bytes",
+                    return_value=64 * 1024**3,
+                ),
+                patch(
+                    "omlx.process_memory_enforcer.get_iogpu_wired_limit_bytes",
+                    return_value=64 * 1024**3,
+                ),
+                patch(
+                    "omlx.process_memory_enforcer.wired_collector_enabled",
+                    return_value=not collector_disabled,
+                ),
+                patch("omlx.process_memory_enforcer.mx") as mock_mx,
+                patch.object(asyncio, "create_task", side_effect=_close_coro),
+            ):
+                enforcer.start()
+        if collector_disabled:
+            assert "iogpu.disable_wired_collector" not in caplog.text
+        else:
+            assert "sudo sysctl iogpu.disable_wired_collector=1" in caplog.text
+
 
 class TestSingleModelMemoryPressure:
     """Tests for hard-pressure single-model memory handling.
