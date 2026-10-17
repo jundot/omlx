@@ -32,7 +32,8 @@ of all its query heads, so each key block is read once per group. Otherwise
 blocks of four to eight rows use ``_wide_causal_sdpa``: one threadgroup per
 query head and key split holds all rows with simdgroup matrices. Both merge
 the splits in a second launch, and probabilities enter the value product in
-bf16.
+bf16. Greedy single-request verify (``set_verify_width_stable``) keeps the
+vector chunks, whose rows match a one-row decode call.
 
 MTP draft chains attend through ``ChainKVCache``: chain rows stay in a short
 tail next to the head's cache, and ``prefix_tail_attention`` reads both.
@@ -46,7 +47,7 @@ import struct
 
 import mlx.core as mx
 
-from .qwen35_verify_qmm import is_row_exact_armed
+from .qwen35_verify_qmm import is_row_exact_armed, is_width_stable_armed
 
 logger = logging.getLogger(__name__)
 
@@ -945,6 +946,11 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
                         # the tile kernels below round probabilities
                         # differently.
                         out = _row_exact_causal_sdpa(queries, keys, values, scale, limit)
+                    elif is_width_stable_armed():
+                        # The tile kernels below score a row differently from
+                        # a one-row decode call, so a position's result
+                        # depends on whether and how wide it was verified.
+                        out = _chunked_causal_sdpa(queries, keys, values, scale, limit)
                     elif (
                         q_len <= _WIDE_MAX_ROWS
                         and keys.shape[-2] >= _GQA_MIN_KEYS
