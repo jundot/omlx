@@ -713,6 +713,8 @@ def test_production_install_order_covers_vlm_language(
     monkeypatch.setattr(fa256, "_PATCHED", False, raising=False)
     monkeypatch.setattr(fa256, "is_nax_available", lambda: False)
     monkeypatch.setattr(fa256, "_auto_dispatch_budget", lambda *a, **k: 0)
+    # Counts steel-kernel calls; keep the M1 chunked-SDPA route out of it.
+    monkeypatch.setenv("OMLX_FA256_M1_SDPA", "0")
 
     steel_calls = {"n": 0}
 

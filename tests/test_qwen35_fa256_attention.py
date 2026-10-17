@@ -12,6 +12,13 @@ import mlx.core as mx
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _steel_route_only(monkeypatch):
+    # These tests exercise the steel-kernel route; on M1 hosts the chunked
+    # MLX SDPA route (tests/test_fa256_m1_sdpa.py) would intercept first.
+    monkeypatch.setenv("OMLX_FA256_M1_SDPA", "0")
+
+
 def _qkv(q_len=128, kv_len=None, dtype=mx.bfloat16):
     kv_len = q_len if kv_len is None else kv_len
     mx.random.seed(3)

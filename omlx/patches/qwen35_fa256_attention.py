@@ -16,7 +16,9 @@ SDPA implementation is called unchanged.
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
 import sys
 import time
 
@@ -70,6 +72,31 @@ _MAX_AUTO_BUDGET = 2_000_000_000
 _Q_BLOCK = 32
 _K_BLOCK = 8
 
+# M1-class GPUs (applegpu_g13): MLX's own SDPA outruns the steel kernel here
+# by 22-40% (M1 Max, fp16, 2048-row prefill chunks over 32k-98k keys) as long
+# as each dispatch stays short; one long dispatch hits the IOGPU
+# preemption slowdown (#2225) instead. The query rows are split so a dispatch
+# covers at most _M1_SDPA_WORK (heads * rows * keys, ~15-20ms there); below
+# _M1_SDPA_MIN_ROWS rows the GPU is under-occupied, so when even that many
+# rows exceed _M1_SDPA_MAX_WORK (~128k keys) the steel kernel keeps the call.
+# OMLX_FA256_M1_SDPA=0 disables the route.
+_M1_SDPA_WORK = 120_000_000
+_M1_SDPA_MAX_WORK = 160_000_000
+_M1_SDPA_MIN_ROWS = 64
+# The first prefill chunk (keys == queries == 2048) is 10-19% faster on the
+# steel kernel; from 3072 keys the chunked route wins by 6-32% (M1 Max,
+# 16/8, 24/4 and 16/2 layouts).
+_M1_SDPA_MIN_KV = 3072
+# Trim MLX's buffer cache above this many bytes after a chunked call.
+_M1_SDPA_CACHE_TRIM = 2 * 1024**3
+# Head_dim 512 (Gemma 4 global layers) has no fused MLX route at all, so the
+# stock path materializes every score: one 2048-row chunk over 128k keys
+# peaked at +8.9 GB and ran at 4.4 TFLOP/s on M1 Max; the chunked route ran
+# it at 7.0 TFLOP/s (-37%) within +0.6 GB. Routed from this many keys on
+# (below it the two tie on time; the chunking still bounds memory).
+_M1_D512_MIN_KV = 32768
+_M1_K_BLOCK = 16
+
 
 def _native_kernel():
     try:
@@ -92,6 +119,15 @@ def _bounded_sdpa_fallback(queries, keys, values, scale, mask, sinks):
     return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
 
 
+def _calibration_dtype():
+    """M1-class GPUs have no bf16 ALUs: bf16 runs at about half the fp16 rate
+    there (5.1e9 vs 2.7e9 work/s on an M1 Max), and the models served on them
+    are fp16, so calibrating in bf16 would halve every dispatch's budget."""
+    from omlx.utils.hardware import get_apple_gpu_generation
+
+    return mx.float16 if get_apple_gpu_generation() == 13 else mx.bfloat16
+
+
 def _auto_dispatch_budget(kernel, q_block: int, k_block: int) -> int:
     """Size the dispatch budget from the kernel's measured throughput.
 
@@ -102,15 +138,10 @@ def _auto_dispatch_budget(kernel, q_block: int, k_block: int) -> int:
     measurement fails."""
     try:
         work = _CALIB_HEADS * _CALIB_Q_LEN * _CALIB_KV_LEN
-        q = mx.random.normal((1, _CALIB_HEADS, _CALIB_Q_LEN, 256)).astype(
-            mx.bfloat16
-        )
-        k = mx.random.normal((1, _CALIB_KV_HEADS, _CALIB_KV_LEN, 256)).astype(
-            mx.bfloat16
-        )
-        v = mx.random.normal((1, _CALIB_KV_HEADS, _CALIB_KV_LEN, 256)).astype(
-            mx.bfloat16
-        )
+        dtype = _calibration_dtype()
+        q = mx.random.normal((1, _CALIB_HEADS, _CALIB_Q_LEN, 256)).astype(dtype)
+        k = mx.random.normal((1, _CALIB_KV_HEADS, _CALIB_KV_LEN, 256)).astype(dtype)
+        v = mx.random.normal((1, _CALIB_KV_HEADS, _CALIB_KV_LEN, 256)).astype(dtype)
         mx.eval(q, k, v)
         best = 0.0
         for i in range(4):
@@ -149,6 +180,97 @@ def _auto_dispatch_budget(kernel, q_block: int, k_block: int) -> int:
             exc_info=True,
         )
         return _DEFAULT_DISPATCH_BUDGET
+
+
+def _m1_sdpa_enabled() -> bool:
+    if os.environ.get("OMLX_FA256_M1_SDPA", "").strip() == "0":
+        return False
+    from omlx.utils.hardware import get_apple_gpu_generation
+
+    return get_apple_gpu_generation() == 13
+
+
+def _m1_query_rows(q_heads: int, q_len: int, kv_len: int) -> int:
+    """Query rows per MLX SDPA dispatch on M1, or 0 to keep the steel kernel."""
+    rows = q_len
+    while rows > _M1_SDPA_MIN_ROWS and q_heads * rows * kv_len > _M1_SDPA_WORK:
+        rows = max(_M1_SDPA_MIN_ROWS, rows // 2)
+    if q_heads * rows * kv_len > _M1_SDPA_MAX_WORK:
+        return 0
+    return rows
+
+
+def _m1_chunked_sdpa(queries, keys, values, scale: float, rows: int) -> mx.array:
+    """Causal SDPA for queries at the end of the keys, ``rows`` per dispatch.
+
+    Rows [start, stop) attend to keys [0, kv_len - (q_len - stop)), which is
+    exactly the end-aligned causal mask restricted to that row block.
+
+    Each block materializes its scores (head_dim 256 is not a fused SDPA
+    size on these GPUs) and copies its key/value prefix, so at most two
+    blocks are kept in flight: block ``i`` is submitted, then block ``i-1``
+    is waited on and its scratch released. Unbounded, a 2048-row chunk at
+    98k keys peaked at +6.1 GB; this way +0.6 GB, at the same speed.
+    """
+    q_len = queries.shape[2]
+    kv_len = keys.shape[2]
+    outs = []
+    for start in range(0, q_len, rows):
+        stop = min(q_len, start + rows)
+        end = kv_len - (q_len - stop)
+        out = mx.fast.scaled_dot_product_attention(
+            queries[:, :, start:stop],
+            keys[:, :, :end],
+            values[:, :, :end],
+            scale=scale,
+            mask="causal",
+        )
+        if q_len > rows:
+            mx.async_eval(out)
+            if outs:
+                mx.eval(outs[-1])
+        outs.append(out)
+    # Block scratch sizes change with every block and every prefill chunk
+    # (the keys grow), so MLX's buffer cache cannot reuse them and grew to
+    # tens of GB over a long prefill; the scheduler then read that footprint
+    # as prefill memory pressure, released the ANE banks and throttled
+    # chunks. Trimming it costs one re-allocation per few layers.
+    if mx.get_cache_memory() > _M1_SDPA_CACHE_TRIM:
+        mx.eval(outs[-1])
+        mx.clear_cache()
+    return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
+
+
+def _m1_d512_attention(queries, keys, values, cache, scale, mask, sinks):
+    """Causal head_dim-512 prefill attention through the M1 chunked route, or
+    None when the call is not that shape (or not on an M1-class GPU)."""
+    if (
+        queries.ndim != 4
+        or queries.shape[-1] != 512
+        or queries.shape[-2] < _MIN_ROUTE_Q_LEN
+        or sinks is not None
+        or not (isinstance(mask, str) and mask == "causal")
+        or _has_quantized_cache(cache)
+        or getattr(keys, "ndim", 0) != 4
+        or getattr(values, "ndim", 0) != 4
+        or keys.shape[-1] != 512
+        or values.shape[-1] != 512
+        or queries.dtype not in (mx.float16, mx.bfloat16)
+        or keys.dtype != queries.dtype
+        or values.dtype != queries.dtype
+        or keys.shape[-3] == 0
+        or queries.shape[-3] % keys.shape[-3]
+        or keys.shape[-2] < max(_M1_D512_MIN_KV, queries.shape[-2])
+        or not _m1_sdpa_enabled_cached()
+    ):
+        return None
+    rows = _m1_query_rows(queries.shape[1], queries.shape[2], keys.shape[2])
+    return _m1_chunked_sdpa(queries, keys, values, scale, rows or _M1_SDPA_MIN_ROWS)
+
+
+@functools.cache
+def _m1_sdpa_enabled_cached() -> bool:
+    return _m1_sdpa_enabled()
 
 
 def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
@@ -226,6 +348,10 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     min_kv_len = min_kv_len or 2048
     q_block = _Q_BLOCK
     k_block = _K_BLOCK
+    m1_sdpa = _m1_sdpa_enabled()
+    if m1_sdpa:
+        # 16-key tiles measured 3-7% faster than 8 on M1 Max (98k keys).
+        k_block = _M1_K_BLOCK
     if not _fa256_fast.fa256_supports_dispatch_budget():
         logger.warning(
             "Qwen FA-256 steel kernel predates chunked dispatch (issue "
@@ -236,6 +362,22 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         dispatch_budget = 0
     else:
         dispatch_budget = _auto_dispatch_budget(kernel, q_block, k_block)
+
+    def attend(queries, keys, values, scale):
+        if m1_sdpa and keys.shape[2] >= _M1_SDPA_MIN_KV:
+            rows = _m1_query_rows(queries.shape[1], queries.shape[2], keys.shape[2])
+            if rows:
+                return _m1_chunked_sdpa(queries, keys, values, scale, rows)
+        return kernel(
+            queries,
+            keys,
+            values,
+            scale,
+            causal=True,
+            q_block=q_block,
+            k_block=k_block,
+            dispatch_budget=dispatch_budget,
+        )
 
     patched_any = False
 
@@ -253,18 +395,12 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
             mask: mx.array | None,
             sinks: mx.array | None = None,
         ) -> mx.array:
+            m1_out = _m1_d512_attention(queries, keys, values, cache, scale, mask, sinks)
+            if m1_out is not None:
+                return m1_out
             if _should_route(queries, keys, cache, mask, sinks, min_kv_len):
                 try:
-                    return kernel(
-                        queries,
-                        keys,
-                        values,
-                        scale,
-                        causal=True,
-                        q_block=q_block,
-                        k_block=k_block,
-                        dispatch_budget=dispatch_budget,
-                    )
+                    return attend(queries, keys, values, scale)
                 except Exception:
                     logger.warning(
                         "fa256 steel lm kernel failed; using bounded MLX SDPA",
@@ -300,18 +436,14 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                 mask=None,
                 sinks=None,
             ):
+                m1_out = _m1_d512_attention(
+                    queries, keys, values, cache, scale, mask, sinks
+                )
+                if m1_out is not None:
+                    return m1_out
                 if _should_route(queries, keys, cache, mask, sinks, min_kv_len):
                     try:
-                        return kernel(
-                            queries,
-                            keys,
-                            values,
-                            scale,
-                            causal=True,
-                            q_block=q_block,
-                            k_block=k_block,
-                            dispatch_budget=dispatch_budget,
-                        )
+                        return attend(queries, keys, values, scale)
                     except Exception:
                         logger.warning(
                             "fa256 steel vlm kernel failed; using bounded MLX SDPA",
@@ -355,10 +487,11 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         _PATCHED = True
         logger.info(
             "Qwen3.5/3.6 FA-256 steel attention patch applied "
-            "(min_kv_len=%d, q_block=%d, k_block=%d, dispatch_budget=%d)",
+            "(min_kv_len=%d, q_block=%d, k_block=%d, dispatch_budget=%d%s)",
             min_kv_len,
             q_block,
             k_block,
             dispatch_budget,
+            ", M1 chunked MLX SDPA up to ~128k keys" if m1_sdpa else "",
         )
     return patched_any

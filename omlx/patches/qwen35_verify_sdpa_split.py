@@ -549,6 +549,42 @@ _GQA_MAX_GROUP = 8
 _GQA_MIN_KEYS = 64
 
 
+@functools.cache
+def _m1_gpu() -> bool:
+    from omlx.utils.hardware import get_apple_gpu_generation
+
+    return get_apple_gpu_generation() == 13
+
+
+@functools.cache
+def _m1_gpu_cores() -> int:
+    """GPU core count of this M1-class chip (14/16 Pro, 24/32 Max, 48/64 Ultra).
+
+    Falls back to 32, the M1 Max the splits were tuned on, when it can't be read.
+    """
+    from omlx.utils.hardware import get_gpu_core_count
+
+    return get_gpu_core_count() or 32
+
+
+def _m1_gqa_chunk(kv_len: int, kv_heads: int, cores: int | None = None) -> int:
+    """Keys per split on M1: threadgroups = splits x KV heads, sized against the GPU cores.
+
+    While one wave fits (about one threadgroup per core, 1024..4096 keys per split), use
+    it. Past the 4096-key cap the same sizing would leave a few threadgroups more than
+    cores: a second, nearly empty wave (M1 Max 76k keys: 38 threadgroups on 32 cores,
+    decode attention 4.3 ms against 3.1; M1 Ultra 133k keys: 66 on 64, decode -17%).
+    There, use many small splits (about 8 per core, 512 keys at least) so the tail wave
+    is a small share of the work.
+    """
+    cores = cores or _m1_gpu_cores()
+    one_wave = -(-kv_len * kv_heads // cores)
+    if one_wave <= 4096:
+        return min(4096, max(1024, (one_wave + 63) // 64 * 64))
+    many = -(-kv_len * kv_heads // (8 * cores))
+    return min(4096, max(512, (many + 63) // 64 * 64))
+
+
 def _gqa_causal_sdpa(queries, keys, values, scale):
     """Causal verify attention for up to eight rows, one pass per KV head."""
     _, heads, q_len, dim = queries.shape
@@ -564,7 +600,9 @@ def _gqa_causal_sdpa(queries, keys, values, scale):
     )
     # Short splits beyond 16k keys keep a KV head's blocks in cache between
     # splits; measured best on M3 Ultra from 2k to 64k keys.
-    if kv_len > 16384:
+    if kv_len > 16384 and _m1_gpu():
+        chunk = _m1_gqa_chunk(kv_len, kv_heads)
+    elif kv_len > 16384:
         chunk = 512
     else:
         chunk = max(256, (-(-kv_len // 16) + 63) // 64 * 64)
