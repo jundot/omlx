@@ -246,6 +246,8 @@
   "models.downloader.hf_token": "HF 令牌",
   "models.downloader.hf_token_optional": "（可选）",
   "models.downloader.hf_token_placeholder": "hf_...",
+  "models.downloader.exclude_patterns": "排除模式",
+  "models.downloader.exclude_patterns_hint": "可选，以逗号分隔的 glob（例如 *.gguf）。仓库内的其余文件仍会被下载。",
   "models.downloader.download_button": "下载",
   "models.downloader.token_warning": "你存储的 Hugging Face 令牌被拒绝，因此结果以无认证方式显示。运行 'hf auth logout' 或设置有效的 HF_TOKEN 以消除此警告。",
   "models.downloader.ms_download_section": "从魔搭社区下载",

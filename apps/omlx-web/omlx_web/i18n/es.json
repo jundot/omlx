@@ -246,6 +246,8 @@
   "models.downloader.hf_token": "Token HF",
   "models.downloader.hf_token_optional": "(opcional)",
   "models.downloader.hf_token_placeholder": "hf_...",
+  "models.downloader.exclude_patterns": "Patrones de exclusión",
+  "models.downloader.exclude_patterns_hint": "Opcional, globs separados por comas (p. ej. *.gguf). El resto del repositorio se descarga igualmente.",
   "models.downloader.download_button": "Descargar",
   "models.downloader.token_warning": "Your stored Hugging Face token was rejected, so results are shown without authentication. Run 'hf auth logout' or set a valid HF_TOKEN to clear this warning.",
   "models.downloader.ms_download_section": "Descargar desde ModelScope",

@@ -496,6 +496,7 @@
             // HF Downloader state
             hfRepoId: '',
             hfToken: '',
+            hfIgnorePatterns: '',
             hfDownloading: false,
             hfTasks: [],
             hfModels: [],
@@ -6904,6 +6905,11 @@
                 const repoId = this.hfRepoId.trim();
                 if (!repoId) return;
 
+                const ignorePatterns = this.hfIgnorePatterns
+                    .split(',')
+                    .map((pattern) => pattern.trim())
+                    .filter(Boolean);
+
                 this.hfError = '';
                 this.hfSuccess = '';
                 this.hfDownloading = true;
@@ -6917,6 +6923,7 @@
                         body: JSON.stringify({
                             repo_id: repoId,
                             hf_token: this.hfToken,
+                            ignore_patterns: ignorePatterns,
                         }),
                         signal: controller.signal,
                     });

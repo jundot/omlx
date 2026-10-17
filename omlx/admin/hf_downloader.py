@@ -390,6 +390,16 @@ class DownloadStatus(str, enum.Enum):
     CANCELLED = "cancelled"
 
 
+def _merge_ignore_patterns(auto: list[str], user: list[str]) -> list[str]:
+    """Combine automatic and per-download exclusions, in order and without duplicates."""
+    merged: list[str] = []
+    for pattern in (*auto, *user):
+        pattern = pattern.strip()
+        if pattern and pattern not in merged:
+            merged.append(pattern)
+    return merged
+
+
 @dataclass
 class DownloadTask:
     """Represents a single model download task."""
@@ -405,6 +415,8 @@ class DownloadTask:
     error: str = ""
     # Request-supplied HF/MS token for restart resume. Never in to_dict().
     token: str = ""
+    # Per-download globs excluded on top of the automatic ones.
+    ignore_patterns: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     completed_at: float = 0.0
@@ -421,6 +433,7 @@ class DownloadTask:
             "downloaded_size": self.downloaded_size,
             "speed_bps": round(self.speed_bps, 1),
             "error": self.error,
+            "ignore_patterns": self.ignore_patterns,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
@@ -439,6 +452,7 @@ class DownloadTask:
             downloaded_size=int(data.get("downloaded_size", 0)),
             error=data.get("error", ""),
             token=data.get("token", ""),
+            ignore_patterns=list(data.get("ignore_patterns", [])),
             created_at=float(data.get("created_at", time.time())),
             started_at=float(data.get("started_at", 0.0)),
             completed_at=float(data.get("completed_at", 0.0)),
@@ -857,6 +871,7 @@ class _QueuePersistenceMixin:
                         task = await self.start_download(
                             entry["repo_id"], entry.get("token", "")
                         )
+                        task.ignore_patterns = list(entry.get("ignore_patterns", []))
                         task.created_at = float(
                             entry.get("created_at", task.created_at)
                         )
@@ -1228,13 +1243,17 @@ class HFDownloader(_QueuePersistenceMixin):
         self._model_dir = Path(new_dir)
 
     async def start_download(
-        self, repo_id: str, hf_token: str = ""
+        self,
+        repo_id: str,
+        hf_token: str = "",
+        ignore_patterns: list[str] | None = None,
     ) -> DownloadTask:
         """Start downloading a model from HuggingFace.
 
         Args:
             repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
             hf_token: Optional HuggingFace token for gated models.
+            ignore_patterns: Optional globs to exclude from this download.
 
         Returns:
             The created DownloadTask.
@@ -1263,6 +1282,7 @@ class HFDownloader(_QueuePersistenceMixin):
         task_id = str(uuid.uuid4())
         task = DownloadTask(task_id=task_id, repo_id=repo_id)
         task.token = hf_token or ""
+        task.ignore_patterns = list(ignore_patterns or [])
         self._tasks[task_id] = task
 
         # Start download in background
@@ -1381,7 +1401,9 @@ class HFDownloader(_QueuePersistenceMixin):
 
         # Start fresh download (snapshot_download resumes from existing files).
         # An empty retry token keeps the stored one.
-        new_task = await self.start_download(repo_id, hf_token or old_task.token)
+        new_task = await self.start_download(
+            repo_id, hf_token or old_task.token, old_task.ignore_patterns
+        )
         new_task.retry_count = old_retry_count + 1
         self._persist()
         return new_task
@@ -1458,7 +1480,7 @@ class HFDownloader(_QueuePersistenceMixin):
 
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
-                ignore_patterns = None
+                auto_ignore_patterns: list[str] = []
                 st_estimate = 0
                 try:
                     model_info = await asyncio.wait_for(
@@ -1474,7 +1496,7 @@ class HFDownloader(_QueuePersistenceMixin):
                         getattr(model_info, "safetensors", None)
                     )
                     if st_params:
-                        ignore_patterns = [
+                        auto_ignore_patterns = [
                             "*.bin",
                             "original/**",
                             "consolidated.*.pth",
@@ -1507,6 +1529,9 @@ class HFDownloader(_QueuePersistenceMixin):
                     "endpoint": endpoint,
                     "etag_timeout": 30,
                 }
+                ignore_patterns = _merge_ignore_patterns(
+                    auto_ignore_patterns, task.ignore_patterns
+                )
                 if ignore_patterns:
                     dl_kwargs["ignore_patterns"] = ignore_patterns
 

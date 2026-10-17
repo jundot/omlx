@@ -798,6 +798,7 @@ class HFDownloadRequest(BaseModel):
 
     repo_id: str
     hf_token: str = ""
+    ignore_patterns: list[str] = Field(default_factory=list)
 
 
 class HFRetryRequest(BaseModel):
@@ -7523,7 +7524,9 @@ async def start_hf_download(
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
     try:
-        task = await _hf_downloader.start_download(request.repo_id, request.hf_token)
+        task = await _hf_downloader.start_download(
+            request.repo_id, request.hf_token, request.ignore_patterns
+        )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

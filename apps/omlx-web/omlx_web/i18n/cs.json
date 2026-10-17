@@ -246,6 +246,8 @@
   "models.downloader.hf_token": "HF token",
   "models.downloader.hf_token_optional": "(volitelné)",
   "models.downloader.hf_token_placeholder": "hf_…",
+  "models.downloader.exclude_patterns": "Vzory k vyloučení",
+  "models.downloader.exclude_patterns_hint": "Volitelné, vzory glob oddělené čárkami (např. *.gguf). Ostatní soubory v úložišti se stáhnou.",
   "models.downloader.download_button": "Stáhnout",
   "models.downloader.token_warning": "Váš uložený Hugging Face token byl zamítnut, takže výsledky jsou zobrazeny bez ověření. Spusťte 'hf auth logout' nebo nastavte platný HF_TOKEN, čímž tuto výstrahu odstraníte.",
   "models.downloader.ms_download_section": "Stáhnout z ModelScope",
