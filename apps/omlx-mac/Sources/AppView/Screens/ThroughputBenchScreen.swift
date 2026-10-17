@@ -125,7 +125,7 @@ private struct DeviceChip: View {
                 .font(.system(size: 10.5))
                 .foregroundStyle(theme.textTertiary)
             Text(label)
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
             Spacer(minLength: 0)
         }
@@ -320,7 +320,7 @@ private struct ConfigurationSection: View {
                     Text(String(localized: "bench.throughput.config.pending_flags",
                                 defaultValue: "This run will be tagged on the leaderboard: \(pendingFlags.joined(separator: ", "))",
                                 comment: "Inline note warning that acceleration features are on; placeholder is the comma-joined feature list"))
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textTertiary)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -395,7 +395,7 @@ private struct Chip: View {
     var body: some View {
         Button(action: onTap) {
             Text(label)
-                .font(.omlxText(11.5, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                 // Chips must never compress: under width pressure SwiftUI
                 // would otherwise wrap "128K" to "12/8K". The label column
                 // absorbs the squeeze instead.
@@ -430,13 +430,13 @@ private struct LiveProgressCard: View {
                         Text(String(localized: "bench.throughput.progress.warming_up",
                                     defaultValue: "Warming up…",
                                     comment: "Throughput Bench progress label before the first result arrives"))
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                     } else {
                         Text(String(localized: "bench.throughput.progress.running",
                                     defaultValue: "Running… results so far: \(resultCount)",
                                     comment: "Throughput Bench progress label with how many results have arrived; placeholder is the count"))
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                     }
                     Spacer(minLength: 0)
@@ -497,7 +497,7 @@ private struct SingleResultsTable: View {
                 HStack(spacing: 10) {
                     ForEach(Array(columnHeaders.enumerated()), id: \.offset) { _, h in
                         Text(h)
-                            .font(.omlxText(10.5, weight: .semibold))
+                            .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                             .foregroundStyle(theme.textTertiary)
                             .textCase(.uppercase)
                             .kerning(0.4)
@@ -524,7 +524,7 @@ private struct SingleResultsTable: View {
 
     private func cell(_ text: String, mono: Bool = false) -> some View {
         Text(text)
-            .font(mono ? .omlxMono(11.5) : .omlxText(11.5))
+            .font(mono ? .omlxMono(DesignTokens.FontSize.aux) : .omlxText(DesignTokens.FontSize.aux))
             .foregroundStyle(theme.text)
             .lineLimit(1)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -583,7 +583,7 @@ private struct BatchResultsTable: View {
                 HStack(spacing: 10) {
                     ForEach(Array(columnHeaders.enumerated()), id: \.offset) { _, h in
                         Text(h)
-                            .font(.omlxText(10.5, weight: .semibold))
+                            .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                             .foregroundStyle(theme.textTertiary)
                             .textCase(.uppercase)
                             .kerning(0.4)
@@ -623,7 +623,7 @@ private struct BatchResultsTable: View {
 
     private func cell(_ text: String, mono: Bool = false) -> some View {
         Text(text)
-            .font(mono ? .omlxMono(11.5) : .omlxText(11.5))
+            .font(mono ? .omlxMono(DesignTokens.FontSize.aux) : .omlxText(DesignTokens.FontSize.aux))
             .foregroundStyle(theme.text)
             .lineLimit(1)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -658,7 +658,7 @@ private struct TextExportSection: View {
                         Text(String(localized: "bench.throughput.text_export.title",
                                     defaultValue: "Text export",
                                     comment: "Disclosure header for the Throughput Bench text export block"))
-                            .font(.omlxText(11, weight: .semibold))
+                            .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                             .foregroundStyle(theme.textSecondary)
                             .textCase(.uppercase)
                             .kerning(0.6)
@@ -685,7 +685,7 @@ private struct TextExportSection: View {
                     FreeRow(isLast: true) {
                         ScrollView(.horizontal, showsIndicators: true) {
                             Text(text)
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.text)
                                 .fixedSize(horizontal: true, vertical: true)
                                 .textSelection(.enabled)
@@ -740,14 +740,14 @@ private struct UploadSection: View {
                         Text(String(localized: "bench.throughput.upload.uploading",
                                     defaultValue: "Uploading to omlx.ai…",
                                     comment: "Status label while bench results are being uploaded to the community leaderboard"))
-                            .font(.omlxText(11.5))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                         Spacer(minLength: 0)
                         if !state.results.isEmpty {
                             Text(String(localized: "bench.throughput.upload.count_submitted",
                                         defaultValue: "\(state.results.count) submitted",
                                         comment: "Inline counter shown during community upload; placeholder is the submitted count"))
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.textTertiary)
                         }
                     }
@@ -814,7 +814,7 @@ private struct UploadRow: View {
             Text(String(localized: "bench.throughput.upload.row.context_length",
                         defaultValue: "PP \(result.contextLength)",
                         comment: "Per-row label showing prompt-processing context length in the upload list; placeholder is the integer length"))
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.text)
                 .frame(width: 80, alignment: .leading)
 
@@ -823,7 +823,7 @@ private struct UploadRow: View {
                     .font(.system(size: 11))
                     .foregroundStyle(theme.redDot)
                 Text(err)
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.redDot)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -841,7 +841,7 @@ private struct UploadRow: View {
                      : String(localized: "bench.throughput.upload.row.submitted",
                               defaultValue: "Submitted",
                               comment: "Upload row label after a successful submission"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
                 Spacer(minLength: 0)
                 Button {
@@ -861,7 +861,7 @@ private struct UploadRow: View {
                 Text(String(localized: "bench.throughput.upload.row.no_url",
                             defaultValue: "No URL returned",
                             comment: "Upload row label when the server returned no leaderboard URL"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                 Spacer(minLength: 0)
             }
@@ -884,10 +884,10 @@ private struct OwnerHashRow: View {
             Text(String(localized: "bench.throughput.upload.owner_hash.label",
                         defaultValue: "Owner hash",
                         comment: "Label next to the leaderboard owner-hash identifier"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textTertiary)
             Text(ownerHash)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.aux))
                 .foregroundStyle(theme.textSecondary)
                 .textSelection(.enabled)
             Spacer(minLength: 0)
@@ -923,10 +923,10 @@ private struct SkippedBanner: View {
                 Text(String(localized: "bench.throughput.upload.skipped.title",
                             defaultValue: "Skipped community upload",
                             comment: "Banner heading shown when the server skipped uploading bench results"))
-                    .font(.omlxText(12, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(body(reason: reason))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -967,12 +967,12 @@ private struct FeatureFlagChips: View {
                 Text(String(localized: "bench.throughput.upload.flags.title",
                             defaultValue: "Acceleration flags",
                             comment: "Heading above the acceleration-feature chips in the community upload block"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                 FlowRow(spacing: 6) {
                     ForEach(flags) { flag in
                         Text(flag.detail.map { "\(flag.label) · \($0)" } ?? flag.label)
-                            .font(.omlxMono(10.5))
+                            .font(.omlxMono(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.greenDot)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 3)

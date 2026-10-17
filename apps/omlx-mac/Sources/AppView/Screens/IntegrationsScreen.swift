@@ -193,7 +193,7 @@ private struct ExternalEnginesSection: View {
                     let used = UInt64(max(0, model.memoryBytes ?? 0))
                     let budget = UInt64(max(0, model.memoryBudgetBytes ?? 0))
                     Text("\(SystemMetricsPoller.formatBytesAsGiB(used)) / \(SystemMetricsPoller.formatBytesAsGiB(budget)) GB")
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                 }
             }
@@ -316,7 +316,7 @@ private struct ClaudeSetupCommandSection: View {
                          : String(localized: "integrations.setup.advanced.local",
                                   defaultValue: "Points the real `claude` binary at your local oMLX server.",
                                   comment: "Explanation of the advanced env recipe in local mode"))
-                        .font(.omlxText(11.5))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                     CommandBlock(command: vm.claudeEnvRecipe)
                 }
@@ -325,7 +325,7 @@ private struct ClaudeSetupCommandSection: View {
                 Text(String(localized: "integrations.setup.advanced.label",
                             defaultValue: "Advanced — run `claude` directly",
                             comment: "Disclosure label revealing the advanced env-var recipe for running claude directly"))
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
             }
             .padding(.horizontal, 4)
@@ -347,12 +347,12 @@ private struct CommandBlock: View {
                 Text(caption ?? String(localized: "integrations.command.terminal_caption",
                                        defaultValue: "$ Terminal",
                                        comment: "Caption above each shell command block"))
-                    .font(.omlxText(10, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .semibold))
                     .foregroundStyle(theme.textTertiary)
                     .textCase(.uppercase)
                     .kerning(0.6)
                 Text(command)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.text)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -517,7 +517,7 @@ private struct IntegrationRow: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 12) {
                     Text(name)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     Spacer(minLength: 12)
                     Popup(
@@ -532,11 +532,11 @@ private struct IntegrationRow: View {
                             Text(String(localized: "integrations.openclaw.profile_label",
                                         defaultValue: "Tools profile",
                                         comment: "Row label for the OpenClaw tools-profile picker"))
-                                .font(.omlxText(12))
+                                .font(.omlxText(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.textSecondary)
                             if let profileSublabel {
                                 Text(profileSublabel)
-                                    .font(.omlxText(11))
+                                    .font(.omlxText(DesignTokens.FontSize.aux))
                                     .foregroundStyle(theme.textTertiary)
                             }
                         }

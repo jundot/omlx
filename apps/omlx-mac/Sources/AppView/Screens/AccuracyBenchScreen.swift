@@ -231,10 +231,10 @@ private struct ConfigurationSection: View {
                         Text(String(localized: "bench.accuracy.benchmarks.title",
                                     defaultValue: "Benchmarks",
                                     comment: "Inline label above the Accuracy Bench benchmark grid"))
-                            .font(.omlxText(13, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                             .foregroundStyle(theme.text)
                         Text(benchmarksSubtitle)
-                            .font(.omlxText(11.5))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textSecondary)
                         Spacer(minLength: 0)
                     }
@@ -398,10 +398,10 @@ private struct BenchmarkCard: View {
                 HStack {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(entry.displayName)
-                            .font(.omlxText(12.5, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                             .foregroundStyle(theme.text)
                         Text(entry.category)
-                            .font(.omlxText(10.5))
+                            .font(.omlxText(DesignTokens.FontSize.aux))
                             .foregroundStyle(theme.textTertiary)
                     }
                     Spacer()
@@ -413,7 +413,7 @@ private struct BenchmarkCard: View {
                     Text(String(localized: "bench.accuracy.card.samples_label",
                                 defaultValue: "Samples:",
                                 comment: "Inline label next to the per-benchmark sample-size dropdown"))
-                        .font(.omlxText(10.5))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textTertiary)
                     Popup(
                         selection: $sampleSize,
@@ -525,7 +525,7 @@ private struct RunningRow: View {
                               defaultValue: "Running…",
                               comment: "Accuracy Bench running-row title when the server hasn't reported the model id yet")
                      : modelId)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -548,7 +548,7 @@ private struct RunningRow: View {
             }
             if let line = progressLine {
                 Text(line)
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -585,12 +585,12 @@ private struct QueuedRow: View {
                 .foregroundStyle(theme.textTertiary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.modelId)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(item.benchmarks.map(displayName(for:)).joined(separator: ", "))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -661,13 +661,13 @@ private struct ResultCard: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 Text(percentText)
-                    .font(.omlxText(22, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.page, weight: .semibold))
                     .foregroundStyle(accuracyColor)
                     .monospacedDigit()
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(benchmarkDisplay)
-                            .font(.omlxText(13, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                             .foregroundStyle(theme.text)
                         Pill(label: result.modelId, color: theme.blueDot)
                         if result.thinkingUsed {
@@ -678,7 +678,7 @@ private struct ResultCard: View {
                         }
                     }
                     Text(subtitleText)
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                 }
                 Spacer(minLength: 0)
@@ -698,7 +698,7 @@ private struct ResultCard: View {
                         Text(String(localized: "bench.accuracy.result.categories",
                                     defaultValue: "Categories",
                                     comment: "Disclosure label on an Accuracy Bench result card revealing per-category breakdowns"))
-                            .font(.omlxText(11, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                     }
                     .foregroundStyle(theme.textSecondary)
                     .contentShape(Rectangle())
@@ -743,7 +743,7 @@ private struct Pill: View {
 
     var body: some View {
         Text(label)
-            .font(.omlxText(10, weight: .medium))
+            .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
             .foregroundStyle(color)
             .lineLimit(1)
             .truncationMode(.middle)
@@ -771,7 +771,7 @@ private struct UploadStatusRow: View {
                 Text(String(localized: "bench.accuracy.upload.skipped_min",
                             defaultValue: "Not uploaded (needs at least 100 questions)",
                             comment: "Accuracy result card status when the run was below the community upload minimum"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                 Spacer(minLength: 0)
             } else if let err = upload.error, !err.isEmpty {
@@ -781,10 +781,10 @@ private struct UploadStatusRow: View {
                 Text(String(localized: "bench.accuracy.upload.failed",
                             defaultValue: "Community upload failed",
                             comment: "Accuracy result card status when the omlx.ai upload failed"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.redDot)
                 Text(err)
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textTertiary)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -802,7 +802,7 @@ private struct UploadStatusRow: View {
                      : String(localized: "bench.accuracy.upload.submitted",
                               defaultValue: "Uploaded to omlx.ai",
                               comment: "Accuracy result card status after a successful community upload"))
-                    .font(.omlxText(11))
+                    .font(.omlxText(DesignTokens.FontSize.aux))
                     .foregroundStyle(theme.textSecondary)
                 Spacer(minLength: 0)
                 Button {
@@ -831,13 +831,13 @@ private struct CategoriesTable: View {
             ForEach(Array(entries.enumerated()), id: \.element.key) { idx, pair in
                 HStack(spacing: 10) {
                     Text(pair.key)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
                     Spacer(minLength: 8)
                     Text(String(format: "%.1f%%", pair.value * 100))
-                        .font(.omlxMono(11))
+                        .font(.omlxMono(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.text)
                         .monospacedDigit()
                 }
@@ -889,7 +889,7 @@ private struct TextExportSection: View {
                                      : String(localized: "bench.accuracy.text_export.show",
                                               defaultValue: "Show text dump",
                                               comment: "Disclosure label that reveals the Accuracy Bench text export"))
-                                    .font(.omlxText(11, weight: .medium))
+                                    .font(.omlxText(DesignTokens.FontSize.aux, weight: .medium))
                             }
                             .foregroundStyle(theme.textSecondary)
                             .contentShape(Rectangle())
@@ -914,7 +914,7 @@ private struct TextExportSection: View {
                     if isOpen {
                         ScrollView {
                             Text(textDump)
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.text)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(8)

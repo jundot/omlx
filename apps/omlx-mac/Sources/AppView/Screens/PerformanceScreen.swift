@@ -257,7 +257,7 @@ private struct MemoryLifecycleSection: View {
             VStack(alignment: .leading, spacing: 8) {
                 if let breakdown = vm.memoryGuardBreakdown {
                     Text(breakdown)
-                        .font(.omlxText(11.5))
+                        .font(.omlxText(DesignTokens.FontSize.aux))
                         .foregroundStyle(theme.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -268,7 +268,7 @@ private struct MemoryLifecycleSection: View {
                             .foregroundStyle(theme.warningText)
                         VStack(alignment: .leading, spacing: 6) {
                             Text(warning)
-                                .font(.omlxText(11))
+                                .font(.omlxText(DesignTokens.FontSize.aux))
                                 .foregroundStyle(theme.text)
                                 .fixedSize(horizontal: false, vertical: true)
                             CodeChip(value: vm.wiredLimitCommand)
