@@ -2709,6 +2709,111 @@ class TestPrepareSystemMessagesForTemplate:
         assert after_user is True
         assert after_tool is False
 
+    def test_budget_marker_system_after_tool_result_keeps_prompt_append_only(self):
+        tokenizer = self.UserOnlyMidSystemTokenizer()
+
+        def conversation(turns):
+            messages = [
+                {"role": "system", "content": "You are an agent."},
+                {"role": "user", "content": "Fix the bug."},
+            ]
+            for turn in range(turns):
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": f"c{turn}",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"c{turn}",
+                        "content": f"result {turn}",
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"<total_tokens>{150000 - 1000 * turn} tokens left"
+                            "</total_tokens>"
+                        ),
+                    }
+                )
+            return messages
+
+        prompts = [
+            tokenizer.apply_chat_template(
+                prepare_system_messages_for_template(
+                    conversation(turns),
+                    tokenizer,
+                    unsupported_mid_system_policy="user_note_safe",
+                )
+            )
+            for turns in (1, 2, 3)
+        ]
+
+        for earlier, later in zip(prompts, prompts[1:]):
+            assert later.startswith(earlier)
+
+    def test_strips_marker_appended_to_leading_system(self):
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an agent."
+                    "\n\n<total_tokens>150000 tokens left</total_tokens>"
+                ),
+            },
+            {"role": "user", "content": "Hello"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert result[0]["content"] == "You are an agent."
+
+    def test_drops_marker_only_system_even_when_template_preserves_it(self):
+        messages = [
+            {"role": "system", "content": "You are an agent."},
+            {"role": "user", "content": "Hello"},
+            {
+                "role": "system",
+                "content": "<total_tokens>42 tokens left</total_tokens>",
+            },
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert [message["role"] for message in result] == ["system", "user"]
+        assert result[0]["content"] == "You are an agent."
+
+    def test_keeps_marker_text_in_non_system_content(self):
+        messages = [
+            {
+                "role": "user",
+                "content": "log: <total_tokens>7 tokens left</total_tokens>",
+            }
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert result[0]["content"] == (
+            "log: <total_tokens>7 tokens left</total_tokens>"
+        )
+
 
 class TestMergeConsecutiveRoles:
     """Tests for consecutive same-role message merging."""
