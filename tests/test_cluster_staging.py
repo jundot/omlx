@@ -16,12 +16,14 @@ from omlx.cluster.staging import (
     _REMOTE_INSTALL_SNIPPET,
     ShardInfo,
     index_shards,
+    is_safe_relative_shard_path,
     plan_cluster_staging,
     plan_staging,
     scp_copy,
     scp_push,
     shards_for_stage,
     sidecar_files,
+    stage_files_from_source,
     stage_manifest,
     validate_staged_model,
 )
@@ -923,3 +925,334 @@ def test_real_sftp_copies_literal_paths(
         b"previous contents" if missing else content
     )
     assert sorted(p.name for p in destination.iterdir()) == [filename]
+
+
+# --- root-relative (subdirectory) shard paths — oMLX #3662 follow-up ----------
+
+
+def _model_with_subdir_weight(tmp_path, layers=4, per_file=2):
+    """A model whose index declares one weight under ``optiq/`` (OptiQ-style)."""
+
+    root = _model(tmp_path, layers=layers, per_file=per_file, with_index=True)
+    optiq = root / "optiq"
+    optiq.mkdir()
+    _write_shard(optiq, "optiq_vision.safetensors", ["vision.embed_tokens.weight"])
+    index_path = root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"]["vision.embed_tokens.weight"] = (
+        "optiq/optiq_vision.safetensors"
+    )
+    index_path.write_text(json.dumps(index))
+    return root
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model-00001.safetensors",
+        "optiq/optiq_vision.safetensors",
+        "omnimodal/audio_encoder.safetensors",
+        "a/b/c.safetensors",
+    ],
+)
+def test_is_safe_relative_shard_path_accepts_model_root_relative_paths(name):
+    assert is_safe_relative_shard_path(name) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        "/etc/passwd",
+        "../escape.safetensors",
+        "optiq/../../escape.safetensors",
+        "optiq/./x.safetensors",
+        "optiq/",
+        "~/.ssh/authorized_keys",
+        "optiq\nmalicious",
+        None,
+        7,
+    ],
+)
+def test_is_safe_relative_shard_path_rejects_escapes_and_junk(name):
+    assert is_safe_relative_shard_path(name) is False
+
+
+def test_index_shards_names_index_declared_subdir_weights_by_relative_path(
+    tmp_path,
+):
+    root = _model_with_subdir_weight(tmp_path)
+
+    shards = index_shards(root)
+
+    names = {shard.name for shard in shards}
+    assert "optiq/optiq_vision.safetensors" in names
+    subdir = next(s for s in shards if s.name == "optiq/optiq_vision.safetensors")
+    assert subdir.size_bytes == (root / "optiq" / "optiq_vision.safetensors").stat().st_size
+    # Root-level shards keep their exact names — no behavior change for flat models.
+    assert "model-00000.safetensors" in names
+
+
+def test_index_shards_ignores_undeclared_subdirectories(tmp_path):
+    """Only the index may admit a subdirectory weight — not a stray folder."""
+
+    root = _model(tmp_path, layers=4, per_file=2, with_index=True)
+    stray = root / "backup"
+    stray.mkdir()
+    _write_shard(stray, "old.safetensors", ["model.layers.0.old.weight"])
+
+    names = {shard.name for shard in index_shards(root)}
+
+    assert not any(name.startswith("backup/") for name in names)
+
+
+def test_index_shards_rejects_unsafe_index_paths(tmp_path):
+    root = _model(tmp_path, layers=2, with_index=True)
+    index_path = root / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text())
+    index["weight_map"]["evil.weight"] = "../../escape.safetensors"
+    index_path.write_text(json.dumps(index))
+
+    with pytest.raises(ValueError, match="unsafe safetensors filename in index"):
+        index_shards(root)
+
+
+def test_validate_staged_model_covers_subdir_weights(tmp_path):
+    root = _model_with_subdir_weight(tmp_path)
+
+    status = validate_staged_model(root, 0, 4)
+
+    assert status["stage_ready"] is True
+    assert "optiq/optiq_vision.safetensors" in status["required_files"]
+
+    # Removing the subdir weight must be detected as missing, not skipped.
+    (root / "optiq" / "optiq_vision.safetensors").unlink()
+    status = validate_staged_model(root, 0, 4)
+
+    assert status["stage_ready"] is False
+    assert "optiq/optiq_vision.safetensors" in status["missing_files"]
+
+
+def test_scp_push_creates_subdir_and_installs_relative_shard(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    (source / "optiq").mkdir(parents=True)
+    payload = b"x" * 64
+    (source / "optiq" / "optiq_vision.safetensors").write_bytes(payload)
+    destination = tmp_path / "destination"
+    commands = []
+    real_run = subprocess.run  # capture before monkeypatch replaces the attribute
+
+    def run(command, **kwargs):
+        commands.append(command)
+        if command[0] == "ssh" and "mkdir -p" in command[-1]:
+            Path(command[-1].split("mkdir -p ", 1)[1].strip("'")).mkdir(
+                parents=True, exist_ok=True
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command[0] == "ssh" and "os.replace" in command[-1]:
+            # Run the real install snippet so the staged temp is published.
+            return real_run(["/bin/sh", "-c", command[-1]], capture_output=True)
+        if command[0] == "scp":
+            Path(command[-1].split(":", 1)[1]).write_bytes(payload)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    scp_push(
+        destination_host="peer.example",
+        source_dir=str(source),
+        destination_dir=str(destination),
+        filename="optiq/optiq_vision.safetensors",
+    )
+
+    mkdirs = [c[-1] for c in commands if c[0] == "ssh" and "mkdir -p" in c[-1]]
+    assert any(str(destination / "optiq") in cmd for cmd in mkdirs)
+    assert (destination / "optiq" / "optiq_vision.safetensors").exists()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["../escape.safetensors", "/etc/passwd", "~/.ssh/x", "a/../../b"],
+)
+def test_scp_push_rejects_escaping_filenames(tmp_path, filename, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: calls.append(a) or SimpleNamespace(returncode=0)
+    )
+
+    with pytest.raises(ValueError, match="relative to the model root"):
+        scp_push(
+            destination_host="peer.example",
+            source_dir=str(tmp_path),
+            destination_dir=str(tmp_path),
+            filename=filename,
+        )
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["../escape.safetensors", "/etc/passwd", "a/../../b"],
+)
+def test_scp_copy_rejects_escaping_filenames(tmp_path, filename):
+    with pytest.raises(ValueError, match="relative to the model root"):
+        scp_copy(
+            source_host="source.example",
+            destination_host="destination.example",
+            source_dir=str(tmp_path),
+            destination_dir=str(tmp_path),
+            filename=filename,
+        )
+
+
+def test_scp_copy_pull_into_local_subdir_creates_parent(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    payload = b"y" * 32
+    (source / "optiq_vision.safetensors").write_bytes(payload)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+
+    def run(command, **kwargs):
+        if command[0] == "scp":
+            Path(command[-1]).write_bytes(payload)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    scp_copy(
+        source_host="source.example",
+        destination_host="127.0.0.1",
+        source_dir=str(source),
+        destination_dir=str(destination),
+        filename="optiq/optiq_vision.safetensors",
+    )
+
+    landed = destination / "optiq" / "optiq_vision.safetensors"
+    assert landed.read_bytes() == payload
+    # The hidden staging partial must not survive a successful install.
+    assert not [p for p in destination.iterdir() if p.name.startswith(".omlx-stage-")]
+
+
+def test_stage_files_from_source_pushes_subdir_weight(tmp_path, monkeypatch):
+    from omlx.cluster import staging as staging_mod
+
+    root = _model_with_subdir_weight(tmp_path, layers=4, per_file=2)
+    shards = index_shards(root)
+    plan = plan_staging(
+        root, node_id="studio", start_layer=0, end_layer=4, present={}, shards=shards
+    )
+    landed = {}
+    copied = []
+
+    def fake_transfer(**kwargs):
+        copied.append(kwargs["filename"])
+        landed[kwargs["filename"]] = (root / kwargs["filename"]).stat().st_size
+
+    monkeypatch.setattr(
+        staging_mod, "remote_file_sizes", lambda _host, _path: dict(landed)
+    )
+    monkeypatch.setattr(
+        staging_mod,
+        "check_disk_for_staging",
+        lambda *args, **kwargs: 100 * 1024**3,
+    )
+    monkeypatch.setattr(
+        staging_mod,
+        "remote_model_dir",
+        lambda _host, path, **_kwargs: str(tmp_path / "rank0"),
+    )
+    expected = {
+        name: (root / name).stat().st_size
+        for name in (*plan.required, *sidecar_files(root))
+        if (root / name).is_file()
+    }
+    result = stage_files_from_source(
+        plan,
+        model_path=str(root),
+        source_host="studio",
+        destination_host="macbook",
+        expected_sizes=expected,
+        transfer=fake_transfer,
+    )
+
+    assert result.ok
+    assert "optiq/optiq_vision.safetensors" in copied
+
+
+def test_stage_files_from_source_rejects_unsafe_expected_names(tmp_path):
+    root = _model(tmp_path, layers=2, with_index=True)
+    plan = plan_staging(
+        root,
+        node_id="n",
+        start_layer=0,
+        end_layer=2,
+        present={},
+        shards=index_shards(root),
+    )
+
+    with pytest.raises(RuntimeError, match="unsafe file inventory"):
+        stage_files_from_source(
+            plan,
+            model_path=root,
+            source_host="127.0.0.1",
+            destination_host="127.0.0.1",
+            expected_sizes={"../../escape.safetensors": 1},
+            destination_dir=str(root),
+        )
+
+
+def test_local_file_sizes_uses_root_relative_keys(tmp_path):
+    from omlx.cluster.staging import _local_file_sizes
+
+    root = _model_with_subdir_weight(tmp_path)
+
+    sizes = _local_file_sizes(root)
+
+    assert "optiq/optiq_vision.safetensors" in sizes
+    assert "model-00000.safetensors" in sizes
+    assert "optiq_vision.safetensors" not in sizes
+
+
+def test_remote_file_sizes_snippet_reports_relative_keys(tmp_path):
+    root = _model_with_subdir_weight(tmp_path)
+
+    result = subprocess.run(
+        [sys.executable, "-c", _REMOTE_FILE_SIZES_SNIPPET, str(root)],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+
+    sizes = json.loads(result.stdout)
+    assert "optiq/optiq_vision.safetensors" in sizes
+
+
+def test_remote_inventory_roundtrip_admits_subdir_rejects_escape(
+    tmp_path, monkeypatch
+):
+    from omlx.cluster import staging
+
+    root = _model_with_subdir_weight(tmp_path)
+    inventory = staging.model_staging_inventory(root)
+    assert any(
+        item["name"] == "optiq/optiq_vision.safetensors"
+        for item in inventory["shards"]
+    )
+
+    payload = json.dumps(inventory)
+    monkeypatch.setattr(
+        staging,
+        "run_remote_python",
+        lambda *args, **kwargs: json.loads(payload),
+    )
+    shards, sidecars = staging.remote_model_staging_inventory("peer", "~/m")
+    assert any(s.name == "optiq/optiq_vision.safetensors" for s in shards)
+
+    poisoned = json.loads(payload)
+    poisoned["shards"][0]["name"] = "../../escape.safetensors"
+    monkeypatch.setattr(
+        staging,
+        "run_remote_python",
+        lambda *args, **kwargs: poisoned,
+    )
+    with pytest.raises(RuntimeError, match="unsafe shard entry"):
+        staging.remote_model_staging_inventory("peer", "~/m")

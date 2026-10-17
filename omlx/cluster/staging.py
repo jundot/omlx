@@ -33,6 +33,29 @@ _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 _MAX_HEADER_BYTES = 64 * 1024 * 1024
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+
+def is_safe_relative_shard_path(name: str) -> bool:
+    """Whether ``name`` may be joined under a model root.
+
+    Weight files may live in model-root-relative subdirectories — OptiQ
+    exports ship ``optiq/optiq_vision.safetensors`` and reference it from the
+    weight map — so staging must accept relative paths, not just basenames.
+    What must never pass is anything that escapes the root once joined:
+    absolute paths, a leading ``~`` (``expanduser`` forms), and any empty,
+    ``.`` or ``..`` path component. Names arrive from three places we do not
+    fully control — the model index on disk, a peer's inventory answer over
+    SSH, and the ``expected`` map a caller passes in — so this predicate is
+    the single chokepoint every such join goes through.
+    """
+
+    if not isinstance(name, str) or not name:
+        return False
+    if name.startswith(("/", "~")):
+        return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        return False
+    return not any(part in ("", ".", "..") for part in name.split("/"))
+
 # Every running oMLX installation publishes this interpreter shim. Keep the
 # peer-home form so the remote shell expands it for the authenticated user.
 DEFAULT_REMOTE_PYTHON = CLUSTER_PYTHON_SHIM
@@ -114,8 +137,6 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
     if not root.is_dir():
         raise ValueError(f"model path is not a directory: {root}")
     files = sorted(root.glob("*.safetensors"))
-    if not files:
-        raise ValueError(f"no safetensors files in {root}")
 
     names_by_file: dict[str, list[str]] = {}
     index = root / "model.safetensors.index.json"
@@ -124,10 +145,27 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
         if isinstance(weight_map, dict):
             for tensor, filename in weight_map.items():
                 names_by_file.setdefault(str(filename), []).append(str(tensor))
+            # Index-declared weights may live in a model-root subdirectory
+            # (``optiq/optiq_vision.safetensors``); the flat glob above cannot
+            # see them, so add exactly the files the index names — never an
+            # arbitrary nested directory the export did not declare.
+            for filename in sorted(names_by_file):
+                if not is_safe_relative_shard_path(filename):
+                    raise ValueError(
+                        f"unsafe safetensors filename in index: {filename!r}"
+                    )
+                if Path(filename).name == filename:
+                    continue
+                declared = root / filename
+                if declared.is_file() and declared not in files:
+                    files.append(declared)
+    if not files:
+        raise ValueError(f"no safetensors files in {root}")
 
     shards = []
-    for path in files:
-        names = names_by_file.get(path.name)
+    for path in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        names = names_by_file.get(relative)
         if names is None:
             names = _safetensors_tensor_names(path)
         layers = set()
@@ -140,7 +178,7 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
                 shared = True
         shards.append(
             ShardInfo(
-                name=path.name,
+                name=relative,
                 size_bytes=path.stat().st_size,
                 layers=frozenset(layers),
                 has_shared_tensors=shared,
@@ -231,7 +269,7 @@ def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
     names_by_file: dict[str, list[str]] = {}
     for tensor, raw_filename in weight_map.items():
         filename = str(raw_filename)
-        if Path(filename).name != filename:
+        if not is_safe_relative_shard_path(filename):
             raise ValueError(f"unsafe safetensors filename in index: {filename!r}")
         names_by_file.setdefault(filename, []).append(str(tensor))
 
@@ -399,7 +437,11 @@ def remote_model_staging_inventory(
             shared = item["has_shared_tensors"] is True
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(f"invalid shard entry from {ssh_target}") from exc
-        if Path(name).name != name or size_bytes < 0 or min(layers, default=0) < 0:
+        if (
+            not is_safe_relative_shard_path(name)
+            or size_bytes < 0
+            or min(layers, default=0) < 0
+        ):
             raise RuntimeError(f"unsafe shard entry from {ssh_target}")
         shards.append(
             ShardInfo(
@@ -414,7 +456,7 @@ def remote_model_staging_inventory(
     for name, size in raw_sidecars.items():
         if (
             not isinstance(name, str)
-            or Path(name).name != name
+            or not is_safe_relative_shard_path(name)
             or not isinstance(size, int)
             or isinstance(size, bool)
             or size < 0
@@ -538,8 +580,10 @@ def stage_manifest(
                 (path_map or {}).get(assignment.node_id, remote_dir)
             ).expanduser()
             present_by_node[assignment.node_id] = {
-                path.name: path.stat().st_size
-                for path in (destination.iterdir() if destination.is_dir() else ())
+                path.relative_to(destination).as_posix(): path.stat().st_size
+                for path in (
+                    destination.rglob("*") if destination.is_dir() else ()
+                )
                 if path.is_file()
             }
         else:
@@ -720,12 +764,17 @@ def scp_push(
 ) -> None:
     """Push one local model file to the Mac that needs it."""
 
-    if Path(filename).name != filename:
-        raise ValueError(f"staging filename must be a basename: {filename!r}")
+    if not is_safe_relative_shard_path(filename):
+        raise ValueError(
+            f"staging filename must stay relative to the model root: {filename!r}"
+        )
     source = Path(source_dir).expanduser() / filename
     if not source.is_file():
         raise RuntimeError(f"source model file is missing: {source}")
-    remote_dir = shlex.quote(str(Path(destination_dir).expanduser()))
+    destination_root = Path(destination_dir).expanduser()
+    # The parent of the final path too: a root-relative shard lands in a
+    # subdirectory (``optiq/…``) that may not exist on the peer yet.
+    remote_dir = shlex.quote(str(destination_root / Path(filename).parent))
     mkdir = subprocess.run(
         [
             "ssh",
@@ -787,7 +836,13 @@ def _local_file_sizes(model_dir: str | Path) -> dict[str, int]:
     root = Path(model_dir).expanduser()
     if not root.is_dir():
         return {}
-    return {path.name: path.stat().st_size for path in root.iterdir() if path.is_file()}
+    # Keyed by root-relative path so files in subdirectories (``optiq/…``)
+    # match the names plans and inventories use.
+    return {
+        path.relative_to(root).as_posix(): path.stat().st_size
+        for path in root.rglob("*")
+        if path.is_file()
+    }
 
 
 def scp_copy(
@@ -802,8 +857,10 @@ def scp_copy(
 ) -> None:
     """Copy one model file between any two enrolled cluster nodes."""
 
-    if Path(filename).name != filename:
-        raise ValueError(f"staging filename must be a basename: {filename!r}")
+    if not is_safe_relative_shard_path(filename):
+        raise ValueError(
+            f"staging filename must stay relative to the model root: {filename!r}"
+        )
     source_local = is_local_host(source_host)
     destination_local = is_local_host(destination_host)
     if source_local and destination_local:
@@ -835,6 +892,10 @@ def scp_copy(
     if destination_local:
         destination = Path(destination_dir).expanduser()
         destination.mkdir(parents=True, exist_ok=True)
+        # Parent of the final path too: a root-relative shard lands in a
+        # subdirectory that ``destination.mkdir`` alone does not create.
+        final = destination / filename
+        final.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination / _staging_partial_name()
         try:
             result = subprocess.run(
@@ -854,12 +915,18 @@ def scp_copy(
                 timeout=timeout,
             )
             if result.returncode == 0:
-                os.replace(temporary, destination / filename)
+                os.replace(temporary, final)
         finally:
             if temporary.exists():
                 temporary.unlink()
     else:
-        remote_destination = shlex.quote(destination_dir)
+        # The parent of the final path too (see scp_push): a root-relative
+        # shard lands in a subdirectory the peer may not have yet.
+        remote_destination = shlex.quote(
+            f"{destination_dir.rstrip('/')}/{Path(filename).parent}"
+            if Path(filename).parent != Path(".")
+            else destination_dir.rstrip("/")
+        )
         mkdir = subprocess.run(
             [
                 "ssh",
@@ -956,7 +1023,7 @@ def stage_files_from_source(
     # The caller supplies only this rank's required shards plus common
     # sidecars. Validate that contract here before any disk or network action.
     if any(
-        Path(name).name != name
+        not is_safe_relative_shard_path(name)
         or not isinstance(size, int)
         or isinstance(size, bool)
         or size < 0
@@ -1111,8 +1178,9 @@ _REMOTE_FILE_SIZES_SNIPPET = (
     "import json,sys;"
     "from pathlib import Path;"
     "p=Path(sys.argv[1]).expanduser();"
-    "files=p.iterdir() if p.is_dir() else ();"
-    "print(json.dumps({f.name:f.stat().st_size for f in files if f.is_file()}))"
+    "files=p.rglob('*') if p.is_dir() else ();"
+    "print(json.dumps({f.relative_to(p).as_posix():f.stat().st_size"
+    " for f in files if f.is_file()}))"
 )
 
 
@@ -1224,10 +1292,16 @@ def stage_remote_files(
 
     source = Path(model_path).expanduser()
     destination_dir = destination_dir or str(source)
+    # Root-relative keys so subdirectory weights (``optiq/…``) participate in
+    # the present/missing comparison exactly as the plan names them.
     expected = {
-        path.name: path.stat().st_size
-        for path in source.iterdir()
-        if path.is_file() and (path.name in plan.required or path.name in sidecars)
+        path.relative_to(source).as_posix(): path.stat().st_size
+        for path in source.rglob("*")
+        if path.is_file()
+        and (
+            path.relative_to(source).as_posix() in plan.required
+            or path.relative_to(source).as_posix() in sidecars
+        )
     }
     present = present_reader(destination_host, destination_dir)
     missing = tuple(

@@ -1682,8 +1682,8 @@ def _run_staging_job(
                 destination_path = Path(destination_dir)
                 present = (
                 {
-                    path.name: path.stat().st_size
-                    for path in destination_path.iterdir()
+                    path.relative_to(destination_path).as_posix(): path.stat().st_size
+                    for path in destination_path.rglob("*")
                     if path.is_file()
                 }
                     if destination_path.is_dir()
