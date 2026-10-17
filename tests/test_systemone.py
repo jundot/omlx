@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the decision models behind /v1/systemone (Clef, OpenJev, d3)."""
+"""Tests for the decision models behind /v1/systemone (Clef, OpenJev, d3, d1)."""
 
 import copy
 import inspect
@@ -16,7 +16,7 @@ import mlx.nn as nn  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 
 from omlx.exceptions import InvalidRequestError  # noqa: E402
-from omlx.models import clef, d3, decision, openjev  # noqa: E402
+from omlx.models import clef, d1, d3, decision, openjev  # noqa: E402
 from omlx.models.decision import (  # noqa: E402
     DecisionBackbone,
     DecisionContextLengthError,
@@ -964,3 +964,465 @@ def test_base_layout_weights_sanitize_once():
     twice = model.sanitize(dict(once))
     assert set(twice) == set(once)
     assert twice["language_model.model.norm.weight"].tolist() == [1.0] * 64
+
+
+# --------------------------------------------------------------------------
+# d1 prompt, readout and shared prefix
+
+_D1_WORDS = {"yes": 300, "Yes": 301, "no": 302, "No": 303, " A": 304, " B": 305}
+
+
+class _D1Tokenizer:
+    """Characters, plus a few words that are one token as in the d1 vocabulary."""
+
+    bos_token = "<|startoftext|>"
+
+    def encode(self, text, add_special_tokens=False):
+        if text in _D1_WORDS:
+            return [_D1_WORDS[text]]
+        return [ord(c) % 250 + 1 for c in text]
+
+
+def _d1_model(backbone=None) -> d1.D1Model:
+    model = d1.D1Model("unused")
+    if backbone is not None:
+        model.backbone = backbone
+    model.backbone.tokenizer = _D1Tokenizer()
+    model._bos = _D1Tokenizer.bos_token
+    return model
+
+
+def _d1_text(model, request) -> list[str]:
+    plan = model.encode(request)
+    return [plan.prefix + item.suffix for item in plan.items]
+
+
+def test_d1_prompt_layout_matches_release():
+    # Expected texts are the release prompt.py renderings used for the d1 study.
+    model = _d1_model()
+    state = {
+        "message": "My package arrived with a broken screen. Please send a replacement.",
+        "order_status": "delivered",
+        "warranty": "active",
+    }
+    choice = {
+        "type": "choice",
+        "instructions": "Route this support request.",
+        "criteria": {
+            "refund": "return the customer's payment",
+            "replacement": "send a replacement device",
+            "technical support": "help troubleshoot the device",
+        },
+    }
+    assert _d1_text(model, {"state": state, "questions": {"q": choice}}) == [
+        "<|startoftext|><|im_start|>user\n{\n"
+        '  "message": "My package arrived with a broken screen. Please send a '
+        'replacement.",\n  "order_status": "delivered",\n  "warranty": "active"\n'
+        "}\n\n\nQUESTION:\nRoute this support request.\n\nOptions:\n"
+        "A return the customer's payment\nB send a replacement device\n"
+        "C help troubleshoot the device\n\nReply with the option code only."
+        "<|im_end|>\n<|im_start|>assistant\n"
+    ]
+    noul = {
+        "type": "noul",
+        "instructions": "Does this task require disclosure of private customer data?",
+    }
+    assert _d1_text(model, {"state": "plain text", "questions": {"q": noul}}) == [
+        "<|startoftext|><|im_start|>user\nplain text\n\n\nQUESTION:\n"
+        "Does this task require disclosure of private customer data?\n\n"
+        "Reply with yes or no only.<|im_end|>\n<|im_start|>assistant\n"
+    ]
+    score = {
+        "type": "score",
+        "instructions": "Rate the urgency.",
+        "criteria": ["low", "high", 3],
+    }
+    noul_criteria = {**noul, "criteria": {"true": "it does", "false": None}}
+    texts = _d1_text(
+        model, {"state": [1, 2], "questions": {"s": score, "n": noul_criteria}}
+    )
+    prefix = "<|startoftext|><|im_start|>user\n[\n  1,\n  2\n]\n\n\nQUESTION:\n"
+    assert texts == [
+        prefix + "Rate the urgency.\n\n0 low\n1 high\n2 3\n\n"
+        "Reply with a single digit 0-2 only.<|im_end|>\n<|im_start|>assistant\n",
+        prefix + "Does this task require disclosure of private customer data?\n"
+        "Yes: it does\nNo: None\n\nReply with yes or no only."
+        "<|im_end|>\n<|im_start|>assistant\n",
+    ]
+
+
+def test_d1_option_tokens_and_codes():
+    model = _d1_model()
+    choice = {
+        "type": "choice",
+        "instructions": "Pick.",
+        "criteria": {"x_y": None, "z": None},
+    }
+    item = model.encode({"state": "s", "questions": {"q": choice}}).items[0]
+    assert "A x y\nB z" in item.suffix
+    # Each option scores its bare code and its spaced code when that is one token.
+    assert item.groups == [[ord("A") % 250 + 1, 304], [ord("B") % 250 + 1, 305]]
+    noul = model.encode(
+        {"state": "s", "questions": {"q": {"type": "noul", "instructions": "?"}}}
+    ).items[0]
+    assert noul.groups == [[300, 301], [302, 303]]
+
+    assert d1.option_codes(["b", "a"]) == ["b", "a"]
+    assert d1.option_codes(["one", "two"]) == ["A", "B"]
+    assert d1.option_codes([str(i) for i in range(30)])[:2] == ["00", "01"]
+    # Two-character codes are not one token here, so the fallback pool fills in.
+    many = {
+        "type": "choice",
+        "instructions": "Pick.",
+        "criteria": {f"o{i}": None for i in range(30)},
+    }
+    item = model.encode({"state": "s", "questions": {"q": many}}).items[0]
+    firsts = [group[0] for group in item.groups]
+    assert len(set(firsts)) == 30
+    assert item.suffix.split("Options:\n")[1].startswith("A o0\nB o1\n")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        {"type": "noul"},
+        {"type": "choice", "instructions": "x", "criteria": ["a", "b"]},
+        {"type": "score", "instructions": "x", "criteria": ["only"]},
+        {"type": "noul", "instructions": "x", "criteria": ["a"]},
+    ],
+)
+def test_d1_rejects_malformed_questions(question):
+    with pytest.raises(DecisionRequestError):
+        _d1_model().encode({"state": "s", "questions": {"q": question}})
+
+
+def test_d1_rejects_media_and_long_prompts():
+    model = _d1_model()
+    question = {"q": {"type": "noul", "instructions": "x"}}
+    with pytest.raises(DecisionRequestError):
+        model.encode({"state": "s", "questions": question, "images": ["data:"]})
+    with pytest.raises(DecisionRequestError, match="videos"):
+        model.encode({"state": "s", "questions": question, "videos": ["data:"]})
+    model.backbone.config = {"text_config": {"max_position_embeddings": 64}}
+    with pytest.raises(DecisionContextLengthError):
+        model.encode({"state": "s" * 80, "questions": question})
+
+
+def test_d1_readout_and_answer_format():
+    model = _d1_model()
+    item = d1._Question("q", "choice", ["a", "b", "c"], [], "", [[0, 1], [2], [3]])
+    rows = mx.eye(4, 2)
+    model.backbone.output_rows = lambda ids: rows[ids]
+    # Logits per token: [1, 0, 0, 0] @ hidden; option a takes its best token.
+    probs = model._probs(item, mx.array([2.0, 5.0]))
+    expected = np.exp([5.0, 0.0, 0.0]) / np.exp([5.0, 0.0, 0.0]).sum()
+    assert np.allclose(probs, expected)
+    answer = model._answer(item, probs)
+    assert answer["choice"] == "a"
+    assert answer["confidence"] == round(expected[0], 4)
+    assert list(answer["probabilities"]) == ["a", "b", "c"]
+
+    score = d1._Question("s", "score", ["0", "1"], ["low", "high"], "", [[0], [1]])
+    assert model._answer(score, [0.25, 0.75]) == {
+        "type": "score",
+        "score": 0.75,
+        "confidence": 0.75,
+        "probabilities": {"0": 0.25, "1": 0.75},
+        "legend": {"0": "low", "1": "high"},
+    }
+    noul = d1._Question("n", "noul", ["yes", "no"], [], "", [[0], [1]])
+    assert model._answer(noul, [0.3, 0.7]) == {"type": "noul", "noul": 0.3}
+
+
+_LFM2_CONFIG = {
+    "model_type": "lfm2",
+    "hidden_size": 64,
+    "num_hidden_layers": 4,
+    "intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "num_heads": 4,
+    "vocab_size": 320,
+    "max_position_embeddings": 4096,
+    "block_dim": 64,
+    "block_auto_adjust_ff_dim": False,
+    "conv_dim": 64,
+    "conv_dim_out": 64,
+    "layer_types": ["conv", "full_attention", "conv", "full_attention"],
+}
+
+
+@pytest.fixture(scope="module")
+def tiny_lfm2_backbone():
+    from mlx_vlm.models.lfm2_vl.config import TextConfig
+    from mlx_vlm.models.lfm2_vl.language import LanguageModel
+
+    mx.random.seed(4)
+    language_model = LanguageModel(TextConfig.from_dict(_LFM2_CONFIG))
+    mx.eval(language_model.parameters())
+    backbone = d1.Lfm2DecisionBackbone("tiny-lfm2")
+    backbone.model = SimpleNamespace(language_model=language_model)
+    backbone.config = {"text_config": _LFM2_CONFIG}
+    backbone._text_model = language_model.model
+    backbone._lm_head = language_model.model.embed_tokens
+    return backbone
+
+
+def test_d1_backbone_matches_lfm2_logits(tiny_lfm2_backbone):
+    backbone = tiny_lfm2_backbone
+    ids = np.arange(5, 25, dtype=np.int32)
+    embeds, positions = backbone.embed(ids)
+    hidden = _drain(
+        backbone.prefill(
+            ids, embeds, positions, backbone.make_cache(), lambda: 7, keep_all=False
+        )
+    )
+    expected = backbone.model.language_model(mx.array(ids)[None]).logits[0, -1]
+    assert np.allclose(np.array(backbone.logits(hidden)), np.array(expected), atol=1e-4)
+
+
+def test_d1_shared_prefix_matches_each_question_alone(tiny_lfm2_backbone):
+    model = _d1_model(tiny_lfm2_backbone)
+    questions = {
+        "team": {
+            "type": "choice",
+            "instructions": "Which team?",
+            "criteria": {
+                "billing": "charges and refunds",
+                "support": None,
+                "sales": None,
+            },
+        },
+        "angry": {"type": "noul", "instructions": "Is the customer angry?"},
+        "urgency": {
+            "type": "score",
+            "instructions": "How urgent?",
+            "criteria": ["later", "today", "now"],
+        },
+    }
+    state = {"ticket": "charged twice, nobody replied"}
+    plan = model.encode({"state": state, "questions": questions})
+    shared = _drain(model.run(plan, lambda: 16))
+    tokens = len(model.backbone.tokenize(plan.prefix))
+    tokens += sum(len(model.backbone.tokenize(item.suffix)) for item in plan.items)
+    assert shared["input_tokens"] == tokens
+    for key, question in questions.items():
+        model.prefixes.clear()  # alone: one plain pass over the whole prompt
+        alone = _drain(
+            model.run(
+                model.encode({"state": state, "questions": {key: question}}), lambda: 16
+            )
+        )["answers"][key]
+        if key == "angry":
+            assert shared["answers"][key]["noul"] == pytest.approx(
+                alone["noul"], abs=2e-4
+            )
+        else:
+            a = shared["answers"][key]["probabilities"]
+            b = alone["probabilities"]
+            assert list(a) == list(b)
+            assert np.allclose(list(a.values()), list(b.values()), atol=2e-4)
+    json.dumps(shared)
+
+
+def _cache_arrays(cache) -> list[np.ndarray]:
+    return [np.array(a) for c in cache for _, a in tree_flatten(c.state)]
+
+
+def test_d1_batched_branches_match_one_at_a_time(tiny_lfm2_backbone):
+    backbone = tiny_lfm2_backbone
+    model = _d1_model(backbone)
+    trunk = np.arange(5, 40, dtype=np.int32)
+    trunk_cache = backbone.make_cache()
+    _drain(model._prefill(trunk, trunk_cache, lambda: 16))
+    before = _cache_arrays(trunk_cache)
+    branches = [np.arange(50, 50 + n, dtype=np.int32) for n in (9, 3, 6, 6, 1)]
+
+    expected = []
+    for b in branches:
+        expected.append(
+            _drain(model._prefill(b, copy.deepcopy(trunk_cache), lambda: 16))
+        )
+    sizes = []
+
+    def chunk():
+        return 12  # groups: [1, 3], [6, 6], [9]
+
+    steps = model._branches(trunk_cache, len(trunk), branches, chunk)
+    while True:
+        try:
+            sizes.append(next(steps))
+        except StopIteration as stop:
+            hidden = stop.value
+            break
+    assert sizes == [4, 12, 9]
+    for h, e in zip(hidden, expected, strict=True):
+        assert np.allclose(np.array(h), np.array(e), atol=1e-5)
+    after = _cache_arrays(trunk_cache)
+    assert all(np.array_equal(x, y) for x, y in zip(before, after, strict=True))
+
+
+def _prefill_lengths(model, monkeypatch) -> list[int]:
+    lengths = []
+    prefill = model._prefill
+
+    def recording(ids, cache, chunk_size):
+        lengths.append(len(ids))
+        return (yield from prefill(ids, cache, chunk_size))
+
+    monkeypatch.setattr(model, "_prefill", recording)
+    return lengths
+
+
+def test_d1_prefix_cache_serves_later_requests(tiny_lfm2_backbone, monkeypatch):
+    model = _d1_model(tiny_lfm2_backbone)
+    lengths = _prefill_lengths(model, monkeypatch)
+    state = {"ticket": "charged twice, nobody replied"}
+    angry = {"type": "noul", "instructions": "Is the customer angry?"}
+    urgency = {"type": "score", "instructions": "How urgent?", "criteria": ["a", "b"]}
+    both = {"state": state, "questions": {"angry": angry, "urgency": urgency}}
+    plan = model.encode(both)
+    prefix_len = len(model.backbone.tokenize(plan.prefix))
+
+    first = _drain(model.run(plan, lambda: 64))
+    assert first["cached_tokens"] == 0
+    assert len(model.prefixes) == 1
+    stored = _cache_arrays(model.prefixes.get(model.prefix_key(plan)))
+
+    # A later single question on the same state runs only its own tokens.
+    lengths.clear()
+    single = {"state": state, "questions": {"angry": angry}}
+    again = _drain(model.run(model.encode(single), lambda: 64))
+    assert prefix_len not in lengths and max(lengths) < prefix_len
+    assert again["cached_tokens"] == prefix_len
+    assert again["answers"]["angry"]["noul"] == pytest.approx(
+        first["answers"]["angry"]["noul"], abs=2e-4
+    )
+    after = _cache_arrays(model.prefixes.get(model.prefix_key(plan)))
+    assert all(np.array_equal(x, y) for x, y in zip(stored, after, strict=True))
+
+    # A single question on a new short prefix keeps the one plain pass.
+    lengths.clear()
+    other = {"state": "another ticket", "questions": {"angry": angry}}
+    out = _drain(model.run(model.encode(other), lambda: 64))
+    assert len(lengths) == 1 and out["input_tokens"] == lengths[0]
+    assert len(model.prefixes) == 1
+
+    # From SPLIT_PREFIX_TOKENS a single question splits off its prefix and keeps it.
+    monkeypatch.setattr(d1, "SPLIT_PREFIX_TOKENS", 4)
+    out = _drain(model.run(model.encode(other), lambda: 64))
+    assert len(model.prefixes) == 2 and out["cached_tokens"] == 0
+
+    # The backbone is shared by the module's tests; only the model closes.
+    monkeypatch.setattr(model.backbone, "close", lambda: None)
+    model.close()
+    assert len(model.prefixes) == 0 and model.prefixes.nbytes == 0
+
+
+def test_d1_prefix_cache_evicts_by_bytes(tiny_lfm2_backbone):
+    model = _d1_model(tiny_lfm2_backbone)
+    questions = {
+        "a": {"type": "noul", "instructions": "A?"},
+        "b": {"type": "noul", "instructions": "B?"},
+    }
+    plans = [
+        model.encode({"state": f"ticket {i}", "questions": questions}) for i in range(3)
+    ]
+    _drain(model.run(plans[0], lambda: 64))
+    one = model.prefixes.nbytes
+    model.prefixes.max_bytes = 2 * one + one // 2
+    _drain(model.run(plans[1], lambda: 64))
+    model.prefixes.get(model.prefix_key(plans[0]))  # most recently used
+    _drain(model.run(plans[2], lambda: 64))
+    assert model.prefixes.get(model.prefix_key(plans[1])) is None
+    assert model.prefixes.get(model.prefix_key(plans[0])) is not None
+    assert model.prefixes.nbytes <= model.prefixes.max_bytes
+
+    model.prefixes.max_bytes = one - 1
+    model.prefixes.clear()
+    _drain(model.run(plans[0], lambda: 64))
+    assert len(model.prefixes) == 0
+
+
+def _active_memory() -> int:
+    import gc
+
+    gc.collect()
+    mx.synchronize()
+    mx.clear_cache()
+    return mx.get_active_memory()
+
+
+def test_d1_prefix_cache_holds_only_what_it_counts(tiny_lfm2_backbone):
+    model = _d1_model(tiny_lfm2_backbone)
+    questions = {
+        "a": {"type": "noul", "instructions": "A?"},
+        "b": {"type": "noul", "instructions": "B?"},
+    }
+    _drain(
+        model.run(
+            model.encode({"state": "warm up", "questions": questions}), lambda: 4096
+        )
+    )
+    model.prefixes.clear()
+    base = _active_memory()
+    # One long chunk: each conv state is a slice of a buffer as long as the prefix.
+    request = {"state": "x" * 3000, "questions": questions}
+    _drain(model.run(model.encode(request), lambda: 4096))
+    retained = _active_memory() - base
+    assert model.prefixes.nbytes > 0
+    assert retained <= 1.25 * model.prefixes.nbytes + 64 * 1024
+
+
+class _MergingTokenizer(_D1Tokenizer):
+    """Like the d1 tokenizer, ``\\n\\n`` is one token, so text merges across a split."""
+
+    def encode(self, text, add_special_tokens=False):
+        if text in _D1_WORDS:
+            return [_D1_WORDS[text]]
+        out, i = [], 0
+        while i < len(text):
+            if text.startswith("\n\n", i):
+                out.append(299)
+                i += 2
+            else:
+                out.append(ord(text[i]) % 250 + 1)
+                i += 1
+        return out
+
+
+def test_d1_single_question_keeps_the_whole_prompt_tokens(
+    tiny_lfm2_backbone, monkeypatch
+):
+    model = _d1_model(tiny_lfm2_backbone)
+    model.backbone.tokenizer = _MergingTokenizer()
+    lengths = _prefill_lengths(model, monkeypatch)
+    state = "charged twice"
+    merged = {"type": "noul", "instructions": "\nIs it urgent?"}
+    other = {"type": "noul", "instructions": "Is it urgent?"}
+    _drain(
+        model.run(
+            model.encode({"state": state, "questions": {"m": merged, "o": other}}),
+            lambda: 64,
+        )
+    )
+    assert len(model.prefixes) == 1
+
+    # The prefix ends with a newline, so this question's text merges across the
+    # split; it keeps one pass over the whole prompt instead of the cached prefix.
+    lengths.clear()
+    plan = model.encode({"state": state, "questions": {"m": merged}})
+    whole = model.backbone.tokenize(plan.prefix + plan.items[0].suffix)
+    parts = model.backbone.tokenize(plan.prefix) + model.backbone.tokenize(
+        plan.items[0].suffix
+    )
+    assert whole != parts
+    out = _drain(model.run(plan, lambda: 64))
+    assert lengths == [len(whole)]
+    assert out["input_tokens"] == len(whole) and out["cached_tokens"] == 0
+
+    lengths.clear()
+    out = _drain(
+        model.run(model.encode({"state": state, "questions": {"o": other}}), lambda: 64)
+    )
+    assert out["cached_tokens"] > 0 and max(lengths) < len(whole)

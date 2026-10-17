@@ -659,6 +659,28 @@ class TestDetectModelType:
         assert detect_model_type(mlx_copy) == "decision"
         assert detect_model_type(other_family) == "llm"
 
+    def test_detect_d1_by_auto_map_or_directory_name(self, tmp_path):
+        config = {
+            "model_type": "lfm2_vl",
+            "architectures": ["Lfm2VlForConditionalGeneration"],
+            "vision_config": {"model_type": "siglip2_vision_model"},
+        }
+        release = tmp_path / "decider"
+        mlx_copy = tmp_path / "LiquidAI-d1-3B-mlx-affine4-gs64-rtn"
+        plain = tmp_path / "LFM2.5-VL-1.6B"
+        for path in (release, mlx_copy, plain):
+            path.mkdir()
+            (path / "config.json").write_text(json.dumps(config))
+        (release / "config.json").write_text(
+            json.dumps({**config, "auto_map": {"AutoModel": "modeling_d1.D1Model"}})
+        )
+
+        assert detect_model_type(release) == "decision"
+        assert decision_kind(release) == "d1"
+        assert decision_kind(mlx_copy) == "d1"
+        assert decision_kind(plain) is None
+        assert detect_model_type(plain) == "vlm"
+
     def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
         """Qwen3 with CausalLM architecture should be LLM, not embedding."""
         config = {
