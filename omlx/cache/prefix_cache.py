@@ -1226,9 +1226,9 @@ class BlockAwarePrefixCache(CacheManager):
                 # Isolate the whole chain. Intermediate split-GDN exact-prefix
                 # blocks carry structural recurrent placeholders and must never
                 # enter ordinary partial-prefix matching.
-                block_extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,)
+                block_extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,) + (extra_keys or ())
             elif is_exact_terminal:
-                block_extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
+                block_extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,) + (extra_keys or ())
             else:
                 block_extra_keys = resolve_block_extra_keys(
                     global_end,
@@ -1717,6 +1717,8 @@ class BlockAwarePrefixCache(CacheManager):
         tokens: list[int],
         cache_data: list[Any],
         model_cache_config: ModelCacheConfig | None = None,
+        *,
+        extra_keys: tuple[Any, ...] | None = None,
     ) -> BlockTable | None:
         """Persist a complete prefix, including its exact terminal boundary.
 
@@ -1767,6 +1769,7 @@ class BlockAwarePrefixCache(CacheManager):
             tokens,
             cache_data,
             model_cache_config=model_cache_config,
+            extra_keys=extra_keys,
             hot_cache_write_back=False,
             _store_exact_terminal=True,
         )
@@ -1785,7 +1788,9 @@ class BlockAwarePrefixCache(CacheManager):
         self._exact_prefix_stores += 1
         return stored_table
 
-    def _exact_prefix_hashes(self, tokens: list[int]) -> list[tuple[BlockHash, int]]:
+    def _exact_prefix_hashes(
+        self, tokens: list[int], extra_keys: tuple[Any, ...] | None = None
+    ) -> list[tuple[BlockHash, int]]:
         """Return deterministic hashes for an exact prefix."""
         block_hashes_and_token_counts: list[tuple[BlockHash, int]] = []
         parent_hash: BlockHash | None = None
@@ -1798,15 +1803,15 @@ class BlockAwarePrefixCache(CacheManager):
         for block_start in range(0, len(tokens), self.block_size):
             block_tokens = tokens[block_start : block_start + self.block_size]
             if split_gdn_layout:
-                extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,)
+                block_extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,) + (extra_keys or ())
             elif block_start == terminal_start:
-                extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
+                block_extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,) + (extra_keys or ())
             else:
-                extra_keys = None
+                block_extra_keys = extra_keys
             block_hash = compute_block_hash(
                 parent_hash,
                 block_tokens,
-                extra_keys=extra_keys,
+                extra_keys=block_extra_keys,
                 model_name=self.paged_cache.model_name,
             )
             block_hashes_and_token_counts.append((block_hash, len(block_tokens)))
@@ -1818,13 +1823,15 @@ class BlockAwarePrefixCache(CacheManager):
         self,
         request_id: str,
         tokens: list[int],
+        *,
+        extra_keys: tuple[Any, ...] | None = None,
     ) -> BlockTable | None:
         """Acquire an all-or-nothing exact prefix chain from hot cache or SSD."""
         if not tokens or self.paged_ssd_cache is None:
             return None
 
         acquired_blocks: list[CacheBlock] = []
-        for block_hash, token_count in self._exact_prefix_hashes(tokens):
+        for block_hash, token_count in self._exact_prefix_hashes(tokens, extra_keys):
             cached_block = self.paged_cache.cached_block_hash_to_block.get_block(
                 block_hash
             )
@@ -1871,9 +1878,10 @@ class BlockAwarePrefixCache(CacheManager):
         tokens: list[int],
         *,
         promote_to_hot_cache: bool,
+        extra_keys: tuple[Any, ...] | None = None,
     ) -> list[Any] | None:
         """Reconstruct a complete exact prefix and release temporary block refs."""
-        block_table = self.fetch_exact_prefix(request_id, tokens)
+        block_table = self.fetch_exact_prefix(request_id, tokens, extra_keys=extra_keys)
         if block_table is None:
             self._exact_prefix_misses += 1
             return None

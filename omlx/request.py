@@ -9,6 +9,7 @@ request management system, simplified for MLX backend.
 
 import enum
 import time
+from .cache_namespace import namespace_keys, with_namespace
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -145,6 +146,8 @@ class Request:
     batch_uid: Optional[int] = None  # UID assigned by BatchGenerator
 
     # Prefix cache fields
+    # Capture authenticated identity before crossing scheduler/worker boundaries.
+    cache_namespace: Optional[str] = None
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
     cached_tokens: int = 0  # Prefix tokens in KV, including resumed prefill
     prefill_resumed_tokens: int = 0  # Locally computed tokens retained after a pause
@@ -205,29 +208,43 @@ class Request:
     rope_deltas: float = 0.0  # Per-request mRoPE position delta (set after VLM prefill)
 
     @property
-    def vlm_extra_keys_for_cache(self) -> Optional[Tuple[str, ...]]:
-        """Whole-request image hash wrapped as extra_keys tuple."""
+    def vlm_extra_keys_for_cache(self) -> Optional[Tuple[Any, ...]]:
+        """Request namespace and whole-request media identity."""
         if self.vlm_image_hash:
-            return (self.vlm_image_hash,)
-        return None
+            return with_namespace((self.vlm_image_hash,), self.cache_namespace)
+        return namespace_keys(self.cache_namespace)
 
     @property
     def vlm_extra_key_token_start_for_cache(self) -> Optional[int]:
         """Token index where image-specific cache keying begins."""
         if self.vlm_image_hash:
+            # The namespace applies from token zero; a media boundary must
+            # never make the preceding text shared across credentials.
+            if self.cache_namespace is not None:
+                return None
             return self.vlm_cache_key_start
         return None
 
     @property
     def vlm_extra_key_ranges_for_cache(
         self,
-    ) -> Optional[List[Tuple[int, Tuple[str, ...]]]]:
+    ) -> Optional[List[Tuple[int, Tuple[Any, ...]]]]:
         """Segmented VLM cache key ranges for per-image-turn keying."""
-        if not self.vlm_cache_key_ranges:
+        ranges = self.vlm_cache_key_ranges
+        if not ranges and self.cache_namespace is None:
             return None
-        return [
-            (start, (image_hash,)) for start, image_hash in self.vlm_cache_key_ranges
-        ]
+        if not ranges and self.vlm_image_hash:
+            ranges = [(self.vlm_cache_key_start, self.vlm_image_hash)]
+        result = []
+        if self.cache_namespace is not None:
+            result.append((0, namespace_keys(self.cache_namespace)))
+        result.extend(
+            (start, with_namespace((image_hash,), self.cache_namespace))
+            for start, image_hash in (ranges or [])
+        )
+        # Text-only scopes use a request-wide key so MTP sidecar priming
+        # retains its existing fast path.
+        return result if ranges else None
 
     # Metadata
     finish_reason: Optional[str] = None

@@ -13,6 +13,7 @@ from mlx_lm.models.cache import make_prompt_cache
 
 from ..prefill_progress import get_prefill_tracker
 from ..request import Request
+from ..cache_namespace import namespace_keys
 from .policy import SpecPrefillScoringPlan
 
 
@@ -20,7 +21,7 @@ class DraftPrefixCache(Protocol):
     """Draft-cache operations used by the scoring workflow."""
 
     def fetch_cache(
-        self, request_id: str, tokens: Sequence[int]
+        self, request_id: str, tokens: Sequence[int], *, extra_keys: tuple | None = None
     ) -> tuple[Any, list[int]]: ...
 
     def preload_blocks(self, block_table: Any) -> int: ...
@@ -34,6 +35,7 @@ class DraftPrefixCache(Protocol):
         cache_data: list[Any],
         model_cache_config: Any = ...,
         boundary_snapshots: dict[int, list[Any]] | None = ...,
+        extra_keys: tuple | None = None,
     ) -> Any: ...
 
     block_size: int
@@ -99,6 +101,11 @@ def run_specprefill_draft_scoring(
     tokens_to_score = plan.tokens_to_score
     n_to_score = plan.n_to_score
     tracker = get_prefill_tracker()
+    namespace_kwargs = (
+        {"extra_keys": namespace_keys(request.cache_namespace)}
+        if getattr(request, "cache_namespace", None) is not None
+        else {}
+    )
 
     try:
         # Resolve patch helpers at call time so engine-specific patches apply.
@@ -110,7 +117,7 @@ def run_specprefill_draft_scoring(
             try:
                 # Leave the final token uncached to compute prompt-end logits without replay.
                 block_table, _draft_remaining = draft_prefix_cache.fetch_cache(
-                    request.request_id, tokens_to_score[:-1]
+                    request.request_id, tokens_to_score[:-1], **namespace_kwargs
                 )
                 if block_table and block_table.num_tokens > 0:
                     draft_prefix_cache.preload_blocks(block_table)
@@ -270,6 +277,7 @@ def run_specprefill_draft_scoring(
                         extracted_cache,
                         model_cache_config=model_cache_config,
                         boundary_snapshots=boundary_snapshots or None,
+                        **namespace_kwargs,
                     )
             except Exception as error:
                 log.debug(f"SpecPrefill: draft cache store failed: {error}")
