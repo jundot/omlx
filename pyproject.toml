@@ -53,7 +53,7 @@ dependencies = [
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     # The mlx-lm pin above includes the NewlineTokenizer registration fix
     # required by transformers 5.13+. mlx-vlm requires the 5.14 processor API.
-    "transformers>=5.14.0,<5.18",
+    "transformers>=5.14.0,<5.20",
     # transformers 5.x's tokenization_mistral_common module imports
     # ReasoningEffort from mistral_common (added in 1.10). The audio extras
     # transitively pull mistral-common via mlx-audio[stt], which historically
