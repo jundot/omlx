@@ -92,6 +92,76 @@ def _think_end_token_ids(tokenizer) -> list[int] | None:
     return None
 
 
+# Special tokens that open a chat turn. The open-thinking scan stops at the
+# last one, so it never looks past the start of the final (assistant) turn.
+_TURN_START_MARKERS = (
+    "<|im_start|>",  # ChatML (Qwen, many fine-tunes)
+    "<|start_header_id|>",  # Llama 3
+    "<start_of_turn>",  # Gemma
+    "<｜Assistant｜>",  # DeepSeek
+    "<|assistant|>",  # GLM
+)
+# Upper bound on how far back the scan looks for the final turn's think
+# marker when the prompt has no turn marker close by.
+OPEN_THINK_MAX_LOOKBACK = 32768
+
+
+def turn_start_token_ids(tokenizer) -> frozenset[int]:
+    """Return the single-token ids of known chat turn markers in the vocab."""
+    convert = _safe_tokenizer_attr(tokenizer, "convert_tokens_to_ids")
+    if not callable(convert):
+        return frozenset()
+    unk = _safe_tokenizer_attr(tokenizer, "unk_token_id")
+    ids = set()
+    for marker in _TURN_START_MARKERS:
+        try:
+            token_id = convert(marker)
+        except Exception:
+            continue
+        if isinstance(token_id, int) and not isinstance(token_id, bool):
+            if token_id >= 0 and token_id != unk:
+                ids.add(token_id)
+    return frozenset(ids)
+
+
+def thinking_open_in_final_turn(
+    prompt_ids: Sequence[int],
+    think_start_ids: Sequence[int],
+    think_end_ids: Sequence[int] | None,
+    turn_start_ids: frozenset[int] | set[int],
+    max_lookback: int = OPEN_THINK_MAX_LOOKBACK,
+) -> bool:
+    """Return whether the prompt ends inside an unclosed thinking block.
+
+    Scans back from the end of the prompt to the last turn marker (at most
+    ``max_lookback`` tokens). Thinking is open when the last think marker in
+    that span is a start marker. This covers a template's ``<think>\\n``
+    generation prompt as well as a prompt that continues a partial reasoning
+    trace, and rejects the disabled-thinking ``<think></think>`` pattern.
+    """
+    start = [int(token) for token in think_start_ids]
+    end = [int(token) for token in think_end_ids or ()]
+    if not start or prompt_ids is None or len(prompt_ids) == 0:
+        return False
+    lowest = max(0, len(prompt_ids) - max_lookback)
+
+    def ends_at(sequence: list[int], idx: int) -> bool:
+        begin = idx - len(sequence) + 1
+        if begin < lowest:
+            return False
+        return [int(token) for token in prompt_ids[begin : idx + 1]] == sequence
+
+    for idx in range(len(prompt_ids) - 1, lowest - 1, -1):
+        token = int(prompt_ids[idx])
+        if end and token == end[-1] and ends_at(end, idx):
+            return False
+        if token == start[-1] and ends_at(start, idx):
+            return True
+        if token in turn_start_ids:
+            return False
+    return False
+
+
 def prompt_opens_thinking(
     tokenizer,
     prompt: str,
@@ -126,6 +196,16 @@ def prompt_opens_thinking(
         prompt_ids = list(prompt_token_ids)
     if not prompt_ids or not think_start_id:
         return False, think_tag
+
+    turn_start_ids = turn_start_token_ids(tokenizer)
+    if turn_start_ids:
+        opened = thinking_open_in_final_turn(
+            prompt_ids,
+            [think_start_id],
+            _think_end_token_ids(tokenizer),
+            turn_start_ids,
+        )
+        return opened, think_tag
 
     last_tokens = list(prompt_ids[-3:])
     if think_start_id not in last_tokens:
