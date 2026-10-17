@@ -6107,6 +6107,218 @@ def test_coarse_draft_head_splits_qwen4_logits_source_from_chain_hidden():
     assert mx.argmax(exact).item() in ids.tolist()[0]
 
 
+def test_coarse_draft_head_greedy_token_is_the_exact_argmax_of_its_candidates():
+    class Language(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.args = SimpleNamespace(tie_word_embeddings=False)
+            self.mtp = nn.Module()
+            self.mtp.fc = nn.Linear(256, 128, bias=False)
+            self.lm_head = nn.QuantizedLinear(256, 1 << 16, bias=False, bits=8)
+
+        def mtp_forward(self):
+            pass
+
+    Language.mtp_forward._omlx_lm_head_logits = True
+    mx.random.seed(12)
+    lang = Language()
+    lang.mtp.fc.weight = lang.mtp.fc.weight.astype(mx.bfloat16)
+    head = bg._coarse_draft_head(lang, quantize_fc=False)
+    assert type(lang.mtp.fc) is nn.Linear
+    h = mx.random.normal((1, 1, 256))
+    ids, exact = head.rescored(h)
+    token = head.greedy_token(h)
+    assert token.shape == (1,)
+    assert token.item() == ids.tolist()[0][mx.argmax(exact, axis=-1).item()]
+    full = mx.argmax(lang.lm_head(h[:, -1, :]), axis=-1).item()
+    assert full in ids.tolist()[0]
+    assert token.item() == full
+
+
+def _greedy_coarse_model(vocab=256):
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    args = dict(vars(_model("qwen").args))
+    mlx_lm_mtp.set_mtp_active(True)
+    mx.random.seed(31)
+    model = TextModel(
+        TextModelArgs.from_dict(
+            dict(args, hidden_size=128, tie_word_embeddings=False, vocab_size=vocab)
+        )
+    )
+    model.lm_head = nn.QuantizedLinear.from_linear(model.lm_head, 64, 8)
+    model.mtp.fc.weight = model.mtp.fc.weight.astype(mx.bfloat16)
+    mx.eval(model.parameters())
+    return model
+
+
+@pytest.mark.parametrize("procs", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_greedy_chain_drafts_through_the_coarse_head_only_when_enabled(
+    monkeypatch, procs, enabled
+):
+    """Greedy chains draft through the coarse head; logits processors keep the full head; fc stays as stored."""
+    monkeypatch.setattr(bg, "_COARSE_MIN_VOCAB", 0)
+    monkeypatch.setenv("OMLX_MTP_GREEDY_COARSE", "1" if enabled else "0")
+    model = _greedy_coarse_model()
+    sampler = lambda lp: mx.argmax(lp, -1)  # noqa: E731
+    sampler.temp = 0.0
+
+    def run(coarse_candidates):
+        monkeypatch.setattr(bg, "_COARSE_CANDIDATES", coarse_candidates)
+        state = bg._MtpState(uid=0, mtp_cache=model.make_mtp_cache())
+        state.depth = 3
+        row = SimpleNamespace(
+            model=model,
+            samplers=[sampler],
+            logits_processors=[[lambda toks, logits: logits]] if procs else None,
+        )
+        mx.random.seed(5)
+        hidden = mx.random.normal((1, 2, 128))
+        tokens = mx.array([7, 9], dtype=mx.uint32)
+        bg._COARSE_HEADS.clear()
+        bg._chain_next_drafts(row, state, hidden, tokens, mx.array([1, 2, 3]))
+        return state, len(bg._COARSE_HEADS)
+
+    state, built = run(256)  # the whole vocabulary: the exact argmax
+    coarse = enabled and not procs
+    assert built == int(coarse)
+    assert type(model.mtp.fc) is nn.Linear
+    if coarse:
+        assert state.draft_lps == [] and len(state.draft_accept_lps) == 0
+    else:
+        assert len(state.draft_lps) == 3
+
+
+def test_greedy_chain_without_a_coarse_head_keeps_the_full_head(monkeypatch):
+    """Heads the coarse path does not support (here: a vocabulary below its minimum) draft as before."""
+    monkeypatch.setenv("OMLX_MTP_GREEDY_COARSE", "1")
+    model = _greedy_coarse_model()
+    assert bg._head_vocab(model.lm_head) < bg._COARSE_MIN_VOCAB
+    sampler = lambda lp: mx.argmax(lp, -1)  # noqa: E731
+    sampler.temp = 0.0
+    state = bg._MtpState(uid=0, mtp_cache=model.make_mtp_cache())
+    state.depth = 3
+    row = SimpleNamespace(model=model, samplers=[sampler], logits_processors=None)
+    bg._COARSE_HEADS.clear()
+    bg._chain_next_drafts(
+        row, state, mx.random.normal((1, 2, 128)), mx.array([7, 9], dtype=mx.uint32), None
+    )
+    assert not bg._COARSE_HEADS
+    assert len(state.draft_lps) == 3
+    assert type(model.mtp.fc) is nn.Linear
+
+
+def test_greedy_then_sampled_then_greedy_share_one_coarse_copy(monkeypatch):
+    """One coarse copy per head; ``fc`` is bf16 until a sampled request quantizes it, then stays 4-bit."""
+    monkeypatch.setattr(bg, "_COARSE_MIN_VOCAB", 0)
+    monkeypatch.setenv("OMLX_MTP_GREEDY_COARSE", "1")
+    model = _greedy_coarse_model()
+    greedy = lambda lp: mx.argmax(lp, -1)  # noqa: E731
+    greedy.temp = 0.0
+    sampled = lambda lp: mx.argmax(lp, -1)  # noqa: E731
+    sampled.temp, sampled.top_p, sampled.top_k, sampled.min_p = 0.7, 0.9, 20, 0.0
+    bg._COARSE_HEADS.clear()
+
+    def chain(sampler):
+        state = bg._MtpState(uid=0, mtp_cache=model.make_mtp_cache())
+        state.depth = 2
+        state.draft_sampler = sampler
+        row = SimpleNamespace(model=model, samplers=[sampler], logits_processors=None)
+        hidden = mx.random.normal((1, 2, 128))
+        bg._chain_next_drafts(row, state, hidden, mx.array([7, 9], dtype=mx.uint32), None)
+        return state
+
+    state = chain(greedy)
+    first = next(iter(bg._COARSE_HEADS.values()))
+    assert type(model.mtp.fc) is nn.Linear and state.draft_lps == []
+    chain(sampled)
+    assert isinstance(model.mtp.fc, nn.QuantizedLinear)
+    state = chain(greedy)
+    assert list(bg._COARSE_HEADS.values()) == [first]
+    assert isinstance(model.mtp.fc, nn.QuantizedLinear)
+    assert state.draft_lps == [] and len(state.drafts) == 2
+
+
+def test_sampled_chain_still_quantizes_fc_and_uses_the_coarse_head(monkeypatch):
+    monkeypatch.setattr(bg, "_COARSE_MIN_VOCAB", 0)
+    model = _greedy_coarse_model()
+    sampler = lambda lp: mx.argmax(lp, -1)  # noqa: E731
+    sampler.temp, sampler.top_p, sampler.top_k, sampler.min_p = 0.7, 0.9, 20, 0.0
+    state = bg._MtpState(uid=0, mtp_cache=model.make_mtp_cache())
+    state.depth = 2
+    state.draft_sampler = sampler
+    row = SimpleNamespace(model=model, samplers=[sampler], logits_processors=None)
+    bg._COARSE_HEADS.clear()
+    bg._chain_next_drafts(
+        row, state, mx.random.normal((1, 2, 128)), mx.array([7, 9], dtype=mx.uint32), None
+    )
+    assert len(bg._COARSE_HEADS) == 1
+    assert isinstance(model.mtp.fc, nn.QuantizedLinear)
+    assert isinstance(state.draft_accept_lps, bg.SparseDraftQ)
+
+
+def _generate_with_logprobs(model, prompts, limit):
+    bg.apply()
+    cache_rollback.apply()
+    gen = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        prefill_batch_size=len(prompts),
+        max_tokens=limit,
+    )
+    tokens = {uid: [] for uid in gen.insert(prompts, max_tokens=[limit] * len(prompts))}
+    logprobs = {uid: [] for uid in tokens}
+    done = set()
+    try:
+        for _ in range(200):
+            _, responses = gen.next()
+            for r in responses:
+                tokens[r.uid].append(r.token)
+                logprobs[r.uid].append(float(r.logprobs[r.token].item()))
+                if r.finish_reason:
+                    done.add(r.uid)
+            if len(done) == len(prompts):
+                break
+    finally:
+        gen.close()
+    return tokens, logprobs
+
+
+@pytest.mark.parametrize("depth", [2, 5])
+@pytest.mark.parametrize("candidates", [256, 4])
+def test_greedy_coarse_drafts_leave_output_and_logprobs_unchanged(
+    monkeypatch, candidates, depth
+):
+    """Whatever the coarse head proposes, verification yields the MTP-off greedy stream and its log-probabilities."""
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        monkeypatch.setattr(bg, "_COARSE_MIN_VOCAB", 0)
+        monkeypatch.setattr(bg, "_COARSE_CANDIDATES", candidates)
+        monkeypatch.setenv("OMLX_MTP_GREEDY_COARSE", "1")
+        model = _greedy_coarse_model()
+        model._omlx_mtp_chain = True
+        model._omlx_mtp_depth = depth
+        prompts = [[3, 5, 7, 11], [2, 4, 6]]
+
+        def run(mtp):
+            model._omlx_mtp_decode_enabled = mtp
+            bg._COARSE_HEADS.clear()
+            out = _generate_with_logprobs(model, prompts, 24)
+            return out, len(bg._COARSE_HEADS)
+
+        (off_tokens, off_lp), _ = run(False)
+        (on_tokens, on_lp), built = run(True)
+        assert built == 1
+        assert on_tokens == off_tokens
+        for uid in off_lp:
+            assert len(on_lp[uid]) == len(off_lp[uid])
+            assert all(abs(a - b) < 5e-2 for a, b in zip(on_lp[uid], off_lp[uid]))
+    finally:
+        mx.set_default_device(previous_device)
+
+
 @pytest.mark.parametrize("raised", [True, False])
 def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
     """Speculative steps raise MLX's buffer caps where measured and always restore them."""
