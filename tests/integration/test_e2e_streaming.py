@@ -4893,6 +4893,57 @@ async def test_qwen_length_does_not_repair_missing_envelope_close():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_qwen_length_truncated_parameters_reach_client_as_text(api):
+    """A cap-truncated call is delivered as text with a length signal.
+
+    The generation stopped at ``max_tokens`` inside the envelope, so no call
+    can be recovered; the partial payload must still reach the client instead
+    of a coded error, and the truncation must stay visible through the
+    transport's own length signal (chat ``length``, Anthropic ``max_tokens``).
+    """
+    raw = "<tool_call><function=write><parameter=content>" + "x" * 512
+    events = await _recovery_stream(raw, api, finish_reason="length")
+
+    assert not _recovery_calls(events, api)
+    assert not any("error" in e or e.get("type") == "response.failed" for e in events)
+
+    if api == "chat":
+        assert (
+            "".join(
+                c.get("delta", {}).get("content", "")
+                for e in events
+                for c in e.get("choices", [])
+            )
+            == raw
+        )
+        assert [
+            c["finish_reason"]
+            for e in events
+            for c in e.get("choices", [])
+            if c.get("finish_reason")
+        ] == ["length"]
+    elif api == "anthropic":
+        assert events[-1]["type"] == "message_stop"
+        assert [
+            e["delta"]["stop_reason"]
+            for e in events
+            if e.get("type") == "message_delta"
+        ] == ["max_tokens"]
+    else:
+        assert events[-1]["type"] == "response.incomplete"
+        assert events[-1]["response"]["status"] == "incomplete"
+        assert (
+            "".join(
+                e.get("delta", "")
+                for e in events
+                if e.get("type") == "response.output_text.delta"
+            )
+            == raw
+        )
+
+
+@pytest.mark.asyncio
 async def test_qwen_closed_envelope_with_unclosed_parameter_never_emits_call():
     events = await _recovery_stream(
         "<tool_call><function=write><parameter=content>cut</function></tool_call>"

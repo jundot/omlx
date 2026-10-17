@@ -2312,6 +2312,18 @@ def parse_qwen_tool_calls(
             envelope = text[start:end]
         else:
             end = function_end
+            if end is None and finish_reason == "length":
+                # Generation stopped at the output cap while the envelope was
+                # still open, so no function element ever closed: the payload is
+                # partial text, not a call attempt.  Keep the withheld bytes as
+                # content and let ``finish_reason=length`` carry the truncation;
+                # a coded error would drop a payload the client can still
+                # salvage.  The generic parser path already behaves this way for
+                # the same shape.  A ``stop`` here stays an error, because there
+                # the model chose to end an unfinished call.
+                prose.append(text[start:])
+                pos = len(text)
+                break
             if end is None or (
                 paired
                 and (
