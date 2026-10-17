@@ -183,7 +183,7 @@ def configure_qwen4_exp_runtime(
     logger.info("Qwen4-Exp PLE mode for %s: %s", model_path, resolved)
     if mtp_enabled and not mtp_runtime.enabled:
         logger.warning(
-            "Qwen4-Exp Lightning MTP was requested for %s, but no embedded "
+            "Qwen4-Exp Lightning MTP was requested for %s, but no compatible "
             "MTP tensors were found",
             model_path,
         )
@@ -191,6 +191,6 @@ def configure_qwen4_exp_runtime(
         logger.info(
             "Qwen4-Exp Lightning MTP enabled for %s (checkpoint layout: %s)",
             model_path,
-            mtp_runtime.checkpoint_prefix,
+            mtp_runtime.sidecar_path or mtp_runtime.checkpoint_prefix,
         )
     return resolved
