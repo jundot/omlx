@@ -71,6 +71,21 @@ def test_usage_template_renders_with_localized_labels(client):
     )
 
 
+def test_appearance_settings_offer_exact_and_compact_counts(client):
+    client, _ = client
+    html = client.get("/admin/dashboard").text
+    assert 'id="settings-number-scale"' in html
+    assert html.count('x-model="statsNumberScale"') == 1
+    theme_at = html.index('>Theme</label>')
+    scale_at = html.index('for="settings-number-scale"')
+    readability_at = html.index('>Enhanced Readability</label>')
+    assert theme_at < scale_at < readability_at
+    assert '@change="setStatsNumberScale($event.target.value)"' in html
+    assert '<option value="exact">Exact digits</option>' in html
+    assert '<option value="compact">Higher units</option>' in html
+    assert "js/count_format.js" in html
+
+
 def test_dashboard_renders_usage_history_switch_and_disabled_notice(client):
     client, _ = client
     html = client.get("/admin/dashboard").text
@@ -92,7 +107,7 @@ def test_usage_history_i18n_keys_present_in_every_locale():
         assert not missing, f"{locale_path.name}: missing {sorted(missing)}"
 
 
-def test_dashboard_counts_use_wan_and_yi_only_in_chinese():
+def test_dashboard_counts_use_east_asian_units():
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is required for dashboard behavior tests")
@@ -100,22 +115,40 @@ def test_dashboard_counts_use_wan_and_yi_only_in_chinese():
 const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
+const countSource = fs.readFileSync('omlx_web/static/js/count_format.js', 'utf8');
 const source = fs.readFileSync('omlx_web/static/js/dashboard.js', 'utf8');
 const render = (lang, fn, value) => {
     const context = {localStorage: {getItem: () => null}, window: {t: key => key},
                      document: {documentElement: {lang}}};
-    return vm.runInNewContext(source + '\n dashboard;', context)()[fn](value);
+    return vm.runInNewContext(countSource + '\n' + source + '\n dashboard;', context)()[fn](value);
+};
+const exact = (lang, value) => {
+    const context = {window: {}, document: {documentElement: {lang}}};
+    vm.runInNewContext(countSource, context);
+    return context.window.omlxCount.exact(value, lang);
 };
 assert.equal(render('zh', 'formatNumber', 9999), '9,999');
+assert.equal(render('zh', 'formatNumber', 10000), '1.0万');
 assert.equal(render('zh', 'formatNumber', 19290), '1.9万');
 assert.equal(render('zh', 'formatNumber', 12345678), '1,234.6万');
-assert.equal(render('zh', 'formatNumber', 99999999), '1亿');
+assert.equal(render('zh', 'formatNumber', 99999999), '1.0亿');
+assert.equal(render('zh', 'formatNumber', 160000000), '1.6亿');
 assert.equal(render('zh', 'formatTokenCount', 1.2e12), '1.2万亿');
 assert.equal(render('zh-TW', 'formatDownloads', 123456789), '1.2億');
-// Every other language keeps its current output.
+assert.equal(render('ja', 'formatNumber', 19290), '1.9万');
+assert.equal(render('ja', 'formatNumber', 160000000), '1.6億');
+assert.equal(render('ja', 'formatNumber', 1.2e12), '1.2兆');
+assert.equal(render('ko', 'formatTokenCount', 19290), '1.9만');
+assert.equal(render('ko', 'formatNumber', 160000000), '1.6억');
+assert.equal(render('ko', 'formatNumber', 1.2e12), '1.2조');
+assert.equal(render('zh', 'formatNumber', 97116000), '9,711.6万');
+assert.equal(render('ja', 'formatNumber', 33320000), '3,332.0万');
+assert.equal(render('ko', 'formatNumber', 33320000), '3,332.0만');
+// Other languages keep their own separators and compact units.
+assert.equal(exact('zh', 1234567), '1,234,567');
+assert.equal(exact('fr', 1234567), '1\u202f234\u202f567');
+assert.equal(exact('es', 1234567), '1.234.567');
 assert.equal(render('en', 'formatNumber', 12345678), '12.3M');
-assert.equal(render('ko', 'formatTokenCount', 19290), '19.3k');
-assert.equal(render('ja', 'formatDownloads', 19290), '19.3K');
 """
     result = subprocess.run(
         [node, "-e", script], cwd=ROOT, capture_output=True, text=True

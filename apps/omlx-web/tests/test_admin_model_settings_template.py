@@ -826,6 +826,7 @@ const context = {
 vm.createContext(context);
 vm.runInContext(fs.readFileSync('omlx_web/static/js/dashboard_layout.js', 'utf8'), context);
 context.DashboardLayout = context.window.DashboardLayout;
+vm.runInContext(fs.readFileSync('omlx_web/static/js/count_format.js', 'utf8'), context);
 vm.runInContext(fs.readFileSync('omlx_web/static/js/dashboard.js', 'utf8'), context);
 const app = context.dashboard();
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -874,14 +875,25 @@ assert.equal(app.servingStatGridClass, '');
 app.toggleDashTile('generated_tokens');
 app.toggleDashTile('cache_efficiency');
 app.stats = { ...app.stats, total_completion_tokens: 1234, cache_efficiency: 50 };
-app.alltimeStats = { ...app.alltimeStats, total_completion_tokens: 98765 };
+app.alltimeStats = { ...app.alltimeStats, total_completion_tokens: 104166321 };
 const tile = id => app.servingStatTiles.find(t => t.id === id);
 assert.equal(tile('generated_tokens').value, app.formatNumber(1234));
 assert.equal(tile('generated_tokens').label, 'status.stat.generated_tokens');
 assert.equal(tile('cache_efficiency').value, '50.0');
 assert.equal(tile('cache_efficiency').unit, '%');
 app.statsScope = 'alltime';
-assert.equal(tile('generated_tokens').value, app.formatNumber(98765));
+assert.equal(tile('generated_tokens').value, app.formatNumber(104166321));
+
+// Exact digits skip every compact unit.
+app.statsNumberScale = 'exact';
+assert.equal(tile('generated_tokens').value, '104,166,321');
+app.statsScope = 'session';
+assert.equal(tile('generated_tokens').value, '1,234');
+assert.equal(tile('cache_efficiency').value, '50.0');
+
+// The picker publishes the choice so Usage History follows it.
+app.setStatsNumberScale('exact');
+assert.equal(context.window.omlxCount.scale(), 'exact');
 """
     result = subprocess.run(
         [node, "-e", script],

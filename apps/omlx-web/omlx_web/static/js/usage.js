@@ -12,8 +12,12 @@ function usageLocale() {
 function usageHistory() {
     return {
         range: 'today', model: '', modelIds: [], data: null, error: '', disabled: false, loading: false, peak: 1, displayedQuery: '',
-        timer: null, request: null,
+        timer: null, request: null, numberScale: window.omlxCount?.scale?.() || 'compact', _scaleHandler: null,
         init() {
+            this._scaleHandler = event => {
+                this.numberScale = event.detail === 'exact' ? 'exact' : 'compact';
+            };
+            window.addEventListener?.('omlx-number-scale', this._scaleHandler);
             this.$watch('mainTab', tab => {
                 if (tab === 'status') this.load();
             });
@@ -22,7 +26,11 @@ function usageHistory() {
                 if (this.mainTab === 'status' && !document.hidden) this.load();
             }, 15000);
         },
-        destroy() { clearInterval(this.timer); this.request?.abort(); },
+        destroy() {
+            clearInterval(this.timer);
+            this.request?.abort();
+            if (this._scaleHandler) window.removeEventListener?.('omlx-number-scale', this._scaleHandler);
+        },
         async load() {
             this.request?.abort();
             const request = new AbortController();
@@ -74,7 +82,15 @@ function usageHistory() {
         shade(tokens) {
             return tokens ? `rgb(var(--palette-green-600) / ${0.2 + 0.8 * Math.sqrt(tokens / this.peak)})` : 'rgb(var(--palette-mid-gray) / 0.12)';
         },
-        number(value) { return new Intl.NumberFormat(usageLocale(), {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); },
+        number(value) {
+            const locale = usageLocale();
+            if (this.numberScale === 'exact') {
+                return window.omlxCount.exact(value, locale);
+            }
+            const compact = window.omlxCount?.eastAsian?.(value, locale);
+            if (compact != null) return compact;
+            return new Intl.NumberFormat(locale, {notation: 'compact', maximumFractionDigits: 1}).format(value || 0);
+        },
         speed(value) { return value == null ? '—' : value.toFixed(1); },
     };
 }
