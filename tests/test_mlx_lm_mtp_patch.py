@@ -1006,6 +1006,67 @@ class TestBatchGeneratorDispatch:
         finally:
             set_mtp_active(prior_active)
 
+    def test_calibration_standard_step_sets_multirow_marker(self, monkeypatch):
+        """Policy-calibration standard steps must set the multirow decode
+        marker exactly like ordinary standard steps: without it, a batch that
+        shrinks to one row skips the compact-cache check before a fresh
+        singleton MTP activation (#2150)."""
+        from mlx_lm.generate import GenerationBatch
+
+        class _Matcher:
+            def advance(self, token):
+                return False
+
+        stepped = []
+
+        class _CalibBatch:
+            # Minimal surface the real (pre-patch) GenerationBatch.next
+            # touches when no row finishes.
+            def __init__(self):
+                self.model = SimpleNamespace(
+                    mtp=object(),
+                    mtp_forward=lambda *args, **kwargs: None,
+                    _omlx_mtp_decode_enabled=True,
+                )
+                self.uids = [1, 2]
+                self.logits_processors = []
+                self._omlx_mtp_activation_safe = True
+                self._num_tokens = [0, 0]
+                self.max_tokens = [10**9, 10**9]
+                self._matchers = [_Matcher(), _Matcher()]
+                self.Response = lambda **kwargs: kwargs
+
+            def _step(self):
+                stepped.append(True)
+                return [7, 8], [None, None]
+
+        policy = SimpleNamespace(
+            uids=(1, 2),
+            needs_standard=lambda: True,
+            cycle_time_ms=lambda *args: None,
+            observe_standard=lambda elapsed: None,
+        )
+
+        monkeypatch.setattr(bg, "_is_mtp_batch_eligible", lambda _: True)
+        monkeypatch.setattr(bg, "_batch_policy_for_next", lambda _: policy)
+        monkeypatch.setattr(
+            bg, "_batch_park_memory", lambda _: SimpleNamespace(tick=lambda: None)
+        )
+        monkeypatch.setattr(bg, "_reconcile_mtp_batch_to_standard", lambda _: True)
+        monkeypatch.setattr(bg, "_drop_mtp_batch_state", lambda *args, **kwargs: None)
+        monkeypatch.setattr(bg, "_mtp_common_eligible", lambda _: True)
+        monkeypatch.setattr(bg, "_ineligibility_reason", lambda _: None)
+
+        batch = _CalibBatch()
+        responses = GenerationBatch.next(batch)
+
+        assert stepped == [True]
+        assert len(responses) == 2
+        assert batch._omlx_mtp_saw_standard_multirow_decode is True
+        # The calibration step also announces MTP inactivity like the
+        # fallthrough standard path.
+        assert batch._omlx_mtp_inactive_logged is True
+
     def test_batch_generator_activation_safe_helper(self):
         from collections import deque
 
