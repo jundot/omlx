@@ -68,6 +68,9 @@ struct OQStartRequest: Encodable, Sendable {
     let textOnly: Bool
     let dtype: String
     let preserveMtp: Bool
+    // Qwen3.8-Flash-Next only: write the PLE N-gram table at source
+    // precision instead of 4-bit. Every other source passes false.
+    let preserveNgramTable: Bool
     let enhanced: Bool
     let imatrixCachePath: String
     let imatrixReuseCache: Bool

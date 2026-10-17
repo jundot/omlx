@@ -15321,6 +15321,54 @@
         }
       }
     },
+    "quant.advanced.preserve_ngram_table.label" : {
+      "comment" : "Toggle row label: keep the Qwen3.8-Flash-Next PLE N-gram table at source precision",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Preserve N-gram table"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сохранить таблицу N-gram"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保留 N-gram 表"
+          }
+        }
+      }
+    },
+    "quant.advanced.preserve_ngram_table.sub" : {
+      "comment" : "Toggle row sublabel: what preserving the PLE N-gram table at source precision costs (size) and what to have ready (SSD offload or free memory)",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Write the Qwen3.8-Flash-Next PLE N-gram table at source precision instead of 4-bit. The table is about 3.2x larger; keep PLE SSD offload enabled or have the extra memory free. Output name gets a -plebf16 suffix."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Записывает таблицу N-gram PLE в Qwen3.8-Flash-Next с исходной точностью вместо 4 бит. Таблица примерно в 3,2 раза больше; оставьте выгрузку N-gram на SSD включенной или держите эту память свободной. К имени результата добавляется суффикс -plebf16."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "以源精度而非 4-bit 写出 Qwen3.8-Flash-Next 的 PLE N-gram 表。该表约大 3.2 倍；请保持开启 SSD N-gram 卸载，或确保有多余内存可用。输出名称追加 -plebf16 后缀。"
+          }
+        }
+      }
+    },
     "quant.advanced.text_only.label" : {
       "comment" : "Toggle row label: drop vision encoder weights when quantizing a VLM",
       "extractionState" : "manual",

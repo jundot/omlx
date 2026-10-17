@@ -64,6 +64,10 @@ The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix`
 - **Attention and other sensitive projections:** extra bits where the measurement says so.
 - **Routed experts:** stay at the base bits, because they are most of the model and the most expensive to raise. oQ3.5 gives their down projections one extra bit, and oQ2.5 and oQ2.7 raise whole expert layers to 3-bit.
 - **MTP heads** (with **Preserve MTP weights**): kept, with the small connecting layers at full precision and the rest at 4-bit or more.
+- **N-gram PLE table (Qwen3.8-Flash-Next):** 4-bit with groups of 32. It is counted
+  in the file size but kept out of the level's bit budget and its bpw figure, so it
+  never takes bits away from the rest of the model. Turn it off with **Preserve
+  N-gram table**; see *Raw N-gram tables* below.
 
 Every model ends up with its own bit layout, because the plan follows that model's measurements.
 
@@ -84,6 +88,7 @@ Sample selection uses a fixed seed, so repeated runs on the same model see the s
 | Enhanced quantization (oQe) | Uses the imatrix when rounding. Recommended |
 | Text Only | Leaves out the vision encoder of a vision-language model and writes a text-only model |
 | Preserve MTP weights | Keeps the MTP heads so Lightning MTP works after quantization. Adds `-mtp` to the name |
+| Preserve N-gram table | Write the Qwen3.8-Flash-Next PLE N-gram table at source precision instead of 4-bit. Adds `-plebf16` to the name. Qwen3.8-Flash-Next only |
 | Combine other model's MTP head | Grafts an MTP head from another checkpoint of the same architecture, or a Gemma 4 assistant model, into the output |
 | Non-quant weight dtype | bfloat16 (default) or float16 for unquantized weights and quantization scales. float16 adds `-fp16` to the name |
 | Sensitivity Model | Measures sensitivity on an already quantized copy of the model to use about 4x less memory |
@@ -112,6 +117,33 @@ Some models have their own rules:
 
 - **DeepSeek V4.1:** oQ3, oQ3e, oQ4 and oQ4e with bfloat16 output, from the original checkpoint. oQ4 keeps the original FP4/FP8 projection precision and quantizes the Engram tables to 4-bit.
 - **DeepSeek V4:** float16 output is not supported.
+- **Qwen3.8-Flash-Next:** the N-gram PLE table (about 28% of the parameters) is
+  quantized to 4-bit with groups of 32 and is priced outside the resident bit budget,
+  so it neither raises nor lowers the rest of the model. Turn it off with
+  **Preserve N-gram table**.
+
+## Raw N-gram tables
+
+Qwen3.8-Flash-Next gathers 16 rows of its N-gram table per token, so the table is
+looked up by id at serve time rather than read as a matrix. Whether to quantize it is
+a memory question, not a speed question: a row is 100 bytes at 4-bit (group 32) versus
+320 bytes unquantized, so a 4-bit table is about 3.2x smaller — 30 GiB instead of
+95 GiB — and each cached 16 KiB page holds 3.2x more rows. That is what lets the table
+be offloaded to SSD on a Mac that cannot hold it in memory at all, and what keeps the
+page cache free for expert weights and the KV cache.
+
+Turn on **Preserve N-gram table** to skip that rounding and keep source precision. The
+checkpoint grows by roughly 65 GiB, so the model wants PLE SSD offload enabled in
+Model Settings or enough free memory for the whole table. Offload still works — the
+reader takes dense rows exactly like packed ones — but warm rows are served from the
+operating system's page cache, and a cached 16 KiB page holds 51 rows instead of 163,
+so the same memory keeps a smaller share of the table hot. Quality is worth measuring
+yourself: the table reaches the output through one PLE layer, so its sensitivity is far
+below the core's, but it is not zero.
+
+The level's bpw figure and the resident size are identical either way — the estimator
+reports both the whole file (`output_size_bytes`) and the split
+(`ngram_table_size_bytes` / `resident_size_bytes`).
 
 ## Benchmarks
 

@@ -1519,6 +1519,7 @@ def resolve_output_name(
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
     enhanced: bool = False,
+    preserve_ngram_table: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
@@ -1527,15 +1528,22 @@ def resolve_output_name(
     appends `-mtp` so the resulting name reflects that mtp.* tensors and
     config fields were preserved through quantization.
 
+    ``preserve_ngram_table`` appends ``-plebf16`` (``-plefp16`` for float16
+    output): the qwen4_exp PLE N-gram table was written at source precision
+    instead of the level's 4-bit offload layout, so that table is ~3.2x
+    larger and wants PLE SSD offload when the model is served.
+
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
         "Qwen3.5-122B-A10B" + 4 + enhanced -> "Qwen3.5-122B-A10B-oQ4e"
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
+        "Qwen3.8-Flash-Next" + 4 + bfloat16 + preserve_ngram_table ->
+            "Qwen3.8-Flash-Next-oQ4-plebf16"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp|ple(?:bf|fp)16)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -1550,6 +1558,8 @@ def resolve_output_name(
         suffix += "-fp16"
     if preserve_mtp:
         suffix += "-mtp"
+    if preserve_ngram_table:
+        suffix += "-plefp16" if dtype == "float16" else "-plebf16"
     return f"{base}{suffix}"
 
 
@@ -3510,6 +3520,7 @@ def estimate_bpw_and_size(
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
+    preserve_ngram_table: bool = False,
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -3521,11 +3532,19 @@ def estimate_bpw_and_size(
         preserve_mtp: When True, mtp.* tensors are kept (counted toward
             output size) instead of being skipped. Mirrors the matching
             argument in ``quantize_oq_streaming``.
+        preserve_ngram_table: When True, the qwen4_exp PLE N-gram table is
+            counted at source precision (fp16 passthrough) rather than the
+            level's 4-bit offload layout. Mirrors ``quantize_oq_streaming``.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
 
     Returns:
-        Dict with effective_bpw, output_size_bytes, output_size_formatted.
+        Dict with effective_bpw, output_size_bytes, output_size_formatted,
+        memory_streaming_bytes/_formatted, and the qwen4_exp split
+        ``ngram_table_size_bytes`` / ``resident_size_bytes`` (both 0 for other
+        architectures). The N-gram table is excluded from effective_bpw in
+        both modes — it is gathered by row id and priced outside the resident
+        bit budget — but is always charged to output_size_bytes.
     """
     source = Path(model_path)
     config_path = source / "config.json"
@@ -3657,11 +3676,29 @@ def estimate_bpw_and_size(
     # branch answers).
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
+    # The qwen4_exp N-gram PLE table is gathered by row id and served off SSD,
+    # so it lives outside the level's bit budget — the same exclusion
+    # _budgeted_shapes applies to the plan. Keep it out of effective_bpw either
+    # way (that metric describes the resident weights) while still charging its
+    # bytes to the output size. ``preserve_ngram_table`` only changes the price:
+    # source precision instead of the 4-bit offload layout. Non-qwen4
+    # checkpoints never match, which is the documented "no effect on other
+    # model types".
+    ngram_table = {
+        _normalize_quant_path(name)
+        for name in logical
+        if _is_qwen4_exp_ngram_embedding_tensor(name, config)
+    }
+    preserved_ngram = ngram_table if preserve_ngram_table else set()
+    ngram_table_bytes = 0
+
     # Pre-quantized tensors that pass through in source precision (mirrors
     # the decision in quantize_oq_streaming, evaluated pre-boost).
     fixed_overrides = {}
     _pre_boost_config = {**config, "_oq_boost_map": {}}
     for _path in named_shapes:
+        if _path in preserved_ngram:
+            continue
         _info = _source_quant_info(f"{_path}.weight")
         if _info is None:
             continue
@@ -3712,6 +3749,22 @@ def estimate_bpw_and_size(
             n_elements *= d
 
         if _should_skip_tensor(name, preserve_mtp=preserve_mtp):
+            continue
+
+        norm_name = _normalize_quant_path(name)
+        if norm_name in ngram_table:
+            tensor_bytes = (
+                n_elements * 2
+                if norm_name in preserved_ngram
+                else _tensor_quantized_bytes(
+                    tuple(shape),
+                    _offload_table_bits(oq_level),
+                    _QWEN4_EXP_NGRAM_GROUP_SIZE,
+                    "affine",
+                )
+            )
+            ngram_table_bytes += tensor_bytes
+            total_output_bytes += tensor_bytes
             continue
 
         if not _should_quantize_tensor(name, shape):
@@ -3775,7 +3828,9 @@ def estimate_bpw_and_size(
         )
         if not _down_visible:
             effective_bpw += 0.3 * _down_boost
-            total_output_bytes = int(effective_bpw * total_params / 8)
+            total_output_bytes = int(effective_bpw * total_params / 8) + (
+                ngram_table_bytes
+            )
 
     source_total = sum(sf.stat().st_size for sf in _source_weight_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
@@ -3786,6 +3841,8 @@ def estimate_bpw_and_size(
         "output_size_formatted": _format_size(total_output_bytes),
         "memory_streaming_bytes": streaming_peak,
         "memory_streaming_formatted": _format_size(streaming_peak),
+        "ngram_table_size_bytes": ngram_table_bytes,
+        "resident_size_bytes": total_output_bytes - ngram_table_bytes,
     }
 
 

@@ -415,7 +415,8 @@ final class OMLXClient: ObservableObject {
     func estimateOQ(
         modelPath: String,
         oqLevel: Double,
-        preserveMtp: Bool = false
+        preserveMtp: Bool = false,
+        preserveNgramTable: Bool = false
     ) async throws -> OQEstimateResponse {
         // `oq_level` accepts ints and fractional levels. Send it without a
         // trailing `.0` so the server parses an int when the user picked one.
@@ -426,6 +427,7 @@ final class OMLXClient: ObservableObject {
             URLQueryItem(name: "model_path", value: modelPath),
             URLQueryItem(name: "oq_level", value: levelStr),
             URLQueryItem(name: "preserve_mtp", value: preserveMtp ? "true" : "false"),
+            URLQueryItem(name: "preserve_ngram_table", value: preserveNgramTable ? "true" : "false"),
         ])
     }
 

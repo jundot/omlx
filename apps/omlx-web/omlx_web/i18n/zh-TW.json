@@ -411,6 +411,8 @@
   "models.oq.preserve_mtp": "保留 MTP 權重",
   "models.oq.preserve_mtp_help": "在輸出模型中保留 mtp.* 張量和設定欄位，使 Lightning MTP 切換在量化後仍可運作。輸出名稱會加上 -mtp 後綴。",
   "models.oq.preserve_mtp_unavailable": "來源模型沒有 MTP 頭。",
+  "models.oq.preserve_ngram_table": "保留 N-gram 表",
+  "models.oq.preserve_ngram_table_help": "以來源精度而非 4-bit 寫出 Qwen3.8-Flash-Next 的 PLE N-gram 表。該表大約大 3.2 倍；請保持啟用 SSD N-gram 卸載，或確保有多餘記憶體可用。輸出名稱會加上 -plebf16 後綴。",
   "models.oq.combine_assistant": "合併 assistant 模型為 MTP 頭",
   "models.oq.combine_assistant_help": "將獨立的 gemma4_assistant 檢查點合併至輸出中作為 Lightning MTP 頭。輸出名稱會加上 -mtp 後綴，且 Lightning MTP 切換可作用於結果。",
   "models.oq.combine_assistant_none": "無",

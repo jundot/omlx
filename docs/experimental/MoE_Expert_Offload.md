@@ -340,6 +340,13 @@ enabled alongside expert offload. The PLE automatic fallback decision and
 loaded-model memory accounting include expert savings without counting them
 twice.
 
+A checkpoint quantized with oQ's **Preserve N-gram table** (`-plebf16`) keeps the PLE
+table at source precision: about 95 GiB instead of about 30 GiB. Expert residency is
+unchanged, because the table is not part of the expert pool, but the same page cache
+now covers roughly 3.2x fewer N-gram rows, so expect more PLE reads per step. The
+residency estimate and the automatic fallback both measure the table from the
+checkpoint headers, so they report the larger figure with no extra configuration.
+
 Lightning MTP (`mtp_enabled`) can be combined with expert offload when the
 checkpoint carries the native MTP head: the head's experts (`mtp.*`) stay
 resident while backbone experts stream, the same pairing as DeepSeek V4.1

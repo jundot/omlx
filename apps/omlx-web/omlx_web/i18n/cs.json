@@ -411,6 +411,8 @@
   "models.oq.preserve_mtp": "Zachovat váhy MTP",
   "models.oq.preserve_mtp_help": "Zachová tensory mtp.* a konfigurační pole ve výsledném modelu, aby po kvantizaci fungoval přepínač Lightning MTP. Název výstupu dostane příponu -mtp.",
   "models.oq.preserve_mtp_unavailable": "Zdrojový model nemá hlavy MTP.",
+  "models.oq.preserve_ngram_table": "Zachovat tabulku N-gramů",
+  "models.oq.preserve_ngram_table_help": "Zapíše tabulku PLE N-gramů modelu Qwen3.8-Flash-Next v původní přesnosti místo 4bitové. Tabulka je přibližně 3,2× větší; nechte zapnutý offload N-gramů na SSD, nebo mějte tuto paměť navíc volnou. Název výstupu dostane příponu -plebf16.",
   "models.oq.combine_assistant": "Sloučit pomocný model jako hlavu MTP",
   "models.oq.combine_assistant_help": "Sloučí samostatný checkpoint gemma4_assistant do výstupu jako hlavu Lightning MTP. Výsledný model dostane příponu -mtp a půjde zapnout Lightning MTP.",
   "models.oq.combine_assistant_none": "Žádný",

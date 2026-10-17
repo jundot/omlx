@@ -80,6 +80,7 @@ class QuantTask:
     text_only: bool = False
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
+    preserve_ngram_table: bool = False
     auto_proxy_sensitivity: bool = True
     enhanced: bool = False
     imatrix_cache_path: str = ""
@@ -110,6 +111,7 @@ class QuantTask:
             "source_size": self.source_size,
             "output_size": self.output_size,
             "dtype": self.dtype,
+            "preserve_ngram_table": self.preserve_ngram_table,
             "enhanced": self.enhanced,
             "imatrix_cache_path": self.imatrix_cache_path,
         }
@@ -295,6 +297,7 @@ class OQManager:
         text_only: bool = False,
         dtype: str = "bfloat16",
         preserve_mtp: bool = False,
+        preserve_ngram_table: bool = False,
         auto_proxy_sensitivity: bool = True,
         enhanced: bool = False,
         imatrix_cache_path: str = "",
@@ -311,6 +314,9 @@ class OQManager:
             oq_level: oQ level from OQ_LEVELS.
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
+            preserve_ngram_table: Write the qwen4_exp PLE N-gram table at
+                source precision instead of the level's 4-bit offload layout.
+                Silently disabled for other model types.
             mtp_assistant_model_path: Optional checkpoint whose MTP head is
                 merged into the output. A Gemma 4 assistant donor uses the
                 assistant merge; any other donor grafts its native
@@ -327,6 +333,7 @@ class OQManager:
             GEMMA4_ASSISTANT_TYPES,
             OQ_DTYPES,
             OQ_LEVELS,
+            _is_qwen4_exp_config,
             _validate_oq_dtype_for_model,
             _validate_v41_oq_settings,
             resolve_output_name,
@@ -366,6 +373,15 @@ class OQManager:
             )
             preserve_mtp = False
 
+        if preserve_ngram_table and not _is_qwen4_exp_config(config):
+            logger.warning(
+                "Preserve N-gram table requested for %s, but the raw N-gram "
+                "table is a qwen4_exp feature; disabling it for model_type %r",
+                model_name,
+                config.get("model_type", ""),
+            )
+            preserve_ngram_table = False
+
         if preserve_mtp and mtp_assistant_model_path:
             raise ValueError(
                 "Choose either 'Preserve MTP weights' or 'Combine MTP head', "
@@ -397,6 +413,7 @@ class OQManager:
             dtype,
             preserve_mtp=preserve_mtp,
             enhanced=enhanced,
+            preserve_ngram_table=preserve_ngram_table,
         )
         if mtp_assistant_model_path and not output_name.endswith("-mtp"):
             output_name += "-mtp"
@@ -456,6 +473,7 @@ class OQManager:
             text_only=text_only,
             dtype=dtype,
             preserve_mtp=preserve_mtp,
+            preserve_ngram_table=preserve_ngram_table,
             auto_proxy_sensitivity=auto_proxy_sensitivity,
             enhanced=enhanced,
             imatrix_cache_path=imatrix_cache_path,
@@ -643,6 +661,7 @@ class OQManager:
                     imatrix_strict=task.imatrix_strict,
                     imatrix_num_samples=task.imatrix_num_samples,
                     imatrix_seq_length=task.imatrix_seq_length,
+                    preserve_ngram_table=task.preserve_ngram_table,
                 )
 
                 if task_id in self._cancelled:

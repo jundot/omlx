@@ -864,3 +864,97 @@ async def test_v41_rejects_unsupported_settings_before_queueing(
         await manager.start_quantization(str(source), **settings)
     assert not manager._active_tasks
     assert list(tmp_path.iterdir()) == [source]
+
+
+class TestOQManagerPreserveNgramTable:
+    """Raw qwen4_exp N-gram table option through start/run."""
+
+    def _write_qwen4(self, root, name="Qwen3.8-Flash-Next"):
+        model = root / name
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen4_exp",
+                    "text_config": {
+                        "model_type": "qwen4_exp_text",
+                        "hidden_size": 2560,
+                        "num_hidden_layers": 2,
+                        "num_experts": 512,
+                        "ple_layer_ids": [2],
+                        "split_ngram_parts": 2,
+                    },
+                }
+            )
+        )
+        (model / "model.safetensors").write_bytes(b"\x00" * 4096)
+        return model
+
+    @pytest.mark.asyncio
+    async def test_start_keeps_the_flag_and_tags_the_output_name(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "models"
+        root.mkdir()
+        source = self._write_qwen4(root)
+        manager = OQManager(model_dirs=[str(root)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+
+        task = await manager.start_quantization(
+            str(source), 4, preserve_ngram_table=True
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.preserve_ngram_table is True
+        assert task.output_name == "Qwen3.8-Flash-Next-oQ4-plebf16"
+        assert task.to_dict()["preserve_ngram_table"] is True
+
+    @pytest.mark.asyncio
+    async def test_start_disables_the_flag_for_other_architectures(
+        self, fp_model_dir, monkeypatch, caplog
+    ):
+        manager = OQManager(model_dirs=[str(fp_model_dir)])
+
+        async def _noop_run(task_id):
+            return None
+
+        monkeypatch.setattr(manager, "_run_quantization", _noop_run)
+
+        with caplog.at_level("WARNING", logger="omlx.admin.oq_manager"):
+            task = await manager.start_quantization(
+                str(fp_model_dir / "Llama-3B"), 4, preserve_ngram_table=True
+            )
+            await manager._active_tasks[task.task_id]
+
+        assert task.preserve_ngram_table is False
+        assert task.output_name == "Llama-3B-oQ4"
+        assert "qwen4_exp feature" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_run_forwards_the_flag_to_the_streaming_quantizer(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "models"
+        root.mkdir()
+        source = self._write_qwen4(root)
+        manager = OQManager(model_dirs=[str(root)])
+
+        calls = []
+
+        def _fake_quantize(model_path, output_path, *args, **kwargs):
+            Path(output_path).mkdir(parents=True)
+            calls.append(kwargs)
+
+        monkeypatch.setattr("omlx.oq.quantize_oq_streaming", _fake_quantize)
+
+        task = await manager.start_quantization(
+            str(source), 4, preserve_ngram_table=True
+        )
+        await manager._active_tasks[task.task_id]
+
+        assert task.status is QuantStatus.COMPLETED
+        assert calls and calls[0]["preserve_ngram_table"] is True
