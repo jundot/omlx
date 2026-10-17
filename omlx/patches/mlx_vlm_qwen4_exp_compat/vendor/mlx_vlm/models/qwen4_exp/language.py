@@ -32,6 +32,8 @@ from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_pl
 from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
+from omlx.patches.vlm_batch_kv_capacity import install_capacity_methods
+
 from .cache import BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.cache_state import start_speculative_cache
@@ -57,6 +59,10 @@ from .qsa_fast import (
 from . import attn_fused, hc_fused
 
 logger = logging.getLogger(__name__)
+
+# This package carries its own BatchKVCache class, which the stock-class
+# capacity patch (#4312) does not reach.
+install_capacity_methods(BatchKVCache)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
@@ -226,9 +232,15 @@ class _QSAIndexerCache:
         self._invalidate_pooled_indexer()
 
     def reserve_index_capacity(self, tokens: int) -> None:
-        """Reserve a stepped prefill horizon; later growth uses plain steps."""
+        """Reserve a stepped prefill horizon; later growth uses plain steps.
+
+        The horizon also sizes a fixed-step KV buffer (``_reserved_tokens``).
+        """
 
         self._index_reserved_tokens = max(0, int(tokens))
+
+    def _reserved_tokens(self) -> int:
+        return getattr(self, "_index_reserved_tokens", 0)
 
     @property
     def index_keys(self):
@@ -495,7 +507,6 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     def state(self, value):
         self.keys, self.values, index_keys, index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
-        self._geometric_capacity_managed = False
         self._restore_indexer_state(index_keys, index_position_ids)
 
     def trim(self, n):
@@ -514,7 +525,6 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
                 self.values[idx : idx + 1, :, : self.offset, :]
             )
             cache.offset = self.offset
-            cache._geometric_capacity_managed = False
         if self.index_keys is not None:
             index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
             if self.index_position_ids.ndim == 3:
@@ -1245,7 +1255,6 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
     def state(self, value):
         self.keys, self.values, index_keys, index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys[0].shape[2]
-        self._geometric_capacity_managed = False
         self._restore_indexer_state(index_keys, index_position_ids)
 
     def trim(self, n):
@@ -1266,7 +1275,6 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
                 for x in self.values
             )
             cache.offset = self.offset
-            cache._geometric_capacity_managed = False
         if self.index_keys is not None:
             index_keys = mx.contiguous(self.index_keys[idx : idx + 1])
             if self.index_position_ids.ndim == 3:
