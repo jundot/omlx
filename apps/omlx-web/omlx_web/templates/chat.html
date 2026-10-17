@@ -7026,11 +7026,20 @@
                 }
             } else {
                 console.error('Streaming error:', error);
+                // The stream can die with tokens already on screen — a backgrounded
+                // WebKit tab kills the fetch ("TypeError: Load failed"). Keep that
+                // text, as the Stop path does, instead of replacing it with the
+                // error line alone. Appending the error keeps the failure visible.
                 const assistantId = stream.targetMessageId || this.newMessageId();
-                const errorMsg = {
+                const partialContent = (stream._toolRoundContent || '') + (stream.streamingContent || '');
+                const assistantMsg = {
                     id: assistantId,
                     role: 'assistant',
-                    content: `Error: ${error.message}`,
+                    content: partialContent
+                        ? `${partialContent}\n\nError: ${error.message}`
+                        : `Error: ${error.message}`,
+                    reasoning_content: this.hasVisibleThinking(stream.streamingThinking)
+                        ? stream.streamingThinking : null,
                     model: requestModel,
                     meta: this.captureGenerationContext(
                         requestModel,
@@ -7039,9 +7048,11 @@
                         context._generationOverride
                     ),
                     _perfVisible: false,
+                    _thinkingOpen: false,
                 };
-                this.attachProfileToAssistantMessage(errorMsg, context._profile);
-                chatSession.messages.push(errorMsg);
+                this.attachThinkingToAssistantMessage(assistantMsg, stream.streamingThinking);
+                this.attachProfileToAssistantMessage(assistantMsg, context._profile);
+                chatSession.messages.push(assistantMsg);
                 this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
                 this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
                 if (this.currentChatId === context.chatId) {
