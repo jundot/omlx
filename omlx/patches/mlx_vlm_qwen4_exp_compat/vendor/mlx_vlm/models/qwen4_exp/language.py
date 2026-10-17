@@ -1780,7 +1780,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         """Fail closed outside the proven contiguous batch-one text shape."""
 
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
-        if not (
+        return (
             x.ndim == 3
             and x.shape[0] == 1
             and causal_mask
@@ -1788,11 +1788,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and isinstance(cache.offset, int)
             and position_embeddings is None
             and not target_verify
+            and qwen4_gathered_prefill_route(
+                x.shape[1], cache.offset, self.indexer.token_budget
+            )
             and self._batch_one_text_position_ids(position_ids, x.shape[1])
-        ):
-            return False
-        return qwen4_gathered_prefill_route(
-            x.shape[1], cache.offset, self.indexer.token_budget
         )
 
     def _gathered_text_decode_eligible(
