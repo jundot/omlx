@@ -8030,45 +8030,23 @@ class Scheduler:
             return list(ids)
         return None
 
+    def _budget_token_pieces(self):
+        """Per-tokenizer piece lookup, built once (detects byte-level BPE)."""
+        from .api.thinking import BudgetTokenPieces
+
+        pieces = getattr(self, "_budget_token_pieces_cache", None)
+        if pieces is None or pieces.tokenizer is not self.tokenizer:
+            pieces = BudgetTokenPieces(self.tokenizer)
+            self._budget_token_pieces_cache = pieces
+        return pieces
+
     def _thinking_budget_token_to_piece(self, token_id: int) -> str | bytes | None:
         """Best-effort token piece lookup for UTF-8-safe budget forcing."""
-        try:
-            token = self.tokenizer.convert_ids_to_tokens(token_id)
-            if token is not None:
-                byte_piece = self._token_piece_to_bytes(token)
-                return byte_piece if byte_piece is not None else token
-        except (AttributeError, KeyError, TypeError, ValueError):
-            pass
-
-        try:
-            return self.tokenizer.decode([token_id], skip_special_tokens=False)
-        except TypeError:
-            try:
-                return self.tokenizer.decode([token_id])
-            except Exception:
-                return None
-        except Exception:
-            return None
+        return self._budget_token_pieces()(token_id)
 
     def _token_piece_to_bytes(self, token: str) -> bytes | None:
-        """Convert byte-fallback tokenizer pieces to raw bytes when possible."""
-        import re
-
-        byte_fallback = re.fullmatch(r"(?:<0x[0-9A-Fa-f]{2}>)+", token)
-        if byte_fallback is not None:
-            return bytes(
-                int(match.group(1), 16)
-                for match in re.finditer(r"<0x([0-9A-Fa-f]{2})>", token)
-            )
-
-        byte_decoder = getattr(self.tokenizer, "byte_decoder", None)
-        if isinstance(byte_decoder, dict) and token:
-            try:
-                return bytes(byte_decoder[ch] for ch in token)
-            except (KeyError, TypeError, ValueError):
-                pass
-
-        return None
+        """Convert byte-fallback or byte-level BPE pieces to raw bytes."""
+        return self._budget_token_pieces().piece_to_bytes(token)
 
     def _resolve_output_parser_thinking_trailing_ids(self) -> list[int] | None:
         """Resolve parser-provided tokens that should follow a forced close."""
