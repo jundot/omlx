@@ -228,3 +228,12 @@ Run `python -m pytest -q tests/integration/test_server_endpoints.py -k structure
 Run `python -m pytest -q tests/test_qwen4_qsa_decode_gather.py -k "batch_bank or batch_gather"` to check the batched QSA paths. The row-bank cases drive one attention layer through right-padded chunked prompt prefill, decode, verify windows, ragged vector rollback, reorder and drop filters, extend, trim and state restore, and require layer outputs and cache state to be bit-identical with fresh per-row indexer caches. The gathered cases compare batched decode steps and verify windows with the dense masked path: outputs allclose, cache state identical, every query bounded to the QSA budget plus its tail, and each fail-closed case kept on the dense path. Both groups include the served ratio 4 / top-k 512 geometry.
 
 For a real-server comparison, use the same model, prompts and cache state on main and the branch, with sessions of different lengths well past the QSA crossover (e.g. a 100K shared prompt plus 2K unshared tokens per session). Report aggregate decode while every stream is decoding, per batch size, with Lightning MTP on and off, and check a temperature-0 cold/warm identity and a multi-session codeword fan-out with prompts of different lengths.
+
+# Client-observed streaming benchmarks
+
+For a fixed-token concurrent HTTP measurement protocol and historical oMLX
+0.7.1.dev1 results on M4 Max, see
+[Fixed-token HTTP streaming measurements](experimental/m4_max_http_streaming.md).
+It separates first-text and complete-response latency, a client stream proxy,
+and group throughput from admin PP/TG rates, and retains all fresh-process
+results and environment limitations.
