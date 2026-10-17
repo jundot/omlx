@@ -359,3 +359,69 @@ class TestPoolReleaseAccounting:
         )
         assert tracker.flat_overhead_charge_for(True) == 0
         assert tracker.flat_overhead_charge_for(False) == 3 * 1024**3
+
+
+class TestGenericReclaimChargeBound:
+    """#4417: the generic reclaim ledger must not price a whole idle pool.
+
+    A long-running server reclaims 15-17 GB of idle pool every ~20 s; each
+    release reaches ``record_reclaim`` as a negative post-chunk delta. Before
+    any positive sample they must still accumulate (the release is real), but
+    once a positive chunk has been measured the charge is bounded by what one
+    chunk can plausibly re-allocate — the largest measured chunk growth.
+    """
+
+    def test_releases_accumulate_unbounded_before_any_positive_sample(self):
+        tracker = PrefillTransientTracker("m")
+        # The reporter's 10:12-10:13 reclaims, all before the next positive
+        # measurement. Nothing has been measured to bound by yet.
+        reclaims = [int(gb * 1024**3) for gb in (16.1, 15.9, 16.7, 15.3, 17.3)]
+        for released in reclaims:
+            tracker.record_reclaim(released)
+        assert tracker.reclaim_charge_ceiling_bytes() == 0
+        assert tracker.recent_reclaim_bytes == sum(reclaims)
+
+    def test_charge_is_bounded_by_largest_measured_chunk_growth(self):
+        tracker = PrefillTransientTracker("m")
+        tracker.update(2048, 3 * 1024**3)  # largest positive chunk this session
+        tracker.record_reclaim(10 * 1024**3)
+        assert tracker.recent_reclaim_bytes == 3 * 1024**3
+        # Further releases in the same window cannot grow past the ceiling.
+        tracker.record_reclaim(5 * 1024**3)
+        assert tracker.recent_reclaim_bytes == 3 * 1024**3
+
+    def test_bounded_charge_keeps_a_small_release_intact(self):
+        tracker = PrefillTransientTracker("m")
+        tracker.update(2048, 3 * 1024**3)
+        tracker.record_reclaim(960 * 1024**2)  # below the ceiling: unchanged
+        assert tracker.recent_reclaim_bytes == 960 * 1024**2
+
+    def test_ceiling_is_clamped_to_the_observed_max_clamp(self):
+        tracker = PrefillTransientTracker("m")
+        tracker.update(2048, 8 * 1024**3)  # a one-off spike, not repeatable
+        assert tracker.reclaim_charge_ceiling_bytes() == 4 * 1024**3
+        tracker.record_reclaim(20 * 1024**3)
+        assert tracker.recent_reclaim_bytes == 4 * 1024**3
+
+    def test_gathered_sample_bounds_the_shared_ledger(self):
+        tracker = PrefillTransientTracker("m")
+        tracker.update(2048, 2 * 1024**3, gathered_core=True)
+        # The ledger is shared across regimes, so the gathered ceiling binds it.
+        tracker.record_reclaim(9 * 1024**3)
+        assert tracker.recent_reclaim_bytes == 2 * 1024**3
+
+    def test_floor_sample_already_measured_bounds_the_charge(self):
+        tracker = PrefillTransientTracker("m")
+        tracker.update(512, 1024**2)  # seed a sample so floor_sample is accepted
+        tracker.update(32, 1024**3, floor_sample=True)
+        assert tracker.observed_max_bytes_for(False) == 1024**3
+        tracker.record_reclaim(6 * 1024**3)
+        assert tracker.recent_reclaim_bytes == 1024**3
+
+    def test_positive_sample_drops_the_bounded_charge(self):
+        tracker = PrefillTransientTracker("m")
+        tracker.update(2048, 3 * 1024**3)
+        tracker.record_reclaim(10 * 1024**3)
+        assert tracker.recent_reclaim_bytes == 3 * 1024**3
+        tracker.update(2048, 2 * 1024**3)  # growth confirms reallocation
+        assert tracker.recent_reclaim_bytes == 0
