@@ -672,6 +672,31 @@ class TestSTTEnginePromptBiasing:
         assert "system_prompt" not in generate_kwargs
 
     @pytest.mark.asyncio
+    async def test_prompt_maps_to_context_for_vibevoice_style(self, tmp_path):
+        """VibeVoice-ASR-style backends take hotwords as ``context``."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, context=None, **kwargs):
+                generate_kwargs["context"] = context
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="ok", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("vibevoice-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(self._wav(tmp_path), prompt="ZyntriQix, Digique")
+
+        assert generate_kwargs["context"] == "ZyntriQix, Digique"
+        assert "prompt" not in generate_kwargs
+        assert "system_prompt" not in generate_kwargs
+        assert "initial_prompt" not in generate_kwargs
+
+    @pytest.mark.asyncio
     async def test_prompt_dropped_for_backends_without_hook(self, tmp_path):
         """Backends with no biasing hook never see the field and never fail."""
         from omlx.engine.stt import STTEngine
