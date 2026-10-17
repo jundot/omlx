@@ -408,6 +408,11 @@ class ModelSettings:
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
     moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
+    # Opt-in batched expert install for the offload path above: reserve all
+    # miss slots and write them in ONE _write_many call instead of one
+    # _install per miss. Off by default (= upstream per-expert install);
+    # only meaningful (and only honored) when moe_expert_offload_enabled.
+    moe_expert_offload_batch_enabled: bool = False
 
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
