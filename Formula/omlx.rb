@@ -42,7 +42,12 @@ class Omlx < Formula
   end
 
   service do
-    run [opt_bin/"omlx", "serve"]
+    # launchd starts a LaunchAgent at the default scheduling role, which costs
+    # decode speed (37 instead of 55 tok/s measured on an M3 Ultra, where
+    # ProcessType Interactive alone changed nothing). taskpolicy -a gives the
+    # server the scheduling policies of an application, like the menu bar app,
+    # and execs it, so KeepAlive still supervises the server process itself.
+    run ["/usr/sbin/taskpolicy", "-a", opt_bin/"omlx", "serve"]
     keep_alive true
     working_dir var
     log_path var/"log/omlx.log"
