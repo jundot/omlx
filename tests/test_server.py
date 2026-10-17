@@ -1518,6 +1518,12 @@ class TestRequestBodySizeLimit:
         monkeypatch.setattr(body_limit, "get_settings", lambda: settings)
         assert body_limit._resolve_limit() > 1024**3
 
+    def test_limit_follows_a_raised_video_limit(self, monkeypatch):
+        settings = GlobalSettings()
+        settings.server.max_video_upload_size = "2GB"
+        monkeypatch.setattr(body_limit, "get_settings", lambda: settings)
+        assert body_limit._resolve_limit() >= 2 * 1024**3 * 4 // 3
+
 
 @pytest.fixture
 def prepared_chat_engine():
