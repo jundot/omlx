@@ -1218,9 +1218,16 @@ class SplashEngine(BaseEngine):
         body["messages"] = splash_messages(messages)
         if tools:
             body["tools"] = tools
-        effort = splash_effort(kwargs.get("chat_template_kwargs"))
+        template_kwargs = kwargs.get("chat_template_kwargs") or {}
+        effort = splash_effort(template_kwargs)
         if effort:
             body["reasoning_effort"] = effort
+        # Qwen 3.6+ templates drop reasoning from turns before the latest user
+        # message unless this is set, so every new user turn would miss the
+        # prefix cache from the first stripped assistant turn onward.
+        preserve = template_kwargs.get("preserve_thinking")
+        if isinstance(preserve, bool):
+            body["preserve_thinking"] = preserve
         async for output in self._stream(body):
             yield output
 

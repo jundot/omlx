@@ -563,6 +563,33 @@ class TestStreaming:
         assert body["stream"] is True and body["return_progress"] is True
         assert engine.has_active_requests() is False
 
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            ({"preserve_thinking": True}, True),
+            ({"preserve_thinking": False}, False),
+            ({"reasoning_effort": "high"}, None),
+            (None, None),
+        ],
+    )
+    async def test_preserve_thinking_is_forwarded(self, tmp_path, kwargs, expected):
+        # Qwen 3.6+ templates drop reasoning from turns before the latest user
+        # message unless preserve_thinking is set, which defeats prefix caching.
+        seen = {}
+
+        def handler(request):
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, content=_sse({"choices": [{"delta": {"content": "x"}}]})
+            )
+
+        engine = _engine_with_transport(tmp_path, handler)
+        async for _ in engine.stream_chat(
+            [{"role": "user", "content": "hi"}], chat_template_kwargs=kwargs
+        ):
+            pass
+        assert seen["body"].get("preserve_thinking") is expected
+
     async def test_unfinished_reasoning_is_closed(self, tmp_path):
         def handler(request):
             return httpx.Response(
