@@ -1771,6 +1771,35 @@ def _count_image_tokens_real(
     return total
 
 
+def _video_and_image_cache_key_ranges(
+    image_ranges: list[tuple[int, str]], video_ranges: list[tuple[int, str]]
+) -> list[tuple[int, str]]:
+    """Prefix-cache ranges for a prompt with images and clips.
+
+    Each boundary's key covers every image and clip before it, so a follow-up
+    turn keeps the cached prefix up to the first media item that changed.
+    """
+    import hashlib
+
+    events = [(start, key, None) for start, key in image_ranges]
+    events += [(start, None, key) for start, key in video_ranges]
+    ranges: list[tuple[int, str]] = []
+    image_key, video_key = "", None
+    for start, image_update, video_update in sorted(events, key=lambda e: e[0]):
+        if image_update is not None:
+            image_key = image_update
+        if video_update is not None:
+            video_key = video_update
+        key = image_key
+        if video_key is not None:
+            key = hashlib.sha256(f"video:{image_key}:{video_key}".encode()).hexdigest()
+        if ranges and ranges[-1][0] == start:
+            ranges[-1] = (start, key)
+        else:
+            ranges.append((start, key))
+    return ranges
+
+
 def _audio_feature_cache_key_ranges(
     token_ids: list[int],
     input_features: Any,
@@ -3393,10 +3422,11 @@ class VLMBatchedEngine(BaseEngine):
             elif msg_num_videos > 0:
                 # Qwen3-VL chat templates render {"type": "video"} as the
                 # vision_start/video_pad/vision_end block the processor expands
-                # into timestamped temporal patches. Keep the clip where the
-                # user placed it relative to the text.
+                # into timestamped temporal patches. Keep clips and images
+                # where the user placed them relative to the text.
                 video_content: list[dict[str, Any]] = []
                 inserted_videos = 0
+                inserted_images = 0
                 for item in raw_content:
                     if isinstance(item, dict):
                         item_type = item.get("type", "")
@@ -3408,6 +3438,10 @@ class VLMBatchedEngine(BaseEngine):
                         if inserted_videos < msg_num_videos:
                             video_content.append({"type": "video"})
                             inserted_videos += 1
+                    elif item_type in image_part_types:
+                        if inserted_images < msg_num_images:
+                            video_content.append({"type": "image"})
+                            inserted_images += 1
                     elif item_type == "text" and item_text:
                         video_content.append({"type": "text", "text": item_text})
                 formatted_messages.append({"role": role, "content": video_content})
@@ -3991,6 +4025,71 @@ class VLMBatchedEngine(BaseEngine):
         self._vision_cache.put(video_identity, self._model_name, features)
         return features
 
+    def _mixed_visual_features(
+        self,
+        token_ids: list[int],
+        input_ids: Any,
+        pixel_values: Any,
+        extra_model_inputs: dict,
+        image_features: Any,
+        video_hashes: list[str],
+    ) -> tuple[mx.array, list[tuple[int, str]]] | None:
+        """Vision features and clip cache ranges for a request with images and clips.
+
+        Qwen checkpoints fill image and video placeholders from one feature
+        array, in token order. Both modalities come from the vision feature
+        cache when possible, so a follow-up turn encodes neither again.
+        Returns None when the features cannot be lined up with the tokens.
+        """
+        config = getattr(self._vlm_model, "config", None)
+        image_token_id = getattr(config, "image_token_id", None)
+        video_token_id = getattr(config, "video_token_id", None)
+        if image_token_id is None or video_token_id is None:
+            return None
+        image_count = sum(token == image_token_id for token in token_ids)
+        video_count = sum(token == video_token_id for token in token_ids)
+
+        if image_features is None:
+            image_features = self._compute_vision_features(
+                pixel_values, extra_model_inputs
+            )
+        video_grid_thw = extra_model_inputs.get("video_grid_thw")
+        video_ranges = self._video_cache_key_ranges(
+            token_ids, video_grid_thw, video_hashes
+        )
+        if not video_ranges:
+            first = token_ids.index(video_token_id) if video_count else 0
+            video_ranges = [(first, self._video_cache_identity(video_hashes))]
+        video_features = self._cached_video_features(
+            video_ranges[-1][1], input_ids, extra_model_inputs
+        )
+        if video_features is None:
+            video_features = self._compute_vision_features(
+                extra_model_inputs["pixel_values_videos"],
+                {"image_grid_thw": video_grid_thw},
+            )
+        if image_features is None or video_features is None:
+            return None
+        if not (
+            self._vision_features_match_image_tokens(image_features, image_count)
+            and self._vision_features_match_image_tokens(video_features, video_count)
+        ):
+            return None
+
+        image_index, video_index = iter(range(image_count)), iter(
+            range(image_count, image_count + video_count)
+        )
+        order = [
+            next(image_index) if token == image_token_id else next(video_index)
+            for token in token_ids
+            if token in (image_token_id, video_token_id)
+        ]
+        features = mx.concatenate(
+            [image_features, video_features.astype(image_features.dtype)], axis=0
+        )[mx.array(order)]
+        mx.eval(features)
+        return features, video_ranges
+
     def _vision_features_match_image_tokens(
         self, features: Any, image_token_count: Optional[int]
     ) -> bool:
@@ -4551,6 +4650,24 @@ class VLMBatchedEngine(BaseEngine):
                             "Vision feature computation failed, using full pipeline",
                             exc_info=True,
                         )
+
+            if has_video and num_images > 0:
+                mixed = self._mixed_visual_features(
+                    token_ids,
+                    input_ids,
+                    pixel_values,
+                    extra_model_inputs,
+                    call_kwargs.pop("cached_image_features", None),
+                    video_hashes or [],
+                )
+                if mixed is not None:
+                    features, video_ranges = mixed
+                    call_kwargs["cached_image_features"] = features
+                    image_cache_key_ranges = _video_and_image_cache_key_ranges(
+                        image_cache_key_ranges or [(0, image_hash)], video_ranges
+                    )
+                    image_cache_key_start = image_cache_key_ranges[0][0]
+                    image_hash = image_cache_key_ranges[-1][1]
 
             if (
                 self.model_type == "deepseek_v4"
@@ -5480,12 +5597,11 @@ class VLMBatchedEngine(BaseEngine):
         text_messages, images, audio, videos = extract_media_from_messages(
             media_messages
         )
-        # mlx-vlm's Qwen3-VL embedding path takes the grid of one modality per
-        # call, so a request that mixes them would silently lose one.
-        if videos and (images or audio):
+        # Images and clips share one feature array, which the engine assembles
+        # in token order (see _mixed_visual_features). Audio is not handled.
+        if videos and audio:
             raise InvalidRequestError(
-                "Video input cannot be combined with image or audio input "
-                "in the same request.",
+                "Video input cannot be combined with audio input in the same request.",
                 field="messages",
             )
         return media_messages, text_messages, images, audio, videos
