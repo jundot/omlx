@@ -1606,6 +1606,65 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     return "Use the model's dedicated endpoint (see /v1/models)."
 
 
+_IMAGE_CONTENT_PART_TYPES = frozenset({"image", "image_url", "input_image"})
+
+
+def _content_carries_image(content: object) -> bool:
+    """True when a content list holds an image part, at any nesting depth.
+
+    Anthropic ``tool_result`` blocks carry their own content list, so the
+    walk recurses rather than only inspecting the top level.
+    """
+    if not isinstance(content, (list, tuple)):
+        return False
+    for part in content:
+        if isinstance(part, dict):
+            part_type, nested = part.get("type"), part.get("content")
+        else:
+            part_type = getattr(part, "type", None)
+            nested = getattr(part, "content", None)
+        if part_type in _IMAGE_CONTENT_PART_TYPES or _content_carries_image(nested):
+            return True
+    return False
+
+
+def _request_carries_image(messages: object) -> bool:
+    """True when any request message carries an image content part.
+
+    Covers both wire formats this server accepts: the OpenAI ``image_url`` /
+    ``input_image`` parts and the Anthropic ``image`` block.
+    """
+    if not isinstance(messages, (list, tuple)):
+        return False
+    return any(
+        _content_carries_image(
+            message.get("content")
+            if isinstance(message, dict)
+            else getattr(message, "content", None)
+        )
+        for message in messages
+    )
+
+
+def _reject_image_input_on_downgraded_vlm(entry: object, messages: object) -> None:
+    """Refuse image input to a VLM the pool had to serve as a text-only LLM.
+
+    ``EnginePool`` falls back to ``BatchedEngine`` when a VLM checkpoint
+    fails to load. The text extractor then drops every image part, so the
+    model answers from the surrounding text alone and the caller gets an
+    ordinary 200 describing an image that never reached the prompt (#3688).
+    Fail the request instead, and say which load error caused it.
+    """
+    reason = getattr(entry, "vision_downgrade_reason", None)
+    if not reason or not _request_carries_image(messages):
+        return
+    raise InvalidRequestError(
+        "This model is being served by the text-only engine because loading "
+        f"it as a vision model failed, so it cannot accept images: {reason}",
+        field="messages",
+    )
+
+
 def _reject_lone_surrogates(request: BaseModel) -> None:
     # JSON allows lone surrogate escapes, but the tokenizer cannot encode them.
     field = find_lone_surrogate(request.model_dump(exclude_none=True))
@@ -4806,6 +4865,10 @@ async def create_chat_completion(
             settings_guided_grammar = _settings_guided_grammar(ms)
         merged_ct_kwargs, thinking_budget = _merge_chat_template_kwargs(request, ms)
 
+        if not _engine_accepts_images(engine):
+            _reject_image_input_on_downgraded_vlm(
+                get_engine_pool().get_entry(resolved_model), request.messages
+            )
         chat_messages = _extract_chat_messages(
             request, engine, resolved_model, max_tool_result_tokens
         )
@@ -7413,6 +7476,8 @@ async def create_anthropic_message(
         # Convert Anthropic format to internal format
         # Harmony models need special handling to preserve tool format
         is_vlm = _engine_accepts_images(engine)
+        if not is_vlm:
+            _reject_image_input_on_downgraded_vlm(_entry, request.messages)
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
