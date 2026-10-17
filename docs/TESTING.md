@@ -175,6 +175,12 @@ Run `python -m pytest -q tests/test_mlx_lm_mtp_patch.py -k "spec_command_buffers
 
 Run `python -m pytest tests/test_dflash_batched.py tests/test_mlx_lm_mtp_patch.py -q -k "dflash or block_drafter or drafter"`. `test_dflash_batched.py` builds tiny DFlash2, Laguna and Muse Glimmer drafters with random weights and checks that the batched forward matches each family's mlx-vlm `draft_block` (MiMo's value scale and trained mask embedding against a v1 reference with scaled `v_proj` weights and a replaced mask-token row), that rows drafted together match the same rows drafted alone across ring wrap-around, ragged context segments and cohort changes, and covers prefill seed window slicing, prefix-hit context restore, block-size clamping and verify-mode parsing. The `block_drafter` cases in `test_mlx_lm_mtp_patch.py` drive the Lightning MTP verify path with a table drafter on the CountingModel harness and require token parity with standard decoding, one context entry per committed position (including late joins) and release of finished rows; the drafter-target cases check layer captures on Qwen3 and Qwen3.5 text targets and require greedy parity with plain decode for tiny Qwen3 and Laguna targets, including Laguna's sliding window wrapping; on NAX hosts `test_mimo_v2_patch.py` also checks that MiMo's fused decode loop reports the same layer captures as the reference loop. Real drafter acceptance and throughput need a target checkpoint with its DFlash draft and are measured against the standard batched engine.
 
+Survivor cleanup cases also cover coalesced removals before a draft, reordered
+re-entry, retryable gather construction, and ring ownership after assembly.
+`release` must not evaluate GPU work. Metal allocation regressions bound the
+next assembly's peak without per-row intermediate banks; these are not engine
+throughput or process-RSS measurements.
+
 # VLM cache boundary tests
 
 Run `python -m pytest -q tests/test_vlm_cache_boundaries.py tests/test_vlm_engine.py tests/test_prefix_cache.py tests/test_paged_cache.py` to check image-aware prefix keys. Boundary cases cover reasoning-dependent template prefixes, final grid token positions, adjacent images, multiple images per turn, block edges, invalid metadata, and isolation when earlier or later images change. These tests use synthetic processor inputs and KV arrays; checkpoint preprocessing and inference comparisons require local models.
