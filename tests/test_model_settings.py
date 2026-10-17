@@ -331,6 +331,54 @@ class TestModelSettingsManager:
 
     def test_empty_settings(self):
         """Test with no settings file."""
+
+    def test_prefixed_model_id_falls_back_to_bare_key(self):
+        """Cluster deployments expose org/name IDs; settings use bare names."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(json.dumps({
+                "version": 1,
+                "models": {
+                    "qwen-27b": {
+                        "temperature": 0.6,
+                        "thinking_budget_enabled": True,
+                        "thinking_budget_tokens": 4096,
+                    }
+                }
+            }))
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            settings = manager.get_settings("org/qwen-27b")
+            assert settings.temperature == 0.6
+            assert settings.thinking_budget_enabled is True
+            assert settings.thinking_budget_tokens == 4096
+
+    def test_exact_prefixed_key_wins_over_bare_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(json.dumps({
+                "version": 1,
+                "models": {
+                    "qwen-27b": {"temperature": 0.6},
+                    "org/qwen-27b": {"temperature": 0.9},
+                }
+            }))
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            assert manager.get_settings("org/qwen-27b").temperature == 0.9
+            assert manager.get_settings("qwen-27b").temperature == 0.6
+
+    def test_unknown_prefixed_id_returns_defaults(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_file = Path(tmpdir) / "model_settings.json"
+            settings_file.write_text(json.dumps({"version": 1, "models": {}}))
+
+            manager = ModelSettingsManager(Path(tmpdir))
+            settings = manager.get_settings("org/never-seen")
+            assert settings.temperature == ModelSettings().temperature
+            assert settings.is_pinned is False
+
+
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ModelSettingsManager(Path(tmpdir))
             settings = manager.get_settings("nonexistent")
