@@ -547,6 +547,49 @@ async def test_distributed_chat_preserves_rank_zero_tool_calls_and_reasoning():
 
 
 @pytest.mark.asyncio
+async def test_distributed_chat_keeps_length_with_truncated_tool_calls():
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_weather",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "get_weather",
+                                        "arguments": '{"city": "Paris"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14,
+                },
+            },
+        )
+
+    engine = _ready_engine(handler)
+    try:
+        output = await engine.chat([{"role": "user", "content": "Weather?"}])
+    finally:
+        await engine._client.aclose()
+
+    assert output.finish_reason == "length"
+    assert [call["name"] for call in output.tool_calls] == ["get_weather"]
+
+
+@pytest.mark.asyncio
 async def test_distributed_stream_chat_preserves_structured_tool_calls():
     events = [
         {

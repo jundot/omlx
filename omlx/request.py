@@ -49,6 +49,24 @@ class RequestStatus(enum.IntEnum):
         return None
 
 
+def finish_reason_with_tools(
+    base_finish_reason: Optional[str],
+    has_tool_calls: bool,
+    *,
+    tool_calls_reason: str = "tool_calls",
+) -> Optional[str]:
+    """Prefer length truncation over a tool-calls finish reason.
+
+    OpenAI/Anthropic clients treat a truncated tool-call turn as complete when
+    the finish/stop reason says tools were finished. Keep ``length`` visible.
+    """
+    if base_finish_reason == "length":
+        return "length"
+    if has_tool_calls:
+        return tool_calls_reason
+    return base_finish_reason
+
+
 @dataclass
 class SamplingParams:
     """Sampling parameters for text generation."""

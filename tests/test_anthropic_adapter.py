@@ -389,6 +389,37 @@ class TestAnthropicAdapter:
 
         assert result.stop_reason == "max_tokens"
 
+    def test_format_response_length_with_tool_calls(self, adapter):
+        """Truncated tool-call turns keep stop_reason=max_tokens."""
+        from omlx.api.openai_models import FunctionCall, ToolCall
+
+        request = MessagesRequest(
+            model="claude-3-sonnet",
+            max_tokens=1024,
+            messages=[AnthropicMessage(role="user", content="Hello")],
+        )
+        tool_calls = [
+            ToolCall(
+                id="call_abc123",
+                type="function",
+                function=FunctionCall(
+                    name="get_weather",
+                    arguments='{"location": "Tokyo"}',
+                ),
+            )
+        ]
+        response = InternalResponse(
+            text="",
+            finish_reason="length",
+            tool_calls=tool_calls,
+        )
+
+        result = adapter.format_response(response, request)
+
+        assert result.stop_reason == "max_tokens"
+        tool_use_blocks = [c for c in result.content if c.type == "tool_use"]
+        assert len(tool_use_blocks) == 1
+
     def test_format_response_empty_text(self, adapter):
         """Test formatting response with empty text."""
         request = MessagesRequest(

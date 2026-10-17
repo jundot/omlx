@@ -18,6 +18,7 @@ from typing import Any
 
 import httpx
 
+from ..request import finish_reason_with_tools
 from ..cluster.deployment import ClusterDeployment
 from ..cluster.launch import (
     DistributedJobSupervisor,
@@ -1236,10 +1237,8 @@ raise SystemExit(2)
                 new_text=text,
                 prompt_tokens=int(usage["prompt_tokens"]),
                 completion_tokens=int(usage["completion_tokens"]),
-                finish_reason=(
-                    "tool_calls"
-                    if tool_calls
-                    else (choice.get("finish_reason") or "stop")
+                finish_reason=finish_reason_with_tools(
+                    choice.get("finish_reason") or "stop", bool(tool_calls)
                 ),
                 tool_calls=tool_calls,
                 cached_tokens=int(details.get("cached_tokens", 0)),
@@ -1505,7 +1504,9 @@ raise SystemExit(2)
             new_text=pending_final_text,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            finish_reason=("tool_calls" if tool_calls else (finish_reason or "stop")),
+            finish_reason=finish_reason_with_tools(
+                finish_reason or "stop", bool(tool_calls)
+            ),
             finished=True,
             tool_calls=tool_calls,
             cached_tokens=cached_tokens,

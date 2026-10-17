@@ -1764,6 +1764,11 @@ class TestMapFinishReasonToStopReason:
         result = map_finish_reason_to_stop_reason("stop", True)
         assert result == "tool_use"
 
+    def test_length_with_tool_calls_stays_max_tokens(self):
+        """Truncation must not be reported as tool_use."""
+        result = map_finish_reason_to_stop_reason("length", True)
+        assert result == "max_tokens"
+
     def test_none_reason(self):
         """Test mapping None reason."""
         result = map_finish_reason_to_stop_reason(None, False)

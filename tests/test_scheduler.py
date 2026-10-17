@@ -8001,6 +8001,43 @@ class TestStopStringOutputBuffer:
             assert not outputs[-1].tool_calls
             assert outputs[-1].output_text == "".join(pieces)
 
+    def test_parser_tool_calls_keep_length_finish_reason(
+        self, mock_model, monkeypatch
+    ):
+        """Parser-reported tool_calls must not overwrite a length cap (#4559)."""
+        from omlx.patches.deepseek_v41 import output_parser
+
+        scheduler = self._setup(mock_model)
+        request = scheduler.running["stop-output"]
+        request.sampling_params.stop = []
+        tokenizer = scheduler.tokenizer
+        tokenizer.pieces = {**tokenizer.pieces, 100: "Prose."}
+        scheduler._build_state_machine(request)
+        monkeypatch.setattr(
+            output_parser,
+            "create_streaming_detokenizer",
+            lambda tokenizer, model_path: _StopSequenceDetokenizer(tokenizer),
+        )
+        call = {"id": "call_1", "name": "get", "arguments": "{}"}
+
+        class _ToolCallSession(output_parser.DeepSeekV41OutputParserSession):
+            def finalize(self):
+                result = super().finalize()
+                result.tool_calls = [call]
+                result.finish_reason = "tool_calls"
+                return result
+
+        session = _ToolCallSession(tokenizer)
+        scheduler._output_parser_sessions[request.request_id] = session
+        scheduler._get_output_parser_session = lambda request_id: session
+
+        outputs, _ = scheduler._process_batch_responses(
+            [self._response(100, finish_reason="length")]
+        )
+
+        assert outputs[-1].tool_calls == [call]
+        assert outputs[-1].finish_reason == "length"
+
     def test_partial_stop_prefix_is_flushed_on_eos(self, mock_model):
         scheduler = self._setup(mock_model)
         responses = [
