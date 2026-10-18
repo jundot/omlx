@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 from omlx.engine.stt import (
     RealtimeTranscriptionSession,
     STTEngine,
+    _is_qwen3_realtime_model,
+    _Qwen3RealtimeBackend,
     _split_audio_segments,
     _VoxtralRealtimeBackend,
     _WhisperRealtimeBackend,
@@ -34,8 +36,12 @@ class TestRealtimeSttClassification:
     def test_voxtral_realtime_is_realtime(self):
         assert is_realtime_stt_model("audio_stt", "voxtral_realtime")
 
+    def test_qwen3_asr_is_realtime(self):
+        # Served by _Qwen3RealtimeBackend (server-side endpointing), not by
+        # an incremental-input decoder — see TestQwen3RealtimeBackend.
+        assert is_realtime_stt_model("audio_stt", "qwen3_asr")
+
     def test_other_stt_families_are_not_realtime(self):
-        assert not is_realtime_stt_model("audio_stt", "qwen3_asr")
         assert not is_realtime_stt_model("audio_stt", "parakeet")
         assert not is_realtime_stt_model("audio_stt", "")
 
@@ -65,6 +71,22 @@ class TestSupportsRealtimeStt:
         engine._model = SimpleNamespace(generate=lambda: None)
         assert not engine.supports_realtime_stt()
 
+    def test_qwen3_model_supported_without_streaming_symbols(self):
+        engine = STTEngine("m")
+        engine._model = _FakeQwen3RtModel()
+        assert engine.supports_realtime_stt()
+
+    def test_admission_is_module_pinned_not_symbol_pinned(self):
+        # A different whole-buffer model exposing stream_generate must
+        # NOT be admitted: only a module carrying _Qwen3RealtimeBackend
+        # semantics may pass (UP-11: symbol whitelisting alone would
+        # crash foreign models in whisper code paths).
+        engine = STTEngine("m")
+        engine._model = SimpleNamespace(
+            stream_generate=lambda: None, generate=lambda: None
+        )
+        assert not engine.supports_realtime_stt()
+
 
 class TestRealtimeSessionLifecycle:
     @pytest.mark.asyncio
@@ -91,6 +113,38 @@ class TestRealtimeSessionLifecycle:
     async def test_unstarted_engine_raises(self):
         with pytest.raises(RuntimeError, match="not started"):
             await STTEngine("m").create_realtime_session()
+
+    @pytest.mark.asyncio
+    async def test_qwen3_model_dispatches_to_qwen3_backend(self):
+        engine = STTEngine("m")
+        engine._model = _FakeQwen3RtModel()
+
+        session = await engine.create_realtime_session(language="cs")
+        assert isinstance(session._backend, _Qwen3RealtimeBackend)
+        # "cs" is not in _ISO_TO_STT_LANG: the hint passes through verbatim
+        assert session._backend._language == "cs"
+        await session.release()
+
+    @pytest.mark.asyncio
+    async def test_whisper_symbol_model_still_dispatches_to_whisper(self):
+        engine = STTEngine("m")
+        engine._model = SimpleNamespace(generate_streaming=lambda: None)
+
+        session = await engine.create_realtime_session()
+        assert isinstance(session._backend, _WhisperRealtimeBackend)
+        await session.release()
+
+    @pytest.mark.asyncio
+    async def test_unmatched_model_never_reaches_whisper_catch_all(self):
+        # supports_realtime_stt() normally rejects such a model at the
+        # route; if a future gate change lets one through, dispatch must
+        # fail explicitly instead of feeding it to the whisper decoder
+        # (the latent hole behind the UP-10 oQ8 crash shape).
+        engine = STTEngine("m")
+        engine._model = SimpleNamespace(generate=lambda: None)
+        engine.supports_realtime_stt = lambda: True  # bypass the gate
+        with pytest.raises(RuntimeError, match="no realtime backend"):
+            await engine.create_realtime_session()
 
 
 class TestPcm16Conversion:
@@ -179,6 +233,172 @@ class TestVoxtralBackend:
         backend.feed(np.zeros(4, dtype=np.float32))
         assert backend.poll_sync() == []
         assert backend.close_sync() == []
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-ASR realtime backend (server-side per-utterance endpointing)
+# ---------------------------------------------------------------------------
+
+
+_QWEN3_MODULE = "mlx_audio.stt.models.qwen3_asr.qwen3_asr"
+_RT_FRAME = 1600  # one 0.1 s slice at the realtime rate (16 kHz)
+
+
+class _FakeQwen3RtModel:
+    """Whole-buffer Qwen3-ASR stand-in for the realtime path.
+
+    ``generate`` mirrors the per-closed-utterance call the backend makes
+    through the same whole-buffer path as the file endpoint. Scripted
+    replies / failures let the tests pin the decode budget, the
+    degenerate-output guard and session survival without a checkpoint.
+    """
+
+    def __init__(self, texts=None, fail_times=0, expects_language_names=False):
+        self.calls = []
+        self._texts = list(texts or [])
+        self._fail_times = fail_times
+        if expects_language_names:
+            self.config = SimpleNamespace(support_languages=["English", "Czech"])
+
+    def generate(self, audio, language=None, max_tokens=None):
+        i = len(self.calls)
+        self.calls.append(
+            SimpleNamespace(
+                audio=np.asarray(audio),
+                language=language,
+                max_tokens=max_tokens,
+            )
+        )
+        if i < self._fail_times:
+            raise RuntimeError("simulated decode failure")
+        return SimpleNamespace(
+            text=self._texts[i] if i < len(self._texts) else "ok",
+            language="english",
+        )
+
+
+# The engine admits Qwen3 models by their mlx-audio module path, so the
+# fake must claim it (this is also the contract a real checkpoint upgrade
+# would break, loudly: the gate falls back to segmented mode).
+_FakeQwen3RtModel.__module__ = _QWEN3_MODULE
+
+
+def _voiced(n, frame=_RT_FRAME):
+    # RMS 0.05 clears VOICE_RMS (0.01); amplitude is irrelevant otherwise
+    return [np.full(frame, 0.05, dtype=np.float32) for _ in range(n)]
+
+
+def _quiet(n, frame=_RT_FRAME):
+    return [np.zeros(frame, dtype=np.float32) for _ in range(n)]
+
+
+def _drain(backend, frames):
+    """Feed frame by frame, polling each time (tighter than the real 1 s
+    session cadence; upper-bounds commit promptness)."""
+    out = []
+    for f in frames:
+        backend.feed(f)
+        out.extend(backend.poll_sync())
+    return out
+
+
+class TestQwen3RealtimeBackend:
+    def test_utterance_committed_after_trailing_silence(self):
+        model = _FakeQwen3RtModel(texts=["hello world"])
+        out = _drain(_Qwen3RealtimeBackend(model), _voiced(5) + _quiet(8))
+
+        assert out == ["hello world"]
+        assert len(model.calls) == 1
+        # 0.7 s silence closes; kept = speech + TAIL_MARGIN (0.2 s)
+        assert len(model.calls[0].audio) == 7 * _RT_FRAME
+        # 0.7 s -> 24*0.7+64 = 80.8 -> floor MIN_TOKENS
+        assert model.calls[0].max_tokens == 96
+
+    def test_preroll_keeps_the_first_syllable(self):
+        model = _FakeQwen3RtModel()
+        out = _drain(
+            _Qwen3RealtimeBackend(model),
+            _quiet(10) + _voiced(5) + _quiet(8),
+        )
+
+        assert out == ["ok"]
+        # Onset picks up the 0.3 s preroll (3 frames) + 5 voiced + 0.2 s
+        # tail margin (2 frames) = 10 frames
+        assert len(model.calls[0].audio) == 10 * _RT_FRAME
+
+    def test_cough_is_not_an_utterance(self):
+        model = _FakeQwen3RtModel()
+        out = _drain(_Qwen3RealtimeBackend(model), _voiced(2) + _quiet(8))
+
+        assert out == []
+        assert model.calls == []  # decode never paid for a 0.2 s blip
+
+    def test_long_monologue_force_cut_bounds_decode(self):
+        model = _FakeQwen3RtModel()
+        backend = _Qwen3RealtimeBackend(model)
+        out = _drain(backend, _voiced(260))  # 26 s without a pause
+
+        assert len(out) == 1  # cut at MAX_SEGMENT_SECONDS, no silence needed
+        assert len(model.calls[0].audio) == 250 * _RT_FRAME
+        # 25 s -> 24*25+64 = 664 -> capped at MAX_TOKENS_CAP
+        assert model.calls[0].max_tokens == 512
+
+        rest = backend.close_sync()
+        assert len(rest) == 1  # the open 1 s tail still lands on close
+        assert len(model.calls) == 2
+
+    def test_degenerate_spiral_dropped_session_continues(self):
+        # Measured field shape (mruu report): a broken checkpoint emitted
+        # 32k chars from 2.1 s of audio. The guard must swallow that
+        # utterance — never deliver the wall — and keep listening.
+        model = _FakeQwen3RtModel(texts=["x" * 100, "fine"])
+        out = _drain(
+            _Qwen3RealtimeBackend(model),
+            _voiced(5) + _quiet(8) + _voiced(5) + _quiet(8),
+        )
+
+        assert out == ["fine"]  # first: 0.7 s audio, cap 42 chars -> dropped
+        assert len(model.calls) == 2
+
+    def test_failed_decode_drops_one_segment_not_the_session(self):
+        model = _FakeQwen3RtModel(fail_times=1)
+        out = _drain(
+            _Qwen3RealtimeBackend(model),
+            _voiced(5) + _quiet(8) + _voiced(5) + _quiet(8),
+        )
+
+        assert out == ["ok"]  # poison segment gone, second one delivered
+        assert len(model.calls) == 2
+
+    def test_close_flushes_open_utterance(self):
+        model = _FakeQwen3RtModel(texts=["tail words"])
+        backend = _Qwen3RealtimeBackend(model)
+        assert _drain(backend, _voiced(5)) == []  # no silence yet
+
+        assert backend.close_sync() == ["tail words"]
+        assert len(model.calls[0].audio) == 5 * _RT_FRAME
+
+    def test_quiet_stream_produces_nothing(self):
+        model = _FakeQwen3RtModel()
+        backend = _Qwen3RealtimeBackend(model)
+
+        assert _drain(backend, _quiet(50)) == []
+        assert backend.close_sync() == []
+        assert model.calls == []
+
+    def test_language_hint_normalized_for_name_expecting_models(self):
+        model = _FakeQwen3RtModel(expects_language_names=True)
+        backend = _Qwen3RealtimeBackend(model, language="en")
+        _drain(backend, _voiced(5) + _quiet(8))
+
+        assert model.calls[0].language == "english"
+
+    def test_language_hint_verbatim_for_unknown_iso(self):
+        model = _FakeQwen3RtModel(expects_language_names=True)
+        backend = _Qwen3RealtimeBackend(model, language="cs")
+        _drain(backend, _voiced(5) + _quiet(8))
+
+        assert model.calls[0].language == "cs"
 
 
 # ---------------------------------------------------------------------------
