@@ -158,6 +158,12 @@ class TokenEmbeddingRequest(BaseModel):
     input_ids: List[List[int]]
     """One list of token ids per input sequence. All sequences must be non-empty."""
 
+    max_length: Optional[int] = Field(default=None, gt=0)
+    """
+    Optional maximum token length for each input sequence. When omitted, the
+    server uses the model's effective context window.
+    """
+
     @model_validator(mode="after")
     def validate_input_ids(self) -> "TokenEmbeddingRequest":
         """Reject an empty batch or a ragged/negative token id."""

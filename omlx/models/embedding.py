@@ -781,6 +781,43 @@ class MLXEmbeddingModel:
 
         return _DEFAULT_EMBEDDING_MAX_LENGTH
 
+    def _resolve_vocab_size(self) -> Optional[int]:
+        """Resolve model vocabulary size from model config, args, or tokenizer."""
+        from ..utils.tokenizer import resolve_vocab_size
+
+        vs = resolve_vocab_size(self.model)
+        if vs is not None:
+            return vs
+
+        for obj in (
+            getattr(self, "processor", None),
+            getattr(getattr(self, "processor", None), "tokenizer", None),
+            getattr(getattr(self, "processor", None), "_tokenizer", None),
+        ):
+            if obj is None:
+                continue
+            vocab_size = getattr(obj, "vocab_size", None)
+            if isinstance(vocab_size, int) and vocab_size > 0:
+                return vocab_size
+            try:
+                length = len(obj)
+                if isinstance(length, int) and length > 0:
+                    return length
+            except Exception:
+                pass
+
+        for attr in ("embed_tokens", "word_embeddings"):
+            layer = getattr(self.model, attr, None)
+            weight = getattr(layer, "weight", None)
+            if (
+                weight is not None
+                and hasattr(weight, "shape")
+                and len(weight.shape) > 0
+            ):
+                return int(weight.shape[0])
+
+        return None
+
     def _prepare_embedding_inputs(
         self,
         processor,
@@ -1219,6 +1256,7 @@ class MLXEmbeddingModel:
     def embed_token_ids(
         self,
         ids_batch: List[List[int]],
+        max_length: int | None = None,
     ) -> TokenEmbeddingOutput:
         """Per-token vectors for EXACT token ids (late interaction / MaxSim).
 
@@ -1238,6 +1276,8 @@ class MLXEmbeddingModel:
 
         Args:
             ids_batch: one list of token ids per input sequence.
+            max_length: Maximum token length for each sequence. If omitted,
+                resolves against model context length / max position embeddings.
 
         Returns:
             TokenEmbeddingOutput with ragged per-token vectors.
@@ -1250,6 +1290,33 @@ class MLXEmbeddingModel:
             raise ValueError(
                 "token-id embeddings require at least one non-empty sequence"
             )
+
+        resolved_max_length = self._resolve_max_length(max_length)
+        vocab_size = self._resolve_vocab_size()
+
+        for ids in sequences:
+            if len(ids) > resolved_max_length:
+                raise ValueError(
+                    f"Input sequence of length {len(ids)} exceeds maximum "
+                    f"context length of {resolved_max_length}"
+                )
+            for token_id in ids:
+                if (
+                    not isinstance(token_id, int)
+                    or isinstance(token_id, bool)
+                    or token_id < 0
+                ):
+                    raise ValueError(
+                        f"token ids must be non-negative integers; got {token_id}"
+                    )
+                if token_id >= 2**31:
+                    raise ValueError(
+                        f"token id {token_id} exceeds 32-bit integer range"
+                    )
+                if vocab_size is not None and token_id >= vocab_size:
+                    raise ValueError(
+                        f"token id {token_id} exceeds model vocabulary size of {vocab_size}"
+                    )
 
         width = max(len(ids) for ids in sequences)
         # The pad id is irrelevant: real tokens precede the pads, so a causal

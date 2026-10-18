@@ -4272,11 +4272,15 @@ async def create_token_embeddings(
         start_time = time.perf_counter()
         try:
             async with acquire_embedding_engine(request.model) as engine:
-                output = await engine.embed_token_ids(sequences)
-        except ValueError as e:
+                output = await engine.embed_token_ids(
+                    sequences, max_length=max_length
+                )
+        except (ValueError, TypeError) as e:
             raise HTTPException(status_code=400, detail=str(e))
-        except TypeError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        except RuntimeError as e:
+            if "bad_cast" in str(e):
+                raise HTTPException(status_code=400, detail=str(e))
+            raise
 
         elapsed = time.perf_counter() - start_time
         resolved_model = resolve_model_id(request.model) or request.model
