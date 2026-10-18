@@ -16,6 +16,7 @@ import types
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError, wait
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -132,6 +133,65 @@ class RuntimePLEForkTests(unittest.TestCase):
     def tearDown(self):
         self.reader.close()
         self.temp.cleanup()
+
+    def test_selected_rows_own_storage_after_reader_close(self):
+        for indices in ([], [3], [7, 2, 7, 0]):
+            with self.subTest(indices=indices):
+                copied, dtype = self.reader.rows_np("weight", indices)
+                self.assertEqual(dtype, "F32")
+                self.assertTrue(copied.flags.owndata)
+                np.testing.assert_array_equal(copied, self.values[indices])
+                if indices:
+                    copied[0, 0] = -1
+                    np.testing.assert_array_equal(
+                        self.reader.rows_np("weight", indices)[0], self.values[indices]
+                    )
+        copied, _ = self.reader.rows_np("weight", [7, 2, 7, 0])
+        self.reader.close()
+        np.testing.assert_array_equal(copied, self.values[[7, 2, 7, 0]])
+
+    def test_page_batches_bound_tasks_and_retry_short_reads(self):
+        pages = np.arange(4 * NS["_PLE_IO_WORKERS"] + 5)
+        page_size = NS["_PLE_PAGE_SIZE"]
+        self.reader._seen_pages = bytearray(len(pages))
+        reads = []
+
+        def pread(fd, size, offset):
+            count = min(size, page_size // 2)
+            reads.append((offset, count))
+            return b"x" * count
+
+        pool = MagicMock(wraps=NS["_PLE_IO_POOL"])
+        with patch.dict(NS, {"_PLE_IO_POOL": pool}), patch.object(os, "pread", pread):
+            self.assertFalse(self.reader._prefetch_missing_pages(pages, 0, page_size))
+            self.assertEqual(pool.submit.call_count, NS["_PLE_IO_WORKERS"])
+            self.assertEqual(
+                sorted(reads),
+                [
+                    (offset, page_size // 2)
+                    for offset in range(0, len(pages) * page_size, page_size // 2)
+                ],
+            )
+            self.assertEqual(self.reader._seen_pages, bytes([1]) * len(pages))
+            pool.submit.reset_mock()
+            self.assertTrue(self.reader._prefetch_missing_pages(pages, 0, page_size))
+            pool.submit.assert_not_called()
+
+    def test_failed_page_batch_leaves_pages_unmarked(self):
+        pages = np.arange(2 * NS["_PLE_IO_WORKERS"])
+        self.reader._seen_pages = bytearray(len(pages))
+
+        def pread(fd, size, offset):
+            if offset == 0:
+                raise OSError("injected batch failure")
+            return b"x" * size
+
+        with (
+            patch.object(os, "pread", pread),
+            self.assertRaisesRegex(OSError, "injected batch failure"),
+        ):
+            self.reader._prefetch_missing_pages(pages, 0, NS["_PLE_PAGE_SIZE"])
+        self.assertFalse(any(self.reader._seen_pages))
 
     def embedding(self):
         e = object.__new__(NS["DiskBackedShardedEmbedding"])

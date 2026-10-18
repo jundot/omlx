@@ -17,7 +17,7 @@ import functools
 import inspect
 import logging
 import math
-import os
+import threading
 import time
 import weakref
 from collections import deque
@@ -50,9 +50,6 @@ def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
         pass
 
 
-_ROW_EXACT_DISABLED = os.environ.get("OMLX_MTP_ROW_EXACT_VERIFY", "1").strip() == "0"
-
-
 def _row_exact_verify(model: Any) -> bool:
     """Whether the target's verify rows must reproduce its one-row decode.
 
@@ -60,10 +57,7 @@ def _row_exact_verify(model: Any) -> bool:
     armed verify forwards then run every multi-row quantized projection,
     DeltaNet prework and attention row with the arithmetic of a serial
     decode step, so greedy MTP output equals MTP-off output byte for byte.
-    ``OMLX_MTP_ROW_EXACT_VERIFY=0`` restores the faster verify kernels.
     """
-    if _ROW_EXACT_DISABLED:
-        return False
     for candidate in (
         model,
         getattr(model, "_language_model", None),
@@ -128,8 +122,10 @@ def apply() -> bool:
                     logger.debug("MTP path not active: %s", reason)
 
         def patched_next(self, *args, **kwargs):
+            model = getattr(self, "model", None)
             if _is_mtp_batch_eligible(self):
                 policy = _batch_policy_for_next(self)
+                _batch_park_memory(self.model).tick()
                 if policy is not None and policy.needs_standard():
                     if not _reconcile_mtp_batch_to_standard(self):
                         raise RuntimeError(
@@ -155,7 +151,7 @@ def apply() -> bool:
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        with _spec_command_buffers():
+                        with _spec_command_buffers(model):
                             return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
@@ -182,7 +178,7 @@ def apply() -> bool:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
-                            with _spec_command_buffers():
+                            with _spec_command_buffers(model):
                                 return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
@@ -376,6 +372,24 @@ def _model_has_mtp_module(model: Any) -> bool:
 # raise its peak memory.
 _SPEC_BUFFER_CAPS = (200, 512)
 
+# Target model types supported by the Qwen Lightning MTP/DFlash paths.
+_SPEC_CAPS_TARGET_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_5_vl",
+        "qwen3_6",
+        "qwen3_6_moe",
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }
+)
+
+
+def _spec_caps_target(model: Any) -> bool:
+    """Whether the loaded target belongs to the selected Qwen family."""
+    return getattr(model, "model_type", None) in _SPEC_CAPS_TARGET_TYPES
+
 
 @functools.lru_cache(maxsize=1)
 def _raises_spec_buffer_caps() -> bool:
@@ -393,22 +407,35 @@ def _raises_spec_buffer_caps() -> bool:
     return architecture.startswith("applegpu_g15")
 
 
+# The caps live on the MLX device, so engines running cycles at the same time
+# share one raise and the last one out restores MLX's values.
+_spec_caps_lock = threading.Lock()
+_spec_caps_holders = 0
+_spec_caps_previous: Optional[Tuple[int, int]] = None
+
+
 @contextlib.contextmanager
-def _spec_command_buffers():
-    """Raise MLX's command-buffer caps for one speculative decode step.
+def _spec_command_buffers(model: Any = None):
+    """Raise caps for supported Qwen targets and GPUs, then restore them."""
+    global _spec_caps_holders, _spec_caps_previous
+    if not _spec_caps_target(model) or not _raises_spec_buffer_caps():
+        yield
+        return
 
-    Measured on M5 and M3 Ultra, so other GPUs keep MLX's caps.
-    """
-    from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
+    from omlx.custom_kernels.quant_matmul.fast import set_command_buffer_caps
 
-    previous = None
-    if _raises_spec_buffer_caps():
-        previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+    with _spec_caps_lock:
+        if _spec_caps_holders == 0:
+            _spec_caps_previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+        _spec_caps_holders += 1
     try:
         yield
     finally:
-        if previous is not None:
-            set_command_buffer_caps(*previous)
+        with _spec_caps_lock:
+            _spec_caps_holders -= 1
+            if _spec_caps_holders == 0 and _spec_caps_previous is not None:
+                set_command_buffer_caps(*_spec_caps_previous)
+                _spec_caps_previous = None
 
 
 def _drafter_for(model: Any) -> Optional[Any]:
@@ -417,7 +444,7 @@ def _drafter_for(model: Any) -> Optional[Any]:
     A drafter replaces the embedded MTP head as the draft source. It is
     stamped on the language model as ``_omlx_drafter`` at attach time and
     exposes ``depth``, ``target_layer_ids``, ``draft``, ``observe``,
-    ``release`` and ``decode_scope`` (see omlx.speculative.dflash_drafter).
+    ``release`` and ``decode_scope`` (see omlx.speculative.dflash).
     """
     candidates = [model]
     for attr in ("language_model", "_language_model"):
@@ -858,10 +885,10 @@ class _MtpState:
     # Boundary tokens need a one-row forward on a private cache.
     boundary_emit_pending: bool = False
 
-    # Context-copy proposer (greedy chain cycles; False when this request
-    # never copies), whether the pending drafts came from it rather than the
-    # MTP head, and whether this cycle rebuilt its index (a one-off host
-    # cost the depth controller must not time as the window's).
+    # Context-copy proposer (greedy chain cycles), whether the pending drafts
+    # came from it rather than the MTP head, and whether this cycle rebuilt
+    # its index (a one-off host cost the depth controller must not time as
+    # the window's).
     context_copy: Optional[Any] = None
     copy_drafts: bool = False
     copy_untimed: bool = False
@@ -1355,18 +1382,35 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
     return batch_state
 
 
+# One ParkMemory per live model object (keyed by id: models are dict-like
+# modules; the weak reference keeps a reused id from inheriting verdicts).
+_BATCH_PARK_MEMORY: Dict[int, Tuple[Any, Any]] = {}
+
+
+def _batch_park_memory(model: Any):
+    from .batch_policy import ParkMemory
+
+    entry = _BATCH_PARK_MEMORY.get(id(model))
+    if entry is None or entry[0]() is not model:
+        entry = _BATCH_PARK_MEMORY[id(model)] = (weakref.ref(model), ParkMemory())
+    return entry[1]
+
+
 def _batch_policy_for_next(gen_batch: Any):
     from .batch_policy import BatchPolicy
 
     policy = getattr(gen_batch, "_omlx_mtp_batch_policy", None)
     if policy is None or policy.uids != tuple(gen_batch.uids):
+        memory = _batch_park_memory(gen_batch.model)
+        if policy is not None:
+            memory.retired(policy)
         chain, depth, _ = _resolve_mtp_chain_depth(gen_batch.model)
         policy = BatchPolicy(
             gen_batch.uids,
             depth if chain else 1,
-            fixed=_drafter_for(gen_batch.model) is not None
-            or _mtp_depth_fixed(gen_batch.model),
+            fixed=_mtp_depth_fixed(gen_batch.model),
         )
+        memory.seed(policy)
         gen_batch._omlx_mtp_batch_policy = policy
     return policy
 
@@ -1519,6 +1563,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     tokens = gen_batch.tokens[0] if getattr(gen_batch, "tokens", None) else None
     if not tokens:
         return False
+    started = time.perf_counter()
     try:
         new_cache = _rebuild_singleton_cache(gen_batch.model)
         if new_cache is None:
@@ -1562,11 +1607,14 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             from mlx_lm.models.cache import TokenBuffer
 
             gen_batch._token_context[0] = TokenBuffer(list(tokens))
-        logger.debug(
-            "MTP reconciled to standard on reshape (uid=%s tokens=%d queue=%d)",
+        logger.info(
+            "MTP reconciled to standard on reshape (uid=%s tokens=%d chunks=%d "
+            "queue=%d, %.2fs)",
             getattr(state, "uid", "?"),
             len(tokens),
+            -(-total // step),
             len(state.queue),
+            time.perf_counter() - started,
         )
         return True
     except Exception as exc:
@@ -2240,7 +2288,14 @@ def _resolve_mtp_chain_depth(model: Any) -> Tuple[bool, int, bool]:
 
 
 def _mtp_depth_fixed(model: Any) -> bool:
-    """True when the model was loaded with a fixed draft depth (no controller)."""
+    """True when the draft depth has no controller.
+
+    That is a model loaded with a fixed MTP depth, or a block drafter whose
+    verify mode keeps the whole block.
+    """
+    drafter = _drafter_for(model)
+    if drafter is not None:
+        return not getattr(drafter, "adaptive", False)
     candidates = [model]
     for attr in ("language_model", "_language_model"):
         inner = getattr(model, attr, None)
@@ -2887,6 +2942,7 @@ def _dspark_next_drafts(
     hidden_rows: Any,
     committed: Any,
     prev_buf: Optional[Any],
+    depth: Optional[int] = None,
 ) -> None:
     """Append committed target taps and sample one DSpark block.
 
@@ -2900,7 +2956,8 @@ def _dspark_next_drafts(
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
 
-    depth = state.controller.cur if state.controller is not None else state.depth
+    if depth is None:
+        depth = state.controller.cur if state.controller is not None else state.depth
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
     n = int(committed.shape[0])
     if depth <= 0:
@@ -2994,6 +3051,7 @@ def _chain_next_drafts(
             hidden_rows,
             committed,
             prev_buf,
+            depth,
         )
     sampler = _resolve_draft_sampler(gen_batch, state)
     procs = _proc_list(gen_batch)
@@ -3202,20 +3260,6 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
-        if drafter is not None:
-            # Block drafters keep their own per-request context and draft a
-            # fixed block, so neither the head cache nor the depth
-            # controller applies. The captured hidden of main_tok is the
-            # newest context entry; next_main is the anchor.
-            state.mtp_cache = []
-            state.next_main = _ensure_uint32(next_main_tok)
-            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
-            state.queue.append(
-                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
-            )
-            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
-            gen_batch._omlx_mtp_state = state
-            return
         if depth > 1 and not _mtp_depth_fixed(gen_batch.model):
             factory = getattr(
                 _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
@@ -3234,6 +3278,20 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
                     gen_batch.model._omlx_mtp_depth_seed = state.controller
                 except Exception:
                     pass
+        if drafter is not None:
+            # Block drafters keep their own per-request context and draft
+            # the whole block; the depth controller only narrows the
+            # verified part. The captured hidden of main_tok is the newest
+            # context entry; next_main is the anchor.
+            state.mtp_cache = []
+            state.next_main = _ensure_uint32(next_main_tok)
+            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+            state.queue.append(
+                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+            )
+            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
+            gen_batch._omlx_mtp_state = state
+            return
         primed = _prompt_priming.take_primed(
             gen_batch.model,
             gen_batch.prompt_cache,
@@ -3338,13 +3396,28 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
     if policy is not None and policy.uids != tuple(gen_batch.uids):
         policy = None
     saved = [(state.controller, state.depth) for state in states]
-    depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
+    # Copied windows are not draft-depth decisions; the singleton depth
+    # controller skips them too.
+    copied = any(state.copy_drafts for state in states)
     previous = [(state.stats.cycles, state.stats.accepts) for state in states]
     requested = policy.cur if policy is not None else None
     if policy is not None:
         for state in states:
             state.controller = None
             state.depth = requested
+    if _drafter_for(gen_batch.model) is not None:
+        # Clip before grouping so rows that share a window verify together.
+        for state in states:
+            if state.chain:
+                _clip_block_drafts(
+                    state,
+                    (
+                        state.controller.cur
+                        if state.controller is not None
+                        else state.depth
+                    ),
+                )
+    depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
     started = time.perf_counter()
     try:
         advance(gen_batch, batch_state)
@@ -3364,6 +3437,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
     )
     if (
         policy is not None
+        and not copied
         and tuple(gen_batch.uids) == policy.uids
         and len(set(depths)) == 1
         and depths[0] > 0
@@ -3391,6 +3465,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
                     "Lightning MTP could not restore batch parking state"
                 )
             policy.park()
+            _batch_park_memory(gen_batch.model).parked(policy)
             logger.info(
                 "Lightning MTP batch parked: rows=%d standard_ms=%.3f cooldown=%d",
                 len(states),
@@ -3804,6 +3879,25 @@ def _dense_q_rows(draft_accept_lps) -> list:
     return list(draft_accept_lps)
 
 
+def _clip_block_drafts(state: _MtpState, limit: int) -> None:
+    """Keep the first ``limit`` drafts of a block for this verify.
+
+    Block drafters pick positions left to right, so a prefix of the block
+    with its draft distributions is a complete proposal.
+    """
+    drafts = state.drafts
+    if drafts is None or limit >= int(drafts.shape[0]):
+        return
+    state.drafts = drafts[:limit]
+    if state.draft_lps:
+        state.draft_lps = state.draft_lps[:limit]
+    q = state.draft_accept_lps
+    if isinstance(q, SparseDraftQ):
+        state.draft_accept_lps = SparseDraftQ(q.ids[:limit], q.logq[:limit], q.vocab)
+    elif q:
+        state.draft_accept_lps = list(q)[:limit]
+
+
 def _sparse_top_k(sampler) -> int:
     """Top-k of a sampler whose target filter is exactly top-p + top-k, else 0."""
     top_k = int(getattr(sampler, "top_k", 0) or 0)
@@ -3968,22 +4062,21 @@ def _context_copy_drafts(
     ``[]`` when the MTP head should draft instead.
     """
     if state.context_copy is None:
-        # False marks a request that never copies (disabled, or a DSpark
-        # host whose drafter owns the window).
-        state.context_copy = (
-            _context_copy.ContextCopy()
-            if _context_copy.ENABLED and _dspark_host(gen_batch.model) is None
-            else False
+        state.context_copy = _context_copy.ContextCopy(
+            wide_window=_row_exact_verify(gen_batch.model)
         )
     copier = state.context_copy
-    if not copier:
-        return []
     state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
     # The next cycle emits up to len(drafts) + 1 tokens after the queued ones.
     room = (
         gen_batch.max_tokens[0] - gen_batch._num_tokens[0] - len(committed_ids) - 1
     )
-    return copier.propose(room)
+    if _dspark_host(gen_batch.model) is None:
+        return copier.propose(room)
+    # Copies verify in DSpark's window sizes, and only a copy that fills the
+    # block replaces it: DSpark already drafts repeated text accurately.
+    copied = copier.propose(min(room, state.depth))
+    return copied if len(copied) == state.depth else []
 
 
 def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
@@ -4025,6 +4118,13 @@ def _run_verify_cycle_chain(
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
     is_greedy = _is_greedy(gen_batch)
+    drafter = _drafter_for(gen_batch.model)
+    if drafter is not None and verify_result is None:
+        # A shared verify was already built from the drafts it was given.
+        _clip_block_drafts(
+            state,
+            state.controller.cur if state.controller is not None else state.depth,
+        )
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
@@ -4044,7 +4144,6 @@ def _run_verify_cycle_chain(
 
     # --- backbone verify forward + single host sync ---
     t0 = time.perf_counter()
-    drafter = _drafter_for(gen_batch.model)
     if verify_result is None:
         verify_result = _call_backbone_captured(
             gen_batch.model,
@@ -4224,10 +4323,12 @@ def _run_verify_cycle_chain(
         state.stats.copy_cycles += 1
         state.stats.copy_drafted += k
         state.stats.copy_accepted += m
-        state.context_copy.observe(m)
+        state.context_copy.observe(m, k)
     else:
-        if len(state.stats.depth_drafted) < state.depth:
-            pad = state.depth - len(state.stats.depth_drafted)
+        # A batch policy can lower state.depth below the drafts a row holds.
+        depth = max(state.depth, k)
+        if len(state.stats.depth_drafted) < depth:
+            pad = depth - len(state.stats.depth_drafted)
             state.stats.depth_drafted.extend([0] * pad)
             state.stats.depth_accepted.extend([0] * pad)
         for j in range(k):

@@ -22,14 +22,10 @@ and top-k selection can only differ at exact near-ties.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
-
-_ENV = os.environ.get("OMLX_GLM_DSA_INDEXER_NAX", "1").strip().lower()
-_ENABLED = _ENV not in {"0", "false", "off"}
 
 # Rows per call: bounds the [rows, P] bf16 score buffer (256 MiB).
 _MAX_SCORE_ELEMENTS = 1 << 27
@@ -192,8 +188,6 @@ def _kernel():
 
 @lru_cache(maxsize=1)
 def nax_indexer_available() -> bool:
-    if not _ENABLED:
-        return False
     try:
         from omlx.custom_kernels.nax import is_nax_available
 

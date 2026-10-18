@@ -60,9 +60,15 @@ struct ModelsScreen: View {
                           comment: "Generic cancel button"),
                    role: .cancel) { vm.pendingRemoveID = nil }
         } message: { id in
-            Text(String(localized: "models.delete.confirm_message",
-                        defaultValue: "The model files will be permanently removed from disk and unloaded if currently running.",
-                        comment: "Body text inside the delete-model confirmation dialog explaining the impact"))
+            if vm.allModels.first(where: { $0.id == id })?.isInHFCache == true {
+                Text(String(localized: "models.delete.confirm_message_hf_cache",
+                            defaultValue: "This model is in the shared Hugging Face cache. Other apps that use the cache will need to download it again.",
+                            comment: "Body text inside the delete-model confirmation dialog when the model lives in the shared Hugging Face cache"))
+            } else {
+                Text(String(localized: "models.delete.confirm_message",
+                            defaultValue: "The model files will be permanently removed from disk and unloaded if currently running.",
+                            comment: "Body text inside the delete-model confirmation dialog explaining the impact"))
+            }
         }
     }
 }
@@ -233,6 +239,17 @@ private struct LibrarySection: View {
                                         .lineLimit(1)
                                         .truncationMode(.tail)
                                     CopyIconButton(value: m.id)
+                                    if m.isInHFCache {
+                                        StatusPill(status: .custom(
+                                            color: theme.textTertiary,
+                                            label: String(localized: "models.library.hf_cache.badge",
+                                                          defaultValue: "HF cache",
+                                                          comment: "Badge on a library model found in the shared Hugging Face cache"),
+                                            fillBg: true))
+                                            .help(String(localized: "models.library.hf_cache.help",
+                                                         defaultValue: "Found in the Hugging Face cache. Other apps that use this cache will need to download it again after you delete it.",
+                                                         comment: "Tooltip on the HF cache badge in the model library"))
+                                    }
                                 }
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                                     .font(.omlxMono(11))
@@ -305,7 +322,7 @@ private struct LibrarySection: View {
 
     private func gradient(for m: ModelDTO) -> [Color] {
         switch m.modelType {
-        case "embedding", "reranker": return SquircleGradient.downloads
+        case "embedding", "reranker", "decision": return SquircleGradient.downloads
         case "audio_stt", "audio_tts", "audio_sts": return SquircleGradient.integrations
         case "vlm":             return SquircleGradient.update
         default:                return SquircleGradient.models
@@ -316,6 +333,7 @@ private struct LibrarySection: View {
         switch m.modelType {
         case "embedding": return "cube.transparent"
         case "reranker":  return "arrow.up.arrow.down"
+        case "decision":  return "checklist"
         case "audio_stt", "audio_tts", "audio_sts": return "waveform"
         case "vlm":     return "eye"
         default:        return "cpu"

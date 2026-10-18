@@ -1485,6 +1485,32 @@ def _patch_verify_layer_flush() -> None:
     Qwen3_5BatchInvariantForward._model = _model
 
 
+def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
+    """Kernel an armed verify projection runs ("sg8", "mma" or "vk"), or None
+    for the stock qmm."""
+    if sg8_eligible(rows, K, N, bits, group_size, dtype):
+        return "sg8"
+    if mma_eligible(rows, K, N, bits, group_size, dtype):
+        return "mma"
+    if rows <= 6 and vk_eligible(rows, K, N, bits, group_size, dtype):
+        return "vk"
+    return None
+
+
+def takes_verify_route(layer, rows: int, dtype) -> bool:
+    """Whether a ``rows``-row call of ``layer`` (an ``nn.QuantizedLinear``)
+    now leaves the stock qmm: row-exact mode, or an armed verify route."""
+    if rows < 2 or not getattr(type(layer), "_omlx_verify_qmm_patched", False):
+        return False
+    if is_row_exact_armed():
+        return True
+    if not _is_armed() or getattr(layer, "mode", "affine") != "affine":
+        return False
+    K = layer.weight.shape[-1] * 32 // layer.bits
+    N = layer.scales.shape[0]
+    return _verify_route(rows, K, N, layer.bits, layer.group_size, dtype) is not None
+
+
 def apply_verify_qmm_patch() -> bool:
     """Route verify-shaped ``nn.QuantizedLinear`` calls to the vk kernels.
 
@@ -1522,13 +1548,7 @@ def apply_verify_qmm_patch() -> bool:
         batch, length, K = x.shape
         rows = batch * length
         N = self.scales.shape[0]
-        route = None
-        if sg8_eligible(rows, K, N, self.bits, self.group_size, x.dtype):
-            route = "sg8"
-        elif mma_eligible(rows, K, N, self.bits, self.group_size, x.dtype):
-            route = "mma"
-        elif rows <= 6 and vk_eligible(rows, K, N, self.bits, self.group_size, x.dtype):
-            route = "vk"
+        route = _verify_route(rows, K, N, self.bits, self.group_size, x.dtype)
         if route is None:
             return orig_call(self, x)
         try:

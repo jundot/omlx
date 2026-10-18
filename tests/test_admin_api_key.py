@@ -22,6 +22,7 @@ class TestListModelsSettings:
     def test_list_models_includes_all_model_settings_fields(self):
         """Ensure list_models response includes all ModelSettings fields."""
         mock_engine_pool = MagicMock()
+        mock_engine_pool.splash_target.return_value = (None, "")
         mock_engine_pool.get_status.return_value = {
             "models": [
                 {
@@ -198,6 +199,7 @@ class TestListModelsSettings:
         model_id = "Qwen3.6-27B-MLX-oQ5-FP16"
 
         mock_engine_pool = MagicMock()
+        mock_engine_pool.splash_target.return_value = (None, "")
         mock_engine_pool.get_status.return_value = {
             "models": [
                 {
@@ -221,6 +223,7 @@ class TestListModelsSettings:
         mock_global_settings = SimpleNamespace(
             base_path=tmp_path,
             model=SimpleNamespace(get_model_dirs=lambda base_path: [model_root]),
+            integrations=SimpleNamespace(splash_path=None),
         )
 
         with (

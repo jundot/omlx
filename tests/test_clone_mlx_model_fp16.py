@@ -7,7 +7,7 @@ import mlx.core as mx
 import pytest
 from safetensors import safe_open
 
-from tools.clone_mlx_model_fp16 import clone_model
+from scripts.clone_mlx_model_fp16 import clone_model
 
 
 def _source_model(tmp_path, values: list[float]):

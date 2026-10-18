@@ -579,6 +579,27 @@ class TestCompileGrammarForRequest:
         )
         mock_get_tag.assert_called_once_with("qwen", reasoning=False)
 
+    @requires_xgrammar
+    @patch("xgrammar.get_builtin_structural_tag")
+    def test_tag_without_output_slot_degrades_response_format(self, mock_get_tag):
+        """A tag with no output slot must not compile an unconstrained answer."""
+        mock_tag = MagicMock()
+        mock_tag.model_dump.return_value = {
+            "type": "structural_tag",
+            "format": {"type": "const_string", "value": "x"},
+        }
+        mock_get_tag.return_value = mock_tag
+        compiler = MagicMock()
+        engine = _make_engine(grammar_compiler=compiler)
+
+        result = self._call(
+            engine,
+            response_format={"type": "json_object"},
+            reasoning_parser="kimi_k3",
+        )
+        assert result is None
+        compiler.compile_structural_tag.assert_not_called()
+
     def test_no_reasoning_parser_uses_bare_grammar(self):
         """Without reasoning_parser, bare grammar compilation is used."""
         compiler = MagicMock()
@@ -1023,27 +1044,38 @@ _BUDGET_VOCAB = [bytes([i]) for i in range(256)] + [
     b"<ifm|tool_call>",
     b"</ifm|tool_call>",
     b"<ifm|arg_key>",
+    b"<mm:think>",
+    b"</mm:think>",
 ]
 _THINK_END, _THINK_START, _BUDGET_STOP = 256, 257, 258
+_MM_THINK_START, _MM_THINK_END = 265, 266
 
 
-def _budget_processors(compiled):
+def _budget_processors(compiled, think_end=_THINK_END, think_start=_THINK_START):
     scheduler = MagicMock(spec=Scheduler)
     scheduler._xtc_special_tokens = set()
     scheduler._model_suppress_tokens = set()
     scheduler._get_model_vocab_size.return_value = len(_BUDGET_VOCAB)
     scheduler._get_think_token_id.return_value = _THINK_START
-    scheduler._resolve_think_end_token_ids.return_value = [_THINK_END]
+    scheduler._resolve_think_end_token_ids.return_value = [think_end]
     scheduler._resolve_think_close_pattern.return_value = (None, None)
     scheduler._resolve_output_parser_thinking_trailing_ids.return_value = None
-    scheduler._get_output_parser_thinking_end_text.return_value = "</think>"
+    scheduler._get_output_parser_thinking_end_text.return_value = (
+        _BUDGET_VOCAB[think_end].decode()
+    )
+    scheduler._get_output_parser_thinking_start_text.return_value = (
+        _BUDGET_VOCAB[think_start].decode()
+    )
+    scheduler._encode_thinking_marker.side_effect = (
+        lambda text: [_BUDGET_VOCAB.index(text.encode())]
+    )
     scheduler._thinking_budget_token_to_piece.side_effect = (
         lambda token: _BUDGET_VOCAB[token]
     )
     params = SamplingParams(temperature=0, thinking_budget=1, compiled_grammar=compiled)
     request = Request(request_id="grammar-budget", prompt="test", sampling_params=params)
     request.needs_think_prefix = True
-    request.think_end_token_id = _THINK_END
+    request.think_end_token_id = think_end
     return Scheduler._build_sampler_and_processors(scheduler, params, request)[1]
 
 
@@ -1118,6 +1150,74 @@ class TestGrammarThinkingBudget:
             [*expected, *b"abc", _BUDGET_STOP],
             preferred=lambda token: ord("x") if token == _THINK_END else token,
         )
+
+    # Qwen3 leaves <think> to the model; Qwen3.5 puts it at the end of the prompt.
+    @pytest.mark.parametrize("opener", [[_THINK_START], []])
+    def test_open_reasoning_accepts_model_opener(self, compiler, opener):
+        compiled = _compile_with_structural_tag(
+            compiler, {"type": "regex", "pattern": "abc"}, "qwen_3", None
+        )
+        matcher = xgr.GrammarMatcher(compiled)
+        for token in [*opener, *b"x", _THINK_END, *b"\n\nabc", _BUDGET_STOP]:
+            assert matcher.accept_token(token), _BUDGET_VOCAB[token]
+        assert matcher.is_terminated()
+
+    def test_minimax_m3_budget_close_starts_output(self, compiler):
+        compiled = _compile_with_structural_tag(
+            compiler,
+            {"type": "regex", "pattern": "abc"},
+            "minimax_m3",
+            {"enable_thinking": True},
+        )
+        _sample_through(
+            _budget_processors(compiled, think_end=_MM_THINK_END),
+            [_MM_THINK_END, *b"abc", _BUDGET_STOP],
+            preferred=lambda token: ord("x") if token == _MM_THINK_END else token,
+        )
+
+    # The adaptive prompt leaves <mm:think> to the model, so the budget must not
+    # count, or force a close into, an answer that skips reasoning.
+    @pytest.mark.parametrize(
+        "expected",
+        [[*b"abc"], [_MM_THINK_START, _MM_THINK_END, *b"abc"]],
+    )
+    def test_minimax_m3_adaptive_budget_waits_for_opener(self, compiler, expected):
+        compiled = _compile_with_structural_tag(
+            compiler, {"type": "regex", "pattern": "abc"}, "minimax_m3", {}
+        )
+        _sample_through(
+            _budget_processors(
+                compiled, think_end=_MM_THINK_END, think_start=_MM_THINK_START
+            ),
+            [*expected, _BUDGET_STOP],
+            preferred=lambda token: ord("x") if token == _MM_THINK_END else token,
+        )
+
+    @pytest.mark.parametrize(
+        "ct_kwargs, output",
+        [
+            # The default adaptive prompt has no opener; the model may think or not.
+            ({}, [_MM_THINK_START, *b"x", _MM_THINK_END, *b"abc"]),
+            ({}, [*b"abc"]),
+            (
+                {"thinking_mode": "adaptive", "enable_thinking": True},
+                [_MM_THINK_END, *b"abc"],
+            ),
+            # The enabled prompt ends with <mm:think>; disabled ends with </mm:think>.
+            ({"enable_thinking": True}, [*b"x", _MM_THINK_END, *b"abc"]),
+            ({"thinking_mode": "disabled", "enable_thinking": True}, [*b"abc"]),
+        ],
+    )
+    def test_minimax_m3_grammar_follows_template_thinking_mode(
+        self, compiler, ct_kwargs, output
+    ):
+        compiled = _compile_with_structural_tag(
+            compiler, {"type": "regex", "pattern": "abc"}, "minimax_m3", ct_kwargs
+        )
+        matcher = xgr.GrammarMatcher(compiled)
+        for token in [*output, _BUDGET_STOP]:
+            assert matcher.accept_token(token), _BUDGET_VOCAB[token]
+        assert matcher.is_terminated()
 
     def test_unconstrained_output_keeps_budget(self):
         assert _has_budget(_budget_processors(None))

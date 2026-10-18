@@ -1059,29 +1059,22 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
         assert same(actual, reference)
 
 
-def test_qwen4_decode_setting_is_captured_per_model(monkeypatch):
-    from omlx.scheduler import SchedulerConfig
-
+def test_qwen4_decode_setting_is_captured_per_model():
     module = _canonical_qwen4_decode_module(((8, 64),) * 4)
     module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
-    model = SimpleNamespace(modules=lambda: [module])
-    config = SchedulerConfig(qwen4_gdn_decode_wide_proj=True)
-    monkeypatch.setenv("OMLX_QWEN4_GDN_DECODE_WIDE_PROJ", "1")
     assert not prework_mod._qwen4_decode_static_eligible(module)
 
     prework_mod.configure_qwen4_decode(
-        model, wide_projections=config.qwen4_gdn_decode_wide_proj
+        SimpleNamespace(modules=lambda: [module]), wide_projections=True
     )
-    config.qwen4_gdn_decode_wide_proj = False
     assert prework_mod._qwen4_decode_static_eligible(module)
 
-    reloaded = _canonical_qwen4_decode_module(((8, 64),) * 4)
-    reloaded.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    other = _canonical_qwen4_decode_module(((8, 64),) * 4)
+    other.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
     prework_mod.configure_qwen4_decode(
-        SimpleNamespace(modules=lambda: [reloaded]),
-        wide_projections=config.qwen4_gdn_decode_wide_proj,
+        SimpleNamespace(modules=lambda: [other]), wide_projections=False
     )
-    assert not prework_mod._qwen4_decode_static_eligible(reloaded)
+    assert not prework_mod._qwen4_decode_static_eligible(other)
     assert prework_mod._qwen4_decode_static_eligible(module)
 
 
@@ -1410,7 +1403,7 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8, 12, 16])
 @pytest.mark.parametrize("seed", [5, 23])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
     monkeypatch, qwen4_verify, rows, seed
@@ -1534,11 +1527,14 @@ def test_qwen4_batched_decode_step_equals_one_row_steps(rows):
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rows", [1, 2, 4, 9])
+@pytest.mark.parametrize("rows", [1, 2, 4, 9, 16])
 @pytest.mark.parametrize("seed", [7, 29])
 def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows, seed):
     """The FP32 instantiation carries the unrounded conv, q/k/v, recurrence
     output and gate products that BF16 rounds away."""
+    if dtype == mx.float32 and rows > 9:
+        pytest.skip("FP32 staging exceeds 32 KB of threadgroup memory past 15 rows; "
+                    "served verify windows are BF16")
     mx.random.seed(seed)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
     q_scale = mx.array(DK**-0.5, dtype=dtype)

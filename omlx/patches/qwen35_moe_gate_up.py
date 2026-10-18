@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import os
 from functools import wraps
 from typing import Any
 
@@ -51,19 +50,17 @@ from mlx_vlm.models.switch_layers import (
 from ..scheduler import _sync_and_clear_cache
 from . import moe_verify_gather
 from .m5_gather_qmm import fused_gate_up_activation
+from .m5_gather_qmm_a8 import try_routed_a8
 from .moe_routes import sort_routes
 from .module_cache import cached_per_module
 
 logger = logging.getLogger(__name__)
 
 _CALL_PATCHED = False
-# Unsorted routed-expert calls (decode) read the fused operands resolved once
-# per SwitchGLU; OMLX_QWEN35_MOE_DECODE_PLAN=0 resolves them per call.
-_DECODE_PLAN_ENABLED = os.environ.get("OMLX_QWEN35_MOE_DECODE_PLAN", "1") != "0"
 
 # Loaded model classes whose module path marks a supported SwitchGLU family:
 # mlx-lm Qwen3.5/3.6 and HyV3, Qwen4-Exp's inherited SwitchGLU, the oMLX
-# single-checkpoint MTP wrapper, and the vendored Laguna module.
+# single-checkpoint MTP wrapper, the vendored Laguna module and Muse Spark.
 _FAMILY_TOKENS = (
     "qwen3_5",
     "qwen3_6",
@@ -71,6 +68,7 @@ _FAMILY_TOKENS = (
     "qwen4_exp",
     "laguna",
     "hy_v3",
+    "muse_spark",
 )
 
 
@@ -90,6 +88,10 @@ def _can_fuse(switch_mlp: Any) -> bool:
         return False
     gate, up = switch_mlp.gate_proj, switch_mlp.up_proj
     if type(gate) is not type(up):
+        return False
+    if any("global_scale" in p for p in (gate, up, switch_mlp.down_proj)):
+        # NVFP4 tensor scales stay per projection, and the fused forward does
+        # not apply the down projection's scale.
         return False
     if isinstance(gate, (QuantizedSwitchLinear, VLMQuantizedSwitchLinear)):
         if (gate.group_size, gate.bits, gate.mode) != (
@@ -160,6 +162,18 @@ def _make_patched_call(orig_call):
             idx = mx.stop_gradient(idx)
         x_act = None
         if do_sort and not self.training:
+            # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up
+            # on INT8 operands and the A16 Down; None keeps the A16 path.
+            routed = try_routed_a8(
+                self,
+                token_rows,
+                idx,
+                # [B, L, k] routes: the sequence length, not B * L
+                seq_len=int(indices.shape[-2]) if indices.ndim >= 3 else None,
+            )
+            if routed is not None:
+                x = _scatter_unsort(routed, inv_order, indices.shape)
+                return x.squeeze(-2)
             # Sorted prefill on M5: the activation in the [gate; up]
             # matmul's epilogue, token rows read in place (bit-identical;
             # None keeps this path).
@@ -256,7 +270,7 @@ def _make_vlm_patched_call(original):
             # The upstream kernel would copy the strided gate/up views.
             routed = _fused_verify_switch(self, x, indices)
             return self._combine(routed, weights, shared, residual)
-        if _DECODE_PLAN_ENABLED and indices.size < 64:
+        if indices.size < 64:
             # fused_call's unsorted branch (decode rows) with cached operands.
             plan = cached_per_module(self, "_omlx_gate_up_decode_plan", _build_decode_plan)
             if plan is not None:
@@ -320,18 +334,21 @@ def _ensure_call_patch() -> None:
 def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
     """Fuse gate+up expert projections on a supported loaded MoE model.
 
-    Returns the number of fused ``SwitchGLU`` instances (0 when disabled
-    via ``OMLX_QWEN35_MOE_GATE_UP=0``, the model family is unsupported,
-    or there is nothing to fuse).
+    Returns the number of fused ``SwitchGLU`` instances (0 when the model
+    family is unsupported or there is nothing to fuse).
     """
-    if os.environ.get("OMLX_QWEN35_MOE_GATE_UP", "1") == "0":
-        return 0
     if not _is_supported_family(model):
         return 0
+    # Subclasses opt in when their forward defers to the patched SwitchGLU
+    # forward once gate_up_proj exists.
     targets = [
         m
         for _, m in model.named_modules()
-        if type(m) in (SwitchGLU, VLMSwitchGLU) and _can_fuse(m)
+        if (
+            type(m) in (SwitchGLU, VLMSwitchGLU)
+            or getattr(type(m), "_omlx_gate_up_fusion", False)
+        )
+        and _can_fuse(m)
     ]
     if not targets:
         return 0

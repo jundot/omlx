@@ -528,6 +528,19 @@ class TestPagedCacheManager:
         assert manager.free_blocks == initial_free + 1
         assert block_id not in manager.allocated_blocks
 
+    def test_free_block_clears_hash_and_token_count(self):
+        """Free-queue blocks must carry no stale hash or token_count."""
+        manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)
+
+        block = manager.allocate_block()
+        block.block_hash = compute_block_hash(None, [1, 2, 3])
+        block.token_count = 3
+
+        assert manager.free_block(block.block_id) is True
+        assert block.block_hash is None
+        assert block.token_count == 0
+        assert manager.cold_block_count == 0
+
     def test_free_block_shared(self):
         """Test freeing a shared block only decrements ref_count."""
         manager = PagedCacheManager(block_size=64, max_blocks=100, initial_blocks=100)

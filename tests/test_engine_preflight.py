@@ -221,12 +221,10 @@ async def test_batched_engine_preflight_runs_eviction_before_final_check():
     scheduler.preflight_eviction_request.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
-        text_only=True,
     )
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=123,
         request_id="req-evict",
-        text_only=True,
     )
     assert order == [("evict", "req-evict"), ("final", "checked")]
 
@@ -271,7 +269,6 @@ async def test_batched_engine_retries_transient_rejection_after_cleanup(monkeypa
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=60_000,
         request_id="req-next",
-        text_only=True,
     )
     evict.assert_not_awaited()
 
@@ -321,7 +318,6 @@ async def test_stale_idle_preflight_refreshes_before_eviction():
             request_id="req-stale",
             eviction_callback=evict,
             executor=executor,
-            text_only=True,
         )
     finally:
         executor.shutdown(wait=True)
@@ -331,7 +327,6 @@ async def test_stale_idle_preflight_refreshes_before_eviction():
     scheduler.preflight_or_raise.assert_called_once_with(
         num_prompt_tokens=60_000,
         request_id="req-stale",
-        text_only=True,
     )
     evict.assert_not_awaited()
 
@@ -441,7 +436,10 @@ def test_async_remove_schedules_clear_after_extracted_cache_release(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_batched_engine_preflight_chat_raises_for_oversize_prompt(monkeypatch):
+@pytest.mark.parametrize("prepared", [False, True])
+async def test_batched_engine_preflight_chat_raises_for_oversize_prompt(
+    monkeypatch, prepared
+):
     from omlx.engine.batched import BatchedEngine
 
     scheduler = _make_scheduler()
@@ -458,8 +456,16 @@ async def test_batched_engine_preflight_chat_raises_for_oversize_prompt(monkeypa
     # it out so the test only exercises the preflight wiring.
     engine._preprocess_messages = lambda m: m
 
+    kwargs = {}
+    if prepared:
+        kwargs["_prepared_prompt"] = ("prepared", list(range(110_000)))
+        engine._tokenizer.encode.side_effect = AssertionError(
+            "prepared prompt was reencoded"
+        )
     with pytest.raises(PrefillMemoryExceededError):
-        await engine.preflight_chat(messages=[{"role": "user", "content": "x"}])
+        await engine.preflight_chat(
+            messages=[{"role": "user", "content": "x"}], **kwargs
+        )
 
 
 @pytest.mark.asyncio
@@ -1076,7 +1082,7 @@ class TestRejectionMessageNamesBindingCeiling:
             "(dynamic ceiling 32.00 GB - hot cache 8.00 GB - safety margin 1.92 GB)"
             in rej.message
         )
-        assert "only 24.00 GB is reclaimable right now" in rej.message
+        assert "oMLX already uses all but 24.00 GB of it" in rej.message
         assert "lower hot_cache_max_size" in rej.message
 
     def test_static_binding_falls_back_to_generic_advice(self, monkeypatch):

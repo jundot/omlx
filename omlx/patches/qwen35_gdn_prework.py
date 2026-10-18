@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 import sys
 
 import mlx.core as mx
@@ -59,37 +58,33 @@ _QWEN4_DECODE_ENGAGED_LOGGED = False
 _QWEN35_DECODE_ENGAGED_LOGGED = False
 _QWEN4_PREFILL_KERNELS = None
 _QWEN4_PREFILL_ENGAGED_LOGGED = False
-_QWEN4_PREFILL_ENABLED = os.environ.get("OMLX_QWEN4_GDN_PREFILL_FUSED", "1") != "0"
+# Fixed on; tests clear these to reach the per-op reference paths.
+_QWEN4_PREFILL_ENABLED = True
 _QWEN4_PREFILL_MIN_ROWS = 64
 # The B1/T1 decode resolves its static eligibility and operands once per layer
-# (rebuilt when a weight or child module is replaced); =0 re-derives them per call.
-_QWEN4_DECODE_PLAN_ENABLED = os.environ.get("OMLX_QWEN4_GDN_DECODE_PLAN", "1") != "0"
-# On the planned decode: the prework, recurrence and norm-gate as one launch
-# (=0 keeps the three launches), and the in-/out-projections as one-row
-# qmv_fast with a narrower column tile (=0 keeps stock quantized_matmul).
-_QWEN4_DECODE_STEP_FUSED = os.environ.get("OMLX_QWEN4_GDN_DECODE_STEP_FUSED", "1") != "0"
-_QWEN4_DECODE_QMV = os.environ.get("OMLX_QWEN4_GDN_DECODE_QMV", "1") != "0"
+# (rebuilt when a weight or child module is replaced).
+_QWEN4_DECODE_PLAN_ENABLED = True
+# On the planned decode: the prework, recurrence and norm-gate as one launch,
+# and the in-/out-projections as one-row qmv_fast with a narrower column tile.
+_QWEN4_DECODE_STEP_FUSED = True
+_QWEN4_DECODE_QMV = True
 # B1 speculative verify rows (Qwen4 L2 arm): the stacked in-projection, one
 # launch for every row's prework, recurrence (with the per-step rollback
-# states) and norm-gate, and the out-projection (=0 keeps the per-op path).
-_QWEN4_VERIFY_FUSED = os.environ.get("OMLX_QWEN4_GDN_VERIFY_FUSED", "1") != "0"
-_QWEN4_BATCH_DECODE = os.environ.get("OMLX_QWEN4_GDN_BATCH_DECODE", "1") != "0"
+# states) and norm-gate, and the out-projection.
+_QWEN4_VERIFY_FUSED = True
 # Rows of a batched one-token decode per step launch, and the widest batch
 # whose projections run per row (bit-identical to each row decoded alone).
 _QWEN4_BATCH_DECODE_MAX_ROWS = 16
 _QWEN4_BATCH_ROW_EXACT_ROWS = 3
-# Its 2..8-row projections on the fully unrolled row-exact tile with the
-# per-row-count tiles below (=0 keeps the rolled tiles of the first geometry).
-_QWEN4_VERIFY_TILES = os.environ.get("OMLX_QWEN4_GDN_VERIFY_TILES", "1") != "0"
-# Its rollback records skip the per-step recurrent states (S-1 x 3 MB per
+# The verify's rollback records skip the per-step recurrent states (S-1 x 3 MB per
 # layer, written on every verify and read only on a partial accept): a commit
-# keeping m of S rows reruns the fused step on the first m rows (=0 writes
-# them per verify).
-_QWEN4_VERIFY_DEFERRED_STATES = (
-    os.environ.get("OMLX_QWEN4_GDN_VERIFY_DEFERRED_STATES", "1") != "0"
-)
+# keeping m of S rows reruns the fused step on the first m rows.
+_QWEN4_VERIFY_DEFERRED_STATES = True
 _QWEN4_VERIFY_STEP_KERNELS: dict = {}
 _QWEN4_VERIFY_ENGAGED_LOGGED = False
+# The fused verify's norm-gate stage runs step t on simdgroup t of its
+# head_v_dim // 8 = 16 simdgroups, so a window holds at most 16 rows.
+_QWEN4_VERIFY_MAX_ROWS = 16
 _VERIFY_REJECT_DIAG = 0
 
 _SOURCE = """
@@ -121,8 +116,8 @@ _SOURCE = """
             acc += float(xv) * float(conv_w[channel * 4 + tap]);
         }
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+        const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
         activated[i] = act;
         if (L2) {
             const T sqv = T(float(act) * float(act));
@@ -271,8 +266,8 @@ _QWEN4_DECODE_SOURCE = """
         }
         acc += float(qkv[channel]) * float(conv_w[channel * 4 + 3]);
         const T conv = T(acc);
-        T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-        const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+        const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+        const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
         activated[i] = act;
         const T sqv = T(float(act) * float(act));
         l2acc = T(float(l2acc) + float(sqv));
@@ -312,9 +307,9 @@ _QWEN4_DECODE_SOURCE = """
         }
         if (lane == 0) {
             const T bv = b_in[head];
-            // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
-            T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
-            beta_out[head] = (bv < T(0)) ? by : T(1) - by;
+            // MLX's Sigmoid functor, rounded to T once.
+            const auto by = 1 / (1 + metal::precise::exp(metal::abs(bv)));
+            beta_out[head] = T((bv < T(0)) ? by : 1 - by);
 
             // compute_g casts A_log to FP32 but keeps softplus(a+dt_bias)
             // in BF16 before the FP32 multiply and outer exp.
@@ -419,8 +414,8 @@ _QWEN4_DECODE_STEP_SOURCE = """
             }
             acc += float(qkv[channel]) * float(conv_w[channel * 4 + 3]);
             const T conv = T(acc);
-            T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-            const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+            const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+            const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
             activated[i] = act;
             const T sqv = T(float(act) * float(act));
             l2acc = T(float(l2acc) + float(sqv));
@@ -456,9 +451,9 @@ _QWEN4_DECODE_STEP_SOURCE = """
     } else if (sg == 3 && lane == 0) {
         const uint head = hv;
         const T bv = b_in[head];
-        // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
-        T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
-        tg_beta[0] = (bv < T(0)) ? by : T(1) - by;
+        // MLX's Sigmoid functor, rounded to T once.
+        const auto by = 1 / (1 + metal::precise::exp(metal::abs(bv)));
+        tg_beta[0] = T((bv < T(0)) ? by : 1 - by);
 
         const T apd = T(float(a_in[head]) + float(dt_bias[head]));
         const T neg_abs = -metal::abs(apd);
@@ -616,8 +611,8 @@ _QWEN4_VERIFY_STEP_SOURCE = """
             const T x_t = proj[t * P + channel];
             acc += float(x_t) * float(conv_w[channel * 4 + 3]);
             const T conv = T(acc);
-            T sy = T(1) / (T(1) + metal::exp(metal::abs(conv)));
-            const T act = conv * ((conv < T(0)) ? sy : T(1) - sy);
+            const auto sy = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+            const T act = conv * T((conv < T(0)) ? sy : 1 - sy);
             activated[i] = act;
             const T sqv = T(float(act) * float(act));
             l2acc = T(float(l2acc) + float(sqv));
@@ -662,9 +657,9 @@ _QWEN4_VERIFY_STEP_SOURCE = """
         const uint t = lane;
         const uint head = hv;
         const T bv = proj[t * P + b_off + head];
-        // MLX's Sigmoid takes a precise FP32 exp; a fast bf16 exp rounds some b apart.
-        T by = T(1) / (T(1) + T(metal::precise::exp(metal::abs(float(bv)))));
-        tg_beta[t] = (bv < T(0)) ? by : T(1) - by;
+        // MLX's Sigmoid functor, rounded to T once.
+        const auto by = 1 / (1 + metal::precise::exp(metal::abs(bv)));
+        tg_beta[t] = T((bv < T(0)) ? by : 1 - by);
 
         const T apd = T(float(proj[t * P + a_off + head]) + float(dt_bias[head]));
         const T neg_abs = -metal::abs(apd);
@@ -1644,16 +1639,28 @@ def _build_qwen4_verify_plan(module):
     if fused is None:
         return None
     weights, scales, biases, _, group_size, bits, mode = fused
-    tiles = _QWEN4_VERIFY_TILES
+    # 2..8-row projections use the unrolled row-exact tile for their row count.
     in_rows = rows_qmv(
-        weights, scales, biases, bits, group_size, mode, mx.bfloat16,
-        _qwen4_verify_in_tile if tiles else _qwen4_verify_in_geometry,
-        unrolled=tiles,
+        weights,
+        scales,
+        biases,
+        bits,
+        group_size,
+        mode,
+        mx.bfloat16,
+        _qwen4_verify_in_tile,
+        unrolled=True,
     )
     out_rows = rows_qmv(
-        out.weight, out.scales, out.biases, out.bits, out.group_size, out.mode,
-        mx.bfloat16, _qwen4_verify_out_tile if tiles else _qwen4_verify_out_geometry,
-        unrolled=tiles,
+        out.weight,
+        out.scales,
+        out.biases,
+        out.bits,
+        out.group_size,
+        out.mode,
+        mx.bfloat16,
+        _qwen4_verify_out_tile,
+        unrolled=True,
     )
     if in_rows is None or out_rows is None:
         return None
@@ -2039,11 +2046,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             plan = _qwen4_decode_plan(self)
             if plan is not None and _qwen4_decode_state_eligible(inputs, cache):
                 return qwen4_decode(self, plan, inputs, cache)
-            if (
-                _QWEN4_BATCH_DECODE
-                and plan is not None
-                and _qwen4_batch_decode_state_eligible(inputs, cache)
-            ):
+            if plan is not None and _qwen4_batch_decode_state_eligible(inputs, cache):
                 return _qwen4_batch_decode(self, plan, inputs, cache)
         if _qwen4_prefill_eligible(self, inputs, mask, cache):
             return _qwen4_prefill(self, inputs, cache)
@@ -2164,7 +2167,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             and cache is not None
             and cache.is_speculating
             and cache.lengths is None
-            and 1 <= length <= 9
+            and 1 <= length <= _QWEN4_VERIFY_MAX_ROWS
             and (length == 1 or is_row_exact_armed())
             and _qwen4_verify_state_eligible(inputs, cache)
         ):

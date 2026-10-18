@@ -10,10 +10,11 @@ settings.json so a restart resumes interrupted downloads.
 import asyncio
 import enum
 import errno
+import fcntl
+import functools
 import json
 import logging
 import os
-import shutil
 import signal
 import sys
 import threading
@@ -27,15 +28,17 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub._local_folder import read_download_metadata
 from huggingface_hub.utils import (
     GatedRepoError,
     HfHubHTTPError,
     RepositoryNotFoundError,
+    filter_repo_objects,
 )
 from huggingface_hub.utils import tqdm as _hf_tqdm
 
-# Private-module import; the pyproject floor (huggingface-hub>=1.19.0)
-# guarantees it exists. Re-verify the symbol when bumping the hub version.
+# Private-module imports (also read_download_metadata above); the pyproject floor
+# (huggingface-hub>=1.19.0) guarantees them. Re-verify both when bumping the hub.
 from huggingface_hub.utils._xet import abort_xet_session
 
 logger = logging.getLogger(__name__)
@@ -56,6 +59,9 @@ _STARTUP_STALL_TIMEOUT = 120
 
 _PROGRESS_POLL_INTERVAL = 0.5
 _SUBPROCESS_TERMINATE_TIMEOUT = 5
+
+# Seconds between xet aborts while a cancelled download's worker unwinds.
+_REAP_INTERVAL = 0.5
 
 # Seconds of byte-count history the reported speed averages over.
 _SPEED_WINDOW = 1.0
@@ -460,6 +466,66 @@ _BLOB_SIZE_CACHE_MAX = 512
 _blob_size_cache: dict[str, tuple[int, float]] = {}
 
 
+def _stale_local_files(local_dir: Path, dry_result) -> dict[str, tuple[int, int]]:
+    """Map local files snapshot_download will refetch to (inode, size).
+
+    The dry run reports outdated files as cached; only kept files get the
+    target commit in their metadata.
+    """
+    stale: dict[str, tuple[int, int]] = {}
+    for info in dry_result:
+        # Keyed like _get_download_activity's scan of the same directory.
+        path = Path(local_dir) / info.filename
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if not info.will_download:
+            metadata = read_download_metadata(local_dir, info.filename)
+            if metadata is not None and metadata.commit_hash == info.commit_hash:
+                continue
+        stale[str(path)] = (stat.st_ino, stat.st_size)
+    return stale
+
+
+def _stale_bytes(stale: dict[str, tuple[int, int]], files: dict) -> int:
+    """Sum outdated bytes in one scan; forget files deleted or replaced (new inode)."""
+    total = 0
+    for path, (inode, size) in list(stale.items()):
+        if path not in files:
+            del stale[path]
+            continue
+        try:
+            if os.stat(path).st_ino != inode:
+                del stale[path]
+                continue
+        except OSError:
+            pass  # Deleted after the scan, which still counted it.
+        total += size
+    return total
+
+
+def _hub_lock_held(staging_dir: Path) -> bool:
+    """True when a hub file lock in ``staging_dir`` is held or cannot be checked.
+
+    Hub holds a file's lock for as long as its temp file exists.
+    """
+    for lock_path in staging_dir.rglob("*.lock"):
+        try:
+            fd = os.open(lock_path, os.O_RDONLY)
+        except FileNotFoundError:
+            continue  # Released by a holder that removes its lock file.
+        except OSError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        finally:
+            os.close(fd)  # Also releases a lock taken above.
+    return False
+
+
 def _safetensors_parameters(safetensors) -> dict:
     """Return the dtype → count map from HF safetensors metadata."""
     if not safetensors:
@@ -476,28 +542,48 @@ def _histogram_has_packed_u32(safetensors) -> bool:
     return "U32" in _safetensors_parameters(safetensors)
 
 
-def _sum_safetensors_blob_bytes(siblings) -> int | None:
-    """Sum current-revision *.safetensors blob sizes from model_info siblings.
-
-    Returns None when siblings are missing or have no sizes (list_models does
-    not populate them). Does not use usedStorage, which includes old revisions.
-    """
+def _sibling_sizes(siblings) -> dict[str, int]:
+    """Map model_info siblings with a known size to that size."""
+    sizes: dict[str, int] = {}
     if not isinstance(siblings, (list, tuple)):
-        return None
-    total = 0
-    saw_size = False
+        return sizes
     for sibling in siblings:
-        name = getattr(sibling, "rfilename", None) or ""
-        if not str(name).endswith(".safetensors"):
+        name = getattr(sibling, "rfilename", None)
+        if not name:
             continue
         try:
             size = int(getattr(sibling, "size", None) or 0)
         except (TypeError, ValueError):
             continue
         if size > 0:
-            total += size
-            saw_size = True
-    return total if saw_size else None
+            sizes[str(name)] = size
+    return sizes
+
+
+def _sum_safetensors_blob_bytes(siblings) -> int | None:
+    """Sum current-revision *.safetensors blob sizes from model_info siblings.
+
+    Returns None when siblings are missing or have no sizes (list_models does
+    not populate them). Does not use usedStorage, which includes old revisions.
+    """
+    sizes = [
+        size
+        for name, size in _sibling_sizes(siblings).items()
+        if name.endswith(".safetensors")
+    ]
+    return sum(sizes) if sizes else None
+
+
+def _sum_snapshot_bytes(siblings, ignore_patterns: list[str] | None) -> int | None:
+    """Sum sizes of the files snapshot_download fetches under ``ignore_patterns``.
+
+    Returns None when siblings are missing or have no sizes.
+    """
+    sizes = _sibling_sizes(siblings)
+    if not sizes:
+        return None
+    kept = filter_repo_objects(sizes, ignore_patterns=ignore_patterns)
+    return sum(sizes[name] for name in kept)
 
 
 def _fetch_safetensors_blob_bytes(api: HfApi, repo_id: str) -> int:
@@ -1200,7 +1286,8 @@ class HFDownloader(_QueuePersistenceMixin):
             ValueError: If repo_id format is invalid or download is already queued.
         """
         repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
+        parts = repo_id.split("/")
+        if len(parts) != 2 or any(part in ("", ".", "..") for part in parts):
             raise ValueError(
                 f"Invalid repository ID: '{repo_id}'. "
                 "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
@@ -1253,11 +1340,8 @@ class HFDownloader(_QueuePersistenceMixin):
         task.status = DownloadStatus.CANCELLED
         self._persist()
 
-        # A task in DOWNLOADING owns the download semaphore, so the in-flight
-        # xet transfer is necessarily this one; aborting the (global) session
-        # makes its snapshot_download thread unwind immediately. Pending tasks
-        # must not abort, that would kill another task's transfer. The next
-        # download lazily creates a fresh session.
+        # Only the DOWNLOADING task owns the semaphore and the xet transfer.
+        # A pending cancel must not abort another task's transfer.
         if was_downloading:
             abort_xet_session()
 
@@ -1266,13 +1350,22 @@ class HFDownloader(_QueuePersistenceMixin):
         if progress_task and not progress_task.done():
             progress_task.cancel()
 
-        # Cancel the download task
-        active_task = self._active_tasks.pop(task_id, None)
+        # The task stays in _active_tasks until its worker stops writing.
+        active_task = self._active_tasks.get(task_id)
         if active_task and not active_task.done():
             active_task.cancel()
 
         logger.info(f"Download cancelled: {task.repo_id} (task_id={task_id})")
         return True
+
+    async def cancel_download_for_dir(self, target_dir: Path) -> None:
+        """Cancel the download writing into ``target_dir`` and wait for it."""
+        resolved = Path(target_dir).resolve()
+        for task_id, active in list(self._active_tasks.items()):
+            task = self._tasks.get(task_id)
+            if task and (self._model_dir / task.repo_id).resolve() == resolved:
+                await self.cancel_download(task_id)
+                await asyncio.gather(active, return_exceptions=True)
 
     def remove_task(self, task_id: str) -> bool:
         """Remove a completed, failed, or cancelled task from the list.
@@ -1371,6 +1464,16 @@ class HFDownloader(_QueuePersistenceMixin):
 
         logger.info("HF Downloader shut down")
 
+    async def _reap_payload(self, payload: asyncio.Future) -> None:
+        """Abort xet until the cancelled download call returns.
+
+        One abort misses the next file, which hub starts on a fresh session.
+        """
+        while not payload.done():
+            await asyncio.sleep(_REAP_INTERVAL)
+            abort_xet_session()
+        await asyncio.gather(payload, return_exceptions=True)
+
     async def _run_download(self, task_id: str, hf_token: str) -> None:
         """Execute a download task.
 
@@ -1394,12 +1497,22 @@ class HFDownloader(_QueuePersistenceMixin):
                 # when sharing a model directory.
                 target_dir = self._model_dir / task.repo_id
 
+                # Hub never resumes leftover temp files; they only inflate progress.
+                try:
+                    await asyncio.to_thread(
+                        self._cleanup_partial, task, orphans_only=True
+                    )
+                except Exception as e:  # noqa: BLE001 - progress only
+                    logger.warning(
+                        f"Could not clean up partial files for {task.repo_id}: {e}"
+                    )
+
                 api, endpoint = _get_hf_api()
 
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
                 ignore_patterns = None
-                st_estimate = 0
+                size_estimate = 0
                 try:
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -1419,22 +1532,17 @@ class HFDownloader(_QueuePersistenceMixin):
                             "original/**",
                             "consolidated.*.pth",
                         ]
-                        # Blob sizes match the download; the U32 dtype
-                        # histogram is logical params, not disk bytes (#3401).
-                        # Non-int counts degrade to no estimate instead of
-                        # failing the download from the dry-run handler.
-                        try:
-                            blob = _sum_safetensors_blob_bytes(
-                                getattr(model_info, "siblings", None)
-                            )
-                            if blob is not None:
-                                st_estimate = blob
-                            elif "U32" not in st_params:
-                                st_estimate = _calc_safetensors_disk_size(
-                                    {"parameters": st_params}
-                                )
-                        except (TypeError, ValueError):
-                            st_estimate = 0
+                    # Blob sizes of every file the snapshot fetches.
+                    snapshot_bytes = _sum_snapshot_bytes(
+                        getattr(model_info, "siblings", None), ignore_patterns
+                    )
+                    if snapshot_bytes is not None:
+                        size_estimate = snapshot_bytes
+                    elif st_params and "U32" not in st_params:
+                        # Weights-only fallback; U32 counts are not disk bytes (#3401).
+                        size_estimate = _calc_safetensors_disk_size(
+                            {"parameters": st_params}
+                        )
                 except Exception as e:
                     logger.warning(
                         f"Could not fetch repo info for {task.repo_id}: {e}"
@@ -1453,6 +1561,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
                 size_estimated = False
+                stale: dict[str, tuple[int, int]] = {}
                 try:
                     dry_result = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -1463,11 +1572,21 @@ class HFDownloader(_QueuePersistenceMixin):
                         timeout=30,
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
+                    try:
+                        stale = await asyncio.to_thread(
+                            _stale_local_files, target_dir, dry_result
+                        )
+                    except Exception as e:  # noqa: BLE001 - progress only
+                        logger.debug(
+                            "Could not find outdated files for %s: %s",
+                            task.repo_id,
+                            e,
+                        )
                 except Exception as e:
-                    if st_estimate:
-                        task.total_size = st_estimate
+                    if size_estimate:
+                        task.total_size = size_estimate
                         size_estimated = True
-                        detail = "Estimated total size from safetensors metadata."
+                        detail = "Estimated total size from Hub metadata."
                     else:
                         detail = "Progress estimation will be unavailable."
                     logger.warning(
@@ -1476,22 +1595,28 @@ class HFDownloader(_QueuePersistenceMixin):
 
                 wire_counter = _WireCounter()
                 self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, target_dir, wire_counter)
+                    self._poll_progress(task_id, target_dir, wire_counter, stale)
                 )
 
-                xet_error: Exception | None = None
-                try:
-                    # Awaiting the thread here is intentional: after a stall,
-                    # fallback cannot start until abort_xet_session() has made
-                    # the original writer return.
-                    await asyncio.to_thread(
+                payload = asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(
                         snapshot_download,
                         **dl_kwargs,
                         tqdm_class=_make_cancellable_tqdm(
                             lambda: task_id in self._cancelled,
                             on_wire_bytes=wire_counter.add,
                         ),
-                    )
+                    ),
+                )
+                xet_error: Exception | None = None
+                try:
+                    # The HTTP fallback must not overlap this writer.
+                    # A cancel holds the semaphore until the writer stops.
+                    await asyncio.shield(payload)
+                except asyncio.CancelledError:
+                    await self._reap_payload(payload)
+                    raise
                 except Exception as error:
                     stalled = self._stalled.pop(task_id, None)
                     if stalled is not None:
@@ -1518,7 +1643,7 @@ class HFDownloader(_QueuePersistenceMixin):
                     # The HTTP worker refetches the payload, so xet's wire
                     # bytes do not carry over.
                     self._progress_tasks[task_id] = asyncio.create_task(
-                        self._poll_progress(task_id, target_dir, _WireCounter())
+                        self._poll_progress(task_id, target_dir, _WireCounter(), stale)
                     )
                     try:
                         await self._run_http_fallback(task_id, dl_kwargs)
@@ -1574,13 +1699,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 logger.error(
                     f"Failed to clean up cancelled download {task.repo_id}: {e}"
                 )
-        except RepositoryNotFoundError:
-            task.status = DownloadStatus.FAILED
-            task.error = (
-                f"Repository not found: {task.repo_id}. "
-                "This may be a gated model that requires HuggingFace authentication."
-            )
-            logger.error(f"Repository not found: {task.repo_id}")
+        # GatedRepoError subclasses RepositoryNotFoundError.
         except GatedRepoError:
             task.status = DownloadStatus.FAILED
             task.error = (
@@ -1588,6 +1707,13 @@ class HFDownloader(_QueuePersistenceMixin):
                 "Please provide a valid HF token with access."
             )
             logger.error(f"Gated repo access denied: {task.repo_id}")
+        except RepositoryNotFoundError:
+            task.status = DownloadStatus.FAILED
+            task.error = (
+                f"Repository not found: {task.repo_id}. "
+                "This may be a gated model that requires HuggingFace authentication."
+            )
+            logger.error(f"Repository not found: {task.repo_id}")
         except Exception as e:
             # Do not clobber an earlier terminal error or a user cancellation.
             if (
@@ -1597,6 +1723,14 @@ class HFDownloader(_QueuePersistenceMixin):
                 task.status = DownloadStatus.FAILED
                 task.error = str(e)
                 logger.error(f"Download failed for {task.repo_id}: {e}")
+                # A killed HTTP fallback child skips hub's own temp file cleanup.
+                try:
+                    self._cleanup_partial(task, orphans_only=True)
+                except Exception as cleanup_error:
+                    logger.error(
+                        f"Failed to clean up failed download {task.repo_id}: "
+                        f"{cleanup_error}"
+                    )
         finally:
             # Stop progress polling
             progress_task = self._progress_tasks.pop(task_id, None)
@@ -1678,7 +1812,11 @@ class HFDownloader(_QueuePersistenceMixin):
             await process.wait()
 
     async def _poll_progress(
-        self, task_id: str, target_dir: Path, wire: _WireCounter | None = None
+        self,
+        task_id: str,
+        target_dir: Path,
+        wire: _WireCounter | None = None,
+        stale: dict[str, tuple[int, int]] | None = None,
     ) -> None:
         """Poll the target directory to estimate download progress.
 
@@ -1691,8 +1829,13 @@ class HFDownloader(_QueuePersistenceMixin):
         The wire counter covers xet's fetch phase, where bytes arrive on the
         network long before they reach disk: it feeds progress, speed, and
         stall liveness.
+
+        ``stale`` files are left out of the disk reading. Hub deletes them
+        before refetching, which would otherwise hide disk growth.
         """
         wire = wire or _WireCounter()
+        # Own copy: _stale_bytes forgets replaced files as they go.
+        stale = dict(stale or {})
         task = self._tasks.get(task_id)
         if task is None:
             return
@@ -1707,7 +1850,9 @@ class HFDownloader(_QueuePersistenceMixin):
         wire_meter.add(wire.value, now=last_activity_at)
         last_wire = wire.value
         # A resume fetches only missing bytes, so wire bytes add to this.
-        base_logical = last_activity.logical_size
+        base_logical = last_activity.logical_size - _stale_bytes(
+            stale, last_activity.files
+        )
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -1718,10 +1863,11 @@ class HFDownloader(_QueuePersistenceMixin):
 
                 activity = self._get_download_activity(target_dir)
                 wire_now = wire.value
+                logical = activity.logical_size - _stale_bytes(stale, activity.files)
 
                 # Add wire bytes the disk has not caught up with yet.
-                disk_growth = max(0, activity.logical_size - base_logical)
-                reported = activity.logical_size + max(0, wire_now - disk_growth)
+                disk_growth = max(0, logical - base_logical)
+                reported = logical + max(0, wire_now - disk_growth)
                 if task.total_size > 0:
                     reported = min(reported, task.total_size)
                     # Cap at 99% until snapshot_download confirms completion
@@ -1803,20 +1949,35 @@ class HFDownloader(_QueuePersistenceMixin):
             pass
         return total
 
-    def _cleanup_partial(self, task: DownloadTask) -> None:
-        """Remove in-progress shards while keeping finalized files for resume.
+    def _cleanup_partial(
+        self, task: DownloadTask, *, orphans_only: bool = False
+    ) -> None:
+        """Remove hub's partial files and keep finished files for resume.
 
-        Hub stages partial downloads inside a hidden ``._____temp`` directory
-        and only renames a shard into the target on completion. Wiping the
-        whole target dir would also nuke shards the user has already paid
-        for; finalized files are visible in the file browser, so users can
-        keep them for auto-resume on retry or remove them themselves.
+        ``.metadata`` files stay so a retry can skip files it already verified.
+        With ``orphans_only``, files stay while any hub lock here is held.
         """
-        target_dir = self._model_dir / task.repo_id
-        temp_dir = target_dir / "._____temp"
-        if temp_dir.exists():
+        staging_dir = (
+            self._model_dir / task.repo_id / ".cache" / "huggingface" / "download"
+        )
+        if not staging_dir.is_dir():
+            return
+        # List first: a live writer already holds the lock of any file seen now.
+        partials = list(staging_dir.rglob("*.incomplete"))
+        if orphans_only and partials and _hub_lock_held(staging_dir):
+            logger.info(
+                f"Kept {len(partials)} in-progress file(s), a hub lock is held "
+                f"or could not be checked: {staging_dir}"
+            )
+            return
+        for partial in partials:
             try:
-                shutil.rmtree(temp_dir)
-                logger.info(f"Cleaned up in-progress shards: {temp_dir}")
-            except Exception as e:
-                logger.error(f"Failed to clean up {temp_dir}: {e}")
+                # A writer that finished after the listing renamed its file.
+                partial.unlink(missing_ok=True)
+            except OSError as e:
+                logger.error(f"Failed to clean up {partial}: {e}")
+        if partials:
+            logger.info(
+                f"Cleaned up {len(partials)} in-progress file(s): "
+                f"{staging_dir}"
+            )

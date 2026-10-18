@@ -17,8 +17,18 @@ def sort_routes(x, indices):
     replicated ``[T * k, 1, K]`` rows (``m5_gather_qmm.fused_gate_up_activation``
     with ``token_rows`` reads them in place instead).
     """
-    *_, M = indices.shape
+    *_, top_k = indices.shape
     indices = indices.flatten()
     order = mx.argsort(indices)
-    inv_order = mx.argsort(order)
-    return x.flatten(0, -3), order // M, indices[order], inv_order
+    # ``order`` is a permutation, so a scatter inverts it without a second
+    # sort. Short route lists keep argsort, which is cheaper there.
+    if order.size >= 4096:
+        inv_order = mx.put_along_axis(
+            mx.zeros_like(order),
+            order,
+            mx.arange(order.size, dtype=order.dtype),
+            axis=0,
+        )
+    else:
+        inv_order = mx.argsort(order)
+    return x.flatten(0, -3), order // top_k, indices[order], inv_order

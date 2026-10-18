@@ -17,8 +17,8 @@ import mlx.core as mx
 from mlx_lm.models.cache import _BaseCache
 
 # Widest single update whose pooling remainder can still be rolled back
-# through the undo log. Depth-k MTP chains verify at most 8 tokens; the
-# GLM-5.3 DFlash lane verifies up to a 16-token draft block per cycle.
+# through the undo log. Depth-k MTP chains and batched DFlash blocks verify
+# at most 8 tokens.
 POOLING_UNDO_MAX_TOKENS = 16
 
 
@@ -150,7 +150,7 @@ class PoolingCache(_BaseCache):
         # pre-update state plus this update's raw inputs to undo the last
         # token when it completed a pool window. Only decode / MTP-verify /
         # DFlash-verify sized updates (POOLING_UNDO_MAX_TOKENS covers depth-k
-        # chain verify windows and a 16-token DFlash block) are ever trimmed;
+        # chain and DFlash verify windows) are ever trimmed;
         # skipping the stash for prompt chunks avoids pinning large prefill
         # projections. Buffer slices are taken before any mutation, so they
         # reference the pre-update array node.

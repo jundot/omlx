@@ -43,6 +43,54 @@ except ImportError:
 # different head dimensions; unsupported cases fall back to an unfused
 # score-matrix allocation.
 _SDPA_VECTOR_QUERY_TOKEN_THRESHOLD = 8
+
+# Narrower Qwen4 windows (Lightning MTP) stay on masked SDPA (M5 crossover).
+_QWEN4_GATHERED_MIN_QUERY_TOKENS = 16
+
+
+def qwen4_gathered_prefill_route(
+    query_tokens: int, cache_tokens: int, indexer_budget: int
+) -> bool:
+    """Whether Qwen4 text prefill uses sparse gathered QSA."""
+    return (
+        query_tokens >= _QWEN4_GATHERED_MIN_QUERY_TOKENS
+        and cache_tokens + query_tokens > indexer_budget
+    )
+
+
+_TEXT_MROPE_EQUAL_PLANES: list[tuple[Any, int, bool]] = []
+
+
+def qwen4_text_mrope_broadcast(position_ids: Any, length: int) -> bool:
+    """True for missing/2-D text ids, or 3-D mRoPE that is a text broadcast.
+
+    The parent LanguageModel tiles identical ``(1, L)`` positions to
+    ``(3, 1, L)`` for text-only mRoPE. Real image grids differ across the
+    three planes and must stay on the official mask+SDPA path. Shared by the
+    Qwen4 runtime eligibility gate and the scheduler's route pricing so both
+    sides decide identically for image-region chunks.
+    """
+    if position_ids is None:
+        return True
+    if mx is None or not isinstance(position_ids, mx.array):
+        return False
+    if position_ids.ndim == 2:
+        return tuple(position_ids.shape) == (1, length)
+    if position_ids.ndim != 3 or tuple(position_ids.shape) != (3, 1, length):
+        return False
+    for cached_ids, cached_len, cached_same in _TEXT_MROPE_EQUAL_PLANES:
+        if cached_ids is position_ids and cached_len == length:
+            return cached_same
+    same = bool(
+        mx.array_equal(position_ids[0], position_ids[1]).item()
+        and mx.array_equal(position_ids[1], position_ids[2]).item()
+    )
+    _TEXT_MROPE_EQUAL_PLANES.append((position_ids, length, same))
+    if len(_TEXT_MROPE_EQUAL_PLANES) > 8:
+        del _TEXT_MROPE_EQUAL_PLANES[:-8]
+    return same
+
+
 _SDPA_FULL_SUPPORTED_HEAD_DIMS = frozenset({64, 72, 80, 96, 128})
 _SDPA_VECTOR_SUPPORTED_HEAD_DIMS = frozenset({64, 96, 128, 256})
 # Default bytes/elem for the materialized unfused score matrix when the model's
@@ -871,6 +919,16 @@ class MemoryMonitor:
                 _GLM5NextPrefillMemoryProfile,
                 _DeepSeekV41PrefillMemoryProfile,
             ),
+        )
+
+    def qwen4_gathered_prefill_route(
+        self, query_tokens: int, cache_tokens: int
+    ) -> bool:
+        profile = self._prefill_memory_profile
+        return isinstance(
+            profile, _Qwen4ExpPrefillMemoryProfile
+        ) and qwen4_gathered_prefill_route(
+            query_tokens, cache_tokens, profile.indexer_budget
         )
 
     def estimate_chunk_transient_bytes(
@@ -2051,10 +2109,9 @@ def _ane_prefill_transient_bytes(model: Any) -> int:
 def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
     """Populate ``monitor`` with KV/SDPA dims read from an mlx-lm ``model``.
 
-    The engine-agnostic baseline used by engines that bypass the
-    ``Scheduler`` (currently ``DFlashEngine``'s primary speculative path) so
-    they can run the same prefill-peak estimate the scheduler-driven engines
-    get. Best-effort: on any extraction failure the monitor is left dim-less
+    The engine-agnostic baseline used by guards outside the ``Scheduler``
+    (the cluster rank guard) so they can run the same prefill-peak estimate
+    the scheduler-driven engines get. Best-effort: on any extraction failure the monitor is left dim-less
     and ``estimate_prefill_peak_bytes`` returns 0, making the guard a no-op
     rather than raising spuriously.
 
@@ -2126,8 +2183,8 @@ def set_model_info_from_model(monitor: "MemoryMonitor", model: Any) -> None:
         )
 
         # Classify layer cache types for hybrid models. Mirrors
-        # Scheduler._set_model_info_for_monitor via the shared helper so the
-        # DFlash guard and the scheduler guard price the same layer groups.
+        # Scheduler._set_model_info_for_monitor via the shared helper so both
+        # guards price the same layer groups.
         cache_list = None
         num_kv_cache_layers = num_layers
         rotating_layer_specs: list[tuple[int, int]] = []
@@ -2205,8 +2262,8 @@ def raise_if_prefill_exceeds(
     push memory past ``hard_limit_bytes``.
 
     The shared front-door guard, taking token counts + watermarks directly so
-    an engine without a ``Scheduler`` (``DFlashEngine``) enforces with the
-    same math ``Scheduler.preflight_or_raise`` uses. No-op when the guard is
+    a guard without a ``Scheduler`` (the cluster rank guard) enforces with
+    the same math ``Scheduler.preflight_or_raise`` uses. No-op when the guard is
     disabled, no limit is set, the monitor is missing, or the request fits.
     The caller supplies ``current_usage_bytes`` so HTTP/event-loop preflight
     paths can use cached executor telemetry plus physical footprint without
@@ -2215,11 +2272,10 @@ def raise_if_prefill_exceeds(
 
     ``cached_tokens`` means prompt KV *already resident in current memory*
     (e.g. the scheduler's paged prefix cache) — not merely "tokens that hit
-    a cache". A cache whose hits re-allocate KV (DFlash prefix snapshots)
-    must pass 0.
+    a cache". A cache whose hits re-allocate KV must pass 0.
 
     The component ceilings are optional: callers that receive the
-    enforcer's breakdown (the DFlash prefill guard) pass them so the
+    enforcer's breakdown pass them so the
     rejection names the binding constraint the same way the scheduler's
     does. Callers that do not fall back to generic advice.
     """

@@ -76,6 +76,30 @@ def _set_resource_limits():
         pass
 
 
+# Starter signatures use typing names such as `List`.
+_FUNCTIONAL_PREAMBLE = "from typing import *\nimport json\n"
+
+
+def _entry_point(starter_code: str) -> str:
+    """Method a functional problem asks the model to implement."""
+    return re.search(r"def\s+(\w+)\s*\(", starter_code).group(1)
+
+
+def _functional_script(code: str, item: dict) -> str:
+    """Wrap a functional solution in a self-checking script."""
+    cases = json.dumps(list(zip(item["inputs"][:3], item["outputs"][:3])))
+    return (
+        f"{_FUNCTIONAL_PREAMBLE}\n{code}\n\n"
+        "_solution = Solution()\n"
+        f"for _raw, _expected in {cases}:\n"
+        "    _args = [json.loads(_line) for _line in _raw.split('\\n')]\n"
+        f"    _got = _solution.{_entry_point(item['starter_code'])}(*_args)\n"
+        "    if isinstance(_got, tuple):\n"
+        "        _got = list(_got)\n"
+        "    assert _got == json.loads(_expected)\n"
+    )
+
+
 def _execute_code(code: str, stdin_input: str = "") -> tuple[str, bool, str]:
     """Execute Python code in a subprocess with safety limits.
 
@@ -159,6 +183,7 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
                 "outputs": outputs,
                 "difficulty": item.get("difficulty", ""),
                 "starter_code": item.get("starter_code", ""),
+                "testtype": test_cases[0].get("testtype", "stdin"),
             })
 
         logger.info(f"LiveCodeBench: loaded {len(normalized)} problems")
@@ -175,11 +200,21 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
     def format_prompt(self, item: dict) -> list[dict[str, str]]:
         """Format as a coding problem prompt."""
         description = item["description"]
+        if item.get("testtype") == "functional":
+            instruction = (
+                "Implement the function in the signature below and return its result; "
+                "do not read from stdin or print to stdout."
+            )
+            signature = f"\nSignature:\n{item['starter_code']}\n"
+        else:
+            instruction = "Read input from stdin and print the output to stdout."
+            signature = ""
         prompt = (
             "Solve the following programming problem in Python. "
-            "Read input from stdin and print the output to stdout. "
+            f"{instruction} "
             "Provide only the complete Python code, no explanations.\n\n"
-            f"Problem:\n{description}\n\n"
+            f"Problem:\n{description}\n"
+            f"{signature}\n"
             "Solution:"
         )
         return [{"role": "user", "content": prompt}]
@@ -195,6 +230,10 @@ class LiveCodeBenchBenchmark(BaseBenchmark):
         """
         if not predicted.strip():
             return False
+
+        if item.get("testtype") == "functional":
+            _, success, _ = _execute_code(_functional_script(predicted, item))
+            return success
 
         inputs = item["inputs"][:3]
         outputs = item["outputs"][:3]

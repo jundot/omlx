@@ -36,6 +36,13 @@ class RerankRequest(BaseModel):
       rerankers). Image values must be base64 data URIs.
     """
 
+    instruction: str | None = None
+    """
+    Task instruction for Qwen3-Reranker and Qwen3-VL-Reranker, rendered into
+    the `<Instruct>:` slot. If not specified or empty, the default instruction
+    is used. Other rerankers ignore it.
+    """
+
     top_n: int | None = None
     """
     Number of top results to return.

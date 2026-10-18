@@ -16,8 +16,9 @@ without further changes.
 
 from __future__ import annotations
 
+import functools
 import math
-from typing import Callable, List
+from typing import Callable, List, Sequence
 
 import mlx.core as mx
 
@@ -162,6 +163,35 @@ def apply_xtc(
     )
 
 
+def make_no_repeat_ngram_processor(
+    ngram_size: int, window: int = 0
+) -> Callable[[mx.array, mx.array], mx.array]:
+    """Ban tokens that would repeat an n-gram already in ``tokens``.
+
+    A nonzero ``window`` searches only the last ``window`` tokens.
+    Lazy ops only, so the decode step does not wait on the host.
+    """
+
+    def no_repeat_ngram_processor(tokens: mx.array, logits: mx.array) -> mx.array:
+        start = max(0, len(tokens) - window) if window else 0
+        recent = tokens[start:]
+        count = len(recent) - ngram_size + 1
+        if count <= 0:
+            return logits
+        # Row i is the prefix of the n-gram starting at i; compare it to the tail.
+        prefixes = mx.as_strided(recent, (count, ngram_size - 1), (1, 1))
+        matches = (prefixes == recent[count:]).all(axis=1)
+        last = recent[ngram_size - 1 :]
+        # Unmatched n-grams, and ids past the vocab, go to a spare slot.
+        vocab = logits.shape[-1]
+        target = mx.where(matches & (last < vocab), last, vocab)
+        banned = mx.zeros((vocab + 1,), dtype=mx.bool_)
+        banned[target] = True
+        return mx.where(banned[:vocab], -mx.inf, logits)
+
+    return no_repeat_ngram_processor
+
+
 def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
     """Sample a token id from the categorical distribution defined by
     ``logits / temp``. RNG state is advanced through ``mx.random.categorical``."""
@@ -255,3 +285,49 @@ def make_sampler(
     sampler.min_tokens_to_keep = min_tokens_to_keep
     sampler.xtc_probability = xtc_probability
     return sampler
+
+
+# mlx-lm samples a decode batch in one call only when every row holds the same
+# sampler object, so equal parameters reuse one. XTC flips one coin per call.
+@functools.lru_cache(maxsize=256)
+def _shared_sampler(
+    temp: float, top_p: float, min_p: float, min_tokens_to_keep: int, top_k: int
+) -> Callable[[mx.array], mx.array]:
+    return make_sampler(
+        temp=temp,
+        top_p=top_p,
+        min_p=min_p,
+        min_tokens_to_keep=min_tokens_to_keep,
+        top_k=top_k,
+    )
+
+
+def make_shared_sampler(
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: Sequence[int] = (),
+) -> Callable[[mx.array], mx.array]:
+    """``make_sampler`` that hands equal parameters the same sampler object."""
+    if xtc_probability > 0.0:
+        return make_sampler(
+            temp=temp,
+            top_p=top_p,
+            min_p=min_p,
+            min_tokens_to_keep=min_tokens_to_keep,
+            top_k=top_k,
+            xtc_probability=xtc_probability,
+            xtc_threshold=xtc_threshold,
+            xtc_special_tokens=list(xtc_special_tokens or ()),
+        )
+    return _shared_sampler(
+        float(temp),
+        float(top_p),
+        float(min_p),
+        int(min_tokens_to_keep),
+        int(top_k or 0),
+    )

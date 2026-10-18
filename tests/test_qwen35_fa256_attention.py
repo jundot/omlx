@@ -63,12 +63,6 @@ def _fresh_fa256_patch(monkeypatch):
         "_auto_dispatch_budget",
         lambda *a, **k: patch._DEFAULT_DISPATCH_BUDGET,
     )
-    monkeypatch.delenv("OMLX_FA256_STEEL", raising=False)
-    monkeypatch.delenv("OMLX_FA256_MIN_KV_LEN", raising=False)
-    monkeypatch.delenv("OMLX_FA256_Q_BLOCK", raising=False)
-    monkeypatch.delenv("OMLX_FA256_K_BLOCK", raising=False)
-    monkeypatch.delenv("OMLX_FA256_DEBUG", raising=False)
-    monkeypatch.delenv("OMLX_FA256_DISPATCH_BUDGET", raising=False)
     yield
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
     memory_monitor._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
@@ -126,7 +120,7 @@ def test_vlm_patch_routes_and_passes_through(monkeypatch):
 
     monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
     monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+        patch._attention_fast, "fa256_supports_dispatch_budget", lambda: True
     )
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
 
@@ -167,7 +161,7 @@ def test_kernel_failure_keeps_registered_bounded_route(monkeypatch):
         patch, "_native_kernel", lambda: MagicMock(side_effect=RuntimeError("boom"))
     )
     monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+        patch._attention_fast, "fa256_supports_dispatch_budget", lambda: True
     )
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
     bounded = MagicMock(return_value="bounded")
@@ -182,7 +176,7 @@ def test_kernel_failure_keeps_registered_bounded_route(monkeypatch):
     bounded.assert_called_once_with(q, k, v, scale, "causal", None)
 
 
-def test_dispatch_budget_env_and_capability_gate(monkeypatch):
+def test_dispatch_budget_uses_auto_calibration(monkeypatch):
     import omlx.patches.qwen35_fa256_attention as patch
 
     base, _ = _install_fake_vlm_base(monkeypatch)
@@ -196,32 +190,7 @@ def test_dispatch_budget_env_and_capability_gate(monkeypatch):
 
     monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
     monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
-    )
-    monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
-    monkeypatch.setenv("OMLX_FA256_DISPATCH_BUDGET", "12345")
-
-    assert patch.apply_qwen35_fa256_attention_patch(min_kv_len=16)
-    q, k, v = _qkv(32, 32)
-    base.scaled_dot_product_attention(q, k, v, None, 0.0625, "causal")
-    assert calls == [12345]
-
-
-def test_dispatch_budget_auto_calibration_used_when_env_unset(monkeypatch):
-    import omlx.patches.qwen35_fa256_attention as patch
-
-    base, _ = _install_fake_vlm_base(monkeypatch)
-    calls = []
-
-    def fake_kernel(
-        q, k, v, scale, causal=True, q_block=32, k_block=8, dispatch_budget=0
-    ):
-        calls.append(dispatch_budget)
-        return "steel"
-
-    monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
-    monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: True
+        patch._attention_fast, "fa256_supports_dispatch_budget", lambda: True
     )
     monkeypatch.setattr(patch, "_auto_dispatch_budget", lambda *a, **k: 777)
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
@@ -249,7 +218,7 @@ def test_dispatch_budget_zeroed_on_old_extension(monkeypatch):
 
     monkeypatch.setattr(patch, "_native_kernel", lambda: fake_kernel)
     monkeypatch.setattr(
-        patch._fa256_fast, "fa256_supports_dispatch_budget", lambda: False
+        patch._attention_fast, "fa256_supports_dispatch_budget", lambda: False
     )
     monkeypatch.setattr(patch.mx.metal, "is_available", lambda: True)
 
@@ -261,52 +230,23 @@ def test_dispatch_budget_zeroed_on_old_extension(monkeypatch):
 
 def test_apply_skips_on_nax_gpu(monkeypatch):
     # MLX 0.32.2 has a native NAX split-D fused path for head-dim-256 causal
-    # prefill, so the auto mode must not replace it with the pre-NAX kernel.
+    # prefill, so the patch must not replace it with the pre-NAX kernel.
     import omlx.patches.qwen35_fa256_attention as patch
 
     monkeypatch.setattr(patch, "is_nax_available", lambda: True)
     assert patch.apply_qwen35_fa256_attention_patch() is False
-
-
-def test_apply_env_forces_steel_on_nax_gpu(monkeypatch):
-    import omlx.patches.qwen35_fa256_attention as patch
-
-    _install_fake_vlm_base(monkeypatch)
-    monkeypatch.setattr(patch, "is_nax_available", lambda: True)
-    monkeypatch.setattr(patch, "_native_kernel", lambda: lambda *a, **k: "steel")
-    monkeypatch.setenv("OMLX_FA256_STEEL", "1")
-    assert patch.apply_qwen35_fa256_attention_patch() is True
-
-
-def test_apply_env_kill_switch_wins(monkeypatch):
-    import omlx.patches.qwen35_fa256_attention as patch
-
-    monkeypatch.setattr(patch, "is_nax_available", lambda: False)
-    monkeypatch.setenv("OMLX_FA256_STEEL", "0")
-    assert patch.apply_qwen35_fa256_attention_patch() is False
-
-
-def test_qwen_native_symbols_are_not_registered_on_glm_extension():
-    from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
-
-    assert not glm_fast.has_symbol("qwen35_fa256_attention")
-    assert not glm_fast.has_symbol("qwen35_q4_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_q5_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_q6_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_q8_affine_qmm_t")
-    assert not glm_fast.has_symbol("qwen35_moe_weighted_sum")
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
 def test_native_fa256_matches_mlx_reference_small():
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.attention import fast
 
-    if not fast.has_symbol("qwen35_fa256_attention"):
-        pytest.skip("native qwen35_fa256_attention is unavailable")
+    if not fast.has_symbol("fa256_attention"):
+        pytest.skip("native fa256_attention is unavailable")
 
     q, k, v = _qkv(128)
     scale = 1.0 / math.sqrt(256)
-    out = fast.qwen35_fa256_attention(q, k, v, scale, causal=True)
+    out = fast.fa256_attention(q, k, v, scale, causal=True)
     ref = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal")
     mx.eval(out, ref)
 
@@ -322,14 +262,14 @@ def test_native_fa256_matches_mlx_reference_small():
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
 def test_auto_dispatch_budget_calibrates_within_clamp():
     import omlx.patches.qwen35_fa256_attention as patch
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.attention import fast
 
-    if not fast.has_symbol("qwen35_fa256_attention"):
-        pytest.skip("native qwen35_fa256_attention is unavailable")
+    if not fast.has_symbol("fa256_attention"):
+        pytest.skip("native fa256_attention is unavailable")
     if not fast.fa256_supports_dispatch_budget():
         pytest.skip("extension predates chunked dispatch")
 
-    budget = patch._auto_dispatch_budget(fast.qwen35_fa256_attention, 32, 8)
+    budget = patch._auto_dispatch_budget(fast.fa256_attention, 32, 8)
     assert patch._MIN_AUTO_BUDGET <= budget <= patch._MAX_AUTO_BUDGET
 
 
@@ -346,19 +286,19 @@ def test_native_fa256_chunked_matches_single_dispatch(q_len, kv_len):
     # The dispatch budget splits the key axis into separately dispatched
     # chunks combined by logsumexp weights (issue #2225); the result must
     # match the single-dispatch kernel up to combine rounding.
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.attention import fast
 
-    if not fast.has_symbol("qwen35_fa256_attention"):
-        pytest.skip("native qwen35_fa256_attention is unavailable")
+    if not fast.has_symbol("fa256_attention"):
+        pytest.skip("native fa256_attention is unavailable")
     if not fast.fa256_supports_dispatch_budget():
         pytest.skip("extension predates chunked dispatch")
 
     q, k, v = _qkv(q_len, kv_len)
     scale = 1.0 / math.sqrt(256)
-    single = fast.qwen35_fa256_attention(q, k, v, scale, causal=True, dispatch_budget=0)
+    single = fast.fa256_attention(q, k, v, scale, causal=True, dispatch_budget=0)
     # Budget forcing ~8 chunks for these shapes.
     budget = (24 * q_len * kv_len) // 8
-    chunked = fast.qwen35_fa256_attention(
+    chunked = fast.fa256_attention(
         q, k, v, scale, causal=True, dispatch_budget=budget
     )
     mx.eval(single, chunked)
