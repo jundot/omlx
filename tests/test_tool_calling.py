@@ -5678,6 +5678,7 @@ def test_qwen_parameter_is_not_decoded_twice(monkeypatch, spec):
         (["string"], "null", "null"),
         (["string", "null"], '"null"', "null"),
         (["number", "string"], "42", 42),
+        (["boolean", "null"], "False", False),
     ],
 )
 def test_xml_union_parameter_preserves_declared_value_type(
@@ -5717,6 +5718,8 @@ def test_xml_union_parameter_preserves_declared_value_type(
             [True, None],
         ),
         ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, "7", 7),
+        ({"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "False", False),
+        ({"anyOf": [{"type": "boolean"}, {"type": "null"}]}, "True", True),
     ],
 )
 def test_xml_union_keyword_parameter_keeps_declared_alternatives(

@@ -315,6 +315,11 @@ def _matches_union_type(value: Any, types: list) -> bool | None:
         return None
 
 
+def _union_admits_boolean(types: object) -> bool:
+    """Whether the declared alternatives include a boolean."""
+    return isinstance(types, list) and any(t in _SCHEMA_BOOL_TYPES for t in types)
+
+
 def _union_keyword_types(spec: dict) -> list[str] | None:
     alts = [
         alt
@@ -341,12 +346,19 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     spec = props.get(key)
     raw_type = spec.get("type") if isinstance(spec, dict) else None
     if not isinstance(raw_type, str):
+        if not isinstance(raw_type, list) and isinstance(spec, dict):
+            raw_type = _union_keyword_types(spec)
+        # Capitalized Python literals are not JSON, so decode them against the
+        # union before the parse below rejects them (#4630).
+        stripped = val.strip()
+        if len(stripped) <= 5 and _union_admits_boolean(raw_type):
+            lowered = stripped.lower()
+            if lowered in ("true", "false"):
+                return lowered == "true"
         try:
             decoded = json.loads(val)
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return val
-        if not isinstance(raw_type, list) and isinstance(spec, dict):
-            raw_type = _union_keyword_types(spec)
         if isinstance(raw_type, list):
             # Plain 123 remains a string for ["string", "null"].
             matches = _matches_union_type(decoded, raw_type)
