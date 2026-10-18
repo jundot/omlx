@@ -243,12 +243,12 @@ def _affine_spec(
 
 def _fused_swiglu_symbol(bits: int, *, dual: bool) -> str:
     if bits == 4:
-        return "qwen35_ane_dual_q4_swiglu_t" if dual else "qwen35_ane_q4_swiglu_t"
+        return "ane_dual_q4_swiglu_t" if dual else "ane_q4_swiglu_t"
     if bits in (5, 6, 8):
         return (
-            "qwen35_ane_dual_affine_swiglu_t"
+            "ane_dual_affine_swiglu_t"
             if dual
-            else "qwen35_ane_affine_swiglu_t"
+            else "ane_affine_swiglu_t"
         )
     raise ValueError(f"Unsupported ANE SwiGLU bit width: {bits}")
 
@@ -409,24 +409,24 @@ def _eligible_pair(mlp: Any) -> bool:
 def _cpu_gate_kernel_symbol(bits: int, *, dual: bool = True) -> str | None:
     if bits == 4:
         return (
-            "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"
+            "ane_dual_cpu_fp16_q4_swiglu_t"
             if dual
-            else "qwen35_ane_cpu_fp16_q4_swiglu_t"
+            else "ane_cpu_fp16_q4_swiglu_t"
         )
     if bits in (5, 6, 8):
         return (
-            "qwen35_ane_dual_cpu_fp16_swiglu_t"
+            "ane_dual_cpu_fp16_swiglu_t"
             if dual
-            else "qwen35_ane_cpu_fp16_swiglu_t"
+            else "ane_cpu_fp16_swiglu_t"
         )
     return None
 
 
 def _cpu_gdn_kernel_symbol(*, dual: bool) -> str:
     return (
-        "qwen35_ane_dual_cpu_fp16_affine_qmm_t"
+        "ane_dual_cpu_fp16_affine_qmm_t"
         if dual
-        else "qwen35_ane_cpu_fp16_affine_qmm_t"
+        else "ane_cpu_fp16_affine_qmm_t"
     )
 
 
@@ -434,13 +434,13 @@ def _prepare_cpu_linear(
     linear: Any, fraction: float
 ) -> _CpuLinearState | None:
     """Eagerly split one affine projection into FP16 CPU and quantized GPU rows."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     if fraction <= 0 or getattr(linear, "scales", None) is None:
         return None
     # Without the native symbol the dispatch wrapper would raise at first use
     # and latch the whole layer off; stay a clean no-op like the other sites.
-    if not fast.has_symbol("qwen35_cpu_fp16_affine_qmm_t"):
+    if not fast.has_symbol("cpu_fp16_affine_qmm_t"):
         return None
     spec = _affine_spec(linear, mx.float16)
     if spec is None:
@@ -564,7 +564,7 @@ def _prepare_down_for_bank(
 
 
 def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | None:
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
@@ -581,7 +581,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
     group_size = int(gate.group_size)
     dual_ane = bool(
         config.dual_ane
-        and fast.has_symbol("qwen35_ane_dual_affine_qmm_t")
+        and fast.has_symbol("ane_dual_affine_qmm_t")
         and fast.has_symbol(_fused_swiglu_symbol(bits, dual=True))
     )
     if bits != 4 and not fast.has_symbol(_fused_swiglu_symbol(bits, dual=dual_ane)):
@@ -675,12 +675,12 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
             values.append(dense1)
         mx.eval(*values)
         model = (
-            fast.qwen35_ane_compile_linear(dense0, config.sequence_length, 1)
+            fast.ane_compile_linear(dense0, config.sequence_length, 1)
             if dual_ane
-            else fast.qwen35_ane_compile_linear(dense0, config.sequence_length)
+            else fast.ane_compile_linear(dense0, config.sequence_length)
         )
         model1 = (
-            fast.qwen35_ane_compile_linear(dense1, config.sequence_length, 2)
+            fast.ane_compile_linear(dense1, config.sequence_length, 2)
             if dense1 is not None
             else None
         )
@@ -714,7 +714,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
 def _prepare_pair_for_bank(
     mlp: Any, config: _AnePrefillConfig
 ) -> tuple[_CombinedMLPState, mx.array, mx.array | None] | None:
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
@@ -843,7 +843,7 @@ def _prepare_pair_runtime_state(
     tuner exercises the same row alignment, q4 eligibility, and down-split
     implementation as normal inference.
     """
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
@@ -942,9 +942,9 @@ def _post_ane_linear(
     gain. Other quantizations retain the existing exact native route.
     """
     if cpu_state is not None:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
 
-        return fast.qwen35_cpu_fp16_affine_qmm_t(
+        return fast.cpu_fp16_affine_qmm_t(
             x,
             cpu_state.weight,
             cpu_state.gpu_weight,
@@ -988,10 +988,10 @@ def _post_ane_down(
     ):
         raise RuntimeError("ANE down-projection state is incomplete")
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     if state.cpu_weight is not None:
-        return fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+        return fast.ane_dual_cpu_fp16_affine_qmm_t(
             x,
             state.cpu_weight,
             state.weight,
@@ -1006,7 +1006,7 @@ def _post_ane_down(
             config.cpu_threads,
             config.cpu_shared_resource,
         )
-    return fast.qwen35_ane_dual_affine_qmm_t(
+    return fast.ane_dual_affine_qmm_t(
         x,
         state.weight,
         state.scales,
@@ -1097,9 +1097,9 @@ def _pack_affine_gdn_suffix(
 
 
 def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
-    if not _eligible_gdn(gdn) or not fast.has_symbol("qwen35_ane_affine_qmm_t"):
+    if not _eligible_gdn(gdn) or not fast.has_symbol("ane_affine_qmm_t"):
         return None
     qkv, z, b, a = _gdn_linears(gdn)
     cache = getattr(gdn, "_omlx_ane_gdn_cache", None)
@@ -1119,7 +1119,7 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
     if qkv_spec is None or z_spec is None:
         return None
     qkv_bits, qkv_group_size = qkv_spec
-    dual_ane = bool(config.dual_ane and fast.has_symbol("qwen35_ane_dual_affine_qmm_t"))
+    dual_ane = bool(config.dual_ane and fast.has_symbol("ane_dual_affine_qmm_t"))
     alignment = 128 if dual_ane else 64
     ane_outputs = _recurrent_safe_gdn_ane_outputs(
         z_outputs,
@@ -1230,12 +1230,12 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
             values.append(dense1)
         mx.eval(*values)
         model = (
-            fast.qwen35_ane_compile_linear(dense0, config.sequence_length, 1)
+            fast.ane_compile_linear(dense0, config.sequence_length, 1)
             if dual_ane
-            else fast.qwen35_ane_compile_linear(dense0, config.sequence_length)
+            else fast.ane_compile_linear(dense0, config.sequence_length)
         )
         model1 = (
-            fast.qwen35_ane_compile_linear(dense1, config.sequence_length, 2)
+            fast.ane_compile_linear(dense1, config.sequence_length, 2)
             if dense1 is not None
             else None
         )
@@ -1371,7 +1371,7 @@ def _prepare_gdn_for_bank(
         config.fraction,
         alignment,
     )
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     cpu_enabled = bool(
         config.cpu_fraction > 0
@@ -1479,7 +1479,7 @@ def _prepare_gdn_runtime_state(
     model1: Any,
 ) -> _CombinedGDNState | None:
     """Move the CPU/GPU QKV boundary without recompiling the ANE prefix."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     if not _eligible_gdn(gdn):
         return None
@@ -1586,13 +1586,13 @@ def _gdn_backend_exact(
     if state is None or state.scales.dtype != x.dtype:
         return None
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
         from omlx.patches.qwen35_q4_mlp import _post_ane_qmm_or_linear
 
         _raise_if_latched(state.model, state.model1)
         if state.cpu_weight is not None:
             if state.model1 is not None:
-                combined = fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+                combined = fast.ane_dual_cpu_fp16_affine_qmm_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1608,7 +1608,7 @@ def _gdn_backend_exact(
                     config.cpu_shared_resource,
                 )
             else:
-                combined = fast.qwen35_ane_cpu_fp16_affine_qmm_t(
+                combined = fast.ane_cpu_fp16_affine_qmm_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1623,7 +1623,7 @@ def _gdn_backend_exact(
                     config.cpu_shared_resource,
                 )
         elif state.model1 is not None:
-            combined = fast.qwen35_ane_dual_affine_qmm_t(
+            combined = fast.ane_dual_affine_qmm_t(
                 x,
                 state.weight,
                 state.scales,
@@ -1635,7 +1635,7 @@ def _gdn_backend_exact(
                 state.group_size,
             )
         else:
-            combined = fast.qwen35_ane_affine_qmm_t(
+            combined = fast.ane_affine_qmm_t(
                 x,
                 state.weight,
                 state.scales,
@@ -1760,13 +1760,13 @@ def _backend_exact(
     fused_down_state = getattr(mlp, "_omlx_ane_fused_down_state", None)
     if fused_down_state is not None:
         try:
-            from omlx.custom_kernels.qwen35_prefill import fast
+            from omlx.custom_kernels.quant_matmul import ane as fast
 
             _raise_if_latched(fused_down_state.model, fused_down_state.model1)
             if fused_down_state.cpu_gate_up_weight is not None:
                 if fused_down_state.cpu_down_weight is None:
                     raise RuntimeError("Incomplete fused CPU MLP state")
-                return fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
+                return fast.ane_dual_cpu_fp16_q4_swiglu_down_t(
                     x,
                     fused_down_state.cpu_gate_up_weight,
                     fused_down_state.cpu_down_weight,
@@ -1783,7 +1783,7 @@ def _backend_exact(
                     config.cpu_threads,
                     config.cpu_shared_resource,
                 )
-            return fast.qwen35_ane_dual_q4_swiglu_down_t(
+            return fast.ane_dual_q4_swiglu_down_t(
                 x,
                 fused_down_state.gate_up_weight,
                 fused_down_state.gate_up_scales,
@@ -1825,12 +1825,12 @@ def _backend_exact(
         return None
 
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
 
         _raise_if_latched(state.model, state.model1, state.down_ane)
         if state.cpu_weight is not None:
             if state.model1 is not None and state.bits == 4:
-                activation = fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
+                activation = fast.ane_dual_cpu_fp16_q4_swiglu_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1844,7 +1844,7 @@ def _backend_exact(
                     config.cpu_shared_resource,
                 )
             elif state.model1 is not None:
-                activation = fast.qwen35_ane_dual_cpu_fp16_swiglu_t(
+                activation = fast.ane_dual_cpu_fp16_swiglu_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1859,7 +1859,7 @@ def _backend_exact(
                     config.cpu_shared_resource,
                 )
             elif state.bits == 4:
-                activation = fast.qwen35_ane_cpu_fp16_q4_swiglu_t(
+                activation = fast.ane_cpu_fp16_q4_swiglu_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1872,7 +1872,7 @@ def _backend_exact(
                     config.cpu_shared_resource,
                 )
             else:
-                activation = fast.qwen35_ane_cpu_fp16_swiglu_t(
+                activation = fast.ane_cpu_fp16_swiglu_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1895,7 +1895,7 @@ def _backend_exact(
 
         if state.model1 is not None:
             if state.bits == 4:
-                activation = fast.qwen35_ane_dual_q4_swiglu_t(
+                activation = fast.ane_dual_q4_swiglu_t(
                     x,
                     state.weight,
                     state.scales,
@@ -1908,7 +1908,7 @@ def _backend_exact(
             else:
                 if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=True)):
                     return None
-                activation = fast.qwen35_ane_dual_affine_swiglu_t(
+                activation = fast.ane_dual_affine_swiglu_t(
                     x,
                     state.weight,
                     state.scales,
@@ -1930,7 +1930,7 @@ def _backend_exact(
         if state.bits != 4:
             if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=False)):
                 return None
-            activation = fast.qwen35_ane_affine_swiglu_t(
+            activation = fast.ane_affine_swiglu_t(
                 x,
                 state.weight,
                 state.scales,
@@ -1948,8 +1948,8 @@ def _backend_exact(
                 state.down_cpu,
             )
 
-        if fast.has_symbol("qwen35_ane_q4_swiglu_t"):
-            activation = fast.qwen35_ane_q4_swiglu_t(
+        if fast.has_symbol("ane_q4_swiglu_t"):
+            activation = fast.ane_q4_swiglu_t(
                 x,
                 state.weight,
                 state.scales,
@@ -1966,7 +1966,7 @@ def _backend_exact(
                 state.down_cpu,
             )
 
-        combined = fast.qwen35_ane_q4_affine_qmm_t(
+        combined = fast.ane_q4_affine_qmm_t(
             x,
             state.weight,
             state.scales,
@@ -2270,15 +2270,15 @@ def _compile_dual_banks(
     enable path streams slices through the incremental builder instead
     (issue #2781). See :func:`_bank_split_ladder` for the retry contract.
     """
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     return _bank_split_ladder(
         [int(weight.nbytes) for weight in weights0],
         lambda start, stop: (
-            fast.qwen35_ane_compile_linear_bank(
+            fast.ane_compile_linear_bank(
                 weights0[start:stop], sequence_length, 1
             ),
-            fast.qwen35_ane_compile_linear_bank(
+            fast.ane_compile_linear_bank(
                 weights1[start:stop], sequence_length, 2
             ),
         ),
@@ -2290,7 +2290,7 @@ def _compile_single_banks(
     sequence_length: int,
 ) -> tuple[list[Any], int] | None:
     """Compile instance-0 procedure banks with the same split retry ladder."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     cap = 0
     total_bytes = sum(weight.nbytes for weight in weights)
@@ -2317,7 +2317,7 @@ def _compile_single_banks(
             models: list[Any] = []
             for start, stop in spans:
                 models.extend(
-                    fast.qwen35_ane_compile_linear_bank(
+                    fast.ane_compile_linear_bank(
                         weights[start:stop], sequence_length, 0
                     )
                 )
@@ -2449,19 +2449,19 @@ def _enable_dual_procedure_banks(
     gdn_max_layers: int,
     cpu_gdn_fraction: float = 0.0,
 ) -> tuple[int, int, int, int] | None:
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     if not (
         config.dual_ane
-        and fast.has_symbol("qwen35_ane_compile_linear_bank")
-        and fast.has_symbol("qwen35_ane_dual_affine_qmm_t")
+        and fast.has_symbol("ane_compile_linear_bank")
+        and fast.has_symbol("ane_dual_affine_qmm_t")
     ):
         return None
     candidate_bits = {
         int(getattr(getattr(module, "gate_proj", None), "bits", 0))
         for module in mlp_candidates
     }
-    if 4 in candidate_bits and not fast.has_symbol("qwen35_ane_dual_q4_swiglu_t"):
+    if 4 in candidate_bits and not fast.has_symbol("ane_dual_q4_swiglu_t"):
         return None
     if any(
         bits != 4
@@ -2493,10 +2493,10 @@ def _enable_dual_procedure_banks(
         builder0 = builder1 = None
         if fast.has_symbol("AneLinearBankBuilder"):
             try:
-                builder0 = fast.qwen35_ane_linear_bank_builder(
+                builder0 = fast.ane_linear_bank_builder(
                     config.sequence_length
                 )
-                builder1 = fast.qwen35_ane_linear_bank_builder(
+                builder1 = fast.ane_linear_bank_builder(
                     config.sequence_length
                 )
             except Exception:
@@ -2793,7 +2793,7 @@ def _enable_fused_down_banks(
     """Compile contiguous 32-layer dual-ANE fused SwiGLU/down banks."""
     if not config.fused_down or not config.dual_ane or not candidates:
         return None
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     count = 0
     resident_programs = 0
@@ -2804,12 +2804,12 @@ def _enable_fused_down_banks(
         # the next layer dequantizes (the issue #2781 recipe; the one-shot
         # path below kept a whole 32-layer chunk of fp32 alive at once).
         builder0 = builder1 = None
-        if hasattr(fast, "qwen35_ane_fused_bank_builder"):
+        if hasattr(fast, "ane_fused_bank_builder"):
             try:
-                builder0 = fast.qwen35_ane_fused_bank_builder(
+                builder0 = fast.ane_fused_bank_builder(
                     config.sequence_length
                 )
-                builder1 = fast.qwen35_ane_fused_bank_builder(
+                builder1 = fast.ane_fused_bank_builder(
                     config.sequence_length
                 )
             except Exception:
@@ -2835,14 +2835,14 @@ def _enable_fused_down_banks(
             models1 = builder1.compile(2, 0, builder1.size)
         else:
             mx.eval(*[w for weights in legacy_weights for w in weights])
-            models0 = fast.qwen35_ane_compile_swiglu_down_bank(
+            models0 = fast.ane_compile_swiglu_down_bank(
                 [weights[0] for weights in legacy_weights],
                 [weights[1] for weights in legacy_weights],
                 [weights[2] for weights in legacy_weights],
                 config.sequence_length,
                 1,
             )
-            models1 = fast.qwen35_ane_compile_swiglu_down_bank(
+            models1 = fast.ane_compile_swiglu_down_bank(
                 [weights[3] for weights in legacy_weights],
                 [weights[4] for weights in legacy_weights],
                 [weights[5] for weights in legacy_weights],
@@ -3117,9 +3117,9 @@ def enable_qwen35_ane_prefill(
         )
 
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
 
-        if not fast.qwen35_ane_available():
+        if not fast.ane_available():
             logger.warning("Private ANE runtime unavailable; Qwen ANE prefill skipped")
             return 0
     except Exception:
@@ -3184,7 +3184,7 @@ def enable_qwen35_ane_prefill(
             )
             cpu_gdn_fraction = 0.0
         elif cpu_shared_resource:
-            if fast.qwen35_cpu_shared_resource_available():
+            if fast.cpu_shared_resource_available():
                 logger.info(
                     "Qwen ANE CPU sharing using performance-aware scheduling "
                     "with %d workers",
@@ -3251,7 +3251,7 @@ def enable_qwen35_ane_prefill(
                 sequence_length,
                 (
                     "NAX"
-                    if fast.qwen35_ane_hybrid_nax_enabled()
+                    if fast.ane_hybrid_nax_enabled()
                     else "classic Metal"
                 ),
             )

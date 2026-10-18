@@ -263,7 +263,7 @@ GLM-5.2 and GLM-5.3 (`model_type: glm_moe_dsa`: 78 layers, the first 3 dense,
 256 routed experts, top-8, one shared expert) run their routed experts
 through oMLX's own GLM SwitchGLU, which fuses the gate and up projections at
 load and, on sorted calls, returns the routes already weighted and summed by
-the native `glm_moe_weighted_sum` kernel. The adapter in
+the native `moe_weighted_sum` kernel. The adapter in
 `omlx/patches/glm_moe_dsa/moe_offload.py` keeps that module and its kernels:
 each projection's parameters are replaced by resident slots before lazy
 weights materialize, expert ids are translated to slot ids, and the module's
@@ -351,3 +351,10 @@ MTP depth up to 3. Fixed depth 3 was slower (15.0 tok/s) because longer
 verify windows route to more distinct experts, so keep the adaptive
 controller. Checkpoints without MTP weights, or with MTP disabled, load
 exactly as before.
+
+With the native custom kernels built and Lightning MTP off, missing experts
+are read straight into a fixed pool of MLX buffers (about 110 MB) instead of
+being copied through Python bytes. Reads that find the pool full, and builds
+without the kernels, use the bytes path. On an M3 Ultra at 25% residency with
+the experts in page cache, decode went from 19.4 to 21.2 tok/s (+9%) with a
+2.7k prompt and from 19.6 to 20.9 tok/s (+7%) at 8k, with identical output.

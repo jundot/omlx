@@ -4,11 +4,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const countSource = fs.readFileSync(path.join(__dirname, '..', 'omlx_web/static/js/count_format.js'), 'utf8');
 const source = fs.readFileSync(path.join(__dirname, '..', 'omlx_web/static/js/usage.js'), 'utf8');
 
 function component(fetch, lang = 'en') {
     const context = vm.createContext({fetch, AbortController, URLSearchParams, Intl,
         window: {t: key => key}, document: {hidden: false, documentElement: {lang}}, setInterval, clearInterval});
+    vm.runInContext(countSource, context);
     vm.runInContext(source, context);
     return context.usageHistory();
 }
@@ -78,6 +80,40 @@ test('recording switched off shows the settings pointer, not the unavailable war
 
 test('compact numbers follow the UI language, not the runtime locale', () => {
     assert.equal(component(null, 'en').number(33320000), '33.3M');
-    assert.equal(component(null, 'ja').number(33320000), '3332万');
+    assert.equal(component(null, 'ja').number(33320000), '3,332.0万');
+    assert.equal(component(null, 'ko').number(33320000), '3,332.0만');
     assert.equal(component(null, 'en_US').number(33320000), '33.3M');
+    assert.equal(component(null, 'zh').number(97116000), '9,711.6万');
+    assert.equal(component(null, 'zh').number(99999999), '1.0亿');
+    assert.equal(component(null, 'zh').number(160000000), '1.6亿');
+    assert.equal(component(null, 'ja').number(160000000), '1.6億');
+    assert.equal(component(null, 'ko').number(160000000), '1.6억');
+});
+
+test('exact scale applies to usage history counts', () => {
+    const view = component(null, 'zh');
+    view.statsNumberScale = 'exact';  // Stands in for the parent dashboard() scope.
+    assert.equal(view.number(160000000), '160,000,000');
+    assert.equal(view.number(97116000), '97,116,000');
+});
+
+test('number scale survives a page reload', () => {
+    const store = new Map();
+    const make = () => {
+        const context = vm.createContext({
+            window: {},
+            document: {documentElement: {lang: 'en'}},
+            localStorage: {
+                getItem: key => store.has(key) ? store.get(key) : null,
+                setItem: (key, value) => store.set(key, value),
+            },
+        });
+        vm.runInContext(countSource, context);
+        return context.window.omlxCount;
+    };
+    const first = make();
+    assert.equal(first.scale(), 'compact');
+    first.setScale('exact');
+    assert.equal(store.get('omlx-number-scale'), 'exact');
+    assert.equal(make().scale(), 'exact');
 });

@@ -130,8 +130,7 @@
     }
 
     .response-tab-group:hover {
-        background: color-mix(in srgb, var(--timeline-accent) 10%, var(--bg-secondary));
-        border-color: color-mix(in srgb, var(--timeline-accent) 40%, var(--border-normal));
+        background: var(--bg-tertiary);
     }
 
     .response-tab-group .response-tab {
@@ -157,7 +156,7 @@
     }
 
     .response-tab-group.response-tab-group--active:hover {
-        background: color-mix(in srgb, var(--timeline-accent) 12%, var(--bg-secondary));
+        background: var(--bg-tertiary);
     }
 
     .response-tab-group.response-tab-group--active-missing {
@@ -805,7 +804,7 @@
         border: 1px solid var(--border-normal);
         border-radius: 1rem;
         background-color: var(--bg-primary);
-        box-shadow: 0 12px 32px rgb(0 0 0 / 0.14);
+        box-shadow: 0 12px 32px rgb(var(--palette-black) / 0.14);
     }
 
     .composer-menu-item {
@@ -860,7 +859,7 @@
         width: 0.75rem;
         height: 0.75rem;
         border-radius: 9999px;
-        background-color: #fff;
+        background-color: rgb(var(--palette-white));
         transition: transform 0.15s;
     }
 
@@ -911,7 +910,7 @@
     }
 
     .reasoning-slider-dot.is-filled {
-        background-color: rgb(255 255 255 / 0.7);
+        background-color: rgb(var(--palette-white) / 0.7);
     }
 
     .reasoning-slider input[type="range"] {
@@ -944,8 +943,8 @@
         width: var(--t);
         height: var(--t);
         border-radius: 9999px;
-        background-color: #fff;
-        box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+        background-color: rgb(var(--palette-white));
+        box-shadow: 0 1px 4px rgb(var(--palette-black) / 0.3);
         transition: opacity 0.15s;
         -webkit-appearance: none;
         appearance: none;
@@ -956,12 +955,12 @@
         height: var(--t);
         border: none;
         border-radius: 9999px;
-        background-color: #fff;
-        box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+        background-color: rgb(var(--palette-white));
+        box-shadow: 0 1px 4px rgb(var(--palette-black) / 0.3);
     }
 
     .reasoning-slider input[type="range"]:focus-visible::-webkit-slider-thumb {
-        box-shadow: 0 0 0 3px rgb(255 255 255 / 0.5), 0 0 0 5px var(--timeline-accent);
+        box-shadow: 0 0 0 3px rgb(var(--palette-white) / 0.5), 0 0 0 5px var(--timeline-accent);
     }
 
     /* Auto is the model default, not a level; keep its fill neutral. */
@@ -1067,7 +1066,7 @@
         background: rgb(var(--palette-white) / 0.1);
         border: none;
         border-radius: 50%;
-        color: white;
+        color: rgb(var(--palette-white));
         cursor: pointer;
         display: flex;
         align-items: center;

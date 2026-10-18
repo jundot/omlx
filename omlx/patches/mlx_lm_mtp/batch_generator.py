@@ -17,6 +17,7 @@ import functools
 import inspect
 import logging
 import math
+import threading
 import time
 import weakref
 from collections import deque
@@ -406,23 +407,35 @@ def _raises_spec_buffer_caps() -> bool:
     return architecture.startswith("applegpu_g15")
 
 
+# The caps live on the MLX device, so engines running cycles at the same time
+# share one raise and the last one out restores MLX's values.
+_spec_caps_lock = threading.Lock()
+_spec_caps_holders = 0
+_spec_caps_previous: Optional[Tuple[int, int]] = None
+
+
 @contextlib.contextmanager
 def _spec_command_buffers(model: Any = None):
     """Raise caps for supported Qwen targets and GPUs, then restore them."""
-    if not _spec_caps_target(model):
+    global _spec_caps_holders, _spec_caps_previous
+    if not _spec_caps_target(model) or not _raises_spec_buffer_caps():
         yield
         return
 
-    from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
+    from omlx.custom_kernels.quant_matmul.fast import set_command_buffer_caps
 
-    previous = None
-    if _raises_spec_buffer_caps():
-        previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+    with _spec_caps_lock:
+        if _spec_caps_holders == 0:
+            _spec_caps_previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+        _spec_caps_holders += 1
     try:
         yield
     finally:
-        if previous is not None:
-            set_command_buffer_caps(*previous)
+        with _spec_caps_lock:
+            _spec_caps_holders -= 1
+            if _spec_caps_holders == 0 and _spec_caps_previous is not None:
+                set_command_buffer_caps(*_spec_caps_previous)
+                _spec_caps_previous = None
 
 
 def _drafter_for(model: Any) -> Optional[Any]:
@@ -1550,6 +1563,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     tokens = gen_batch.tokens[0] if getattr(gen_batch, "tokens", None) else None
     if not tokens:
         return False
+    started = time.perf_counter()
     try:
         new_cache = _rebuild_singleton_cache(gen_batch.model)
         if new_cache is None:
@@ -1593,11 +1607,14 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             from mlx_lm.models.cache import TokenBuffer
 
             gen_batch._token_context[0] = TokenBuffer(list(tokens))
-        logger.debug(
-            "MTP reconciled to standard on reshape (uid=%s tokens=%d queue=%d)",
+        logger.info(
+            "MTP reconciled to standard on reshape (uid=%s tokens=%d chunks=%d "
+            "queue=%d, %.2fs)",
             getattr(state, "uid", "?"),
             len(tokens),
+            -(-total // step),
             len(state.queue),
+            time.perf_counter() - started,
         )
         return True
     except Exception as exc:

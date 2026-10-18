@@ -6,7 +6,7 @@ through this package's own :class:`~omlx.patches.deepseek_v4.switch_layers
 .SwitchGLU`, which the common adapter cannot wrap: it is not the stock
 mlx-lm module, and its forward carries native Metal fast paths (the
 ``deepseek_*_gather_qmm`` block kernels, the gate/up pair kernels and the
-native ``glm_moe_weighted_sum``). Re-implementing that forward would fork
+native ``moe_weighted_sum``). Re-implementing that forward would fork
 it, so this adapter keeps the module and swaps what it computes on.
 
 Each projection's parameters are replaced, before lazy weights materialize,
@@ -39,7 +39,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from ...custom_kernels.glm_moe_dsa import fast as glm_fast
+from ...custom_kernels.quant_matmul import fast as quant_fast
 from ...scheduler import _sync_and_clear_cache
 from ..moe_expert_offload import (
     _DTYPES,
@@ -287,7 +287,7 @@ class OffloadedSwitchGLU(nn.Module):
             and scores.shape[-1] in (6, 8)
             and scores.dtype == mx.float32
             and y.dtype in (mx.float16, mx.bfloat16)
-            and glm_fast.has_symbol("glm_moe_weighted_sum")
+            and quant_fast.has_symbol("moe_weighted_sum")
         ):
             y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         return y

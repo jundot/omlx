@@ -810,17 +810,17 @@ def _native_indexer_scores(
         return None
 
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         if not fast.is_native_available() or not fast.has_symbol(
-            "qwen4_qsa_indexer_scores"
+            "qsa_indexer_scores"
         ):
             _NATIVE_QSA_SCORE_DISABLED = True
             return None
         # The caller's [B,M,H,D] view transposes back to the GEMM-friendly
         # [B,H,M,D] ABI. The native wrapper only copies when the resulting
         # view is not row-contiguous (for example an offset query chunk).
-        scores = fast.qwen4_qsa_indexer_scores(
+        scores = fast.qsa_indexer_scores(
             queries.transpose(0, 2, 1, 3),
             pooled_keys[:, None],
             mask_ratio=compress_ratio,
@@ -859,14 +859,14 @@ def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
     if scores.shape[1] < _NATIVE_TOPK_MIN_ROWS:
         return None
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         if not fast.is_native_available() or not fast.has_symbol(
-            "qwen4_qsa_topk_indices"
+            "qsa_topk_indices"
         ):
             _NATIVE_QSA_TOPK_DISABLED = True
             return None
-        indices = fast.qwen4_qsa_topk_indices(scores, topk=topk).astype(mx.int32)
+        indices = fast.qsa_topk_indices(scores, topk=topk).astype(mx.int32)
         if not _NATIVE_QSA_TOPK_PROVEN:
             mx.eval(indices)
             _NATIVE_QSA_TOPK_PROVEN = True
@@ -911,15 +911,15 @@ def _native_sparse_gqa_attention(
     if queries.shape[2] < _NATIVE_MAIN_MIN_ROWS:
         return None
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         if not fast.is_native_available() or not fast.has_symbol(
-            "qwen4_qsa_sparse_gqa_attention"
+            "sparse_gqa_attention"
         ):
             _NATIVE_QSA_MAIN_DISABLED = True
             return None
         native_blocks = mx.contiguous(selected_blocks.astype(mx.uint32)[:, None])
-        output = fast.qwen4_qsa_sparse_gqa_attention(
+        output = fast.sparse_gqa_attention(
             queries,
             keys,
             values,
@@ -1014,7 +1014,7 @@ def _decode_qsa_sdpa(
     """
 
     try:
-        from omlx.custom_kernels.decode_fast import fast
+        from omlx.custom_kernels.attention import fast
 
         extension = getattr(fast, "_ext", None)
         supported = getattr(extension, "sdpa_decode_supported", None)
@@ -1237,10 +1237,10 @@ def contiguous_causal_gathered_qsa(
             and not _NATIVE_QSA_MAIN_DISABLED
         ):
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
+                from omlx.custom_kernels.attention import fast
 
                 if fast.is_native_available() and fast.has_symbol(
-                    "qwen4_qsa_sparse_gqa_attention"
+                    "sparse_gqa_attention"
                 ):
                     query_chunk = max(
                         query_chunk, _native_causal_query_chunk(key_tokens)

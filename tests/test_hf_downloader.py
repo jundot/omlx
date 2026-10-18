@@ -2,6 +2,9 @@
 """Tests for the HuggingFace model downloader."""
 
 import asyncio
+import contextlib
+import fcntl
+import io
 import json
 import os
 import shutil
@@ -12,9 +15,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import huggingface_hub
 import pytest
 from fastapi import HTTPException
 from huggingface_hub import HfApi
+from huggingface_hub import constants as hub_constants
+from huggingface_hub import file_download as hub_file_download
 from huggingface_hub.utils import HfHubHTTPError
 
 from omlx._hf_download_worker import _download_without_xet
@@ -864,6 +870,97 @@ class TestHFDownloader:
         assert sibling.exists()
         assert org_dir.exists()
 
+    @staticmethod
+    def _orphan_layout(model_dir):
+        """A finished shard, its metadata, and a temp file left by a killed writer."""
+        target = model_dir / "owner" / "model"
+        staging = target / ".cache" / "huggingface" / "download"
+        staging.mkdir(parents=True)
+        (target / "model-00001-of-00002.safetensors").write_bytes(b"finalized")
+        (staging / "model-00001-of-00002.safetensors.metadata").write_text("a\nb\n")
+        (staging / "model-00001-of-00002.safetensors.lock").touch()
+        lock = staging / "model-00002-of-00002.safetensors.lock"
+        lock.touch()
+        orphan = staging / "1a2b3c4d.etag.5e6f7a8b.incomplete"
+        orphan.write_bytes(b"x" * 4096)
+        return target, lock, orphan
+
+    @pytest.mark.asyncio
+    async def test_run_download_drops_orphaned_partials_before_dry_run(self, model_dir):
+        """A dead writer's temp file must not be counted as progress."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        target, _, orphan = self._orphan_layout(model_dir)
+        task = DownloadTask(task_id="t-orphan", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+        orphan_at_dry_run = []
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                orphan_at_dry_run.append(orphan.exists())
+            return []
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(MagicMock(), None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert orphan_at_dry_run == [False]
+        assert (target / "model-00001-of-00002.safetensors").exists()
+        assert (
+            target
+            / ".cache/huggingface/download/model-00001-of-00002.safetensors.metadata"
+        ).exists()
+        assert task.status == DownloadStatus.COMPLETED
+
+    def test_orphan_cleanup_waits_for_a_live_hub_writer(self, model_dir):
+        """A temp file stays while another writer holds a hub lock in the folder."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        _, lock, partial = self._orphan_layout(model_dir)
+        task = DownloadTask(task_id="t1", repo_id="owner/model")
+
+        with open(lock) as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            downloader._cleanup_partial(task, orphans_only=True)
+            assert partial.exists()
+
+        downloader._cleanup_partial(task, orphans_only=True)
+        assert not partial.exists()
+
+    @pytest.mark.asyncio
+    async def test_failed_download_drops_partials_its_writers_left(self, model_dir):
+        """A writer killed mid-file leaves a temp file no later attempt resumes."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+        task = DownloadTask(task_id="t-failed", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+        staging = model_dir / "owner" / "model" / ".cache" / "huggingface" / "download"
+        partial = staging / "1a2b3c4d.etag.5e6f7a8b.incomplete"
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                return []
+            staging.mkdir(parents=True, exist_ok=True)
+            partial.write_bytes(b"x" * 4096)
+            raise RuntimeError("connection reset by peer")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(MagicMock(), None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.FAILED
+        assert not partial.exists()
+
     @pytest.mark.asyncio
     async def test_download_uses_owner_model_layout(self, model_dir):
         """snapshot_download must receive local_dir under the org subfolder."""
@@ -1080,6 +1177,45 @@ class TestHFDownloader:
             await downloader._run_download(task.task_id, "")
 
         assert task.total_size == 15_400_000_000
+        assert task.status == DownloadStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_dry_run_failure_counts_every_fetched_file(self, model_dir):
+        """The estimate covers every file the snapshot fetches, not only weights."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-all-files", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_info = MagicMock()
+        mock_info.safetensors = {"parameters": {"BF16": 5_000}, "total": 5_000}
+        mock_info.siblings = [
+            SimpleNamespace(rfilename=name, size=size)
+            for name, size in [
+                ("model.safetensors", 10_000),
+                ("model-Q4_K_M.gguf", 20_000),
+                ("pytorch_model.bin", 40_000),  # in ignore_patterns
+                ("config.json", 100),
+            ]
+        ]
+        mock_api = MagicMock()
+        mock_api.model_info.return_value = mock_info
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                raise RuntimeError("dry_run not supported")
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.total_size == 30_100
         assert task.status == DownloadStatus.COMPLETED
 
     @pytest.mark.asyncio
@@ -3695,13 +3831,49 @@ class TestXetHTTPFallback:
         assert request["kwargs"]["token"] == "secret-token"
 
     def test_worker_sets_disable_xet_before_download(self, monkeypatch):
-        monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+        # setenv, not delenv: teardown must undo the worker's own write.
+        monkeypatch.setenv("HF_HUB_DISABLE_XET", "0")
         download = MagicMock()
 
         _download_without_xet({"repo_id": "owner/model"}, download)
 
         assert os.environ["HF_HUB_DISABLE_XET"] == "1"
         download.assert_called_once_with(repo_id="owner/model")
+
+    def test_worker_writes_http_streams_before_a_full_hub_chunk(self, monkeypatch):
+        """The stall watchdog sees an HTTP stream only when hub writes to disk."""
+        monkeypatch.setenv("HF_HUB_DISABLE_XET", "0")
+        hub_chunk = hub_constants.DOWNLOAD_CHUNK_SIZE
+        monkeypatch.setattr(hub_constants, "DOWNLOAD_CHUNK_SIZE", hub_chunk)
+        payload = b"x" * hub_chunk
+        response = httpx.Response(
+            200, content=payload, request=httpx.Request("GET", "https://hub.test/f")
+        )
+        monkeypatch.setattr(
+            hub_file_download,
+            "http_stream_backoff",
+            lambda *args, **kwargs: contextlib.nullcontext(response),
+        )
+        writes = []
+
+        class Sink(io.BytesIO):
+            def write(self, chunk):
+                writes.append(len(chunk))
+                return super().write(chunk)
+
+        def fake_snapshot_download(**kwargs):
+            hub_file_download.http_get(
+                "https://hub.test/f", Sink(), expected_size=len(payload)
+            )
+
+        monkeypatch.setattr(
+            huggingface_hub, "snapshot_download", fake_snapshot_download
+        )
+
+        _download_without_xet({"repo_id": "owner/model"})
+
+        assert sum(writes) == len(payload)
+        assert len(writes) > 1
 
     @pytest.mark.asyncio
     async def test_http_fallback_starts_wire_progress_from_zero(

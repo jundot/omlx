@@ -70,6 +70,8 @@ LOG_TAIL_LINES = 5
 # snapshot offline with a local DFlash2 draft; 1.3.1 added mixed-bit ones.
 MIN_SPLASH_VERSION = (1, 3, 0)
 MIXED_QUANTIZATION_VERSION = (1, 3, 1)
+# Splash reads a per-request thinking_token_budget from 1.3.2 on.
+THINKING_BUDGET_VERSION = (1, 3, 2)
 SPLASH_MAX_CONTEXT = 262144
 SPLASH_INSTALL_HINT = (
     "Splash is not installed: brew install incoai/tap/splash (M3 or later), "
@@ -141,6 +143,10 @@ class SplashBinary:
     @property
     def loads_mixed_quantization(self) -> bool:
         return self.version_tuple >= MIXED_QUANTIZATION_VERSION
+
+    @property
+    def accepts_thinking_budget(self) -> bool:
+        return self.version_tuple >= THINKING_BUDGET_VERSION
 
 
 def _version_tuple(version: str) -> tuple[int, int, int] | None:
@@ -1078,6 +1084,11 @@ class SplashEngine(BaseEngine):
         for key in ("frequency_penalty", "stop", "seed", "response_format"):
             if kwargs.get(key) is not None:
                 body[key] = kwargs[key]
+        # oMLX's resolved budget (request over model settings); the in-process
+        # engines enforce it in the scheduler, Splash enforces it itself.
+        budget = kwargs.get("thinking_budget")
+        if budget is not None and self._target.binary.accepts_thinking_budget:
+            body["thinking_token_budget"] = budget
         return body
 
     async def _stream(self, body: dict[str, Any]) -> AsyncIterator[GenerationOutput]:

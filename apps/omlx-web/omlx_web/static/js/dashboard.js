@@ -124,30 +124,6 @@
     };
     const ACC_PRESET_NAMES = ['quick', 'standard', 'full'];
 
-    // Chinese counts in ten-thousands: 万/亿/万亿 (zh) and 萬/億/兆 (zh-TW), the
-    // exact grouped figure below 10,000. Returns null for every other language.
-    function chineseCount(value) {
-        const lang = typeof document !== 'undefined' ? document.documentElement?.lang : '';
-        if (lang !== 'zh' && lang !== 'zh-TW') return null;
-        const number = Number(value);
-        if (!Number.isFinite(number)) return null;
-        const units = lang === 'zh-TW' ? ['萬', '億', '兆'] : ['万', '亿', '万亿'];
-        const scales = [1e4, 1e8, 1e12];
-        const magnitude = Math.abs(number);
-        let step = scales.length - 1;
-        while (step >= 0 && magnitude < scales[step]) step -= 1;
-        if (step < 0) return Math.round(number).toLocaleString(lang);
-        let mantissa = (magnitude / scales[step]).toFixed(1);
-        // 10,000万 is 1亿: the unit follows the printed mantissa.
-        if (Number(mantissa) >= 10000 && step < scales.length - 1) {
-            step += 1;
-            mantissa = (magnitude / scales[step]).toFixed(1);
-        }
-        const [whole, fraction] = mantissa.replace(/\.0$/, '').split('.');
-        const text = Number(whole).toLocaleString(lang) + (fraction ? '.' + fraction : '');
-        return (number < 0 ? '-' : '') + text + units[step];
-    }
-
     function dashboard() {
         // GridStack instance and helpers stay outside the reactive Alpine state.
         let dashGrid = null;
@@ -438,6 +414,7 @@
             },
 
             statsScope: 'session',
+            statsNumberScale: window.omlxCount?.scale?.() || 'compact',
             // Dashboard block layout (see dashboard_layout.js)
             dashLayout: null,
             dashDraft: null,
@@ -3123,6 +3100,228 @@
                 return null;
             },
 
+            buildModelSettingsPayload(ms) {
+                const isDiffusion = !!ms.is_diffusion_model;
+                // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
+                const chatTemplateKwargs = {};
+                const forcedCtKwargs = [];
+                for (const entry of ms.ctKwargEntries) {
+                    if (entry.type === 'enable_thinking') {
+                        if (isDiffusion) continue;
+                        chatTemplateKwargs.enable_thinking = entry.value === 'true';
+                        if (entry.force) forcedCtKwargs.push('enable_thinking');
+                    } else if (entry.type === 'reasoning_effort') {
+                        if (isDiffusion) continue;
+                        const rawEffort = entry.custom
+                            ? entry.customValue
+                            : entry.value;
+                        const effort = this.coerceKwargValue(rawEffort);
+                        if (String(effort).trim() !== '') {
+                            chatTemplateKwargs.reasoning_effort = effort;
+                            if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                        }
+                    } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
+                        const val = this.coerceKwargValue(entry.value);
+                        const key = entry.key.trim();
+                        if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
+                            continue;
+                        }
+                        chatTemplateKwargs[key] = val;
+                        if (entry.force) forcedCtKwargs.push(key);
+                    }
+                }
+                const payload = {
+                    model_alias: ms.model_alias?.trim() || null,
+                    model_type_override: ms.model_type_override || null,
+                    max_context_window: ms.max_context_window || null,
+                    max_tokens: ms.max_tokens || null,
+                    temperature: Number.isFinite(ms.temperature) ? ms.temperature : null,
+                    top_p: Number.isFinite(ms.top_p) ? ms.top_p : null,
+                    top_k: Number.isFinite(ms.top_k) ? ms.top_k : null,
+                    repetition_penalty: Number.isFinite(ms.repetition_penalty) ? ms.repetition_penalty : null,
+                    min_p: Number.isFinite(ms.min_p) ? ms.min_p : null,
+                    presence_penalty: Number.isFinite(ms.presence_penalty) ? ms.presence_penalty : null,
+                    force_sampling: ms.force_sampling,
+                    reasoning_parser: ms.reasoning_parser || null,
+                    ttl_seconds: ms.ttl_seconds || null,
+                    index_cache_freq: ms.enableIndexCache
+                        ? (ms.index_cache_freq || 4)
+                        : 0,
+                    enable_thinking: this.selectedModel?.thinking_forced ? null : ms.enable_thinking,
+                    qwen4_ple_ssd_offload:
+                        ms.qwen4_ple_ssd_offload_forced
+                            ? !!ms.qwen4_ple_ssd_offload_requested
+                            : !!ms.qwen4_ple_ssd_offload,
+                    deepseek_v41_ced_prefill_enabled:
+                        !!ms.deepseek_v41_ced_prefill_enabled,
+                    qwen4_gdn_decode_wide_proj:
+                        !!ms.qwen4_gdn_decode_wide_proj,
+                    deepseek_v41_engram_ssd_offload:
+                        ms.deepseek_v41_engram_ssd_offload_forced
+                            ? !!ms.deepseek_v41_engram_ssd_offload_requested
+                            : !!ms.deepseek_v41_engram_ssd_offload,
+                    thinking_budget_enabled: ms.enableThinkingBudget,
+                    thinking_budget_tokens: ms.enableThinkingBudget
+                        ? (ms.thinking_budget_tokens || null)
+                        : 0,
+                    guided_grammar_enabled: ms.guided_grammar_enabled,
+                    guided_grammar: ms.guided_grammar_enabled
+                        ? (ms.guided_grammar || null)
+                        : null,
+                    max_tool_result_tokens: ms.enableToolResultLimit
+                        ? (ms.max_tool_result_tokens || null)
+                        : 0,
+                    chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
+                        ? chatTemplateKwargs : null,
+                    forced_ct_kwargs: forcedCtKwargs.length > 0
+                        ? forcedCtKwargs : null,
+                    turboquant_kv_enabled: ms.turboquant_kv_enabled,
+                    turboquant_kv_bits: ms.turboquant_kv_enabled
+                        ? (parseFloat(ms.turboquant_kv_bits) || 4)
+                        : 4,
+                    moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
+                    moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
+                    qwen35_oq_a8_enabled: !!ms.qwen35_oq_a8_enabled,
+                    qwen35_oq_a8_min_tokens: Number(ms.qwen35_oq_a8_min_tokens) || 128,
+                    qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
+                    // Validation only runs when the feature is enabled, so a
+                    // blank numeric input must fall back to the server default
+                    // instead of coercing to 0 and failing an unrelated save.
+                    qwen35_ane_prefill_sequence_length: Number(ms.qwen35_ane_prefill_sequence_length) || 2048,
+                    qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(ms.qwen35_ane_prefill_tail_padding_min_tokens))
+                        ? Number(ms.qwen35_ane_prefill_tail_padding_min_tokens)
+                        : 0,
+                    qwen35_ane_prefill_fraction: Number(ms.qwen35_ane_prefill_fraction),
+                    qwen35_ane_prefill_max_layers: Number(ms.qwen35_ane_prefill_max_layers) || 64,
+                    qwen35_ane_prefill_dual_ane: !!ms.qwen35_ane_prefill_dual_ane,
+                    qwen35_ane_prefill_gdn: !!ms.qwen35_ane_prefill_gdn,
+                    qwen35_ane_prefill_gdn_fraction: Number(ms.qwen35_ane_prefill_gdn_fraction) || 0.5,
+                    qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(ms.qwen35_ane_prefill_gdn_max_layers))
+                        ? Number(ms.qwen35_ane_prefill_gdn_max_layers)
+                        : 48,
+                    qwen35_ane_prefill_cpu_enabled: !!ms.qwen35_ane_prefill_cpu_enabled,
+                    qwen35_ane_prefill_cpu_fraction: Number(ms.qwen35_ane_prefill_cpu_fraction),
+                    qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_down_fraction))
+                        ? Number(ms.qwen35_ane_prefill_cpu_down_fraction)
+                        : 0,
+                    qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_gdn_fraction))
+                        ? Number(ms.qwen35_ane_prefill_cpu_gdn_fraction)
+                        : 0,
+                    qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_threads))
+                        ? Number(ms.qwen35_ane_prefill_cpu_threads)
+                        : 8,
+                    qwen35_ane_prefill_cpu_shared_resource: !!ms.qwen35_ane_prefill_cpu_shared_resource,
+                    specprefill_enabled: ms.specprefill_enabled,
+                    specprefill_draft_model: ms.specprefill_draft_model || null,
+                    specprefill_keep_pct: ms.specprefill_enabled
+                        ? parseFloat(ms.specprefill_keep_pct) || 0.2
+                        : null,
+                    specprefill_threshold: ms.specprefill_enabled
+                        ? (ms.specprefill_threshold || null)
+                        : null,
+                    dflash_enabled: ms.dflash_enabled,
+                    dflash_draft_model: ms.dflash_draft_model || null,
+                    dflash_draft_quant_enabled: ms.dflash_enabled && !!ms.dflash_draft_quant_enabled,
+                    dflash_draft_quant_weight_bits: ms.dflash_enabled && ms.dflash_draft_quant_enabled
+                        ? parseInt(ms.dflash_draft_quant_weight_bits)
+                        : null,
+                    dflash_draft_quant_group_size: ms.dflash_enabled && ms.dflash_draft_quant_enabled
+                        ? parseInt(ms.dflash_draft_quant_group_size)
+                        : null,
+                    // Long-context tuning. Empty → oMLX default.
+                    dflash_draft_window_size: ms.dflash_enabled
+                        && ms.dflash_draft_window_size
+                        ? parseInt(ms.dflash_draft_window_size)
+                        : null,
+                    dflash_block_size: ms.dflash_enabled
+                        && ms.dflash_block_size
+                        ? parseInt(ms.dflash_block_size)
+                        : null,
+                    dflash_verify_mode: ms.dflash_enabled
+                        ? (ms.dflash_verify_mode || 'adaptive')
+                        : null,
+                    mtp_enabled: !!ms.mtp_enabled,
+                    mtp_adaptive_max_depth: ms.mtp_enabled
+                        ? parseInt(ms.mtp_adaptive_max_depth || '3')
+                        : null,
+                    mtp_fixed_depth: null,
+                    qwen35_ane_prefill_shared_fraction: Number(ms.qwen35_ane_prefill_shared_fraction),
+                    vlm_mtp_enabled: !!ms.vlm_mtp_enabled,
+                    vlm_mtp_draft_model: ms.vlm_mtp_enabled
+                        ? (ms.vlm_mtp_draft_model || null)
+                        : null,
+                    vlm_mtp_draft_block_size: ms.vlm_mtp_enabled
+                        && ms.vlm_mtp_draft_block_size
+                        ? parseInt(ms.vlm_mtp_draft_block_size)
+                        : null,
+                    trust_remote_code: ms.trust_remote_code,
+                    external_engine: ms.external_engine || null,
+                };
+                if (isDiffusion) {
+                    Object.assign(payload, {
+                        top_p: null,
+                        top_k: null,
+                        repetition_penalty: null,
+                        min_p: null,
+                        presence_penalty: null,
+                        force_sampling: false,
+                        reasoning_parser: null,
+                        index_cache_freq: 0,
+                        enable_thinking: null,
+                        thinking_budget_enabled: false,
+                        thinking_budget_tokens: 0,
+                        guided_grammar_enabled: false,
+                        guided_grammar: null,
+                        max_tool_result_tokens: 0,
+                        turboquant_kv_enabled: false,
+                        turboquant_kv_bits: 4,
+                        qwen35_ane_prefill_enabled: false,
+                        qwen35_ane_prefill_sequence_length: 2048,
+                        qwen35_ane_prefill_tail_padding_min_tokens: 0,
+                        qwen35_ane_prefill_fraction: 0.53,
+                        qwen35_ane_prefill_max_layers: 64,
+                        qwen35_ane_prefill_dual_ane: true,
+                        qwen35_ane_prefill_gdn: true,
+                        qwen35_ane_prefill_gdn_fraction: 0.5,
+                        qwen35_ane_prefill_gdn_max_layers: 48,
+                        qwen35_ane_prefill_cpu_enabled: false,
+                        qwen35_ane_prefill_cpu_fraction: 0.135,
+                        qwen35_ane_prefill_cpu_down_fraction: 0,
+                        qwen35_ane_prefill_cpu_gdn_fraction: 0,
+                        qwen35_ane_prefill_cpu_threads: 8,
+                        qwen35_ane_prefill_cpu_shared_resource: true,
+                        specprefill_enabled: false,
+                        specprefill_draft_model: null,
+                        specprefill_keep_pct: null,
+                        specprefill_threshold: null,
+                        external_engine: null,
+                        dflash_enabled: false,
+                        dflash_draft_model: null,
+                        dflash_draft_quant_enabled: false,
+                        dflash_draft_quant_weight_bits: null,
+                        dflash_draft_quant_group_size: null,
+                        dflash_draft_window_size: null,
+                        dflash_block_size: null,
+                        dflash_verify_mode: null,
+                        mtp_enabled: false,
+                        mtp_adaptive_max_depth: null,
+                        mtp_fixed_depth: null,
+                        vlm_mtp_enabled: false,
+                        vlm_mtp_draft_model: null,
+                        vlm_mtp_draft_block_size: null,
+                    });
+                }
+                if (this.selectedModel?.embedding_audio_supported) {
+                    const audioSeconds = Number(ms.embedding_audio_max_seconds);
+                    Object.assign(payload, {
+                        embedding_audio_enabled: !!ms.embedding_audio_enabled,
+                        // Empty keeps the 30 s processor default.
+                        embedding_audio_max_seconds: audioSeconds > 0 ? audioSeconds : null,
+                    });
+                }
+                return payload;
+            },
+
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
@@ -3140,230 +3339,24 @@
 
                 this.savingModelSettings = true;
                 try {
+                    const payload = this.buildModelSettingsPayload(this.modelSettings);
+                    if (this._modelSettingsBaseline) {
+                        // Send only edited fields so a stale form does not overwrite other changes.
+                        // Always send mtp_fixed_depth: null to clear a legacy fixed depth.
+                        const initial = this.buildModelSettingsPayload(
+                            JSON.parse(this._modelSettingsBaseline),
+                        );
+                        for (const key of Object.keys(payload)) {
+                            if (key !== 'mtp_fixed_depth'
+                                && JSON.stringify(payload[key]) === JSON.stringify(initial[key])) {
+                                delete payload[key];
+                            }
+                        }
+                    }
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify((() => {
-                            const isDiffusion = !!this.modelSettings.is_diffusion_model;
-                            // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
-                            const chatTemplateKwargs = {};
-                            const forcedCtKwargs = [];
-                            for (const entry of this.modelSettings.ctKwargEntries) {
-                                if (entry.type === 'enable_thinking') {
-                                    if (isDiffusion) continue;
-                                    chatTemplateKwargs.enable_thinking = entry.value === 'true';
-                                    if (entry.force) forcedCtKwargs.push('enable_thinking');
-                                } else if (entry.type === 'reasoning_effort') {
-                                    if (isDiffusion) continue;
-                                    const rawEffort = entry.custom
-                                        ? entry.customValue
-                                        : entry.value;
-                                    const effort = this.coerceKwargValue(rawEffort);
-                                    if (String(effort).trim() !== '') {
-                                        chatTemplateKwargs.reasoning_effort = effort;
-                                        if (entry.force) forcedCtKwargs.push('reasoning_effort');
-                                    }
-                                } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
-                                    const val = this.coerceKwargValue(entry.value);
-                                    const key = entry.key.trim();
-                                    if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
-                                        continue;
-                                    }
-                                    chatTemplateKwargs[key] = val;
-                                    if (entry.force) forcedCtKwargs.push(key);
-                                }
-                            }
-                            const payload = {
-                                model_alias: this.modelSettings.model_alias?.trim() || null,
-                                model_type_override: this.modelSettings.model_type_override || null,
-                                max_context_window: this.modelSettings.max_context_window || null,
-                                max_tokens: this.modelSettings.max_tokens || null,
-                                temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
-                                top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
-                                top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
-                                repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
-                                min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
-                                presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
-                                force_sampling: this.modelSettings.force_sampling,
-                                reasoning_parser: this.modelSettings.reasoning_parser || null,
-                                ttl_seconds: this.modelSettings.ttl_seconds || null,
-                                index_cache_freq: this.modelSettings.enableIndexCache
-                                    ? (this.modelSettings.index_cache_freq || 4)
-                                    : 0,
-                                enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
-                                qwen4_ple_ssd_offload:
-                                    this.modelSettings.qwen4_ple_ssd_offload_forced
-                                        ? !!this.modelSettings.qwen4_ple_ssd_offload_requested
-                                        : !!this.modelSettings.qwen4_ple_ssd_offload,
-                                deepseek_v41_ced_prefill_enabled:
-                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
-                                qwen4_gdn_decode_wide_proj:
-                                    !!this.modelSettings.qwen4_gdn_decode_wide_proj,
-                                deepseek_v41_engram_ssd_offload:
-                                    this.modelSettings.deepseek_v41_engram_ssd_offload_forced
-                                        ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
-                                        : !!this.modelSettings.deepseek_v41_engram_ssd_offload,
-                                thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
-                                thinking_budget_tokens: this.modelSettings.enableThinkingBudget
-                                    ? (this.modelSettings.thinking_budget_tokens || null)
-                                    : 0,
-                                guided_grammar_enabled: this.modelSettings.guided_grammar_enabled,
-                                guided_grammar: this.modelSettings.guided_grammar_enabled
-                                    ? (this.modelSettings.guided_grammar || null)
-                                    : null,
-                                max_tool_result_tokens: this.modelSettings.enableToolResultLimit
-                                    ? (this.modelSettings.max_tool_result_tokens || null)
-                                    : 0,
-                                chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
-                                    ? chatTemplateKwargs : null,
-                                forced_ct_kwargs: forcedCtKwargs.length > 0
-                                    ? forcedCtKwargs : null,
-                                turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
-                                turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
-                                    ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
-                                    : 4,
-                                moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
-                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
-                                qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
-                                qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
-                                qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
-                                // Validation only runs when the feature is enabled, so a
-                                // blank numeric input must fall back to the server default
-                                // instead of coercing to 0 and failing an unrelated save.
-                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
-                                qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
-                                    : 0,
-                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction),
-                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
-                                qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
-                                qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
-                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
-                                qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
-                                    : 48,
-                                qwen35_ane_prefill_cpu_enabled: !!this.modelSettings.qwen35_ane_prefill_cpu_enabled,
-                                qwen35_ane_prefill_cpu_fraction: Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction),
-                                qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction)
-                                    : 0,
-                                qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction)
-                                    : 0,
-                                qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_threads))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
-                                    : 8,
-                                qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
-                                specprefill_enabled: this.modelSettings.specprefill_enabled,
-                                specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
-                                specprefill_keep_pct: this.modelSettings.specprefill_enabled
-                                    ? parseFloat(this.modelSettings.specprefill_keep_pct) || 0.2
-                                    : null,
-                                specprefill_threshold: this.modelSettings.specprefill_enabled
-                                    ? (this.modelSettings.specprefill_threshold || null)
-                                    : null,
-                                dflash_enabled: this.modelSettings.dflash_enabled,
-                                dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_enabled: this.modelSettings.dflash_enabled && !!this.modelSettings.dflash_draft_quant_enabled,
-                                dflash_draft_quant_weight_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_weight_bits)
-                                    : null,
-                                dflash_draft_quant_group_size: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_group_size)
-                                    : null,
-                                // Long-context tuning. Empty → oMLX default.
-                                dflash_draft_window_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_draft_window_size
-                                    ? parseInt(this.modelSettings.dflash_draft_window_size)
-                                    : null,
-                                dflash_block_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_block_size
-                                    ? parseInt(this.modelSettings.dflash_block_size)
-                                    : null,
-                                dflash_verify_mode: this.modelSettings.dflash_enabled
-                                    ? (this.modelSettings.dflash_verify_mode || 'adaptive')
-                                    : null,
-                                mtp_enabled: !!this.modelSettings.mtp_enabled,
-                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
-                                    ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
-                                    : null,
-                                mtp_fixed_depth: null,
-                                qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
-                                vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
-                                vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
-                                    ? (this.modelSettings.vlm_mtp_draft_model || null)
-                                    : null,
-                                vlm_mtp_draft_block_size: this.modelSettings.vlm_mtp_enabled
-                                    && this.modelSettings.vlm_mtp_draft_block_size
-                                    ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
-                                    : null,
-                                trust_remote_code: this.modelSettings.trust_remote_code,
-                                external_engine: this.modelSettings.external_engine || null,
-                            };
-                            if (isDiffusion) {
-                                Object.assign(payload, {
-                                    top_p: null,
-                                    top_k: null,
-                                    repetition_penalty: null,
-                                    min_p: null,
-                                    presence_penalty: null,
-                                    force_sampling: false,
-                                    reasoning_parser: null,
-                                    index_cache_freq: 0,
-                                    enable_thinking: null,
-                                    thinking_budget_enabled: false,
-                                    thinking_budget_tokens: 0,
-                                    guided_grammar_enabled: false,
-                                    guided_grammar: null,
-                                    max_tool_result_tokens: 0,
-                                    turboquant_kv_enabled: false,
-                                    turboquant_kv_bits: 4,
-                                    qwen35_ane_prefill_enabled: false,
-                                    qwen35_ane_prefill_sequence_length: 2048,
-                                    qwen35_ane_prefill_tail_padding_min_tokens: 0,
-                                    qwen35_ane_prefill_fraction: 0.53,
-                                    qwen35_ane_prefill_max_layers: 64,
-                                    qwen35_ane_prefill_dual_ane: true,
-                                    qwen35_ane_prefill_gdn: true,
-                                    qwen35_ane_prefill_gdn_fraction: 0.5,
-                                    qwen35_ane_prefill_gdn_max_layers: 48,
-                                    qwen35_ane_prefill_cpu_enabled: false,
-                                    qwen35_ane_prefill_cpu_fraction: 0.135,
-                                    qwen35_ane_prefill_cpu_down_fraction: 0,
-                                    qwen35_ane_prefill_cpu_gdn_fraction: 0,
-                                    qwen35_ane_prefill_cpu_threads: 8,
-                                    qwen35_ane_prefill_cpu_shared_resource: true,
-                                    specprefill_enabled: false,
-                                    specprefill_draft_model: null,
-                                    specprefill_keep_pct: null,
-                                    specprefill_threshold: null,
-                                    external_engine: null,
-                                    dflash_enabled: false,
-                                    dflash_draft_model: null,
-                                    dflash_draft_quant_enabled: false,
-                                    dflash_draft_quant_weight_bits: null,
-                                    dflash_draft_quant_group_size: null,
-                                    dflash_draft_window_size: null,
-                                    dflash_block_size: null,
-                                    dflash_verify_mode: null,
-                                    mtp_enabled: false,
-                                    mtp_adaptive_max_depth: null,
-                                    mtp_fixed_depth: null,
-                                    vlm_mtp_enabled: false,
-                                    vlm_mtp_draft_model: null,
-                                    vlm_mtp_draft_block_size: null,
-                                });
-                            }
-                            if (this.selectedModel?.embedding_audio_supported) {
-                                const audioSeconds = Number(this.modelSettings.embedding_audio_max_seconds);
-                                Object.assign(payload, {
-                                    embedding_audio_enabled: !!this.modelSettings.embedding_audio_enabled,
-                                    // Empty keeps the 30 s processor default.
-                                    embedding_audio_max_seconds: audioSeconds > 0 ? audioSeconds : null,
-                                });
-                            }
-                            return payload;
-                        })()),
+                        body: JSON.stringify(payload),
                     });
 
                     if (response.ok) {
@@ -3888,7 +3881,7 @@
                     return {
                         id,
                         label: window.t(tile.label),
-                        value: tile.unit === '%' ? raw.toFixed(1) : this.formatNumber(raw),
+                        value: tile.unit === '%' ? raw.toFixed(1) : this.formatServingCount(raw),
                         unit: tile.unit || '',
                     };
                 });
@@ -4478,11 +4471,22 @@
             },
 
             formatNumber(num) {
-                const chinese = chineseCount(num);
-                if (chinese !== null) return chinese;
+                const compact = window.omlxCount?.eastAsian?.(num);
+                if (compact != null) return compact;
                 if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
                 if (num >= 10000000) return (num / 1000000).toFixed(1) + 'M';
                 return num.toLocaleString();
+            },
+
+            setStatsNumberScale(value) {
+                window.omlxCount?.setScale?.(value);
+            },
+
+            formatServingCount(value) {
+                if (this.statsNumberScale === 'exact') {
+                    return window.omlxCount.exact(value);
+                }
+                return this.formatNumber(value);
             },
 
             cacheObsCumulative(stats, selectedModel) {
@@ -4530,8 +4534,8 @@
             },
 
             formatTokenCount(n) {
-                const chinese = chineseCount(n);
-                if (chinese !== null) return chinese;
+                const compact = window.omlxCount?.eastAsian?.(n);
+                if (compact != null) return compact;
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                 return String(n);
@@ -7834,8 +7838,8 @@
             },
 
             formatDownloads(count) {
-                const chinese = chineseCount(count);
-                if (chinese !== null) return chinese;
+                const compact = window.omlxCount?.eastAsian?.(count);
+                if (compact != null) return compact;
                 if (count >= 1000000) return (count / 1000000).toFixed(1) + 'M';
                 if (count >= 1000) return (count / 1000).toFixed(1) + 'K';
                 return count.toString();

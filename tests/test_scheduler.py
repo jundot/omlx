@@ -51,6 +51,7 @@ from omlx.scheduler import (
     _StoreCacheGate,
     _VLMMTPDecodeState,
 )
+from omlx.utils import metal_sync
 
 
 def test_boundary_snapshot_provider_removes_failed_promotion(tmp_path):
@@ -2254,7 +2255,7 @@ class TestSchedulerStatistics:
         self, mock_model, mock_tokenizer, offload
     ):
         """On a 24 GB host without NAX, the wide qwen4 step needs offload."""
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         mock_model.config.model_type = "qwen4_exp_text"
         with (
@@ -2910,14 +2911,7 @@ class TestSchedulerXtcSpecialTokens:
 class TestSyncAndClearCache:
     """Tests for module-level _sync_and_clear_cache() helper (#300, #888)."""
 
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "There is no Stream(gpu, 0) in current thread.",
-            "kIOGPUCommandBufferCallbackErrorTimeout",
-        ],
-    )
-    def test_swallows_generation_stream_thread_error(self, message):
+    def test_swallows_generation_stream_thread_error(self):
         """generation_stream sync failing must not break cache clear.
 
         Reproduces #888: on some MLX builds mx.synchronize(generation_stream)
@@ -2933,7 +2927,7 @@ class TestSyncAndClearCache:
 
         def fake_gen_sync(stream):
             calls.append(("gen_sync", stream))
-            raise RuntimeError(message)
+            raise RuntimeError("There is no Stream(gpu, 0) in current thread.")
 
         def fake_default_sync():
             calls.append(("default_sync",))
@@ -2956,6 +2950,34 @@ class TestSyncAndClearCache:
         assert calls[0][0] == "gen_sync"
         assert ("default_sync",) in calls
         assert ("clear_cache",) in calls
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "00000003:kIOGPUCommandBufferCallbackErrorHang",
+            "00000005:kIOGPUCommandBufferCallbackErrorInnocentVictim",
+            "00000002:kIOGPUCommandBufferCallbackErrorTimeout",
+        ],
+    )
+    def test_raises_generation_stream_command_buffer_error(self, code):
+        """A failed engine-stream buffer must reach the caller (#4224).
+
+        MLX clears the stored error when it raises, so a swallowed error
+        lets the engine keep decoding on results the GPU discarded.
+        """
+        error = RuntimeError(f"[METAL] Command buffer execution failed: ({code}).")
+
+        def synchronize(*args):
+            if args:
+                raise error
+
+        with (
+            patch.object(metal_sync.mx, "synchronize", side_effect=synchronize),
+            patch.object(metal_sync.mx, "clear_cache") as clear,
+            pytest.raises(RuntimeError, match=code),
+        ):
+            metal_sync._sync_and_clear_cache("engine-stream")
+        clear.assert_not_called()
 
     @pytest.mark.parametrize("stage", ["generation", "default", "clear"])
     def test_terminal_gpu_error_exits_before_further_cleanup(self, stage):
@@ -4458,11 +4480,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4502,11 +4524,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             ),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4544,11 +4566,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=native_available,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=symbol_available,
             ),
         ):
@@ -4576,11 +4598,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4628,11 +4650,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):

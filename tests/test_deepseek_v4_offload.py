@@ -123,12 +123,12 @@ def kernels(request, monkeypatch):
     """With the native GLM/DSv4 kernels, or without them as on a CI runner:
     the module then returns sorted routes unsummed and the caller applies the
     scores, and the adapter must follow the same rule."""
-    from omlx.custom_kernels.glm_moe_dsa import fast as k
+    from omlx.custom_kernels.quant_matmul import fast as k
 
     if request.param == "fallback":
         monkeypatch.setattr(k, "_ext", None)
         monkeypatch.setattr(k, "has_symbol", lambda name: False)
-    elif not k.has_symbol("glm_moe_weighted_sum"):
+    elif not k.has_symbol("moe_weighted_sum"):
         pytest.skip("native GLM kernels are not built here")
     return request.param
 

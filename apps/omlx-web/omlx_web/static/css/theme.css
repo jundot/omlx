@@ -256,15 +256,15 @@
 
     /* Surfaces, text, borders and controls */
     --bg-primary: rgb(var(--palette-white));
-    --bg-secondary: rgb(var(--palette-slate-50));
-    --bg-tertiary: rgb(var(--palette-slate-100));
+    --bg-secondary: rgb(var(--palette-neutral-50));
+    --bg-tertiary: rgb(var(--palette-neutral-100));
     --text-primary: rgb(var(--palette-slate-900));
     --text-secondary: rgb(var(--palette-slate-600));
     --text-tertiary: rgb(var(--palette-slate-500));
     --text-muted: rgb(var(--palette-slate-400));
     --border-faint: rgb(var(--palette-slate-200));
     --border-normal: rgb(var(--palette-slate-300));
-    --code-bg: rgb(var(--palette-gray-100));
+    --code-bg: rgb(var(--palette-neutral-100));
     --link-color: rgb(var(--palette-blue-600));
     --btn-primary: rgb(var(--palette-neutral-900));
     --btn-primary-hover: rgb(var(--palette-zinc-800));

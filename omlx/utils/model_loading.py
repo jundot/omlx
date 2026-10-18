@@ -727,6 +727,13 @@ def maybe_apply_pre_load_patches(
         if apply_hy_v3_patch():
             logger.info("Hy3 pre-load patch applied for %s", model_name)
 
+    if model_type == "muse_spark":
+        # The VLM imports the same text model, so register it on both paths.
+        from ..patches.muse_spark import apply_muse_spark_patch
+
+        if apply_muse_spark_patch():
+            logger.info("Muse Spark mlx-lm registration applied for %s", model_name)
+
     text_config = config.get("text_config")
     text_model_type = (
         text_config.get("model_type") if isinstance(text_config, dict) else None
@@ -807,6 +814,17 @@ def maybe_apply_pre_load_patches(
         if apply_mlx_vlm_muse_glimmer_compat_patch():
             logger.info(
                 "Muse Glimmer mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
+    if for_vlm and model_type == "muse_spark":
+        from ..patches.mlx_vlm_muse_spark_compat import (
+            apply_mlx_vlm_muse_spark_compat_patch,
+        )
+
+        if apply_mlx_vlm_muse_spark_compat_patch():
+            logger.info(
+                "Muse Spark mlx-vlm compatibility patch applied for %s",
                 model_name,
             )
 

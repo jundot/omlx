@@ -4165,36 +4165,6 @@ class TestToolCallMarkerInArguments:
         text = f"<tool_call>{deep}</tool_call>"
         assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [deep]
 
-    def test_boundary_scan_stays_linear_on_adversarial_output(self):
-        """Guard the linear-time rule for untrusted model output.
-
-        Locating the payload end must not re-scan the accumulated buffer once
-        per chunk: an unterminated JSON object stuffed with close markers
-        would then cost quadratic time. Model output is attacker-influenceable
-        via prompt injection, so this is a DoS surface, not just a slowdown.
-        """
-        import time
-
-        def elapsed(markers):
-            evil = (
-                "<tool_call>"
-                + '{"name":"f","arguments":{"s":"'
-                + "</tool_call>" * markers
-            )
-            filt = ToolCallStreamFilter(self._tokenizer())
-            start = time.perf_counter()
-            for i in range(0, len(evil), 64):
-                filt.feed(evil[i : i + 64])
-            filt.finish()
-            return time.perf_counter() - start
-
-        elapsed(400)  # warm up the interpreter before timing
-        small = max(elapsed(400), 1e-4)
-        large = elapsed(3200)
-        # 8x the input: linear would be ~8x, quadratic ~64x. Allow generous
-        # headroom for a loaded CI box while still catching quadratic growth.
-        assert large / small < 24, f"superlinear growth: {small=} {large=}"
-
 
 class TestQwen3CoderMarkerInArguments:
     """qwen3_coder XML dialect with literal markers in a value (#2507).

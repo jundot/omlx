@@ -14,7 +14,8 @@ import mlx.nn as nn
 import numpy as np
 from mlx_lm.models.switch_layers import SwitchLinear
 
-from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+from omlx.custom_kernels.attention import fast as attention_fast
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
 from ..deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
 from . import growth
@@ -346,9 +347,9 @@ class Attention(nn.Module):
             and c.n_heads == 64
             and c.head_dim == 512
             and q.dtype == mx.bfloat16
-            and glm_fast.has_symbol("deepseek_v41_packed_attention")
+            and attention_fast.has_symbol("packed_sparse_attention")
         ):
-            out = glm_fast.deepseek_v41_packed_attention(
+            out = attention_fast.packed_sparse_attention(
                 q.transpose(0, 2, 1, 3),
                 kv[:, None],
                 pooled,
@@ -431,7 +432,7 @@ class Expert(nn.Module):
             and x.size // self.w1.input_dims == indices.size // indices.shape[-1]
             and indices.size > 0
             and weights.size == indices.size
-            and glm_fast.has_symbol("deepseek_v41_grouped_expert")
+            and quant_fast.has_symbol("grouped_expert")
         ):
             # Short DSpark verification blocks share the decode execution
             # pipeline, retaining a distinct quantized input for each token.
@@ -462,7 +463,7 @@ class Expert(nn.Module):
                 gate, up, weights.reshape(-1), x.dtype, self._limit
             )
             down = gather(y, self.w2, mx.arange(ids.size, dtype=mx.uint32))
-            return glm_fast.deepseek_v41_grouped_expert(gate, up, y, down).reshape(
+            return quant_fast.grouped_expert(gate, up, y, down).reshape(
                 *indices.shape, 1, x.shape[-1]
             )
         block_plan = None
@@ -496,14 +497,14 @@ class Expert(nn.Module):
             and block_kind == "mxfp4"
             and self.w1.quantize_input == self.w3.quantize_input
             and self.w1.output_dims == self.w3.output_dims
-            and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_pair_concat_blocks")
+            and quant_fast.has_symbol("mxfp4_gather_qmm_pair_concat_blocks")
         ):
             inp = (
                 quantize_activation(x)
                 if self.w1.quantize_input and not input_quantized
                 else x
             )
-            pair = glm_fast.deepseek_mxfp4_gather_qmm_pair_concat_blocks(
+            pair = quant_fast.mxfp4_gather_qmm_pair_concat_blocks(
                 inp,
                 self.w1.weight,
                 self.w1.scales,
@@ -519,7 +520,7 @@ class Expert(nn.Module):
             and self.w1.group_size == self.w3.group_size
             and self.w1.quantize_input == self.w3.quantize_input
             and self.w1.output_dims == self.w3.output_dims
-            and glm_fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks")
+            and quant_fast.has_symbol("affine_gather_qmm_pair_concat_blocks")
         ):
             inp = (
                 quantize_activation(x)
@@ -527,7 +528,7 @@ class Expert(nn.Module):
                 else x
             )
             meta, count, variant = block_plan
-            pair = glm_fast.deepseek_affine_gather_qmm_pair_concat_blocks(
+            pair = quant_fast.affine_gather_qmm_pair_concat_blocks(
                 inp,
                 self.w1.weight,
                 self.w1.scales,

@@ -55,6 +55,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
 
+import anyio
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi import Request as FastAPIRequest
 from fastapi.encoders import jsonable_encoder
@@ -2982,14 +2983,17 @@ async def _with_sse_keepalive(
                     return
                 yield result
     finally:
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                pass
-        if hasattr(ait, "aclose"):
-            await ait.aclose()
+        # Starlette's cancelled response scope would cancel this cleanup again
+        # and cut it short, e.g. closing an upstream connection.
+        with anyio.CancelScope(shield=True):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
+            if hasattr(ait, "aclose"):
+                await ait.aclose()
 
 
 async def _run_with_disconnect_guard(
@@ -3106,10 +3110,12 @@ async def _with_json_keepalive(
     finally:
         if not task.done():
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                pass
+            # Same shielded drain as _with_sse_keepalive.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await task
+                except (asyncio.CancelledError, StopAsyncIteration):
+                    pass
 
 
 async def _json_response_or_keepalive(

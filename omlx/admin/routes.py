@@ -83,6 +83,7 @@ from ..settings import (
     SubKeyEntry,
     burst_decode_env,
 )
+from ..utils.fatal import is_command_buffer_error
 from ..utils.hardware import (
     compute_owner_hash,
     get_chip_name,
@@ -243,7 +244,7 @@ def _oq_a8_kernels_available() -> bool:
     a no-op.
     """
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
 
         return bool(fast.oq_a8_available())
     except Exception:
@@ -3060,8 +3061,8 @@ async def update_model_settings(
         current_settings.specprefill_threshold = request.specprefill_threshold or None
     if "external_engine" in sent:
         engine_id = None if is_diffusion_model else request.external_engine or None
-        # Check only a change: the web modal resends the field on every save,
-        # and a launcher or draft removed later must not block other fields.
+        # Check only a change: a client may resend the stored value, and a
+        # launcher or draft removed later must not block other fields.
         if engine_id is not None and engine_id != current_settings.external_engine:
             if engine_id not in EXTERNAL_ENGINES:
                 raise HTTPException(
@@ -7219,6 +7220,15 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
             try:
                 await loop.run_in_executor(executor, _sync_and_clear_cache, stream)
             except RuntimeError as exc:
+                if is_command_buffer_error(exc):
+                    # Keep reclaiming the other engines.
+                    logger.warning(
+                        "Metal command buffer error while reclaiming MLX "
+                        "buffers for model '%s': %s",
+                        model_id,
+                        exc,
+                    )
+                    continue
                 if "cannot schedule new futures after shutdown" not in str(exc):
                     raise
                 logger.warning(

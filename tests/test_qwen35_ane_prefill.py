@@ -9,23 +9,23 @@ import mlx.nn as nn
 import pytest
 
 import omlx.patches.qwen35_ane_prefill as ane_patch
-from omlx.custom_kernels.qwen35_prefill import fast
+from omlx.custom_kernels.quant_matmul import ane as fast
 from omlx.patches import qwen35_packed_linear
 
 
 def test_ane_compile_bindings_release_the_python_gil():
     bindings = (
         Path(__file__).resolve().parents[1]
-        / "omlx/custom_kernels/qwen35_prefill/csrc/bindings.cpp"
+        / "omlx/custom_kernels/quant_matmul/csrc/bindings.cpp"
     ).read_text(encoding="utf-8")
     blocks = bindings.split("  m.def(")
     guard = "nb::call_guard<nb::gil_scoped_release>()"
 
     for name in (
-        "qwen35_ane_compile_linear",
-        "qwen35_ane_compile_linear_bank",
-        "qwen35_ane_compile_fp16_linear",
-        "qwen35_ane_compile_swiglu_down",
+        "ane_compile_linear",
+        "ane_compile_linear_bank",
+        "ane_compile_fp16_linear",
+        "ane_compile_swiglu_down",
     ):
         block = next(part for part in blocks if f'"{name}"' in part)
         assert guard in block
@@ -34,10 +34,10 @@ def test_ane_compile_bindings_release_the_python_gil():
 def test_dual_ane_ticket_acquisition_rolls_back_the_first_ticket():
     source = (
         Path(__file__).resolve().parents[1]
-        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+        / "omlx/custom_kernels/quant_matmul/csrc/ane/ane_hybrid.mm"
     ).read_text(encoding="utf-8")
     helper = source.split("static AneTicketPair begin_ane_ticket_pair(", 1)[1]
-    helper = helper.split("bool qwen35_ane_available()", 1)[0]
+    helper = helper.split("bool ane_available()", 1)[0]
 
     assert "first->cancel_ticket(first_ticket);" in helper
     assert source.count("begin_ane_ticket_pair(") == 3
@@ -47,7 +47,7 @@ def test_ane_dispatch_guard_transfers_each_ticket_after_thread_spawn():
     """A thread-constructor failure must leave every unowned ticket guarded."""
     source = (
         Path(__file__).resolve().parents[1]
-        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+        / "omlx/custom_kernels/quant_matmul/csrc/ane/ane_hybrid.mm"
     ).read_text(encoding="utf-8")
     dual = source.split("class DualAneHybridPrimitive", 1)[1]
     dual = dual.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[0]
@@ -75,7 +75,7 @@ def test_hybrid_merge_waits_for_gpu_suffix_completion():
     """ANE completion alone must not let merge race an in-flight GPU qmm."""
     source = (
         Path(__file__).resolve().parents[1]
-        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+        / "omlx/custom_kernels/quant_matmul/csrc/ane/ane_hybrid.mm"
     ).read_text(encoding="utf-8")
     single = source.split("class AneHybridQ4Primitive", 1)[1]
     single = single.split("class DualAneHybridPrimitive", 1)[0]
@@ -225,10 +225,10 @@ def test_packed_projections_are_ineligible_instead_of_raising():
 @pytest.mark.parametrize(
     ("bits", "symbol"),
     [
-        (4, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"),
-        (5, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
-        (6, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
-        (8, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
+        (4, "ane_dual_cpu_fp16_q4_swiglu_t"),
+        (5, "ane_dual_cpu_fp16_swiglu_t"),
+        (6, "ane_dual_cpu_fp16_swiglu_t"),
+        (8, "ane_dual_cpu_fp16_swiglu_t"),
     ],
 )
 def test_cpu_gate_kernel_keeps_q4_specialized(bits, symbol):
@@ -238,10 +238,10 @@ def test_cpu_gate_kernel_keeps_q4_specialized(bits, symbol):
 @pytest.mark.parametrize(
     ("bits", "symbol"),
     [
-        (4, "qwen35_ane_cpu_fp16_q4_swiglu_t"),
-        (5, "qwen35_ane_cpu_fp16_swiglu_t"),
-        (6, "qwen35_ane_cpu_fp16_swiglu_t"),
-        (8, "qwen35_ane_cpu_fp16_swiglu_t"),
+        (4, "ane_cpu_fp16_q4_swiglu_t"),
+        (5, "ane_cpu_fp16_swiglu_t"),
+        (6, "ane_cpu_fp16_swiglu_t"),
+        (8, "ane_cpu_fp16_swiglu_t"),
     ],
 )
 def test_cpu_gate_kernel_selects_single_ane_symbols(bits, symbol):
@@ -712,7 +712,7 @@ def test_install_dispatch_registers_mlx_lm_gdn_backend(monkeypatch):
 
 
 def test_enable_marks_only_requested_number_of_loaded_mlps(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -747,9 +747,9 @@ def test_enable_marks_only_requested_number_of_loaded_mlps(monkeypatch):
 def test_cpu_shared_resource_scheduler_is_capability_guarded(
     monkeypatch, available
 ):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(
-        fast, "qwen35_cpu_shared_resource_available", lambda: available
+        fast, "cpu_shared_resource_available", lambda: available
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -796,7 +796,7 @@ def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
         captured.append(args)
         return mx.zeros((1, 1, 128), dtype=mx.float16)
 
-    monkeypatch.setattr(fast, "qwen35_cpu_fp16_affine_qmm_t", hybrid)
+    monkeypatch.setattr(fast, "cpu_fp16_affine_qmm_t", hybrid)
     result = ane_patch._post_ane_linear(
         linear,
         mx.zeros((1, 1, 256), dtype=mx.float16),
@@ -811,7 +811,7 @@ def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
 
 
 def test_enable_caps_dual_layers_at_resident_program_budget(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -837,7 +837,7 @@ def test_enable_caps_dual_layers_at_resident_program_budget(monkeypatch):
 
 
 def test_enable_logs_gdn_starvation_when_budget_exhausted(monkeypatch, caplog):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -868,10 +868,10 @@ def test_enable_logs_gdn_starvation_when_budget_exhausted(monkeypatch, caplog):
 
 
 def test_enable_packs_all_dual_layers_into_two_procedure_banks(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -882,7 +882,7 @@ def test_enable_packs_all_dual_layers_into_two_procedure_banks(monkeypatch):
         compiled.append((len(weights), sequence_length, ane_instance, models))
         return models
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     model = _Model(4)
 
     count = ane_patch.enable_qwen35_ane_prefill(
@@ -1039,7 +1039,7 @@ def test_compile_single_banks_stops_retrying_when_headroom_runs_out(monkeypatch)
         calls.append(len(weights))
         raise RuntimeError("ANE procedure bank load failed: 0x20004")
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
 
     headroom_calls = []
 
@@ -1068,7 +1068,7 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
         calls.append((len(values), sequence_length, ane_instance))
         return [object() for _ in values]
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
 
     result = ane_patch._compile_single_banks(weights, 2048)
@@ -1081,10 +1081,10 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
 
 
 def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -1098,7 +1098,7 @@ def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
             raise RuntimeError("ANE procedure bank load failed: 0x20004")
         return [object() for _ in weights]
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     model = _Model(4)
 
     count = ane_patch.enable_qwen35_ane_prefill(
@@ -1133,10 +1133,10 @@ def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
 
 
 def test_enable_first_retry_is_a_near_half_split(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -1150,7 +1150,7 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
             raise RuntimeError("ANE procedure bank load failed: 0x20004")
         return [object() for _ in weights]
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     model = _Model(4)
 
     count = ane_patch.enable_qwen35_ane_prefill(
@@ -1167,10 +1167,10 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
 
 
 def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -1180,7 +1180,7 @@ def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
     def compile_bank(weights, sequence_length, ane_instance):
         raise RuntimeError("ANE procedure bank load failed: 0x20004")
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     per_layer = []
 
     def compile_pair(mlp, config):
@@ -1216,7 +1216,7 @@ def test_compile_pair_builds_one_combined_ane_program(monkeypatch):
         compiled.append((weight.shape, weight.dtype, sequence_length))
         return object()
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     monkeypatch.setattr(
         fast,
         "has_symbol",
@@ -1247,15 +1247,15 @@ def test_compile_pair_splits_one_prompt_across_two_ane_instances(monkeypatch):
         compiled.append((weight.shape, sequence_length, ane_instance, model))
         return model
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     monkeypatch.setattr(
         fast,
         "has_symbol",
         lambda name: (
             name
             in {
-                "qwen35_ane_dual_affine_qmm_t",
-                "qwen35_ane_dual_q4_swiglu_t",
+                "ane_dual_affine_qmm_t",
+                "ane_dual_q4_swiglu_t",
             }
         ),
     )
@@ -1334,11 +1334,11 @@ def test_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(monkeypatch, dual):
     assert ane_patch._eligible_pair(_make_affine_mlp(6, 64))
     generic_name = ane_patch._fused_swiglu_symbol(6, dual=dual)
     assert generic_name == (
-        "qwen35_ane_dual_affine_swiglu_t"
+        "ane_dual_affine_swiglu_t"
         if dual
-        else "qwen35_ane_affine_swiglu_t"
+        else "ane_affine_swiglu_t"
     )
-    q4_name = "qwen35_ane_dual_q4_swiglu_t" if dual else "qwen35_ane_q4_swiglu_t"
+    q4_name = "ane_dual_q4_swiglu_t" if dual else "ane_q4_swiglu_t"
     captured = {}
     activation = mx.zeros((1, 1, 4), dtype=mx.bfloat16)
 
@@ -1404,14 +1404,14 @@ def test_compile_pair_cache_identity_includes_bits_and_group_size(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_swiglu_t",
+        lambda name: name == "ane_affine_swiglu_t",
     )
 
     def compile_linear(weight, sequence_length):
         compiled.append((weight.shape, sequence_length))
         return object()
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     config = ane_patch._AnePrefillConfig(2048, 0.5, 8)
 
     first = ane_patch._compile_pair(mlp, config)
@@ -1437,7 +1437,7 @@ def test_prepare_pair_tracks_q8_bits_and_packed_shape(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_dual_affine_swiglu_t",
+        lambda name: name == "ane_dual_affine_swiglu_t",
     )
 
     prepared = ane_patch._prepare_pair_for_bank(
@@ -1463,7 +1463,7 @@ def test_compile_pair_skips_q8_without_generic_fused_swiglu(monkeypatch):
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear",
+        "ane_compile_linear",
         lambda *args: pytest.fail("Q8 must not prepare an unfused ANE path"),
     )
 
@@ -1493,11 +1493,11 @@ def test_compile_gdn_accepts_q8_and_propagates_bits(monkeypatch):
         compiled.append((weight.shape, weight.dtype, sequence_length))
         return object()
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_qmm_t",
+        lambda name: name == "ane_affine_qmm_t",
     )
 
     state = ane_patch._compile_gdn(gdn, ane_patch._AneGDNConfig(2048, 0.5, 8))
@@ -1517,13 +1517,13 @@ def test_q6_gdn_packs_suffix_and_extracts_b_a(group_size, monkeypatch):
 
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear",
+        "ane_compile_linear",
         lambda weight, sequence_length: compiled.append(weight.shape) or object(),
     )
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_qmm_t",
+        lambda name: name == "ane_affine_qmm_t",
     )
 
     config = ane_patch._AneGDNConfig(1, 0.5, 8)
@@ -1546,7 +1546,7 @@ def test_q6_gdn_packs_suffix_and_extracts_b_a(group_size, monkeypatch):
     )
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_affine_qmm_t",
+        "ane_affine_qmm_t",
         lambda *args: combined,
     )
 
@@ -1580,14 +1580,14 @@ def test_backend_dispatches_single_q8_swiglu_with_bits(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_swiglu_t",
+        lambda name: name == "ane_affine_swiglu_t",
     )
 
     def fused(*args):
         captured["args"] = args
         return activation
 
-    monkeypatch.setattr(fast, "qwen35_ane_affine_swiglu_t", fused, raising=False)
+    monkeypatch.setattr(fast, "ane_affine_swiglu_t", fused, raising=False)
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
@@ -1630,7 +1630,7 @@ def test_backend_dispatches_dual_q8_swiglu_with_bits(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_dual_affine_swiglu_t",
+        lambda name: name == "ane_dual_affine_swiglu_t",
     )
 
     def fused(*args):
@@ -1639,7 +1639,7 @@ def test_backend_dispatches_dual_q8_swiglu_with_bits(monkeypatch):
 
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_dual_affine_swiglu_t",
+        "ane_dual_affine_swiglu_t",
         fused,
         raising=False,
     )
@@ -1698,7 +1698,7 @@ def test_prepare_pair_enables_cpu_gate_share_for_q5_plus(monkeypatch, bits):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_dual_cpu_fp16_swiglu_t",
+        lambda name: name == "ane_dual_cpu_fp16_swiglu_t",
     )
 
     state = ane_patch._prepare_pair_runtime_state(
@@ -1772,11 +1772,11 @@ def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):
         compiled.append((weight.shape, weight.dtype, sequence_length))
         return object()
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_qmm_t",
+        lambda name: name == "ane_affine_qmm_t",
     )
 
     state = ane_patch._compile_gdn(gdn, ane_patch._AneGDNConfig(2048, 0.5, 8))
@@ -1854,7 +1854,7 @@ def test_prepare_gdn_splits_residual_qkv_across_cpu_and_gpu(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_dual_cpu_fp16_affine_qmm_t",
+        lambda name: name == "ane_dual_cpu_fp16_affine_qmm_t",
     )
 
     prepared = ane_patch._prepare_gdn_for_bank(
@@ -1888,7 +1888,7 @@ def test_prepare_gdn_splits_cpu_work_with_single_ane(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_cpu_fp16_affine_qmm_t",
+        lambda name: name == "ane_cpu_fp16_affine_qmm_t",
     )
 
     prepared = ane_patch._prepare_gdn_for_bank(
@@ -1916,7 +1916,7 @@ def test_gdn_backend_routes_cpu_split_through_three_way_native_merge(monkeypatch
         calls.append(args)
         return combined
 
-    monkeypatch.setattr(fast, "qwen35_ane_dual_cpu_fp16_affine_qmm_t", hybrid)
+    monkeypatch.setattr(fast, "ane_dual_cpu_fp16_affine_qmm_t", hybrid)
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
     monkeypatch.setattr(
@@ -1966,7 +1966,7 @@ def test_gdn_backend_routes_single_ane_cpu_split(monkeypatch):
         calls.append(args)
         return combined
 
-    monkeypatch.setattr(fast, "qwen35_ane_cpu_fp16_affine_qmm_t", hybrid)
+    monkeypatch.setattr(fast, "ane_cpu_fp16_affine_qmm_t", hybrid)
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
     monkeypatch.setattr(
@@ -2011,7 +2011,7 @@ def test_gdn_backend_routes_single_ane_cpu_split(monkeypatch):
 def test_gdn_backend_restores_projection_order_and_keeps_b_a_exact(monkeypatch):
     combined = mx.array([[[1, 2, 10, 20, 30, 40]]], dtype=mx.bfloat16)
     captured = []
-    monkeypatch.setattr(fast, "qwen35_ane_affine_qmm_t", lambda *args: combined)
+    monkeypatch.setattr(fast, "ane_affine_qmm_t", lambda *args: combined)
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
@@ -2070,7 +2070,7 @@ def test_backend_reassembles_combined_gate_and_up_outputs(monkeypatch):
         captured["up"] = up
         return gate
 
-    monkeypatch.setattr(fast, "qwen35_ane_q4_affine_qmm_t", hybrid)
+    monkeypatch.setattr(fast, "ane_q4_affine_qmm_t", hybrid)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "swiglu", capture_swiglu)
 
@@ -2106,11 +2106,11 @@ def test_backend_uses_fused_merge_swiglu_when_available(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_q4_swiglu_t",
+        lambda name: name == "ane_q4_swiglu_t",
     )
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_q4_affine_qmm_t",
+        "ane_q4_affine_qmm_t",
         lambda *args: pytest.fail("raw merge path should not run"),
     )
 
@@ -2118,7 +2118,7 @@ def test_backend_uses_fused_merge_swiglu_when_available(monkeypatch):
         captured["fused_args"] = args
         return activation
 
-    monkeypatch.setattr(fast, "qwen35_ane_q4_swiglu_t", fused)
+    monkeypatch.setattr(fast, "ane_q4_swiglu_t", fused)
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
@@ -2167,7 +2167,7 @@ def test_backend_uses_both_ane_models_for_one_prompt(monkeypatch):
         captured["dual_args"] = args
         return activation
 
-    monkeypatch.setattr(fast, "qwen35_ane_dual_q4_swiglu_t", dual)
+    monkeypatch.setattr(fast, "ane_dual_q4_swiglu_t", dual)
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
@@ -2213,7 +2213,7 @@ def test_fused_down_backend_runs_compatible_cpu_hidden_branch(monkeypatch):
         return output
 
     monkeypatch.setattr(
-        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t", fused
+        fast, "ane_dual_cpu_fp16_q4_swiglu_down_t", fused
     )
     model0, model1 = object(), object()
     state = ane_patch._FusedDownMLPState(
@@ -2289,10 +2289,10 @@ def test_cpu_gate_uses_bit_appropriate_fused_swiglu(
         return activation
 
     monkeypatch.setattr(
-        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t", q4_fused
+        fast, "ane_dual_cpu_fp16_q4_swiglu_t", q4_fused
     )
     monkeypatch.setattr(
-        fast, "qwen35_ane_dual_cpu_fp16_swiglu_t", generic_fused
+        fast, "ane_dual_cpu_fp16_swiglu_t", generic_fused
     )
     monkeypatch.setattr(
         ane_patch,
@@ -2372,8 +2372,8 @@ def test_single_ane_cpu_gate_uses_bit_appropriate_fused_swiglu(
         captured["args"] = args
         return activation
 
-    monkeypatch.setattr(fast, "qwen35_ane_cpu_fp16_q4_swiglu_t", q4_fused)
-    monkeypatch.setattr(fast, "qwen35_ane_cpu_fp16_swiglu_t", generic_fused)
+    monkeypatch.setattr(fast, "ane_cpu_fp16_q4_swiglu_t", q4_fused)
+    monkeypatch.setattr(fast, "ane_cpu_fp16_swiglu_t", generic_fused)
     monkeypatch.setattr(
         ane_patch,
         "_post_ane_linear",
@@ -2480,7 +2480,7 @@ def test_enable_rejects_unsafe_fixed_shape_settings(
 
 
 def test_enable_uses_ane_on_nax_gpu_when_model_setting_enabled(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -2560,7 +2560,7 @@ def test_prefill_status_safe_on_untouched_model():
 
 
 def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(
         ane_patch, "_enable_dual_procedure_banks", lambda *args, **kwargs: None
@@ -2596,10 +2596,10 @@ def test_bank_prepare_keeps_packed_q6_suffix():
 
 
 def test_enable_survives_warmup_failure(monkeypatch, caplog):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -2610,7 +2610,7 @@ def test_enable_survives_warmup_failure(monkeypatch, caplog):
 
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear_bank",
+        "ane_compile_linear_bank",
         lambda weights, sequence_length, ane_instance: [
             _FailingModel() for _ in weights
         ],
@@ -2638,20 +2638,20 @@ def test_prepare_cpu_linear_needs_the_native_symbol(monkeypatch):
     assert ane_patch._prepare_cpu_linear(linear, 0.25) is None
 
     monkeypatch.setattr(
-        fast, "has_symbol", lambda name: name == "qwen35_cpu_fp16_affine_qmm_t"
+        fast, "has_symbol", lambda name: name == "cpu_fp16_affine_qmm_t"
     )
     assert ane_patch._prepare_cpu_linear(linear, 0.25) is not None
 
 
 def test_enable_warms_the_cpu_sharing_path(monkeypatch):
     """CPU-shared modules get one dummy dispatch at load, not at first use."""
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear_bank",
+        "ane_compile_linear_bank",
         lambda weights, sequence_length, ane_instance: [object() for _ in weights],
     )
     warmed = []
@@ -2786,18 +2786,18 @@ class _RecorderBankBuilder:
 
 
 def _builder_test_setup(monkeypatch, builders):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
     monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", lambda seq: builders.pop(0)
+        fast, "ane_linear_bank_builder", lambda seq: builders.pop(0)
     )
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear_bank",
+        "ane_compile_linear_bank",
         lambda *a, **k: pytest.fail(
             "the builder path must not stage all weights at once"
         ),
@@ -2856,10 +2856,10 @@ def test_builder_split_ladder_retries_without_restaging(monkeypatch):
 
 def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
     """One broken procedure disables its module; the rest keep warming (#2940)."""
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -2878,7 +2878,7 @@ def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
     def compile_bank(weights, sequence_length, ane_instance):
         return [_WarmModel(i) for i in range(len(weights))]
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     model = _Model(3)
 
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
@@ -3030,7 +3030,7 @@ def test_fused_bank_staging_streams_through_builder(monkeypatch):
         return builder
 
     monkeypatch.setattr(
-        fast, "qwen35_ane_fused_bank_builder", _make_builder, raising=False
+        fast, "ane_fused_bank_builder", _make_builder, raising=False
     )
     monkeypatch.setattr(
         ane_patch,
@@ -3063,7 +3063,7 @@ def test_fused_bank_staging_streams_through_builder(monkeypatch):
 
 def test_fused_bank_staging_falls_back_without_builder(monkeypatch):
     """Old extensions without the fused builder keep the one-shot path."""
-    monkeypatch.delattr(fast, "qwen35_ane_fused_bank_builder", raising=False)
+    monkeypatch.delattr(fast, "ane_fused_bank_builder", raising=False)
     compiled = []
 
     def _compile_bank(gates, ups, downs, sequence_length, ane_instance):
@@ -3071,7 +3071,7 @@ def test_fused_bank_staging_falls_back_without_builder(monkeypatch):
         return [object() for _ in gates]
 
     monkeypatch.setattr(
-        fast, "qwen35_ane_compile_swiglu_down_bank", _compile_bank
+        fast, "ane_compile_swiglu_down_bank", _compile_bank
     )
     monkeypatch.setattr(
         ane_patch,
@@ -3129,7 +3129,7 @@ def test_warm_cpu_sharing_path_dispatches_mlp_and_gdn(monkeypatch):
 
 _ANE_MM_PATH = (
     Path(__file__).resolve().parents[1]
-    / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    / "omlx/custom_kernels/quant_matmul/csrc/ane/ane_hybrid.mm"
 )
 
 

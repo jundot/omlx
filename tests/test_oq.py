@@ -1881,6 +1881,29 @@ class TestForwardLayer:
         assert seen == [("mask", None, "prev_topk")]
 
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_failed_signature_probe_does_not_retain_block(self):
+        # Streaming calibration frees each layer by reference count. A failed
+        # probe kept with its traceback forms a cycle that holds the block.
+        import gc
+        import weakref
+
+        class Block(nn.Module):
+            def __call__(self, x, mask=None, cache=None):
+                return x * 2
+
+        gc.disable()
+        try:
+            block = Block()
+            ref = weakref.ref(block)
+            result, _ = _forward_layer_result(block, mx.ones((2, 4)), None, None)
+            assert isinstance(result, mx.array)
+            del block
+            assert ref() is None
+        finally:
+            gc.enable()
+
+
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestGemma4StatefulLayerForward:
     @staticmethod
@@ -2594,6 +2617,30 @@ class TestOQImatrixCollector:
         np.testing.assert_allclose(entry.in_sum2[0], np.array([1.0, 4.0, 9.0, 16.0]))
         np.testing.assert_allclose(entry.in_sum2[1], np.array([25.0, 36.0, 49.0, 64.0]))
         np.testing.assert_allclose(entry.in_sum2[2], np.array([26.0, 40.0, 58.0, 80.0]))
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+    def test_muse_spark_scaled_experts_are_captured_with_tensor_scales(self):
+        from omlx.patches.muse_spark.muse_spark_model import ScaledSwitchGLU
+
+        mx.random.seed(0)
+        glu = ScaledSwitchGLU(32, 16, 4)
+        for proj in (glu.gate_proj, glu.up_proj, glu.down_proj):
+            proj.global_scale = mx.random.uniform(1.0, 4.0, (4,))
+        x = mx.random.normal((1, 3, 32))
+        indices = mx.array([[[0, 2], [1, 3], [2, 0]]], dtype=mx.int32)
+        expected = glu(x, indices)
+
+        collector = OQImatrixCollector()
+        assert collector.install(glu, name_prefix="mlp.switch_mlp.") == 3
+        got = glu(x, indices)
+        collector.restore(glu)
+
+        # The wrapped projections still apply their NVFP4 tensor scales.
+        assert mx.array_equal(got, expected).item()
+        assert collector.switch_capture_modules == 3
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            counts = collector.entries[f"mlp.switch_mlp.{proj}"].counts
+            np.testing.assert_array_equal(counts, np.array([2, 1, 2, 1]))
 
 
 class TestOQECalibrationData:
@@ -4330,6 +4377,123 @@ class TestPreQuantizedSource:
         tid = dp.pop("tid2eid")
         assert tid.dtype == mx.int32
         assert mx.array_equal(tid, mx.arange(8, dtype=mx.int32).reshape(2, 4)).item()
+
+    def test_muse_spark_nvfp4_experts_pass_through(self, tmp_path):
+        from omlx.patches.muse_spark import muse_spark_model as msm
+
+        prefix = "model.language_model.layers.0.mlp.experts."
+        rng = np.random.default_rng(0)
+        packed = rng.integers(0, 256, (2, 32, 16), dtype=np.uint8)
+        block = rng.integers(0x68, 0x7F, (2, 32, 2), dtype=np.uint8)
+        scale2 = np.array([[1e-5, 2e-5], [3e-5, 4e-5]], dtype=np.float32)
+
+        def f32(a):
+            return (np.ascontiguousarray(a).tobytes(), list(a.shape), "F32")
+
+        path = str(tmp_path / "experts.safetensors")
+        _write_safetensors(
+            path,
+            {
+                prefix + "gate_up_proj": (packed.tobytes(), [2, 32, 16], "U8"),
+                prefix + "gate_up_proj_weight_scale": (
+                    block.tobytes(),
+                    [2, 32, 2],
+                    "F8_E4M3",
+                ),
+                prefix + "gate_up_proj_weight_scale_2": f32(scale2),
+                prefix + "gate_up_proj_input_scale": f32(scale2),
+                prefix + "down_proj": (packed[:, :16].tobytes(), [2, 16, 16], "U8"),
+                prefix + "down_proj_weight_scale": (
+                    block[:, :16].tobytes(),
+                    [2, 16, 2],
+                    "F8_E4M3",
+                ),
+                prefix + "down_proj_weight_scale_2": f32(scale2[:, 0]),
+                prefix + "down_proj_input_scale": f32(scale2[:, 0]),
+            },
+        )
+        config = {
+            "model_type": "muse_spark",
+            "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        }
+        idx = _LazyTensorIndex([path], config=config)
+        nvfp4 = {"kind": "nvfp4", "bits": 4, "group_size": 16, "mode": "nvfp4"}
+        assert idx.source_quant_info(prefix + "gate_up_proj") == nvfp4
+        logical = idx.logical_metadata()
+        assert logical[prefix + "gate_up_proj"] == ((2, 32, 32), "BF16")
+        assert prefix + "gate_up_proj_weight_scale" not in logical
+
+        dp = _DiscoveredPlan(_discover_sanitize_plan(msm.sanitize_experts, idx), idx)
+        switch = "model.language_model.layers.0.mlp.switch_mlp."
+        # oQ3 requantizes gate/up and folds their tensor scales into the
+        # weights; projections passed through as NVFP4 (all of them at oQ4)
+        # keep their scales.
+        from omlx.oq import _fold_nvfp4_tensor_scale, _muse_spark_folded_scales
+
+        folded = _muse_spark_folded_scales(dp, config, 3, 64)
+        assert f"{switch}gate_proj.global_scale" in folded
+        assert f"{switch}up_proj.global_scale" in folded
+        assert not _muse_spark_folded_scales(dp, config, 4, 64)
+        # The fused gate_up source splits into two packed halves, gate first.
+        for proj, rows in (("gate_proj", slice(0, 16)), ("up_proj", slice(16, 32))):
+            out = f"{switch}{proj}.weight"
+            assert dp.source_quant_info(out) == nvfp4
+            weight, scales = dp.pop_packed(out)
+            expected = mx.array(packed[:, rows]).view(mx.uint32)
+            assert mx.array_equal(weight, expected).item()
+            assert mx.array_equal(scales, mx.array(block[:, rows])).item()
+        assert dp.source_quant_info(f"{switch}down_proj.weight") == nvfp4
+        # Tensor scales become the amax mlx-lm stores: scale * 6 * 448.
+        amax = scale2 * np.float32(6 * 448)
+        for proj, value in (
+            ("gate_proj", amax[:, 0]),
+            ("up_proj", amax[:, 1]),
+            ("down_proj", amax[:, 0]),
+        ):
+            assert mx.array_equal(
+                dp.pop(f"{switch}{proj}.global_scale"), mx.array(value)
+            ).item()
+
+        # Sourced dequantized (streamed calibration), the tensor scale is left
+        # to the model, which applies global_scale at run time.
+        expected = mx.dequantize(
+            mx.array(packed).view(mx.uint32),
+            mx.array(block),
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+        )
+        assert mx.array_equal(
+            idx._dequant_one(prefix + "gate_up_proj"),
+            expected.astype(mx.bfloat16),
+        ).item()
+        # Folding restores the real weights: NVFP4 units times weight_scale_2.
+        units = expected[:, :16]
+        folded = _fold_nvfp4_tensor_scale(units, mx.array(amax[:, 0]))
+        real = units.astype(mx.float32) * mx.array(scale2[:, 0])[:, None, None]
+        assert folded.dtype == units.dtype
+        assert mx.allclose(folded.astype(mx.float32), real, rtol=1e-2, atol=0).item()
+
+    def test_muse_spark_imatrix_cache_serves_passthrough_levels(self):
+        from omlx.oq import OQImatrixData, _oqe_cache_covers_capture_skip
+
+        experts = ["language_model.model.layers.1.mlp.switch_mlp.gate_proj"]
+
+        def cache(metadata):
+            return OQImatrixData(entries={}, metadata=metadata, path="unused.npz")
+
+        full = cache({"capture_skip": []})
+        partial = cache({"capture_skip": experts})
+        legacy = cache({"capture_skip_hash": "0" * 64})
+        passthrough = {"_oq_imatrix_capture_skip": frozenset(experts)}
+        requantize = {}
+        # A full collection (oQ3e) also serves a level that passes the NVFP4
+        # experts through (oQ4e), but not the other way around.
+        assert _oqe_cache_covers_capture_skip(full, passthrough)
+        assert _oqe_cache_covers_capture_skip(partial, passthrough)
+        assert not _oqe_cache_covers_capture_skip(partial, requantize)
+        # Hash-only caches do not record which modules they skipped.
+        assert not _oqe_cache_covers_capture_skip(legacy, passthrough)
 
     def test_stack_pop_packed(self, tmp_path):
         path = str(tmp_path / "experts.safetensors")

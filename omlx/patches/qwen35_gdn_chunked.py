@@ -48,7 +48,7 @@ def apply_qwen35_gdn_prefill_patch() -> bool:
 
     original = gd.gated_delta_update
 
-    from omlx.custom_kernels.qwen35_prefill import (
+    from omlx.custom_kernels.attention.gated_delta import (
         gated_delta_blocked_seq,
         gated_delta_chunked_metal,
         gated_delta_pipelined,

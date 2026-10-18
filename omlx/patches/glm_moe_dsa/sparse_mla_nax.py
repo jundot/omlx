@@ -2,7 +2,7 @@
 
 GLM-5.3's DSA layers attend every query over its own top-k latent rows
 (2048 + 3 tail slots, 64 heads, 512-wide NoPE latent; values are the same
-latent rows). The native ``glm_dsa_sparse_mla_attention`` kernel computes
+latent rows). The native ``sparse_mla_attention`` kernel computes
 this in fp32 on the classic SIMD matrix units at ~10-13 TFLOPS: ~42-54 ms
 per layer per 2048-token chunk (4k-64k context, M5 Ultra).
 

@@ -76,7 +76,7 @@ from .patches.qwen35_yarn import yarn_factor
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
 from .speculative.dflash import context_bytes_per_row, load_dflash_drafter
-from .utils.fatal import exit_if_gpu_submissions_ignored
+from .utils.fatal import exit_if_gpu_submissions_ignored, is_command_buffer_error
 from .utils.generation_config import SAMPLING_SETTING_KEYS, load_sampling_defaults
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import (
@@ -3393,7 +3393,7 @@ class EnginePool:
         try:
             await loop.run_in_executor(get_mlx_executor(), sync_clear)
         except RuntimeError as e:
-            if "Command buffer execution failed" not in str(e):
+            if not is_command_buffer_error(e):
                 raise
             exit_if_gpu_submissions_ignored(e)
             # A failed prefill can leave this error pending. MLX clears it when

@@ -448,6 +448,68 @@ def test_patch_routes_256_and_passes_through_others(monkeypatch):
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
 
 
+def test_m1_m2_fp16_verify_rows_stay_under_vector_thread_limit(monkeypatch):
+    """Batched MTP verify at 24/4 heads and 5 rows asks MLX for 960 threads,
+    above the 896 its FP16 head-dim-256 vector kernel allows on M1/M2 (#4609)."""
+    from mlx_lm.models import base as mlx_base
+
+    import omlx.patches.sdpa256_attention as sdpa256
+
+    monkeypatch.setattr(sdpa256, "_PATCHED", False, raising=False)
+    monkeypatch.setattr(
+        sdpa256, "_SDPA256_MIN_KV_LEN", sdpa256._SDPA256_MIN_KV_LEN, raising=False
+    )
+    original = mlx_base.scaled_dot_product_attention
+    rows = []
+
+    def recording_original(q, k, v, cache, scale, mask, sinks=None):
+        rows.append(q.shape[-2])
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+    monkeypatch.setattr(mlx_base, "scaled_dot_product_attention", recording_original)
+    assert sdpa256.apply_sdpa256_attention_patch() is True
+    patched = mlx_base.scaled_dot_product_attention
+    try:
+        mx.random.seed(0)
+        q = mx.random.normal((2, 24, 5, 256)).astype(mx.float16)
+        k = mx.random.normal((2, 4, 2048, 256)).astype(mx.float16)
+        v = mx.random.normal((2, 4, 2048, 256)).astype(mx.float16)
+        pads = mx.array([0, 9])[:, None, None, None]
+        mask = mx.broadcast_to(mx.arange(2048) >= pads, (2, 1, 5, 2048))
+
+        monkeypatch.setattr(sdpa256, "_vector_thread_limited_gpu", lambda: True)
+        out = patched(q, k, v, None, SCALE_256, mask)
+        assert rows == [3, 2]
+        # One-row calls share the key-partition plan, so rows match bit for bit.
+        reference = mx.concatenate(
+            [
+                mx.fast.scaled_dot_product_attention(
+                    q[..., i : i + 1, :],
+                    k,
+                    v,
+                    scale=SCALE_256,
+                    mask=mask[..., i : i + 1, :],
+                )
+                for i in range(5)
+            ],
+            axis=-2,
+        )
+        assert mx.array_equal(out, reference).item()
+
+        # Not evaluated: the unsplit FP16 call fails on M1/M2 hosts.
+        rows.clear()
+        q16, k16, v16 = (x.astype(mx.bfloat16) for x in (q, k, v))
+        patched(q16, k16, v16, None, SCALE_256, mask)
+        monkeypatch.setattr(sdpa256, "_vector_thread_limited_gpu", lambda: False)
+        patched(q, k, v, None, SCALE_256, mask)
+        assert rows == [5, 5]
+    finally:
+        monkeypatch.setattr(mlx_base, "scaled_dot_product_attention", original)
+        from omlx import memory_monitor as mm
+
+        mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+
 # --- estimator lockstep --------------------------------------------------
 
 

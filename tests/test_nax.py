@@ -7,7 +7,8 @@ import types
 
 import pytest
 
-import omlx.custom_kernels.qwen35_prefill.fast as fast
+import omlx.custom_kernels.quant_matmul.ane as ane
+import omlx.custom_kernels.quant_matmul.fast as fast
 from omlx.custom_kernels.nax import is_nax_available
 
 
@@ -119,7 +120,7 @@ def test_qmm_nax_kwargs_supported_bits_use_nax(monkeypatch, bits):
 
 
 def test_qmm_nax_kwargs_never_requests_nax_for_bits2(monkeypatch):
-    # qwen35_qmm_nax.metal only defines kernels for bits 4/5/6/8. Routing a
+    # affine_qmm_nax.metal only defines kernels for bits 4/5/6/8. Routing a
     # q2 call through NAX anyway fails the kernel lookup and latches
     # nax_qmm_runtime_ok=false process-wide, permanently demoting every
     # q4/q5/q6/q8 layer for the rest of the process — bits==2 must never
@@ -134,14 +135,14 @@ def test_qmm_nax_kwargs_never_requests_nax_for_bits2(monkeypatch):
 
 
 def test_ane_hybrid_nax_capability_reports_native_state(monkeypatch):
-    fake_ext = types.SimpleNamespace(qwen35_ane_hybrid_nax_enabled=lambda: True)
-    monkeypatch.setattr(fast, "_ext", fake_ext)
-    assert fast.qwen35_ane_hybrid_nax_enabled() is True
+    fake_ext = types.SimpleNamespace(ane_hybrid_nax_enabled=lambda: True)
+    monkeypatch.setattr(ane, "_ext", fake_ext)
+    assert ane.ane_hybrid_nax_enabled() is True
 
 
 def test_ane_hybrid_nax_capability_is_false_for_older_extension(monkeypatch):
-    monkeypatch.setattr(fast, "_ext", types.SimpleNamespace())
-    assert fast.qwen35_ane_hybrid_nax_enabled() is False
+    monkeypatch.setattr(ane, "_ext", types.SimpleNamespace())
+    assert ane.ane_hybrid_nax_enabled() is False
 
 
 def _nax_qmm_ready() -> bool:
@@ -172,7 +173,7 @@ def test_every_bundled_nax_qmm_tile_matches_stock(
         x, wq, scales, biases, transpose=True, group_size=group_size, bits=bits
     )
     monkeypatch.setattr(fast, "QMM_NAX_VARIANT", variant)
-    native = getattr(fast, f"qwen35_q{bits}_affine_qmm_t")
+    native = getattr(fast, f"affine_q{bits}_qmm_t")
     out = native(x, wq, scales, biases, 8, group_size)
     ref32 = ref.astype(mx.float32)
     err = mx.abs(out.astype(mx.float32) - ref32).max().item()

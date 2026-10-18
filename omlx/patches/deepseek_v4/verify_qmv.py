@@ -408,9 +408,9 @@ def pair_eligible(module_a, module_b, inputs: mx.array) -> bool:
     input_dims = int(inputs.shape[-1])
     rows = int(inputs.size) // input_dims
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.quant_matmul import fast
 
-        native = fast.has_symbol("dspark_exact_mxfp8_qmv_pair")
+        native = fast.has_symbol("mxfp8_qmv_pair")
     except Exception:
         native = False
     return (
@@ -433,13 +433,13 @@ def pair_eligible(module_a, module_b, inputs: mx.array) -> bool:
 
 def exact_verify_qmv_pair(module_a, module_b, inputs: mx.array):
     """Apply two MXFP8 linears with independent M=1-identical reductions."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     input_dims = int(inputs.shape[-1])
     rows = int(inputs.size) // input_dims
     output_dims = int(module_a.scales.shape[0])
     flat = mx.contiguous(inputs.reshape(rows, input_dims))
-    paired = fast.dspark_exact_mxfp8_qmv_pair(
+    paired = fast.mxfp8_qmv_pair(
         flat,
         module_a.weight,
         module_a.scales,

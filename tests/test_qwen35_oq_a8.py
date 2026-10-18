@@ -29,7 +29,7 @@ GROUP_SIZE = 64
 def _kernels():
     """The native module, or None when this build/host cannot run it."""
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
     except Exception:
         return None
     if not fast.oq_a8_available():
@@ -179,7 +179,7 @@ def test_kernel_decode_is_bit_exact(bits):
     K = 512
     packed, _, _ = make_quantized(96, K, bits, seed=bits)
 
-    decoded = fast.qwen35_oq_a8_decode_weights(packed, bits, K // GROUP_SIZE)
+    decoded = fast.oq_a8_decode_weights(packed, bits, K // GROUP_SIZE)
     mx.eval(decoded)
 
     expected = unpack_codes(np.array(packed), bits, K) - (128 if bits == 8 else 0)
@@ -194,7 +194,7 @@ def test_q8_decode_edge_codes():
         np.array([0, 127, 128, 255, 1, 126, 129, 254], dtype=np.uint8), (4, 8)
     )
     packed = mx.array(codes.view("<u4").copy())
-    decoded = fast.qwen35_oq_a8_decode_weights(packed, 8, 1)
+    decoded = fast.oq_a8_decode_weights(packed, 8, 1)
     mx.eval(decoded)
     np.testing.assert_array_equal(
         np.array(decoded).astype(np.int64), codes.astype(np.int64) - 128
@@ -216,7 +216,7 @@ def test_stage_a_matches_reference(act_mode, dtype):
     x_np = (rng.standard_normal((rows, K)) * 0.7).astype(np.float32)
     x = mx.array(x_np, dtype=dtype)
 
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, act_mode)
+    qa, sa, ra = fast.oq_a8_quantize(x, act_mode)
     mx.eval(qa, sa, ra)
 
     # Quantize from the same rounded input the kernel saw, so the comparison
@@ -240,7 +240,7 @@ def test_stage_a_group_sum_is_exactly_the_code_sum(act_mode):
     rng = np.random.default_rng(11)
     x = mx.array((rng.standard_normal((rows, K)) * 2.0).astype(np.float32), mx.float16)
 
-    qa, _, ra = fast.qwen35_oq_a8_quantize(x, act_mode)
+    qa, _, ra = fast.oq_a8_quantize(x, act_mode)
     mx.eval(qa, ra)
 
     codes = np.array(qa).astype(np.int64).reshape(rows, K // GROUP_SIZE, GROUP_SIZE)
@@ -252,7 +252,7 @@ def test_stage_a_zero_row_is_not_nan():
     """An all-zero row has no representable scale; it must not produce NaN."""
     fast = _kernels()
     x = mx.zeros((64, 128), dtype=mx.float16)
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, 0)
+    qa, sa, ra = fast.oq_a8_quantize(x, 0)
     mx.eval(qa, sa, ra)
 
     assert not np.isnan(np.array(sa)).any()
@@ -281,9 +281,9 @@ def test_qmm_matches_affine_reference(bits, act_mode):
     rng = np.random.default_rng(23)
     x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
 
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, act_mode)
-    qa8, sa8, ra8 = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
-    got = fast.qwen35_oq_a8_qmm_t(
+    qa, sa, ra = fast.oq_a8_quantize(x, act_mode)
+    qa8, sa8, ra8 = fast.oq_a8_stage_a_v8(x, act_mode)
+    got = fast.oq_a8_qmm_t(
         qa8,
         sa8,
         ra8,
@@ -327,7 +327,7 @@ def test_qmm_tracks_the_unquantized_projection(bits):
     rng = np.random.default_rng(31)
     x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
 
-    got = fast.qwen35_oq_a8_linear(x, packed, scales, biases, bits, 0, 800)
+    got = fast.oq_a8_linear(x, packed, scales, biases, bits, 0, 800)
     reference = mx.quantized_matmul(
         x,
         packed,
@@ -355,7 +355,7 @@ def test_qmm_handles_a_partial_row_tile():
     rng = np.random.default_rng(53)
     x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
 
-    got = fast.qwen35_oq_a8_linear(x, packed, scales, biases, 4, 0, 800)
+    got = fast.oq_a8_linear(x, packed, scales, biases, 4, 0, 800)
     mx.eval(got)
     assert got.shape == (M, N)
     assert not np.isnan(np.array(got.astype(mx.float32))).any()
@@ -367,9 +367,9 @@ def test_qmm_rejects_untiled_output_width():
     K, N = 128, 96  # 96 is not a multiple of BN=64
     packed, scales, biases = make_quantized(N, K, 4, seed=17)
     x = mx.zeros((64, K), dtype=mx.float16)
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, 0)
+    qa, sa, ra = fast.oq_a8_quantize(x, 0)
     with pytest.raises(ValueError):
-        fast.qwen35_oq_a8_linear(x, packed, scales, biases, 4, 0, 800)
+        fast.oq_a8_linear(x, packed, scales, biases, 4, 0, 800)
 
 
 # --------------------------------------------------------------------------
@@ -544,8 +544,8 @@ def test_stage_a_v8_carries_the_schedules_k_order(act_mode):
     x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.float16)
     mx.eval(x)
 
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, act_mode)
-    qa8, sa8, ra8 = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
+    qa, sa, ra = fast.oq_a8_quantize(x, act_mode)
+    qa8, sa8, ra8 = fast.oq_a8_stage_a_v8(x, act_mode)
     mx.eval(qa, sa, ra, qa8, sa8, ra8)
 
     groups = K // GROUP_SIZE
@@ -595,10 +595,10 @@ def test_v8_matches_w4a16_within_quantization_error(bits, act_mode, M):
 
     sc_t = mx.contiguous(scales.T)
     bi_t = mx.contiguous(biases.T)
-    qa, sa, ra = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
+    qa, sa, ra = fast.oq_a8_stage_a_v8(x, act_mode)
     mx.eval(sc_t, bi_t, qa, sa, ra)
 
-    got = fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, bits, act_mode, 800)
+    got = fast.oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, bits, act_mode, 800)
     ref = mx.quantized_matmul(
         x,
         packed,
@@ -633,11 +633,11 @@ def test_v8_tiles_agree_with_each_other(variant, bits):
     mx.eval(packed, scales, biases, x)
     sc_t = mx.contiguous(scales.T)
     bi_t = mx.contiguous(biases.T)
-    qa, sa, ra = fast.qwen35_oq_a8_stage_a_v8(x, 0)
+    qa, sa, ra = fast.oq_a8_stage_a_v8(x, 0)
     mx.eval(sc_t, bi_t, qa, sa, ra)
 
-    base = fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, bits, 0, 800)
-    got = fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, bits, 0, variant)
+    base = fast.oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, bits, 0, 800)
+    got = fast.oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, bits, 0, variant)
     mx.eval(base, got)
     np.testing.assert_allclose(
         np.array(got.astype(mx.float32)),
@@ -670,12 +670,12 @@ def test_packed_linear_matches_the_row_major_layout(variant, act_mode):
     packed = _pack(sources)
     rng = np.random.default_rng(9)
     x = mx.array((rng.standard_normal((M, K)) * 0.5).astype(np.float32), mx.bfloat16)
-    qa, sa, ra = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
+    qa, sa, ra = fast.oq_a8_stage_a_v8(x, act_mode)
 
     for source, linear in zip(sources, packed):
         plan = dispatch.classify_linear(linear)
         assert plan is not None and plan.packed and plan.bits == 4
-        want = fast.qwen35_oq_a8_qmm_t(
+        want = fast.oq_a8_qmm_t(
             qa,
             sa,
             ra,
@@ -687,7 +687,7 @@ def test_packed_linear_matches_the_row_major_layout(variant, act_mode):
             variant,
         )
         weight, scales, biases = dispatch._prepared_weights(linear)
-        got = fast.qwen35_oq_a8_qmm_t(
+        got = fast.oq_a8_qmm_t(
             qa, sa, ra, weight, scales, biases, 4, act_mode, variant, packed=True
         )
         mx.eval(want, got)
@@ -710,7 +710,7 @@ def test_stage_a_keeps_the_batch_rank(act_mode):
         (rng.standard_normal((3, 128, 256)) * 0.5).astype(np.float32), mx.float16
     )
     mx.eval(x)
-    qa, _, _ = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
+    qa, _, _ = fast.oq_a8_stage_a_v8(x, act_mode)
     mx.eval(qa)
     assert qa.shape == x.shape
 
@@ -731,8 +731,8 @@ def test_stage_a_group_major_metadata_is_not_axis_reversed(act_mode):
     x = mx.array((rng.standard_normal((B, S, K)) * 0.5).astype(np.float32), mx.float16)
     mx.eval(x)
 
-    _, sa_flat, ra_flat = fast.qwen35_oq_a8_quantize(x, act_mode)
-    _, sa, ra = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
+    _, sa_flat, ra_flat = fast.oq_a8_quantize(x, act_mode)
+    _, sa, ra = fast.oq_a8_stage_a_v8(x, act_mode)
     mx.eval(sa_flat, ra_flat, sa, ra)
 
     expected = np.array(ra_flat).reshape(B * S, groups).T
@@ -760,9 +760,9 @@ def test_batched_prefill_keeps_sequences_independent(B):
     mx.eval(sc_t, bi_t)
 
     def run(inp):
-        qa, sa, ra = fast.qwen35_oq_a8_stage_a_v8(inp, 0)
+        qa, sa, ra = fast.oq_a8_stage_a_v8(inp, 0)
         mx.eval(qa, sa, ra)
-        out = fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, 4, 0, 806)
+        out = fast.oq_a8_qmm_t(qa, sa, ra, packed, sc_t, bi_t, 4, 0, 806)
         mx.eval(out)
         return out
 
@@ -985,7 +985,7 @@ def test_native_qmm_rejects_removed_variants(variant):
     packed, scales, biases = make_quantized(128, 128, 4, seed=20)
     x = mx.ones((128, 128), dtype=mx.float16)
     with pytest.raises(ValueError, match="variant"):
-        fast.qwen35_oq_a8_linear(x, packed, scales, biases, 4, variant=variant)
+        fast.oq_a8_linear(x, packed, scales, biases, 4, variant=variant)
 
 
 def test_mlp_routing_errors_are_not_silently_ignored(monkeypatch):
@@ -1030,9 +1030,9 @@ def test_q8_gemm_matches_affine_reference(dtype, act_mode, m):
     )
     x = mx.array((rng.standard_normal((m, k)) * 0.5).astype(np.float32), dtype)
 
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, act_mode)
-    qa8, sa8, ra8 = fast.qwen35_oq_a8_stage_a_natural(x, act_mode)
-    got = fast.qwen35_oq_a8_qmm_t(qa8, sa8, ra8, packed, scales, biases, 8, act_mode)
+    qa, sa, ra = fast.oq_a8_quantize(x, act_mode)
+    qa8, sa8, ra8 = fast.oq_a8_stage_a_natural(x, act_mode)
+    got = fast.oq_a8_qmm_t(qa8, sa8, ra8, packed, scales, biases, 8, act_mode)
     mx.eval(qa, sa, ra, got)
 
     expected = affine_reference(
@@ -1057,8 +1057,8 @@ def test_stage_a_natural_keeps_k_order(act_mode):
     fast = _kernels()
     rng = np.random.default_rng(3)
     x = mx.array((rng.standard_normal((40, 256)) * 0.7).astype(np.float32), mx.float16)
-    qa, sa, ra = fast.qwen35_oq_a8_quantize(x, act_mode)
-    qn, sn, rn = fast.qwen35_oq_a8_stage_a_natural(x, act_mode)
+    qa, sa, ra = fast.oq_a8_quantize(x, act_mode)
+    qn, sn, rn = fast.oq_a8_stage_a_natural(x, act_mode)
     mx.eval(qa, sa, ra, qn, sn, rn)
 
     np.testing.assert_array_equal(np.array(qn), np.array(qa))
@@ -1078,8 +1078,8 @@ def test_q8_tiles_and_token_paths_agree(act_mode):
 
     def run(m):
         x = mx.array(rows[:m] * 0.5, mx.float16)
-        qa, sa, ra = fast.qwen35_oq_a8_stage_a_natural(x, act_mode)
-        y = fast.qwen35_oq_a8_qmm_t(qa, sa, ra, packed, scales, biases, 8, act_mode)
+        qa, sa, ra = fast.oq_a8_stage_a_natural(x, act_mode)
+        y = fast.oq_a8_qmm_t(qa, sa, ra, packed, scales, biases, 8, act_mode)
         return np.array(y.astype(mx.float32)).view(np.uint32)
 
     narrow = run(1028)  # (1,2) tile, vector Ra/Sa loads
@@ -1093,9 +1093,9 @@ def test_q8_rejects_group_major_metadata():
     """Q8 metadata is [N, K/64]; a transposed copy is a shape error."""
     fast = _kernels()
     packed, scales, biases = make_quantized(128, 256, 8)
-    qa, sa, ra = fast.qwen35_oq_a8_stage_a_natural(mx.zeros((64, 256), mx.float16), 0)
+    qa, sa, ra = fast.oq_a8_stage_a_natural(mx.zeros((64, 256), mx.float16), 0)
     with pytest.raises(ValueError, match="incompatible"):
-        fast.qwen35_oq_a8_qmm_t(
+        fast.oq_a8_qmm_t(
             qa, sa, ra, packed, mx.contiguous(scales.T), mx.contiguous(biases.T), 8
         )
 
@@ -1103,14 +1103,14 @@ def test_q8_rejects_group_major_metadata():
 @pytest.mark.parametrize("bits", [4, 5, 8])
 def test_apply_plan_metadata_layout(monkeypatch, bits):
     """Q8 gets the layer's own [N, K/64] arrays; Q4/Q5 a cached [K/64, N] copy."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
     from omlx.patches import qwen35_oq_a8 as dispatch
 
     calls = []
     monkeypatch.setattr(fast, "oq_a8_available", lambda: True)
     monkeypatch.setattr(
         fast,
-        "qwen35_oq_a8_qmm_t",
+        "oq_a8_qmm_t",
         lambda qa, sa, ra, w, s, b, *args, **kwargs: calls.append((w, s, b)),
     )
     linear = _quantized_linear(256, 128, bits)

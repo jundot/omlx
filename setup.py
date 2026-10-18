@@ -37,21 +37,24 @@ def _custom_kernel_build_kwargs() -> dict:
 
     extension._HOST_SOURCE_SUFFIXES.add(".mm")
 
-    common = "omlx/custom_kernels/common/csrc"
-    bonsai = "omlx/custom_kernels/bonsai/csrc"
-    decode = "omlx/custom_kernels/decode_fast/csrc"
-    glm = "omlx/custom_kernels/glm_moe_dsa/csrc"
-    minimax = "omlx/custom_kernels/minimax_m3/csrc"
-    qwen = "omlx/custom_kernels/qwen35_prefill/csrc"
+    root = "omlx/custom_kernels"
+    shared = f"{root}/include"
+    attention = f"{root}/attention/csrc"
+    lowbit = f"{root}/lowbit/csrc"
+    quant = f"{root}/quant_matmul/csrc"
+    sparse = f"{root}/sparse_index/csrc"
 
-    qwen_libraries = [
+    quant_libraries = [
         extension.MetalLibrary(
-            "omlx_qwen35_prefill_kernels",
+            "omlx_quant_matmul_kernels",
             sources=[
-                f"{qwen}/qwen35_attention.metal",
-                f"{qwen}/qwen35_qmm.metal",
-                f"{qwen}/qwen35_oq_a8.metal",
-                f"{qwen}/qwen35_ane.metal",
+                f"{quant}/affine_qmm.metal",
+                f"{quant}/gather_qmm.metal",
+                f"{quant}/head_flat_qmm.metal",
+                f"{quant}/moe_weighted_sum.metal",
+                f"{quant}/mxfp8_qmv.metal",
+                f"{quant}/oq_a8.metal",
+                f"{quant}/ane/ane_hybrid.metal",
             ],
         ),
     ]
@@ -59,13 +62,13 @@ def _custom_kernel_build_kwargs() -> dict:
         ["xcrun", "-sdk", "macosx", "--show-sdk-version"], text=True
     ).strip()
     if tuple(int(part) for part in sdk_version.split(".")) >= (26, 2):
-        qwen_libraries.append(
+        quant_libraries.append(
             extension.MetalLibrary(
-                "omlx_qwen35_prefill_kernels_nax",
+                "omlx_quant_matmul_kernels_nax",
                 sources=[
-                    f"{qwen}/qwen35_qmm_nax.metal",
-                    f"{qwen}/qwen35_oq_a8_nax.metal",
-                    f"{qwen}/qwen35_oq_q8_a8_nax.metal",
+                    f"{quant}/affine_qmm_nax.metal",
+                    f"{quant}/oq_a8_nax.metal",
+                    f"{quant}/oq_q8_a8_nax.metal",
                 ],
                 deployment_target="26.2",
             )
@@ -74,93 +77,89 @@ def _custom_kernel_build_kwargs() -> dict:
     return {
         "ext_modules": [
             extension.MetalExtension(
-                "omlx.custom_kernels.bonsai._ext",
-                sources=[f"{bonsai}/bindings.cpp", f"{bonsai}/bonsai_kernels.cpp"],
-                include_dirs=[bonsai, common],
+                "omlx.custom_kernels.attention._ext",
+                sources=[
+                    f"{attention}/bindings.cpp",
+                    f"{attention}/block_mask_attention.cpp",
+                    f"{attention}/compressed_sparse_attention.cpp",
+                    f"{attention}/fa256_attention.cpp",
+                    f"{attention}/packed_sparse_attention.cpp",
+                    f"{attention}/sdpa_decode.cpp",
+                    f"{attention}/sparse_gqa_attention.cpp",
+                    f"{attention}/sparse_mla.cpp",
+                    f"{attention}/verify_gemm.cpp",
+                ],
+                include_dirs=[attention, shared],
                 metal_libraries=[
                     extension.MetalLibrary(
-                        "omlx_bonsai_kernels",
+                        "omlx_attention_kernels",
                         sources=[
-                            f"{bonsai}/bonsai_quantized.metal",
-                            f"{bonsai}/spec_decode.metal",
+                            f"{attention}/block_mask_attention.metal",
+                            f"{attention}/compressed_sparse_attention.metal",
+                            f"{attention}/fa256_attention.metal",
+                            f"{attention}/packed_sparse_attention.metal",
+                            f"{attention}/sdpa_decode.metal",
+                            f"{attention}/sparse_gqa_attention.metal",
+                            f"{attention}/sparse_mla.metal",
+                            f"{attention}/verify_gemm.metal",
                         ],
                     ),
                 ],
             ),
             extension.MetalExtension(
-                "omlx.custom_kernels.decode_fast._ext",
-                sources=[
-                    f"{decode}/bindings.cpp",
-                    f"{decode}/sdpa_decode.cpp",
-                ],
-                include_dirs=[decode],
+                "omlx.custom_kernels.lowbit._ext",
+                sources=[f"{lowbit}/bindings.cpp", f"{lowbit}/lowbit_qmv.cpp"],
+                include_dirs=[lowbit, shared],
                 metal_libraries=[
                     extension.MetalLibrary(
-                        "omlx_decode_fast_kernels",
-                        sources=[f"{decode}/sdpa_decode.metal"],
-                    ),
-                ],
-            ),
-            extension.MetalExtension(
-                "omlx.custom_kernels.glm_moe_dsa._ext",
-                sources=[
-                    f"{glm}/bindings.cpp",
-                    f"{glm}/dsa_indexer.cpp",
-                    f"{glm}/deepseek_v4_sparse_attention.cpp",
-                    f"{glm}/deepseek_v41_packed_attention.cpp",
-                    f"{glm}/deepseek_v41_grouped_expert.cpp",
-                    f"{glm}/dspark_gemm.cpp",
-                    f"{glm}/dspark_qmv.cpp",
-                    f"{glm}/exact_block_attention.cpp",
-                    f"{glm}/fused_moe.cpp",
-                    f"{glm}/qwen4_qsa_sparse_gqa.cpp",
-                    f"{glm}/sparse_mla.cpp",
-                ],
-                include_dirs=[glm, common],
-                metal_libraries=[
-                    extension.MetalLibrary(
-                        "omlx_glm_kernels",
+                        "omlx_lowbit_kernels",
                         sources=[
-                            f"{glm}/deepseek_moe.metal",
-                            f"{glm}/deepseek_v4_sparse_attention.metal",
-                            f"{glm}/deepseek_v41_packed_attention.metal",
-                            f"{glm}/dspark_gemm.metal",
-                            f"{glm}/dspark_qmv.metal",
-                            f"{glm}/dsa_indexer.metal",
-                            f"{glm}/exact_block_attention.metal",
-                            f"{glm}/fused_moe.metal",
-                            f"{glm}/qwen4_qsa_sparse_gqa.metal",
-                            f"{glm}/sparse_mla.metal",
+                            f"{lowbit}/lowbit_qmv.metal",
                         ],
                     ),
                 ],
             ),
             extension.MetalExtension(
-                "omlx.custom_kernels.minimax_m3._ext",
-                sources=[f"{minimax}/bindings.cpp", f"{minimax}/minimax_msa.cpp"],
-                include_dirs=[minimax],
-                metal_libraries=[
-                    extension.MetalLibrary(
-                        "omlx_minimax_m3_kernels",
-                        sources=[f"{minimax}/minimax_msa.metal"],
-                    ),
-                ],
-            ),
-            extension.MetalExtension(
-                "omlx.custom_kernels.qwen35_prefill._ext",
+                "omlx.custom_kernels.quant_matmul._ext",
                 sources=[
-                    f"{qwen}/bindings.cpp",
-                    f"{qwen}/qwen35_prefill.cpp",
-                    f"{qwen}/qwen35_oq_a8.cpp",
-                    f"{qwen}/qwen35_ane.mm",
+                    f"{quant}/bindings.cpp",
+                    f"{quant}/affine_qmm.cpp",
+                    f"{quant}/command_buffer_caps.cpp",
+                    f"{quant}/command_queue.cpp",
+                    f"{quant}/gather_qmm.cpp",
+                    f"{quant}/grouped_expert.cpp",
+                    f"{quant}/head_flat_qmm.cpp",
+                    f"{quant}/moe_staging.cpp",
+                    f"{quant}/moe_weighted_sum.cpp",
+                    f"{quant}/mxfp8_qmv.cpp",
+                    f"{quant}/oq_a8.cpp",
+                    f"{quant}/ane/ane_hybrid.mm",
                 ],
-                include_dirs=[qwen, common],
-                metal_libraries=qwen_libraries,
+                include_dirs=[quant, shared],
+                metal_libraries=quant_libraries,
                 extra_link_args=[
                     "SHELL:-framework Accelerate",
                     "SHELL:-framework Foundation",
                     "SHELL:-framework IOSurface",
                     "SHELL:-framework Metal",
+                ],
+            ),
+            extension.MetalExtension(
+                "omlx.custom_kernels.sparse_index._ext",
+                sources=[
+                    f"{sparse}/bindings.cpp",
+                    f"{sparse}/dsa_indexer.cpp",
+                    f"{sparse}/msa_block_topk.cpp",
+                ],
+                include_dirs=[sparse, shared],
+                metal_libraries=[
+                    extension.MetalLibrary(
+                        "omlx_sparse_index_kernels",
+                        sources=[
+                            f"{sparse}/dsa_indexer.metal",
+                            f"{sparse}/msa_block_topk.metal",
+                        ],
+                    ),
                 ],
             ),
         ],

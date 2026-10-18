@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ..utils.fatal import is_command_buffer_error
 from ..utils.metal_sync import _sync_and_clear_cache
 
 try:
@@ -4759,6 +4760,8 @@ class BlockAwarePrefixCache(CacheManager):
             return reconstructed_caches
 
         except Exception as e:
+            if is_command_buffer_error(e):
+                raise
             logger.warning(f"Failed to reconstruct cache: {e}")
             import traceback
 
@@ -4869,7 +4872,9 @@ class BlockAwarePrefixCache(CacheManager):
             _sync_and_clear_cache()
             logger.debug("Restore pool flush cleared %d bytes", pool_bytes)
             return True
-        except Exception:  # noqa: BLE001 - best effort, never fail a restore
+        except Exception as exc:  # noqa: BLE001 - best effort, never fail a restore
+            if is_command_buffer_error(exc):
+                raise
             logger.debug("Restore pool flush failed", exc_info=True)
             return False
 

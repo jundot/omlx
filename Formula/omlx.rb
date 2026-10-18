@@ -1,10 +1,8 @@
 class Omlx < Formula
-  CUSTOM_KERNELS = %w[bonsai decode_fast glm_moe_dsa minimax_m3 qwen35_prefill].freeze
-
   desc "LLM inference server optimized for Apple Silicon"
   homepage "https://github.com/jundot/omlx"
-  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.0.tar.gz"
-  sha256 "cd58f72b7390896d8484ae0056cb8f578e21b18b448a5199caa023118a215c83"
+  url "https://github.com/jundot/omlx/archive/refs/tags/v0.7.1rc1.tar.gz"
+  sha256 "dc55b7a83054bf0cfc4e635ae1906414c7d1eeb10fec25248abe9000da3c263a"
   license "Apache-2.0"
 
   head "https://github.com/jundot/omlx.git", branch: "main"
@@ -100,10 +98,9 @@ class Omlx < Formula
         EOS
       end
 
-      kernel_sources = CUSTOM_KERNELS.map do |kernel|
-        buildpath/"omlx/custom_kernels/#{kernel}/csrc"
-      end
-      unless kernel_sources.all?(&:directory?)
+      # Each kernel package keeps its sources in <package>/csrc; the package
+      # list comes from the tarball itself so any release layout builds.
+      unless (buildpath/"omlx/custom_kernels").glob("*/csrc").any?(&:directory?)
         odie "--with-custom-kernel requires oMLX custom kernel sources; use --HEAD or a release that includes them"
       end
 
@@ -248,13 +245,11 @@ class Omlx < Formula
 
   def verify_custom_kernels(python)
     system python, "-c", <<~PYTHON
-      import importlib
-      failed = {}
-      for package in #{CUSTOM_KERNELS.inspect}:
-          fast = importlib.import_module(f"omlx.custom_kernels.{package}.fast")
-          if not fast.is_native_available():
-              failed[package] = str(fast.import_error())
-      assert not failed, failed
+      from omlx.custom_kernels import native_kernel_status
+      status = native_kernel_status()
+      failed = {name: report["import_error"] for name, report in status.items()
+                if not report["available"]}
+      assert status and not failed, failed
     PYTHON
   end
 
