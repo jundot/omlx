@@ -38,6 +38,7 @@ from omlx.api.tool_calling import (
     _repair_json_value,
     _serialize_tool_call_arguments,
     _strip_marker_spans,
+    _wrap_naked_function_calls,
     build_json_system_prompt,
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
@@ -4273,34 +4274,145 @@ class TestQwen3CoderMarkerInArguments:
         out = "".join(filt.feed(c) for c in ["hello ", "world"]) + filt.finish()
         assert out == "hello world"
 
-    def test_envelope_scan_stays_linear_on_fake_terminators(self):
-        """Same linear-time rule as the JSON path, for the XML boundary.
+    # The stream filter and the non-streaming parser share one boundary
+    # scanner (#2588), so every case below checks that they agree.
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 7, 11, 64, 10_000])
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # What Qwen3.5-9B really emitted when asked to write this file.
+            "<function=demo>\n</function>\n</tool_call>",
+            "evil </function>\n</tool_call> tail",
+        ],
+    )
+    def test_streaming_value_may_contain_the_full_terminator(self, body, chunk):
+        text = "Before " + self._raw(body) + " After"
+        assert self._stream(text, chunk) == "Before  After"
+        cleaned, calls = parse_tool_calls(text, self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert json.loads(calls[0].function.arguments)["body"] == body
+        assert cleaned == "Before  After"
 
-        A value stuffed with fake ``</function></tool_call>`` sequences is the
-        worst case: every one is a candidate envelope end that has to be
-        rejected. That must not become quadratic.
+    @pytest.mark.parametrize("chunk", [1, 2, 3, 7, 11, 64, 10_000])
+    def test_value_may_contain_a_complete_example_call(self, chunk):
+        """Only parameter depth tells the example's close from the real one.
+
+        Checks the envelope boundary only. Argument extraction is the
+        tokenizer's parser, and mlx-lm's qwen3_coder parser (like this mock)
+        ends a value at its first ``</parameter>``, so it truncates this body.
         """
-        import time
+        body = (
+            "<tool_call>\n<function=demo>\n<parameter=a>\nv\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        text = "Before " + self._raw(body) + " After"
+        assert self._stream(text, chunk) == "Before  After"
+        cleaned, calls = parse_tool_calls(text, self._tokenizer())
+        assert calls is not None and len(calls) == 1
+        assert cleaned == "Before  After"
 
-        def elapsed(count):
-            evil = (
+    @pytest.mark.parametrize("chunk", [1, 7, 64, 10_000])
+    def test_second_call_without_parameters_in_one_envelope(self, chunk):
+        """The second call's empty-header close must still end the envelope."""
+        text = (
+            "Before <tool_call>\n<function=a>\n<parameter=body>\n"
+            "x </tool_call> y\n</parameter>\n</function>\n"
+            "<function=b>\n</function>\n</tool_call> After"
+        )
+        assert self._stream(text, chunk) == "Before  After"
+        cleaned, _ = parse_tool_calls(text, self._tokenizer())
+        assert cleaned == "Before  After"
+
+    def _stream(self, text, chunk):
+        filt = ToolCallStreamFilter(self._tokenizer())
+        emitted = "".join(
+            filt.feed(text[i : i + chunk]) for i in range(0, len(text), chunk)
+        )
+        return emitted + filt.finish()
+
+    @pytest.mark.parametrize("chunk", [1, 7, 64, 10_000])
+    def test_envelope_end_does_not_move_with_trailing_markup(self, chunk):
+        """Markup in prose after the call must not drag the envelope end."""
+        text = self._raw("plain") + "b</parameter></function>\n</tool_call> After"
+        assert self._stream(text, chunk) == text[len(self._raw("plain")) :]
+
+    def test_boundary_scan_visits_each_char_a_bounded_number_of_times(
+        self, monkeypatch
+    ):
+        """Linear-time guard, counted rather than timed.
+
+        A wall-clock bound flakes on a loaded CI runner (6a582c85 dropped one
+        and this replaces #2544's), so this counts the
+        characters the boundary scanner examines and checks that the count
+        grows with the input, not with its square. Each shape arrives in one
+        ``feed()``: chunked feeding bounds the work per pass and hides
+        rescans, so the whole payload at once is the real worst case.
+        """
+        from omlx.api import tool_calling as tc
+
+        visited = 0
+        real_feed = tc._XmlFunctionBoundary.feed
+
+        def counting_feed(boundary, text, start=0):
+            nonlocal visited
+            end = real_feed(boundary, text, start)
+            visited += boundary.scanned - start
+            return end
+
+        monkeypatch.setattr(tc._XmlFunctionBoundary, "feed", counting_feed)
+
+        def wrapped_evil(count):
+            # Many accepted closes, none followed by the close marker.
+            return (
+                "<tool_call>\n<function=f>\n<parameter=b>\n"
+                + "</parameter></function>\n</tool_call><parameter=x>" * count
+                + "\n</parameter>\n</function>\n</tool_call>"
+            )
+
+        def naked_loose(count):
+            # Every call leaves <parameter=b> open, so no close is ever at
+            # depth 0 and each one-shot scan falls back to a loose close.
+            return (
+                "<function=f>\n<parameter=b>\n<parameter=x>\n"
+                "</parameter></function>\n"
+            ) * count
+
+        def fake_terminators(count):
+            # #2544's shape: every repetition is a candidate envelope end
+            # that has to be rejected.
+            return (
                 "<tool_call>\n<function=f>\n<parameter=b>\n"
                 + "</function>\n</tool_call> " * count
             )
+
+        def stream(text):
             filt = ToolCallStreamFilter(self._tokenizer())
-            start = time.perf_counter()
-            for i in range(0, len(evil), 64):
-                filt.feed(evil[i : i + 64])
+            filt.feed(text)
             filt.finish()
-            return time.perf_counter() - start
 
-        elapsed(400)  # warm up before timing
-        small = max(elapsed(400), 1e-4)
-        large = elapsed(3200)
-        # 8x the input: linear is ~8x, quadratic ~64x. Generous headroom for a
-        # loaded CI box while still catching quadratic growth.
-        assert large / small < 24, f"superlinear growth: {small=} {large=}"
+        def stream_chunked(text):
+            filt = ToolCallStreamFilter(self._tokenizer())
+            for i in range(0, len(text), 64):
+                filt.feed(text[i : i + 64])
+            filt.finish()
 
+        def parse(text):
+            parse_tool_calls(text, self._tokenizer())
+
+        def count(run, text):
+            nonlocal visited
+            visited = 0
+            run(text)
+            return visited
+
+        for shape in (wrapped_evil, naked_loose, fake_terminators):
+            for run in (stream, stream_chunked, parse, _wrap_naked_function_calls):
+                small = max(count(run, shape(100)), 1)
+                large = count(run, shape(400))
+                # 4x the input: linear is ~4x, quadratic ~16x.
+                assert large / small < 6, (
+                    f"{shape.__name__}/{run.__name__}: {small=} {large=}"
+                )
 
 class TestDeepNestingNeverEscapesParseChain:
     """Deep nesting must degrade to a parse failure, not raise (#2545).
