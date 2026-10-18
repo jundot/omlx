@@ -7,8 +7,8 @@ check the wiring is present.
 
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-DASHBOARD = ROOT / "omlx/admin/static/js/dashboard.js"
+ROOT = Path(__file__).resolve().parents[1]  # apps/omlx-web
+DASHBOARD = ROOT / "omlx_web" / "static" / "js" / "dashboard.js"
 
 
 def _script() -> str:
