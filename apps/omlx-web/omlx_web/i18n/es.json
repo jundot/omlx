@@ -1,4 +1,8 @@
 {
+  "modal.model_settings.mapped_weights_label": "Mapped weights (experimental)",
+  "modal.model_settings.mapped_weights_help": "Load weights from read-only file views. Idle memory can be reclaimed without swap; active generation still needs the full model. Misaligned tensors are copied. Requires reload. Incompatible with expert offload.",
+  "modal.model_settings.mapped_weights_coverage": "{mappable} of {total} ({percent}%) can be mapped without copying.",
+  "modal.model_settings.mapped_weights_misaligned": "Only {percent}% of this model ({mappable} of {total}) can be mapped: its weight files are not 8-byte aligned, so most of it loads the usual way and this option brings little benefit. Use a checkpoint saved with 8-byte aligned tensors to get the full benefit.",
   "cluster.v2.device.ssh_user": "Nombre de usuario de SSH",
   "cluster.v2.device.ssh_user_help": "Introduce el nombre corto de la cuenta del equipo remoto. Déjalo en blanco para usar el inicio de sesión registrado o la configuración de SSH.",
   "cluster.v2.device.ssh_user_save": "Guardar nombre de usuario de SSH",

@@ -67,6 +67,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_oq_a8_min_tokens",
     "moe_expert_offload_enabled",
     "moe_expert_offload_resident_fraction",
+    "mapped_weights_enabled",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",

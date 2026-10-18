@@ -404,6 +404,8 @@ class ModelSettingsRequest(BaseModel):
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool | None = None
     moe_expert_offload_resident_fraction: float | None = None
+    # Mapped weights (zero-copy from the checkpoint files)
+    mapped_weights_enabled: bool | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -1003,6 +1005,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["turboquant_skip_last"] = True
     settings["moe_expert_offload_enabled"] = False
     settings["moe_expert_offload_resident_fraction"] = 0.25
+    settings["mapped_weights_enabled"] = False
     settings["specprefill_enabled"] = False
     settings["external_engine"] = None
     settings["dflash_enabled"] = False
@@ -1076,6 +1079,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.turboquant_skip_last = True
     settings.moe_expert_offload_enabled = False
     settings.moe_expert_offload_resident_fraction = 0.25
+    settings.mapped_weights_enabled = False
     settings.specprefill_enabled = False
     settings.specprefill_draft_model = None
     settings.specprefill_keep_pct = None
@@ -2360,6 +2364,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         moe_offload_supported, _ = moe_offload_compatibility(
             model_info.get("model_path") or ""
         )
+        from ..utils.mapped_weights import mapped_coverage
+
+        coverage = mapped_coverage(model_info.get("model_path") or "")
+        mapped_weights_coverage = (
+            {"mappable_bytes": coverage[0], "total_bytes": coverage[1]}
+            if coverage
+            else None
+        )
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2485,6 +2497,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
             "moe_expert_offload_supported": moe_offload_supported,
+            "mapped_weights_coverage": mapped_weights_coverage,
             "moe_offload_allows_mtp": (
                 (model_info.get("config_model_type") or "").replace("-", "_").lower()
                 in MOE_OFFLOAD_MTP_MODEL_TYPES
@@ -3047,6 +3060,8 @@ async def update_model_settings(
             if request.moe_expert_offload_resident_fraction is None
             else request.moe_expert_offload_resident_fraction
         )
+    if "mapped_weights_enabled" in sent:
+        current_settings.mapped_weights_enabled = bool(request.mapped_weights_enabled)
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False

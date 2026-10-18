@@ -313,6 +313,7 @@ class BatchedEngine(BaseEngine):
         # while ensuring no concurrent Metal operations. See issue #85.
         from ..engine_core import get_mlx_executor
 
+        @self._mapped_weight_loading()
         def _load_model_sync():
             custom_loaded = maybe_load_custom_quantization(
                 self._model_name,
@@ -423,6 +424,10 @@ class BatchedEngine(BaseEngine):
                 "moe expert offload active (%d layers): skipping gate/up fusion",
                 moe_offload_wrapped,
             )
+        elif getattr(self._model_settings, "mapped_weights_enabled", False):
+            # Fusion concatenates gate and up into a new buffer: a full copy
+            # of the routed experts, which is what mapping avoids.
+            logger.info("mapped weights active: skipping gate/up fusion")
         elif (
             getattr(self._model_settings, "moe_gate_up_fusion_enabled", True)
             is not False

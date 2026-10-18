@@ -1,4 +1,8 @@
 {
+  "modal.model_settings.mapped_weights_label": "Pesos mapeados (experimental)",
+  "modal.model_settings.mapped_weights_help": "Carrega pesos de arquivos sem cópia quando alinhados. A memória ociosa pode ser recuperada sem swap; a geração ainda precisa do modelo inteiro. Tensores desalinhados são copiados. Requer recarga. Incompatível com offload de experts.",
+  "modal.model_settings.mapped_weights_coverage": "{mappable} de {total} ({percent}%) podem ser mapeados sem cópia.",
+  "modal.model_settings.mapped_weights_misaligned": "Só {percent}% deste modelo ({mappable} de {total}) pode ser mapeado: os arquivos de pesos não estão alinhados a 8 bytes, então quase tudo carrega do jeito normal e esta opção traz pouco benefício. Use um checkpoint salvo com tensores alinhados a 8 bytes para aproveitar a opção por completo.",
   "cluster.v2.device.ssh_user": "Nome de usuário SSH",
   "cluster.v2.device.ssh_user_help": "Digite o nome curto da conta do computador remoto. Deixe em branco para usar o login cadastrado ou a configuração de SSH.",
   "cluster.v2.device.ssh_user_save": "Salvar nome de usuário SSH",

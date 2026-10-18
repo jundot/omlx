@@ -15,6 +15,7 @@ on the Mac:
 Ceiling = min(static_ceiling, dynamic_ceiling, metal_cap_effective):
   static_ceiling  = total_ram - tier_reserve
   dynamic_ceiling = omlx_phys + free + inactive + active file cache
+                    + resident mapped bytes outside that file cache
                     + reclaim_ratio * other_apps_active - tier_reserve
                     (custom: the user-pinned ceiling)
   metal_cap_effective = metal_cap + omlx_cpu_footprint
@@ -691,6 +692,7 @@ class ProcessMemoryEnforcer:
 
         safe / balanced / aggressive:
             omlx_phys + free + inactive + active file cache
+                + resident mapped bytes outside that file cache
                 + other_apps_active * ratio - tier_reserve
 
             free / inactive / active come from `host_statistics64`
@@ -706,6 +708,9 @@ class ProcessMemoryEnforcer:
             inactive, so we deliberately do not add them (would double
             count). Memory oMLX just released counts until vm_stat reports
             it as free, so a Metal cache clear does not dip the ceiling.
+            Read-only mapped Metal buffers are omitted from omlx_phys; fresh
+            region counters contribute only a resident lower bound outside
+            that reclaimable cache, without delayed-release credit.
 
         VM stats failure: falls back to psutil_compat.virtual_memory().available
         (= roughly free + inactive on macOS, similar elsewhere). On macOS that
@@ -758,6 +763,13 @@ class ProcessMemoryEnforcer:
         terms["released"] = self._release_credit(
             terms["omlx"], terms["free"] + terms["inactive"]
         )
+        from .utils.mapped_residency import resident_mapped_bytes
+
+        # Read-only mapped Metal buffers are absent from phys_footprint.
+        # Subtract all reclaimable file cache as possible overlap. Nonresident
+        # weights get no credit, and residency changes never mint release credit.
+        terms["mapped_resident"] = resident_mapped_bytes() if stats is not None else 0
+        terms["omlx"] += max(0, terms["mapped_resident"] - terms["inactive"])
         reclaimable = (
             terms["free"] + terms["inactive"] + terms["other_apps"] + terms["released"]
         )
