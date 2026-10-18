@@ -35,9 +35,10 @@ Import of ``onnx`` is deferred to call time so oMLX keeps working without it.
 
 import gc
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 import mlx.core as mx
 
@@ -64,7 +65,7 @@ class OnnxDenseWeights:
     """One projection module read from the graph, in the MLX/torch [out, in] layout."""
 
     linear: mx.array
-    residual: Optional[mx.array]
+    residual: mx.array | None
 
 
 @dataclass(frozen=True)
@@ -75,10 +76,10 @@ class OnnxColbertWeights:
     quantized: bool
     """Whether the graph stores its matrices as int8 + scale (dynamic quantization)."""
 
-    encoder: Dict[str, mx.array]
+    encoder: dict[str, mx.array]
     """MLX ``ModernBertModel`` parameter name -> array, all in MLX layout."""
 
-    projection: Tuple[OnnxDenseWeights, ...]
+    projection: tuple[OnnxDenseWeights, ...]
     """Projection modules in pipeline order."""
 
 
@@ -123,10 +124,10 @@ def _dequantize(
 
 
 def _weight_operand(
-    operand: Optional[str],
-    initializers: Dict[str, Any],
+    operand: str | None,
+    initializers: dict[str, Any],
     numpy_helper: Any,
-) -> Optional[Any]:
+) -> Any | None:
     """Resolve a MatMul B operand to a float array, dequantizing when needed.
 
     Returns None when the operand is an activation (no initializer), which is how
@@ -153,7 +154,7 @@ def _weight_operand(
     )
 
 
-def _module_path(node_name: str) -> Optional[str]:
+def _module_path(node_name: str) -> str | None:
     """``/bert/layers.7/mlp/Wo/MatMul`` -> ``layers.7.mlp.Wo``."""
     if not node_name.startswith(_NODE_PREFIX):
         return None
@@ -163,7 +164,7 @@ def _module_path(node_name: str) -> Optional[str]:
     return stem.rsplit("/", 1)[0].replace("/", ".")
 
 
-def _encoder_weights(graph: Any, numpy_helper: Any) -> Dict[str, mx.array]:
+def _encoder_weights(graph: Any, numpy_helper: Any) -> dict[str, mx.array]:
     """MLX parameter name -> array for everything under ``/bert/``.
 
     Two naming systems meet here. Norms and the token embedding are ordinary
@@ -174,7 +175,7 @@ def _encoder_weights(graph: Any, numpy_helper: Any) -> Dict[str, mx.array]:
     the ``[out, in]`` layout ``nn.Linear`` uses.
     """
     initializers = {init.name: init for init in graph.initializer}
-    weights: Dict[str, mx.array] = {}
+    weights: dict[str, mx.array] = {}
 
     for init in graph.initializer:
         if init.name.startswith(_INITIALIZER_PREFIX):
@@ -203,15 +204,15 @@ def _projection_weights(
     graph: Any,
     dense: Sequence[ColbertDenseSpec],
     numpy_helper: Any,
-) -> Tuple[OnnxDenseWeights, ...]:
+) -> tuple[OnnxDenseWeights, ...]:
     """Read ``/projection_layers.{i}/{linear,residual}`` in pipeline order."""
     initializers = {init.name: init for init in graph.initializer}
-    by_prefix: Dict[str, Any] = {}
+    by_prefix: dict[str, Any] = {}
     for node in graph.node:
         if node.op_type in _MATMUL_OPS and node.name.startswith("/projection_layers."):
             by_prefix[node.name] = node
 
-    projection: List[OnnxDenseWeights] = []
+    projection: list[OnnxDenseWeights] = []
     for index, spec in enumerate(dense):
         if spec.bias:
             raise ColbertLayoutError(
