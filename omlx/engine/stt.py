@@ -436,6 +436,210 @@ class _WhisperRealtimeBackend:
         return [text] if text else []
 
 
+def _is_qwen3_realtime_model(model: Any) -> bool:
+    """True for whole-buffer Qwen3-ASR models that the server-endpointing
+    realtime backend can drive.
+
+    Qwen3-ASR exposes ``stream_generate`` / ``stream_transcribe``, but those
+    only stream OUTPUT over a COMPLETE audio buffer (VOICE-11/UP-11: the
+    encoder needs the whole window) — neither existing capability symbol
+    applies. Pinned to the module so other whole-buffer models are not
+    falsely admitted without a backend that can feed them.
+    """
+    return str(type(model).__module__ or "").startswith(
+        "mlx_audio.stt.models.qwen3_asr"
+    )
+
+
+class _Qwen3RealtimeBackend:
+    """Push-input adapter for Qwen3-ASR: per-utterance server-side endpointing.
+
+    Qwen3-ASR has no incremental-input API, so true chunk-causal live tokens
+    are impossible with it (VOICE-14 mode C). Mode B instead: an energy gate
+    segments the pushed stream server-side and each closed utterance is
+    transcribed EXACTLY ONCE with the same whole-buffer path the file
+    endpoint uses. Deltas are whole utterances — no revision problem — and
+    the WebSocket protocol the client speaks is unchanged. The RMS gate
+    follows ``_WhisperRealtimeBackend.QUIET_RMS``; all ``*_sync`` methods run
+    on the MLX executor, ``feed`` is thread-safe and cheap.
+    """
+
+    VOICE_RMS = 0.01
+    SILENCE_SECONDS = 0.7        # trailing quiet that closes an utterance
+    MIN_SPEECH_SECONDS = 0.4     # shorter than this is a cough, not speech
+    MAX_SEGMENT_SECONDS = 25.0   # bound the whole-buffer decode latency
+    PREROLL_SECONDS = 0.3        # speech starts before the first voiced slice
+    TAIL_MARGIN_SECONDS = 0.2    # keep a little of the closing silence
+    MIN_TOKENS = 96              # decode floor for a closed utterance
+    MAX_TOKENS_CAP = 512         # ceiling regardless of utterance length
+    CHARS_PER_SECOND_CAP = 60.0  # beyond this the transcript is degenerate
+    _FRAME = int(0.1 * REALTIME_SAMPLE_RATE)
+
+    def __init__(self, model: Any, language: str | None = None):
+        self._model = model
+        self._language = _normalize_stt_generate_language(model, language)
+        self._lock = threading.Lock()
+        self._buffer: list[np.ndarray] = []
+        self._buffered = 0
+        self._preroll: list[np.ndarray] = []
+        self._preroll_samples = 0
+        self._seg: list[np.ndarray] = []
+        self._seg_samples = 0
+        self._voiced_samples = 0
+        self._quiet_tail = 0
+
+    def feed(self, samples: np.ndarray) -> None:
+        with self._lock:
+            self._buffer.append(samples)
+            self._buffered += len(samples)
+
+    def _take_pending(self) -> list[np.ndarray]:
+        with self._lock:
+            if not self._buffer:
+                return []
+            merged = np.concatenate(self._buffer)
+            self._buffer = []
+            self._buffered = 0
+        return [
+            merged[i : i + self._FRAME]
+            for i in range(0, len(merged), self._FRAME)
+        ]
+
+    @staticmethod
+    def _rms(frame: np.ndarray) -> float:
+        if not len(frame):
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(frame.astype(np.float64)))))
+
+    def _close_segment(self, trim_silence: bool) -> str:
+        import time as _time
+
+        seg, n = self._seg, self._seg_samples
+        voiced, quiet_tail = self._voiced_samples, self._quiet_tail
+        self._seg, self._seg_samples = [], 0
+        self._voiced_samples, self._quiet_tail = 0, 0
+        if voiced < int(self.MIN_SPEECH_SECONDS * REALTIME_SAMPLE_RATE):
+            return ""  # a cough is not an utterance
+        keep = n
+        if trim_silence:
+            keep = max(
+                0,
+                min(
+                    n,
+                    n - quiet_tail
+                    + int(self.TAIL_MARGIN_SECONDS * REALTIME_SAMPLE_RATE),
+                ),
+            )
+        audio = np.concatenate(seg)[:keep] if seg else None
+        if audio is None or not len(audio):
+            return ""
+        t0 = _time.monotonic()
+        # Per-utterance decode budget. Legitimate ASR output runs ~3-6
+        # tokens per second of speech even in dense languages; anything
+        # past 24/s + floor is a degenerate repetition loop (measured live
+        # on Qwen3-ASR-1.7B-8bit with auto-language Czech: 2.1s of audio
+        # -> mlx-audio's 8192-token default -> 32k chars -> 135s of decode
+        # holding the session open). The cap turns worst-case stalls from
+        # minutes into seconds.
+        seconds = keep / REALTIME_SAMPLE_RATE
+        budget = int(
+            min(
+                self.MAX_TOKENS_CAP,
+                max(self.MIN_TOKENS, 24.0 * seconds + 64.0),
+            )
+        )
+        try:
+            res = self._model.generate(
+                np.asarray(audio, dtype=np.float32),
+                language=self._language,
+                max_tokens=budget,
+            )
+        except Exception:
+            # One poison segment must not kill the session (nor the engine
+            # slot bookkeeping): log the real traceback and keep listening.
+            # The route-level finally still releases cleanly on teardown.
+            logger.exception(
+                "STT realtime utterance failed (%.1fs audio) — segment "
+                "dropped, session continues",
+                n / REALTIME_SAMPLE_RATE,
+            )
+            return ""
+        text = getattr(res, "text", None)
+        if text is None:
+            text = str(res)
+        text = text.strip()
+        if len(text) > self.CHARS_PER_SECOND_CAP * seconds:
+            # ran the budget inside a repetition spiral: never deliver the
+            # wall of garbage, say so loudly, keep the session listening
+            logger.warning(
+                "STT realtime utterance DEGENERATE: %.1fs audio -> %d chars "
+                "in %.2fs (language=%s) — dropped, session continues",
+                seconds, len(text), _time.monotonic() - t0,
+                getattr(res, "language", None),
+            )
+            return ""
+        logger.info(
+            "STT realtime utterance: %.1fs audio -> %d chars in %.2fs "
+            "(language=%s)",
+            seconds, len(text), _time.monotonic() - t0,
+            getattr(res, "language", None),
+        )
+        return text
+
+    def _step(self, frame: np.ndarray, out: list[str]) -> None:
+        voiced = self._rms(frame) >= self.VOICE_RMS
+        if not self._seg:
+            if not voiced:
+                self._preroll.append(frame)
+                self._preroll_samples += len(frame)
+                cap = int(self.PREROLL_SECONDS * REALTIME_SAMPLE_RATE)
+                while self._preroll_samples > cap and len(self._preroll) > 1:
+                    dropped = self._preroll.pop(0)
+                    self._preroll_samples -= len(dropped)
+                return
+            # utterance onset: pick up the preroll so the first syllable
+            # (which caused THIS frame to cross the gate) is not clipped
+            self._seg = self._preroll + [frame]
+            self._seg_samples = self._preroll_samples + len(frame)
+            self._preroll, self._preroll_samples = [], 0
+            self._voiced_samples = len(frame)
+            return
+        self._seg.append(frame)
+        self._seg_samples += len(frame)
+        if voiced:
+            self._voiced_samples += len(frame)
+            self._quiet_tail = 0
+        else:
+            self._quiet_tail += len(frame)
+        if self._quiet_tail >= int(self.SILENCE_SECONDS * REALTIME_SAMPLE_RATE):
+            text = self._close_segment(trim_silence=True)
+            if text:
+                out.append(text)
+        elif self._seg_samples >= int(
+            self.MAX_SEGMENT_SECONDS * REALTIME_SAMPLE_RATE
+        ):
+            # force-cut a long monologue: bound the decode latency
+            text = self._close_segment(trim_silence=False)
+            if text:
+                out.append(text)
+
+    def poll_sync(self) -> list[str]:
+        out: list[str] = []
+        for frame in self._take_pending():
+            self._step(frame, out)
+        return out
+
+    def close_sync(self) -> list[str]:
+        out: list[str] = []
+        for frame in self._take_pending():
+            self._step(frame, out)
+        if self._seg:
+            text = self._close_segment(trim_silence=True)
+            if text:
+                out.append(text)
+        return out
+
+
 class _VoxtralRealtimeBackend:
     """Push-input adapter over mlx-audio's VoxtralStreamingSession."""
 
@@ -1091,13 +1295,17 @@ class STTEngine(BaseNonStreamingEngine):
 
         Whisper-family models expose ``generate_streaming`` (AlignAtt
         StreamingDecoder); voxtral_realtime exposes
-        ``create_streaming_session``. Other STT backends only accept a
-        complete audio input.
+        ``create_streaming_session``. Qwen3-ASR exposes neither — it is
+        admitted through ``_is_qwen3_realtime_model`` and served by the
+        server-endpointing ``_Qwen3RealtimeBackend`` (VOICE-14 mode B).
+        Other STT backends only accept a complete audio input.
         """
         if self._model is None:
             return False
-        return hasattr(self._model, "create_streaming_session") or hasattr(
-            self._model, "generate_streaming"
+        return (
+            hasattr(self._model, "create_streaming_session")
+            or hasattr(self._model, "generate_streaming")
+            or _is_qwen3_realtime_model(self._model)
         )
 
     async def create_realtime_session(
@@ -1127,8 +1335,17 @@ class STTEngine(BaseNonStreamingEngine):
             backend: Any = _VoxtralRealtimeBackend(model)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(get_mlx_executor(), backend.start_sync)
-        else:
+        elif _is_qwen3_realtime_model(model):
+            backend = _Qwen3RealtimeBackend(model, language=language)
+        elif hasattr(model, "generate_streaming"):
             backend = _WhisperRealtimeBackend(model, language=language)
+        else:
+            # Unreachable via supports_realtime_stt(); explicit so an
+            # unknown model can never be fed to the whisper mel decoder
+            # by a catch-all (the UP-10 oQ8 failure shape).
+            raise RuntimeError(
+                f"Model '{self._model_name}' has no realtime backend"
+            )
 
         self._realtime_active = True
         activity_id = self._begin_activity(

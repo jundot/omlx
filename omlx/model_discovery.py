@@ -391,9 +391,11 @@ AUDIO_STS_ARCHITECTURES = {
 
 # STT families whose mlx-audio implementations accept incremental audio
 # input (push-based realtime decoding): whisper via the AlignAtt
-# StreamingDecoder, voxtral_realtime via VoxtralStreamingSession. Gates
-# the realtime transcription WebSocket and the admin chat mic button.
-REALTIME_STT_MODEL_TYPES = {"whisper", "voxtral_realtime"}
+# StreamingDecoder, voxtral_realtime via VoxtralStreamingSession, and
+# qwen3_asr via the server-endpointing _Qwen3RealtimeBackend (Qwen3-ASR
+# has no incremental-input API, so its deltas are whole utterances).
+# Gates the realtime transcription WebSocket and the admin chat mic button.
+REALTIME_STT_MODEL_TYPES = {"whisper", "voxtral_realtime", "qwen3_asr"}
 
 
 def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
