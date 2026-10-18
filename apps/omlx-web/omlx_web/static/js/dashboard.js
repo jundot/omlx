@@ -4478,6 +4478,7 @@
             },
 
             setStatsNumberScale(value) {
+                this.statsNumberScale = value;
                 window.omlxCount?.setScale?.(value);
             },
 

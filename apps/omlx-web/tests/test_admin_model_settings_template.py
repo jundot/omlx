@@ -911,9 +911,11 @@ app.statsScope = 'session';
 assert.equal(tile('generated_tokens').value, '1,234');
 assert.equal(tile('cache_efficiency').value, '50.0');
 
-// The picker persists the choice.
+// The picker persists the choice and reflects it in the segmented control.
+app.statsNumberScale = 'compact';
 app.setStatsNumberScale('exact');
 assert.equal(context.window.omlxCount.scale(), 'exact');
+assert.equal(app.statsNumberScale, 'exact');
 """
     result = subprocess.run(
         [node, "-e", script],
