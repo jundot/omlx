@@ -252,6 +252,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
     async def embed_token_ids(
         self,
         ids_batch: List[List[int]],
+        max_length: int | None = None,
     ) -> TokenEmbeddingOutput:
         """Per-token vectors for explicit token ids (late interaction / MaxSim).
 
@@ -286,15 +287,29 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             order = sorted(range(len(sequences)), key=lambda i: len(sequences[i]))
             ordered_sequences = [sequences[i] for i in order]
 
-            for start in range(0, len(ordered_sequences), batch_size):
-                batch = ordered_sequences[start:start + batch_size]
+            fairness = self._fairness
+            index = 0
+            while index < len(ordered_sequences):
+                # Limit each forward while another engine is decoding.
+                cap = fairness.chunk_cap()
+                size = batch_size if cap is None else max(1, min(batch_size, cap))
+                batch = ordered_sequences[index:index + size]
+                index += len(batch)
 
-                def _embed_sync():
+                def _embed_sync(batch=batch):
+                    contended = fairness.wait_turn()
+                    start_ts = time.perf_counter()
                     try:
-                        return model.embed_token_ids(batch)
+                        return model.embed_token_ids(
+                            batch, max_length=max_length
+                        )
                     finally:
                         mx.synchronize()
-                        mx.clear_cache()
+                        fairness.settle(
+                            time.perf_counter() - start_ts, len(batch), contended
+                        )
+                        if fairness.should_clear_cache():
+                            mx.clear_cache()
 
                 output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
                 token_embeddings.extend(output.token_embeddings)
@@ -303,7 +318,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                     dimensions = output.dimensions
                 self._update_activity(
                     activity_id,
-                    completed_items=min(start + len(batch), len(sequences)),
+                    completed_items=min(index, len(sequences)),
                     token_count=total_tokens,
                     dimensions=dimensions,
                 )
