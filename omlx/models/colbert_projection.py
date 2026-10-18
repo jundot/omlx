@@ -50,9 +50,10 @@ shape so a transposed export fails loudly instead of quietly producing noise.
 import json
 import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any
 
 import mlx.core as mx
 
@@ -73,7 +74,7 @@ WEIGHT_SOURCE_ENV = "OMLX_COLBERT_WEIGHT_SOURCE"
 
 # Candidate ONNX graphs, most preferred first: the fp32 export defined the frozen
 # measurements, the int8 export is a quantized derivative of it.
-ONNX_GRAPH_NAMES: Tuple[str, ...] = ("model.onnx", "model_int8.onnx")
+ONNX_GRAPH_NAMES: tuple[str, ...] = ("model.onnx", "model_int8.onnx")
 
 _SENTENCE_TRANSFORMERS_CONFIG = "config_sentence_transformers.json"
 _MODULES_FILE = "modules.json"
@@ -114,7 +115,7 @@ class ColbertDenseSpec:
     bias: bool
     """Whether ``linear.bias`` (and ``residual.bias``) exist."""
 
-    weights: Optional[Path] = None
+    weights: Path | None = None
     """``model.safetensors`` for the safetensors source; None when ONNX-sourced."""
 
 
@@ -128,13 +129,13 @@ class ColbertLayout:
     weight_source: str
     """``onnx`` or ``safetensors`` -- which artifact supplies the weights."""
 
-    dense: Tuple[ColbertDenseSpec, ...]
+    dense: tuple[ColbertDenseSpec, ...]
     """Projection modules, in pipeline order."""
 
-    encoder_weights: Optional[Path] = None
+    encoder_weights: Path | None = None
     """``model.safetensors`` holding the encoder weights (safetensors source)."""
 
-    onnx_graph: Optional[Path] = None
+    onnx_graph: Path | None = None
     """``model.onnx`` / ``model_int8.onnx`` supplying the weights (ONNX source)."""
 
     @property
@@ -161,7 +162,7 @@ class ColbertLayout:
         return self.encoder_weights
 
 
-def _load_json(path: Path) -> Optional[Any]:
+def _load_json(path: Path) -> Any | None:
     """Read a JSON file, returning None for anything unreadable."""
     try:
         with open(path) as fh:
@@ -174,12 +175,14 @@ def _is_dense_module(module_type: Any) -> bool:
     """Whether a ``modules.json`` entry is a projection Dense.
 
     pylate registers ``pylate.models.Dense.Dense``; accept any dotted ``*.Dense``
-    so a renamed pylate package does not silently drop the projection.
+    or bare ``Dense`` so a renamed pylate package does not silently drop the projection.
     """
-    return isinstance(module_type, str) and module_type.endswith(".Dense")
+    return isinstance(module_type, str) and (
+        module_type == "Dense" or module_type.endswith(".Dense")
+    )
 
 
-def _dense_modules(model_path: Path) -> List[Dict[str, Any]]:
+def _dense_modules(model_path: Path) -> list[dict[str, Any]]:
     """Projection module entries from ``modules.json``, in pipeline order."""
     modules = _load_json(model_path / _MODULES_FILE)
     if not isinstance(modules, list):
@@ -192,24 +195,49 @@ def _dense_modules(model_path: Path) -> List[Dict[str, Any]]:
 
 
 def is_pylate_colbert_dir(model_path: Path) -> bool:
-    """Whether ``model_path`` is a pylate ColBERT sentence-transformers export.
+    """Whether ``model_path`` is a pylate / sentence-transformers ColBERT export.
 
-    The marker is the ColBERT declaration in ``config_sentence_transformers.json``
-    *plus* at least one Dense module in ``modules.json``. A plain embedding export
-    also ships ``modules.json`` (Transformer/Pooling/Normalize) but never the
-    ColBERT declaration, and a directory that merely has "colbert" in its name is
-    not evidence. Both files are read without raising so this stays a predicate.
+    Detected when projection Dense modules are present in ``modules.json`` and
+    any of the following ColBERT indicators match:
+    1. ``config_sentence_transformers.json`` declares ``model_type`` as ColBERT
+       (or MultiVectorEncoder), or ``similarity_fn_name`` as MaxSim/MeanMaxSim.
+    2. Any module in ``modules.json`` is from ``pylate`` (e.g. ``pylate.models.Dense.Dense``).
+    3. ``config.json`` declares a ColBERT architecture (e.g. ``HF_ColBERT``) or model_type.
     """
     model_path = Path(model_path)
+    dense_modules = _dense_modules(model_path)
+    if not dense_modules:
+        return False
+
+    raw_modules = _load_json(model_path / _MODULES_FILE)
+    if isinstance(raw_modules, list):
+        for mod in raw_modules:
+            if isinstance(mod, dict) and "pylate" in str(mod.get("type", "")).lower():
+                return True
+
     declared = _load_json(model_path / _SENTENCE_TRANSFORMERS_CONFIG)
-    if not isinstance(declared, dict):
-        return False
-    if declared.get("model_type") != COLBERT_MODEL_TYPE:
-        return False
-    return bool(_dense_modules(model_path))
+    if isinstance(declared, dict):
+        model_type = str(declared.get("model_type", "")).lower()
+        if model_type in ("colbert", "multivectorencoder"):
+            return True
+        similarity_fn = str(declared.get("similarity_fn_name", "")).lower()
+        if similarity_fn in ("maxsim", "meanmaxsim"):
+            return True
+
+    config = _load_json(model_path / "config.json")
+    if isinstance(config, dict):
+        if str(config.get("model_type", "")).lower() == "colbert":
+            return True
+        architectures = config.get("architectures", [])
+        if isinstance(architectures, list):
+            for arch in architectures:
+                if "colbert" in str(arch).lower():
+                    return True
+
+    return False
 
 
-def find_onnx_graph(model_path: Path) -> Optional[Path]:
+def find_onnx_graph(model_path: Path) -> Path | None:
     """The best ONNX graph in ``model_path``, or None."""
     model_path = Path(model_path)
     for name in ONNX_GRAPH_NAMES:
@@ -219,7 +247,7 @@ def find_onnx_graph(model_path: Path) -> Optional[Path]:
     return None
 
 
-def _requested_weight_source(explicit: Optional[str]) -> Optional[str]:
+def _requested_weight_source(explicit: str | None) -> str | None:
     """Resolve the requested source from an argument, then the environment."""
     value = explicit if explicit is not None else os.getenv(WEIGHT_SOURCE_ENV)
     if value is None:
@@ -237,26 +265,29 @@ def _requested_weight_source(explicit: Optional[str]) -> Optional[str]:
 
 def resolve_weight_source(
     model_path: Path,
-    explicit: Optional[str] = None,
+    explicit: str | None = None,
 ) -> str:
     """Choose where a ColBERT export takes its weights from.
 
     An explicit request (argument or ``OMLX_COLBERT_WEIGHT_SOURCE``) wins. With
-    nothing requested, the ONNX graph is preferred when present: it is the
-    artifact the frozen retrieval measurements came from, and where both exist
-    they are not the same numbers, so the choice must not be silent.
+    nothing requested, safetensors is preferred when present (since onnx is an
+    optional dependency and safetensors is native to MLX). When safetensors is
+    not present, fallback to the ONNX graph if available.
     """
     requested = _requested_weight_source(explicit)
     if requested is not None:
         return requested
-    if find_onnx_graph(Path(model_path)) is not None:
+    model_path = Path(model_path)
+    if (model_path / _WEIGHTS_FILE).is_file():
+        return WEIGHT_SOURCE_SAFETENSORS
+    if find_onnx_graph(model_path) is not None:
         return WEIGHT_SOURCE_ONNX
     return WEIGHT_SOURCE_SAFETENSORS
 
 
 def _dense_spec(
     model_path: Path,
-    module: Dict[str, Any],
+    module: dict[str, Any],
     require_safetensors: bool,
 ) -> ColbertDenseSpec:
     """Resolve one Dense module entry into a validated spec."""
@@ -300,7 +331,7 @@ def _dense_spec(
 
 def resolve_colbert_layout(
     model_path: Path,
-    weight_source: Optional[str] = None,
+    weight_source: str | None = None,
 ) -> ColbertLayout:
     """Validate a pylate ColBERT export and describe its projection chain.
 
@@ -313,7 +344,7 @@ def resolve_colbert_layout(
     modules = _dense_modules(model_path)
     if not modules:
         raise ColbertLayoutError(
-            f"{model_path} declares model_type '{COLBERT_MODEL_TYPE}' but lists no "
+            f"{model_path} is detected as a ColBERT export but lists no "
             f"Dense projection module in {_MODULES_FILE}"
         )
 
@@ -367,7 +398,7 @@ def resolve_colbert_layout(
     return layout
 
 
-def flatten_rope_parameters(config: Dict[str, Any]) -> Dict[str, Any]:
+def flatten_rope_parameters(config: dict[str, Any]) -> dict[str, Any]:
     """Copy HF's nested ``rope_parameters`` thetas onto mlx-embeddings' flat fields.
 
     ModernBERT configs written by transformers>=5 -- this checkpoint included --
@@ -414,10 +445,10 @@ def l2_normalize_tokens(vectors: mx.array, eps: float = _L2_EPS) -> mx.array:
 
 
 def _checked_matrix(
-    matrix: Optional[mx.array],
+    matrix: mx.array | None,
     key: str,
     spec: ColbertDenseSpec,
-) -> Optional[mx.array]:
+) -> mx.array | None:
     """Validate one ``[out_features, in_features]`` matrix."""
     if matrix is None:
         return None
@@ -446,11 +477,11 @@ class ColbertProjection:
     def __init__(self, dense: Sequence[ColbertDenseSpec]):
         if not dense:
             raise ValueError("a ColBERT projection requires at least one Dense module")
-        self.dense: Tuple[ColbertDenseSpec, ...] = tuple(dense)
-        self._linear: List[mx.array] = []
-        self._linear_bias: List[Optional[mx.array]] = []
-        self._residual: List[Optional[mx.array]] = []
-        self._residual_bias: List[Optional[mx.array]] = []
+        self.dense: tuple[ColbertDenseSpec, ...] = tuple(dense)
+        self._linear: list[mx.array] = []
+        self._linear_bias: list[mx.array | None] = []
+        self._residual: list[mx.array | None] = []
+        self._residual_bias: list[mx.array | None] = []
         self._loaded = False
 
     @property
@@ -509,8 +540,8 @@ class ColbertProjection:
     def from_matrices(
         cls,
         dense: Sequence[ColbertDenseSpec],
-        linear: Sequence[Optional[mx.array]],
-        residual: Sequence[Optional[mx.array]],
+        linear: Sequence[mx.array | None],
+        residual: Sequence[mx.array | None],
     ) -> "ColbertProjection":
         """Build a projection from already-loaded ``[out, in]`` matrices."""
         projection = cls(dense)
