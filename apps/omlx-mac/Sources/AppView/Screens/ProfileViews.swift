@@ -372,7 +372,7 @@ struct ActiveProfileBanner: View {
                 .foregroundStyle(theme.textSecondary)
         case .defaults:
             Text(String(localized: "profile.banner.defaults.subtitle",
-                        defaultValue: "Using server defaults · edit any field to start a working profile",
+                        defaultValue: "Changes save to this model automatically",
                         comment: "Profile banner subtitle when no profile is assigned"))
                 .font(.omlxText(11.5))
                 .foregroundStyle(theme.textSecondary)
@@ -610,7 +610,7 @@ struct ProfileDetailCard: View {
                 }
                 if showUpdate, let onUpdateFromWorking {
                     Button(String(localized: "profile.detail.action.update_with_working",
-                                  defaultValue: "Update with working",
+                                  defaultValue: "Update with Current Settings",
                                   comment: "Profile detail card button that writes the current working edits into this named profile")) { onUpdateFromWorking() }
                         .buttonStyle(.omlx(.normal, size: .small))
                 }
@@ -995,11 +995,10 @@ struct ProfileDetailCard: View {
 
     private func dflashQuantLabel(_ s: [String: AnyCodable]) -> String {
         let w = intOf(s["dflash_draft_quant_weight_bits"]) ?? 4
-        let a = intOf(s["dflash_draft_quant_activation_bits"]) ?? 8
         let g = intOf(s["dflash_draft_quant_group_size"]) ?? 64
         return String(localized: "profile.detail.acceleration.dflash_quant",
-                      defaultValue: "Drafter quant · W\(w)/A\(a) G\(g)",
-                      comment: "DFlash drafter quantization chip; placeholders are weight bits, activation bits, group size")
+                      defaultValue: "Drafter quant · W\(w) G\(g)",
+                      comment: "DFlash drafter quantization chip; placeholders are weight bits, group size")
     }
 
     private func specprefillLabel(_ s: [String: AnyCodable], on: Bool) -> String {

@@ -559,10 +559,10 @@ def test_dspark_attention_kernel_matches_its_decode_path(head_dim, rows):
 
 @pytest.mark.parametrize("rows", [2, 3, 5, 6])
 def test_dspark_ring_gemm_matches_materialized_decode_rows(rows):
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.attention import fast
     from omlx.patches.deepseek_v4.verify_attention import rowwise_gemm
 
-    if not fast.has_symbol("dspark_ring_gemm"):
+    if not fast.has_symbol("ring_gemm"):
         pytest.skip("native DSpark physical-ring GEMM is unavailable")
 
     mx.random.seed(83 + rows)
@@ -578,11 +578,11 @@ def test_dspark_ring_gemm_matches_materialized_decode_rows(rows):
 
     queries = mx.random.normal((rows, 64, 512), dtype=mx.bfloat16)
     expected_scores = rowwise_gemm(queries, gathered, True)
-    actual_scores = fast.dspark_ring_gemm(queries, source, indices, True)
+    actual_scores = fast.ring_gemm(queries, source, indices, True)
 
     weights = mx.random.normal((rows, 64, 128), dtype=mx.bfloat16)
     expected_values = rowwise_gemm(weights, gathered, False)
-    actual_values = fast.dspark_ring_gemm(weights, source, indices, False)
+    actual_values = fast.ring_gemm(weights, source, indices, False)
     mx.eval(expected_scores, actual_scores, expected_values, actual_values)
 
     assert mx.array_equal(actual_scores, expected_scores).item()
@@ -591,9 +591,9 @@ def test_dspark_ring_gemm_matches_materialized_decode_rows(rows):
 
 @pytest.mark.parametrize("rows", [2, 3, 5])
 def test_dspark_ring_sparse_attention_matches_materialized_path(dsv4, rows):
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.attention import fast
 
-    if not fast.has_symbol("dspark_ring_gemm"):
+    if not fast.has_symbol("ring_gemm"):
         pytest.skip("native DSpark physical-ring GEMM is unavailable")
 
     mx.random.seed(109 + rows)

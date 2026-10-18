@@ -37,7 +37,7 @@ import re
 import struct
 import threading
 import time
-from collections import namedtuple
+from collections import Counter, namedtuple
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
@@ -50,6 +50,8 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
+from ..custom_kernels.moe_staging import EXPERTS, MAX_BYTES, Staging
+from ..custom_kernels.moe_staging import NATIVE_AVAILABLE as STAGING_AVAILABLE
 from ..scheduler import _sync_and_clear_cache
 
 logger = logging.getLogger(__name__)
@@ -112,6 +114,7 @@ class CheckpointExpertStore:
     """
 
     def __init__(self, model_path: str | Path):
+        self._staging = None
         self._specs: dict[str, tuple[Path, str, tuple[int, ...], int]] = {}
         self._fds: dict[Path, int] = {}
         model_path = Path(model_path)
@@ -244,26 +247,15 @@ class _GLUStoreView:
 
 
 # One reader pool for the whole process. A miss is IO, not compute: the
-# useful width is the storage queue depth, so the default is wider than the
-# core count. ``OMLX_MOE_OFFLOAD_IO_WORKERS`` <= 1 (or unparseable) keeps the
-# serial path and creates no threads at all;
-# ``OMLX_MOE_OFFLOAD_IO_BATCH`` caps how many experts' payloads may be in
-# flight, which is what bounds the extra host memory the pipeline holds.
+# useful width is the storage queue depth, so it is wider than the core
+# count. ``_IO_WORKERS`` <= 1 keeps the serial path and creates no threads.
+# At most 4 x workers experts' payloads are in flight, which is what bounds
+# the extra host memory the pipeline holds.
 _IO_WORKERS = 12
 _IO_LOCK = threading.Lock()
 _IO_POOL: ThreadPoolExecutor | None = None
 _IO_BATCH = 0
 _IO_CONFIGURED = False
-
-
-def _env_int(name: str, default: int, invalid: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return invalid
 
 
 def _io_pool() -> ThreadPoolExecutor | None:
@@ -272,12 +264,9 @@ def _io_pool() -> ThreadPoolExecutor | None:
     with _IO_LOCK:
         if not _IO_CONFIGURED:
             _IO_CONFIGURED = True
-            workers = _env_int("OMLX_MOE_OFFLOAD_IO_WORKERS", _IO_WORKERS, 0)
+            workers = _IO_WORKERS
             if workers > 1:
-                _IO_BATCH = max(
-                    1,
-                    _env_int("OMLX_MOE_OFFLOAD_IO_BATCH", 4 * workers, 4 * workers),
-                )
+                _IO_BATCH = 4 * workers
                 _IO_POOL = ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix="omlx-moe-io"
                 )
@@ -291,7 +280,7 @@ def _io_batch() -> int:
 
 
 def _shutdown_io_pool() -> None:
-    """Drop the pool; the next fetch re-reads the environment (tests)."""
+    """Drop the pool; the next fetch rebuilds it from ``_IO_WORKERS`` (tests)."""
     global _IO_POOL, _IO_BATCH, _IO_CONFIGURED
     with _IO_LOCK:
         pool, _IO_POOL, _IO_BATCH, _IO_CONFIGURED = _IO_POOL, None, 0, False
@@ -382,6 +371,7 @@ class ExpertCache:
         self.floor = min(max(floor, 1), self.full_capacity)
         self.projs = _PROJS
         self.disk = disk
+        self._staging = None
         self._slot_specs = {
             name: [
                 None if lin.get(f) is None else (lin[f].shape[1:], lin[f].dtype)
@@ -450,8 +440,9 @@ class ExpertCache:
 
     def _submit(self, pool, e: int) -> list:
         """Start reading expert ``e``; a task per tensor keeps its reads parallel."""
+        read = self._staging.read if self._staging else CheckpointExpertStore.read
         return [
-            (name, field, plan, pool.submit(CheckpointExpertStore.read, plan))
+            (name, field, plan, pool.submit(read, plan))
             for name, field, plan in self._plans(e)
         ]
 
@@ -473,17 +464,16 @@ class ExpertCache:
 
     def _write(self, slot: int, payload: list) -> None:
         """Copy one expert's fetched bytes into ``slot``."""
+        convert = self._staging.to_mx if self._staging else CheckpointExpertStore.to_mx
         for name, field, plan, raw in payload:
-            self.resident[name][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
+            self.resident[name][field][slot] = convert(plan, raw)
 
     def _install(
         self, e: int, payload: list | None = None, protected=frozenset()
     ) -> int:
         if payload is None:
-            payload = [
-                (n, f, pl, CheckpointExpertStore.read(pl))
-                for n, f, pl in self._plans(e)
-            ]
+            read = self._staging.read if self._staging else CheckpointExpertStore.read
+            payload = [(n, f, pl, read(pl)) for n, f, pl in self._plans(e)]
         slot = self._reserve(protected)
         try:
             self._write(slot, payload)
@@ -507,10 +497,15 @@ class ExpertCache:
             return
         self._ensure_ids(idx.reshape(-1).tolist())
 
+    def _bind_staging(self) -> None:
+        staging = self.disk._store._staging
+        self._staging = staging.for_owner() if staging is not None else None
+
     def _read_ahead(self, ids, limit: int) -> dict:
         """Start the first ``limit`` misses' reads without touching cache state.
 
         Pass the result to :meth:`_ensure_ids` as ``pending``."""
+        self._bind_staging()
         pool = _io_pool()
         out: dict[int, list] = {}
         if pool is None:
@@ -534,6 +529,7 @@ class ExpertCache:
         :meth:`OffloadSwitchGLU._forward_overlap`). Returns whether that
         happened. ``pending`` holds reads from :meth:`_read_ahead`.
         """
+        self._bind_staging()
         pending = dict(pending or {})
         needed = list(dict.fromkeys(int(e) for e in ids))
         if len(needed) > self.capacity:
@@ -675,9 +671,8 @@ class OffloadSwitchGLU(nn.Module):
         self.cache = ExpertCache(glu, capacity, disk, floor)
         self.activation = glu.activation
         # Fetch/compute overlap in decode: the GPU stays busy while slow
-        # reads of missing experts are pending. OMLX_MOE_OFFLOAD_OVERLAP=0
-        # keeps the serial order (read, then compute) for every step.
-        self._overlap = os.environ.get("OMLX_MOE_OFFLOAD_OVERLAP", "1") != "0"
+        # reads of missing experts are pending.
+        self._overlap = True
 
     def _glu(self, x: mx.array, slots: mx.array) -> mx.array:
         c = self.cache
@@ -1053,10 +1048,9 @@ def apply_moe_expert_offload(
 ) -> int:
     """Replace covered SwitchGLU instances with offloaded ones.
 
-    Returns the number of layers wrapped (0 when disabled via
-    ``OMLX_MOE_EXPERT_OFFLOAD=0``, the model has no stock SwitchGLU, or the
-    checkpoint does not cover them). Must run before lazy weights are
-    materialized for the memory saving to exist.
+    Returns the number of layers wrapped (0 when the model has no stock
+    SwitchGLU or the checkpoint does not cover them). Must run before lazy
+    weights are materialized for the memory saving to exist.
 
     ``mtp_resident`` keeps the embedded MTP draft head's experts resident
     (glm5_next Lightning MTP + offload; see
@@ -1064,8 +1058,6 @@ def apply_moe_expert_offload(
     ``mtp.*`` is skipped by the generic traversal below). Other families
     reject the combination at validation.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
-        return 0
     model_dir = _resolve_model_dir(model_path)
     if model_dir is None:
         return 0
@@ -1095,6 +1087,13 @@ def apply_moe_expert_offload(
         model, model_dir, resident_fraction, mtp_resident=mtp_resident
     )
     total_bytes = resident_bytes = 0
+    staging_sizes = {}
+    staging_requested = (
+        kind == "qwen4_exp"
+        and not mtp_resident
+        and resident_fraction < 1
+        and STAGING_AVAILABLE
+    )
     for parent, key, glu, path in list(_iter_switch_glus(model)):
         if mtp_resident and _is_mtp_path(path):
             # Lightning MTP drafts from this head every step; streaming its
@@ -1123,6 +1122,11 @@ def apply_moe_expert_offload(
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
         new = OffloadSwitchGLU(glu, capacity, view, minimum)
+        if staging_requested:
+            for size, count in Counter(
+                p.nbytes for _, _, p in new.cache._plans(0)
+            ).items():
+                staging_sizes[size] = max(staging_sizes.get(size, 0), count)
         if isinstance(parent, nn.Module):
             setattr(parent, key, new)  # registers via Module.__setattr__
         else:
@@ -1132,6 +1136,18 @@ def apply_moe_expert_offload(
         # to total RAM, so drain per layer to bound the load transient
         # (same reasoning as the gate/up fusion patch, #2304).
         _sync_and_clear_cache()
+
+    if staging_sizes:
+        sizes = [
+            size
+            for size, count in sorted(staging_sizes.items())
+            for _ in range(count * EXPERTS)
+        ]
+        # MLX allocations round up to pages, so bound actual reserved memory.
+        if sum((size + 16383) // 16384 * 16384 for size in sizes) <= MAX_BYTES:
+            store._staging = Staging(sizes, store.read, store.to_mx)
+        else:
+            logger.warning("moe offload staging layout exceeds 128 MiB; using bytes")
 
     if total_bytes:
         logger.info(
@@ -1166,8 +1182,6 @@ def estimate_offload_admission_bytes(
     do not under-report the resident share. Falls back to ``full_size`` on
     any failure — admission must never get more permissive by accident.
     """
-    if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
-        return full_size
     try:
         model_dir = _resolve_model_dir(model_path)
         if model_dir is None:

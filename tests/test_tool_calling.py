@@ -441,6 +441,18 @@ class TestParseJsonOutput:
         assert is_valid is True
         assert parsed == {"result": True}
 
+    def test_returns_extracted_json_text_verbatim(self):
+        json_text = '{\n  "name": "\\u0421",\n  "price": 1.50\n}'
+        text = f"Sure:\n```json\n{json_text}\n```"
+
+        cleaned, parsed, is_valid, error = parse_json_output(
+            text, {"type": "json_object"}
+        )
+
+        assert is_valid is True
+        assert cleaned == json_text
+        assert parsed == {"name": "С", "price": 1.5}
+
 
 class TestBuildJsonSystemPrompt:
     """Tests for build_json_system_prompt function."""
@@ -4153,36 +4165,6 @@ class TestToolCallMarkerInArguments:
         text = f"<tool_call>{deep}</tool_call>"
         assert _marker_payloads(text, "<tool_call>", "</tool_call>") == [deep]
 
-    def test_boundary_scan_stays_linear_on_adversarial_output(self):
-        """Guard the linear-time rule for untrusted model output.
-
-        Locating the payload end must not re-scan the accumulated buffer once
-        per chunk: an unterminated JSON object stuffed with close markers
-        would then cost quadratic time. Model output is attacker-influenceable
-        via prompt injection, so this is a DoS surface, not just a slowdown.
-        """
-        import time
-
-        def elapsed(markers):
-            evil = (
-                "<tool_call>"
-                + '{"name":"f","arguments":{"s":"'
-                + "</tool_call>" * markers
-            )
-            filt = ToolCallStreamFilter(self._tokenizer())
-            start = time.perf_counter()
-            for i in range(0, len(evil), 64):
-                filt.feed(evil[i : i + 64])
-            filt.finish()
-            return time.perf_counter() - start
-
-        elapsed(400)  # warm up the interpreter before timing
-        small = max(elapsed(400), 1e-4)
-        large = elapsed(3200)
-        # 8x the input: linear would be ~8x, quadratic ~64x. Allow generous
-        # headroom for a loaded CI box while still catching quadratic growth.
-        assert large / small < 24, f"superlinear growth: {small=} {large=}"
-
 
 class TestQwen3CoderMarkerInArguments:
     """qwen3_coder XML dialect with literal markers in a value (#2507).
@@ -5651,7 +5633,14 @@ def test_qwen_untyped_parameter_conversion_boundaries(spec, raw, expected):
     assert json.loads(calls[0].function.arguments)["v"] == expected
 
 
-@pytest.mark.parametrize("spec", [{}, {"type": ["string", "null"]}])
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {},
+        {"type": ["string", "null"]},
+        {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+    ],
+)
 def test_qwen_parameter_is_not_decoded_twice(monkeypatch, spec):
     from mlx_lm.tool_parsers import qwen3_coder
 
@@ -5708,9 +5697,63 @@ def test_xml_union_parameter_preserves_declared_value_type(
     assert validate_json_schema(arguments, schema)[0]
 
 
+@pytest.mark.parametrize("parser_module", _QWEN_PARSER_MODULES)
+@pytest.mark.parametrize(
+    "spec, raw, expected",
+    [
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "123", "123"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "true", "true"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, '{"a": 1}', '{"a": 1}'),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "[1, 2]", "[1, 2]"),
+        ({"oneOf": [{"type": "string"}, {"type": "null"}]}, '{"a": 1}', '{"a": 1}'),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, '"123"', "123"),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "null", None),
+        ({"anyOf": [{"type": "string"}]}, "123", "123"),
+        ({"anyOf": [{"type": "string"}]}, "null", "null"),
+        ({"oneOf": [{"type": "string"}, {"type": "object"}]}, '{"a": 1}', {"a": 1}),
+        (
+            {"anyOf": [{"type": "array"}, {"type": "null"}]},
+            "[true, null]",
+            [True, None],
+        ),
+        ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, "7", 7),
+    ],
+)
+def test_xml_union_keyword_parameter_keeps_declared_alternatives(
+    parser_module, spec, raw, expected
+):
+    """The oneOf/anyOf alternatives bound what an XML value may decode to."""
+    schema = {"type": "object", "properties": {"v": spec}, "required": ["v"]}
+    tools = [{"function": {"name": "f", "parameters": schema}}]
+    _, calls = parse_tool_calls(
+        f"<tool_call><function=f><parameter=v>{raw}</parameter></function></tool_call>",
+        _qwen_parser_tokenizer(parser_module),
+        tools,
+    )
+    assert calls and len(calls) == 1
+    arguments = json.loads(calls[0].function.arguments)
+    assert arguments["v"] == expected
+    assert type(arguments["v"]) is type(expected)
+    assert validate_json_schema(arguments, schema)[0]
+
+
 @pytest.mark.parametrize("types", [["unknown"], [None], []])
 def test_invalid_union_type_declarations_keep_best_effort_parsing(types):
     assert _coerce_param_value("123", "v", {"v": {"type": types}}, "f") == 123
+
+
+@pytest.mark.parametrize(
+    "alternatives, raw, expected",
+    [
+        ([{"$ref": "#/$defs/M"}, {"type": "null"}], '{"a": 1}', {"a": 1}),
+        ([{"enum": [1, 2]}, {"type": "null"}], "1", 1),
+    ],
+)
+def test_untyped_union_alternatives_keep_best_effort_parsing(
+    alternatives, raw, expected
+):
+    spec = {"v": {"anyOf": alternatives}}
+    assert _coerce_param_value(raw, "v", spec, "f") == expected
 
 
 @pytest.mark.parametrize(

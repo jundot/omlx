@@ -37,7 +37,6 @@ SAFETENSORS_NUMPY_DTYPES = {
     "F8_E8M0FNU": "u1",
 }
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
-PAGE_PREFETCH_MIN_ROWS = 128
 PAGE_IO_WORKERS = 48
 _PAGE_IO_POOL = ThreadPoolExecutor(
     max_workers=PAGE_IO_WORKERS, thread_name_prefix="v41-page-io"
@@ -142,7 +141,7 @@ class TensorFile:
                 gather_start = None
                 row_bytes = (end - start) // view.shape[0] if view.shape[0] else 0
                 if (
-                    rows.size > PAGE_PREFETCH_MIN_ROWS
+                    rows.size
                     and 0 < row_bytes <= PAGE_SIZE
                     and self._prefetch_pages(rows, self._start + start, row_bytes)
                 ):

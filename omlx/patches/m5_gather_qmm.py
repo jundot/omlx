@@ -22,8 +22,7 @@ The wrapper self-arms: the first matching call runs a tiny canary whose last
 expert is followed by NaN in the same buffer, against an fp32 dequantized
 reference, and only intervenes when the defect is present on this
 machine/mlx build. Healthy setups keep the fast path untouched, and the patch
-retires itself once mlx ships a kernel fix. Kill switch:
-``OMLX_M5_GATHER_QMM_FIX=0``.
+retires itself once mlx ships a kernel fix.
 
 On NAX hosts every supported sorted call (``transpose=True`` rhs gather
 of ``[M, 1, K]`` rows, bf16/fp16 activations, affine 4/8-bit or MXFP4
@@ -33,7 +32,6 @@ scheduling (one expert per 64- to 128-row tile) on the tensor units,
 correct for any K and row count in one dispatch, bit-identical to mlx's
 sorted kernel wherever that kernel is correct. Each kernel instantiation self-tests
 once; anything unsupported or failing keeps the stock handling above.
-``OMLX_M5_GATHER_QMM_NAX=0`` disables only this route.
 
 ``fused_gate_up_activation`` lets a SwitchGLU forward whose fused ``[gate;
 up]`` sorted projection would take that route run its SwiGLU in the NAX
@@ -46,7 +44,6 @@ that kernel reads each routed token's row in place instead of from the
 from __future__ import annotations
 
 import logging
-import os
 
 import mlx.core as mx
 
@@ -200,7 +197,7 @@ def _nax_sorted_gather_qmm(x, w, args, kwargs):
 
 
 def _gather_qmm_rerouted(x, w, *args, **kwargs):
-    if kwargs.get("sorted_indices") and _nax.enabled() and _on_nax_host():
+    if kwargs.get("sorted_indices") and _on_nax_host():
         out = _nax_sorted_gather_qmm(x, w, args, kwargs)
         if out is not None:
             return out
@@ -269,7 +266,7 @@ def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
         return None
     if not getattr(mx.gather_qmm, "_omlx_m5_reroute", False):
         return None
-    if not (_nax.enabled() and _on_nax_host()):
+    if not _on_nax_host():
         return None
     if "bias" in proj or not all(hasattr(proj, a) for a in ("group_size", "bits")):
         return None
@@ -304,11 +301,9 @@ def apply_m5_gather_qmm_workaround() -> bool:
     """Install the reroute wrapper on ``mx.gather_qmm``.
 
     Idempotent; returns True when the wrapper was installed by this
-    call. Disabled entirely via ``OMLX_M5_GATHER_QMM_FIX=0``.
+    call.
     """
     global _original_gather_qmm
-    if os.environ.get("OMLX_M5_GATHER_QMM_FIX", "1") == "0":
-        return False
     if getattr(mx.gather_qmm, "_omlx_m5_reroute", False):
         return False
     _original_gather_qmm = mx.gather_qmm

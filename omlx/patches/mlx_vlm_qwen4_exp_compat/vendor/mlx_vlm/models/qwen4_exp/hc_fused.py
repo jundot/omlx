@@ -19,11 +19,8 @@ Each kernel specialization is evaluated once to catch lazy compilation errors.
 A failure falls back for the current call only; the NAX prefill projections
 instead fall back to MLX for the process after a failure or a bitwise
 mismatch on first use. Later evaluation errors propagate.
-Disable with OMLX_QWEN4_HC_FUSED=0. OMLX_QWEN4_HC_FUSED_WRITE=0 keeps the
-decode residual writes eager and stops deferring each layer's tail write into
-the next hyper-connection norm. OMLX_QWEN4_HC_DECODE_V2=0 restores the
-three-launch decode kernels (norm, down/inject, up/mix) in place of the
-two-launch ones; both produce the same bits.
+Where the geometry allows, small decode batches take two launches in place of
+the three-launch kernels (norm, down/inject, up/mix); both produce the same bits.
 """
 
 from __future__ import annotations
@@ -36,7 +33,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from . import hc_prefill_nax
-from .hc_projection import _HEADER, env_enabled
+from .hc_projection import _HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -45,14 +42,15 @@ MAX_ROWS = 16
 # traversal is the same for every group size, only the scale/bias index moves.
 _GROUP_SIZES = (32, 64)
 _SUPPORTED_BITS = (4, 5, 6, 8)
-_DISABLED = not env_enabled("OMLX_QWEN4_HC_FUSED")
-_WRITE_DISABLED = not env_enabled("OMLX_QWEN4_HC_FUSED_WRITE")
+# Tests flip the flags below to reach the reference paths.
+_DISABLED = False
+_WRITE_DISABLED = False
 # Prefill rows on the tensor units (hc_prefill_nax): three dispatches instead of
-# six, bit-identical. Disable with OMLX_QWEN4_HC_NAX_PREFILL=0.
-_NAX_DISABLED = not env_enabled("OMLX_QWEN4_HC_NAX_PREFILL")
+# six, bit-identical.
+_NAX_DISABLED = False
 _NAX_AVAILABLE: bool | None = None
 _NAX_BROKEN = False
-_DECODE_V2 = env_enabled("OMLX_QWEN4_HC_DECODE_V2")
+_DECODE_V2 = True
 _KERNELS: dict[str, object] = {}
 _VALIDATED: set[tuple] = set()
 _FAILURE_LOGGED = False
@@ -587,7 +585,7 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
     float sum = 0.0f;
     if (bits == 4) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 16.0f;
             xt[i + 2] = x[i + 2] / 256.0f;
@@ -595,8 +593,8 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
         }
     } else if (bits == 5) {
         for (int i = 0; i < N; i += 8) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3]
-                + x[i + 4] + x[i + 5] + x[i + 6] + x[i + 7];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3])
+                + float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 32.0f;
             xt[i + 2] = x[i + 2] / 4.0f;
@@ -608,7 +606,7 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
         }
     } else if (bits == 6) {
         for (int i = 0; i < N; i += 4) {
-            sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
             xt[i] = x[i];
             xt[i + 1] = x[i + 1] / 64.0f;
             xt[i + 2] = x[i + 2] / 16.0f;

@@ -109,8 +109,9 @@ def describe_ceiling_binding(
     elif "dynamic" in binding and static and static > dynamic:
         headroom = max(0, dynamic - hot_cache - current)
         remedies.append(
-            f"close other apps to free RAM (static cap is {fmt(static)} but "
-            f"only {fmt(headroom)} is reclaimable right now)"
+            f"close other apps to free RAM (macOS and other apps leave oMLX "
+            f"{fmt(dynamic)} of the {fmt(static)} static cap, and oMLX already "
+            f"uses all but {fmt(headroom)} of it)"
         )
         remedies.append(f"raise memory_guard_tier ({MEMORY_GUARD_TIER_LADDER})")
     elif "metal_cap" in binding:

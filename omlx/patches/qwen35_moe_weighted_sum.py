@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import os
 from collections.abc import Callable
 from typing import Any
 
@@ -25,16 +24,18 @@ from .moe_routes import sort_routes
 logger = logging.getLogger(__name__)
 
 _PATCHED = False
+# Shorter prefill chunks keep the stock body.
+_MIN_TOKENS = 1024
 
 
 def _native_weighted_sum():
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
     except Exception:
         return None
-    if not fast.has_symbol("qwen35_moe_weighted_sum"):
+    if not fast.has_symbol("moe_weighted_sum"):
         return None
-    return fast.qwen35_moe_weighted_sum
+    return fast.moe_weighted_sum
 
 
 def _target_verify_arg(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
@@ -46,14 +47,12 @@ def _target_verify_arg(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
 def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) -> bool:
     # Shape gates first: this runs on every MoE block call of every decode
     # step, so the common (decode) case must exit on the seq-len check
-    # before touching env vars or Metal state (issue #2132).
+    # before touching Metal state (issue #2132).
     if x.ndim != 3 or x.shape[-2] < min_tokens:
         return False
     if target_verify:
         return False
     if x.dtype not in (mx.float16, mx.bfloat16):
-        return False
-    if os.environ.get("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1") == "0":
         return False
     if not mx.metal.is_available():
         return False
@@ -144,7 +143,7 @@ def _call_shared_expert(self: Any, x: mx.array, target_verify: bool) -> mx.array
 def _fast_moe(self: Any, x: mx.array, target_verify: bool) -> mx.array:
     weighted_sum = _native_weighted_sum()
     if weighted_sum is None:
-        raise RuntimeError("qwen35_moe_weighted_sum native kernel is unavailable")
+        raise RuntimeError("moe_weighted_sum native kernel is unavailable")
 
     gates = self.gate(x)
     gates = mx.softmax(gates, axis=-1, precise=True)
@@ -203,15 +202,11 @@ def apply_qwen35_moe_weighted_sum_patch() -> bool:
     global _PATCHED
     if _PATCHED:
         return True
-    if os.environ.get("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1") == "0":
-        return False
     if _native_weighted_sum() is None:
         logger.debug("Qwen MoE weighted-sum native kernel unavailable; patch skipped")
         return False
 
-    min_tokens = int(
-        os.environ.get("OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS", "1024")
-    )
+    min_tokens = _MIN_TOKENS
     patched = False
     patched |= _patch_class(
         "mlx_vlm.models.qwen3_5_moe.language",

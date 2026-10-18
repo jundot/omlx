@@ -212,6 +212,65 @@ def pipeline_prefill_schedule(
 
 
 @contextmanager
+def wait_for_pipeline_peers_on_host(model: Any) -> Iterator[None]:
+    """Wait for pipeline peers on the CPU during prefill and the steps after it.
+
+    A GPU op that reads a ring/JACCL transfer waits inside its Metal command
+    buffer, and Metal fails the buffer after ~5 s including that wait. A peer's
+    long prefill chunk outlasts it.
+    """
+
+    import mlx.core as mx
+
+    pipeline_model = getattr(model, "model", None)
+    if getattr(pipeline_model, "pipeline_size", 1) < 2:
+        yield
+        return
+
+    call = type(pipeline_model).__call__
+    state = threading.local()
+    transfers = {
+        name: getattr(mx.distributed, name)
+        for name in ("send", "recv", "recv_like", "all_gather")
+    }
+
+    def host_waited(name: str, transfer: Any) -> Any:
+        def wait(*args: Any, **kwargs: Any) -> Any:
+            value = transfer(*args, **kwargs)
+            mode = getattr(state, "mode", None)
+            # Prefill never evaluates the final gather.
+            if mode == "decode" or (mode == "prefill" and name != "all_gather"):
+                mx.eval(value)
+            return value
+
+        return wait
+
+    def tracked_call(instance: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
+        steps = getattr(state, "steps", 0)
+        if getattr(inputs, "ndim", 0) > 1 and inputs.shape[1] > 1:
+            # Two decode steps, plus a one-token prompt remainder that looks
+            # like decode.
+            state.mode, state.steps = "prefill", 3
+        elif steps:
+            state.mode, state.steps = "decode", steps - 1
+            mx.eval(inputs)
+        try:
+            return call(instance, inputs, *args, **kwargs)
+        finally:
+            state.mode = None
+
+    for name, transfer in transfers.items():
+        setattr(mx.distributed, name, host_waited(name, transfer))
+    type(pipeline_model).__call__ = tracked_call
+    try:
+        yield
+    finally:
+        type(pipeline_model).__call__ = call
+        for name, transfer in transfers.items():
+            setattr(mx.distributed, name, transfer)
+
+
+@contextmanager
 def install_runtime_optimizations(
     model: Any,
     group: Any,

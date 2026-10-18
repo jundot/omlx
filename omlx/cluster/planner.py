@@ -872,7 +872,7 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
                 )
                 denominator = num_layers * index_pool
                 return (numerator + denominator - 1) // denominator
-        return (kv_lora_rank + rope_dim) * dtype_size
+        return _hybrid_kv_average((kv_lora_rank + rope_dim) * dtype_size, config)
 
     heads = _config_int(config, "num_attention_heads", 0)
     kv_heads = _config_int(config, "num_key_value_heads", heads)
@@ -884,22 +884,41 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
         return 0
     if kv_heads <= 0 or head_dim <= 0:
         return 0
-    per_layer = kv_heads * head_dim * 2 * dtype_size
-    # Hybrid linear-attention models (Qwen3.5/3.6/3.8 dense: 3 gated-delta-net
-    # layers per full-attention layer) keep a constant-size state in the linear
-    # layers; only the full-attention layers grow a KV cache. ModelLayout stores
-    # one integral average per layer, rounded up to stay conservative.
+    return _hybrid_kv_average(kv_heads * head_dim * 2 * dtype_size, config)
+
+
+def _hybrid_kv_average(per_layer: int, config: dict[str, Any]) -> int:
+    """Average per-layer KV bytes when only the attention layers grow a cache.
+
+    Hybrid checkpoints often omit ``layer_types``; the fallbacks mirror MLX-LM.
+    """
+
     text_config = config.get("text_config")
     layer_config = text_config if isinstance(text_config, dict) else config
     layer_types = layer_config.get("layer_types")
+    linear = layer_config.get("linear_attn_config")
+    kda = linear.get("kda_layers") if isinstance(linear, dict) else None
+    total = _config_int(config, "num_hidden_layers", 0)
+    interval = _config_int(config, "full_attention_interval", 0)
+    group = _config_int(config, "layer_group_size", 0)
     if (
         isinstance(layer_types, list)
         and layer_types
         and all(isinstance(t, str) for t in layer_types)
     ):
+        total = len(layer_types)
         full = sum(t != "linear_attention" for t in layer_types)
-        if 0 < full < len(layer_types):
-            return (per_layer * full + len(layer_types) - 1) // len(layer_types)
+    elif isinstance(kda, list):
+        full = total - len(kda)
+    elif interval > 1:
+        full = total // interval
+    elif group > 1 and str(config.get("model_type", "")).startswith("bailing"):
+        # Attention closes each group and fills the leftover tail.
+        full = total // group + total % group
+    else:
+        return per_layer
+    if 0 < full < total:
+        return (per_layer * full + total - 1) // total
     return per_layer
 
 

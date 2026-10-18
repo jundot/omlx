@@ -7,9 +7,9 @@ from typing import Optional
 import mlx.core as mx
 
 try:
-    from omlx.custom_kernels.minimax_m3 import fast as _minimax_fast
+    from omlx.custom_kernels.sparse_index import fast as _index_fast
 except Exception:  # pragma: no cover - optional native extension
-    _minimax_fast = mx.fast
+    _index_fast = mx.fast
 
 
 _NATIVE_TOPK_SELECT_MODE = os.environ.get(
@@ -21,10 +21,10 @@ _NATIVE_MSA_TOPK_MODE = os.environ.get(
 
 
 def _has_minimax_fast_symbol(name: str) -> bool:
-    has_symbol = getattr(_minimax_fast, "has_symbol", None)
+    has_symbol = getattr(_index_fast, "has_symbol", None)
     if callable(has_symbol):
         return bool(has_symbol(name))
-    return hasattr(_minimax_fast, name)
+    return hasattr(_index_fast, name)
 
 
 def _load_mlx_steel_attn_header() -> Optional[str]:
@@ -476,7 +476,7 @@ def _build_grouped_msa_topk_native(
     force_fallback = _NATIVE_MSA_TOPK_MODE in {"0", "false", "no", "off"}
     if force_fallback:
         return None
-    if not _has_minimax_fast_symbol("minimax_msa_topk"):
+    if not _has_minimax_fast_symbol("msa_block_topk"):
         return None
     if not mx.metal.is_available():
         return None
@@ -492,7 +492,7 @@ def _build_grouped_msa_topk_native(
         return None
 
     try:
-        return _minimax_fast.minimax_msa_topk(
+        return _index_fast.msa_block_topk(
             idx_queries,
             idx_keys,
             q_start=int(q_start),

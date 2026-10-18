@@ -24,12 +24,9 @@ whose details change every few lines).
 
 from __future__ import annotations
 
-import os
 from typing import Dict, List, Sequence
 
 import numpy as np
-
-ENABLED = os.environ.get("OMLX_MTP_CONTEXT_COPY", "1").strip() != "0"
 
 # One verify window carries the pending token plus the drafts. Qwen4-Exp's
 # row-exact verify kernels (MoE routed window, router, row-exact qmv, fused

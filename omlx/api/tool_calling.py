@@ -315,6 +315,21 @@ def _matches_union_type(value: Any, types: list) -> bool | None:
         return None
 
 
+def _union_keyword_types(spec: dict) -> list[str] | None:
+    alts = [
+        alt
+        for group in (spec.get("oneOf"), spec.get("anyOf"))
+        if isinstance(group, list)
+        for alt in group
+    ]
+    # A $ref/enum/const alternative has no type to bound the value.
+    if alts and all(
+        isinstance(alt, dict) and isinstance(alt.get("type"), str) for alt in alts
+    ):
+        return [alt["type"] for alt in alts]
+    return None
+
+
 def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     """Convert an XML-extracted parameter value per its declared schema type.
 
@@ -330,11 +345,13 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             decoded = json.loads(val)
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return val
+        if not isinstance(raw_type, list) and isinstance(spec, dict):
+            raw_type = _union_keyword_types(spec)
         if isinstance(raw_type, list):
             # Plain 123 remains a string for ["string", "null"].
             matches = _matches_union_type(decoded, raw_type)
             return val if matches is False else decoded
-        # Undeclared params and oneOf/anyOf retain best-effort JSON parsing.
+        # Undeclared params and untyped unions keep best-effort JSON parsing.
         return decoded
     if val.strip().lower() == "null":
         return None
@@ -2040,10 +2057,14 @@ def _parse_tool_calls_impl(
                                 if not isinstance(spec, dict):
                                     continue
                                 value = arguments.get(key)
+                                raw_type = (
+                                    spec["type"]
+                                    if "type" in spec
+                                    else _union_keyword_types(spec)
+                                )
                                 union_mismatch = (
-                                    isinstance(spec.get("type"), list)
-                                    and _matches_union_type(value, spec["type"])
-                                    is False
+                                    isinstance(raw_type, list)
+                                    and _matches_union_type(value, raw_type) is False
                                 )
                                 untyped_string = "type" not in spec and isinstance(
                                     value, str
@@ -3754,22 +3775,30 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     """
     Extract JSON from model output text.
 
-    Tries multiple strategies:
-    1. Parse entire text as JSON
-    2. Extract JSON from markdown code blocks
-    3. Find JSON object/array in text
-
     Args:
         text: Raw model output text
 
     Returns:
         Parsed JSON data, or None if no valid JSON found
     """
+    extracted = _extract_json_span(text)
+    return extracted[0] if extracted is not None else None
+
+
+def _extract_json_span(text: str) -> Optional[Tuple[Any, str]]:
+    """
+    Extract JSON from model output text, with the exact text it was parsed from.
+
+    Tries multiple strategies:
+    1. Parse entire text as JSON
+    2. Extract JSON from markdown code blocks
+    3. Find JSON object/array in text
+    """
     text = text.strip()
 
     # Strategy 1: Try to parse entire text as JSON
     try:
-        return json.loads(text)
+        return json.loads(text), text
     except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
         pass
 
@@ -3778,8 +3807,9 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
     code_block_pattern = r"```(?:json)?\s*([\s\S]*?)\s*```"
     matches = re.findall(code_block_pattern, text)
     for match in matches:
+        candidate = match.strip()
         try:
-            return json.loads(match.strip())
+            return json.loads(candidate), candidate
         except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
             continue
 
@@ -3793,7 +3823,7 @@ def extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
         match = re.search(pattern, text)
         if match:
             try:
-                return json.loads(match.group(1))
+                return json.loads(match.group(1)), match.group(1)
             except (json.JSONDecodeError, *_DEEP_NEST_ERRORS):
                 continue
 
@@ -3814,7 +3844,8 @@ def parse_json_output(
 
     Returns:
         Tuple of (cleaned_text, parsed_json, is_valid, error_message)
-        - cleaned_text: Original text (preserved for reference)
+        - cleaned_text: Exact JSON text extracted from the output, or the
+          original text if extraction failed
         - parsed_json: Extracted JSON data, or None if extraction failed
         - is_valid: True if JSON is valid (and matches schema if specified)
         - error_message: Error description if invalid, None if valid
@@ -3843,10 +3874,12 @@ def parse_json_output(
         return text, None, True, None
 
     # json_object or json_schema - extract JSON
-    parsed = extract_json_from_text(text)
-
-    if parsed is None:
+    extracted = _extract_json_span(text)
+    if extracted is None or extracted[0] is None:
         return text, None, False, "Failed to extract valid JSON from output"
+    # Return the model's own JSON text. Re-serializing it would change
+    # formatting and escapes.
+    parsed, text = extracted
 
     # json_object - just verify it's valid JSON (already done by extraction)
     if format_type == "json_object":

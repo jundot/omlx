@@ -91,18 +91,10 @@ struct ModelSettingsSnapshot: Equatable {
     var dflashDraftModel: String
     var dflashDraftQuantEnabled: Bool
     var dflashDraftQuantWeightBits: String
-    var dflashDraftQuantActivationBits: String
     var dflashDraftQuantGroupSize: String
-    var dflashMaxCtx: String
     var dflashBlockSize: String
     var dflashVerifyMode: String
     var dflashDraftWindowSize: String
-    var dflashDraftSinkSize: String
-    var dflashInMemoryCache: Bool
-    var dflashInMemoryCacheGib: String
-    var dflashInMemoryCacheMaxEntries: String
-    var dflashSsdCache: Bool
-    var dflashSsdCacheGib: String
     var mtpEnabled: Bool
 }
 
@@ -136,6 +128,8 @@ enum ProfileSettingsKey {
     static let isPinned = "is_pinned"
     static let chatTemplateKwargs = "chat_template_kwargs"
     static let forcedCtKwargs = "forced_ct_kwargs"
+    static let guidedGrammarEnabled = "guided_grammar_enabled"
+    static let guidedGrammar = "guided_grammar"
 
     /// Keys a global template keeps (`UNIVERSAL_PROFILE_FIELDS`). The server
     /// drops every other key from template settings.
@@ -144,6 +138,7 @@ enum ProfileSettingsKey {
         repetitionPenalty, presencePenalty, enableThinking,
         thinkingBudgetEnabled, thinkingBudgetTokens, reasoningParser,
         maxToolResultTokens, forceSampling, chatTemplateKwargs, forcedCtKwargs,
+        guidedGrammarEnabled, guidedGrammar,
     ]
 
     // Model-specific
@@ -154,6 +149,8 @@ enum ProfileSettingsKey {
     static let qwen35AnePrefillSharedFraction = "qwen35_ane_prefill_shared_fraction"
     static let qwen35OqA8Enabled = "qwen35_oq_a8_enabled"
     static let qwen35OqA8MinTokens = "qwen35_oq_a8_min_tokens"
+    static let moeExpertOffloadEnabled = "moe_expert_offload_enabled"
+    static let moeExpertOffloadResidentFraction = "moe_expert_offload_resident_fraction"
     static let qwen35AnePrefillEnabled = "qwen35_ane_prefill_enabled"
     static let qwen35AnePrefillSequenceLength = "qwen35_ane_prefill_sequence_length"
     static let qwen35AnePrefillTailPaddingMinTokens = "qwen35_ane_prefill_tail_padding_min_tokens"
@@ -179,18 +176,10 @@ enum ProfileSettingsKey {
     static let dflashDraftModel = "dflash_draft_model"
     static let dflashDraftQuantEnabled = "dflash_draft_quant_enabled"
     static let dflashDraftQuantWeightBits = "dflash_draft_quant_weight_bits"
-    static let dflashDraftQuantActivationBits = "dflash_draft_quant_activation_bits"
     static let dflashDraftQuantGroupSize = "dflash_draft_quant_group_size"
-    static let dflashMaxCtx = "dflash_max_ctx"
     static let dflashVerifyMode = "dflash_verify_mode"
     static let dflashDraftWindowSize = "dflash_draft_window_size"
-    static let dflashDraftSinkSize = "dflash_draft_sink_size"
     static let dflashBlockSize = "dflash_block_size"
-    static let dflashInMemoryCache = "dflash_in_memory_cache"
-    static let dflashInMemoryCacheMaxBytes = "dflash_in_memory_cache_max_bytes"
-    static let dflashInMemoryCacheMaxEntries = "dflash_in_memory_cache_max_entries"
-    static let dflashSsdCache = "dflash_ssd_cache"
-    static let dflashSsdCacheMaxBytes = "dflash_ssd_cache_max_bytes"
     static let mtpEnabled = "mtp_enabled"
     static let mtpAdaptiveMaxDepth = "mtp_adaptive_max_depth"
     static let vlmMtpEnabled = "vlm_mtp_enabled"

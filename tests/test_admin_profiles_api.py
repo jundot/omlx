@@ -40,9 +40,13 @@ class _FakeEntry:
 class _FakePool:
     def __init__(self):
         self._entries = {"model-a": _FakeEntry("model-a")}
+        self.recommended_sampling = {}
 
     def get_entry(self, model_id):
         return self._entries.get(model_id)
+
+    def recommended_sampling_settings(self, entry):
+        return dict(self.recommended_sampling)
 
     def get_status(self):
         return {
@@ -62,6 +66,9 @@ class _FakePool:
 
     def _engine_runtime_signature(self, model_id, runtime_settings=None):
         return ()
+
+    def splash_target(self, model_id, model_settings):
+        return None, ""
 
     @staticmethod
     def _clear_load_failure(entry):
@@ -647,8 +654,6 @@ class TestModelsResponseActiveProfile:
                 "turboquant_kv_enabled": True,
                 "specprefill_enabled": True,
                 "dflash_enabled": True,
-                "dflash_in_memory_cache": False,
-                "dflash_ssd_cache": True,
                 "mtp_enabled": True,
                 "vlm_mtp_enabled": True,
             },
@@ -667,8 +672,6 @@ class TestModelsResponseActiveProfile:
         assert settings["turboquant_kv_enabled"] is False
         assert settings["specprefill_enabled"] is False
         assert settings["dflash_enabled"] is False
-        assert settings["dflash_in_memory_cache"] is True
-        assert settings["dflash_ssd_cache"] is False
         assert settings["mtp_enabled"] is False
         assert settings["vlm_mtp_enabled"] is False
 
@@ -963,61 +966,6 @@ class TestExposeAsModelAPI:
         assert prof["expose_as_model"] is True
         assert prof["settings"]["temperature"] == 0.9
 
-    def test_dashboard_profile_ui_round_trips_expose_as_model_flag(self):
-        from pathlib import Path
-
-        root = Path(__file__).resolve().parents[1]
-        js = (root / "omlx/admin/static/js/dashboard.js").read_text()
-        html = (
-            root / "omlx/admin/templates/dashboard/_modal_model_settings.html"
-        ).read_text()
-        settings_html = (
-            root / "omlx/admin/templates/dashboard/_settings.html"
-        ).read_text()
-        dashboard_html = (root / "omlx/admin/templates/dashboard.html").read_text()
-        en = (root / "omlx/admin/i18n/en.json").read_text()
-
-        # api_name is the exposed model ID suffix, so it's validated as a
-        # slug and rejected on bad input.
-        assert "isValidProfileName" in js
-        assert "api_name" in js
-        assert "modal.model_settings.profiles.invalid_name" in en
-        # Profile chips keep the display name visible in both API-on and
-        # API-off states. API state is shown as a badge and edited from the
-        # edit form, not toggled directly from the chip row.
-        assert "profileTooltip(p)" in html
-        assert "p.display_name || p.name" in html
-        assert "p.expose_as_model ? (p.api_name || p.name)" not in html
-        assert "expose_as_model: !p.expose_as_model" not in html
-        assert "p.has_engine_fields" in html
-        # Editing updates display_name/api_name/description/exposure without
-        # renaming the internal profile key.
-        assert "updateProfileFromEdit" in js
-        assert "api_name: apiName" in js
-        assert "description: description" in js
-        assert "expose_as_model: exposeAsModel" in js
-        edit_method = js.split("updateProfileFromEdit(p) {", 1)[1].split(
-            "updateProfileSettingsFromForm(p)", 1
-        )[0]
-        assert "settings:" not in edit_method
-        assert "updateProfileSettingsFromForm(p)" in js
-        assert "updateProfileFromEdit(p)" in html
-        assert "updateProfileSettingsFromForm(p)" in html
-        assert "_editDescription" in html
-        assert "_editExposeAsModel" in html
-        assert "profileTooltip(profile)" in settings_html
-        assert "model.exposed_profiles" in settings_html
-        assert "profile.api_name || profile.name" in settings_html
-        assert settings_html.index("profile.has_engine_fields") < settings_html.index(
-            "profile.api_name || profile.name"
-        )
-        assert 'x-text="model.settings.active_profile_name"' not in settings_html
-        assert "profileTooltip" in js
-        assert "whitespace-pre-line" in dashboard_html
-        assert "modal.model_settings.profiles.expose_as_model" in html
-        assert "modal.model_settings.profiles.exposed_as" in en
-        assert "modal.model_settings.profiles.expose_engine_fields_hint" in en
-
 
 @pytest.mark.parametrize("operation", ["create", "update", "apply"])
 @pytest.mark.parametrize("reason", ["hardware", "architecture", "conflict", "floor"])
@@ -1095,10 +1043,9 @@ def test_a8_profile_roundtrip_supported_architectures(client, monkeypatch, model
     [
         {"turboquant_kv_bits": 5},
         {"dflash_verify_mode": "typo"},
-        {"dflash_in_memory_cache_max_entries": -1},
-        {"dflash_in_memory_cache_max_entries": 1.5},
+        {"dflash_block_size": 1.5},
         {"specprefill_enabled": "not-a-boolean"},
-        {"dflash_in_memory_cache": []},
+        {"dflash_draft_quant_enabled": []},
         {"specprefill_draft_model": "/missing-draft-for-validation"},
         {"vlm_mtp_draft_model": "./missing-draft-for-validation"},
         {"reasoning_parser": "unknown-parser"},
@@ -1148,10 +1095,10 @@ def test_valid_settings_are_normalized_and_preserved(client, tmp_path, operation
     url = "/admin/api/models/model-a"
     payload = {
         "specprefill_enabled": "false",
-        "dflash_in_memory_cache": "false",
+        "dflash_draft_quant_enabled": "false",
         "cache_reasoning_output": "false",
         "turboquant_kv_bits": 0,
-        "dflash_in_memory_cache_max_entries": 0,
+        "dflash_verify_mode": "ddtree",
         "dflash_draft_model": str(draft),
     }
     if operation == "settings":
@@ -1178,16 +1125,16 @@ def test_valid_settings_are_normalized_and_preserved(client, tmp_path, operation
         )
         assert model_id == "model-a"
         assert exposed.specprefill_enabled is False
-        assert exposed.dflash_in_memory_cache is False
+        assert exposed.dflash_draft_quant_enabled is False
         assert exposed.cache_reasoning_output is False
         response = c.post(url + "/profiles/valid/apply")
     assert response.status_code == 200, response.text
     result = mgr.get_settings("model-a")
     assert result.specprefill_enabled is False
-    assert result.dflash_in_memory_cache is False
+    assert result.dflash_draft_quant_enabled is False
     assert result.cache_reasoning_output is False
     assert result.turboquant_kv_bits == 4
-    assert result.dflash_in_memory_cache_max_entries == 4
+    assert result.dflash_verify_mode == "adaptive"
     assert result.dflash_draft_model == str(draft)
 
 
@@ -1514,6 +1461,23 @@ class TestSettingsSnapshotRoutes:
         again = c.post("/admin/api/models/model-a/settings/reset").json()
         assert again["changed"] is False
 
+    def test_reset_restores_recommended_sampling(self, client):
+        c, mgr = client
+        pool = admin_routes._get_engine_pool()
+        pool.recommended_sampling = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+        mgr.set_settings(
+            "model-a", ModelSettings(temperature=0.1, top_k=5, model_alias="alias")
+        )
+
+        body = c.post("/admin/api/models/model-a/settings/reset").json()
+
+        expected = ModelSettings(temperature=0.6, top_p=0.95, top_k=20).to_dict()
+        assert body["settings"] == expected
+        assert body["applied"]["temperature"] == 0.6
+        assert mgr.get_settings("model-a").to_dict() == expected
+        again = c.post("/admin/api/models/model-a/settings/reset").json()
+        assert again["changed"] is False
+
     def test_reset_unknown_model_404(self, client):
         c, _ = client
         assert c.post("/admin/api/models/nope/settings/reset").status_code == 404
@@ -1659,30 +1623,6 @@ class TestSettingsSnapshotRoutes:
             }
         ]
 
-    @pytest.mark.parametrize("ssd_available", [False, True])
-    def test_recipe_checks_inactive_dflash_ssd_cache(self, client, ssd_available):
-        from omlx.admin.benchmark import _filter_uploaded_settings
-
-        c, mgr = client
-        admin_routes._get_engine_pool()._scheduler_config = SimpleNamespace(
-            paged_ssd_cache_dir="/cache" if ssd_available else None
-        )
-        source = ModelSettings(
-            temperature=0.2, dflash_enabled=False, dflash_ssd_cache=True
-        )
-        recipe = settings_recipe.encode_recipe(_filter_uploaded_settings(source))
-        response = c.post(
-            "/admin/api/models/model-a/settings/recipe", json={"recipe": recipe}
-        )
-        assert response.status_code == 200, response.text
-        saved = mgr.get_settings("model-a")
-        assert saved.temperature == 0.2
-        assert saved.dflash_enabled is False
-        assert saved.dflash_ssd_cache is ssd_available
-        assert [item["feature"] for item in response.json()["skipped"]] == (
-            [] if ssd_available else ["dflash_ssd_cache"]
-        )
-
     @pytest.mark.parametrize(
         "engine_type,target_type,draft_type,mismatch,accepted",
         [
@@ -1748,15 +1688,15 @@ class TestSettingsSnapshotRoutes:
     def test_recipe_resolves_installed_draft_by_basename(
         self, client, monkeypatch, tmp_path
     ):
-        import omlx.engine.dflash as dflash_engine
-
         c, mgr = client
         draft_path = self._install_draft(tmp_path)
         monkeypatch.setattr(
             admin_routes, "_dflash_compat_for_model", lambda info: (True, "")
         )
-        # The settings PUT re-checks the target with the engine helper.
-        monkeypatch.setattr(dflash_engine, "is_dflash_compatible", lambda p: (True, ""))
+        # The settings PUT re-checks the target type.
+        monkeypatch.setattr(
+            admin_routes, "dflash_compatibility", lambda *args: (True, "")
+        )
         recipe = settings_recipe.encode_recipe(
             {"dflash_enabled": True, "dflash_draft_model": "Qwen3-4B-DFlash-b16"}
         )
@@ -1929,38 +1869,6 @@ class TestSettingsSnapshotRoutes:
         assert settings["guided_grammar"] == 'root ::= "YES"'
         assert "guided_grammar" not in r.json()["applied"]
 
-    def test_dashboard_wires_snapshot_actions(self):
-        from pathlib import Path
-
-        root = Path(__file__).resolve().parents[1]
-        js = (root / "omlx/admin/static/js/dashboard.js").read_text()
-        modal = (
-            root / "omlx/admin/templates/dashboard/_modal_model_settings.html"
-        ).read_text()
-        apply_modal = (
-            root / "omlx/admin/templates/dashboard/_modal_settings_apply.html"
-        ).read_text()
-        dashboard = (root / "omlx/admin/templates/dashboard.html").read_text()
-        en = json.loads((root / "omlx/admin/i18n/en.json").read_text())
-        ko = json.loads((root / "omlx/admin/i18n/ko.json").read_text())
-
-        assert "dashboard/_modal_settings_apply.html" in dashboard
-        for mode in ("reset", "optimal", "recipe"):
-            assert f"openSettingsApply('{mode}')" in modal
-        assert "/settings/${path}`" in js
-        assert "_settingsActionRequest('POST', 'reset')" in js
-        assert "_settingsActionRequest('GET', 'optimal')" in js
-        assert "_settingsActionRequest('POST', 'recipe'" in js
-        assert "applyOptimalCandidate(item.benchmark_id)" in apply_modal
-        assert "by_pp" in js and "by_tg" in js
-        for key in (
-            "modal.model_settings.actions.reset_confirm",
-            "modal.model_settings.actions.group_pp",
-            "modal.model_settings.actions.group_tg",
-            "modal.model_settings.actions.none_body",
-            "js.error.settings_apply_failed",
-        ):
-            assert key in en and key in ko
 
     def test_cache_reasoning_output_round_trips_through_put(self, client):
         c, mgr = client

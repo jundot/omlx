@@ -11,7 +11,7 @@ import sys
 import time
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -846,6 +846,28 @@ class TestBlockAwarePrefixCacheWithSSD:
         result = prefix_cache_with_ssd.reconstruct_cache(table)
 
         assert result is None
+
+    @pytest.mark.parametrize(
+        "message,raises",
+        [
+            ("[METAL] Command buffer execution failed: Caused GPU Hang Error", True),
+            ("unexpected block layout", False),
+        ],
+    )
+    def test_reconstruct_cache_raises_only_failed_command_buffers(
+        self, prefix_cache_with_ssd, message, raises
+    ):
+        """A GPU reset must fail the request, not turn into a cache miss."""
+        type(prefix_cache_with_ssd.paged_ssd_cache)._expected_layer_cache_types = (
+            PropertyMock(side_effect=RuntimeError(message))
+        )
+        table = BlockTable(request_id="req-001", block_ids=[1, 2])
+
+        if raises:
+            with pytest.raises(RuntimeError, match="GPU Hang"):
+                prefix_cache_with_ssd.reconstruct_cache(table)
+        else:
+            assert prefix_cache_with_ssd.reconstruct_cache(table) is None
 
     def test_reconstruct_cache_no_ssd_manager(self, paged_cache):
         """Test reconstruct_cache without SSD manager."""
@@ -5001,14 +5023,14 @@ TYPES = ["ArraysCache", "KVCache", "CacheList"]
 ## MockModel: uses the existing one in this module
 
 
-def _make_cache(cache_dir, *, num_layers=None):
+def _make_cache(cache_dir, *, num_layers=None, ssd_only=False):
     if num_layers is None:
         num_layers = len(TYPES)
     ssd = PagedSSDCacheManager(
         cache_dir=cache_dir,
         max_size_bytes=1024**3,
-        hot_cache_max_bytes=64 * 1024**2,
-        hot_cache_only=True,
+        hot_cache_max_bytes=0 if ssd_only else 64 * 1024**2,
+        hot_cache_only=not ssd_only,
         expected_model_name="test-model",
         expected_num_layers=num_layers,
         expected_block_size=BLOCK_SIZE,
@@ -5271,6 +5293,52 @@ def test_bounded_restore_keeps_non_arrays_layers_intact(tmp_path, monkeypatch):
     ssd.close()
 
 
+@pytest.mark.parametrize("ssd_only", [False, True])
+def test_single_array_recurrent_state_round_trips(tmp_path, ssd_only):
+    """LFM2 short-conv layers are ArraysCache(size=1): a lone conv state must
+    survive store/restore instead of degrading to the (1,) placeholder."""
+    types = ["KVCache", "ArraysCache"]
+    cache, ssd = _make_cache(tmp_path / "ssd", num_layers=len(types), ssd_only=ssd_only)
+    total = NUM_BLOCKS * BLOCK_SIZE
+
+    def data(n):
+        keys, values = _position_kv(n)
+        return [
+            {
+                "state": (keys, values),
+                "meta_state": (n,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            },
+            {
+                "state": (mx.full((1, 2, 16), float(n)),),
+                "meta_state": (),
+                "class_name": "ArraysCache",
+                "cache_type": "ArraysCache",
+            },
+        ]
+
+    snapshots = {BLOCK_SIZE * i: data(BLOCK_SIZE * i) for i in range(1, NUM_BLOCKS + 1)}
+    table = cache.store_cache(
+        "store",
+        list(range(total + 2)),
+        data(total + 2),
+        model_cache_config=ModelCacheConfig.from_type_list(
+            types, model_name="test-model"
+        ),
+        boundary_snapshots=snapshots,
+    )
+    assert table is not None and len(table.block_ids) == NUM_BLOCKS
+
+    restored, restored_tokens = _restore(cache, total, "restore")
+    assert restored_tokens == total
+    assert len(restored[1].cache) == 1
+    assert mx.array_equal(
+        restored[1].cache[0], mx.full((1, 2, 16), float(total))
+    ).item()
+    ssd.close()
+
+
 def test_bounded_restore_with_mid_chain_placeholder(tmp_path, monkeypatch):
     """A mid-chain block whose arrays snapshot is the standard placeholder
     must not break the drop cutoff: the walk-back target (the newest block
@@ -5325,3 +5393,26 @@ def test_bounded_path_inactive(tmp_path, monkeypatch, flush_bytes, min_tokens):
     # Lazy path leaves the KV concat unevaluated, as before the change.
     assert restored[1].keys.shape[2] == total
     ssd.close()
+
+
+def test_restore_pool_flush_raises_failed_command_buffer(monkeypatch):
+    """Only a failed command buffer escapes the best-effort pool flush."""
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 1 << 40)
+    monkeypatch.setattr(
+        prefix_cache_module,
+        "_sync_and_clear_cache",
+        MagicMock(side_effect=RuntimeError("[metal] clear failed")),
+    )
+    assert BlockAwarePrefixCache._flush_restore_pool_if_over(1) is False
+
+    monkeypatch.setattr(
+        prefix_cache_module,
+        "_sync_and_clear_cache",
+        MagicMock(
+            side_effect=RuntimeError(
+                "[METAL] Command buffer execution failed: Caused GPU Hang Error"
+            )
+        ),
+    )
+    with pytest.raises(RuntimeError, match="GPU Hang"):
+        BlockAwarePrefixCache._flush_restore_pool_if_over(1)

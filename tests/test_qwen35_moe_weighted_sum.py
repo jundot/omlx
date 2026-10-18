@@ -30,8 +30,6 @@ def _fresh_moe_patch(monkeypatch):
     import omlx.patches.qwen35_moe_weighted_sum as patch
 
     monkeypatch.setattr(patch, "_PATCHED", False, raising=False)
-    monkeypatch.delenv("OMLX_QWEN35_MOE_WEIGHTED_SUM", raising=False)
-    monkeypatch.delenv("OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS", raising=False)
 
     originals = []
     try:
@@ -78,10 +76,10 @@ def test_moe_weighted_sum_route_gate(monkeypatch):
 @pytest.mark.skipif(not mx.metal.is_available(), reason="Metal is required")
 def test_external_prefill_evaluates_native_weighted_sum_on_engine_stream():
     """The issue #2170 native op must stay on the per-engine worker stream."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
-    if not fast.has_symbol("qwen35_moe_weighted_sum"):
-        pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
+    if not fast.has_symbol("moe_weighted_sum"):
+        pytest.skip("moe_weighted_sum native kernel unavailable")
 
     observed_streams = []
 
@@ -100,7 +98,7 @@ def test_external_prefill_evaluates_native_weighted_sum_on_engine_stream():
             x_sorted = mx.ones((rows, 1, 128), dtype=mx.float16)
             inv_order = mx.arange(rows, dtype=mx.uint32)
             scores = mx.ones((tokens, topk), dtype=mx.float32) / topk
-            cache[0].state = fast.qwen35_moe_weighted_sum(
+            cache[0].state = fast.moe_weighted_sum(
                 x_sorted,
                 inv_order,
                 scores,
@@ -152,16 +150,15 @@ def test_external_prefill_evaluates_native_weighted_sum_on_engine_stream():
 def test_qwen3_moe_patch_matches_stock_and_skips_decode(monkeypatch, top_k):
     from mlx_lm.models import qwen3_moe
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
     from omlx.patches.qwen35_moe_weighted_sum import (
         apply_qwen35_moe_weighted_sum_patch,
     )
 
-    if not fast.has_symbol("qwen35_moe_weighted_sum"):
-        pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
+    if not fast.has_symbol("moe_weighted_sum"):
+        pytest.skip("moe_weighted_sum native kernel unavailable")
 
-    monkeypatch.setenv("OMLX_QWEN35_MOE_WEIGHTED_SUM", "1")
-    monkeypatch.setenv("OMLX_QWEN35_MOE_WEIGHTED_SUM_MIN_TOKENS", "16")
+    monkeypatch.setattr("omlx.patches.qwen35_moe_weighted_sum._MIN_TOKENS", 16)
 
     args = types.SimpleNamespace(
         hidden_size=128,
@@ -179,7 +176,7 @@ def test_qwen3_moe_patch_matches_stock_and_skips_decode(monkeypatch, top_k):
     mx.eval(y_ref)
 
     calls = {"count": 0}
-    orig_weighted_sum = fast.qwen35_moe_weighted_sum
+    orig_weighted_sum = fast.moe_weighted_sum
 
     def spy(*args, **kwargs):
         # Count only native results; a rejected shape falls back to stock.
@@ -187,7 +184,7 @@ def test_qwen3_moe_patch_matches_stock_and_skips_decode(monkeypatch, top_k):
         calls["count"] += 1
         return out
 
-    monkeypatch.setattr(fast, "qwen35_moe_weighted_sum", spy)
+    monkeypatch.setattr(fast, "moe_weighted_sum", spy)
     assert apply_qwen35_moe_weighted_sum_patch() is True
     y = block(x)
     mx.eval(y)

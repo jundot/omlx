@@ -573,7 +573,7 @@ class ActivityTrackingMixin:
     """In-flight operation tracking for admin visibility.
 
     Engines that don't run requests through a Scheduler (non-streaming
-    engines, DFlashEngine) have no scheduler snapshot for the admin
+    and external engines) have no scheduler snapshot for the admin
     Active Models card to read, so they track their own operations here
     and expose them via get_activity_snapshot().
     """

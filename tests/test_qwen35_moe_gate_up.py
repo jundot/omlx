@@ -68,7 +68,6 @@ def _make_model(
 def _restore_call(monkeypatch):
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 
-    monkeypatch.delenv("OMLX_QWEN35_MOE_GATE_UP", raising=False)
     orig = getattr(SwitchGLU, "_omlx_gate_up_original_call", SwitchGLU.__call__)
     monkeypatch.setattr(
         Qwen3_5BatchInvariantForward,
@@ -190,13 +189,6 @@ def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
     assert hasattr(model.blocks[0], "gate_up_proj")
 
 
-def test_env_kill_switch(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_MOE_GATE_UP", "0")
-    model = _make_model()
-    assert apply_qwen35_moe_gate_up_fusion(model) == 0
-    assert hasattr(model.blocks[0], "gate_proj")
-
-
 def test_unsupported_family_skipped():
     model = _make_model(model_cls=_FakeOtherModel)
     assert apply_qwen35_moe_gate_up_fusion(model) == 0
@@ -303,7 +295,7 @@ def test_vlm_fused_projection_views_cross_execution_threads():
 
 @pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (5, mx.float16)])
 @pytest.mark.parametrize("batch,length", [(1, 3), (2, 6), (16, 2)])
-def test_vlm_fused_short_block_matches_verifier_without_copying_views(
+def test_vlm_fused_short_block_matches_native_references_without_copying_views(
     monkeypatch, bits, dtype, batch, length
 ):
     from mlx_vlm.models import fast_ops
@@ -319,7 +311,12 @@ def test_vlm_fused_short_block_matches_verifier_without_copying_views(
     verifier = Qwen3_5BatchInvariantForward()
     x = mx.random.normal((batch, length, 512)).astype(dtype)
     indices = mx.random.randint(0, 8, (batch, length, 6))
-    expected_head = glu(x, indices)
+    # Use real one-token decode: mlx-vlm's short-block helpers still copy
+    # the pre-0.32.4 QMV bias-sum arithmetic.
+    expected_head = mx.concatenate(
+        [glu(x[:, i : i + 1], indices[:, i : i + 1]) for i in range(length)],
+        axis=1,
+    )
     expected_verify = verifier._switch_glu(glu, x, indices)
     mx.eval(expected_head, expected_verify)
 
@@ -391,10 +388,10 @@ def _assert_decode_plan_matches_per_call(monkeypatch, glu, seed):
     for batch in (1, 3):
         x = (mx.random.normal((batch, 1, 2560)) * 0.5).astype(mx.bfloat16)
         idx = mx.random.randint(0, 16, shape=(batch, 1, 10)).astype(mx.uint32)
-        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", False)
-        ref = glu(x, idx)
-        mx.eval(ref)
-        monkeypatch.setattr(patch_mod, "_DECODE_PLAN_ENABLED", True)
+        with monkeypatch.context() as per_call:
+            per_call.setattr(patch_mod, "cached_per_module", lambda *a: None)
+            ref = glu(x, idx)
+            mx.eval(ref)
         out = glu(x, idx)
         mx.eval(out)
         assert out.shape == ref.shape and out.dtype == ref.dtype == mx.bfloat16

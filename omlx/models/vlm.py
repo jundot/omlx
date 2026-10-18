@@ -22,8 +22,6 @@ Architecture:
 import logging
 from typing import Any, Dict, List, Optional
 
-import os
-
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_vlm.models.cache import RotatingKVCache
@@ -31,30 +29,18 @@ from mlx_vlm.models.cache import RotatingKVCache
 logger = logging.getLogger(__name__)
 
 
-# OMLX_QWEN4_STEP_TEXT_POSITIONS=0 keeps decode/MTP-verify steps on rank-three
-# mRoPE positions (Qwen4's gathered-QSA arms then stay off those rows).
-_STEP_TEXT_POSITIONS_DISABLED = os.environ.get(
-    "OMLX_QWEN4_STEP_TEXT_POSITIONS", "1"
-).strip().lower() in {"0", "false", "no", "off"}
 # Cached tokens below which decode/verify rows keep rank-three positions (the
-# masked QSA path); OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT overrides. Unset,
-# it is _GATHERED_STEP_MIN_CONTEXT, the M5 Max crossover for the gathered arms
-# (~12k serial, higher for MTP) -- unless Qwen4's fused attention rows run on
-# this GPU: the masked path is then faster at every context (M5 Ultra, 16K-128K)
-# and bit-identical to the unfused MLX ops, so steps never switch.
-_STEP_TEXT_POSITIONS_MIN_CONTEXT: Optional[int] = (
-    int(os.environ["OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT"])
-    if "OMLX_QWEN4_STEP_TEXT_POSITIONS_MIN_CONTEXT" in os.environ
-    else None
-)
+# masked QSA path): _GATHERED_STEP_MIN_CONTEXT, the M5 Max crossover for the
+# gathered arms (~12k serial, higher for MTP) -- unless Qwen4's fused attention
+# rows run on this GPU: the masked path is then faster at every context (M5
+# Ultra, 16K-128K) and bit-identical to the unfused MLX ops, so steps never
+# switch.
 _GATHERED_STEP_MIN_CONTEXT = 32768
 
 
 def _step_text_positions_min_context() -> float:
     """Cached tokens from which a text-proven Qwen4 step takes rank-two
     positions (the gathered QSA arms); infinite while fused attention rows run."""
-    if _STEP_TEXT_POSITIONS_MIN_CONTEXT is not None:
-        return _STEP_TEXT_POSITIONS_MIN_CONTEXT
     try:
         from mlx_vlm.models.qwen4_exp import attn_fused
     except ImportError:
@@ -450,9 +436,7 @@ class VLMModelAdapter(nn.Module):
         uids = list(uids) if uids is not None else []
         self._qwen4_text_prefill_positions = False
         self._qwen4_step_text_positions = bool(
-            not _STEP_TEXT_POSITIONS_DISABLED
-            and len(uids) == 1
-            and uids[0] in self._uid_text_positions
+            len(uids) == 1 and uids[0] in self._uid_text_positions
         )
 
     def set_batch_rope_deltas(self, deltas: mx.array) -> None:

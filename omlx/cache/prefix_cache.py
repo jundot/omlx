@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ..utils.fatal import is_command_buffer_error
 from ..utils.metal_sync import _sync_and_clear_cache
 
 try:
@@ -296,6 +297,9 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Expected number of layers for cache validation
         self.expected_num_layers = self._get_model_num_layers(model)
+        # Array count per top-level ArraysCache layer (GDN: 2, LFM2 conv: 1),
+        # so a sidecar missing a recurrent member is still rejected.
+        self._arrays_state_arities = self._get_arrays_state_arities(model)
 
         # Hash table for quick prefix lookup
         # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks)
@@ -436,8 +440,8 @@ class BlockAwarePrefixCache(CacheManager):
                 return False
         return saw_arrays
 
-    @staticmethod
     def _validated_gdn_snapshot_layers(
+        self,
         snapshot: Any,
         layer_cache_types: list[str] | tuple[str, ...] | None,
     ) -> dict[int, tuple[Any, Any]] | None:
@@ -455,7 +459,12 @@ class BlockAwarePrefixCache(CacheManager):
             if not isinstance(layer_state, dict):
                 return None
             state = layer_state.get("state", ())
-            if not isinstance(state, (list, tuple)) or len(state) < 2:
+            # Empty is the structural placeholder. A single array is a valid
+            # conv-only state (LFM2), so arity is checked against the model.
+            if not isinstance(state, (list, tuple)) or not state:
+                return None
+            expected_arity = self._arrays_state_arities.get(layer_idx)
+            if expected_arity is not None and len(state) != expected_arity:
                 return None
             if len(state) == 2:
                 cache_data = (state[0], state[1])
@@ -609,6 +618,26 @@ class BlockAwarePrefixCache(CacheManager):
             "Cannot determine model/cache num_layers, cache layer validation disabled"
         )
         return 0
+
+    @staticmethod
+    def _get_arrays_state_arities(model: Any) -> dict[int, int]:
+        """Map each top-level ArraysCache layer to its array count, if known."""
+        make_cache = getattr(model, "make_cache", None)
+        if not callable(make_cache):
+            return {}
+        try:
+            cache_list = make_cache()
+        except Exception as e:
+            logger.debug(f"Could not determine ArraysCache arities: {e}")
+            return {}
+        if not isinstance(cache_list, list):
+            return {}
+        return {
+            layer_idx: len(cache.cache)
+            for layer_idx, cache in enumerate(cache_list)
+            if CacheTypeRegistry.is_arrays_family(type(cache).__name__)
+            and isinstance(getattr(cache, "cache", None), list)
+        }
 
     def set_paged_ssd_cache_manager(
         self, paged_ssd_cache_manager: PagedSSDCacheManager | None
@@ -1219,6 +1248,19 @@ class BlockAwarePrefixCache(CacheManager):
                     extra_keys=block_extra_keys,
                 )
                 if existing_block:
+                    # The lookup takes no reference. The inference thread can
+                    # free and reuse the block before this worker pins it, so
+                    # pin it against the locally computed chain hash.
+                    existing_block = self.paged_cache.acquire_cached_block(
+                        existing_block.block_id,
+                        compute_block_hash(
+                            parent_hash,
+                            block_tokens,
+                            extra_keys=block_extra_keys,
+                            model_name=self.paged_cache.model_name,
+                        ),
+                    )
+                if existing_block:
                     if split_gdn_layout and not self._has_split_gdn_checkpoint(
                         existing_block.block_hash, layer_cache_types
                     ):
@@ -1236,6 +1278,9 @@ class BlockAwarePrefixCache(CacheManager):
                                 "checkpoint",
                                 request_id,
                                 global_start,
+                            )
+                            self.paged_cache.release_for_eviction(
+                                [existing_block.block_id]
                             )
                             break
                     # Dedup'd blocks are never rewritten, so a block first
@@ -1271,8 +1316,6 @@ class BlockAwarePrefixCache(CacheManager):
                                 > _BACKFILL_CHECKED_MAX_ENTRIES
                             ):
                                 self._backfill_checked_hashes.clear()
-                    # Reuse existing block
-                    self.paged_cache.increment_ref(existing_block.block_id)
                     block_table.block_ids.append(existing_block.block_id)
                     block_table.num_tokens += len(block_tokens)
                     if is_tail_terminal:
@@ -2858,7 +2901,10 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                             if len(state) == 8:
                                 marker_class = V41_DELTA_CLASS
-                        if isinstance(state, (list, tuple)) and len(state) > 2:
+                        # Any arity but the legacy (conv, ssm) pair rides the
+                        # N-tuple marker, including LFM2's lone conv state.
+                        arity = len(state) if isinstance(state, (list, tuple)) else 0
+                        if arity not in (0, 2):
                             cloned = [
                                 (
                                     self._clone_tensor(elem)
@@ -3075,6 +3121,12 @@ class BlockAwarePrefixCache(CacheManager):
         if entry:
             self.paged_cache.delete_block_table(request_id)
             logger.debug(f"Released cache for {request_id}")
+            return
+        # fetch_cache records a hit only in the paged manager.
+        # Return its references and keep the blocks cached for a retry.
+        table = self.paged_cache.detach_block_table(request_id)
+        if table is not None:
+            self.paged_cache.release_for_eviction(table.block_ids)
 
     def clear_request_entry(self, request_id: str) -> None:
         """
@@ -4708,6 +4760,8 @@ class BlockAwarePrefixCache(CacheManager):
             return reconstructed_caches
 
         except Exception as e:
+            if is_command_buffer_error(e):
+                raise
             logger.warning(f"Failed to reconstruct cache: {e}")
             import traceback
 
@@ -4818,7 +4872,9 @@ class BlockAwarePrefixCache(CacheManager):
             _sync_and_clear_cache()
             logger.debug("Restore pool flush cleared %d bytes", pool_bytes)
             return True
-        except Exception:  # noqa: BLE001 - best effort, never fail a restore
+        except Exception as exc:  # noqa: BLE001 - best effort, never fail a restore
+            if is_command_buffer_error(exc):
+                raise
             logger.debug("Restore pool flush failed", exc_info=True)
             return False
 
@@ -5109,12 +5165,20 @@ class BlockAwarePrefixCache(CacheManager):
                     and layer_data[0] == "__nstate__"
                 ):
                     elements = layer_data[2]
-                    if not isinstance(elements, (list, tuple)) or len(elements) < 2:
+                    # Non-sliceable layers may hold a single array (LFM2's
+                    # conv-only ArraysCache) and skip the KV checks below.
+                    min_elements = 1 if cache_type in non_sliceable_types else 2
+                    if (
+                        not isinstance(elements, (list, tuple))
+                        or len(elements) < min_elements
+                    ):
                         logger.debug(
                             f"Block validation failed: layer {layer_idx} has "
                             "invalid N-tuple state"
                         )
                         return False
+                    if cache_type in non_sliceable_types:
+                        continue
                     keys, values = elements[0], elements[1]
                 else:
                     keys, values = layer_data[0], layer_data[1]
