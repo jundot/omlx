@@ -6,14 +6,19 @@ from functools import cache
 import mlx.core as mx
 
 _SCALE = r"""
-    // Clamp to 448 * 2^-126 so the power-of-two scale stays normal.
-    const float amax = max(simd_max(abs(v)), 0x1.cp-118f);
-    const int scale_exponent = max(int(ceil(log2(amax / 448.0f))), -126);
+    // DeepSeek-V4.1-Flash inference/kernel.py act_quant: amax = max(amax, 1e-4); the ue8m0
+    // scale is fast_round_scale = 2^ceil(log2(amax * fp32(1/448))) taken from the product's
+    // IEEE bits (exponent, +1 if any mantissa bit is set) rather than a transcendental log2.
+    const float amax = max(simd_max(abs(v)), 1e-4f);
+    const uint scale_bits = as_type<uint>(amax * (1.0f / 448.0f));
+    const int scale_exponent = int((scale_bits >> 23) & 0xFFu) - 127 + int((scale_bits & 0x7FFFFFu) != 0u);
     // Integer powers of two must be exact, including FP8 rounding ties.
     const float scale = as_type<float>(uint(scale_exponent + 127) << 23);
     const float scaled = clamp(v / scale, -448.0f, 448.0f);
     const float a = abs(scaled);
-    const int step_exponent = max(int(floor(log2(max(a, 0x1p-9f)))) - 3, -9);
+    // E4M3 grid step from the binade of a, read from its exponent bits (exact; a log2 can
+    // misplace values just below a power of two). Subnormal grid below 2^-6 is 2^-9.
+    const int step_exponent = max(int((as_type<uint>(a) >> 23) & 0xFFu) - 127 - 3, -9);
     const float step = as_type<float>(uint(step_exponent + 127) << 23);
 """
 

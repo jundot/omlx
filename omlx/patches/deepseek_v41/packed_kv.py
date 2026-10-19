@@ -13,7 +13,8 @@ _SOURCE = r"""
  auto power2 = [](int e) { return as_type<float>(uint(e + 127) << 23); };
  auto round8 = [&](float a) {
    float b = min(abs(a), 448.0f);
-   int e = max(int(floor(metal::precise::log2(max(b, 0x1p-9f)))) - 3, -9);
+   // E4M3 binade from the exponent bits (exact), subnormal grid 2^-9 below 2^-6.
+   int e = max(int((as_type<uint>(b) >> 23) & 255u) - 127 - 3, -9);
    float step = power2(e);
    return sign(a) * min(rint(b / step) * step, 448.0f);
  };
@@ -32,10 +33,13 @@ _SOURCE = r"""
  float scale;
  uchar sb;
  if (E4S) {
-   scale = round8(amax * (1.0f / limit));
+   // kernel.py fp4_quant_kernel: s = Cast(FP8, amax / fp4_max) -- a division, not * (1/6).
+   scale = round8(amax / limit);
    sb = code8(scale);
  } else {
-   int e = max(int(ceil(metal::precise::log2(amax * (1.0f / limit)))), -126);
+   // kernel.py fast_round_scale: 2^ceil(log2(amax * fp32(1/limit))) from the product's bits.
+   const uint pb = as_type<uint>(amax * (1.0f / limit));
+   int e = int((pb >> 23) & 255u) - 127 + int((pb & 0x7FFFFFu) != 0u);
    scale = power2(e);
    sb = uchar(e + 127);
  }
@@ -59,8 +63,11 @@ _SOURCE = r"""
 
 @mx.compile
 def _reference_minimum(x, bits, e4m3_scale):
-    limit = 448.0 if bits == 8 else 6.0
-    return mx.maximum(x, limit * (2.0**-9 if e4m3_scale else 2.0**-126))
+    # DeepSeek-V4.1-Flash kernel.py: act_quant max(amax, 1e-4); fp4_act_quant
+    # 6*2^-9 (E4M3 scales) or 6*2^-126 (E8M0 scales).
+    if bits == 8:
+        return mx.maximum(x, 1e-4)
+    return mx.maximum(x, 6.0 * (2.0**-9 if e4m3_scale else 2.0**-126))
 
 
 @cache

@@ -156,7 +156,9 @@ class Engram(nn.Module):
         inv = mx.rsqrt(mx.mean(x * x, -1) + c.norm_eps) * mx.rsqrt(
             mx.mean(key * key, -1) + c.norm_eps
         )
-        dot = mx.sum(x * self.q_weight * self.k_weight * key, -1) * inv * c.dim**-0.5
+        # Reference: weight = q_weight.float() * k_weight.float(); dot = (h * weight * key).sum(-1)
+        weight = self.q_weight.astype(mx.float32) * self.k_weight.astype(mx.float32)
+        dot = mx.sum(x * weight * key, -1) * inv * c.dim**-0.5
         gate = mx.sigmoid(mx.sign(dot) * mx.sqrt(mx.maximum(mx.abs(dot), 1e-6)))
         # copysign(+sqrt, 0) is positive in the official reference.
         gate = mx.where(dot == 0, mx.sigmoid(mx.array(0.001)), gate)
