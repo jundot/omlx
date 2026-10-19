@@ -1445,50 +1445,11 @@ class MLXRerankerModel:
         indexed_scores.sort(key=lambda x: x[1], reverse=True)
         sorted_indices = [idx for idx, _ in indexed_scores]
 
-        # Count tokens
-        total_tokens = self._count_tokens(query, documents)
-
         return RerankOutput(
             scores=scores,
             indices=sorted_indices,
-            total_tokens=total_tokens,
+            total_tokens=sum(len(ids) for ids in input_ids),
         )
-
-    def _count_tokens(self, query: str, documents: list[str]) -> int:
-        """Count total tokens in query-document pairs."""
-        total = 0
-
-        processor = self.processor
-        processor_class = type(processor).__name__
-        if processor_class == "TokenizerWrapper" and hasattr(processor, "_tokenizer"):
-            processor = processor._tokenizer
-
-        def get_token_count(text: str, add_special: bool = True) -> int:
-            """Get token count for text, handling different tokenizer types."""
-            if hasattr(processor, "encode"):
-                tokens = processor.encode(text, add_special_tokens=add_special)
-                # Handle different return types
-                if isinstance(tokens, list):
-                    return len(tokens)
-                elif hasattr(tokens, "ids"):
-                    # tokenizers.Encoding object
-                    return len(tokens.ids)
-                else:
-                    return len(tokens)
-            else:
-                # Fallback to word count estimate
-                return len(text.split()) + (2 if add_special else 0)
-
-        # Count query tokens once
-        query_len = get_token_count(query, add_special=True)
-
-        # Count document tokens
-        for doc in documents:
-            doc_len = get_token_count(doc, add_special=False)
-            # Each pair includes query + doc + special tokens
-            total += query_len + doc_len + 3  # [CLS], [SEP], [SEP]
-
-        return total
 
     @property
     def num_labels(self) -> int | None:

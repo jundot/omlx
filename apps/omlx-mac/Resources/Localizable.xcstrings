@@ -22552,6 +22552,48 @@
         }
       }
     },
+    "settings.basic.embedding_context_window.sub" : {
+      "comment" : "Sublabel for the context window field of an embedding model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Longer inputs are truncated to this length when a request does not set max_length."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リクエストで max_length を指定しない場合、これより長い入力はこの長さで切り詰められます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청에 max_length가 없으면 이보다 긴 입력은 이 길이로 잘립니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Если в запросе не задан max_length, более длинные входные данные обрезаются до этой длины."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请求未设置 max_length 时，超出此长度的输入将被截断。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請求未設定 max_length 時，超過此長度的輸入會被截斷。"
+          }
+        }
+      }
+    },
     "settings.basic.max_tokens.label" : {
       "comment" : "Row label for the max generated tokens field",
       "extractionState" : "manual",
@@ -22913,19 +22955,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Limit candidates to top K (positive integer)."
+            "value" : "Limit candidates to top K (0 turns it off)."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ограничить кандидаты top K (положительное целое)."
+            "value" : "Ограничить кандидаты до top K (0 — выключено)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "将候选限制为 Top K（正整数）。"
+            "value" : "将候选限制为 Top K（0 表示关闭）。"
           }
         }
       }
@@ -25727,25 +25769,25 @@
       }
     },
     "settings.validator.top_k.positive" : {
-      "comment" : "Validation error when top-k isn't positive",
+      "comment" : "Validation error when top-k is negative",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Top K must be a positive integer."
+            "value" : "Top K must be 0 or a positive integer."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Top K должен быть положительным целым числом."
+            "value" : "Top K должен быть 0 или положительным целым числом."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Top K 必须是正整数。"
+            "value" : "Top K 必须为 0 或正整数。"
           }
         }
       }

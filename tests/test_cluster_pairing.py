@@ -647,6 +647,24 @@ def test_approval_requires_coordinator_ssh_material(tmp_path):
     assert [row["node_id"] for row in coordinator.pending_requests()] == ["join-node"]
 
 
+def test_missing_ssh_host_key_asks_for_remote_login(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    joiner._ssh_host_key_provider = lambda: None
+    joiner.start_join()
+
+    with pytest.raises(PairingRequestError, match="Remote Login"):
+        joiner.request_join("coordinator.local:8080")
+
+    joiner._ssh_host_key_provider = lambda: _test_public_key("host-join-node")
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator._ssh_host_key_provider = lambda: None
+
+    with pytest.raises(EnrollmentDriveError, match="Remote Login"):
+        coordinator.approve("join-node", code)
+    assert coordinator.paired_devices() == []
+
+
 def test_default_enrollment_requires_key_and_verified_address(monkeypatch):
     from omlx.cluster import ssh_keys
 

@@ -121,6 +121,7 @@ class _SlotCache:
         self.n_experts = glu[_PROJS[0]]["weight"].shape[0]
         self.capacity = min(capacity, self.n_experts)
         self.resident: dict[str, list] = {}
+        self.global_scales: dict[str, mx.array] = {}
         for proj in _PROJS:
             lin = glu[proj]
             arrays = []
@@ -129,6 +130,11 @@ class _SlotCache:
                 slots = mx.zeros((self.capacity, *src.shape[1:]), dtype=src.dtype)
                 setattr(lin, field, slots)  # drops the lazy full-size array
                 arrays.append(slots)
+            if "global_scale" in lin:
+                # ModelOpt NVFP4 tensor scales are tiny: keep all, slot a copy.
+                self.global_scales[proj] = lin["global_scale"]
+                lin.global_scale = mx.ones((self.capacity,), dtype=mx.float32)
+                arrays += [self.global_scales[proj], lin["global_scale"]]
             self.resident[proj] = arrays
         self.slot_of: dict[int, int] = {}  # expert id -> slot, LRU ordered
         self.free = list(range(self.capacity))
@@ -210,6 +216,8 @@ class _SlotCache:
                     self.map[victim] = -1
                 for (proj, field, _), plan, raw in raws:
                     self.glu[proj][field][slot] = CheckpointExpertStore.to_mx(plan, raw)
+                for proj, scale in self.global_scales.items():
+                    self.glu[proj]["global_scale"][slot] = scale[e]
                 self.slot_of[e] = slot
                 self.map[e] = slot
                 self.misses += 1

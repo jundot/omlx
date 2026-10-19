@@ -169,6 +169,32 @@ def test_decode_bit_exact_at_quarter_residency(tmp_path, reference):
     )
 
 
+def test_nvfp4_global_scale_follows_slots(tmp_path):
+    def make():
+        mx.random.seed(0)
+        glu = SwitchGLU(D, INTER, E)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            glu[proj].global_scale = mx.random.uniform(1, 8, (E,))
+            glu[proj] = glu[proj].to_quantized(group_size=16, bits=4, mode="nvfp4")
+        mx.eval(glu.parameters())
+        return glu
+
+    reference = make()
+    tensors = {
+        f"{PREFIX}.{proj}.{field}": reference[proj][field]
+        for proj in ("gate_proj", "up_proj", "down_proj")
+        for field in ("weight", "scales")
+    }
+    _write(tmp_path, tensors)
+    model = _Model([make()])
+    assert dsv4.apply_deepseek_v4_moe_expert_offload(model, tmp_path, 0.25) == 1
+    wrapped = model.model.layers[0].ffn.switch_mlp
+    x, i = _x(4, 1, D), _routes((4, 1, K))
+    ref, got = reference(x, i), wrapped(x, i)
+    mx.eval(ref, got)
+    assert bool(mx.array_equal(ref, got))
+
+
 def test_sorted_prefill_bit_exact_at_full_residency(tmp_path, reference, kernels):
     wrapped = _wrapped(tmp_path, reference, 1.0)
     x = _x(2, 40, D)

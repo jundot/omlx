@@ -119,6 +119,8 @@ class TestXLMRobertaReranker:
 
         assert result.scores == [7.0, 3.0, 5.0, 3.0]
         assert result.indices[0] == 0
+        # Usage counts the tokenized (truncated) pairs, not the raw text.
+        assert result.total_tokens == 18
         assert len(shapes) == 3
         assert all(batch * width <= 12 for batch, width in shapes)
 

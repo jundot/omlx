@@ -389,18 +389,9 @@ AUDIO_STS_ARCHITECTURES = {
     "LFM2AudioModel",
 }
 
-# STT families whose mlx-audio implementations accept incremental audio
-# input (push-based realtime decoding): whisper via the AlignAtt
-# StreamingDecoder, voxtral_realtime via VoxtralStreamingSession. Gates
-# the realtime transcription WebSocket and the admin chat mic button.
-REALTIME_STT_MODEL_TYPES = {"whisper", "voxtral_realtime"}
-
-
 def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
-    """True when an audio_stt model supports push-based realtime decoding."""
-    if model_type != "audio_stt":
-        return False
-    return (config_model_type or "").lower() in REALTIME_STT_MODEL_TYPES
+    """True when an audio_stt model can serve the realtime WebSocket."""
+    return model_type == "audio_stt"
 
 
 @dataclass

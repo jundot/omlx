@@ -49,6 +49,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
+from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
@@ -2478,6 +2479,9 @@ class VLMBatchedEngine(BaseEngine):
                             True,
                         ),
                         install_dispatch=False,
+                        packed_projections=qwen35_packed_linear.enabled(
+                            self._vlm_model
+                        ),
                     )
 
                 ane_count = await loop.run_in_executor(
@@ -2491,8 +2495,6 @@ class VLMBatchedEngine(BaseEngine):
         # the M5 tensor units. Replaces the layers in place, so resident
         # memory does not grow; runs on the MLX executor before any forward.
         try:
-            from ..patches import qwen35_packed_linear
-
             if qwen35_packed_linear.enabled(self._vlm_model):
                 packed = await loop.run_in_executor(
                     get_mlx_executor(),
@@ -2620,11 +2622,18 @@ class VLMBatchedEngine(BaseEngine):
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_kv_scheme = getattr(
+                    self._model_settings, "turboquant_kv_scheme", "turboquant"
+                )
                 scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
                 scheduler._set_model_info_for_monitor()
-                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+                logger.info(
+                    "KV cache compression enabled for VLM: %s, %s bits",
+                    scheduler._turboquant_kv_scheme,
+                    tq_bits,
+                )
 
         # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
         # batched.py for rationale. Passthrough-safe; strictly gated route.
@@ -2778,8 +2787,8 @@ class VLMBatchedEngine(BaseEngine):
                         scheduler,
                         requested_ane_sequence_length,
                     )
-                    # Price the compiled I/O surfaces off the full model so
-                    # admission charges them while the banks are resident.
+                    # Price the compiled program weights off the full model
+                    # so admission charges them while the banks are resident.
                     monitor = getattr(scheduler, "memory_monitor", None)
                     if monitor is not None:
                         monitor.set_ane_prefill_transient_bytes(

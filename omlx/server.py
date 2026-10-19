@@ -231,6 +231,7 @@ from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
 from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .utils.network import is_loopback_bind
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -582,6 +583,10 @@ async def lifespan(app: FastAPI):
                     )
                 ),
             )
+            bind_host = _server_state.bind_host
+            discovery_service.config.caps.loopback_only = isinstance(
+                bind_host, str
+            ) and is_loopback_bind(bind_host)
             configure_discovery_service(discovery_service)
             await asyncio.to_thread(discovery_service.start)
         except Exception as exc:  # pragma: no cover - defensive

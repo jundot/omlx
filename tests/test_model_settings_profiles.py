@@ -15,6 +15,54 @@ def mgr(tmp_path):
 
 
 class TestProfilesCRUD:
+
+
+    @pytest.mark.parametrize("bits", [4, 8])
+    def test_legacy_turboquant_profile_keeps_turboquant_over_affine_base(
+        self, tmp_path, bits
+    ):
+        profiles_file = tmp_path / "model_profiles.json"
+        legacy = {
+            "name": "legacy",
+            "display_name": "Legacy TurboQuant",
+            "api_name": "legacy",
+            "created_at": "2026-06-01T00:00:00+00:00",
+            "updated_at": "2026-06-01T00:00:00+00:00",
+            "settings": {"turboquant_kv_enabled": True, "turboquant_kv_bits": bits},
+            "expose_as_model": True,
+        }
+        profiles_file.write_text(
+            json.dumps({"version": 1, "profiles": {"m": {"legacy": legacy}}})
+        )
+        manager = ModelSettingsManager(tmp_path)
+        persisted = json.loads(profiles_file.read_text())["profiles"]["m"]["legacy"]
+        assert persisted["settings"]["turboquant_kv_scheme"] == "turboquant"
+        manager.set_settings(
+            "m",
+            ModelSettings(
+                turboquant_kv_enabled=True,
+                turboquant_kv_scheme="affine4",
+                turboquant_kv_bits=4,
+            ),
+        )
+        _, exposed = manager.get_exposed_profile_runtime_settings_for_request(
+            "m:legacy"
+        )
+        applied = manager.apply_profile("m", "legacy")
+        for settings in (exposed, applied):
+            assert settings.turboquant_kv_scheme == "turboquant"
+            assert settings.turboquant_kv_bits == bits
+
+    def test_partial_profile_validates_against_base_settings(self, mgr):
+        mgr.save_profile("m", "bits", "Bits", None, {"turboquant_kv_bits": 3})
+        mgr.set_settings("m", ModelSettings(turboquant_kv_scheme="affine4"))
+        with pytest.raises(ValueError, match="affine4 requires"):
+            mgr.apply_profile("m", "bits")
+        assert mgr.get_settings("m").turboquant_kv_scheme == "affine4"
+        assert mgr.get_settings("m").turboquant_kv_bits == 4
+        with pytest.raises(ValueError, match="affine4 requires"):
+            mgr.save_profile("m", "bad", "Bad", None, {"turboquant_kv_bits": 3})
+
     def test_list_profiles_empty_by_default(self, mgr):
         assert mgr.list_profiles("model-a") == []
 
@@ -335,6 +383,23 @@ class TestApplyProfile:
         assert persisted.presence_penalty == 1.5
         assert persisted.vlm_mtp_enabled is False
         assert persisted.active_profile_name == "penalty"
+
+    def test_sampling_only_profile_inherits_affine_engine_settings(self, mgr):
+        mgr.set_settings(
+            "m",
+            ModelSettings(
+                turboquant_kv_enabled=True,
+                turboquant_kv_scheme="affine8",
+                turboquant_kv_bits=8,
+            ),
+        )
+        mgr.save_profile("m", "sampling", "Sampling", None, {"temperature": 0.2})
+
+        applied = mgr.apply_profile("m", "sampling")
+
+        assert applied.turboquant_kv_enabled is True
+        assert applied.turboquant_kv_scheme == "affine8"
+        assert applied.turboquant_kv_bits == 8
 
     def test_apply_tolerates_legacy_empty_string_values(self, tmp_path):
         profiles_file = tmp_path / "model_profiles.json"

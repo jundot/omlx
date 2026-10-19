@@ -21,6 +21,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 
+from omlx.patches import qwen35_packed_linear
 from omlx.utils import hardware, proc_memory
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,7 @@ class _AnePrefillConfig:
     ane_down_fraction: float = 0.0
     fused_down: bool = False
     tail_padding_min_tokens: int = 0
+    gpu_suffix_views: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,6 +155,8 @@ class _CombinedMLPState:
     cpu_outputs: int = 0
     down_cpu: _CpuLinearState | None = None
     down_ane: _AneDownState | None = None
+    # Up rows of a view-backed suffix; weight/scales/biases then hold gate rows.
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None
 
 
 @dataclass(frozen=True)
@@ -563,6 +567,33 @@ def _prepare_down_for_bank(
     )
 
 
+def _gate_up_gpu_suffix(
+    gate: Any, up: Any, gpu_start: int, config: _AnePrefillConfig
+) -> tuple[mx.array, mx.array, mx.array, tuple[mx.array, mx.array, mx.array] | None]:
+    """Return the GPU gate/up suffix rows and, for views, the separate up rows."""
+    if config.gpu_suffix_views:
+        return (
+            gate.weight[gpu_start:],
+            gate.scales[gpu_start:],
+            gate.biases[gpu_start:],
+            (up.weight[gpu_start:], up.scales[gpu_start:], up.biases[gpu_start:]),
+        )
+    weight = mx.contiguous(
+        mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
+    )
+    scales = mx.contiguous(
+        mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
+    )
+    biases = mx.contiguous(
+        mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
+    )
+    return weight, scales, biases, None
+
+
+def _split_suffix_kwargs(state: _CombinedMLPState) -> dict[str, Any]:
+    return {} if state.up_suffix is None else {"up_suffix": state.up_suffix}
+
+
 def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | None:
     from omlx.custom_kernels.quant_matmul import ane as fast
 
@@ -610,6 +641,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
         config.cpu_down_fraction,
         group_size,
         "dual" if dual_ane else "linear",
+        config.gpu_suffix_views,
     )
     if key in cache:
         return cache[key]
@@ -659,16 +691,10 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
                     axis=0,
                 )
             )
-        weight = mx.contiguous(
-            mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
+        weight, scales, biases, up_suffix = _gate_up_gpu_suffix(
+            gate, up, gpu_start, config
         )
-        scales = mx.contiguous(
-            mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
-        )
-        biases = mx.contiguous(
-            mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
-        )
-        values = [dense0, weight, scales, biases]
+        values = [dense0, weight, scales, biases, *(up_suffix or ())]
         if cpu_weight is not None:
             values.append(cpu_weight)
         if dense1 is not None:
@@ -699,6 +725,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
             down_cpu=_prepare_cpu_linear(
                 mlp.down_proj, config.cpu_down_fraction
             ),
+            up_suffix=up_suffix,
         )
         cache[key] = state
         logger.debug(
@@ -785,16 +812,8 @@ def _prepare_pair_for_bank(
                 axis=0,
             )
         )
-    weight = mx.contiguous(
-        mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
-    )
-    scales = mx.contiguous(
-        mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
-    )
-    biases = mx.contiguous(
-        mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
-    )
-    values = [dense0, weight, scales, biases]
+    weight, scales, biases, up_suffix = _gate_up_gpu_suffix(gate, up, gpu_start, config)
+    values = [dense0, weight, scales, biases, *(up_suffix or ())]
     if dense1 is not None:
         values.append(dense1)
     if cpu_weight is not None:
@@ -822,6 +841,7 @@ def _prepare_pair_for_bank(
                 )
             ),
             down_ane=down_ane,
+            up_suffix=up_suffix,
         ),
         dense0,
         dense1,
@@ -887,16 +907,8 @@ def _prepare_pair_runtime_state(
                 axis=0,
             )
         )
-    weight = mx.contiguous(
-        mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
-    )
-    scales = mx.contiguous(
-        mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
-    )
-    biases = mx.contiguous(
-        mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
-    )
-    values = [weight, scales, biases]
+    weight, scales, biases, up_suffix = _gate_up_gpu_suffix(gate, up, gpu_start, config)
+    values = [weight, scales, biases, *(up_suffix or ())]
     if cpu_weight is not None:
         values.append(cpu_weight)
     mx.eval(*values)
@@ -913,6 +925,7 @@ def _prepare_pair_runtime_state(
         cpu_weight=cpu_weight,
         cpu_outputs=cpu_outputs,
         down_cpu=_prepare_cpu_linear(mlp.down_proj, config.cpu_down_fraction),
+        up_suffix=up_suffix,
     )
 
 
@@ -1842,6 +1855,7 @@ def _backend_exact(
                     state.group_size,
                     config.cpu_threads,
                     config.cpu_shared_resource,
+                    **_split_suffix_kwargs(state),
                 )
             elif state.model1 is not None:
                 activation = fast.ane_dual_cpu_fp16_swiglu_t(
@@ -1857,6 +1871,7 @@ def _backend_exact(
                     state.group_size,
                     config.cpu_threads,
                     config.cpu_shared_resource,
+                    **_split_suffix_kwargs(state),
                 )
             elif state.bits == 4:
                 activation = fast.ane_cpu_fp16_q4_swiglu_t(
@@ -1870,6 +1885,7 @@ def _backend_exact(
                     state.group_size,
                     config.cpu_threads,
                     config.cpu_shared_resource,
+                    **_split_suffix_kwargs(state),
                 )
             else:
                 activation = fast.ane_cpu_fp16_swiglu_t(
@@ -1884,6 +1900,7 @@ def _backend_exact(
                     state.group_size,
                     config.cpu_threads,
                     config.cpu_shared_resource,
+                    **_split_suffix_kwargs(state),
                 )
             return _post_ane_down(
                 mlp.down_proj,
@@ -1904,6 +1921,7 @@ def _backend_exact(
                     state.model1,
                     config.variant,
                     state.group_size,
+                    **_split_suffix_kwargs(state),
                 )
             else:
                 if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=True)):
@@ -1918,6 +1936,7 @@ def _backend_exact(
                     state.bits,
                     config.variant,
                     state.group_size,
+                    **_split_suffix_kwargs(state),
                 )
             return _post_ane_down(
                 mlp.down_proj,
@@ -1939,6 +1958,7 @@ def _backend_exact(
                 state.bits,
                 config.variant,
                 state.group_size,
+                **_split_suffix_kwargs(state),
             )
             return _post_ane_down(
                 mlp.down_proj,
@@ -1957,6 +1977,7 @@ def _backend_exact(
                 state.model,
                 config.variant,
                 state.group_size,
+                **_split_suffix_kwargs(state),
             )
             return _post_ane_down(
                 mlp.down_proj,
@@ -2774,8 +2795,10 @@ def _enable_dual_procedure_banks(
     # are done. Synchronize first so no in-flight command buffer still
     # references a cached allocation (the issue #300 recipe); this runs on
     # the MLX executor thread like the engine pool's own calls (issue #2781).
+    # The native INT8 chunks are freed malloc blocks that stay resident.
     mx.synchronize()
     mx.clear_cache()
+    proc_memory.release_free_malloc_memory()
 
     return (
         len(prepared_mlps),
@@ -3069,6 +3092,7 @@ def enable_qwen35_ane_prefill(
     cpu_shared_resource: bool = True,
     tail_padding_min_tokens: int = 0,
     install_dispatch: bool = True,
+    packed_projections: bool = False,
 ) -> int:
     """Enable the private ANE backend on eligible MLPs in ``model``.
 
@@ -3077,6 +3101,8 @@ def enable_qwen35_ane_prefill(
 
     With ``install_dispatch=False`` only the slices are compiled. The caller
     must then call ``install_qwen35_ane_prefill_dispatch`` before serving.
+    ``packed_projections`` tells it that ``qwen35_packed_linear.pack_model``
+    replaces the dense projections after this call.
     """
     if (
         sequence_length < _ANE_MIN_SEQUENCE_LENGTH
@@ -3161,6 +3187,14 @@ def enable_qwen35_ane_prefill(
         candidates.append(module)
         if len(candidates) >= max_layers:
             break
+
+    # Row-slice suffixes keep the checkpoint gate/up alive, so keep a copy when
+    # packed projections replace those layers after this compile.
+    if candidates and fast.has_symbol("ane_split_gate_up_suffix"):
+        packed = packed_projections and any(
+            qwen35_packed_linear.eligible(module.gate_proj) for module in candidates
+        )
+        config = replace(config, gpu_suffix_views=not packed)
 
     if not candidates:
         logger.warning(
@@ -3281,6 +3315,7 @@ def enable_qwen35_ane_prefill(
             # dual-bank epilogue that normally does this (issue #2781).
             mx.synchronize()
             mx.clear_cache()
+            proc_memory.release_free_malloc_memory()
             return count
 
     banked = _enable_dual_procedure_banks(
@@ -3324,6 +3359,7 @@ def enable_qwen35_ane_prefill(
     dual_count = 0
     resident_programs = 0
     mlp_budget_exhausted = False
+    compiled_models: list[Any] = []
     for module in candidates:
         requested_programs = 2 if dual_ane else 1
         if resident_programs + requested_programs > _ANE_RESIDENT_PROGRAM_LIMIT:
@@ -3342,6 +3378,9 @@ def enable_qwen35_ane_prefill(
             continue
         module._omlx_ane_prefill_config = config
         module._omlx_ane_prefill_state = state
+        compiled_models.extend(
+            (getattr(state, "model", None), getattr(state, "model1", None))
+        )
         actual_programs = 2 if getattr(state, "model1", None) is not None else 1
         resident_programs += actual_programs
         dual_count += int(actual_programs == 2)
@@ -3383,8 +3422,17 @@ def enable_qwen35_ane_prefill(
             module._omlx_ane_gdn_config = gdn_config
             module._omlx_ane_gdn_state = state
             _register_gdn_module(module)
+            compiled_models.extend(
+                (getattr(state, "model", None), getattr(state, "model1", None))
+            )
             resident_programs += 2 if getattr(state, "model1", None) is not None else 1
             gdn_count += 1
+    # Per-layer programs own their I/O surfaces. Dirty them at load like the
+    # banks so phys_footprint counts them before admission prices a prefill.
+    _warm_ane_models([m for m in compiled_models if m is not None])
+    mx.synchronize()
+    mx.clear_cache()
+    proc_memory.release_free_malloc_memory()
     model._omlx_ane_mlp_prefill_count = count
     model._omlx_ane_gdn_prefill_count = gdn_count
     model._omlx_ane_dual_prefill_count = dual_count
@@ -3437,13 +3485,12 @@ def enable_qwen35_ane_prefill(
 
 
 def ane_prefill_transient_bytes(model: Any) -> int:
-    """Bytes of fp16 ANE I/O surfaces held by ``model``'s compiled slices.
+    """Bytes of ANE program weights for ``model``'s compiled slices.
 
-    Every compiled procedure owns a fixed-shape input and output IOSurface of
-    ``dim * sequence_length * 2`` bytes, allocated at compile time and dirtied
-    at first use, which is exactly the first-request spike of issue #2841.
-    Reads the dims off the live native models, so packing, dual splits, and
-    partial banks are all accounted exactly. 0 when no ANE slice is attached.
+    The ANE driver wires these outside phys_footprint while a prefill runs
+    and for several seconds after (issue #2841). The fixed-shape I/O surfaces
+    are resident from compile time, so phys_footprint already counts them.
+    0 when no ANE slice is attached.
     """
     total = 0
     for module in model.modules() if hasattr(model, "modules") else ():
@@ -3462,12 +3509,17 @@ def ane_prefill_transient_bytes(model: Any) -> int:
                 states.append(down_ane)
         for state in states:
             for ane_model in (state.model, getattr(state, "model1", None)):
-                input_dim = getattr(ane_model, "input_dim", 0)
-                output_dim = getattr(ane_model, "output_dim", 0)
-                seq = getattr(ane_model, "sequence_length", 0)
+                if ane_model is None:
+                    continue
                 try:
-                    total += (int(input_dim) + int(output_dim)) * int(seq) * 2
-                except (TypeError, ValueError):
+                    weight_bytes = getattr(ane_model, "weight_bytes", None)
+                    if weight_bytes is None:
+                        # Extensions without the counter: INT8 rows.
+                        weight_bytes = int(ane_model.input_dim) * int(
+                            ane_model.output_dim
+                        )
+                    total += int(weight_bytes)
+                except (AttributeError, TypeError, ValueError):
                     continue
     return total
 
@@ -3498,11 +3550,10 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
 def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
     """Drop every compiled ANE prefill slice on ``model``; GPU-only from here.
 
-    The compiled procedure banks keep the packed weight blobs they were built
-    from mapped for the lifetime of the native programs (roughly 13 GB for a
-    27B at mlp 0.35 / gdn 0.45) — exactly the resident memory a long-context
-    prefill needs back once the KV cache has grown into the guard's sizing
-    target. Latches every sliced module through the existing per-module
+    The native programs own the ANE I/O surfaces and the program weights the
+    ANE driver wires during every prefill, memory a long-context prefill
+    needs back once the KV cache has grown into the guard's sizing target.
+    Latches every sliced module through the existing per-module
     failure flags first (so the dispatch sites fall back to stock GPU compute
     and never lazily recompile), then drops the state references and clears the
     per-module state caches that hold the same objects; the native models free

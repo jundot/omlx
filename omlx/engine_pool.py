@@ -1143,6 +1143,7 @@ class EnginePool:
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:
+            add("turboquant_kv_scheme", data.get("turboquant_kv_scheme", "turboquant"))
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
@@ -3031,9 +3032,9 @@ class EnginePool:
                         continue
                     if not ane_release_attempted:
                         # Last rung before giving up: shed the requesting
-                        # model's own ANE prefill banks. They hold the packed
-                        # weight blobs mapped into the native programs (~13 GB
-                        # for a 27B at the default fractions) and are purely
+                        # model's own ANE prefill banks. The ANE driver wires
+                        # their program weights during prefill (~7 GiB for a
+                        # 27B at the default fractions) and they are purely
                         # an accelerator — the per-module failure-latch
                         # fallback serves the same modules on GPU — so at
                         # long context the trade is a slower-but-unthrottled
@@ -3241,12 +3242,10 @@ class EnginePool:
     ) -> int:
         """Release the requesting model's ANE prefill banks; report bytes freed.
 
-        The compiled banks keep the packed weight blobs mapped into the
-        native ANE programs for the model's whole residency, so a config
-        tuned at a short calibration length silently competes with the KV
-        cache at long context — on a 27B at mlp 0.35 / gdn 0.45 the banks
-        hold ~13 GB, which is the difference between full 2048-token prefill
-        chunks and the guard throttling to the floor. Shedding them is safe:
+        The ANE driver wires the banks' program weights during every
+        prefill (about 7 GiB on a 27B at the default split), which the
+        admission estimate reserves on top of the KV cache at long context.
+        Shedding them is safe:
         the release latches every sliced module through the existing
         per-module failure flags, so the dispatch sites fall back to stock
         GPU compute exactly as they do after a warmup failure. The banks are
@@ -3316,8 +3315,8 @@ class EnginePool:
             )
             return 0
         freed = max(0, before - get_phys_footprint())
-        # The load-time admission reservation priced these I/O surfaces; drop
-        # it so later passes stop pausing for memory that no longer exists.
+        # The load-time admission reservation priced these program weights;
+        # drop it so later passes stop pausing for memory that no longer exists.
         # The next load re-prices it from the rebuilt banks.
         monitor = getattr(getattr(core, "scheduler", None), "memory_monitor", None)
         if monitor is not None and hasattr(monitor, "clear_ane_prefill_transient"):

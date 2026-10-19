@@ -183,6 +183,54 @@ async def test_sampling_setting_change_keeps_cached_failure():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_kv_format_change_reloads_only_when_compression_is_enabled(enabled):
+    pool, entry = _failed_pool()
+    entry.engine = _idle_engine()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(turboquant_kv_enabled=enabled),
+        admin_routes.ModelSettingsRequest(turboquant_kv_scheme="affine4"),
+    )
+
+    assert result["settings"]["turboquant_kv_scheme"] == "affine4"
+    assert result["requires_reload"] is enabled
+    assert result["auto_unloaded"] is enabled
+    assert result["reload_deferred"] is False
+    assert pool._unload_engine.await_count == int(enabled)
+
+
+@pytest.mark.asyncio
+async def test_legacy_turboquant_bits_only_block_kv_changes():
+    pool, _ = _failed_pool()
+    legacy = ModelSettings(turboquant_kv_bits=5)
+
+    result = await _update_settings(
+        pool, legacy, admin_routes.ModelSettingsRequest(temperature=0.5)
+    )
+    assert result["settings"]["temperature"] == 0.5
+
+    manager = MagicMock()
+    manager.get_settings.return_value = ModelSettings(turboquant_kv_bits=5)
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await admin_routes.update_model_settings(
+            "ling",
+            admin_routes.ModelSettingsRequest(turboquant_kv_scheme="affine8"),
+            is_admin=True,
+        )
+    assert exc.value.status_code == 400
+    manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_qwen_ane_prefill_settings_are_persisted():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
