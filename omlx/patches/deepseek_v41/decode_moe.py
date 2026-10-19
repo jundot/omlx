@@ -26,6 +26,7 @@ from functools import cache
 import mlx.core as mx
 
 _HEADER = r"""
+#include <metal_simdgroup_matrix>
 constant float FP4_VALUES[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                                  -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 inline float e8m0(uchar s) { return s == 0 ? 0x1p-127f : as_type<float>(uint(s) << 23); }
@@ -116,6 +117,61 @@ inline void fp8_rows_nb(W w, S s, uint row0, X x, uint XS, uint lane, thread flo
         }
     }
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
+}
+// fp8_rows_nb on simdgroup matrices, for batches (NB >= 2): rows r0..r0+7 of an MXFP8 matrix
+// against NB <= 8 activation vectors (x + b * XS; vectors >= NB read as 0), written to
+// tile[row * 8 + vector] in threadgroup memory. Per 32-wide scale group a lane loads 8
+// contiguous weight bytes and float4 slices of two vectors feeding 4 MMAs (k-columns
+// base + 4c + j); the group sum is scaled by the row's e8m0 scale and accumulated, and the KS
+// simdgroups splitting K are summed in order. Why this is correct: every product is the
+// same exact fp8 x act_quant product as in fp8_rows; only the fp32 summation order differs,
+// which the reference leaves free (tensor-core order). Versus fp8_rows_nb it is not bitwise
+// equal: on real 1017 weights both match bf16(exact float64 dot) on >= 99.9% of outputs and
+// stay far inside the fp32 accumulation bound K * 2^-24 * sum|w x| (mma_accuracy.py).
+// It has threadgroup barriers: every simdgroup of the threadgroup must call it.
+template <int K, int KS, int NB, typename W, typename S, typename X>
+inline void fp8_mma8(W w, S s, uint r0, X x, uint XS, uint lane, uint ks,
+                     threadgroup float* red, threadgroup float* tile) {
+    constexpr int G = K / 32;
+    static_assert(K % 32 == 0 && G % KS == 0, "K split must cover whole scale groups");
+    constexpr int GPS = G / KS;
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    simdgroup_matrix<float, 8, 8> acc, part, a, b;
+    acc.thread_elements()[0] = 0.0f; acc.thread_elements()[1] = 0.0f;
+    const device uchar* wrow = reinterpret_cast<const device uchar*>(w + size_t(r0 + fm) * (K / 4));
+    const auto srow = s + size_t(r0 + fm) * G;
+    const bool v0 = int(fn) < NB, v1 = int(fn + 1) < NB;
+    const auto x0 = x + size_t(v0 ? fn : 0) * XS;
+    const auto x1 = x + size_t(v1 ? fn + 1 : 0) * XS;
+    for (int g = int(ks) * GPS; g < int(ks + 1) * GPS; ++g) {
+        const uint base = uint(g) * 32;
+        const uint2 wb = *reinterpret_cast<const device uint2*>(wrow + base + 4 * fn);
+        const float4 xa = v0 ? float4(x0[base + 4 * fm], x0[base + 4 * fm + 1], x0[base + 4 * fm + 2], x0[base + 4 * fm + 3]) : float4(0.0f);
+        const float4 xb = v1 ? float4(x1[base + 4 * fm], x1[base + 4 * fm + 1], x1[base + 4 * fm + 2], x1[base + 4 * fm + 3]) : float4(0.0f);
+        part.thread_elements()[0] = 0.0f; part.thread_elements()[1] = 0.0f;
+        for (int j = 0; j < 4; ++j) {
+            a.thread_elements()[0] = fp8_shifted((wb.x >> (8 * j)) & 255u);
+            a.thread_elements()[1] = fp8_shifted((wb.y >> (8 * j)) & 255u);
+            b.thread_elements()[0] = xa[j];
+            b.thread_elements()[1] = xb[j];
+            simdgroup_multiply_accumulate(part, a, b, part);
+        }
+        const float sc = e8m0(srow[g]) * 256.0f;
+        acc.thread_elements()[0] += part.thread_elements()[0] * sc;
+        acc.thread_elements()[1] += part.thread_elements()[1] * sc;
+    }
+    red[ks * 64 + fm * 8 + fn] = acc.thread_elements()[0];
+    red[ks * 64 + fm * 8 + fn + 1] = acc.thread_elements()[1];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) {
+        for (int e = 0; e < 2; ++e) {
+            float t = 0.0f;
+            for (int q = 0; q < KS; ++q) t += red[q * 64 + fm * 8 + fn + e];
+            tile[fm * 8 + fn + e] = t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 // Same for MXFP4 (8 values per uint32): 16 contiguous values per lane per step when K allows
 // (K % 512 == 0), else 8 (e.g. the 2304-wide expert down projection).
@@ -366,6 +422,64 @@ _UP_NB = r"""
         }
     }
 """
+# _UP_NB with the shared expert on simdgroup matrices (fp8_mma8); routed path unchanged.
+_UP_NB_MMA = r"""
+    threadgroup int chosen[8];
+    threadgroup float sv[32]; threadgroup int si[32];
+    threadgroup float hblock[NB][32];
+    const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint ys = threadgroup_position_in_grid.y;
+    const uint row0 = threadgroup_position_in_grid.x * 32 + sg * 4;
+    if (ys < uint(NB * TOPK)) {
+        const uint b = ys / TOPK, slot = ys % TOPK;
+        const device float* sc_b = scores + b * NE;
+        topk_select<NE, TOPK>(sc_b, bias, chosen, sv, si, tid, 256);
+        float wsum = 0.0f;
+        for (int j = 0; j < TOPK; ++j) wsum += sc_b[chosen[j]];
+        const float rw = sc_b[chosen[slot]] / (wsum + 1e-20f) * route_scale[0];
+        if (tid == 0 && threadgroup_position_in_grid.x == 0 && slot == 0)
+            for (int j = 0; j < TOPK; ++j) {
+                out_idx[b * TOPK + j] = chosen[j];
+                out_w[b * TOPK + j] = sc_b[chosen[j]] / (wsum + 1e-20f) * route_scale[0];
+            }
+        const uint e = uint(chosen[slot]);
+        float g4[4], u4[4];
+        fp4_rows<DIM, 4>(w1 + size_t(e) * INTER * (DIM / 8), s1p + size_t(e) * INTER * (DIM / 32), row0, xq + b * DIM, lane, g4);
+        fp4_rows<DIM, 4>(w3 + size_t(e) * INTER * (DIM / 8), s3p + size_t(e) * INTER * (DIM / 32), row0, xq + b * DIM, lane, u4);
+        if (lane < 4) {
+            float gate = float(bfloat16_t(g4[lane])), up = float(bfloat16_t(u4[lane]));
+            if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
+            float h = gate / (1.0f + metal::precise::exp(-gate)) * up;
+            h = rw * h;
+            hblock[0][sg * 4 + lane] = float(bfloat16_t(h));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            const float v = hblock[0][lane];
+            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
+            hq[(b * TOPK + slot) * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+        }
+    } else {
+        // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups
+        threadgroup float red[4][2 * 64], tg_g[4][64], tg_u[4][64];
+        const uint t = sg / 2, ks = sg % 2, r0 = threadgroup_position_in_grid.x * 32 + t * 8;
+        fp8_mma8<DIM, 2, NB>(sw1, ss1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[t]);
+        fp8_mma8<DIM, 2, NB>(sw3, ss3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[t]);
+        for (uint i = tid; i < uint(32 * NB); i += 256) {
+            const uint r = i % 32, b = i / 32;
+            float gate = float(bfloat16_t(tg_g[r / 8][(r % 8) * 8 + b])), up = float(bfloat16_t(tg_u[r / 8][(r % 8) * 8 + b]));
+            if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
+            hblock[b][r] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg < uint(NB)) {
+            const float v = hblock[sg][lane];
+            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
+            hqs[sg * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+        }
+    }
+"""
 
 # Down, routed: one threadgroup per (4 output rows, token), simdgroup = routed slot; the fp32
 # sum over slots in slot order is kept unrounded for the shared expert's addition.
@@ -397,9 +511,34 @@ _DOWN_S_NB = r"""
             out[b * DIM + row0 + lane] = bfloat16_t(partial[b * DIM + row0 + lane] + float(bfloat16_t(acc[lane * NB + b])));
 """
 
+# _DOWN_S_NB on simdgroup matrices: one 8-row tile per threadgroup, K split over 2 simdgroups.
+_DOWN_S_NB_MMA = r"""
+    threadgroup float red[2 * 64], tile[64];
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
+    const uint r0 = threadgroup_position_in_grid.x * 8;
+    fp8_mma8<INTER, 2, NB>(sw2, ss2, r0, hqs, uint(INTER), lane, sg, red, tile);
+    for (uint i = tid; i < uint(8 * NB); i += 64) {
+        const uint r = i % 8, b = i / 8;
+        out[b * DIM + r0 + r] = bfloat16_t(partial[b * DIM + r0 + r] + float(bfloat16_t(tile[r * 8 + b])));
+    }
+"""
+
+
+
+# Batched FP8 GEMVs run on simdgroup matrices from MMA_MIN_BATCH vectors: a request's result
+# then agrees with decoding it alone within fp32 summation rounding (see fp8_mma8), an order
+# the reference leaves free. Fewer vectors run the fp8_rows_nb kernels, bit for bit per
+# request: below 4 most of each 8-wide matrix tile is padding and they are faster
+# (BatchGenerator decode, M3 Ultra, 1017 weights: B=2 -8%, B=4 +4%, B=8 +31% on matrices).
+MMA_MIN_BATCH = 4
+
+
+def use_mma(nb):
+    return nb >= MMA_MIN_BATCH
+
 
 @cache
-def _kernels_nb():
+def _kernels_nb(mma=False):
     gate = mx.fast.metal_kernel(name="v41_decode_moe_gate_nb", input_names=["x", "w", "temp"],
                                 output_names=["scores", "xq"], source=_GATE_NB, header=_HEADER)
     up = mx.fast.metal_kernel(
@@ -411,14 +550,23 @@ def _kernels_nb():
                                   output_names=["partial"], source=_DOWN_R_NB, header=_HEADER)
     down_s = mx.fast.metal_kernel(name="v41_decode_moe_down_shared_nb", input_names=["hqs", "partial", "sw2", "ss2"],
                                   output_names=["out"], source=_DOWN_S_NB, header=_HEADER)
+    if mma:
+        up = mx.fast.metal_kernel(
+            name="v41_decode_moe_up_nb_mma",
+            input_names=["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "w3", "s3p",
+                         "sw1", "ss1", "sw3", "ss3"],
+            output_names=["hq", "hqs", "out_idx", "out_w"], source=_UP_NB_MMA, header=_HEADER)
+        down_s = mx.fast.metal_kernel(name="v41_decode_moe_down_shared_nb_mma",
+                                      input_names=["hqs", "partial", "sw2", "ss2"],
+                                      output_names=["out"], source=_DOWN_S_NB_MMA, header=_HEADER)
     return gate, up, down_r, down_s
 
 
 def fused_decode_moe_nb(moe, x, config):
     """NB tokens at once. x: [NB, dim] bf16 (ffn_norm outputs). Returns [NB, dim] bf16; each
     token's result equals fused_decode_moe on that token alone."""
-    gate_k, up_k, down_r, down_s = _kernels_nb()
     nb = x.shape[0]
+    gate_k, up_k, down_r, down_s = _kernels_nb(use_mma(nb))
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
     tpg = 256
     n_tg = (ne + tpg // 32 - 1) // (tpg // 32)

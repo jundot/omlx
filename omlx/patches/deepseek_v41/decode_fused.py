@@ -302,12 +302,31 @@ def mix_nb(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
     return coef.reshape(b_n, mixw), xn.reshape(b_n, dim), xq.reshape(b_n, dim), h
 
 
+def _mma_split(tiles, groups):
+    """K split for fp8_mma8: enough threadgroups to fill the GPU, whole scale groups each."""
+    for ks in ((1,) if tiles >= 2048 else (2, 1) if tiles >= 512 else (4, 2, 1)):
+        if groups % ks == 0:
+            return ks
+    return 1
+
+
 def gemv_fp8_nb(x, a, b=None):
     """gemv_fp8 for x [B, K]: one weight read for all B vectors."""
     b_n = x.shape[0]
     na, k = a.weight.shape[0], a.weight.shape[1] * 4
     nb = 0 if b is None else b.weight.shape[0]
     assert na % 4 == 0 and nb % 4 == 0
+    if DM.use_mma(b_n) and na % 8 == 0 and nb % 8 == 0:
+        # 8-element dummies: inputs under 8 elements are passed in constant address space.
+        dw, ds = _const((0,) * 8, mx.uint32), _const((0,) * 8, mx.uint8)
+        tiles = (na + nb) // 8
+        ks = _mma_split(tiles, k // 32)
+        ya, yb = DL.kernel("gemv_fp8_mma")(
+            inputs=[x, a.weight, a.scales, b.weight if b is not None else dw, b.scales if b is not None else ds],
+            template=[("NA", na), ("NB_ROWS", nb), ("K", k), ("NB", b_n), ("KS", ks)],
+            grid=(tiles * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
+            output_shapes=[(b_n * na,), (b_n * max(nb, 1),)], output_dtypes=[mx.bfloat16, mx.bfloat16])
+        return ya.reshape(b_n, na), (yb.reshape(b_n, nb) if b is not None else None)
     dummy_w, dummy_s = _dummy(mx.uint32), _dummy(mx.uint8)
     ya, yb = DL.kernel("gemv_fp8_nb")(
         inputs=[x, a.weight, a.scales, b.weight if b is not None else dummy_w, b.scales if b is not None else dummy_s],
@@ -405,11 +424,19 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
         output_dtypes=[mx.bfloat16, mx.float32, mx.uint8])
     qr, qrq, packed = qr.reshape(b_n, -1), qrq.reshape(b_n, -1), packed.reshape(b_n, -1)
     nq = c.n_heads * c.head_dim
-    q = DL.kernel("wqb_rope_nb")(
-        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin],
-        template=[("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n)],
-        grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
-        output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
+    if DM.use_mma(b_n):
+        ks = _mma_split(nq // 8, c.q_lora_rank // 32)
+        q = DL.kernel("wqb_rope_mma")(
+            inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin],
+            template=[("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n), ("KS", ks)],
+            grid=(nq // 8 * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
+            output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
+    else:
+        q = DL.kernel("wqb_rope_nb")(
+            inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin],
+            template=[("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n)],
+            grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
+            output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
     oq = batched_attention(att, q, packed, x, qr, caches, shareds, starts, cos, sin, c)
     if oq is None:   # a request still filling its window: per-request attention
         xs, qrs, qs, ps = mx.split(x, b_n), mx.split(qr, b_n), mx.split(q, b_n), mx.split(packed, b_n)
@@ -419,11 +446,18 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
                              for r in range(b_n)])
     wq, ws = _woa_mxfp8(att)
     rows = c.o_groups * c.o_lora_rank
-    yq = DL.kernel("woa_nb")(
-        inputs=[oq, wq, ws],
-        template=[("R", c.o_lora_rank), ("K", nq // c.o_groups), ("G", c.o_groups), ("NB", b_n)],
-        grid=(rows // 32 * 256, 1, 1), threadgroup=(256, 1, 1),
-        output_shapes=[(b_n * rows,)], output_dtypes=[mx.float32])[0].reshape(b_n, rows)
+    if DM.use_mma(b_n):
+        yq = DL.kernel("woa_mma")(
+            inputs=[oq, wq, ws],
+            template=[("R", c.o_lora_rank), ("K", nq // c.o_groups), ("G", c.o_groups), ("NB", b_n), ("KS", 2)],
+            grid=(rows // 32 * 256, 1, 1), threadgroup=(256, 1, 1),
+            output_shapes=[(b_n * rows,)], output_dtypes=[mx.float32])[0].reshape(b_n, rows)
+    else:
+        yq = DL.kernel("woa_nb")(
+            inputs=[oq, wq, ws],
+            template=[("R", c.o_lora_rank), ("K", nq // c.o_groups), ("G", c.o_groups), ("NB", b_n)],
+            grid=(rows // 32 * 256, 1, 1), threadgroup=(256, 1, 1),
+            output_shapes=[(b_n * rows,)], output_dtypes=[mx.float32])[0].reshape(b_n, rows)
     a, _ = gemv_fp8_nb(yq, att.wo_b)
     coef_f, x2, _, h2 = mix_nb(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
     fp, fo, fc = coef_f[:, :hc], coef_f[:, hc:2 * hc], coef_f[:, 2 * hc:]

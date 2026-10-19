@@ -972,8 +972,9 @@ class LanguageModel(DSparkMixin, nn.Module):
 
         Same per-request semantics as the row loop below (positions, caches, Engram history,
         cache bookkeeping). decode_fused.decode_block_nb, Engram (each request's row projected
-        on its own) and project_logits give each request bit for bit its single-request
-        result.
+        on its own) and project_logits give each request its single-request result: bit for
+        bit below decode_moe.MMA_MIN_BATCH requests, and within the fp32 summation rounding of
+        the simdgroup-matrix GEMVs from there on.
         """
         c = self._config
         b_n = input_ids.shape[0]

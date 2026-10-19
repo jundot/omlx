@@ -151,12 +151,15 @@ def test_fused_decode_rejects_unsupported_layouts():
     assert not decode_fused.supported(model.layers[3], c)
 
 
-@pytest.mark.parametrize("batch", [2, 3])
+@pytest.mark.parametrize("batch", [2, 3, 8])
 def test_batched_decode_matches_single_requests(monkeypatch, batch):
-    """B single-token requests through decode_block_nb give each request the logits it gets
+    """On the row kernels (below decode_moe.MMA_MIN_BATCH requests, and in MTP verify blocks),
+    B single-token requests through decode_block_nb give each request the logits it gets
     decoding alone (per-request arithmetic is the single-request kernels')."""
+    from omlx.patches.deepseek_v41 import decode_moe
     from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 
+    monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
     model = build()
     calls = {"nb": 0}
     real = decode_fused.decode_block_nb
@@ -195,6 +198,97 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch):
     assert attention["batched"] == 4 * model._config.n_layers   # windows are full: request-batched attention
 
 
+def _aq(rng, nb, k):
+    from omlx.patches.deepseek_v41.quantization import quantize_activation
+
+    x = mx.array(rng.normal(0, 1, (nb, k)).astype(np.float32)).astype(mx.bfloat16)
+    return quantize_activation(x).astype(mx.float32)
+
+
+@pytest.mark.parametrize("nb", [4, 5, 8])
+def test_batched_fp8_mma_projection_within_fp32_summation_of_exact(monkeypatch, nb):
+    """Batched projections run on simdgroup matrices from decode_moe.MMA_MIN_BATCH vectors.
+    Every product is exact (fp8 weight x act_quant activation), so each output must equal
+    the float64 dot product up to fp32 summation rounding (K * 2^-24 * sum|w x|) plus the
+    bf16 rounding."""
+    from omlx.patches.deepseek_v41 import decode_layer
+
+    names = []
+    real_kernel = decode_layer.kernel
+    monkeypatch.setattr(decode_layer, "kernel", lambda name: (names.append(name), real_kernel(name))[1])
+    att = build().layers[0].attn
+    k = att.wq_a.weight.shape[1] * 4
+    x = _aq(np.random.default_rng(nb), nb, k)
+    ya, yb = decode_fused.gemv_fp8_nb(x, att.wq_a, att.wkv)
+    assert names == ["gemv_fp8_mma"]
+    X = np.asarray(x).astype(np.float64)
+    for proj, y in ((att.wq_a, ya), (att.wkv, yb)):
+        W = mx.dequantize(proj.weight, proj.scales, None, group_size=32, bits=8, mode="mxfp8", dtype=mx.float32)
+        W = np.asarray(W).astype(np.float64)
+        exact = X @ W.T
+        bound = k * 2.0**-24 * (np.abs(X) @ np.abs(W).T)
+        got = np.asarray(y.astype(mx.float32)).astype(np.float64)
+        top = np.maximum(np.abs(got), np.abs(exact))
+        half_ulp = 2.0 ** (np.floor(np.log2(np.maximum(top, 2.0**-126))) - 8)
+        assert np.all(np.abs(got - exact) <= bound + half_ulp)
+
+
+@pytest.mark.parametrize("nb", [4, 8])
+def test_batched_mma_kernels_match_rows_kernels(monkeypatch, nb):
+    """Each simdgroup-matrix kernel (wq_b+RoPE, wo_a+act_quant, MoE shared expert) agrees with
+    its fp8_rows_nb counterpart up to summation rounding; MoE routing is untouched."""
+    from omlx.patches.deepseek_v41 import decode_layer as DL, decode_moe
+
+    model = build()
+    c = model._config
+    blk = model.layers[0]
+    att = blk.attn
+    rng = np.random.default_rng(31 + nb)
+    nq, rows = c.n_heads * c.head_dim, c.o_groups * c.o_lora_rank
+    qrq = _aq(rng, nb, c.q_lora_rank)
+    cos = mx.array(rng.normal(0, 1, (nb, c.rope_head_dim // 2)).astype(np.float32))
+    sin = mx.array(rng.normal(0, 1, (nb, c.rope_head_dim // 2)).astype(np.float32))
+    ks = decode_fused._mma_split(nq // 8, c.q_lora_rank // 32)
+    tmpl = [("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", nb)]
+    q_mma = DL.kernel("wqb_rope_mma")(
+        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl + [("KS", ks)],
+        grid=(nq // 8 * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
+        output_shapes=[(nb * nq,)], output_dtypes=[mx.bfloat16])[0]
+    q_rows = DL.kernel("wqb_rope_nb")(
+        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl,
+        grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
+        output_shapes=[(nb * nq,)], output_dtypes=[mx.bfloat16])[0]
+    np.testing.assert_allclose(q_mma.astype(mx.float32), q_rows.astype(mx.float32), rtol=2**-6, atol=1e-6)
+    oq = _aq(rng, nb, nq)
+    wq, ws = decode_fused._woa_mxfp8(att)
+    tmpl = [("R", c.o_lora_rank), ("K", nq // c.o_groups), ("G", c.o_groups), ("NB", nb)]
+    y_mma = DL.kernel("woa_mma")(
+        inputs=[oq, wq, ws], template=tmpl + [("KS", 2)], grid=(rows // 32 * 256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(nb * rows,)], output_dtypes=[mx.float32])[0]
+    y_rows = DL.kernel("woa_nb")(
+        inputs=[oq, wq, ws], template=tmpl, grid=(rows // 32 * 256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(nb * rows,)], output_dtypes=[mx.float32])[0]
+    assert np.mean(np.asarray(y_mma) == np.asarray(y_rows)) > 0.99   # act_quant can flip a step at a rounding tie
+    x = mx.array(rng.normal(0, 1, (nb, c.dim)).astype(np.float32)).astype(mx.bfloat16)
+    out_mma, idx_mma, _ = decode_moe.fused_decode_moe_nb(blk.ffn, x, c)
+    monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
+    out_rows, idx_rows, _ = decode_moe.fused_decode_moe_nb(blk.ffn, x, c)
+    np.testing.assert_array_equal(idx_mma, idx_rows)
+    np.testing.assert_allclose(out_mma.astype(mx.float32), out_rows.astype(mx.float32), rtol=2**-6, atol=1e-5)
+
+
+def test_small_batches_keep_rows_kernels(monkeypatch):
+    """Below MMA_MIN_BATCH the fp8_rows_nb kernels stay in use (faster there)."""
+    from omlx.patches.deepseek_v41 import decode_layer, decode_moe
+
+    names = []
+    real_kernel = decode_layer.kernel
+    monkeypatch.setattr(decode_layer, "kernel", lambda name: (names.append(name), real_kernel(name))[1])
+    att = build().layers[0].attn
+    decode_fused.gemv_fp8_nb(_aq(np.random.default_rng(3), decode_moe.MMA_MIN_BATCH - 1, att.wq_a.weight.shape[1] * 4), att.wq_a, att.wkv)
+    assert names == ["gemv_fp8_nb"]
+
+
 @pytest.mark.parametrize("nb", [2, 3, 8])
 def test_batched_moe_matches_single_token_moe(monkeypatch, nb):
     """Without matrix tiles, each token of the batched MoE gets the single-token kernels'
@@ -202,6 +296,7 @@ def test_batched_moe_matches_single_token_moe(monkeypatch, nb):
     routed kernels then dispatch every token of a row block together (see _UP_NB)."""
     from omlx.patches.deepseek_v41 import decode_moe
 
+    monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
     model = build(n_routed_experts=16, n_activated_experts=4)   # >2 slots: their sum order shows
     c = model._config
     rng = np.random.default_rng(23 + nb)

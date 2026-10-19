@@ -484,6 +484,59 @@ _WOA_NB = r"""
     }
 """
 
+# Batched projections on simdgroup matrices (fp8_mma8; used from decode_moe.MMA_MIN_BATCH
+# vectors). Epilogues are the fp8_rows_nb kernels' own.
+_GEMV_FP8_MMA = r"""
+    threadgroup float red[KS * 64], tile[64];
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
+    const uint r0 = threadgroup_position_in_grid.x * 8;
+    const bool in_b = r0 >= uint(NA);                      // uniform per threadgroup
+    if (in_b) fp8_mma8<K, KS, NB>(wb, sb, r0 - NA, x, uint(K), lane, sg, red, tile);
+    else fp8_mma8<K, KS, NB>(wa, sa, r0, x, uint(K), lane, sg, red, tile);
+    for (uint i = tid; i < uint(8 * NB); i += KS * 32) {
+        const uint r = i % 8, b = i / 8;
+        if (in_b) yb[b * NB_ROWS + r0 - NA + r] = bfloat16_t(tile[r * 8 + b]);
+        else ya[b * NA + r0 + r] = bfloat16_t(tile[r * 8 + b]);
+    }
+"""
+_WQB_ROPE_MMA = r"""
+    threadgroup float red[KS * 64], tile[64];
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
+    const uint r0 = threadgroup_position_in_grid.x * 8;
+    fp8_mma8<K, KS, NB>(w, sc, r0, x, uint(K), lane, sg, red, tile);
+    for (uint i = tid; i < uint(4 * NB); i += KS * 32) {
+        const uint pr = i % 4, b = i / 4;                 // request b, RoPE pair (r0 + 2 pr, +1)
+        float a = float(bfloat16_t(tile[(2 * pr) * 8 + b])), c = float(bfloat16_t(tile[(2 * pr + 1) * 8 + b]));
+        const uint d = (r0 + 2 * pr) % HD;
+        if (d >= uint(HD - RD)) {
+            const uint p = (d - (HD - RD)) / 2;
+            const float cs = cosv[b * (RD / 2) + p], sn = sinv[b * (RD / 2) + p];
+            const float ra = a * cs - c * sn, rc = a * sn + c * cs;
+            a = ra; c = rc;
+        }
+        y[b * N + r0 + 2 * pr] = bfloat16_t(a);
+        y[b * N + r0 + 2 * pr + 1] = bfloat16_t(c);
+    }
+"""
+_WOA_MMA = r"""
+    // 32 rows (one act_quant group) per threadgroup: 4 row tiles x KS K-splits
+    threadgroup float red[4][KS * 64], tl[4][64], yb[NB][32];
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
+    const uint t = sg / KS, ks = sg % KS, row32 = threadgroup_position_in_grid.x * 32;
+    const uint g = row32 / R;
+    fp8_mma8<K, KS, NB>(w, sc, row32 + t * 8, x + g * K, uint(G * K), lane, ks, red[t], tl[t]);
+    for (uint i = tid; i < uint(32 * NB); i += 4 * KS * 32) {
+        const uint r = i % 32, b = i / 32;
+        yb[b][r] = float(bfloat16_t(tl[r / 8][(r % 8) * 8 + b]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg < uint(NB)) {
+        const float v = yb[sg][lane];
+        const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
+        yq[sg * (G * R) + row32 + lane] = act_quant_value(v, s);
+    }
+"""
+
 # Standalone hc_post (last step of a layer).
 _HC_POST = r"""
     const uint col = thread_position_in_grid.x;
@@ -558,6 +611,9 @@ def kernel(name):
         "gemv_fp8_nb": (["x", "wa", "sa", "wb", "sb"], ["ya", "yb"], _GEMV_FP8_NB),
         "wqb_rope_nb": (["x", "w", "sc", "cosv", "sinv"], ["y"], _WQB_ROPE_NB),
         "woa_nb": (["x", "w", "sc"], ["yq"], _WOA_NB),
+        "gemv_fp8_mma": (["x", "wa", "sa", "wb", "sb"], ["ya", "yb"], _GEMV_FP8_MMA),
+        "wqb_rope_mma": (["x", "w", "sc", "cosv", "sinv"], ["y"], _WQB_ROPE_MMA),
+        "woa_mma": (["x", "w", "sc"], ["yq"], _WOA_MMA),
         "attn_scores_bq": (["q_all", "window_all", "pooled_all", "wi_all", "ci_all", "meta_all", "scalep"],
                            ["S_all", "BMAX_all"], _ATTN_SCORES_B),
         "attn_pv_bq": (["window_all", "pooled_all", "wi_all", "ci_all", "meta_all", "S_all", "BMAX_all"],
