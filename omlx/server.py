@@ -3388,16 +3388,23 @@ def _entry_scheduler(engine):
 
 
 def _turboquant_ineligible_reason(scheduler) -> str | None:
-    """Why an armed model's TurboQuant KV still falls back to fp16, or None.
+    """Why an armed model's KV cache still stays in its native layout, or None.
 
     Reuses the scheduler's own (memoized) vetoes instead of duplicating the
     model introspection, so the reason reported here is the one the request
     path acted on.
+
+    The attention-sink veto is scheme-dependent, matching
+    ``_can_convert_caches_to_turboquant``: only TurboQuant's cache states miss
+    what those models need, so an Affine4/Affine8 model with sinks does convert
+    and must not be reported as ineligible.
     """
     if scheduler._model_uses_mla():
         return "model uses Multi-head Latent Attention (MLA)"
-    if scheduler._model_uses_attention_sinks():
-        return "model uses attention sinks"
+    scheme = getattr(scheduler, "_turboquant_kv_scheme", "turboquant")
+    if scheme not in ("affine4", "affine8"):
+        if scheduler._model_uses_attention_sinks():
+            return "model uses attention sinks"
     return None
 
 

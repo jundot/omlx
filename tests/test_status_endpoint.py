@@ -392,6 +392,35 @@ class TestStatusTurboQuant:
         assert report["active"] is False
         assert expected_reason in report["reason"]
 
+    @pytest.mark.parametrize("scheme", ["affine4", "affine8"])
+    def test_affine_scheme_keeps_attention_sink_models_active(self, client, scheme):
+        """Only TurboQuant's cache states clash with attention sinks.
+
+        ``_can_convert_caches_to_turboquant`` lets Affine4/Affine8 convert those
+        models, so status must not report them as ineligible while the layers
+        are in fact converted.
+        """
+        settings = SimpleNamespace(turboquant_kv_enabled=True, turboquant_kv_bits=4)
+        scheduler = SimpleNamespace(
+            _turboquant_kv_bits=4.0,
+            _turboquant_kv_scheme=scheme,
+            _turboquant_kv_converted_layers=6,
+            _model_uses_mla=lambda: False,
+            _model_uses_attention_sinks=lambda: True,
+        )
+        self._state.engine_pool = _pool_with_entries(
+            {
+                "sink-model": _entry(_engine_with_scheduler(scheduler, settings)),
+            }
+        )
+
+        data = client.get("/api/status").json()
+
+        report = data["turboquant"]["models"][0]
+        assert report["active"] is True
+        assert report["converted_layers"] == 6
+        assert "reason" not in report
+
     def test_unrequested_and_unloaded_models_are_omitted(self, client):
         scheduler = SimpleNamespace(
             _turboquant_kv_bits=None,
