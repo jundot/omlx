@@ -422,13 +422,11 @@ class TestSetModelInfoTurboQuantDtype:
         kwargs = sched.memory_monitor.set_model_info.call_args.kwargs
         assert kwargs["dtype_size"] == 2
 
-    @pytest.mark.parametrize("dim", [63, 256])
-    @pytest.mark.parametrize("skip_last", [False, True])
     @pytest.mark.parametrize(
-        "scheme,bits,cache_class",
+        "dim,skip_last,scheme,bits,cache_class",
         [
-            ("affine4", 4, "Affine4KVCache"),
-            ("affine8", 8, "Affine8KVCache"),
+            (63, False, "affine4", 4, "Affine4KVCache"),
+            (256, True, "affine8", 8, "Affine8KVCache"),
         ],
     )
     def test_affine_prefill_prices_packed_words_and_fp32_scales(

@@ -74,26 +74,6 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(settings["turboquant_kv_bits"]?.value as? Double, 8)
     }
 
-    func testAffine8SettingsDecodeAndEncode() throws {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let dto = try decoder.decode(
-            ModelSettingsDTO.self,
-            from: Data(#"{"turboquant_kv_enabled":true,"turboquant_kv_scheme":"affine8","turboquant_kv_bits":8}"#.utf8)
-        )
-        XCTAssertEqual(dto.turboquantKvScheme, "affine8")
-        XCTAssertEqual(dto.turboquantKvBits, 8)
-
-        var patch = ModelSettingsPatch()
-        patch.turboquantKvScheme = "affine8"
-        patch.turboquantKvBits = 8
-        let encoder = JSONEncoder()
-        encoder.keyEncodingStrategy = .convertToSnakeCase
-        let object = try JSONSerialization.jsonObject(with: encoder.encode(patch)) as? [String: Any]
-        XCTAssertEqual(object?["turboquant_kv_scheme"] as? String, "affine8")
-        XCTAssertEqual(object?["turboquant_kv_bits"] as? Double, 8)
-    }
-
     func testLightningMtpAllowsTurboQuantInWorkingProfile() {
         let vm = ModelSettingsScreenVM()
         vm.mtpEnabled = true

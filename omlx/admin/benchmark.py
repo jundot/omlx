@@ -38,19 +38,7 @@ logger = logging.getLogger(__name__)
 _benchmark_runs: dict[str, "BenchmarkRun"] = {}
 
 # Valid prompt lengths for single request tests
-VALID_PROMPT_LENGTHS = [
-    1024,
-    4096,
-    8192,
-    16384,
-    32768,
-    50000,
-    65536,
-    131072,
-    150000,
-    200000,
-    250000,
-]
+VALID_PROMPT_LENGTHS = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 200000]
 
 # Valid batch sizes for continuous batching tests
 VALID_BATCH_SIZES = [2, 4, 8]
@@ -675,7 +663,6 @@ def _compute_single_metrics(
         "e2e_latency_s": round(e2e_duration, 3),
         "total_throughput": round(total_throughput, 1),
         "peak_memory_bytes": peak_memory,
-        "peak_memory_source": "mlx_active",
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,
@@ -1191,7 +1178,6 @@ async def _run_batch_test(
         "e2e_latency_s": round(wall_time, 3),
         "peak_memory_bytes": peak_memory,
         "total_gen_tokens": total_gen_tokens,
-        "peak_memory_source": "mlx_active",
         "batch_size": batch_size,
     }
 
@@ -1229,7 +1215,6 @@ async def _run_external_single_test(
         timing_observed=stats.content_observed,
     )
     metrics["peak_memory_bytes"] = None
-    metrics["peak_memory_source"] = None
     return metrics
 
 

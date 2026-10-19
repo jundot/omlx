@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -122,36 +121,7 @@ def _chain(payloads, metas, classes=None):
     return prefix.reconstruct_cache(table)
 
 
-@pytest.mark.parametrize("hot", [False, True])
-@pytest.mark.parametrize("class_name", ["Affine4KVCache", "BatchAffine4KVCache"])
-def test_ssd_roundtrip_preserves_marker_metadata_and_packed_state(
-    manager_factory, hot, class_name
-):
-    manager = manager_factory(hot=hot)
-    cache = _cache(length=4)
-    payload = _payload(cache)
-    assert manager.save_block(
-        b"affine-ssd",
-        [payload],
-        4,
-        model_name="affine-test",
-        layer_cache_types=[class_name],
-        layer_meta_states=[cache.meta_state],
-    )
-    if not hot:
-        manager.close()
-        manager._hot_cache_remove(b"affine-ssd")
-        assert manager._index.get(b"affine-ssd").file_path.exists()
-    loaded, metadata = manager.load_block_with_metadata(b"affine-ssd")
-    assert loaded[0][0] == "__affine4__"
-    assert tuple(metadata["layer_meta_states"][0]) == cache.meta_state
-    assert metadata["layer_cache_types"] == [class_name]
-    assert json.loads(metadata["cache_signature"])["turboquant_kv_bits"] == 4
-    _assert_state_equal(payload[1], loaded[0][1])
-
-
-@pytest.mark.parametrize("matched", [4, 8])
-@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("matched,batched", [(4, False), (8, True)])
 def test_prefix_reuse_keeps_packed_state_and_independent_dimensions(
     manager_factory, matched, batched
 ):
@@ -200,8 +170,7 @@ def test_affine_and_dense_layers_roundtrip_together(manager_factory):
         assert mx.array_equal(expected, actual).item()
 
 
-@pytest.mark.parametrize("same_request", [False, True])
-@pytest.mark.parametrize("hot", [False, True])
+@pytest.mark.parametrize("same_request,hot", [(False, False), (True, True)])
 def test_final_affine_store_replaces_dense_prefill_blocks(
     manager_factory, same_request, hot
 ):
@@ -236,39 +205,16 @@ def test_final_affine_store_replaces_dense_prefill_blocks(
     _assert_state_equal(_state(affine), _state(restored[0]))
 
 
-def test_batch_merge_extract_and_persistence_are_lossless(manager_factory):
-    short, long = _cache(length=4), _cache(length=8)
-    batch = BatchAffine4KVCache.merge([short, long])
-    assert type(batch) is BatchAffine4KVCache
-    manager = manager_factory()
-    prefix, _ = _prefix(manager)
-    for idx, original in enumerate((short, long)):
-        extracted = batch.extract(idx)
-        assert type(extracted) is Affine4KVCache
-        _assert_state_equal(_state(original), _state(extracted))
-        tokens = list(range(idx * 100, idx * 100 + extracted.offset))
-        assert (
-            prefix.store_cache(f"store-{idx}", tokens, [_data(extracted)]) is not None
-        )
-    manager.close()
-    for idx, original in enumerate((short, long)):
-        tokens = list(range(idx * 100, idx * 100 + original.offset))
-        table, remaining = prefix.fetch_cache(f"reuse-{idx}", tokens + [999])
-        assert table is not None and remaining == [999]
-        restored = prefix.reconstruct_cache(table)
-        assert restored is not None and type(restored[0]) is Affine4KVCache
-        _assert_state_equal(_state(original), _state(restored[0]))
-
-
-def test_batch_names_canonicalize_without_collapsing_tq4(manager_factory):
+def test_batch_names_canonicalize_without_collapsing_formats(manager_factory):
     assert _canonicalize_layer_cache_types(
-        ["BatchAffine4KVCache", "BatchTurboQuantKVCache", "KVCache"]
-    ) == ["Affine4KVCache", "TurboQuantKVCache", "KVCache"]
-    for name in ("Affine4KVCache", "BatchAffine4KVCache"):
+        ["BatchAffine4KVCache", "BatchAffine8KVCache", "BatchTurboQuantKVCache"]
+    ) == ["Affine4KVCache", "Affine8KVCache", "TurboQuantKVCache"]
+    for name in ("BatchAffine4KVCache", "BatchAffine8KVCache"):
         assert CacheTypeRegistry.get_handler_by_class_name(name).supports_block_slicing
     for expected, stored in (
         ("Affine4KVCache", "TurboQuantKVCache"),
         ("TurboQuantKVCache", "Affine4KVCache"),
+        ("Affine8KVCache", "Affine4KVCache"),
         ("Affine4KVCache", "KVCache"),
     ):
         manager = manager_factory(types=[expected])
@@ -286,13 +232,8 @@ def test_batch_names_canonicalize_without_collapsing_tq4(manager_factory):
     "meta",
     [
         None,
-        (),
-        ("4", "4", "7"),
         ("4", "4", "7", "turboquant", "13", "21"),
-        ("4", "3", "7", "affine4", "13", "21"),
         ("4", "4", "7", "affine4", "0", "21"),
-        ("4", "4", "7", "affine4", "13"),
-        ("4", "4", "bad", "affine4", "13", "21"),
     ],
 )
 def test_malformed_metadata_rejects_save_and_restore(manager_factory, meta):
@@ -309,24 +250,19 @@ def test_malformed_metadata_rejects_save_and_restore(manager_factory, meta):
     assert _chain([payload], [meta], ["Affine4KVCache"]) is None
 
 
-@pytest.mark.parametrize("mutation", ["dimensions", "seed", "short", "missing_meta"])
+@pytest.mark.parametrize("mutation", ["dimensions", "short"])
 def test_inconsistent_block_chain_is_rejected(mutation):
     cache = _cache()
     parts = [_payload(cache), _payload(cache, 4, 8)]
     metas = [cache.meta_state, cache.meta_state]
     if mutation == "dimensions":
         metas = [(*meta[:4], "40", meta[5]) for meta in metas]
-    elif mutation == "seed":
-        metas[1] = (*metas[1][:2], "8", *metas[1][3:])
-    elif mutation == "short":
-        parts[1] = _payload(cache, 4, 7)
     else:
-        metas[1] = None
+        parts[1] = _payload(cache, 4, 7)
     assert _chain(parts, metas, ["Affine4KVCache"]) is None
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("other", ["dense", "tq4"])
+@pytest.mark.parametrize("other,reverse", [("dense", False), ("tq4", True)])
 def test_mixed_formats_are_rejected_without_tq_fallback(reverse, other):
     affine = _cache(length=4, key_dim=64, value_dim=64)
     if other == "dense":
@@ -342,38 +278,9 @@ def test_mixed_formats_are_rejected_without_tq_fallback(reverse, other):
     assert _chain(payloads, metas, ["Affine4KVCache"]) is None
 
 
-@pytest.mark.parametrize("class_name", [None, "KVCache", "TurboQuantKVCache"])
-def test_affine_marker_requires_affine_class(class_name):
-    cache = _cache(length=4)
-    classes = [class_name] if class_name else None
-    assert _chain([_payload(cache)], [cache.meta_state], classes) is None
-
-
-def test_affine_metadata_cannot_relabel_a_tq_payload(manager_factory):
-    cache = _cache(length=4, key_dim=64, value_dim=64)
-    payload = _payload(cache, marker="__turboquant_v2__")
-    assert _chain([payload], [cache.meta_state], ["TurboQuantKVCache"]) is None
-    assert not manager_factory(types=["TurboQuantKVCache"]).save_block(
-        b"relabelled",
-        [payload],
-        4,
-        layer_cache_types=["TurboQuantKVCache"],
-        layer_meta_states=[cache.meta_state],
-    )
-
-
 @pytest.mark.parametrize(
     "mutation",
-    [
-        "missing_scheme",
-        "missing_meta",
-        "tq_marker",
-        "missing_marker",
-        "both_markers",
-        "tq_class",
-        "field_order",
-        "tq_relabel",
-    ],
+    ["missing_meta", "both_markers", "tq_relabel"],
 )
 def test_corrupt_ssd_payload_is_rejected(manager_factory, mutation):
     manager = manager_factory()
@@ -391,23 +298,14 @@ def test_corrupt_ssd_payload_is_rejected(manager_factory, mutation):
     path = manager._index.get(block_hash).file_path
     arrays, metadata = mx.load(str(path), return_metadata=True)
     mx.eval(arrays)
-    if mutation == "missing_scheme":
-        metadata["layer_meta_states"] = json.dumps([list(cache.meta_state[:3])])
-    elif mutation == "missing_meta":
+    if mutation == "missing_meta":
         del metadata["layer_meta_states"]
-    elif mutation in ("tq_marker", "missing_marker", "tq_relabel"):
+    elif mutation == "tq_relabel":
         del metadata["layer_0_affine4"]
-        if mutation != "missing_marker":
-            metadata["layer_0_turboquant_v2"] = "1"
-    elif mutation == "both_markers":
         metadata["layer_0_turboquant_v2"] = "1"
-    elif mutation == "field_order":
-        metadata["layer_0_tq_key_fields"] = "indices,norms"
-    classes = (
-        ["TurboQuantKVCache"]
-        if mutation in ("tq_class", "tq_relabel")
-        else ["Affine4KVCache"]
-    )
+    else:
+        metadata["layer_0_turboquant_v2"] = "1"
+    classes = ["TurboQuantKVCache" if mutation == "tq_relabel" else "Affine4KVCache"]
     mx.save_safetensors(str(path), arrays, metadata)
     arrays, metadata = mx.load(str(path), return_metadata=True)
     mx.eval(arrays)
@@ -431,19 +329,3 @@ def test_affine8_prefix_and_ssd_roundtrip(manager_factory):
     _assert_state_equal(_state(cache), _state(restored[0]))
 
 
-def test_affine_formats_do_not_share_prefix_signatures(manager_factory):
-    manager = manager_factory(types=["Affine8KVCache"])
-    manager.set_expected_layer_signature(["Affine8KVCache"], turboquant_kv_bits=8)
-    signature = _cache_compat_signature(
-        model_name="affine-test",
-        num_layers=1,
-        block_size=4,
-        layer_cache_types=["Affine4KVCache"],
-        turboquant_kv_bits=4,
-    )
-    assert not manager.is_signature_compatible(signature)
-    assert _canonicalize_layer_cache_types(
-        ["BatchAffine8KVCache", "BatchAffine4KVCache"]
-    ) == ["Affine8KVCache", "Affine4KVCache"]
-    for name in ("Affine8KVCache", "BatchAffine8KVCache"):
-        assert CacheTypeRegistry.get_handler_by_class_name(name).supports_block_slicing

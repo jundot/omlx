@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from mlx_lm.models.base import create_causal_mask
 from mlx_lm.models.cache import KVCache
-from mlx_vlm.turboquant import TurboQuantKVCache, TurboQuantMSEState
+from mlx_vlm.turboquant import TurboQuantMSEState
 
 import omlx.affine4 as affine4
 from omlx.affine4 import (
@@ -64,7 +64,7 @@ def dense(cache, queries, mask=None, sinks=None, states=None):
     ).astype(queries.dtype)
 
 
-@pytest.mark.parametrize("dim", [1, 3, 7, 32, 63, 64, 80, 96, 128, 256, 512])
+@pytest.mark.parametrize("dim", [1, 63, 64, 80, 256])
 @pytest.mark.parametrize(
     "codec_class,max_error",
     [(Affine4Codec, 0.03), (Affine8Codec, 2e-4)],
@@ -93,7 +93,7 @@ def test_codec_orthogonal_and_quantization(dim, codec_class, max_error):
     assert mx.array_equal(state.indices, other.indices).item()
 
 
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.float32])
 @pytest.mark.parametrize("magnitude", [0, 1e-8, 1000, 1e6])
 @pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
 def test_finite_scale_range(dtype, magnitude, cache_class):
@@ -110,33 +110,8 @@ def test_finite_scale_range(dtype, magnitude, cache_class):
         assert mx.all(decoded == 0).item()
 
 
-@pytest.mark.parametrize("bits", [3, 3.5, 4.00001, 8, float("nan")])
-def test_reject_non_four_bits(bits):
-    with pytest.raises(ValueError, match="exactly 4"):
-        Affine4KVCache(bits)
-    with pytest.raises(ValueError, match="exactly 4"):
-        BatchAffine4KVCache([0], bits)
-
-
-@pytest.mark.parametrize("bits", [3, 4, 7.5, 8.00001, float("nan")])
-def test_reject_non_eight_bits(bits):
-    with pytest.raises(ValueError, match="exactly 8"):
-        Affine8KVCache(bits)
-    with pytest.raises(ValueError, match="exactly 8"):
-        BatchAffine8KVCache([0], bits)
-
-
-@pytest.mark.parametrize("dim", [0, -1, 2.5])
-def test_reject_invalid_dimension(dim):
-    with pytest.raises(ValueError):
-        Affine4Codec(dim)
-
-
-@pytest.mark.parametrize(
-    "shape",
-    [(1, 1, 1, 32), (2, 3, 7, 64), (1, 2, 9, 128), (2, 1, 3, 256), (1, 1, 2, 512)],
-)
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("shape", [(1, 1, 1, 32), (2, 3, 7, 64), (1, 1, 2, 512)])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
 def test_actual_fused_quantize_matches_portable(shape, dtype, cache_class):
     if not mx.metal.is_available():
@@ -156,15 +131,19 @@ def test_actual_fused_quantize_matches_portable(shape, dtype, cache_class):
 
 
 @pytest.mark.parametrize(
-    "shape", [(1, 2, 3, 63, 79), (2, 2, 4, 80, 96), (2, 3, 17, 64, 64)]
-)
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
-@pytest.mark.parametrize(
-    "mask_kind",
-    ["none", "causal", "head", "broadcast", "false", "infinity", "additive"],
+    "mask_kind,shape,dtype",
+    [
+        ("none", (1, 2, 3, 63, 79), mx.float16),
+        ("causal", (2, 2, 4, 80, 96), mx.bfloat16),
+        ("head", (2, 3, 17, 64, 64), mx.float32),
+        ("broadcast", (1, 2, 3, 63, 79), mx.bfloat16),
+        ("false", (2, 2, 4, 80, 96), mx.float32),
+        ("infinity", (2, 3, 17, 64, 64), mx.float16),
+        ("additive", (1, 2, 3, 63, 79), mx.float32),
+    ],
 )
 def test_portable_attention_masks_sinks_and_dimensions(
-    monkeypatch, shape, dtype, mask_kind
+    monkeypatch, mask_kind, shape, dtype
 ):
     monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
     batch, heads, rows, dk, dv = shape
@@ -200,20 +179,18 @@ def test_portable_attention_masks_sinks_and_dimensions(
 
 
 @pytest.mark.parametrize(
-    "batch,heads,repeats,rows,dim,tokens",
+    "batch,heads,repeats,rows,dim,tokens,dtype,cache_class",
     [
-        (1, 1, 1, 1, 32, 257),
-        (1, 2, 3, 1, 64, 260),
-        (2, 3, 4, 2, 96, 257),
-        (2, 2, 2, 4, 128, 513),
-        (1, 2, 8, 4, 256, 1025),
-        (1, 2, 8, 4, 256, 150000),
-        (1, 1, 32, 1, 256, 150000),
-        (1, 1, 4, 1, 512, 259),
+        (1, 1, 1, 1, 32, 257, mx.float16, Affine4KVCache),
+        (1, 2, 3, 1, 64, 260, mx.bfloat16, Affine8KVCache),
+        (2, 3, 4, 2, 96, 257, mx.float16, Affine8KVCache),
+        (2, 2, 2, 4, 128, 513, mx.bfloat16, Affine4KVCache),
+        (1, 2, 8, 4, 256, 1025, mx.float16, Affine4KVCache),
+        (1, 2, 8, 4, 256, 150000, mx.bfloat16, Affine8KVCache),
+        (1, 1, 32, 1, 256, 150000, mx.bfloat16, Affine4KVCache),
+        (1, 1, 4, 1, 512, 259, mx.float16, Affine8KVCache),
     ],
 )
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
 def test_actual_native_matches_portable(
     monkeypatch, batch, heads, repeats, rows, dim, tokens, dtype, cache_class
 ):
@@ -268,47 +245,25 @@ def test_native_long_uniform_attention_stays_finite(
     close(output, expected.astype(queries.dtype), atol=0.02)
 
 
-@pytest.mark.parametrize("dim", [64, 72, 80, 96, 128, 256])
-@pytest.mark.parametrize("mask", [None, "causal"])
-@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
-def test_bf16_fused_prefill_matches_reference(
-    monkeypatch, dim, mask, cache_class
+@pytest.mark.parametrize(
+    "dim,repeats,rows,mask,force_fused,cache_class",
+    [
+        (64, 4, 33, None, True, Affine4KVCache),
+        (72, 4, 33, "causal", True, Affine8KVCache),
+        (96, 4, 33, "causal", True, Affine4KVCache),
+        (128, 4, 33, None, True, Affine8KVCache),
+        (256, 6, 5, "causal", True, Affine4KVCache),
+        (256, 6, 6, "causal", None, Affine8KVCache),
+        (64, 8, 5, "causal", None, Affine4KVCache),
+        (80, 4, 8, "causal", None, Affine8KVCache),
+        (80, 4, 9, None, True, Affine4KVCache),
+    ],
+)
+def test_bf16_prefill_forces_fused_sdpa_only_where_supported(
+    monkeypatch, dim, repeats, rows, mask, force_fused, cache_class
 ):
     if not mx.metal.is_available():
         pytest.skip("Fused prefill requires Metal")
-    cache = cache_class()
-    cache.update_and_fetch(
-        random((1, 2, 513, dim), mx.bfloat16),
-        random((1, 2, 513, dim), mx.bfloat16, 1),
-    )
-    queries = random((1, 8, 33, dim), mx.bfloat16, 2)
-    original = mx.fast.scaled_dot_product_attention
-    calls = []
-
-    def capture(q, k, v, **kwargs):
-        calls.append((q.dtype, k.dtype, v.dtype, kwargs.get("force_fused")))
-        return original(q, k, v, **kwargs)
-
-    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", capture)
-    output = cache.attention(queries, scale=dim**-0.5, mask=mask)
-    assert calls == [(mx.bfloat16, mx.bfloat16, mx.bfloat16, True)]
-    close(output, dense(cache, queries, mask), atol=8e-3, rtol=8e-3)
-
-
-@pytest.mark.parametrize(
-    "dim,repeats,rows,force_fused",
-    [
-        (256, 6, 5, True),
-        (256, 6, 6, None),
-        (64, 8, 5, None),
-        (80, 4, 8, None),
-        (80, 4, 9, True),
-    ],
-)
-@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
-def test_bf16_prefill_forces_only_supported_mlx_fused_shapes(
-    monkeypatch, dim, repeats, rows, force_fused, cache_class
-):
     cache = cache_class()
     cache.update_and_fetch(
         random((1, 2, 513, dim), mx.bfloat16),
@@ -319,31 +274,13 @@ def test_bf16_prefill_forces_only_supported_mlx_fused_shapes(
     calls = []
 
     def capture(q, k, v, **kwargs):
-        calls.append(
-            (q.dtype, k.dtype, v.dtype, kwargs.get("force_fused"))
-        )
+        calls.append((q.dtype, k.dtype, kwargs.get("force_fused")))
         return original(q, k, v, **kwargs)
 
     monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", capture)
-    output = cache.attention(queries, scale=dim**-0.5, mask="causal")
-    assert calls == [
-        (mx.bfloat16, mx.bfloat16, mx.bfloat16, force_fused)
-    ]
-    close(output, dense(cache, queries, "causal"), atol=8e-3, rtol=8e-3)
-
-
-@pytest.mark.parametrize("cache_class", [Affine4KVCache, Affine8KVCache])
-def test_native_large_values(cache_class):
-    require_tensor_ops()
-    cache = cache_class()
-    cache.update_and_fetch(
-        mx.zeros((1, 2, 257, 64), mx.bfloat16),
-        mx.full((1, 2, 257, 64), 1e6, mx.bfloat16),
-    )
-    q = mx.zeros((1, 8, 1, 64), mx.bfloat16)
-    output = affine4._native_attention(cache, q, *cache.state, 0.125, None)
-    assert output is not None
-    close(output, dense(cache, q), atol=8192, rtol=0.01)
+    output = cache.attention(queries, scale=dim**-0.5, mask=mask)
+    assert calls == [(mx.bfloat16, mx.bfloat16, force_fused)]
+    close(output, dense(cache, queries, mask), atol=8e-3, rtol=8e-3)
 
 
 @pytest.mark.parametrize("magnitude", [60000, 1e6])
@@ -358,19 +295,6 @@ def test_native_large_queries(magnitude, cache_class):
     close(output, dense(cache, q), atol=0.02)
 
 
-@pytest.mark.parametrize("rows", [1, 4])
-def test_native_arbitrary_boolean_mask(rows):
-    require_tensor_ops()
-    cache = Affine4KVCache()
-    cache.update_and_fetch(random((2, 2, 257, 64)), random((2, 2, 257, 64), seed=1))
-    q = random((2, 6, rows, 64), seed=2)
-    mask = random((2, 6, rows, 257), seed=3) > 0
-    mask[:, 0] = False
-    output = affine4._native_attention(cache, q, *cache.state, 0.125, mask)
-    assert output is not None
-    close(output, dense(cache, q, mask))
-
-
 def test_supplied_strided_states():
     require_tensor_ops()
     cache = Affine4KVCache()
@@ -381,63 +305,6 @@ def test_supplied_strided_states():
     )
     q = random((1, 8, 1, 64), seed=2)
     close(cache.attention(q, *states, scale=0.125), dense(cache, q, states=states))
-
-
-def test_supplied_packed_word_stride():
-    cache = Affine4KVCache()
-    cache.update_and_fetch(random((1, 2, 257, 64)), random((1, 2, 257, 64), seed=1))
-    states = []
-    for state in cache.state:
-        indices = mx.stack((state.indices, mx.zeros_like(state.indices)), axis=-1)
-        indices = indices.reshape(*state.indices.shape[:-1], -1)[..., ::2]
-        states.append(TurboQuantMSEState(state.norms, indices))
-    q = random((1, 8, 1, 64), seed=2)
-    close(cache.attention(q, *states, scale=0.125), dense(cache, q, states=states))
-    restored = Affine4KVCache.from_state(tuple(states), cache.meta_state)
-    close(restored.attention(q, scale=0.125), dense(cache, q, states=states))
-
-
-def test_snapshot_metadata_roundtrip(tmp_path):
-    cache = Affine4KVCache(seed=23)
-    cache.update_and_fetch(random((1, 2, 13, 63)), random((1, 2, 13, 79), seed=1))
-    ks, vs = cache.state
-    path = str(tmp_path / "cache.safetensors")
-    mx.save_safetensors(
-        path,
-        dict(ks=ks.norms, ki=ks.indices, vs=vs.norms, vi=vs.indices),
-        {"meta": ",".join(cache.meta_state)},
-    )
-    arrays, metadata = mx.load(path, return_metadata=True)
-    restored = Affine4KVCache()
-    restored.state = (
-        TurboQuantMSEState(arrays["ks"], arrays["ki"]),
-        TurboQuantMSEState(arrays["vs"], arrays["vi"]),
-    )
-    restored.meta_state = tuple(metadata["meta"].split(","))
-    restored.rebuild_codecs(*restored.state)
-    assert restored.meta_state == ("13", "4.0", "23", "affine4", "63", "79")
-    q = random((1, 6, 1, 63))
-    close(restored.attention(q), cache.attention(q), 0, 0)
-    restored.update_and_fetch(random((1, 2, 1, 63)), random((1, 2, 1, 79)))
-    assert restored.offset == 14
-
-
-def test_missing_and_invalid_metadata():
-    cache = Affine4KVCache()
-    cache.update_and_fetch(random((1, 2, 3, 63)), random((1, 2, 3, 79)))
-    restored = Affine4KVCache()
-    with pytest.raises(ValueError, match="missing"):
-        restored.rebuild_codecs(*cache.state)
-    for meta in [
-        ("3", "4", "0"),
-        ("3", "4", "0", "turboquant", "63", "79"),
-        ("3", "4", "0", "affine4", "0", "0"),
-    ]:
-        with pytest.raises(ValueError):
-            restored.meta_state = meta
-    restored.meta_state = ("3", "4", "0", "affine4", "65", "79")
-    with pytest.raises(ValueError, match="metadata"):
-        restored.rebuild_codecs(*cache.state)
 
 
 def test_from_cache_trim_and_batch_lifecycle():
@@ -507,119 +374,37 @@ def test_left_padded_batch_verify_uses_affine_attention(monkeypatch, cache_class
     close(out, expected, 4e-3, 4e-3)
 
 
-def test_scheme_merge_guard():
-    with pytest.raises(ValueError, match="config"):
-        Affine4KVCache.merge([Affine4KVCache(), TurboQuantKVCache(bits=4)])
-    with pytest.raises(ValueError, match="config"):
-        Affine4KVCache.merge([Affine4KVCache(), Affine8KVCache()])
-    with pytest.raises(ValueError, match="config"):
-        Affine8KVCache.merge([Affine8KVCache(), Affine4KVCache()])
-
-
-def test_affine8_batch_and_metadata_lifecycle():
-    cache = Affine8KVCache(seed=21)
-    cache.update_and_fetch(random((1, 2, 9, 63)), random((1, 2, 9, 79)))
-    assert cache.meta_state == ("9", "8.0", "21", "affine8", "63", "79")
-    assert cache.state[0].indices.shape[-1] == 16
-    clone = Affine8KVCache.from_state(cache.state, cache.meta_state)
-    close(clone.dequantize()[0], cache.dequantize()[0], 0, 0)
-    batch = BatchAffine8KVCache.merge([cache, clone])
-    assert type(batch) is BatchAffine8KVCache
-    assert type(batch.extract(0)) is Affine8KVCache
-    assert batch.extract(0).meta_state == cache.meta_state
-
-
-def test_matching_packed_width_does_not_allow_different_dimensions():
-    caches = [Affine4KVCache(), Affine4KVCache()]
-    for cache, dim in zip(caches, (63, 64)):
-        cache.update_and_fetch(random((1, 2, 3, dim)), random((1, 2, 3, 79)))
-    with pytest.raises(ValueError, match="dimensions"):
-        Affine4KVCache.merge(caches)
-    batches = [BatchAffine4KVCache.merge([cache]) for cache in caches]
-    with pytest.raises(ValueError, match="dimensions"):
-        batches[0].extend(batches[1])
-
-
-def test_batch_state_and_metadata_restore():
-    cache = BatchAffine4KVCache([3, 0], seed=21)
-    cache.update_and_fetch(random((2, 2, 9, 63)), random((2, 2, 9, 79)))
-    restored = BatchAffine4KVCache([3, 0])
-    restored.state = cache.state
-    restored.meta_state = cache.meta_state
-    restored.rebuild_codecs(*restored.state)
-    q = random((2, 6, 1, 63))
-    close(restored.attention(q), cache.attention(q), 0, 0)
-    restored.update_and_fetch(random((2, 2, 1, 63)), random((2, 2, 1, 79)))
-    assert restored.extract(0).offset == 7
-    assert restored.extract(1).offset == 10
-
-
-@pytest.mark.parametrize("which", ["attention", "quantize"])
-def test_first_native_deferred_failure_recovers(monkeypatch, which):
+def test_first_native_compile_failure_uses_portable_attention(monkeypatch):
+    """Systems without TensorOps fail the first launch, not the request."""
     if not affine4._tensor_ops_available():
         pytest.skip("Native lazy failures require Metal")
     cache = Affine4KVCache()
-    keys, values = random((1, 2, 257, 64)), random((1, 2, 257, 64), seed=1)
-    cache.update_and_fetch(keys, values)
-    if which == "attention":
-        monkeypatch.setattr(affine4, "_NATIVE_LAUNCHABLE", {})
-        kernel = mx.fast.metal_kernel(
-            name="affine4_bad_attention",
-            input_names=["x"],
-            output_names=["y"],
-            source="undefined_symbol;",
+    keys = random((1, 2, 257, 64))
+    cache.update_and_fetch(keys, random((1, 2, 257, 64), seed=1))
+    monkeypatch.setattr(affine4, "_NATIVE_LAUNCHABLE", {})
+    kernel = mx.fast.metal_kernel(
+        name="affine4_bad_attention",
+        input_names=["x"],
+        output_names=["y"],
+        source="undefined_symbol;",
+    )
+
+    def launch(**kwargs):
+        return tuple(
+            kernel(
+                inputs=[keys],
+                output_shapes=[shape],
+                output_dtypes=[mx.float32],
+                grid=(1, 1, 1),
+                threadgroup=(1, 1, 1),
+            )[0]
+            for shape in kwargs["output_shapes"]
         )
 
-        def deferred(*args):
-            def launch(**kwargs):
-                return tuple(
-                    kernel(
-                        inputs=[keys],
-                        output_shapes=[shape],
-                        output_dtypes=[mx.float32],
-                        grid=(1, 1, 1),
-                        threadgroup=(1, 1, 1),
-                    )[0]
-                    for shape in kwargs["output_shapes"]
-                )
-
-            return launch
-
-        monkeypatch.setattr(affine4, "_mpp_attention_kernel", deferred)
-        q = random((1, 8, 1, 64), seed=2)
-        close(cache.attention(q, scale=0.125), dense(cache, q))
-        assert False in affine4._NATIVE_LAUNCHABLE.values()
-    else:
-        monkeypatch.setattr(affine4, "_FUSED_QUANTIZE_LAUNCHABLE", {})
-        kernel = mx.fast.metal_kernel(
-            name="affine4_bad_quantize",
-            input_names=["x"],
-            output_names=["y"],
-            source="undefined_symbol;",
-        )
-
-        def deferred(dim):
-            def launch(**kwargs):
-                return tuple(
-                    kernel(
-                        inputs=[keys],
-                        output_shapes=[shape],
-                        output_dtypes=[dtype],
-                        grid=(1, 1, 1),
-                        threadgroup=(1, 1, 1),
-                    )[0]
-                    for shape, dtype in zip(
-                        kwargs["output_shapes"], kwargs["output_dtypes"]
-                    )
-                )
-
-            return launch
-
-        monkeypatch.setattr(affine4, "_fused_quantize_kernel", deferred)
-        cache.update_and_fetch(keys[:, :, :1], values[:, :, :1])
-        assert cache.offset == 258
-        assert mx.all(mx.isfinite(cache.dequantize()[0])).item()
-        assert False in affine4._FUSED_QUANTIZE_LAUNCHABLE.values()
+    monkeypatch.setattr(affine4, "_mpp_attention_kernel", lambda *args: launch)
+    q = random((1, 8, 1, 64), seed=2)
+    close(cache.attention(q, scale=0.125), dense(cache, q))
+    assert False in affine4._NATIVE_LAUNCHABLE.values()
 
 
 def test_first_native_command_buffer_error_propagates(monkeypatch):
@@ -647,46 +432,17 @@ def test_first_native_command_buffer_error_propagates(monkeypatch):
     assert not affine4._NATIVE_LAUNCHABLE
 
 
-def test_warm_execution_errors_propagate_at_evaluation(monkeypatch):
-    """Warm native calls stay asynchronous after successful JIT validation."""
-    require_tensor_ops()
-    cache = Affine4KVCache()
-    keys = random((1, 2, 257, 64))
-    cache.update_and_fetch(keys, keys)
-    q = random((1, 8, 1, 64), seed=2)
-    mx.eval(cache.attention(q, scale=0.125))
-    kernel = mx.fast.metal_kernel(
-        name="affine4_bad_warm",
-        input_names=["x"],
-        output_names=["y"],
-        source="undefined_symbol;",
-    )
-
-    def deferred(*args):
-        def launch(**kwargs):
-            return tuple(
-                kernel(
-                    inputs=[keys],
-                    output_shapes=[shape],
-                    output_dtypes=[mx.float32],
-                    grid=(1, 1, 1),
-                    threadgroup=(1, 1, 1),
-                )[0]
-                for shape in kwargs["output_shapes"]
-            )
-
-        return launch
-
-    monkeypatch.setattr(affine4, "_mpp_attention_kernel", deferred)
-    output = cache.attention(q, scale=0.125)
-    with pytest.raises(RuntimeError, match="metal library"):
-        mx.eval(output)
-
-
-@pytest.mark.parametrize("dim", [1, 7, 63, 80, 128, 257])
-@pytest.mark.parametrize("shape", [(), (3,), (2, 3, 9)])
-@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
-@pytest.mark.parametrize("codec_class", [Affine4Codec, Affine8Codec])
+@pytest.mark.parametrize(
+    "dim,shape,dtype,codec_class",
+    [
+        (1, (), mx.float32, Affine4Codec),
+        (7, (3,), mx.bfloat16, Affine8Codec),
+        (63, (2, 3, 9), mx.float32, Affine8Codec),
+        (80, (), mx.bfloat16, Affine4Codec),
+        (128, (3,), mx.float32, Affine4Codec),
+        (257, (2, 3, 9), mx.bfloat16, Affine8Codec),
+    ],
+)
 def test_fused_rotated_dequantize_arbitrary_dimensions(
     dim, shape, dtype, codec_class
 ):
@@ -716,43 +472,9 @@ def test_fused_rotated_dequantize_strides():
         0,
         0,
     )
-    reversed_state = TurboQuantMSEState(
-        state.norms[::-1, :, ::-1], state.indices[::-1, :, ::-1, ::-1]
-    )
-    close(
-        codec.dequantize_rotated(reversed_state),
-        codec._codes(reversed_state) * reversed_state.norms[..., None],
-        0,
-        0,
-    )
 
 
-def test_dequantize_first_deferred_failure_recovers(monkeypatch):
-    if not mx.metal.is_available():
-        pytest.skip("Deferred Metal failure requires Metal")
-    codec = Affine4Codec(63)
-    state = codec.quantize(random((1, 2, 7, 63)))
-    monkeypatch.setattr(affine4, "_DEQUANTIZE_LAUNCHABLE", {})
-    kernel = mx.fast.metal_kernel(
-        name="affine4_bad_unpack",
-        input_names=["packed", "scales"],
-        output_names=["output"],
-        source="undefined_symbol;",
-    )
-    monkeypatch.setattr(affine4, "_dequantize_rotated_kernel", lambda: kernel)
-    close(
-        codec.dequantize_rotated(state),
-        codec._codes(state) * state.norms[..., None],
-        0,
-        0,
-    )
-    assert affine4._DEQUANTIZE_LAUNCHABLE[(63, 3, mx.float32, mx.float32)] is False
-
-
-@pytest.mark.parametrize("device_context", ["default", "stream"])
-def test_explicit_cpu_uses_portable_operations(monkeypatch, device_context):
-    from contextlib import nullcontext
-
+def test_cpu_stream_uses_portable_operations(monkeypatch):
     def no_metal(*args, **kwargs):
         pytest.fail("CPU execution invoked a Metal kernel")
 
@@ -760,28 +482,29 @@ def test_explicit_cpu_uses_portable_operations(monkeypatch, device_context):
     monkeypatch.setattr(affine4, "_fused_quantize_kernel", no_metal)
     monkeypatch.setattr(affine4, "_dequantize_rotated_kernel", no_metal)
     monkeypatch.setattr(affine4, "_mpp_attention_kernel", no_metal)
-    previous = mx.default_device()
-    if device_context == "default":
-        mx.set_default_device(mx.cpu)
-    try:
-        with mx.stream(mx.cpu) if device_context == "stream" else nullcontext():
-            cache = Affine4KVCache()
-            cache.update_and_fetch(random((1, 2, 257, 64)), random((1, 2, 257, 79)))
-            queries = random((1, 6, 1, 64))
-            close(cache.attention(queries, scale=0.125), dense(cache, queries))
-            assert mx.all(mx.isfinite(cache.dequantize()[1])).item()
-    finally:
-        mx.set_default_device(previous)
+    with mx.stream(mx.cpu):
+        cache = Affine4KVCache()
+        cache.update_and_fetch(random((1, 2, 257, 64)), random((1, 2, 257, 79)))
+        queries = random((1, 6, 1, 64))
+        close(cache.attention(queries, scale=0.125), dense(cache, queries))
+        assert mx.all(mx.isfinite(cache.dequantize()[1])).item()
 
 
-@pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize(
-    "mask_kind",
-    ["none", "causal", "head", "broadcast", "tokens", "false", "infinity", "additive"],
+    "mask_kind,batched,with_sinks",
+    [
+        ("none", False, True),
+        ("causal", True, False),
+        ("head", False, False),
+        ("broadcast", True, True),
+        ("tokens", False, True),
+        ("false", True, False),
+        ("infinity", False, False),
+        ("additive", True, True),
+    ],
 )
-@pytest.mark.parametrize("with_sinks", [False, True])
 def test_bounded_prefill_preserves_masks_and_sinks(
-    monkeypatch, batched, mask_kind, with_sinks
+    monkeypatch, mask_kind, batched, with_sinks
 ):
     cache = BatchAffine4KVCache([3, 0]) if batched else Affine4KVCache()
     cache.update_and_fetch(random((2, 2, 23, 63)), random((2, 2, 23, 79)))

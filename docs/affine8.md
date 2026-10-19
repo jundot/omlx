@@ -88,15 +88,3 @@ and 2,048 were tested in forward and reverse format order. Native BF16,
 TurboQuant4, Affine4, and Affine8 all returned `ZXQJ-4827` exactly: 8/8 successful
 runs. This focused check exercises information near prompt start across long
 filler; it does not establish general semantic quality or long-context accuracy.
-
-## Tests
-
-```sh
-python -m pytest tests/test_affine4.py tests/test_affine4_integration.py tests/test_affine4_prefix_cache.py
-```
-
-Coverage includes native/reference attention, portable multi-layer workspace
-bounds, masks, unsupported shapes, overflow bounds, snapshot metadata, SSD
-round trips, continuous batching, scheduler admission, incremental real-model
-prefill, restored prefixes, and SpecPrefill cache lifecycle for both affine
-formats.

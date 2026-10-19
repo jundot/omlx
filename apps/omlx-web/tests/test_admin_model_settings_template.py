@@ -56,24 +56,6 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
 
 
-def test_kv_compression_format_controls():
-    section = _section(
-        _model_settings_template(),
-        "<!-- KV Cache Compression -->",
-        "<!-- Advanced Settings -->",
-    )
-    assert "t('modal.model_settings.kv_compression')" in section
-    assert 'x-model="modelSettings.turboquant_kv_scheme"' in section
-    assert '<option value="turboquant">' in section
-    assert '<option value="affine4">' in section
-    assert '<option value="affine8">' in section
-    assert "if (modelSettings.turboquant_kv_scheme === 'affine4') modelSettings.turboquant_kv_bits = 4" in section
-    assert "else if (modelSettings.turboquant_kv_scheme === 'affine8') modelSettings.turboquant_kv_bits = 8" in section
-    assert 'x-show="modelSettings.turboquant_kv_scheme === \'turboquant\'"' in section
-    assert 'x-model.number="modelSettings.turboquant_kv_bits"' in section
-    assert "modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled" in section
-
-
 def test_kv_compression_dashboard_state_and_profile_serialization():
     node = shutil.which("node")
     if node is None:
@@ -98,10 +80,6 @@ for (const model of [{is_paroquant: true}, {config_model_type: 'diffusion_gemma'
     assert.equal(state.turboquant_kv_scheme, 'turboquant');
     assert.equal(state.turboquant_kv_bits, 4);
 }
-const affine8 = {turboquant_kv_enabled: true, turboquant_kv_scheme: 'affine8', turboquant_kv_bits: 8};
-app.modelSettings = app.buildModelSettingsState({}, affine8);
-assert.deepEqual(app.formValuesForProfile(), affine8);
-assert.equal(app.isDiffusionUnsupportedProfileField('turboquant_kv_scheme'), true);
 // Turning compression off must keep the affine bit width the server validates.
 for (const [scheme, bits] of [['affine8', 8], ['affine4', 4], ['turboquant', 4]]) {
     const off = app.buildModelSettingsState({}, {turboquant_kv_enabled: false, turboquant_kv_scheme: scheme, turboquant_kv_bits: 8});

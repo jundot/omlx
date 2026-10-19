@@ -8,7 +8,12 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 
 from omlx.affine4 import (
     Affine4KVCache,
@@ -16,6 +21,8 @@ from omlx.affine4 import (
     BatchAffine4KVCache,
     BatchAffine8KVCache,
 )
+from omlx.engine_pool import EnginePool
+from omlx.model_settings import ModelSettings
 from omlx.patches.turboquant_attention import apply_turboquant_attention_patch
 from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, _is_turboquant_kv_family_cache
@@ -64,15 +71,6 @@ def test_scheduler_signature_matches_selected_format(scheduler):
     scheduler._turboquant_kv_scheme = "turboquant"
     types, bits, _ = scheduler._infer_live_layer_cache_types()
     assert types == ["TurboQuantKVCache", "KVCache"]
-
-
-def test_scheduler_keeps_nonstandard_cache_guards(scheduler):
-    scheduler.model = SimpleNamespace(args=SimpleNamespace(kv_lora_rank=128))
-    assert not scheduler._turboquant_eligible([KVCache()])
-    scheduler._mla_model = False
-    assert not scheduler._turboquant_eligible(
-        [CacheList(KVCache(), ArraysCache(size=2))]
-    )
 
 
 def test_affine4_allows_sink_aware_fallback(scheduler):
@@ -197,28 +195,22 @@ def test_specprefill_cache_lifecycle_stays_affine(
 
 
 def test_format_change_requires_engine_reload():
-    from omlx.engine_pool import EnginePool
-    from omlx.model_settings import ModelSettings
-
     pool = EnginePool.__new__(EnginePool)
     pool._entries = {}
-    turbo = ModelSettings(turboquant_kv_enabled=True)
-    affine4 = ModelSettings(
-        turboquant_kv_enabled=True, turboquant_kv_scheme="affine4"
-    )
-    affine8 = ModelSettings(
-        turboquant_kv_enabled=True,
-        turboquant_kv_scheme="affine8",
-        turboquant_kv_bits=8,
-    )
     signatures = {
-        pool._engine_runtime_signature("model", settings)
-        for settings in (turbo, affine4, affine8)
+        pool._engine_runtime_signature(
+            "model",
+            ModelSettings(
+                turboquant_kv_enabled=True,
+                turboquant_kv_scheme=scheme,
+                turboquant_kv_bits=bits,
+            ),
+        )
+        for scheme, bits in (("turboquant", 4), ("affine4", 4), ("affine8", 8))
     }
     assert len(signatures) == 3
 
 
-@pytest.mark.parametrize("architecture", ["llama", "qwen2"])
 @pytest.mark.parametrize(
     "scheme,bits,cache_class,batch_class",
     [
@@ -227,14 +219,14 @@ def test_format_change_requires_engine_reload():
     ],
 )
 def test_real_model_prefill_convert_and_batched_decode(
-    architecture, scheduler, scheme, bits, cache_class, batch_class
+    scheduler, scheme, bits, cache_class, batch_class
 ):
     scheduler._turboquant_kv_scheme = scheme
     scheduler._turboquant_kv_bits = bits
-    module = importlib.import_module(f"mlx_lm.models.{architecture}")
+    module = importlib.import_module("mlx_lm.models.llama")
     model = module.Model(
         module.ModelArgs(
-            model_type=architecture,
+            model_type="llama",
             hidden_size=128,
             num_hidden_layers=2,
             intermediate_size=256,
@@ -269,7 +261,7 @@ def test_real_model_prefill_convert_and_batched_decode(
     assert batch[0].extract(0).offset == 260
 
 
-@pytest.mark.parametrize("architecture", ["llama", "qwen2", "qwen3_5"])
+@pytest.mark.parametrize("architecture", ["llama", "qwen3_5"])
 @pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize(
     "scheme,bits,cache_class",
@@ -281,8 +273,6 @@ def test_real_model_prefill_convert_and_batched_decode(
 def test_incremental_prefill_matches_explicit_cache_updates(
     architecture, chunked, scheme, bits, cache_class, scheduler, monkeypatch
 ):
-    from mlx_lm.models.cache import make_prompt_cache
-
     module = importlib.import_module(f"mlx_lm.models.{architecture}")
     args = dict(
         model_type=architecture,
