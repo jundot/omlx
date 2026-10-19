@@ -32,7 +32,7 @@ def test_lightning_mtp_and_turboquant_are_not_ui_mutexed():
 
     turboquant = _section(
         html,
-        "<!-- TurboQuant KV Cache -->",
+        "<!-- KV Cache Compression -->",
         "<!-- Advanced Settings -->",
     )
     lightning_mtp = _section(
@@ -54,6 +54,64 @@ def test_vlm_mtp_still_conflicts_with_turboquant():
     )
 
     assert "modelSettings.turboquant_kv_enabled" in vlm_mtp
+
+
+def test_kv_compression_format_controls():
+    section = _section(
+        _model_settings_template(),
+        "<!-- KV Cache Compression -->",
+        "<!-- Advanced Settings -->",
+    )
+    assert "t('modal.model_settings.kv_compression')" in section
+    assert 'x-model="modelSettings.turboquant_kv_scheme"' in section
+    assert '<option value="turboquant">' in section
+    assert '<option value="affine4">' in section
+    assert '<option value="affine8">' in section
+    assert "if (modelSettings.turboquant_kv_scheme === 'affine4') modelSettings.turboquant_kv_bits = 4" in section
+    assert "else if (modelSettings.turboquant_kv_scheme === 'affine8') modelSettings.turboquant_kv_bits = 8" in section
+    assert 'x-show="modelSettings.turboquant_kv_scheme === \'turboquant\'"' in section
+    assert 'x-model.number="modelSettings.turboquant_kv_bits"' in section
+    assert "modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled" in section
+
+
+def test_kv_compression_dashboard_state_and_profile_serialization():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise dashboard state")
+    root = Path(__file__).resolve().parents[1]
+    script = """
+const assert = require('node:assert/strict');
+globalThis.localStorage = {getItem: () => null};
+globalThis.window = {t: key => key};
+""" + _dashboard_script() + """
+const app = dashboard();
+const legacy = app.buildModelSettingsState({}, {turboquant_kv_enabled: true, turboquant_kv_bits: 2.5});
+assert.equal(legacy.turboquant_kv_scheme, 'turboquant');
+assert.equal(legacy.turboquant_kv_bits, 2.5);
+const settings = {turboquant_kv_enabled: true, turboquant_kv_scheme: 'affine4', turboquant_kv_bits: 4};
+app.modelSettings = app.buildModelSettingsState({}, settings);
+app.profileFields = {universal: [], model_specific: ['turboquant_kv_enabled', 'turboquant_kv_scheme', 'turboquant_kv_bits']};
+assert.deepEqual(app.formValuesForProfile(), settings);
+for (const model of [{is_paroquant: true}, {config_model_type: 'diffusion_gemma'}]) {
+    const state = app.buildModelSettingsState(model, settings);
+    assert.equal(state.turboquant_kv_enabled, false);
+    assert.equal(state.turboquant_kv_scheme, 'turboquant');
+    assert.equal(state.turboquant_kv_bits, 4);
+}
+const affine8 = {turboquant_kv_enabled: true, turboquant_kv_scheme: 'affine8', turboquant_kv_bits: 8};
+app.modelSettings = app.buildModelSettingsState({}, affine8);
+assert.deepEqual(app.formValuesForProfile(), affine8);
+assert.equal(app.isDiffusionUnsupportedProfileField('turboquant_kv_scheme'), true);
+// Turning compression off must keep the affine bit width the server validates.
+for (const [scheme, bits] of [['affine8', 8], ['affine4', 4], ['turboquant', 4]]) {
+    const off = app.buildModelSettingsState({}, {turboquant_kv_enabled: false, turboquant_kv_scheme: scheme, turboquant_kv_bits: 8});
+    const payload = app.buildModelSettingsPayload(off);
+    assert.equal(payload.turboquant_kv_scheme, scheme);
+    assert.equal(payload.turboquant_kv_bits, bits);
+}
+"""
+    result = subprocess.run([node], input=script, cwd=root, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_reasoning_effort_has_presets_and_custom_input():
@@ -141,6 +199,15 @@ def test_model_settings_feature_i18n_keys_exist_in_every_locale():
         "modal.model_settings.reasoning_parser",
         "modal.model_settings.specprefill",
         "modal.model_settings.dflash",
+        "modal.model_settings.kv_compression",
+        "modal.model_settings.kv_compression_hint",
+        "modal.model_settings.kv_compression_format",
+        "modal.model_settings.kv_compression_turboquant",
+        "modal.model_settings.kv_compression_affine4",
+        "modal.model_settings.kv_compression_affine4_hint",
+        "modal.model_settings.kv_compression_affine8",
+        "modal.model_settings.kv_compression_affine8_hint",
+        "modal.model_settings.vlm_mtp_compression_conflict",
         "modal.model_settings.qwen_ane",
         "modal.model_settings.qwen_ane_hint",
         "modal.model_settings.qwen_ane_prompt_block",
@@ -521,7 +588,7 @@ def test_moe_expert_offload_toggle_blocks_speculative_decoding():
     """Offload is incompatible with speculative verification paths."""
     html = _model_settings_template()
     section = _section(
-        html, "<!-- MoE Expert Offload -->", "<!-- TurboQuant KV Cache -->"
+        html, "<!-- MoE Expert Offload -->", "<!-- KV Cache Compression -->"
     )
     assert "modelSettings.moe_expert_offload_enabled" in section
     assert "modelSettings.moe_expert_offload_resident_percent" in section

@@ -28,6 +28,7 @@
         'max_tool_result_tokens',
         'index_cache_freq',
         'turboquant_kv_enabled',
+        'turboquant_kv_scheme',
         'turboquant_kv_bits',
         'turboquant_skip_last',
         'qwen35_ane_prefill_enabled',
@@ -2156,8 +2157,12 @@
                     ttl_seconds: s.ttl_seconds ?? null,
                     enableIndexCache: !!(s.index_cache_freq),
                     index_cache_freq: s.index_cache_freq || null,
-                    turboquant_kv_enabled: s.turboquant_kv_enabled || false,
-                    turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    turboquant_kv_enabled: !isDiffusion && !model?.is_paroquant
+                        && (s.turboquant_kv_enabled || false),
+                    turboquant_kv_scheme: isDiffusion || model?.is_paroquant
+                        ? 'turboquant' : (s.turboquant_kv_scheme || 'turboquant'),
+                    turboquant_kv_bits: isDiffusion || model?.is_paroquant
+                        ? 4 : (s.turboquant_kv_bits || 4),
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
@@ -3175,8 +3180,11 @@
                     forced_ct_kwargs: forcedCtKwargs.length > 0
                         ? forcedCtKwargs : null,
                     turboquant_kv_enabled: ms.turboquant_kv_enabled,
-                    turboquant_kv_bits: ms.turboquant_kv_enabled
-                        ? (parseFloat(ms.turboquant_kv_bits) || 4)
+                    turboquant_kv_scheme: ms.turboquant_kv_scheme,
+                    // Affine formats have fixed widths, also while compression is off.
+                    turboquant_kv_bits: ms.turboquant_kv_scheme === 'affine8' ? 8
+                        : ms.turboquant_kv_scheme === 'affine4' ? 4
+                        : ms.turboquant_kv_enabled ? (parseFloat(ms.turboquant_kv_bits) || 4)
                         : 4,
                     moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
@@ -3273,6 +3281,7 @@
                         guided_grammar: null,
                         max_tool_result_tokens: 0,
                         turboquant_kv_enabled: false,
+                        turboquant_kv_scheme: 'turboquant',
                         turboquant_kv_bits: 4,
                         qwen35_ane_prefill_enabled: false,
                         qwen35_ane_prefill_sequence_length: 2048,
@@ -3576,6 +3585,7 @@
                         this.modelSettings.max_tool_result_tokens = 0;
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
+                        this.modelSettings.turboquant_kv_scheme = 'turboquant';
                         this.modelSettings.turboquant_kv_bits = 4;
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;

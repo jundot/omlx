@@ -44,6 +44,7 @@ UNIVERSAL_PROFILE_FIELDS = (
 # Model-specific fields — eligible for per-model profiles only (never templates).
 MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_enabled",
+    "turboquant_kv_scheme",
     "turboquant_kv_bits",
     "turboquant_skip_last",
     "qwen35_ane_prefill_enabled",
