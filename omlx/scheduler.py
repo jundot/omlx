@@ -6872,8 +6872,8 @@ class Scheduler:
         chunk_kwargs = {}
         if self._supports_skip_lm_head():
             chunk_kwargs["skip_lm_head"] = True
-        # Prompt position of the chunk: without boundary snapshots base_size
-        # stays 0 even when a prefix is cached.
+        # Prompt position of the chunk. Only boundary prefill corrects
+        # base_size to cached_tokens.
         chunk_start = state.tokens_processed + (
             state.base_size
             if state.boundary_enabled

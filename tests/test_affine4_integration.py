@@ -73,7 +73,7 @@ def test_scheduler_signature_matches_selected_format(scheduler):
     assert types == ["TurboQuantKVCache", "KVCache"]
 
 
-def test_affine4_allows_sink_aware_fallback(scheduler):
+def test_affine4_allows_attention_sink_models(scheduler):
     scheduler.model = SimpleNamespace(modules=lambda: [{"sinks": mx.zeros((4,))}])
     assert scheduler._turboquant_eligible([KVCache()])
     scheduler._turboquant_kv_scheme = "turboquant"

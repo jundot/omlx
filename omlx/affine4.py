@@ -40,6 +40,7 @@ __all__ = [
 _BITS = 4
 _MIN_NATIVE_TOKENS = 256
 _MAX_PADDED_ROWS = 32
+_MAX_THREADGROUP_BYTES = 32 * 1024
 # Bound each unfused float32 score matrix to 64 MiB, or one query row.
 _MAX_SCORE_ELEMENTS = 16 * 1024 * 1024
 _NATIVE_LAUNCHABLE = {}
@@ -642,13 +643,14 @@ _MPP_REDUCE_SOURCE = r"""
     threadgroup float global_m;
     threadgroup float global_l;
     if (dimension == 0) {
-        float maximum = -INFINITY;
+        // A sink is one extra logit in the softmax denominator with no value.
+        float maximum = HasSinks ? row_sinks[row] : -INFINITY;
         for (int block = 0; block < blocks; ++block) {
             int idx = int(row) * blocks + block;
             if (sums[idx] > 0.0f)
                 maximum = max(maximum, maxs[idx]);
         }
-        float normalizer = 0.0f;
+        float normalizer = HasSinks ? fast::exp(row_sinks[row] - maximum) : 0.0f;
         for (int block = 0; block < blocks; ++block) {
             int idx = int(row) * blocks + block;
             if (sums[idx] > 0.0f)
@@ -709,7 +711,7 @@ def _mpp_attention_kernel(
 def _mpp_reduce_kernel(dim: int):
     return mx.fast.metal_kernel(
         name=f"affine_mpp_reduce_d{dim}",
-        input_names=["partials", "sums", "maxs", "params"],
+        input_names=["partials", "sums", "maxs", "row_sinks", "params"],
         output_names=["output"],
         header="using namespace metal;\n",
         source=_MPP_REDUCE_SOURCE,
@@ -740,6 +742,21 @@ def _attention_blocks(tokens: int, kv_heads: int, dim: int, rows: int = 1) -> in
     return min(token_tiles, max(1, (target_groups + kv_heads - 1) // kv_heads))
 
 
+def _repeats_per_launch(dim: int, repeats: int, query_length: int, warps: int) -> int:
+    """Largest divisor of ``repeats`` whose query rows fit one threadgroup."""
+    for group in range(repeats, 0, -1):
+        rows = _padded_rows(group * query_length)
+        # q_tile, scores, probabilities, four per-row floats, per-warp scales.
+        tile_bytes = rows * (2 * dim + 64 * 4 + 64 * 2 + 4 * 4) + 4 * warps
+        if (
+            not repeats % group
+            and rows <= _MAX_PADDED_ROWS
+            and tile_bytes <= _MAX_THREADGROUP_BYTES
+        ):
+            return group
+    return 0
+
+
 def _attention_warps(dim: int) -> int:
     if dim <= 64:
         return 1
@@ -755,6 +772,7 @@ def _native_attention(
     values_state: TurboQuantMSEState,
     scale: float,
     mask,
+    sinks: mx.array | None = None,
 ) -> mx.array | None:
     if (
         mx.default_device() != mx.gpu
@@ -797,13 +815,15 @@ def _native_attention(
         or query_heads % kv_heads
         or query_length < 1
         or query_length > 4
+        or (sinks is not None and sinks.size != query_heads)
     ):
         return None
     repeats = query_heads // kv_heads
-    padded_rows = _padded_rows(repeats * query_length)
     warps = _attention_warps(dim)
-    if padded_rows > _MAX_PADDED_ROWS or dim % warps:
+    group = _repeats_per_launch(dim, repeats, query_length, warps)
+    if not group or dim % warps:
         return None
+    padded_rows = _padded_rows(group * query_length)
     tokens = _state_length(keys_state)
     if (
         tokens < _MIN_NATIVE_TOKENS
@@ -827,7 +847,6 @@ def _native_attention(
         mask = mx.array(True)
     else:
         return None
-    mask = mx.broadcast_to(mask, (batch, query_heads, query_length, tokens))
     valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
 
     blocks = _attention_blocks(tokens, kv_heads, dim, padded_rows if batch == 1 else 1)
@@ -843,61 +862,98 @@ def _native_attention(
     )
     grouped = queries.reshape(batch, kv_heads, repeats, query_length, dim)
     rotated = cache.key_codec.prepare_queries(grouped)
-    rows = batch * query_heads * query_length
-    geometry = (dim, repeats, query_length, padded_rows, warps, kv_heads)
+    has_sinks = sinks is not None
+    row_sinks = (
+        mx.broadcast_to(
+            sinks.astype(mx.float32).reshape(1, kv_heads, repeats, 1),
+            (batch, kv_heads, repeats, query_length),
+        )
+        if has_sinks
+        else mx.zeros((1,), dtype=mx.float32)
+    )
+    rows = batch * kv_heads * group * query_length
+    geometry = (dim, group, query_length, padded_rows, warps, kv_heads)
     signature = (
         *geometry,
         cache.key_codec.bits,
         keys_state.norms.dtype,
         accumulator,
         has_mask,
+        has_sinks,
     )
     if _NATIVE_LAUNCHABLE.get(signature) is False:
         return None
 
     try:
         pass1 = _mpp_attention_kernel(*geometry, cache.key_codec.bits)
-        partials, sums, maxs = pass1(
-            inputs=[
-                rotated.reshape(batch, query_heads, query_length, dim),
-                keys_state.indices,
-                keys_state.norms,
-                values_state.indices,
-                values_state.norms,
-                valid_starts,
-                valid_ends,
-                mask,
-                params,
-            ],
-            template=[
-                ("Dim", dim),
-                ("Repeats", repeats),
-                ("QueryLength", query_length),
-                ("PaddedRows", padded_rows),
-                ("Warps", warps),
-                ("NumKvHeads", kv_heads),
-                ("Bits", cache.key_codec.bits),
-                ("ValuesPerWord", cache.key_codec.values_per_word),
-                ("Accumulator", accumulator),
-                ("HasMask", has_mask),
-            ],
-            output_shapes=[
-                (rows, blocks, dim),
-                (rows, blocks),
-                (rows, blocks),
-            ],
-            output_dtypes=[mx.float32, mx.float32, mx.float32],
-            grid=(kv_heads * 32, batch * warps, blocks),
-            threadgroup=(32, warps, 1),
+        # Query heads that do not fit one threadgroup run as several launches.
+        chunks = []
+        for start in range(0, repeats, group):
+            stop = start + group
+            if has_mask and group < repeats:
+                chunk_mask = mx.broadcast_to(
+                    mask, (batch, query_heads, query_length, tokens)
+                ).reshape(batch, kv_heads, repeats, query_length, tokens)
+                chunk_mask = chunk_mask[:, :, start:stop].reshape(
+                    batch, kv_heads * group, query_length, tokens
+                )
+            else:
+                chunk_mask = mx.broadcast_to(
+                    mask, (batch, kv_heads * group, query_length, tokens)
+                )
+            partials, sums, maxs = pass1(
+                inputs=[
+                    rotated[:, :, start:stop].reshape(
+                        batch, kv_heads * group, query_length, dim
+                    ),
+                    keys_state.indices,
+                    keys_state.norms,
+                    values_state.indices,
+                    values_state.norms,
+                    valid_starts,
+                    valid_ends,
+                    chunk_mask,
+                    params,
+                ],
+                template=[
+                    ("Dim", dim),
+                    ("Repeats", group),
+                    ("QueryLength", query_length),
+                    ("PaddedRows", padded_rows),
+                    ("Warps", warps),
+                    ("NumKvHeads", kv_heads),
+                    ("Bits", cache.key_codec.bits),
+                    ("ValuesPerWord", cache.key_codec.values_per_word),
+                    ("Accumulator", accumulator),
+                    ("HasMask", has_mask),
+                ],
+                output_shapes=[
+                    (rows, blocks, dim),
+                    (rows, blocks),
+                    (rows, blocks),
+                ],
+                output_dtypes=[mx.float32, mx.float32, mx.float32],
+                grid=(kv_heads * 32, batch * warps, blocks),
+                threadgroup=(32, warps, 1),
+            )
+            chunk_sinks = (
+                mx.contiguous(row_sinks[:, :, start:stop]).reshape(-1)
+                if has_sinks
+                else row_sinks
+            )
+            chunks.append(
+                _mpp_reduce_kernel(dim)(
+                    inputs=[partials, sums, maxs, chunk_sinks, params],
+                    template=[("Dim", dim), ("HasSinks", has_sinks)],
+                    output_shapes=[(batch, kv_heads, group, query_length, dim)],
+                    output_dtypes=[mx.float32],
+                    grid=(rows * dim, 1, 1),
+                    threadgroup=(dim, 1, 1),
+                )[0]
+            )
+        rotated_output = (
+            mx.concatenate(chunks, axis=2) if len(chunks) > 1 else chunks[0]
         )
-        rotated_output = _mpp_reduce_kernel(dim)(
-            inputs=[partials, sums, maxs, params],
-            template=[("Dim", dim)],
-            output_shapes=[(batch, kv_heads, repeats, query_length, dim)],
-            output_dtypes=[mx.float32],
-            grid=(rows * dim, 1, 1),
-            threadgroup=(dim, 1, 1),
-        )[0]
         output = cache.value_codec._rotate_inverse(rotated_output)
         output = output.reshape(batch, query_heads, query_length, dim).astype(
             queries.dtype
@@ -909,7 +965,7 @@ def _native_attention(
                 "Affine%d TensorOps attention active (d=%d, repeats=%d, rows=%d)",
                 cache.key_codec.bits,
                 dim,
-                repeats,
+                group,
                 query_length,
             )
         return output
@@ -922,7 +978,7 @@ def _native_attention(
             "using portable attention",
             cache.key_codec.bits,
             dim,
-            repeats,
+            group,
             query_length,
         )
         logger.debug("TensorOps launch failure", exc_info=True)
@@ -1292,12 +1348,11 @@ class Affine4KVCache(TurboQuantKVCache):
             )
         if self.key_codec is None or self.value_codec is None:
             self.rebuild_codecs(keys_state, values_state)
-        if sinks is None:
-            output = _native_attention(
-                self, queries, keys_state, values_state, scale, mask
-            )
-            if output is not None:
-                return output
+        output = _native_attention(
+            self, queries, keys_state, values_state, scale, mask, sinks
+        )
+        if output is not None:
+            return output
         effective_mask = self._attention_mask(
             mask, queries.shape[-2], _state_length(keys_state)
         )

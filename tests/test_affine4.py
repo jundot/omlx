@@ -179,20 +179,31 @@ def test_portable_attention_masks_sinks_and_dimensions(
 
 
 @pytest.mark.parametrize(
-    "batch,heads,repeats,rows,dim,tokens,dtype,cache_class",
+    "batch,heads,repeats,rows,dim,tokens,dtype,cache_class,with_sinks",
     [
-        (1, 1, 1, 1, 32, 257, mx.float16, Affine4KVCache),
-        (1, 2, 3, 1, 64, 260, mx.bfloat16, Affine8KVCache),
-        (2, 3, 4, 2, 96, 257, mx.float16, Affine8KVCache),
-        (2, 2, 2, 4, 128, 513, mx.bfloat16, Affine4KVCache),
-        (1, 2, 8, 4, 256, 1025, mx.float16, Affine4KVCache),
-        (1, 2, 8, 4, 256, 150000, mx.bfloat16, Affine8KVCache),
-        (1, 1, 32, 1, 256, 150000, mx.bfloat16, Affine4KVCache),
-        (1, 1, 4, 1, 512, 259, mx.float16, Affine8KVCache),
+        (1, 1, 1, 1, 32, 257, mx.float16, Affine4KVCache, False),
+        (1, 2, 3, 1, 64, 260, mx.bfloat16, Affine8KVCache, False),
+        (2, 3, 4, 2, 96, 257, mx.float16, Affine8KVCache, False),
+        (2, 2, 2, 4, 128, 513, mx.bfloat16, Affine4KVCache, False),
+        (1, 2, 8, 4, 256, 1025, mx.float16, Affine4KVCache, False),
+        (1, 2, 8, 4, 256, 150000, mx.bfloat16, Affine8KVCache, False),
+        (1, 1, 32, 1, 256, 150000, mx.bfloat16, Affine4KVCache, False),
+        (1, 1, 4, 1, 512, 259, mx.float16, Affine8KVCache, False),
+        (1, 4, 8, 4, 512, 1025, mx.bfloat16, Affine4KVCache, True),
+        (1, 8, 8, 1, 64, 1025, mx.bfloat16, Affine8KVCache, True),
     ],
 )
 def test_actual_native_matches_portable(
-    monkeypatch, batch, heads, repeats, rows, dim, tokens, dtype, cache_class
+    monkeypatch,
+    batch,
+    heads,
+    repeats,
+    rows,
+    dim,
+    tokens,
+    dtype,
+    cache_class,
+    with_sinks,
 ):
     require_tensor_ops()
     cache = cache_class()
@@ -202,10 +213,12 @@ def test_actual_native_matches_portable(
     )
     q = random((batch, heads * repeats, rows, dim), dtype, 2)
     mask = "causal" if rows > 1 else None
-    native = affine4._native_attention(cache, q, *cache.state, dim**-0.5, mask)
+    # Large sinks take most of the softmax mass, so a dropped sink fails.
+    sinks = mx.linspace(4, 9, heads * repeats) if with_sinks else None
+    native = affine4._native_attention(cache, q, *cache.state, dim**-0.5, mask, sinks)
     assert native is not None, "Eligible native attention unexpectedly fell back"
     monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
-    portable = cache.attention(q, scale=dim**-0.5, mask=mask)
+    portable = cache.attention(q, scale=dim**-0.5, mask=mask, sinks=sinks)
     close(native, portable, atol=6e-3 if dtype == mx.bfloat16 else 2e-3)
 
 
