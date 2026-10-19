@@ -289,6 +289,38 @@ def test_small_batches_keep_rows_kernels(monkeypatch):
     assert names == ["gemv_fp8_nb"]
 
 
+def test_paired_weight_decoders_are_exact():
+    """fp8_decode4 / fp4_decode8 give every E4M3 / E2M1 code its value times 2^-8 / 2^-14
+    (E4M3FN NaN codes 0x7F / 0xFF read as 480, like the e4m3() helper; weights never hold them)."""
+    from omlx.patches.deepseek_v41 import decode_moe
+
+    source = r"""
+        const uint i = thread_position_in_grid.x;
+        float v[8];
+        fp8_decode4(words8[i], v);
+        for (int j = 0; j < 4; ++j) out8[i * 4 + j] = v[j] * 256.0f;
+        if (i < 2) {
+            fp4_decode8(words4[i], v);
+            for (int j = 0; j < 8; ++j) out4[i * 8 + j] = v[j] * 16384.0f;
+        }
+    """
+    kernel = mx.fast.metal_kernel(name="v41_test_weight_decoders", input_names=["words8", "words4"],
+                                  output_names=["out8", "out4"], source=source, header=decode_moe._HEADER)
+    codes = np.arange(256, dtype=np.uint8)
+    words8 = codes.view(np.uint32)                                   # code 4i + j at bits 8j of word i
+    words4 = np.array([sum(n << (4 * j) for j, n in enumerate(range(8 * w, 8 * w + 8))) for w in range(2)], np.uint32)
+    out8, out4 = kernel(inputs=[mx.array(words8), mx.array(words4)], grid=(64, 1, 1), threadgroup=(64, 1, 1),
+                        output_shapes=[(256,), (16,)], output_dtypes=[mx.float32, mx.float32])
+    c = codes.astype(np.int64)
+    e, m = (c >> 3) & 15, c & 7
+    e4m3 = np.where(e == 0, m * 2.0**-9, 2.0 ** (e - 7.0) * (1 + m / 8)) * np.where(c & 128, -1, 1)
+    e2m1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
+    np.testing.assert_array_equal(np.asarray(out8), e4m3.astype(np.float32))
+    np.testing.assert_array_equal(np.asarray(out4), e2m1.astype(np.float32))
+    assert np.array_equal(np.signbit(np.asarray(out8)), codes >= 128)
+    assert np.array_equal(np.signbit(np.asarray(out4)), np.arange(16) >= 8)
+
+
 @pytest.mark.parametrize("nb", [2, 3, 8])
 def test_batched_moe_matches_single_token_moe(monkeypatch, nb):
     """Without matrix tiles, each token of the batched MoE gets the single-token kernels'

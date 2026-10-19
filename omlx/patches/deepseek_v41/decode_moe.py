@@ -59,11 +59,23 @@ inline float act_quant_value(float x, float s) {
 // magnitude >= 2^-31) are exact in fp32 either way, and multiplying the group partial by 2^8 /
 // 2^14 before the e8m0 scale is exact (no overflow or underflow at these magnitudes), so the
 // per-group partial equals the reference's partial * scale for the same summation order.
-inline float fp8_shifted(uint b) {
-    return float(as_type<half>(ushort(((b & 0x80u) << 8) | ((b & 0x7Fu) << 7))));
+// Codes are decoded two at a time: two codes 16 bits apart in a packed word become the two
+// fp16 halves of one half2 with the same 32-bit masks and shifts, half the integer work of
+// decoding them one by one (decode issue bounds these GEMVs: B=1..8 decode +4..9%).
+// v[j] = E2M1 code j (bits 4j..4j+3) of p, times 2^-14.
+inline void fp4_decode8(uint p, thread float* v) {
+    for (int j = 0; j < 4; ++j) {
+        const uint q = p >> (4 * j);
+        const float2 f = float2(as_type<half2>(((q & 0x00080008u) << 12) | ((q & 0x00070007u) << 9)));
+        v[j] = f.x; v[j + 4] = f.y;
+    }
 }
-inline float fp4_shifted(uint n) {
-    return float(as_type<half>(ushort(((n & 8u) << 12) | ((n & 7u) << 9))));
+// v[j] = E4M3 code j (bits 8j..8j+7) of p, times 2^-8.
+inline void fp8_decode4(uint p, thread float* v) {
+    const float2 f02 = float2(as_type<half2>(((p & 0x00800080u) << 8) | ((p & 0x007F007Fu) << 7)));
+    const uint q = p >> 8;
+    const float2 f13 = float2(as_type<half2>(((q & 0x00800080u) << 8) | ((q & 0x007F007Fu) << 7)));
+    v[0] = f02.x; v[1] = f13.x; v[2] = f02.y; v[3] = f13.y;
 }
 // ROWS rows of an MXFP8 matrix ([*, K] bytes as uint32, one e8m0 scale per 32) dotted with an
 // fp32 vector; each lane covers 8 contiguous values per step (MLX qmv_fast layout), x is
@@ -79,8 +91,9 @@ inline void fp8_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
             const auto wr = w + size_t(row0 + r) * (K / 4) + k / 4;
             const uint p0 = wr[0], p1 = wr[1];
             float a = 0.0f;
-            for (int j = 0; j < 4; ++j) a += fp8_shifted((p0 >> (8 * j)) & 255u) * xv[j];
-            for (int j = 0; j < 4; ++j) a += fp8_shifted((p1 >> (8 * j)) & 255u) * xv[4 + j];
+            float wv[8];
+            fp8_decode4(p0, wv); fp8_decode4(p1, wv + 4);
+            for (int j = 0; j < 8; ++j) a += wv[j] * xv[j];
             acc[r] += (a * 256.0f) * e8m0(s[size_t(row0 + r) * (K / 32) + k / 32]);
         }
     }
@@ -101,8 +114,7 @@ inline void fp8_rows_nb(W w, S s, uint row0, X x, uint XS, uint lane, thread flo
         for (int r = 0; r < ROWS; ++r) {
             const auto wr = w + size_t(row0 + r) * (K / 4) + k / 4;
             const uint p0 = wr[0], p1 = wr[1];
-            for (int j = 0; j < 4; ++j) wv[r][j] = fp8_shifted((p0 >> (8 * j)) & 255u);
-            for (int j = 0; j < 4; ++j) wv[r][4 + j] = fp8_shifted((p1 >> (8 * j)) & 255u);
+            fp8_decode4(p0, wv[r]); fp8_decode4(p1, wv[r] + 4);
             sc[r] = e8m0(s[size_t(row0 + r) * (K / 32) + k / 32]);
         }
         for (int b = 0; b < NB; ++b) {
@@ -150,9 +162,11 @@ inline void fp8_mma8(W w, S s, uint r0, X x, uint XS, uint lane, uint ks,
         const float4 xa = v0 ? float4(x0[base + 4 * fm], x0[base + 4 * fm + 1], x0[base + 4 * fm + 2], x0[base + 4 * fm + 3]) : float4(0.0f);
         const float4 xb = v1 ? float4(x1[base + 4 * fm], x1[base + 4 * fm + 1], x1[base + 4 * fm + 2], x1[base + 4 * fm + 3]) : float4(0.0f);
         part.thread_elements()[0] = 0.0f; part.thread_elements()[1] = 0.0f;
+        float wx[4], wy[4];
+        fp8_decode4(wb.x, wx); fp8_decode4(wb.y, wy);
         for (int j = 0; j < 4; ++j) {
-            a.thread_elements()[0] = fp8_shifted((wb.x >> (8 * j)) & 255u);
-            a.thread_elements()[1] = fp8_shifted((wb.y >> (8 * j)) & 255u);
+            a.thread_elements()[0] = wx[j];
+            a.thread_elements()[1] = wy[j];
             b.thread_elements()[0] = xa[j];
             b.thread_elements()[1] = xb[j];
             simdgroup_multiply_accumulate(part, a, b, part);
@@ -187,8 +201,9 @@ inline void fp4_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
             const auto wr = w + size_t(row0 + r) * (K / 8) + k / 8;
             float a = 0.0f;
             for (int q = 0; q < NW; ++q) {
-                const uint p = wr[q];
-                for (int j = 0; j < 8; ++j) a += fp4_shifted((p >> (4 * j)) & 15u) * xv[8 * q + j];
+                float wv[8];
+                fp4_decode8(wr[q], wv);
+                for (int j = 0; j < 8; ++j) a += wv[j] * xv[8 * q + j];
             }
             acc[r] += (a * 16384.0f) * e8m0(s[size_t(row0 + r) * (K / 32) + k / 32]);
         }
