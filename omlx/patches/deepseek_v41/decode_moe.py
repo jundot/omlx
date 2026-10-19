@@ -85,6 +85,31 @@ inline void fp8_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
     }
     for (int r = 0; r < ROWS; ++r) acc[r] = simd_sum(acc[r]);
 }
+// fp8_rows for NB activation vectors (x + b * XS) sharing each weight load: the per-vector
+// arithmetic is fp8_rows' (same lane split, same in-group order), so each vector's result
+// is the single-vector result. acc[r * NB + b].
+template <int K, int ROWS, int NB, typename W, typename S, typename X>
+inline void fp8_rows_nb(W w, S s, uint row0, X x, uint XS, uint lane, thread float* acc) {
+    static_assert(K % 256 == 0, "K must be a multiple of 32 lanes x 8 values");
+    for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
+    for (uint k = lane * 8; k < uint(K); k += 256) {
+        for (int r = 0; r < ROWS; ++r) {
+            const auto wr = w + size_t(row0 + r) * (K / 4) + k / 4;
+            const uint p0 = wr[0], p1 = wr[1];
+            float wv[8];
+            for (int j = 0; j < 4; ++j) wv[j] = fp8_shifted((p0 >> (8 * j)) & 255u);
+            for (int j = 0; j < 4; ++j) wv[4 + j] = fp8_shifted((p1 >> (8 * j)) & 255u);
+            const float sc = e8m0(s[size_t(row0 + r) * (K / 32) + k / 32]);
+            for (int b = 0; b < NB; ++b) {
+                const auto xb = x + size_t(b) * XS + k;
+                float a = 0.0f;
+                for (int j = 0; j < 8; ++j) a += wv[j] * float(xb[j]);
+                acc[r * NB + b] += (a * 256.0f) * sc;
+            }
+        }
+    }
+    for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
+}
 // Same for MXFP4 (8 values per uint32): 16 contiguous values per lane per step when K allows
 // (K % 512 == 0), else 8 (e.g. the 2304-wide expert down projection).
 template <int K, int ROWS, typename W, typename S, typename X>
@@ -236,6 +261,184 @@ _DOWN = r"""
         out[row0 + lane] = bfloat16_t(total);
     }
 """
+
+
+# ---- batched decode MoE (NB tokens) --------------------------------------------------------
+# Gate: each simdgroup loads its expert row once and scores all NB tokens (same per-token
+# order as _GATE). act_quant(x) per token.
+_GATE_NB = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.x * (TPG / 32) + simdgroup_index_in_threadgroup;
+    if (row < uint(NE)) {
+        float dot[NB];
+        for (int b = 0; b < NB; ++b) dot[b] = 0.0f;
+        for (uint k = lane * 4; k < uint(DIM); k += 128) {
+            const float4 wv = float4(float(w[row * DIM + k]), float(w[row * DIM + k + 1]),
+                                     float(w[row * DIM + k + 2]), float(w[row * DIM + k + 3]));
+            for (int b = 0; b < NB; ++b) {
+                const auto xb = x + b * DIM;
+                const float4 a = float4(float(xb[k]), float(xb[k + 1]), float(xb[k + 2]), float(xb[k + 3]));
+                dot[b] += a.x * wv.x; dot[b] += a.y * wv.y; dot[b] += a.z * wv.z; dot[b] += a.w * wv.w;
+            }
+        }
+        for (int b = 0; b < NB; ++b) {
+            const float d = simd_sum(dot[b]);
+            if (lane == 0) {
+                const float raw = d / temp[0];
+                const float y = metal::precise::exp(raw);
+                const float sp = raw > 20.0f ? raw
+                    : (y < 1e-4f ? y * (1.0f - y * (0.5f - y * (1.0f / 3.0f))) : metal::precise::log(1.0f + y));
+                scores[b * NE + row] = metal::precise::sqrt(sp);
+            }
+        }
+    }
+    const uint group = threadgroup_position_in_grid.x * (TPG / 32) + simdgroup_index_in_threadgroup;
+    for (uint gb = group; gb < uint(NB * (DIM / 32)); gb += NGROUPS_STRIDE) {
+        const uint b = gb / (DIM / 32), g = gb % (DIM / 32);
+        const float v = float(x[b * DIM + g * 32 + lane]);
+        const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
+        xq[b * DIM + g * 32 + lane] = act_quant_value(v, s);
+    }
+"""
+
+# Up: threadgroup column y < NB * TOPK is (token y / TOPK, routed slot y % TOPK) and runs
+# _UP's routed path on that token; the last column runs the shared expert for all NB tokens
+# with one weight read (fp8_rows_nb).
+_UP_NB = r"""
+    threadgroup int chosen[8];
+    threadgroup float sv[32]; threadgroup int si[32];
+    threadgroup float hblock[NB][32];
+    const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint ys = threadgroup_position_in_grid.y;
+    const uint row0 = threadgroup_position_in_grid.x * 32 + sg * 4;
+    if (ys < uint(NB * TOPK)) {
+        const uint b = ys / TOPK, slot = ys % TOPK;
+        const device float* sc_b = scores + b * NE;
+        topk_select<NE, TOPK>(sc_b, bias, chosen, sv, si, tid, 256);
+        float wsum = 0.0f;
+        for (int j = 0; j < TOPK; ++j) wsum += sc_b[chosen[j]];
+        const float rw = sc_b[chosen[slot]] / (wsum + 1e-20f) * route_scale[0];
+        if (tid == 0 && threadgroup_position_in_grid.x == 0 && slot == 0)
+            for (int j = 0; j < TOPK; ++j) {
+                out_idx[b * TOPK + j] = chosen[j];
+                out_w[b * TOPK + j] = sc_b[chosen[j]] / (wsum + 1e-20f) * route_scale[0];
+            }
+        const uint e = uint(chosen[slot]);
+        float g4[4], u4[4];
+        fp4_rows<DIM, 4>(w1 + size_t(e) * INTER * (DIM / 8), s1p + size_t(e) * INTER * (DIM / 32), row0, xq + b * DIM, lane, g4);
+        fp4_rows<DIM, 4>(w3 + size_t(e) * INTER * (DIM / 8), s3p + size_t(e) * INTER * (DIM / 32), row0, xq + b * DIM, lane, u4);
+        if (lane < 4) {
+            float gate = float(bfloat16_t(g4[lane])), up = float(bfloat16_t(u4[lane]));
+            if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
+            float h = gate / (1.0f + metal::precise::exp(-gate)) * up;
+            h = rw * h;
+            hblock[0][sg * 4 + lane] = float(bfloat16_t(h));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            const float v = hblock[0][lane];
+            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
+            hq[(b * TOPK + slot) * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+        }
+    } else {
+        float g4[4 * NB], u4[4 * NB];
+        fp8_rows_nb<DIM, 4, NB>(sw1, ss1, row0, xq, uint(DIM), lane, g4);
+        fp8_rows_nb<DIM, 4, NB>(sw3, ss3, row0, xq, uint(DIM), lane, u4);
+        if (lane < 4)
+            for (int b = 0; b < NB; ++b) {
+                float gate = float(bfloat16_t(g4[lane * NB + b])), up = float(bfloat16_t(u4[lane * NB + b]));
+                if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
+                hblock[b][sg * 4 + lane] = float(bfloat16_t(gate / (1.0f + metal::precise::exp(-gate)) * up));
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg < uint(NB)) {
+            const float v = hblock[sg][lane];
+            const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
+            hqs[sg * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+        }
+    }
+"""
+
+# Down, routed: one threadgroup per (4 output rows, token), simdgroup = routed slot; the fp32
+# sum over slots in slot order is kept unrounded for the shared expert's addition.
+_DOWN_R_NB = r"""
+    threadgroup float part[TOPK * 4];
+    const uint lane = thread_index_in_simdgroup, slot = simdgroup_index_in_threadgroup;
+    const uint row0 = threadgroup_position_in_grid.x * 4, b = threadgroup_position_in_grid.y;
+    float acc[4];
+    const uint e = uint(idx[b * TOPK + slot]);
+    fp4_rows<INTER, 4>(w2 + size_t(e) * DIM * (INTER / 8), s2p + size_t(e) * DIM * (INTER / 32), row0,
+                       hq + (b * TOPK + slot) * INTER, lane, acc);
+    if (lane < 4) part[slot * 4 + lane] = float(bfloat16_t(acc[lane]));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (slot == 0 && lane < 4) {
+        float total = 0.0f;
+        for (int s = 0; s < TOPK; ++s) total += part[s * 4 + lane];
+        partial[b * DIM + row0 + lane] = total;
+    }
+"""
+# Down, shared: all NB tokens per weight read, then out = bf16(routed partial + bf16(shared)),
+# i.e. _DOWN's slot-order sum with the shared expert last.
+_DOWN_S_NB = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint row0 = (threadgroup_position_in_grid.x * 2 + simdgroup_index_in_threadgroup) * 4;
+    float acc[4 * NB];
+    fp8_rows_nb<INTER, 4, NB>(sw2, ss2, row0, hqs, uint(INTER), lane, acc);
+    if (lane < 4)
+        for (int b = 0; b < NB; ++b)
+            out[b * DIM + row0 + lane] = bfloat16_t(partial[b * DIM + row0 + lane] + float(bfloat16_t(acc[lane * NB + b])));
+"""
+
+
+@cache
+def _kernels_nb():
+    gate = mx.fast.metal_kernel(name="v41_decode_moe_gate_nb", input_names=["x", "w", "temp"],
+                                output_names=["scores", "xq"], source=_GATE_NB, header=_HEADER)
+    up = mx.fast.metal_kernel(
+        name="v41_decode_moe_up_nb",
+        input_names=["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "w3", "s3p",
+                     "sw1", "ss1", "sw3", "ss3"],
+        output_names=["hq", "hqs", "out_idx", "out_w"], source=_UP_NB, header=_HEADER)
+    down_r = mx.fast.metal_kernel(name="v41_decode_moe_down_routed_nb", input_names=["hq", "idx", "w2", "s2p"],
+                                  output_names=["partial"], source=_DOWN_R_NB, header=_HEADER)
+    down_s = mx.fast.metal_kernel(name="v41_decode_moe_down_shared_nb", input_names=["hqs", "partial", "sw2", "ss2"],
+                                  output_names=["out"], source=_DOWN_S_NB, header=_HEADER)
+    return gate, up, down_r, down_s
+
+
+def fused_decode_moe_nb(moe, x, config):
+    """NB tokens at once. x: [NB, dim] bf16 (ffn_norm outputs). Returns [NB, dim] bf16; each
+    token's result equals fused_decode_moe on that token alone."""
+    gate_k, up_k, down_r, down_s = _kernels_nb()
+    nb = x.shape[0]
+    dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
+    tpg = 256
+    n_tg = (ne + tpg // 32 - 1) // (tpg // 32)
+    scores, xq = gate_k(
+        inputs=[x, moe.gate.weight, _const((getattr(config, "gate_temp", 1.0),))],
+        template=[("NE", ne), ("DIM", dim), ("TPG", tpg), ("NGROUPS_STRIDE", n_tg * (tpg // 32)), ("NB", nb)],
+        grid=(n_tg * tpg, 1, 1), threadgroup=(tpg, 1, 1),
+        output_shapes=[(nb * ne,), (nb * dim,)], output_dtypes=[mx.float32, mx.float32])
+    e, s = moe.experts, moe.shared_experts
+    hq, hqs, idx, w = up_k(
+        inputs=[scores, moe.gate.bias, _const((config.route_scale,)), _const((config.swiglu_limit,)), xq,
+                e.w1.weight, e.w1.scales, e.w3.weight, e.w3.scales, s.w1.weight, s.w1.scales, s.w3.weight, s.w3.scales],
+        template=[("NE", ne), ("TOPK", topk), ("DIM", dim), ("INTER", inter), ("NB", nb)],
+        grid=(inter // 32 * 256, nb * topk + 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(nb * topk * inter,), (nb * inter,), (nb * topk,), (nb * topk,)],
+        output_dtypes=[mx.float32, mx.float32, mx.int32, mx.float32])
+    partial = down_r(
+        inputs=[hq, idx, e.w2.weight, e.w2.scales],
+        template=[("TOPK", topk), ("DIM", dim), ("INTER", inter)],
+        grid=(dim // 4 * topk * 32, nb, 1), threadgroup=(topk * 32, 1, 1),
+        output_shapes=[(nb * dim,)], output_dtypes=[mx.float32])[0]
+    out = down_s(
+        inputs=[hqs, partial, s.w2.weight, s.w2.scales],
+        template=[("DIM", dim), ("INTER", inter), ("NB", nb)],
+        grid=(dim // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
+        output_shapes=[(nb * dim,)], output_dtypes=[mx.bfloat16])[0]
+    return out.reshape(nb, dim), idx.reshape(nb, topk), w.reshape(nb, topk)
 
 
 @cache

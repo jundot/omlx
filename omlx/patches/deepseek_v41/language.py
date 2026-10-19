@@ -949,6 +949,91 @@ class LanguageModel(DSparkMixin, nn.Module):
             for i in range(len(self.layers))
         ]
 
+    def _batched_decode_ok(self, input_ids, cache, masks, inputs_embeds, capture, kwargs):
+        """One token for each of 2..MAX_BATCH requests, all at a valid position, through
+        layers the fused decode supports: run the layers once for the whole batch."""
+        b_n = input_ids.shape[0]
+        if not (
+            input_ids.shape[1] == 1
+            and 2 <= b_n <= decode_fused.MAX_BATCH
+            and inputs_embeds is None
+            and not capture
+            and kwargs.get("mtp_verify_states") is None
+            and not kwargs.get("_ced_prefill", False)
+            and all(decode_fused.supported(layer, self._config) for layer in self.layers)
+        ):
+            return False
+        if masks is not None and not bool(np.all(np.asarray(masks))):
+            return False
+        return all(not item.empty() for item in cache)
+
+    def _forward_decode_batched(self, input_ids, cache):
+        """_forward for B single-token requests with the weights read once per step.
+
+        Same per-request semantics as the row loop below (positions, caches, Engram history,
+        cache bookkeeping); the decoder blocks run decode_fused.decode_block_nb, whose kernels
+        give each request the single-request result, and Engram projects each request's row
+        on its own (Engram.__call__).
+        """
+        c = self._config
+        b_n = input_ids.shape[0]
+        rcs = [[item.extract(row) for item in cache] for row in range(b_n)]
+        starts = []
+        for rc in rcs:
+            start = rc[0].size()
+            if any(item.size() != start for item in rc):
+                raise ValueError("DeepSeek V4.1 cache offsets diverged across layers")
+            starts.append(start)
+        hashes, histories = None, None
+        if self._hasher is not None:
+            per_row = [self._hasher(input_ids[r : r + 1], rcs[r][0][6], None) for r in range(b_n)]
+            hashes = np.concatenate([p[0] for p in per_row], 0)
+            histories = [p[1] for p in per_row]
+        h = self.embed(input_ids)
+        h = mx.repeat(h[..., None, :], c.hc_mult, -2)
+        pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
+        shareds = [{} for _ in range(b_n)]
+        prefetch = getattr(self, "_engram_prefetch", None)
+        with prefetch.forward() if prefetch is not None else nullcontext():
+            if prefetch is not None and c.engram_layer_ids:
+                prefetch.submit(self.layers[c.engram_layer_ids[0]].engram.embed, hashes[:, :, 0])
+            for i, layer in enumerate(self.layers):
+                if "engram" in layer:
+                    ix = list(c.engram_layer_ids).index(i)
+                    if prefetch is not None:
+                        mx.async_eval(h, pre)
+                    h = layer.engram(h, hashes[:, :, ix], None)
+                    if prefetch is not None and ix + 1 < len(c.engram_layer_ids):
+                        prefetch.submit(
+                            self.layers[c.engram_layer_ids[ix + 1]].engram.embed, hashes[:, :, ix + 1]
+                        )
+                h, pre = decode_fused.decode_block_nb(
+                    layer, h, pre, [rcs[r][i] for r in range(b_n)], shareds, starts, c
+                )
+                if prefetch is not None and "engram" in layer:
+                    mx.async_eval(h, pre)
+                for r in range(b_n):
+                    rc = rcs[r]
+                    rc[i][0] = mx.array([starts[r] + 1], mx.int32)
+                    if histories is not None and i == 0:
+                        rc[i][6] = mx.array(histories[r], mx.int64)
+                    for slot in range(1, 7):
+                        if rc[i][slot] is None:
+                            width = c.index_head_dim if slot == 3 else c.head_dim
+                            empty = mx.zeros((1, 0, width), h.dtype)
+                            if slot == 1:
+                                empty = pack_activation(empty)
+                            elif slot == 2:
+                                empty = pack_activation(empty, 4, 16, True)
+                            elif slot == 3:
+                                empty = pack_activation(empty, 4)
+                            rc[i][slot] = mx.zeros((1, 0), mx.int64) if slot == 6 else empty
+        logits = project_logits(self.norm(hc_pre(h, pre)), self.head.weight)
+        for i, item in enumerate(cache):
+            item.adopt_rows([rcs[r][i] for r in range(b_n)])
+            item.advance(1)
+        return logits
+
     def _forward(
         self, input_ids, cache=None, inputs_embeds=None, token_types=None, **kwargs
     ):
@@ -968,6 +1053,8 @@ class LanguageModel(DSparkMixin, nn.Module):
             )
         masks = cache[0].make_mask(input_ids.shape[1])
         capture = bool(kwargs.get("return_dspark_hidden", False))
+        if self._batched_decode_ok(input_ids, cache, masks, inputs_embeds, capture, kwargs):
+            return self._forward_decode_batched(input_ids, cache)
         if capture and input_ids.shape[0] != 1:
             raise ValueError(
                 "DSpark target capture currently requires one unpadded row"
@@ -1105,8 +1192,9 @@ class LanguageModel(DSparkMixin, nn.Module):
                 )
             )
         for i, item in enumerate(cache):
-            merged = DeepseekV41Cache.merge(rows[i])
-            item.cache = merged.cache
+            # Rows ran in place on the copies extract() handed out; a batch keeps them as
+            # rows rather than re-concatenating every slot of every layer each step.
+            item.adopt_rows(rows[i])
             item.advance(input_ids.shape[1])
         logits = mx.concatenate(results, 0)
         if capture:

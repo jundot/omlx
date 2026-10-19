@@ -8,6 +8,7 @@ leaves free, so the logits must agree to rounding noise.
 """
 
 import zlib
+from dataclasses import replace
 
 import mlx.core as mx
 import numpy as np
@@ -57,8 +58,8 @@ def config():
 _FP32 = ("hc_", "attn_sink", "gate.bias", "compressor.")
 
 
-def build(seed=4121):
-    model = LanguageModel(config())
+def build(seed=4121, **overrides):
+    model = LanguageModel(replace(config(), **overrides))
     weights = []
     for name, parameter in tree_flatten(model.parameters()):
         rng = np.random.default_rng(seed + zlib.crc32(name.encode()))
@@ -148,3 +149,94 @@ def test_fused_decode_rejects_unsupported_layouts():
     assert not mx.array_equal(scaled, other.wo_a.weight).item()
     other.wo_a.weight = scaled
     assert not decode_fused.supported(model.layers[3], c)
+
+
+@pytest.mark.parametrize("batch", [2, 3])
+def test_batched_decode_matches_single_requests(monkeypatch, batch):
+    """B single-token requests through decode_block_nb give each request the logits it gets
+    decoding alone (per-request arithmetic is the single-request kernels')."""
+    from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
+
+    model = build()
+    calls = {"nb": 0}
+    real = decode_fused.decode_block_nb
+
+    def counted(*args, **kwargs):
+        calls["nb"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(decode_fused, "decode_block_nb", counted)
+    rng = np.random.default_rng(11)
+    prompts = [rng.integers(3, 60, 13 + 2 * r).tolist() for r in range(batch)]   # different lengths
+    singles, rows = [], []
+    for p in prompts:
+        for target in (singles, rows):
+            cache = model.make_cache()
+            mx.eval(model(mx.array([p[:-1]]), cache=cache))
+            target.append(cache)
+    batched = [DeepseekV41Cache.merge([rows[r][i] for r in range(batch)]) for i in range(len(rows[0]))]
+    tokens = [p[-1] for p in prompts]
+    for step in range(4):
+        expected = [np.asarray(model(mx.array([[t]]), cache=c_)[0, -1].astype(mx.float32)) for t, c_ in zip(tokens, singles)]
+        got = np.asarray(model(mx.array([[t] for t in tokens]), cache=batched)[:, -1].astype(mx.float32))
+        for r in range(batch):
+            np.testing.assert_allclose(got[r], expected[r], rtol=0, atol=1e-6 * np.abs(expected[r]).max())
+        tokens = [int(e.argmax()) for e in expected]
+    assert calls["nb"] == 4 * model._config.n_layers
+
+
+@pytest.mark.parametrize("nb", [2, 3, 8])
+def test_batched_moe_matches_single_token_moe(monkeypatch, nb):
+    """Without matrix tiles, each token of the batched MoE gets the single-token kernels'
+    output, routing indices and weights bit for bit, also when tokens share experts: the
+    routed kernels then dispatch every token of a row block together (see _UP_NB)."""
+    from omlx.patches.deepseek_v41 import decode_moe
+
+    model = build(n_routed_experts=16, n_activated_experts=4)   # >2 slots: their sum order shows
+    c = model._config
+    rng = np.random.default_rng(23 + nb)
+    x = rng.normal(0, 1, (nb, c.dim)).astype(np.float32)
+    x[nb // 2:] = x[: nb - nb // 2] + rng.normal(0, 0.05, (nb - nb // 2, c.dim))   # neighbours share experts
+    x = mx.array(x).astype(mx.bfloat16)
+    shared = 0
+    for layer in model.layers:
+        out, idx, w = decode_moe.fused_decode_moe_nb(layer.ffn, x, c)
+        for r in range(nb):
+            single, single_idx, single_w = decode_moe.fused_decode_moe(layer.ffn, x[r].reshape(1, 1, -1), c)
+            assert mx.array_equal(out[r], single.reshape(-1)).item()
+            assert mx.array_equal(idx[r], single_idx).item() and mx.array_equal(w[r], single_w).item()
+        shared += len(np.unique(np.asarray(idx))) < nb * c.n_activated_experts
+    assert shared
+
+
+@pytest.mark.parametrize("batch", [2, 8])
+def test_batched_engram_projects_each_request_like_a_single_request(batch):
+    """Batched decode feeds Engram one row per request. Each row is projected on its own
+    (mxfp8_gemv, as when the request decodes alone); a B-row quantized_matmul rounds its fp32
+    sums differently, which made a request's tokens depend on its batch."""
+    from test_deepseek_v41 import tiny
+
+    from omlx.patches.deepseek_v41.engram import Engram
+
+    c = tiny(
+        dim=512,   # wkv output 2560 wide: there MLX's B-row kernel rounds differently
+        engram_layer_ids=(1,),
+        engram_num_embeddings=(97,),
+        engram_vocab_size=5,
+        engram_max_ngram_size=4,
+        engram_n_heads=8,
+        engram_head_dim=256,
+        engram_compressed_vocab_size=64,
+    )
+    engram = Engram(c, 0)
+    rng = np.random.default_rng(19)   # draws whose B-row projection differs in a few elements
+    engram.embed.weight = mx.array(rng.normal(0, 1, engram.embed.weight.shape).astype(np.float32)).astype(mx.bfloat16)
+    weight = mx.array(rng.normal(0, 0.02, engram.wkv.weight.shape).astype(np.float32)).astype(mx.bfloat16)
+    packed, scales = mx.quantize(weight, group_size=32, bits=8, mode="mxfp8")[:2]
+    engram.wkv = QuantizedProjection(packed, scales, 8, "mxfp8")
+    ids = rng.integers(0, 97, (batch, 1, 3 * 8))
+    # Engram computes in fp32 and returns h's dtype: fp32 h keeps every projection bit visible.
+    h = mx.array(rng.normal(0, 1, (batch, 1, c.hc_mult, c.dim)).astype(np.float32))
+    batched = engram(h, ids)
+    single = mx.concatenate([engram(h[r : r + 1], ids[r : r + 1]) for r in range(batch)])
+    assert mx.array_equal(batched, single).item()

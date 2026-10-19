@@ -432,12 +432,77 @@ _O_MERGE = r"""
     oq[idx] = act_quant_value(v, s);
 """
 
+# ---- batched decode (B requests, one token each) ------------------------------------------
+# Shared-weight GEMVs: each simdgroup decodes its 4 weight rows once and applies them to all
+# NB activation vectors (fp8_rows_nb), so a step reads the weights once instead of B times.
+_GEMV_FP8_NB = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint row0 = (threadgroup_position_in_grid.x * 2 + simdgroup_index_in_threadgroup) * 4;
+    if (row0 >= uint(NA + NB_ROWS)) return;
+    float acc[4 * NB];
+    if (row0 >= uint(NA)) {
+        fp8_rows_nb<K, 4, NB>(wb, sb, row0 - NA, x, uint(K), lane, acc);
+        if (lane < 4) for (int b = 0; b < NB; ++b) yb[b * NB_ROWS + row0 - NA + lane] = bfloat16_t(acc[lane * NB + b]);
+    } else {
+        fp8_rows_nb<K, 4, NB>(wa, sa, row0, x, uint(K), lane, acc);
+        if (lane < 4) for (int b = 0; b < NB; ++b) ya[b * NA + row0 + lane] = bfloat16_t(acc[lane * NB + b]);
+    }
+"""
+_WQB_ROPE_NB = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint row0 = (threadgroup_position_in_grid.x * 2 + simdgroup_index_in_threadgroup) * 4;
+    if (row0 >= uint(N)) return;
+    float acc[4 * NB];
+    fp8_rows_nb<K, 4, NB>(w, sc, row0, x, uint(K), lane, acc);
+    if (lane < 2 * NB) {
+        const uint b = lane / 2, pr = lane % 2;      // request b, RoPE pair (row0 + 2 pr, +1)
+        float a = float(bfloat16_t(acc[(2 * pr) * NB + b])), c = float(bfloat16_t(acc[(2 * pr + 1) * NB + b]));
+        const uint d = (row0 + 2 * pr) % HD;
+        if (d >= uint(HD - RD)) {
+            const uint p = (d - (HD - RD)) / 2;
+            const float cs = cosv[b * (RD / 2) + p], sn = sinv[b * (RD / 2) + p];
+            const float ra = a * cs - c * sn, rc = a * sn + c * cs;
+            a = ra; c = rc;
+        }
+        y[b * N + row0 + 2 * pr] = bfloat16_t(a);
+        y[b * N + row0 + 2 * pr + 1] = bfloat16_t(c);
+    }
+"""
+_WOA_NB = r"""
+    threadgroup float yb[NB][32];
+    const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    const uint row0 = threadgroup_position_in_grid.x * 32 + sg * 4;    // 8 simdgroups x 4 rows
+    const uint g = row0 / R;
+    float acc[4 * NB];
+    fp8_rows_nb<K, 4, NB>(w, sc, row0, x + g * K, uint(G * K), lane, acc);
+    if (lane < 4) for (int b = 0; b < NB; ++b) yb[b][sg * 4 + lane] = float(bfloat16_t(acc[lane * NB + b]));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg < uint(NB)) {
+        const float v = yb[sg][lane];
+        const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
+        yq[sg * (G * R) + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+    }
+"""
+
 # Standalone hc_post (last step of a layer).
 _HC_POST = r"""
     const uint col = thread_position_in_grid.x;
     if (col >= uint(HC * DIM)) return;
     out[col] = hc_post_value(post, comb, sub, res, col / DIM, col % DIM, HC, DIM);
 """
+
+
+# Per-request kernels in a batch: request b = threadgroup_position_in_grid.y reads and writes
+# its own slice (stride per buffer) and otherwise runs the single-request source unchanged.
+_BATCHED_STRIDES = {
+    "mix_partial": {"res": "HC * DIM", "sub": "(POST ? DIM : 0)", "post": "(POST ? HC : 0)", "comb": "(POST ? HC * HC : 0)",
+                    "partial": "((HC * DIM + TPG - 1) / TPG) * (MIX + 1)", "hout": "(POST ? HC * DIM : 0)"},
+    "mix_final": {"partial": "NPART * (MIX + 1)", "h": "HC * DIM", "pre_in": "HC",
+                  "mix_out": "MIX", "xn": "DIM", "xq": "DIM"},
+    "attn_mid": {"qa": "QR", "kv": "HD", "cosv": "RD / 2", "sinv": "RD / 2",
+                 "qr": "QR", "qrq": "QR", "packed": "HD + HD / 32"},
+    "hc_post": {"sub": "DIM", "res": "HC * DIM", "post": "HC", "comb": "HC * HC", "out": "HC * DIM"},
+}
 
 
 @cache
@@ -455,10 +520,22 @@ def kernel(name):
         "attn_scores": (["q", "window", "pooled", "wi", "ci", "meta", "scalep"], ["S", "BMAX"], _ATTN_SCORES),
         "attn_pv": (["window", "pooled", "wi", "ci", "meta", "S", "BMAX"], ["PV", "DEN"], _ATTN_PV),
         "o_merge": (["PV", "DEN", "BMAX", "sink", "meta", "cosv", "sinv"], ["oq"], _O_MERGE),
+        "gemv_fp8_nb": (["x", "wa", "sa", "wb", "sb"], ["ya", "yb"], _GEMV_FP8_NB),
+        "wqb_rope_nb": (["x", "w", "sc", "cosv", "sinv"], ["y"], _WQB_ROPE_NB),
+        "woa_nb": (["x", "w", "sc"], ["yq"], _WOA_NB),
     }
-    inputs, outputs, source = specs[name]
+    batched = name.endswith("_b") and name[:-2] in _BATCHED_STRIDES
+    base = name[:-2] if batched else name
+    inputs, outputs, source = specs[base]
+    if batched:
+        strides = _BATCHED_STRIDES[base]
+        prelude = "    const uint BROW = threadgroup_position_in_grid.y;\n" + "".join(
+            f"    auto {n} = {n}_all + size_t(BROW) * size_t({strides[n]});\n" for n in inputs + outputs if n in strides)
+        inputs = [n + "_all" if n in strides else n for n in inputs]
+        outputs = [n + "_all" if n in strides else n for n in outputs]
+        source = prelude + source
     header = _HEADER
-    if name.startswith("attn_"):
+    if base.startswith("attn_"):
         from .packed_attention import _READ
 
         header = _READ + "\n#include <metal_simdgroup_matrix>\n" + _HEADER

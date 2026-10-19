@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Single-token decode path for DeepSeek V4.1 built from the fused kernels.
+"""Decode paths for DeepSeek V4.1 built from the fused kernels.
 
-Mirrors language.Block.__call__ / Attention.__call__ for one decoded token (no CED, no
-MTP verify, no capture). Compressor, indexer and cache bookkeeping are the existing
+Mirror language.Block.__call__ / Attention.__call__ for one decoded token (decode_block)
+and for one token of each of B requests (decode_block_nb); never for CED, image spans, MTP
+verify blocks or captures. Compressor, indexer and cache bookkeeping are the existing
 implementations; the hyper-connection, projection, norm, RoPE, quantization, attention and
 MoE stages run as fused kernels (decode_layer.py, decode_moe.py), each of which documents
 its rounding points against the DeepSeek-V4.1-Flash-1017 reference.
@@ -214,16 +215,14 @@ def split_attention(q, window, pooled, wi, ci, sink, cos, sin, c, raw=False):
         output_shapes=[(h * d,)], output_dtypes=[mx.float32])[0]
 
 
-def decode_attention(att, x, xq, cache, shared, start, c):
-    """Attention.__call__ for one token. x: [dim] bf16 (attn_norm output), xq: act_quant(x)."""
+def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
+    """One request's attention after its projections: window KV update, compressor, indexer,
+    sparse attention and o epilogue. x: [dim] bf16, qr: [q_lora] bf16, q: [H*D] bf16 (RoPE'd),
+    packed: the new window row. Returns act_quant(o) [H*D] fp32 (the wo_a input)."""
     from .language import packed_sparse_attention
 
     layer = att._layer
     ratio = c.compress_ratios[layer]
-    qa, kv_in = gemv_fp8(xq, att.wq_a, att.wkv)
-    cos, sin = _cos_sin(c, bool(ratio), start)
-    qr, qrq, packed = attn_mid(att, qa, kv_in, cos, sin, c)
-    q = wqb_rope(att, qrq, cos, sin, c).reshape(1, 1, c.n_heads, c.head_dim)
     new = packed.reshape(1, 1, -1)
     old = cache[1]
     old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
@@ -250,12 +249,115 @@ def decode_attention(att, x, xq, cache, shared, start, c):
             shared["kv"] = cache[2] = growth.append(cache, 2, shared["kv"], compressed, start // ratio)
         ci, pooled = shared["idx"], shared["kv"]
     if split_attention_supported(c):
-        oq = split_attention(q.reshape(-1), kv, pooled, idx, ci, att.attn_sink, cos, sin, c)
-    else:
-        out = packed_sparse_attention(q, kv, pooled, idx, ci, att.attn_sink, c.head_dim**-0.5)
-        oq = o_epi(out.reshape(-1), cos, sin, c)
+        return split_attention(q.reshape(-1), kv, pooled, idx, ci, att.attn_sink, cos, sin, c)
+    out = packed_sparse_attention(q.reshape(1, 1, c.n_heads, c.head_dim), kv, pooled, idx, ci, att.attn_sink, c.head_dim**-0.5)
+    return o_epi(out.reshape(-1), cos, sin, c)
+
+
+def decode_attention(att, x, xq, cache, shared, start, c):
+    """Attention.__call__ for one token. x: [dim] bf16 (attn_norm output), xq: act_quant(x)."""
+    ratio = c.compress_ratios[att._layer]
+    qa, kv_in = gemv_fp8(xq, att.wq_a, att.wkv)
+    cos, sin = _cos_sin(c, bool(ratio), start)
+    qr, qrq, packed = attn_mid(att, qa, kv_in, cos, sin, c)
+    q = wqb_rope(att, qrq, cos, sin, c)
+    oq = attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c)
     yq = woa(att, oq, c)
     return gemv_fp8(yq, att.wo_b)[0]
+
+
+# ---- batched decode: B requests, one token each --------------------------------------------
+MAX_BATCH = 8
+
+
+def mix_nb(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
+    """mix() for B requests (rows of res [B, hc*dim], pre_in [B, hc], sub [B, dim], post [B, hc],
+    comb [B, hc*hc]); each request runs the single-request kernels on its own slice."""
+    b_n = res.shape[0]
+    hc, dim = c.hc_mult, c.dim
+    n = hc * dim
+    nparts = (n + _TPG - 1) // _TPG
+    mixw = (2 + hc) * hc
+    eps, hc_eps = _scalars(c)
+    dummy = _dummy(mx.float32)
+    posted = sub is not None
+    partial, hout = DL.kernel("mix_partial_b")(
+        inputs=[res, blk[f"hc_{kind}_fn"], sub if posted else dummy, post if posted else dummy, comb if posted else dummy],
+        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("TPG", _TPG), ("POST", posted)],
+        grid=(nparts * _TPG, b_n, 1), threadgroup=(_TPG, 1, 1),
+        output_shapes=[(b_n * nparts * (mixw + 1),), (b_n * n if posted else 1,)],
+        output_dtypes=[mx.float32, mx.bfloat16])
+    h = hout.reshape(b_n, n) if posted else res
+    norm = blk.attn_norm if kind == "attn" else blk.ffn_norm
+    coef, xn, xq = DL.kernel("mix_final_b")(
+        inputs=[partial, h, pre_in, norm.weight, blk[f"hc_{kind}_scale"], blk[f"hc_{kind}_base"], eps, hc_eps],
+        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("NPART", nparts), ("ITERS", c.hc_sinkhorn_iters)],
+        grid=(1024, b_n, 1), threadgroup=(1024, 1, 1),
+        output_shapes=[(b_n * mixw,), (b_n * dim,), (b_n * dim,)], output_dtypes=[mx.float32, mx.bfloat16, mx.float32])
+    return coef.reshape(b_n, mixw), xn.reshape(b_n, dim), xq.reshape(b_n, dim), h
+
+
+def gemv_fp8_nb(x, a, b=None):
+    """gemv_fp8 for x [B, K]: one weight read for all B vectors."""
+    b_n = x.shape[0]
+    na, k = a.weight.shape[0], a.weight.shape[1] * 4
+    nb = 0 if b is None else b.weight.shape[0]
+    assert na % 4 == 0 and nb % 4 == 0
+    dummy_w, dummy_s = _dummy(mx.uint32), _dummy(mx.uint8)
+    ya, yb = DL.kernel("gemv_fp8_nb")(
+        inputs=[x, a.weight, a.scales, b.weight if b is not None else dummy_w, b.scales if b is not None else dummy_s],
+        template=[("NA", na), ("NB_ROWS", nb), ("K", k), ("NB", b_n)],
+        grid=((na + nb + 7) // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
+        output_shapes=[(b_n * na,), (b_n * max(nb, 1),)], output_dtypes=[mx.bfloat16, mx.bfloat16])
+    return ya.reshape(b_n, na), (yb.reshape(b_n, nb) if b is not None else None)
+
+
+def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
+    """decode_block for B requests at their own positions. h: [B, 1, hc, dim] bf16, pre:
+    [B, 1, hc]; caches / shareds / starts: per request. Weight-streaming kernels run once for
+    the batch; window, compressor, indexer and attention run per request."""
+    b_n = h.shape[0]
+    hc, dim = c.hc_mult, c.dim
+    att = blk.attn
+    ratio = c.compress_ratios[att._layer]
+    hf = h.reshape(b_n, hc * dim)
+    coef_a, x, xq, _ = mix_nb(blk, "attn", c, hf, pre.reshape(b_n, hc))
+    ap, ao, ac = coef_a[:, :hc], coef_a[:, hc:2 * hc], coef_a[:, 2 * hc:]
+    qa, kv_in = gemv_fp8_nb(xq, att.wq_a, att.wkv)
+    trig = [_cos_sin(c, bool(ratio), s) for s in starts]
+    cos, sin = mx.stack([t[0] for t in trig]), mx.stack([t[1] for t in trig])
+    eps, _ = _scalars(c)
+    qr, qrq, packed = DL.kernel("attn_mid_b")(
+        inputs=[qa, kv_in, att.q_norm.weight, att.kv_norm.weight, cos, sin, eps],
+        template=[("QR", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim)],
+        grid=(1024, b_n, 1), threadgroup=(1024, 1, 1),
+        output_shapes=[(b_n * c.q_lora_rank,), (b_n * c.q_lora_rank,), (b_n * (c.head_dim + c.head_dim // 32),)],
+        output_dtypes=[mx.bfloat16, mx.float32, mx.uint8])
+    qr, qrq, packed = qr.reshape(b_n, -1), qrq.reshape(b_n, -1), packed.reshape(b_n, -1)
+    nq = c.n_heads * c.head_dim
+    q = DL.kernel("wqb_rope_nb")(
+        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin],
+        template=[("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n)],
+        grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
+        output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
+    oq = mx.stack([attention_core(att, x[r], qr[r], q[r], packed[r], caches[r], shareds[r], starts[r], cos[r], sin[r], c)
+                   for r in range(b_n)])
+    wq, ws = _woa_mxfp8(att)
+    rows = c.o_groups * c.o_lora_rank
+    yq = DL.kernel("woa_nb")(
+        inputs=[oq, wq, ws],
+        template=[("R", c.o_lora_rank), ("K", nq // c.o_groups), ("G", c.o_groups), ("NB", b_n)],
+        grid=(rows // 32 * 256, 1, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(b_n * rows,)], output_dtypes=[mx.float32])[0].reshape(b_n, rows)
+    a, _ = gemv_fp8_nb(yq, att.wo_b)
+    coef_f, x2, _, h2 = mix_nb(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
+    fp, fo, fc = coef_f[:, :hc], coef_f[:, hc:2 * hc], coef_f[:, 2 * hc:]
+    f = DM.fused_decode_moe_nb(blk.ffn, x2, c)[0]
+    h3 = DL.kernel("hc_post_b")(
+        inputs=[f, h2, fo, fc], template=[("HC", hc), ("DIM", dim)],
+        grid=(hc * dim, b_n, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(b_n * hc * dim,)], output_dtypes=[mx.bfloat16])[0]
+    return h3.reshape(b_n, 1, hc, dim), fp.reshape(b_n, 1, hc)
 
 
 def supported(blk, c):

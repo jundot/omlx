@@ -149,7 +149,15 @@ class Engram(nn.Module):
 
     def __call__(self, h, ids, image_mask=None):
         c = self._config
-        kv = self.wkv(self.embed(mx.array(ids)).flatten(-2))
+        rows = self.embed(mx.array(ids)).flatten(-2)
+        if rows.ndim == 3 and rows.shape[0] > 1 and rows.shape[1] == 1:
+            # Batched decode (one token for each of B requests): project each request's row
+            # on its own, exactly as when it decodes alone. A B-row quantized_matmul runs a
+            # different MLX kernel whose fp32 sums round differently (the reference leaves
+            # GEMM order free, but a request's tokens would then depend on its batch).
+            kv = mx.concatenate([self.wkv(rows[r : r + 1]) for r in range(rows.shape[0])])
+        else:
+            kv = self.wkv(rows)
         key, value = mx.split(kv, [c.dim * c.hc_mult], axis=-1)
         key = key.astype(mx.float32).reshape(*h.shape)
         x = h.astype(mx.float32)
