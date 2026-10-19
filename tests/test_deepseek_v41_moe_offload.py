@@ -581,6 +581,137 @@ def test_sorted_routes_chunk_on_expert_boundaries(tmp_path, monkeypatch):
         plan.close()
 
 
+def test_prefill_read_ahead_moves_reads_without_changing_residency(
+    tmp_path, monkeypatch
+):
+    """A read-ahead starts the next chunk's reads early and nothing else.
+
+    Residency, hit/miss counts and fetched bytes must match the serial order
+    exactly: only when the drive does the read moves.
+    """
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    ids = sorted([0, 0, 0, 1, 2, 2, 3, 4, 4, 4, 4, 5, 6, 7, 7])
+    idx = mx.array(ids)
+    x = mx.random.normal((len(ids), 1, 64)).astype(mx.bfloat16)
+    weights = mx.ones(idx.shape) / 2
+    (tmp_path / "serial").mkdir()
+    (tmp_path / "ahead").mkdir()
+
+    _, serial, serial_plan = _synthetic_affine_experts(tmp_path / "serial", 0.25)
+    _, ahead, ahead_plan = _synthetic_affine_experts(tmp_path / "ahead", 0.25)
+    started = []
+    original = moe_offload._ExpertSlots.read_ahead
+
+    def counted(self, experts):
+        count = original(self, experts)
+        if self is ahead.slots:
+            started.append(count)
+        return count
+
+    monkeypatch.setattr(moe_offload._ExpertSlots, "read_ahead", counted)
+    try:
+        expected = serial(x, idx, weights, sorted_indices=True)
+        actual = ahead(x, idx, weights, sorted_indices=True)
+        mx.eval(expected, actual)
+        np.testing.assert_allclose(
+            actual.astype(mx.float32),
+            expected.astype(mx.float32),
+            rtol=0.01,
+            atol=0.002,
+        )
+        # Four chunks of two experts: the first three have a chunk after them.
+        assert len(started) == 3
+        assert any(count > 0 for count in started)
+        assert ahead.slots.misses == serial.slots.misses
+        assert ahead.slots.hits == serial.slots.hits
+        assert ahead.slots.fetched_bytes == serial.slots.fetched_bytes
+        # Nothing read ahead may outlive the call that started it.
+        assert ahead.slots._ahead == {}
+    finally:
+        serial_plan.close()
+        ahead_plan.close()
+
+
+def test_read_ahead_folds_into_the_inflight_window(tmp_path, monkeypatch):
+    """Carried reads count against the same bound ``ensure_ids`` enforces."""
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    window = 2
+    monkeypatch.setattr(moe_offload, "INFLIGHT_BYTES", window * plan.expert_bytes)
+    try:
+        assert disk.slots.read_ahead([0, 1, 2, 3, 4, 5, 6, 7]) == window
+        assert len(disk.slots._ahead) == window
+        # The read-ahead itself installs nothing.
+        assert disk.slots.misses == 0 and disk.slots.hits == 0
+        # The chunk that needs them consumes the carried reads instead of
+        # starting a second set.
+        assert len(disk.slots.ensure_ids([0, 1])) == 2
+        assert disk.slots.misses == 2
+        assert disk.slots._ahead == {}
+    finally:
+        disk.slots.release_read_ahead()
+        plan.close()
+
+
+def test_unconsumed_read_ahead_is_released(tmp_path):
+    """An expert no later chunk routes to must not keep its payload."""
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
+    try:
+        assert disk.slots.read_ahead([6, 7]) > 0
+        assert disk.slots._ahead
+        assert disk.slots.release_read_ahead() > 0
+        assert disk.slots._ahead == {}
+        assert disk.slots.misses == 0 and disk.slots.hits == 0
+    finally:
+        plan.close()
+
+
+def test_decode_async_eval_defers_the_wait_and_matches_the_serial_path(
+    tmp_path, monkeypatch
+):
+    """Deferred submission changes when the CPU waits, not the result."""
+    from omlx.patches.deepseek_v41 import moe_offload
+
+    ids = mx.array([[3, 4], [5, 6]])
+    x = mx.random.normal((2, 1, 64)).astype(mx.bfloat16)
+    weights = mx.ones(ids.shape) / 2
+    (tmp_path / "serial").mkdir()
+    (tmp_path / "deferred").mkdir()
+
+    _, serial, serial_plan = _synthetic_affine_experts(tmp_path / "serial", 0.25)
+    _, deferred, deferred_plan = _synthetic_affine_experts(tmp_path / "deferred", 0.25)
+    inflight = moe_offload._DECODE_INFLIGHT
+    try:
+        monkeypatch.setattr(inflight, "depth", 0)
+        expected = serial(x, ids, weights)
+        mx.eval(expected)
+
+        # The queue is module-level, so start this arm from a clean one.
+        inflight.drain()
+        monkeypatch.setattr(inflight, "depth", moe_offload.DECODE_ASYNC_DEPTH)
+        actual = deferred(x, ids, weights)
+        # Two chunks were handed to the GPU and neither was awaited.
+        assert len(inflight.pending) == 2
+        assert len(inflight.pending) <= moe_offload.DECODE_ASYNC_DEPTH
+        mx.eval(actual)
+        np.testing.assert_allclose(
+            actual.astype(mx.float32),
+            expected.astype(mx.float32),
+            rtol=0.01,
+            atol=0.002,
+        )
+        # The bound drains the oldest rather than growing without limit.
+        for _ in range(moe_offload.DECODE_ASYNC_DEPTH + 2):
+            deferred(x, ids, weights)
+        assert len(inflight.pending) <= moe_offload.DECODE_ASYNC_DEPTH
+    finally:
+        inflight.drain()
+        serial_plan.close()
+        deferred_plan.close()
+
+
 @pytest.mark.parametrize("engram", [False, True])
 def test_admission_and_fit_match_the_engine_pool(tmp_path, engram):
     from test_engine_pool import _make_pool

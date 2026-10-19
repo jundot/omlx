@@ -46,6 +46,49 @@ _EXPERT_IO_POOL = ThreadPoolExecutor(
     max_workers=EXPERT_IO_WORKERS, thread_name_prefix="v41-expert-io"
 )
 
+# Decode submits each chunk's output with ``mx.async_eval`` so the next
+# layer's expert reads overlap live GPU work instead of idling it. The
+# submission queue is a pipeline of finite depth, so an unbounded deferral
+# would eventually block inside a later submit; the routed path keeps its own
+# count instead and retires the oldest output when the count reaches it. The
+# value is a bound, not a tuned optimum: the unretired outputs are
+# decode-shaped (a few rows each), so the depth costs no meaningful memory,
+# and retiring one is the only place the CPU waits.
+#
+# Only *when* the CPU waits moves: Metal executes one stream in submission
+# order, so a later slot write still lands after the read it replaces.
+DECODE_ASYNC_DEPTH = 6
+
+
+class _InFlight:
+    """Decode's outstanding ``async_eval`` submissions, bounded to the pipeline.
+
+    One instance at module scope: ``OffloadedExpert`` exists per layer while
+    the bound is per stream, and the layer loop runs on one scheduler thread.
+    """
+
+    def __init__(self, depth=DECODE_ASYNC_DEPTH):
+        self.depth = depth
+        self.pending = []
+
+    def submit(self, out):
+        """Hand ``out`` to the GPU without waiting for it to retire."""
+        if self.depth <= 0:
+            mx.eval(out)
+            return
+        if len(self.pending) >= self.depth:
+            mx.eval(self.pending.pop(0))
+        mx.async_eval(out)
+        self.pending.append(out)
+
+    def drain(self):
+        """Synchronously retire every in-flight submission."""
+        while self.pending:
+            mx.eval(self.pending.pop(0))
+
+
+_DECODE_INFLIGHT = _InFlight()
+
 # One positional read: a whole tensor, or one leading-axis row of it.
 Slab = namedtuple("Slab", "key expert fd offset nbytes dtype shape")
 
@@ -364,6 +407,9 @@ class _ExpertSlots:
         self.free = list(range(plan.capacity))
         self.hits = self.misses = 0
         self.fetched_bytes = 0
+        # Experts whose reads a prefill started early: expert -> the same
+        # ``(proj, slabs, futures)`` shape ``ensure_ids`` builds.
+        self._ahead = {}
         for proj in _PROJECTIONS:
             sample = plan.fetch(prefix, proj, 0)
             values = {
@@ -381,6 +427,49 @@ class _ExpertSlots:
     def ensure(self, indices):
         slots = self.ensure_ids(indices.reshape(-1).tolist())
         return mx.array(slots, dtype=mx.int32).reshape(indices.shape)
+
+    def read_ahead(self, ids):
+        """Start the reads a later ``ensure_ids`` would otherwise wait for.
+
+        The SSD idles while the GPU evaluates the chunk that just ran, so the
+        next chunk's reads are issued before that eval. Only reads move: an
+        expert read ahead still counts as a miss when the chunk that needs it
+        runs, its install is the same slot write, and its bytes land in the
+        same ``fetched_bytes`` ledger. The window is the same ``INFLIGHT_BYTES``
+        bound ``ensure_ids`` enforces, and carried entries count against it
+        when that call consumes them, so this adds no peak memory.
+
+        Entries no later call consumes are dropped by ``release_read_ahead``,
+        which a prefill's ``finally`` always runs.
+        """
+        window = max(1, INFLIGHT_BYTES // max(1, self.plan.expert_bytes))
+        room = window - len(self._ahead)
+        started = 0
+        for expert in dict.fromkeys(ids):
+            if started >= room:
+                break
+            if expert in self.slot_of or expert in self._ahead:
+                continue
+            projections = []
+            for proj in _PROJECTIONS:
+                slabs = self.plan.slabs(self.prefix, proj, expert)
+                futures = [
+                    _EXPERT_IO_POOL.submit(self.plan.read, slab) for slab in slabs
+                ]
+                projections.append((proj, slabs, futures))
+            self._ahead[expert] = projections
+            started += 1
+        return started
+
+    def release_read_ahead(self):
+        """Drop every read-ahead entry a chunk did not consume."""
+        ahead, self._ahead = self._ahead, {}
+        for projections in ahead.values():
+            for _, _, futures in projections:
+                for future in futures:
+                    if not future.cancel():
+                        future.exception()
+        return len(ahead)
 
     def ensure_ids(self, ids):
         """Make every expert in ``ids`` resident; return their slots in order.
@@ -413,6 +502,12 @@ class _ExpertSlots:
             while submitted < min(limit, len(misses)):
                 expert = misses[submitted]
                 submitted += 1
+                carried = self._ahead.pop(expert, None)
+                if carried is not None:
+                    # Reads a prefill started early: already on the reader
+                    # pool, and counted against this call's window below.
+                    pending[expert] = carried
+                    continue
                 pending[expert] = []
                 for proj in _PROJECTIONS:
                     slabs = self.plan.slabs(self.prefix, proj, expert)
@@ -487,7 +582,13 @@ class OffloadedExpert(nn.Module):
         return mx.concatenate(outputs, axis=0).reshape(*indices.shape, 1, x.shape[-1])
 
     def _routed(self, x, indices, weights, input_quantized):
-        """Per-token top-k routes: bound each chunk by its route count."""
+        """Per-token top-k routes: bound each chunk by its route count.
+
+        Each chunk's output is submitted with ``mx.async_eval`` so the next
+        layer's expert reads overlap live GPU work instead of idling it. The
+        outputs are the same arrays either way; only when the CPU waits for
+        them moves.
+        """
         flat_i = indices.reshape(-1, indices.shape[-1])
         flat_x = x.reshape(-1, 1, 1, x.shape[-1])
         flat_w = None if weights is None else weights.reshape(flat_i.shape)
@@ -503,16 +604,32 @@ class OffloadedExpert(nn.Module):
                 sorted_indices=False,
                 input_quantized=input_quantized,
             )
-            mx.eval(out)
             outputs.append(out)
+            _DECODE_INFLIGHT.submit(out)
         return outputs
+
+    @staticmethod
+    def _chunk_end(ids, start, capacity):
+        """End index of the chunk starting at ``start``.
+
+        A chunk holds every route of up to ``capacity`` distinct experts.
+        """
+        end, distinct = start, 0
+        while end < len(ids) and distinct < capacity:
+            run = end + 1
+            while run < len(ids) and ids[run] == ids[end]:
+                run += 1
+            end, distinct = run, distinct + 1
+        return end
 
     def _sorted(self, x, indices, weights, input_quantized):
         """Routes sorted by expert: chunk on expert boundaries.
 
         A chunk holds every route of up to ``capacity`` distinct experts, so a
         prefill reads each expert once per layer and runs one kernel per
-        chunk instead of one per ``capacity`` routes.
+        chunk instead of one per ``capacity`` routes. The next chunk's reads
+        are issued before this chunk's eval, so the drive works through the
+        GPU wait instead of queueing behind it.
         """
         ids = indices.reshape(-1).tolist()
         rows = x.reshape(-1, 1, x.shape[-1])
@@ -520,26 +637,30 @@ class OffloadedExpert(nn.Module):
         capacity = self.slots.plan.capacity
         outputs = []
         start = 0
-        while start < len(ids):
-            end, distinct = start, 0
-            while end < len(ids) and distinct < capacity:
-                run = end + 1
-                while run < len(ids) and ids[run] == ids[end]:
-                    run += 1
-                end, distinct = run, distinct + 1
-            slots = mx.array(self.slots.ensure_ids(ids[start:end]), dtype=mx.int32)
-            order = mx.argsort(slots)
-            inverse = mx.argsort(order)
-            out = self.slots.expert(
-                rows[start:end][order],
-                slots[order],
-                None if scores is None else scores[start:end][order],
-                sorted_indices=True,
-                input_quantized=input_quantized,
-            )[inverse]
-            mx.eval(out)
-            outputs.append(out)
-            start = end
+        try:
+            while start < len(ids):
+                end = self._chunk_end(ids, start, capacity)
+                slots = mx.array(
+                    self.slots.ensure_ids(ids[start:end]), dtype=mx.int32
+                )
+                order = mx.argsort(slots)
+                inverse = mx.argsort(order)
+                out = self.slots.expert(
+                    rows[start:end][order],
+                    slots[order],
+                    None if scores is None else scores[start:end][order],
+                    sorted_indices=True,
+                    input_quantized=input_quantized,
+                )[inverse]
+                if end < len(ids):
+                    next_end = self._chunk_end(ids, end, capacity)
+                    self.slots.read_ahead(ids[end:next_end])
+                mx.eval(out)
+                outputs.append(out)
+                start = end
+        finally:
+            # A read-ahead the loop never consumed must not outlive the call.
+            self.slots.release_read_ahead()
         return outputs
 
 
