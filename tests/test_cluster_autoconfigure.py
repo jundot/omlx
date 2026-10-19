@@ -358,6 +358,59 @@ def test_autoconfigure_never_marks_an_unverified_fabric_ready(monkeypatch):
     assert body["preflight"].startswith("Cluster link is not ready:")
 
 
+def test_autoconfigure_keeps_pipeline_on_a_ring_fabric_after_a_failed_probe(
+    monkeypatch,
+):
+    from fastapi.testclient import TestClient
+
+    from omlx.cluster import routes
+
+    monkeypatch.setattr(
+        routes,
+        "detect_cluster_transports",
+        lambda _hosts: SimpleNamespace(transports=()),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_resolve_fabric",
+        lambda hosts: {
+            "ok": True,
+            "backend": "ring",
+            "backend_reason": "no RDMA devices",
+            "blocker": "",
+            "link": {"reason": "ok"},
+            "hosts": [
+                {"host": host, "ips": [f"10.0.1.{index + 1}"], "rdma": []}
+                for index, host in enumerate(hosts)
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "_model_and_nodes",
+        lambda _request: (_model(), _nodes(2)),
+    )
+    monkeypatch.setattr(routes, "_staging_for", lambda *_args: None)
+    payload = _autoconfigure_payload()
+    payload.update(
+        {
+            "hosts": [
+                {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["10.0.1.1"]},
+                {"node_id": "node-1", "ssh": "mini.local", "ips": ["10.0.1.2"]},
+            ],
+            "detect_transports": True,
+            "measure_performance": False,
+            "preflight": False,
+        }
+    )
+
+    with TestClient(_app()) as client:
+        response = client.post("/admin/api/cluster/autoconfigure", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tensor_parallel_size"] == 1
+
+
 def test_performance_is_measured_and_applied_before_staging(tmp_path, monkeypatch):
     """The first copied shard map must already be the measured fast one."""
 

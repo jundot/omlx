@@ -22,8 +22,8 @@ class BatchPolicy:
         self.max_depth = max(1, max_depth)
         self.cur = self.max_depth
         # A fixed policy drafts max_depth every cycle: no ordinary-decode
-        # calibration, no depth search and no parking. Block drafters use it
-        # because their block is trained, not chosen.
+        # calibration, no depth search and no parking. A fixed MTP depth and
+        # a block drafter that verifies its whole block use it.
         self.fixed = bool(fixed)
         self.standard = deque(maxlen=8)
         self.standard_warmup = 2

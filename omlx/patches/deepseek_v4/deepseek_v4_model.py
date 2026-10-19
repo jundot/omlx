@@ -416,9 +416,9 @@ def _dspark_ring_mm(
     transpose_rhs: bool,
 ) -> mx.array:
     """Run an exact local GEMM without materializing every ring snapshot."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.attention import fast
 
-    return fast.dspark_ring_gemm(
+    return fast.ring_gemm(
         mx.contiguous(lhs[:, 0]),
         mx.contiguous(source),
         mx.contiguous(indices),
@@ -670,9 +670,9 @@ def _native_sparse_attention_available() -> bool:
     if _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
         return False
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+        from omlx.custom_kernels.attention import fast as attention_fast
 
-        return glm_fast.has_symbol("deepseek_v4_sparse_attention")
+        return attention_fast.has_symbol("compressed_sparse_attention")
     except Exception as exc:
         _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED = True
         logging.getLogger(__name__).warning(
@@ -737,10 +737,10 @@ def _sparse_pooled_attention(
                 return out
         if not _DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED:
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+                from omlx.custom_kernels.attention import fast as attention_fast
 
-                if glm_fast.has_symbol("deepseek_v4_sparse_attention"):
-                    return glm_fast.deepseek_v4_sparse_attention(
+                if attention_fast.has_symbol("compressed_sparse_attention"):
+                    return attention_fast.compressed_sparse_attention(
                         q,
                         local_kv,
                         pooled,
@@ -1298,7 +1298,7 @@ class Indexer(nn.Module):
             dtype_supported=q.dtype in (mx.float16, mx.bfloat16),
         ):
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+                from omlx.custom_kernels.sparse_index import fast as index_fast
 
                 _have_native = native_indexer_available()
                 if not _have_native and not native_indexer_disabled():
@@ -1347,7 +1347,7 @@ class Indexer(nn.Module):
                     # keeps the Steel path below unchanged.
                     _use_mma = (
                         self._m2_mma_score
-                        and getattr(glm_fast, "_EXT_MMA_SCORE", False)
+                        and getattr(index_fast, "_EXT_MMA_SCORE", False)
                         and q.dtype == mx.bfloat16
                         and pooled.shape[1] >= 64
                     )
@@ -1360,7 +1360,7 @@ class Indexer(nn.Module):
                             "1.37x over Steel)"
                         )
                     if _use_mma:
-                        scores4 = glm_fast.dsa_indexer_scores_mma(
+                        scores4 = index_fast.dsa_indexer_scores_mma(
                             q,
                             pooled[:, None],
                             weights,
@@ -1368,7 +1368,7 @@ class Indexer(nn.Module):
                             mask_q_offset=_mask_q_offset,
                         )
                     else:
-                        scores4 = glm_fast.dsa_indexer_scores(
+                        scores4 = index_fast.dsa_indexer_scores(
                             q,
                             pooled[:, None],
                             weights,
@@ -1382,7 +1382,7 @@ class Indexer(nn.Module):
                             scores4,
                             mx.finfo(scores4.dtype).min,
                         )
-                    indices = glm_fast.dsa_topk_indices(
+                    indices = index_fast.dsa_topk_indices(
                         scores4,
                         self.index_topk,
                         # The bucketed writer appends equal-threshold entries
@@ -1487,10 +1487,10 @@ def _batch_indexer_rows(
         indices = None
         if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED:
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
+                from omlx.custom_kernels.sparse_index import fast
 
-                if fast.has_symbol("dspark_fp32_topk_indices"):
-                    indices = fast.dspark_fp32_topk_indices(
+                if fast.has_symbol("fp32_topk_indices"):
+                    indices = fast.fp32_topk_indices(
                         scores,
                         indexer.index_topk,
                     )
@@ -1547,10 +1547,10 @@ def _batch_indexer_rows(
         indices = None
         if not _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED and k == 512:
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
+                from omlx.custom_kernels.sparse_index import fast
 
-                if fast.has_symbol("dspark_fp32_topk_indices"):
-                    indices = fast.dspark_fp32_topk_indices(scores, k)
+                if fast.has_symbol("fp32_topk_indices"):
+                    indices = fast.fp32_topk_indices(scores, k)
             except Exception as exc:
                 _DEEPSEEK_V4_DSPARK_TOPK_NATIVE_DISABLED = True
                 logging.getLogger(__name__).warning(
@@ -1984,11 +1984,11 @@ class SparseCompressedAttention(nn.Module):
                 )
                 if use_ring_kernel:
                     try:
-                        from omlx.custom_kernels.glm_moe_dsa import fast
+                        from omlx.custom_kernels.attention import fast
 
                         use_ring_kernel = (
                             fast.is_native_available()
-                            and fast.has_symbol("dspark_ring_gemm")
+                            and fast.has_symbol("ring_gemm")
                         )
                     except Exception:
                         use_ring_kernel = False

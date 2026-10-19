@@ -688,6 +688,8 @@ def test_sconv_decode_kernel_matches_masked_fallback(applied):
 
     mx.random.seed(13)
     conv = InklingShortConvolution(32, 4, 0)
+    # Checkpoints and oQ outputs keep sconv weights in bf16.
+    conv.conv.weight = conv.conv.weight.astype(mx.bfloat16)
     x = mx.random.normal((2, 3, 32)).astype(mx.bfloat16)
     residual = mx.random.normal((2, 3, 32)).astype(mx.bfloat16)
     fused_cache = ArraysCache(1)
@@ -701,8 +703,7 @@ def test_sconv_decode_kernel_matches_masked_fallback(applied):
         residual=residual,
     )
     mx.eval(fused, fallback, fused_cache[0], fallback_cache[0])
-    # The fused accumulation can move by one bfloat16 ULP versus Conv1d.
-    assert mx.max(mx.abs(fused - fallback)).item() <= 0.0078125
+    assert mx.array_equal(fused, fallback).item()
     assert mx.max(mx.abs(fused_cache[0] - fallback_cache[0])).item() == 0
 
 

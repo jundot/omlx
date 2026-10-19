@@ -11,7 +11,7 @@ function usageLocale() {
 /* Local serving history; independent of the high-frequency live stats poll. */
 function usageHistory() {
     return {
-        range: 'today', model: '', models: [], data: null, error: '', disabled: false, loading: false, peak: 1, displayedQuery: '',
+        range: 'today', model: '', modelIds: [], data: null, error: '', disabled: false, loading: false, peak: 1, displayedQuery: '',
         timer: null, request: null,
         init() {
             this.$watch('mainTab', tab => {
@@ -40,13 +40,13 @@ function usageHistory() {
                 this.disabled = data.enabled === false;
                 if (this.disabled) {
                     this.data = null;
-                    this.models = [];
+                    this.modelIds = [];
                     this.error = '';
                     return;
                 }
                 this.data = data;
                 this.peak = Math.max(1, ...data.heatmap.flatMap(day => day.tokens));
-                if (!this.model) this.models = data.models.map(row => row.model_id);
+                if (!this.model) this.modelIds = data.models.map(row => row.model_id);
                 this.error = data.available && !data.dropped_requests ? '' : window.t('usage.delayed');
             } catch (error) {
                 if (error.name === 'AbortError' || request.signal.aborted) return;
@@ -74,7 +74,16 @@ function usageHistory() {
         shade(tokens) {
             return tokens ? `rgb(var(--palette-green-600) / ${0.2 + 0.8 * Math.sqrt(tokens / this.peak)})` : 'rgb(var(--palette-mid-gray) / 0.12)';
         },
-        number(value) { return new Intl.NumberFormat(usageLocale(), {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); },
+        number(value) {
+            const locale = usageLocale();
+            // statsNumberScale lives in the parent dashboard() scope.
+            if (this.statsNumberScale === 'exact') {
+                return window.omlxCount.exact(value, locale);
+            }
+            const compact = window.omlxCount?.eastAsian?.(value, locale);
+            if (compact != null) return compact;
+            return new Intl.NumberFormat(locale, {notation: 'compact', maximumFractionDigits: 1}).format(value || 0);
+        },
         speed(value) { return value == null ? '—' : value.toFixed(1); },
     };
 }

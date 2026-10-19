@@ -38,7 +38,7 @@ def _connection_failure_message(exc: Exception) -> str | None:
     if isinstance(reason, socket.gaierror):
         return "The coordinator hostname could not be resolved. Check its address and retry."
     if isinstance(reason, ConnectionRefusedError):
-        return "The coordinator refused the connection. Check that oMLX is running and its port is correct, then retry."
+        return "The coordinator refused the connection. Check that oMLX is running there, its port is correct, and its Host is not 127.0.0.1, then retry."
     return None
 
 

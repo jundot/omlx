@@ -1,6 +1,6 @@
 {% import "components/ui.html" as ui %}
             <div x-show="mainTab === 'settings'" x-cloak role="tabpanel" id="panel-settings" aria-labelledby="tab-settings">
-            <div class="page-tabs mb-6 animate-fade-in-up">
+            <div class="page-tabs mb-6 animate-fade-in-up" :class="activeTab === 'global' ? 'page-tabs--settings-rail' : ''">
                 {{ ui.segmented([('global', t('settings.tab.global')), ('models', t('settings.tab.models')), ('integrations', t('settings.tab.integrations'))],
                                 'activeTab', "setSettingsTab('{value}')", aria_label=t('navbar.tab.settings')) }}
             </div>
@@ -110,6 +110,13 @@
                                                     'theme', "setTheme('{value}')", aria_label=t('chat.theme_label')) }}
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <label class="text-sm text-neutral-700">{{ t('settings.appearance.number_scale') }}</label>
+                                    {{ ui.segmented([('compact', t('settings.appearance.number_scale_compact')),
+                                                     ('exact', t('settings.appearance.number_scale_exact'))],
+                                                    'statsNumberScale', "setStatsNumberScale('{value}')",
+                                                    aria_label=t('settings.appearance.number_scale')) }}
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
                                         <label class="text-sm text-neutral-700">{{ t('chat.enhanced_readability') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('chat.enhanced_readability_desc') }}</p>
@@ -182,8 +189,24 @@
                                             @click="if (isLoopbackBindHost(globalSettings.server.host)) globalSettings.auth.skip_api_key_verification = !globalSettings.auth.skip_api_key_verification"
                                             :disabled="!isLoopbackBindHost(globalSettings.server.host)"
                                             :class="!isLoopbackBindHost(globalSettings.server.host) ? 'bg-neutral-200 opacity-50 cursor-not-allowed' : (globalSettings.auth.skip_api_key_verification ? 'bg-black' : 'bg-neutral-200')"
+                                            role="switch"
+                                            :aria-checked="isLoopbackBindHost(globalSettings.server.host) && globalSettings.auth.skip_api_key_verification ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="isLoopbackBindHost(globalSettings.server.host) && globalSettings.auth.skip_api_key_verification ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm font-medium text-red-700">{{ t('settings.auth.keyless_inference') }}</label>
+                                        <p class="text-xs text-red-600 mt-0.5">{{ t('settings.auth.keyless_inference_hint') }}</p>
+                                    </div>
+                                    <button type="button" @click="toggleUnauthenticatedInference()"
+                                            :class="globalSettings.auth.allow_unauthenticated_inference ? 'bg-red-600' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.auth.allow_unauthenticated_inference ? 'true' : 'false'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-red-500">
+                                        <span :class="globalSettings.auth.allow_unauthenticated_inference ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
@@ -367,6 +390,8 @@
                                     <button type="button"
                                             @click="globalSettings.model.model_fallback = !globalSettings.model.model_fallback"
                                             :class="globalSettings.model.model_fallback ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.model.model_fallback ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.model.model_fallback ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -380,6 +405,8 @@
                                     <button type="button"
                                             @click="globalSettings.model.hide_helper_models = !globalSettings.model.hide_helper_models"
                                             :class="globalSettings.model.hide_helper_models ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.model.hide_helper_models ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.model.hide_helper_models ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -422,6 +449,8 @@
                                     <button type="button"
                                             @click="globalSettings.huggingface.hf_cache_enabled = !globalSettings.huggingface.hf_cache_enabled"
                                             :class="globalSettings.huggingface.hf_cache_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.huggingface.hf_cache_enabled ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.huggingface.hf_cache_enabled ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -502,6 +531,8 @@
                                         <button type="button"
                                                 @click="globalSettings.memory.prefill_memory_guard = !globalSettings.memory.prefill_memory_guard"
                                                 :class="globalSettings.memory.prefill_memory_guard ? 'bg-black' : 'bg-neutral-200'"
+                                                role="switch"
+                                                :aria-checked="globalSettings.memory.prefill_memory_guard ? 'true' : 'false'"
                                                 class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                             <span :class="globalSettings.memory.prefill_memory_guard ? 'translate-x-5' : 'translate-x-0'"
                                                   class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -551,10 +582,16 @@
                                             <span x-show="globalSettings.cache.ssd_cache_max_size === 'auto'">{{ t('settings.resource.cold_cache_auto_description') }}</span>
                                         </p>
                                     </div>
-                                    <div class="flex flex-wrap items-center gap-2 sm:gap-3">
-                                        <button type="button" @click="globalSettings.cache.ssd_cache_max_size = 'auto'"
-                                                :aria-pressed="globalSettings.cache.ssd_cache_max_size === 'auto'"
-                                                class="text-sm underline">{{ t('settings.resource.cold_cache_auto') }}</button>
+                                    <div class="flex flex-wrap sm:flex-nowrap sm:flex-shrink-0 items-center gap-2 sm:gap-3">
+                                        <div class="segmented segmented--sm flex-shrink-0">
+                                            <button type="button" @click="globalSettings.cache.ssd_cache_max_size = 'auto'"
+                                                    :class="globalSettings.cache.ssd_cache_max_size === 'auto' ? 'segmented__item--active' : ''"
+                                                    class="segmented__item">{{ t('settings.resource.cold_cache_auto') }}</button>
+                                            <button type="button"
+                                                    @click="if (globalSettings.cache.ssd_cache_max_size === 'auto') updateCacheFromInput(Math.max(1, cacheSizeGB))"
+                                                    :class="globalSettings.cache.ssd_cache_max_size !== 'auto' ? 'segmented__item--active' : ''"
+                                                    class="segmented__item">{{ t('settings.resource.cold_cache_fixed') }}</button>
+                                        </div>
                                         <input type="range" min="1" max="100" step="1"
                                                x-show="globalSettings.cache.ssd_cache_max_size !== 'auto'"
                                                x-model.number="cachePercent"
@@ -564,8 +601,8 @@
                                                       [&::-webkit-slider-thumb]:bg-black [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:cursor-pointer
                                                       [&::-webkit-slider-thumb]:shadow-sm">
                                         <span class="text-sm text-neutral-600 w-28 text-right inline-flex items-center justify-end gap-0">
-                                            <span x-text="globalSettings.cache.ssd_cache_max_size === 'auto' ? window.t('settings.resource.cold_cache_auto') : cachePercent + '%'"></span>
-                                            <span class="text-neutral-400 ml-1">(</span><span x-show="!editingCache" @click="editingCache = true" class="cursor-pointer hover:text-neutral-900" x-text="cacheSizeGB"></span><input x-show="editingCache"
+                                            <span x-show="globalSettings.cache.ssd_cache_max_size !== 'auto'" x-text="cachePercent + '%'"></span>
+                                            <span x-show="globalSettings.cache.ssd_cache_max_size !== 'auto'" class="text-neutral-400 ml-1">(</span><span x-show="!editingCache" @click="editingCache = true" class="cursor-pointer hover:text-neutral-900" x-text="cacheSizeGB"></span><input x-show="editingCache"
                                                    type="number"
                                                    :value="cacheSizeGB"
                                                    @change="updateCacheFromInput($event.target.value); editingCache = false"
@@ -575,7 +612,7 @@
                                                    x-init="if (editingCache) { $nextTick(() => $el.focus()) }"
                                                    class="w-12 px-1 text-sm text-right border border-neutral-900 rounded-lg focus:outline-none"
                                                    min="0"
-                                                   step="1"><span class="text-neutral-400">GB)</span>
+                                                   step="1"><span class="text-neutral-400 ml-1" x-text="globalSettings.cache.ssd_cache_max_size === 'auto' ? 'GB' : 'GB)'"></span>
                                         </span>
                                     </div>
                                 </div>
@@ -615,6 +652,8 @@
                                     <button type="button"
                                             @click="globalSettings.scheduler.chunked_prefill = !globalSettings.scheduler.chunked_prefill"
                                             :class="globalSettings.scheduler.chunked_prefill ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.scheduler.chunked_prefill ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.scheduler.chunked_prefill ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -629,6 +668,8 @@
                                     <button type="button"
                                             @click="globalSettings.scheduler.decode_fairness = !globalSettings.scheduler.decode_fairness"
                                             :class="globalSettings.scheduler.decode_fairness ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.scheduler.decode_fairness ? 'true' : 'false'"
                                             class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.scheduler.decode_fairness ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -700,6 +741,8 @@
                                     </div>
                                     <button type="button" @click="globalSettings.cache.enabled = !globalSettings.cache.enabled"
                                             :class="globalSettings.cache.enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.cache.enabled ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.cache.enabled ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -717,6 +760,8 @@
                                     </div>
                                     <button type="button" @click="globalSettings.cache.hot_cache_only = !globalSettings.cache.hot_cache_only"
                                             :class="globalSettings.cache.hot_cache_only ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.cache.hot_cache_only ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.cache.hot_cache_only ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -850,6 +895,8 @@
                                     <button type="button"
                                             @click="globalSettings.mcp.expose_tools = !globalSettings.mcp.expose_tools"
                                             :class="globalSettings.mcp.expose_tools ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.mcp.expose_tools ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.mcp.expose_tools ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -985,6 +1032,8 @@
                                             <button type="button"
                                                     @click="globalSettings.server.distributed_inference_enabled = !globalSettings.server.distributed_inference_enabled"
                                                     :class="globalSettings.server.distributed_inference_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="globalSettings.server.distributed_inference_enabled ? 'true' : 'false'"
                                                     class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="globalSettings.server.distributed_inference_enabled ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1015,25 +1064,14 @@
                                         </div>
                                         <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                             <div class="flex-1">
-                                                <label class="text-sm text-neutral-700">{{ t('settings.advanced.qwen4_gdn_decode_wide_proj') }}</label>
-                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.qwen4_gdn_decode_wide_proj_hint') }}</p>
-                                            </div>
-                                            <button type="button"
-                                                    @click="globalSettings.server.qwen4_gdn_decode_wide_proj = !globalSettings.server.qwen4_gdn_decode_wide_proj"
-                                                    :class="globalSettings.server.qwen4_gdn_decode_wide_proj ? 'bg-black' : 'bg-neutral-200'"
-                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                                <span :class="globalSettings.server.qwen4_gdn_decode_wide_proj ? 'translate-x-5' : 'translate-x-0'"
-                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
-                                            </button>
-                                        </div>
-                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                            <div class="flex-1">
                                                 <label class="text-sm text-neutral-700">{{ t('settings.advanced.preserve_mid_system_cache') }}</label>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.advanced.preserve_mid_system_cache_hint') }}</p>
                                             </div>
                                             <button type="button"
                                                     @click="globalSettings.server.preserve_mid_system_cache = !globalSettings.server.preserve_mid_system_cache"
                                                     :class="globalSettings.server.preserve_mid_system_cache ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="globalSettings.server.preserve_mid_system_cache ? 'true' : 'false'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="globalSettings.server.preserve_mid_system_cache ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1065,6 +1103,8 @@
                                             </div>
                                             <button type="button" @click="globalSettings.cache.hot_cache_write_through = !globalSettings.cache.hot_cache_write_through"
                                                     :class="globalSettings.cache.hot_cache_write_through ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="globalSettings.cache.hot_cache_write_through ? 'true' : 'false'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="globalSettings.cache.hot_cache_write_through ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1077,6 +1117,8 @@
                                             </div>
                                             <button type="button" @click="globalSettings.cache.ane_compile_cache = !globalSettings.cache.ane_compile_cache"
                                                     :class="globalSettings.cache.ane_compile_cache ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="globalSettings.cache.ane_compile_cache ? 'true' : 'false'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="globalSettings.cache.ane_compile_cache ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1275,6 +1317,140 @@
                     </div>
 
                     <div class="space-y-4">
+                        <!-- External engines: serve a model from another engine's process -->
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="cpu" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.external_engines.section_label') }}</span>
+                                </div>
+                                <span class="badge bg-neutral-200 text-neutral-600 border-neutral-300">Splash</span>
+                            </div>
+                            <div class="px-4 sm:px-6 py-3 border-b border-neutral-100">
+                                <p class="text-xs text-neutral-500">{{ t('settings.integrations.external_engines.description') }}</p>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <!-- Splash launcher: detected path, or a path to enter -->
+                                <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div class="min-w-0">
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.binary') }}</label>
+                                        <template x-if="globalSettings.external_engines.splash.available && !splashPath.editing">
+                                            <div>
+                                                <p class="text-xs text-neutral-500 mt-1 font-mono break-all" x-text="globalSettings.external_engines.splash.path"></p>
+                                                <p class="text-xs text-neutral-400 mt-0.5"
+                                                   x-text="globalSettings.external_engines.splash.auto_detected ? window.t('settings.integrations.splash.detected_hint') : window.t('settings.integrations.splash.configured_hint')"></p>
+                                            </div>
+                                        </template>
+                                        <template x-if="!globalSettings.external_engines.splash.available || splashPath.editing">
+                                            <div>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.binary_hint') }}</p>
+                                                <p x-show="!globalSettings.external_engines.splash.available && globalSettings.external_engines.splash.reason"
+                                                   class="text-xs text-amber-600 mt-1 break-words"
+                                                   x-text="globalSettings.external_engines.splash.reason"></p>
+                                            </div>
+                                        </template>
+                                        <p x-show="splashPath.error" x-cloak class="text-xs text-red-500 mt-1 break-words" x-text="splashPath.error"></p>
+                                    </div>
+                                    <template x-if="globalSettings.external_engines.splash.available && !splashPath.editing">
+                                        <div class="flex items-center gap-2 flex-shrink-0">
+                                            <span class="badge bg-green-50 text-green-600 border-green-200"
+                                                  x-text="globalSettings.external_engines.splash.label + ' ' + globalSettings.external_engines.splash.version"></span>
+                                            <button type="button" @click="editSplashPath()"
+                                                    class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-full hover:bg-neutral-50 transition-colors shrink-0">{{ t('settings.integrations.splash.change') }}</button>
+                                        </div>
+                                    </template>
+                                    <template x-if="!globalSettings.external_engines.splash.available || splashPath.editing">
+                                        <div class="flex flex-wrap items-center gap-2 sm:justify-end">
+                                            <input type="text"
+                                                   x-model="splashPath.draft"
+                                                   @keydown.enter="applySplashPath(splashPath.draft)"
+                                                   placeholder="/opt/homebrew/bin/splash"
+                                                   class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all font-mono text-xs">
+                                            <button type="button"
+                                                    @click="applySplashPath(splashPath.draft)"
+                                                    :disabled="splashPath.saving || !splashPath.draft.trim()"
+                                                    class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-full hover:bg-neutral-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0">{{ t('settings.integrations.splash.apply') }}</button>
+                                            <button type="button" x-show="globalSettings.integrations.splash_path"
+                                                    @click="applySplashPath('')"
+                                                    :disabled="splashPath.saving"
+                                                    class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-full hover:bg-neutral-50 transition-colors disabled:opacity-50 shrink-0">{{ t('settings.integrations.splash.use_auto') }}</button>
+                                            <button type="button" x-show="splashPath.editing"
+                                                    @click="splashPath.editing = false; splashPath.error = ''"
+                                                    class="px-4 py-2 text-sm font-medium text-neutral-500 rounded-full hover:bg-neutral-50 transition-colors shrink-0">{{ t('settings.integrations.splash.cancel') }}</button>
+                                        </div>
+                                    </template>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.kv_format') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.kv_format_hint') }}</p>
+                                    </div>
+                                    <select x-model="globalSettings.integrations.splash_kv_format"
+                                            @change="saveIntegrationSettings()"
+                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="int8">int8</option>
+                                        <option value="bf16">bf16</option>
+                                    </select>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.max_memory') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.max_memory_hint') }}</p>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="number" min="1" step="1"
+                                               :value="globalSettings.integrations.splash_max_memory_gb ?? ''"
+                                               @change="saveSplashSize('splash_max_memory_gb', $event.target, 1)"
+                                               placeholder="{{ t('settings.integrations.splash.auto') }}"
+                                               class="w-24 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        <span class="text-sm text-neutral-400">GB</span>
+                                    </div>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.ssd_cache') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.ssd_cache_hint') }}</p>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <input type="number" min="0" step="1"
+                                               :value="globalSettings.integrations.splash_ssd_cache_gb ?? ''"
+                                               @change="saveSplashSize('splash_ssd_cache_gb', $event.target, 0)"
+                                               placeholder="{{ t('settings.integrations.splash.auto') }}"
+                                               class="w-24 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                        <span class="text-sm text-neutral-400">GB</span>
+                                    </div>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.ane_prefill') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.ane_prefill_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="globalSettings.integrations.splash_ane_prefill = !globalSettings.integrations.splash_ane_prefill; saveIntegrationSettings()"
+                                            :class="globalSettings.integrations.splash_ane_prefill ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.integrations.splash_ane_prefill ? 'true' : 'false'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.integrations.splash_ane_prefill ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <p x-show="splashOptionsError" x-cloak class="px-4 sm:px-6 py-3 text-xs text-red-500 break-words" x-text="splashOptionsError"></p>
+                                <div x-show="globalSettings.external_engines.splash.models.length" x-cloak class="px-4 sm:px-6 py-4">
+                                    <label class="text-sm text-neutral-700">{{ t('settings.integrations.splash.running') }}</label>
+                                    <template x-for="m in globalSettings.external_engines.splash.models" :key="m.id">
+                                        <div class="mt-2 text-xs">
+                                            <div class="flex items-center justify-between gap-3">
+                                                <span class="font-medium text-neutral-700 truncate" x-text="m.id"></span>
+                                                <span class="text-neutral-500 shrink-0"
+                                                      x-text="formatSizeBytes(m.memory_bytes) + ' / ' + formatSizeBytes(m.memory_budget_bytes)"></span>
+                                            </div>
+                                            <p class="text-neutral-400 font-mono break-all mt-0.5" x-text="m.log_path"></p>
+                                        </div>
+                                    </template>
+                                </div>
+                            </div>
+                        </div>
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">
@@ -1465,6 +1641,8 @@
                                     <button type="button"
                                             @click="globalSettings.integrations.web_search_content_truncate = !globalSettings.integrations.web_search_content_truncate; saveIntegrationSettings()"
                                             :class="globalSettings.integrations.web_search_content_truncate ? 'bg-black' : 'bg-neutral-200'"
+                                            role="switch"
+                                            :aria-checked="globalSettings.integrations.web_search_content_truncate ? 'true' : 'false'"
                                             class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                         <span :class="globalSettings.integrations.web_search_content_truncate ? 'translate-x-5' : 'translate-x-0'"
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
@@ -1644,11 +1822,11 @@
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.hidden_badge')"></span>
                                             <button x-data="{ copied: false }"
-                                                    @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    @click.stop="copyToClipboard(apiModelName(model.id)); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"
                                                     :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
-                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')"
-                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                    :title="window.t('settings.models.table.copy_model_name_tooltip')">
+                                                    <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
                                                 <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
                                             </button>
                                         </div>
@@ -1718,6 +1896,8 @@
                                                     @focus="showTip($event.currentTarget, model.pinned ? window.t('settings.models.table.pin_on_tooltip') : window.t('settings.models.table.pin_off_tooltip'))"
                                                     @blur="hideTip()"
                                                     :class="model.pinned ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="model.pinned ? 'true' : 'false'"
                                                     class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
                                                     <span
@@ -1741,6 +1921,8 @@
                                                     @focus="showTip($event.currentTarget, !model.is_hidden ? window.t('settings.models.table.visible_on_tooltip') : window.t('settings.models.table.visible_off_tooltip'))"
                                                     @blur="hideTip()"
                                                     :class="!model.is_hidden ? 'bg-black' : 'bg-neutral-200'"
+                                                    role="switch"
+                                                    :aria-checked="!model.is_hidden ? 'true' : 'false'"
                                                     class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black"
                                                 >
                                                     <span

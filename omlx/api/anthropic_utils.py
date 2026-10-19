@@ -8,7 +8,6 @@ Handles conversion between Anthropic API format and internal oMLX format.
 import base64
 import json
 import logging
-import re
 import uuid
 from typing import Any
 
@@ -24,6 +23,7 @@ from .anthropic_models import (
     SystemContent,
 )
 from .openai_models import ToolCall
+from .utils import _strip_client_budget_markers
 
 _PRESERVE_ROLE_BOUNDARY = "_preserve_role_boundary"
 logger = logging.getLogger(__name__)
@@ -688,25 +688,6 @@ def convert_anthropic_to_internal_harmony(
 # Prefix to filter out from system blocks (billing metadata that
 # contains randomly changing values, breaking prefix cache).
 _BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
-
-# Claude Code appends a `<total_tokens>N tokens left</total_tokens>` budget
-# marker to the end of the system prompt with a freshly decremented N on
-# every request, keeping the stale copies, so the prompt head both changes
-# and grows each call and no prefix past it can ever be reused (measured as
-# full ~60k-token re-prefills per turn). The marker is informational only —
-# nothing downstream parses it — so it is stripped wholesale, like the
-# billing header above.
-_TOTAL_TOKENS_MARKER_RE = re.compile(
-    r"\n{0,2}<total_tokens>\d+ tokens left</total_tokens>"
-)
-
-
-def _strip_client_budget_markers(text: str) -> str:
-    """Remove Claude Code per-request token-budget markers from system text."""
-    if "<total_tokens>" not in text:
-        return text
-
-    return _TOTAL_TOKENS_MARKER_RE.sub("", text)
 
 
 def _extract_system_text(system: str | list[SystemContent]) -> str:

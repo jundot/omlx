@@ -15,6 +15,9 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from omlx.cache.paged_cache import PagedCacheManager
+from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import MemoryMonitor
 from omlx.request import Request, SamplingParams
@@ -456,10 +459,66 @@ def test_rejection_releases_block_aware_cache_when_present():
 
     scheduler._release_paged_cache_for_request("req-leak")
 
-    # When block_aware_cache is present it owns the cleanup chain
-    # (release_cache → paged_cache_manager.delete_block_table).
+    # When block_aware_cache is present, release_cache owns the cleanup.
     block_aware_cache.release_cache.assert_called_once_with("req-leak")
     paged_cache_manager.delete_block_table.assert_not_called()
+
+
+def test_rejection_after_cache_hit_releases_prefix_blocks(tmp_path):
+    """A rejected cache hit must not pin its prefix blocks (#4213).
+
+    fetch_cache records the hit only in the paged manager. A pinned block
+    keeps its hash after the hot-cache-only tier drops its payload, so the
+    next store deduplicates against it and each turn regains one block.
+    """
+    paged = PagedCacheManager(
+        block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=tmp_path / "unused",
+        max_size_bytes=100 * 1024**2,
+        hot_cache_max_bytes=10 * 1024**2,
+        hot_cache_only=True,
+    )
+    cache = BlockAwarePrefixCache(
+        model=SimpleNamespace(layers=[object()]),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+    )
+    scheduler = _make_scheduler()
+    scheduler.block_aware_cache = cache
+    scheduler.paged_cache_manager = paged
+    tokens = list(range(12))
+    keys = mx.ones((1, 1, 12, 1))
+    kv = [{"state": (keys, keys), "meta_state": (12,), "class_name": "KVCache"}]
+
+    def finish(request_id):
+        table = paged.get_block_table(request_id)
+        paged.release_for_eviction(table.block_ids)
+        cache.clear_request_entry(request_id)
+
+    def restored_tokens(request_id):
+        table, _ = cache.fetch_cache(request_id, tokens)
+        restored = table is not None and cache.reconstruct_cache(table) is not None
+        if table is not None and not restored:
+            paged.delete_block_table(request_id)
+        return table.num_tokens if restored else 0
+
+    try:
+        cache.store_cache("first", tokens, kv)
+        finish("first")
+        assert restored_tokens("rejected") == 12
+        scheduler._release_paged_cache_for_request("rejected")
+        blocks = paged.allocated_blocks.values()
+        assert all(b.ref_count == 0 for b in blocks if not b.is_null)
+
+        ssd.clear_hot_cache()
+        assert restored_tokens("reprefill") == 0
+        cache.store_cache("reprefill", tokens, kv)
+        finish("reprefill")
+        assert restored_tokens("next") == 12
+    finally:
+        ssd.close()
 
 
 def test_rejection_releases_paged_cache_when_no_prefix_cache():

@@ -114,8 +114,13 @@
                                                     <span class="badge bg-neutral-100 text-neutral-500 border-neutral-200 truncate max-w-[120px]"
                                                           x-text="managerModelInfo(model.name)?.settings?.model_alias"></span>
                                                 </template>
+                                                <template x-if="model.source_type === 'hf_cache'">
+                                                    <span class="badge bg-neutral-100 text-neutral-500 border-neutral-200 flex-shrink-0 whitespace-nowrap"
+                                                          :title="window.t('models.manager.hf_cache_tooltip')"
+                                                          x-text="window.t('models.manager.hf_cache_badge')"></span>
+                                                </template>
                                                 <button x-data="{ copied: false }"
-                                                        @click.stop="copyToClipboard(managerModelInfo(model.name)?.settings?.model_alias || model.name); copied = true; setTimeout(() => copied = false, 2000)"
+                                                        @click.stop="copyToClipboard(apiModelName(model.name)); copied = true; setTimeout(() => copied = false, 2000)"
                                                         class="p-1 rounded-md transition-all flex-shrink-0"
                                                         :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
                                                         :title="window.t('models.manager.copy_model_name_tooltip')">
@@ -152,7 +157,8 @@
                                                 </template>
                                                 <template x-if="hfDeleteConfirm === model.name">
                                                     <div class="flex items-center gap-1.5">
-                                                        <span class="text-xs text-red-600 hidden sm:inline">{{ t('models.manager.delete_confirm') }}</span>
+                                                        <span class="text-xs text-red-600 hidden sm:inline"
+                                                              x-text="model.source_type === 'hf_cache' ? window.t('models.manager.delete_confirm_hf_cache') : window.t('models.manager.delete_confirm')"></span>
                                                         <button @click="deleteHFModel(model.name)"
                                                                 class="px-2 py-1 text-xs font-medium text-white bg-red-500 hover:bg-red-600 rounded-lg transition-all">
                                                             {{ t('models.manager.delete_yes') }}
@@ -192,19 +198,26 @@
 
                         <!-- Source Switcher (HF / MS) -->
                         <div class="segmented segmented--sm mb-6 w-fit">
-                            <button @click="downloaderSource = 'hf'"
+                            <button @click="setDownloaderSource('hf')"
                                     :class="downloaderSource === 'hf'
                                         ? 'segmented__item--active'
                                         : ''"
                                     class="segmented__item">
                                 {{ t('models.downloader.source.hf') }}
                             </button>
-                            <button @click="downloaderSource = 'ms'; initMsDownloader()"
+                            <button @click="setDownloaderSource('ms')"
                                     :class="downloaderSource === 'ms'
                                         ? 'segmented__item--active'
                                         : ''"
                                     class="segmented__item">
                                 {{ t('models.downloader.source.ms') }}
+                            </button>
+                            <button @click="setDownloaderSource('recommended')"
+                                    :class="downloaderSource === 'recommended'
+                                        ? 'segmented__item--active'
+                                        : ''"
+                                    class="segmented__item inline-flex items-center gap-1">
+                                <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>{{ t('models.downloader.source.recommended') }}
                             </button>
                         </div>
 
@@ -566,7 +579,13 @@
                                                                       class="badge bg-red-50 text-red-700 border-red-200 shrink-0">
                                                                     {{ t('models.browse.high_oom_risk') }}
                                                                 </span>
+                                                                <span x-show="isModelDownloaded(model.repo_id)" x-cloak
+                                                                      class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                    <i data-lucide="check" class="w-3 h-3"></i>
+                                                                    {{ t('models.browse.downloaded') }}
+                                                                </span>
                                                                 <button @click="downloadRecommended(model.repo_id)"
+                                                                        x-show="!isModelDownloaded(model.repo_id)"
                                                                         :disabled="hfDownloading"
                                                                         class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
                                                                     <i data-lucide="download" class="w-3 h-3"></i>
@@ -587,7 +606,13 @@
                                                                       class="badge bg-red-50 text-red-700 border-red-200 shrink-0">
                                                                     {{ t('models.browse.high_oom_risk') }}
                                                                 </span>
+                                                                <span x-show="isModelDownloaded(model.repo_id)" x-cloak
+                                                                      class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                    <i data-lucide="check" class="w-3 h-3"></i>
+                                                                    {{ t('models.browse.downloaded') }}
+                                                                </span>
                                                                 <button @click="downloadRecommended(model.repo_id)"
+                                                                        x-show="!isModelDownloaded(model.repo_id)"
                                                                         :disabled="hfDownloading"
                                                                         class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
                                                                     <i data-lucide="download" class="w-3 h-3"></i>
@@ -703,7 +728,13 @@
                                                                           class="badge bg-red-50 text-red-700 border-red-200 shrink-0">
                                                                         {{ t('models.browse.high_oom_risk') }}
                                                                     </span>
+                                                                    <span x-show="isModelDownloaded(model.repo_id)" x-cloak
+                                                                          class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                        <i data-lucide="check" class="w-3 h-3"></i>
+                                                                        {{ t('models.browse.downloaded') }}
+                                                                    </span>
                                                                     <button @click="downloadRecommended(model.repo_id)"
+                                                                            x-show="!isModelDownloaded(model.repo_id)"
                                                                             :disabled="hfDownloading"
                                                                             class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
                                                                         <i data-lucide="download" class="w-3 h-3"></i>
@@ -724,7 +755,13 @@
                                                                           class="badge bg-red-50 text-red-700 border-red-200 shrink-0">
                                                                         {{ t('models.browse.high_oom_risk') }}
                                                                     </span>
+                                                                    <span x-show="isModelDownloaded(model.repo_id)" x-cloak
+                                                                          class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                        <i data-lucide="check" class="w-3 h-3"></i>
+                                                                        {{ t('models.browse.downloaded') }}
+                                                                    </span>
                                                                     <button @click="downloadRecommended(model.repo_id)"
+                                                                            x-show="!isModelDownloaded(model.repo_id)"
                                                                             :disabled="hfDownloading"
                                                                             class="px-3 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100 hover:bg-neutral-900 hover:text-white rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-1.5">
                                                                         <i data-lucide="download" class="w-3 h-3"></i>
@@ -771,6 +808,14 @@
                                                 <div class="flex-1 min-w-0">
                                                     <div class="flex items-center gap-2 flex-wrap">
                                                         <span class="text-sm font-medium text-neutral-900 truncate" x-text="task.repo_id"></span>
+                                                        <button x-show="task.status === 'completed'" x-cloak x-data="{ copied: false }"
+                                                                @click.stop="copyToClipboard(apiModelName(task.repo_id.split('/').pop())); copied = true; setTimeout(() => copied = false, 2000)"
+                                                                class="p-1 rounded-md transition-all flex-shrink-0"
+                                                                :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                                :title="window.t('models.queue.copy_model_name_tooltip')">
+                                                            <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                            <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                                        </button>
                                                         <span class="badge uppercase tracking-wider shrink-0"
                                                               :class="{
                                                                   'bg-blue-50 text-blue-700 border border-blue-200': task.status === 'downloading',
@@ -1041,7 +1086,13 @@
                                                                       class="badge bg-amber-50 text-amber-600 border-amber-200">
                                                                     {{ t('models.browse.tight_fit') }}
                                                                 </span>
+                                                                <span x-show="isModelDownloaded(model.repo_id)" x-cloak
+                                                                      class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                    <i data-lucide="check" class="w-3 h-3"></i>
+                                                                    {{ t('models.browse.downloaded') }}
+                                                                </span>
                                                                 <button @click="downloadMsModel(model.repo_id)"
+                                                                        x-show="!isModelDownloaded(model.repo_id)"
                                                                         :disabled="msDownloading"
                                                                         class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
                                                                                hover:bg-neutral-900 hover:text-white rounded-lg transition-all
@@ -1095,7 +1146,13 @@
                                                                       class="badge bg-amber-50 text-amber-600 border-amber-200">
                                                                     {{ t('models.browse.tight_fit') }}
                                                                 </span>
+                                                                <span x-show="isModelDownloaded(model.repo_id)" x-cloak
+                                                                      class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                    <i data-lucide="check" class="w-3 h-3"></i>
+                                                                    {{ t('models.browse.downloaded') }}
+                                                                </span>
                                                                 <button @click="downloadMsModel(model.repo_id)"
+                                                                        x-show="!isModelDownloaded(model.repo_id)"
                                                                         :disabled="msDownloading"
                                                                         class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
                                                                                hover:bg-neutral-900 hover:text-white rounded-lg transition-all
@@ -1154,7 +1211,13 @@
                                                                     </div>
                                                                 </div>
                                                                 <div class="flex items-center gap-2 shrink-0 ml-4">
+                                                                    <span x-show="isModelDownloaded(model.repo_id)" x-cloak
+                                                                          class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                        <i data-lucide="check" class="w-3 h-3"></i>
+                                                                        {{ t('models.browse.downloaded') }}
+                                                                    </span>
                                                                     <button @click="downloadMsModel(model.repo_id)"
+                                                                            x-show="!isModelDownloaded(model.repo_id)"
                                                                             :disabled="msDownloading"
                                                                             class="px-3.5 py-1.5 text-xs font-medium text-neutral-600 bg-neutral-100
                                                                                hover:bg-neutral-900 hover:text-white rounded-lg transition-all
@@ -1199,6 +1262,14 @@
                                                             <div class="flex-1 min-w-0">
                                                                 <div class="flex items-center gap-2 flex-wrap">
                                                                     <span class="text-sm font-medium text-neutral-900 truncate" x-text="task.repo_id"></span>
+                                                                    <button x-show="task.status === 'completed'" x-cloak x-data="{ copied: false }"
+                                                                            @click.stop="copyToClipboard(apiModelName(task.repo_id.split('/').pop())); copied = true; setTimeout(() => copied = false, 2000)"
+                                                                            class="p-1 rounded-md transition-all flex-shrink-0"
+                                                                            :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                                            :title="window.t('models.queue.copy_model_name_tooltip')">
+                                                                        <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                                        <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                                                    </button>
                                                                     <span class="badge uppercase tracking-wider shrink-0"
                                                                           :class="{
                                                                               'bg-blue-50 text-blue-700 border border-blue-200': task.status === 'downloading',
@@ -1261,6 +1332,8 @@
                                 </div>
                             </template>
                         </div><!-- end ModelScope Source -->
+
+                        {% include 'dashboard/_recommendations.html' %}
 
                     </div>
 
@@ -1349,6 +1422,8 @@
                                             <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.enhanced_help') }}</p>
                                         </div>
                                         <button type="button"
+                                                role="switch"
+                                                :aria-checked="oqEnhanced"
                                                 @click="oqEnhanced = !oqEnhanced"
                                                 :class="oqEnhanced ? 'bg-black' : 'bg-neutral-200'"
                                                 class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1363,6 +1438,8 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.imatrix_reuse_cache_help') }}</p>
                                             </div>
                                             <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqeReuseImatrixCache"
                                                     @click="oqeReuseImatrixCache = !oqeReuseImatrixCache"
                                                     :class="oqeReuseImatrixCache ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1383,6 +1460,8 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.imatrix_strict_help') }}</p>
                                             </div>
                                             <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqeStrictImatrix"
                                                     @click="oqeStrictImatrix = !oqeStrictImatrix"
                                                     :class="oqeStrictImatrix ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1404,6 +1483,8 @@
                                         <div x-show="oqSelectedModelIsVLM() && oqSelectedModelType() !== 'deepseek_v41'" x-cloak class="flex items-center justify-between">
                                             <span class="text-sm text-neutral-600">{{ t('models.oq.text_only') }}</span>
                                             <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqTextOnly"
                                                     @click="oqTextOnly = !oqTextOnly"
                                                     :class="oqTextOnly ? 'bg-black' : 'bg-neutral-200'"
                                                     class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
@@ -1422,6 +1503,8 @@
                                                    class="text-xs text-amber-600 mt-1 leading-relaxed">{{ t('models.oq.preserve_mtp_unavailable') }}</p>
                                             </div>
                                             <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqPreserveMtp"
                                                     @click="if (oqSelectedModelHasMtp()) oqPreserveMtp = !oqPreserveMtp"
                                                     :disabled="!oqSelectedModelHasMtp()"
                                                     :class="[
@@ -1456,12 +1539,14 @@
                                             </div>
                                             <div class="flex gap-1.5 shrink-0">
                                                 <button type="button" @click="oqDtype='bfloat16'"
+                                                        :aria-pressed="oqDtype==='bfloat16'"
                                                         :class="oqDtype==='bfloat16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
                                                         class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
                                                     bfloat16
                                                 </button>
                                                 <button type="button" @click="oqDtype='float16'"
                                                         x-show="oqSelectedModelType() !== 'deepseek_v41'"
+                                                        :aria-pressed="oqDtype==='float16'"
                                                         :class="oqDtype==='float16' ? 'bg-black text-white' : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'"
                                                         class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
                                                     float16
@@ -1912,6 +1997,8 @@
                                                     <p class="text-caption text-neutral-400 mt-0.5" x-text="window.t('models.uploader.modal_redownload_hint')"></p>
                                                 </div>
                                                 <button @click="uploadRedownloadNotice = !uploadRedownloadNotice"
+                                                        role="switch"
+                                                        :aria-checked="uploadRedownloadNotice"
                                                         class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300 ml-3"
                                                         :class="uploadRedownloadNotice ? 'bg-black' : 'bg-neutral-200'">
                                                     <span class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
@@ -1923,6 +2010,8 @@
                                         <div class="flex items-center justify-between">
                                             <label class="text-xs font-medium text-neutral-500" x-text="window.t('models.uploader.modal_private_label')"></label>
                                             <button @click="uploadPrivate = !uploadPrivate"
+                                                    role="switch"
+                                                    :aria-checked="uploadPrivate"
                                                     class="relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-300"
                                                     :class="uploadPrivate ? 'bg-black' : 'bg-neutral-200'">
                                                 <span class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"
@@ -2082,8 +2171,14 @@
                                                 {{ t('models.detail.lora_warning') }}
                                             </span>
                                         </template>
+                                        <span x-show="!hfModelDetail.is_adapter && isModelDownloaded(hfModelDetail.repo_id)" x-cloak
+                                              class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                            <i data-lucide="check" class="w-3 h-3"></i>
+                                            {{ t('models.browse.downloaded') }}
+                                        </span>
                                         <template x-if="!hfModelDetail.is_adapter">
                                             <button @click="downloadRecommended(hfModelDetail.repo_id); closeModelDetail();"
+                                                    x-show="!isModelDownloaded(hfModelDetail.repo_id)"
                                                     :disabled="hfDownloading"
                                                     class="px-5 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-full transition-all
                                                        disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
@@ -2167,7 +2262,13 @@
                                                 class="px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-100 rounded-full transition-all">
                                             {{ t('models.detail.close') }}
                                         </button>
+                                        <span x-show="isModelDownloaded(msModelDetail.repo_id)" x-cloak
+                                              class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                            <i data-lucide="check" class="w-3 h-3"></i>
+                                            {{ t('models.browse.downloaded') }}
+                                        </span>
                                         <button @click="downloadMsModel(msModelDetail.repo_id); closeModelDetail();"
+                                                x-show="!isModelDownloaded(msModelDetail.repo_id)"
                                                 :disabled="msDownloading"
                                                 class="px-5 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded-full transition-all
                                                        disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">

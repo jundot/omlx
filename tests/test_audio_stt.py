@@ -1475,6 +1475,31 @@ class TestSTTProcessorErrors:
         asyncio.run(engine.start())
         asyncio.run(engine.stop())
 
+    def test_unrelated_load_error_is_reraised_without_self_cause(self, monkeypatch):
+        import asyncio
+        import sys
+        import types
+
+        def _failing_load(*args, **kwargs):
+            raise ImportError(
+                "VoxtralProcessor requires the PyTorch library but it was not "
+                "found in your environment."
+            )
+
+        fake_utils = types.ModuleType("mlx_audio.stt.utils")
+        fake_utils.load_model = _failing_load
+        fake_stt = sys.modules.setdefault("mlx_audio.stt", types.ModuleType("mlx_audio.stt"))
+        fake_audio = sys.modules.setdefault("mlx_audio", types.ModuleType("mlx_audio"))
+        monkeypatch.setitem(sys.modules, "mlx_audio", fake_audio)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
+        monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
+
+        engine = self._stt_engine("mlx-community/Voxtral-Mini-3B-2507-bf16")
+        with pytest.raises(ImportError, match="PyTorch") as exc_info:
+            asyncio.run(engine.start())
+
+        assert exc_info.value.__cause__ is not exc_info.value
+
 
 class TestQwen3ASRAudioQuantization:
     """Qwen3-ASR loads quantized and floating-point audio layers (#3573)."""

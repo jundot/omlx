@@ -17,6 +17,7 @@ import functools
 import inspect
 import logging
 import math
+import threading
 import time
 import weakref
 from collections import deque
@@ -121,6 +122,7 @@ def apply() -> bool:
                     logger.debug("MTP path not active: %s", reason)
 
         def patched_next(self, *args, **kwargs):
+            model = getattr(self, "model", None)
             if _is_mtp_batch_eligible(self):
                 policy = _batch_policy_for_next(self)
                 _batch_park_memory(self.model).tick()
@@ -149,7 +151,7 @@ def apply() -> bool:
                 try:
                     batch_state = _prepare_mtp_batch_state_for_next(self)
                     if batch_state is not None:
-                        with _spec_command_buffers():
+                        with _spec_command_buffers(model):
                             return _mtp_batch_next(self, batch_state)
                 except _MtpStepFallback as exc:
                     logger.debug("MTP batch next() fallback to standard step: %s", exc)
@@ -176,7 +178,7 @@ def apply() -> bool:
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
-                            with _spec_command_buffers():
+                            with _spec_command_buffers(model):
                                 return _mtp_next(self, state)
                     except _MtpStepFallback as exc:
                         logger.debug("MTP next() fallback to standard step: %s", exc)
@@ -370,6 +372,24 @@ def _model_has_mtp_module(model: Any) -> bool:
 # raise its peak memory.
 _SPEC_BUFFER_CAPS = (200, 512)
 
+# Target model types supported by the Qwen Lightning MTP/DFlash paths.
+_SPEC_CAPS_TARGET_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_5_vl",
+        "qwen3_6",
+        "qwen3_6_moe",
+        "qwen4_exp",
+        "qwen4_exp_text",
+    }
+)
+
+
+def _spec_caps_target(model: Any) -> bool:
+    """Whether the loaded target belongs to the selected Qwen family."""
+    return getattr(model, "model_type", None) in _SPEC_CAPS_TARGET_TYPES
+
 
 @functools.lru_cache(maxsize=1)
 def _raises_spec_buffer_caps() -> bool:
@@ -387,22 +407,35 @@ def _raises_spec_buffer_caps() -> bool:
     return architecture.startswith("applegpu_g15")
 
 
+# The caps live on the MLX device, so engines running cycles at the same time
+# share one raise and the last one out restores MLX's values.
+_spec_caps_lock = threading.Lock()
+_spec_caps_holders = 0
+_spec_caps_previous: Optional[Tuple[int, int]] = None
+
+
 @contextlib.contextmanager
-def _spec_command_buffers():
-    """Raise MLX's command-buffer caps for one speculative decode step.
+def _spec_command_buffers(model: Any = None):
+    """Raise caps for supported Qwen targets and GPUs, then restore them."""
+    global _spec_caps_holders, _spec_caps_previous
+    if not _spec_caps_target(model) or not _raises_spec_buffer_caps():
+        yield
+        return
 
-    Measured on M5 and M3 Ultra, so other GPUs keep MLX's caps.
-    """
-    from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
+    from omlx.custom_kernels.quant_matmul.fast import set_command_buffer_caps
 
-    previous = None
-    if _raises_spec_buffer_caps():
-        previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+    with _spec_caps_lock:
+        if _spec_caps_holders == 0:
+            _spec_caps_previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+        _spec_caps_holders += 1
     try:
         yield
     finally:
-        if previous is not None:
-            set_command_buffer_caps(*previous)
+        with _spec_caps_lock:
+            _spec_caps_holders -= 1
+            if _spec_caps_holders == 0 and _spec_caps_previous is not None:
+                set_command_buffer_caps(*_spec_caps_previous)
+                _spec_caps_previous = None
 
 
 def _drafter_for(model: Any) -> Optional[Any]:
@@ -411,7 +444,7 @@ def _drafter_for(model: Any) -> Optional[Any]:
     A drafter replaces the embedded MTP head as the draft source. It is
     stamped on the language model as ``_omlx_drafter`` at attach time and
     exposes ``depth``, ``target_layer_ids``, ``draft``, ``observe``,
-    ``release`` and ``decode_scope`` (see omlx.speculative.dflash_drafter).
+    ``release`` and ``decode_scope`` (see omlx.speculative.dflash).
     """
     candidates = [model]
     for attr in ("language_model", "_language_model"):
@@ -1375,8 +1408,7 @@ def _batch_policy_for_next(gen_batch: Any):
         policy = BatchPolicy(
             gen_batch.uids,
             depth if chain else 1,
-            fixed=_drafter_for(gen_batch.model) is not None
-            or _mtp_depth_fixed(gen_batch.model),
+            fixed=_mtp_depth_fixed(gen_batch.model),
         )
         memory.seed(policy)
         gen_batch._omlx_mtp_batch_policy = policy
@@ -1531,6 +1563,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     tokens = gen_batch.tokens[0] if getattr(gen_batch, "tokens", None) else None
     if not tokens:
         return False
+    started = time.perf_counter()
     try:
         new_cache = _rebuild_singleton_cache(gen_batch.model)
         if new_cache is None:
@@ -1574,11 +1607,14 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             from mlx_lm.models.cache import TokenBuffer
 
             gen_batch._token_context[0] = TokenBuffer(list(tokens))
-        logger.debug(
-            "MTP reconciled to standard on reshape (uid=%s tokens=%d queue=%d)",
+        logger.info(
+            "MTP reconciled to standard on reshape (uid=%s tokens=%d chunks=%d "
+            "queue=%d, %.2fs)",
             getattr(state, "uid", "?"),
             len(tokens),
+            -(-total // step),
             len(state.queue),
+            time.perf_counter() - started,
         )
         return True
     except Exception as exc:
@@ -2252,7 +2288,14 @@ def _resolve_mtp_chain_depth(model: Any) -> Tuple[bool, int, bool]:
 
 
 def _mtp_depth_fixed(model: Any) -> bool:
-    """True when the model was loaded with a fixed draft depth (no controller)."""
+    """True when the draft depth has no controller.
+
+    That is a model loaded with a fixed MTP depth, or a block drafter whose
+    verify mode keeps the whole block.
+    """
+    drafter = _drafter_for(model)
+    if drafter is not None:
+        return not getattr(drafter, "adaptive", False)
     candidates = [model]
     for attr in ("language_model", "_language_model"):
         inner = getattr(model, attr, None)
@@ -2377,10 +2420,40 @@ def _prefill_activity_recent() -> bool:
         return False
 
 
-def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float], uid: Any = None) -> None:
+def _prefill_activity_since(since_ts: float) -> bool:
+    try:
+        return get_prefill_tracker().active_since(since_ts)
+    except Exception:
+        return False
+
+
+def _arm_std_tax_probe(
+    gen_batch: Any,
+    t0_ms: Optional[float],
+    uid: Any = None,
+    since_ts: Optional[float] = None,
+) -> None:
+    """Arm the post-park standard-step probe.
+
+    ``since_ts`` is the monotonic start of the MTP run that produced
+    ``t0_ms``. When given, only prefill activity after it counts as
+    contention: the sequence's own prefill ended before its run began and
+    cannot have shaped t0. Without it, any prefill in the last
+    ``_STD_TAX_CONTENTION_WINDOW_S`` blocks the probe, which in practice
+    skips every probe of an interactive request (it parks about a second
+    after its own prefill) and leaves the exit margin at its prior.
+    """
     if not (t0_ms and t0_ms > 0.0):
         return
-    if _prefill_activity_recent():
+    if since_ts is not None:
+        if _prefill_activity_since(since_ts):
+            logger.debug(
+                "MTP loop-tax probe skipped: prefill activity during the run, "
+                "t0=%.1fms is contention-contaminated",
+                t0_ms,
+            )
+            return
+    elif _prefill_activity_recent():
         logger.debug(
             "MTP loop-tax probe skipped: prefill activity within %.1fs, "
             "t0=%.1fms is contention-contaminated",
@@ -2393,6 +2466,8 @@ def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float], uid: Any = None) 
         "skip": _STD_TAX_SKIP,
         "samples": [],
         "uid": uid,
+        # Run-scoped probes finalize against activity after arming only.
+        "armed_ts": time.monotonic() if since_ts is not None else None,
     }
 
 
@@ -2423,7 +2498,13 @@ def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
     t_std = samples[len(samples) // 2]
     if t_std <= 0.0:
         return
-    if _prefill_activity_recent():
+    armed_ts = probe.get("armed_ts")
+    contended = (
+        _prefill_activity_since(armed_ts)
+        if armed_ts is not None
+        else _prefill_activity_recent()
+    )
+    if contended:
         logger.debug(
             "MTP loop-tax probe discarded: prefill activity during the "
             "std sampling window"
@@ -2561,6 +2642,17 @@ class _DepthController:
     # a hardcoded ratio.
     EXIT_MARGIN = 1.15
     EXIT_STREAK = 16
+    # Depth 0 drafts nothing, so acceptance does not update while the
+    # controller sits there: a losing verdict built at depth 0 rests on the
+    # estimate that sent it there. A hand-off therefore needs this many
+    # speculative cycles inside the losing streak; when they are missing,
+    # the best speculative depth is re-measured first (the depth-0 trap:
+    # one dip in a story's acceptance otherwise parks MTP for content where
+    # depth 1 beats the plain step). 16 cycles let the acceptance EMA
+    # (ALPHA 0.08) climb back from a dip; in simulation 8 cycles still
+    # parked ~40% of stale dips, 16 parks ~6%, and truly losing content
+    # exits by cycle ~37 (24 before this gate).
+    EXIT_CONFIRM = 16
 
     def __init__(
         self,
@@ -2574,6 +2666,9 @@ class _DepthController:
         if exit_margin:
             self.EXIT_MARGIN = min(_STD_TAX_MAX, max(1.0, float(exit_margin)))
         self.max_depth = max(1, int(max_depth))
+        # Start of this MTP run: a park scopes its loop-tax contention check
+        # to prefill activity after it (see _arm_std_tax_probe).
+        self.started_ts = time.monotonic()
         self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
         # A position never reached yet (None) borrows the estimate of the
         # position before it; a flat 0.6 prior kept deep drafts unexplored.
@@ -2583,6 +2678,7 @@ class _DepthController:
         self.cycles = 0
         self.probe_left = 0
         self.exit_streak = 0
+        self._streak_spec = 0  # speculative cycles in the current losing streak
         self._ms_probe = 0.0  # wall-time since any probe burst
         self._ms_explore = 0.0  # wall-time since a staleness-exploration burst
         # Measure each depth once (max..1), then the depth-0 plain step
@@ -2641,8 +2737,11 @@ class _DepthController:
 
         if self._speculation_losing():
             self.exit_streak += 1
+            if used > 0 and time_sample:
+                self._streak_spec += 1
         else:
             self.exit_streak = 0
+            self._streak_spec = 0
 
         # Warmup sweep: keep walking max..1 until every depth is measured once.
         if self._warmup:
@@ -2653,6 +2752,19 @@ class _DepthController:
                 self.cur = self._warmup[0]
                 return
             self.cur = self._best()
+            self._ms_probe = 0.0
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("MTP controller warmup done: %s", self.describe())
+            return
+
+        # Confirm a losing verdict before it can hand off (EXIT_CONFIRM).
+        if (
+            self.probe_left == 0
+            and self.exit_streak >= self.EXIT_STREAK
+            and self._streak_spec < self.EXIT_CONFIRM
+        ):
+            self.cur = max(range(1, self.max_depth + 1), key=self._score)
+            self.probe_left = self.EXIT_CONFIRM - self._streak_spec
             self._ms_probe = 0.0
             return
 
@@ -2776,8 +2888,27 @@ class _DepthController:
 
     def should_exit(self) -> bool:
         """Sustained losing speculation: hand the sequence back to the
-        standard decoder."""
-        return self.exit_streak >= self.EXIT_STREAK
+        standard decoder. The streak must include EXIT_CONFIRM speculative
+        cycles, so the verdict is not just the estimate that led to depth 0."""
+        return (
+            self.exit_streak >= self.EXIT_STREAK
+            and self._streak_spec >= self.EXIT_CONFIRM
+        )
+
+    def describe(self) -> str:
+        """Compact state for debug logs: costs, acceptance and scores."""
+        t = ", ".join(f"{d}:{v:.1f}" for d, v in sorted(self.t.items()))
+        p = ", ".join("-" if v is None else f"{v:.2f}" for v in self.p)
+        scores = ", ".join(
+            f"{d}:{self._score(d) * 1000.0:.1f}"
+            for d in range(0, self.max_depth + 1)
+            if d > 0 or 0 in self.t
+        )
+        return (
+            f"cur={self.cur} cycles={self.cycles} t_ms={{{t}}} p=[{p}] "
+            f"tok_per_s={{{scores}}} exit_margin={self.EXIT_MARGIN:.3f} "
+            f"exit_streak={self.exit_streak}"
+        )
 
     def _select_candidates(self) -> List[int]:
         # Depth 0 is only selectable once its cost has actually been
@@ -3217,20 +3348,6 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
-        if drafter is not None:
-            # Block drafters keep their own per-request context and draft a
-            # fixed block, so neither the head cache nor the depth
-            # controller applies. The captured hidden of main_tok is the
-            # newest context entry; next_main is the anchor.
-            state.mtp_cache = []
-            state.next_main = _ensure_uint32(next_main_tok)
-            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
-            state.queue.append(
-                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
-            )
-            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
-            gen_batch._omlx_mtp_state = state
-            return
         if depth > 1 and not _mtp_depth_fixed(gen_batch.model):
             factory = getattr(
                 _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
@@ -3249,6 +3366,20 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
                     gen_batch.model._omlx_mtp_depth_seed = state.controller
                 except Exception:
                     pass
+        if drafter is not None:
+            # Block drafters keep their own per-request context and draft
+            # the whole block; the depth controller only narrows the
+            # verified part. The captured hidden of main_tok is the newest
+            # context entry; next_main is the anchor.
+            state.mtp_cache = []
+            state.next_main = _ensure_uint32(next_main_tok)
+            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+            state.queue.append(
+                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+            )
+            drafter.draft([(gen_batch, state, captured, state.next_main, prev_buf)])
+            gen_batch._omlx_mtp_state = state
+            return
         primed = _prompt_priming.take_primed(
             gen_batch.model,
             gen_batch.prompt_cache,
@@ -3353,7 +3484,6 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
     if policy is not None and policy.uids != tuple(gen_batch.uids):
         policy = None
     saved = [(state.controller, state.depth) for state in states]
-    depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
     # Copied windows are not draft-depth decisions; the singleton depth
     # controller skips them too.
     copied = any(state.copy_drafts for state in states)
@@ -3363,6 +3493,19 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
         for state in states:
             state.controller = None
             state.depth = requested
+    if _drafter_for(gen_batch.model) is not None:
+        # Clip before grouping so rows that share a window verify together.
+        for state in states:
+            if state.chain:
+                _clip_block_drafts(
+                    state,
+                    (
+                        state.controller.cur
+                        if state.controller is not None
+                        else state.depth
+                    ),
+                )
+    depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
     started = time.perf_counter()
     try:
         advance(gen_batch, batch_state)
@@ -3633,7 +3776,15 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         park_state = _MtpParkState(uid=state.uid)
         gen_batch._omlx_mtp_park_state = park_state
     if state.controller is not None:
-        _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)
+        describe = getattr(state.controller, "describe", None)
+        if describe is not None and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("MTP[%s] park decision: %s", state.uid, describe())
+        _arm_std_tax_probe(
+            gen_batch,
+            state.controller.t.get(0),
+            state.uid,
+            since_ts=getattr(state.controller, "started_ts", None),
+        )
     logger.info(
         "MTP[%s] parked for %d standard tokens before re-entry probe",
         state.uid,
@@ -3822,6 +3973,25 @@ def _dense_q_rows(draft_accept_lps) -> list:
     if isinstance(draft_accept_lps, SparseDraftQ):
         return [draft_accept_lps[i] for i in range(len(draft_accept_lps))]
     return list(draft_accept_lps)
+
+
+def _clip_block_drafts(state: _MtpState, limit: int) -> None:
+    """Keep the first ``limit`` drafts of a block for this verify.
+
+    Block drafters pick positions left to right, so a prefix of the block
+    with its draft distributions is a complete proposal.
+    """
+    drafts = state.drafts
+    if drafts is None or limit >= int(drafts.shape[0]):
+        return
+    state.drafts = drafts[:limit]
+    if state.draft_lps:
+        state.draft_lps = state.draft_lps[:limit]
+    q = state.draft_accept_lps
+    if isinstance(q, SparseDraftQ):
+        state.draft_accept_lps = SparseDraftQ(q.ids[:limit], q.logq[:limit], q.vocab)
+    elif q:
+        state.draft_accept_lps = list(q)[:limit]
 
 
 def _sparse_top_k(sampler) -> int:
@@ -4044,6 +4214,13 @@ def _run_verify_cycle_chain(
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
     is_greedy = _is_greedy(gen_batch)
+    drafter = _drafter_for(gen_batch.model)
+    if drafter is not None and verify_result is None:
+        # A shared verify was already built from the drafts it was given.
+        _clip_block_drafts(
+            state,
+            state.controller.cur if state.controller is not None else state.depth,
+        )
     # Adaptive depth: the chain may have drafted fewer than state.depth
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
@@ -4063,7 +4240,6 @@ def _run_verify_cycle_chain(
 
     # --- backbone verify forward + single host sync ---
     t0 = time.perf_counter()
-    drafter = _drafter_for(gen_batch.model)
     if verify_result is None:
         verify_result = _call_backbone_captured(
             gen_batch.model,
@@ -4245,8 +4421,10 @@ def _run_verify_cycle_chain(
         state.stats.copy_accepted += m
         state.context_copy.observe(m, k)
     else:
-        if len(state.stats.depth_drafted) < state.depth:
-            pad = state.depth - len(state.stats.depth_drafted)
+        # A batch policy can lower state.depth below the drafts a row holds.
+        depth = max(state.depth, k)
+        if len(state.stats.depth_drafted) < depth:
+            pad = depth - len(state.stats.depth_drafted)
             state.stats.depth_drafted.extend([0] * pad)
             state.stats.depth_accepted.extend([0] * pad)
         for j in range(k):

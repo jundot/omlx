@@ -1186,7 +1186,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         str(fabric["backend"]) if fabric is not None else choose_backend(transports)[0]
     )
     strategy_transports = transports
-    if provisional_backend == "ring" and transports:
+    # A resolved ring fabric is slow even when the transport probe failed.
+    if provisional_backend == "ring" and (transports or fabric is not None):
         strategy_transports = (SimpleNamespace(kind="ethernet"),)
 
     measurements = {}

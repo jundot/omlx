@@ -895,16 +895,17 @@ def test_row_map_of_routed_tokens(mode, gs, limit, tokens, top_k, E):
     _assert_bitwise(got, ref)
 
 
-def test_sort_routes_matches_mlx_lm_gather_sort():
+@pytest.mark.parametrize("tokens", [50, 400])  # 600 and 4800 routes
+def test_sort_routes_matches_mlx_lm_gather_sort(tokens):
     from mlx_lm.models.switch_layers import _gather_sort
 
-    h = mx.random.normal((2, 50, 1, 1, 32)).astype(mx.bfloat16)
+    h = mx.random.normal((2, tokens, 1, 1, 32)).astype(mx.bfloat16)
     inds = mx.argpartition(
-        -mx.random.uniform(shape=(2, 50, 16)), kth=5, axis=-1
+        -mx.random.uniform(shape=(2, tokens, 16)), kth=5, axis=-1
     )[..., :6]
     x_tok, row_map, idx, inv = sort_routes(h, inds)
     x_ref, idx_ref, inv_ref = _gather_sort(h, inds)
-    assert x_tok.shape == (100, 1, 32) and row_map.dtype == mx.uint32
+    assert x_tok.shape == (2 * tokens, 1, 32) and row_map.dtype == mx.uint32
     _assert_bitwise(x_tok[row_map], x_ref)
     assert mx.array_equal(idx, idx_ref).item()
     assert mx.array_equal(inv, inv_ref).item()
@@ -1299,11 +1300,11 @@ def _regrouped(gate_up_mod, glu):
 
 
 def _qwen_weighted_sum_kernel():
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
-    if not fast.has_symbol("qwen35_moe_weighted_sum"):
-        pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
-    return fast.qwen35_moe_weighted_sum
+    if not fast.has_symbol("moe_weighted_sum"):
+        pytest.skip("moe_weighted_sum native kernel unavailable")
+    return fast.moe_weighted_sum
 
 
 @needs_nax

@@ -28,7 +28,7 @@ _GROUP_SIZE = 64
 _PLAN_ATTR = "_omlx_oq_a8_plan"
 _PREPARED_ATTR = "_omlx_oq_a8_prepared"
 
-# Packed weights are reused; only scale/bias metadata and activations are copied.
+# Packed weights and Q8 metadata are reused; Q4/Q5 metadata is transposed once.
 # Rowwise and GS64 activation scaling are supported independently per bit width.
 _ACT_MODE_ROW = 0
 _ACT_MODE_G64 = 1
@@ -81,7 +81,7 @@ def _is_q8_linear(module: Any) -> bool:
 
 def _kernels_available() -> bool:
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
     except ImportError:
         return False
     return fast.oq_a8_available()
@@ -134,17 +134,17 @@ def _layout_for_bits(bits: int) -> int:
 # window per row and prefers a smaller tile.
 _DEFAULT_VARIANT_Q4 = 806
 _DEFAULT_VARIANT_Q5 = 800
-_DEFAULT_VARIANT_Q8 = 806
 
 _VARIANT_MIN = 800
+
+# Q8 picks its tile by row count and ignores the variant; both tiles are this wide.
+_Q8_TILE_N = 64
 
 
 def _variant_for_bits(bits: int) -> int:
     # Q4 and Q5 are autotuned independently: Q5 reads a second plane per
     # weight row and costs more registers, so the best tile need not match.
-    return {5: _DEFAULT_VARIANT_Q5, 8: _DEFAULT_VARIANT_Q8}.get(
-        bits, _DEFAULT_VARIANT_Q4
-    )
+    return _DEFAULT_VARIANT_Q5 if bits == 5 else _DEFAULT_VARIANT_Q4
 
 
 def classify_linear(linear: Any) -> OqA8Plan | None:
@@ -208,11 +208,11 @@ def _plan_for(bits: int, n: int, packed: bool = False) -> OqA8Plan | None:
         packed=packed,
     )
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     # N must tile exactly; the kernel refuses partial column tiles so the
     # weight decoder can stay bounds-check free.
-    tile_bn = _variant_bn(plan.variant)
+    tile_bn = _Q8_TILE_N if bits == 8 else _variant_bn(plan.variant)
     if n % tile_bn != 0:
         logger.debug(
             "oq_a8: N=%d is not a multiple of BN=%d; leaving this projection "
@@ -250,10 +250,9 @@ def _variant_bn(variant: int) -> int:
 
 
 def _prepared_weights(linear: Any):
-    """Cache transposed metadata while reusing the packed weight array.
-
-    A ``PackedLinear`` is read in its own tile layout, so nothing is copied.
-    """
+    """Cache transposed Q4/Q5 metadata; Q8 and PackedLinear are read as stored."""
+    if not isinstance(linear, PackedLinear) and linear.bits == 8:
+        return (linear.weight, linear.scales, linear.biases)
     cached = getattr(linear, _PREPARED_ATTR, None)
     if cached is not None:
         return cached
@@ -302,12 +301,12 @@ def stage_a(
     rebuilt on every prefill, which uses temporary activation memory without
     changing the checkpoint.
     """
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     if layout == _LAYOUT_NATURAL:
-        qa, sa, ra = fast.qwen35_oq_a8_stage_a_natural(x, act_mode)
+        qa, sa, ra = fast.oq_a8_stage_a_natural(x, act_mode)
     else:
-        qa, sa, ra = fast.qwen35_oq_a8_stage_a_v8(x, act_mode)
+        qa, sa, ra = fast.oq_a8_stage_a_v8(x, act_mode)
     return StageA(qa=qa, sa=sa, ra=ra, act_mode=act_mode, layout=layout)
 
 
@@ -324,10 +323,10 @@ def apply_plan(linear: Any, stage: StageA, plan: OqA8Plan) -> mx.array:
             f"Stage-A layout {stage.layout} does not match the projection's "
             f"plan ({plan.layout}); quantize once per kernel layout."
         )
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     weight, scales, biases = _prepared_weights(linear)
-    return fast.qwen35_oq_a8_qmm_t(
+    return fast.oq_a8_qmm_t(
         stage.qa,
         stage.sa,
         stage.ra,

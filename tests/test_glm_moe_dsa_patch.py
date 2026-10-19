@@ -329,7 +329,7 @@ def test_glm_direct_sparse_mla_uses_fork_default_threshold(monkeypatch):
     monkeypatch.setattr(
         glm_moe_dsa_model.glm_fast,
         "has",
-        lambda name: name == "glm_dsa_sparse_mla_attention",
+        lambda name: name == "sparse_mla_attention",
     )
 
     assert glm_moe_dsa_model._native_sparse_mla_default_min_k() == "11264"
@@ -339,11 +339,13 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     mx = pytest.importorskip("mlx.core")
 
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast as attention_fast
+        from omlx.custom_kernels.quant_matmul import fast as quant_fast
+        from omlx.custom_kernels.sparse_index import fast as index_fast
     except Exception as exc:  # pragma: no cover - depends on local native build
-        pytest.skip(f"omlx.custom_kernels.glm_moe_dsa is unavailable: {exc}")
+        pytest.skip(f"omlx.custom_kernels is unavailable: {exc}")
 
-    if not fast.is_native_available():
+    if not attention_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
 
     mx.random.seed(7)
@@ -358,7 +360,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
             mx.random.normal((tokens, topk), dtype=mx.float32),
             axis=-1,
         )
-        y_native = fast.glm_moe_weighted_sum(x_sorted, inv_order, scores)
+        y_native = quant_fast.moe_weighted_sum(x_sorted, inv_order, scores)
         x_ref = mx.squeeze(x_sorted, -2)
         x_ref = mx.take(x_ref, inv_order, axis=0)
         x_ref = mx.reshape(x_ref, scores.shape + (dims,))
@@ -377,7 +379,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
         bits=8,
         mode="affine",
     )
-    y_native = fast.glm_dsa_q8_vup_flat(x, weight, scales, biases)
+    y_native = quant_fast.q8_head_flat_qmm(x, weight, scales, biases)
     y_ref = mx.quantized_matmul(
         x,
         weight,
@@ -442,7 +444,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     assert_padded_indexer_scores_match(100, 4200)
     assert_padded_indexer_scores_match(128, 4210, offset_view=True)
 
-    assert not fast.has_symbol("glm_moe_swiglu_down")
+    assert not attention_fast.has_symbol("glm_moe_swiglu_down")
 
     batch, heads, q_len, k_len, latent, pe = 1, 64, 2, 32, 512, 64
     scale = 0.05
@@ -454,7 +456,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
         mx.reshape(mx.arange(0, k_len, dtype=mx.uint32), (1, 1, 1, k_len)),
         (batch, 1, q_len, k_len),
     )
-    y_native = fast.glm_dsa_sparse_mla_attention(
+    y_native = attention_fast.sparse_mla_attention(
         q_latent,
         q_pe,
         kv_latent,
@@ -501,7 +503,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
         selected = set(ids)
         dense_rows.append([j in selected and j <= q_pos for j in range(k_len)])
     topk_indices = mx.array([[rows]], dtype=mx.uint32)
-    y_native = fast.glm_dsa_sparse_mla_attention(
+    y_native = attention_fast.sparse_mla_attention(
         q_latent,
         q_pe,
         kv_latent,
@@ -550,7 +552,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
             rows.append(list(range(q_abs - topk + 1, q_abs + 1)))
     full_topk = mx.array([[rows]], dtype=mx.uint32)
     suffix_topk = full_topk[:, :, prefix_rows:, :]
-    y_full = fast.glm_dsa_sparse_mla_attention(
+    y_full = attention_fast.sparse_mla_attention(
         q_latent,
         q_pe,
         kv_latent,
@@ -561,7 +563,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
         topk_valid_prefix=True,
         causal_prefix_indices=True,
     )
-    y_compact = fast.glm_dsa_sparse_mla_attention(
+    y_compact = attention_fast.sparse_mla_attention(
         q_latent,
         q_pe,
         kv_latent,
@@ -579,7 +581,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     )
     assert float(compact_diff.item()) <= 5e-4
 
-    if not fast.has_symbol("glm_dsa_exact_block_attention"):
+    if not attention_fast.has_symbol("block_mask_attention"):
         pytest.skip("GLM exact block-token attention native kernel is unavailable")
 
     from omlx.patches.glm_moe_dsa.sparse_mla import topk_indices_to_block_masks
@@ -607,7 +609,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     )
     assert block_masks is not None
     block_mask, block_token_mask = block_masks
-    y_native = fast.glm_dsa_exact_block_attention(
+    y_native = attention_fast.block_mask_attention(
         q,
         k,
         v,
@@ -629,7 +631,7 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
     assert float(diff.item()) <= 2e-3
 
     scores = mx.random.normal((1, 1, 2, 2048), dtype=mx.float16)
-    topk_indices = fast.dsa_topk_indices(
+    topk_indices = index_fast.dsa_topk_indices(
         scores,
         2048,
         bucketed=False,
@@ -643,13 +645,13 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
     mx = pytest.importorskip("mlx.core")
 
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.quant_matmul import fast as quant_fast
     except Exception as exc:  # pragma: no cover - depends on local native build
-        pytest.skip(f"omlx.custom_kernels.glm_moe_dsa is unavailable: {exc}")
+        pytest.skip(f"omlx.custom_kernels is unavailable: {exc}")
 
-    if not fast.is_native_available():
+    if not quant_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
-    if not fast.has_symbol("deepseek_affine_gather_qmm_blocks"):
+    if not quant_fast.has_symbol("affine_gather_qmm_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
     from omlx.custom_kernels.nax import is_nax_available
@@ -709,7 +711,7 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
                 mode="affine",
                 sorted_indices=True,
             )
-            y_native = fast.deepseek_affine_gather_qmm_blocks(
+            y_native = quant_fast.affine_gather_qmm_blocks(
                 x,
                 q0,
                 s0,
@@ -720,7 +722,7 @@ def test_deepseek_affine_block_moe_kernels_match_gather_qmm():
                 bits,
                 block_variant,
             )
-            y_pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks(
+            y_pair = quant_fast.affine_gather_qmm_pair_concat_blocks(
                 x,
                 q0,
                 s0,
@@ -786,13 +788,13 @@ def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
     mx = pytest.importorskip("mlx.core")
 
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.quant_matmul import fast as quant_fast
     except Exception as exc:  # pragma: no cover - depends on local native build
-        pytest.skip(f"omlx.custom_kernels.glm_moe_dsa is unavailable: {exc}")
+        pytest.skip(f"omlx.custom_kernels is unavailable: {exc}")
 
-    if not fast.is_native_available():
+    if not quant_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
-    if not fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks"):
+    if not quant_fast.has_symbol("affine_gather_qmm_pair_concat_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
     from omlx.patches.deepseek_v4 import switch_layers
@@ -819,8 +821,8 @@ def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
     model.down_proj = quantized_affine(model.down_proj)
 
     calls = {"pair": 0, "single": 0}
-    orig_pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks
-    orig_single = fast.deepseek_affine_gather_qmm_blocks
+    orig_pair = quant_fast.affine_gather_qmm_pair_concat_blocks
+    orig_single = quant_fast.affine_gather_qmm_blocks
 
     def pair_spy(*args, **kwargs):
         calls["pair"] += 1
@@ -830,8 +832,8 @@ def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
         calls["single"] += 1
         return orig_single(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_pair_concat_blocks", pair_spy)
-    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
+    monkeypatch.setattr(quant_fast, "affine_gather_qmm_pair_concat_blocks", pair_spy)
+    monkeypatch.setattr(quant_fast, "affine_gather_qmm_blocks", single_spy)
 
     # Reach the 1024-route affine block threshold.
     x = mx.random.normal((1, 512, 128), dtype=mx.bfloat16)
@@ -850,13 +852,13 @@ def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch)
     mx = pytest.importorskip("mlx.core")
 
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.quant_matmul import fast as quant_fast
     except Exception as exc:  # pragma: no cover - depends on local native build
-        pytest.skip(f"omlx.custom_kernels.glm_moe_dsa is unavailable: {exc}")
+        pytest.skip(f"omlx.custom_kernels is unavailable: {exc}")
 
-    if not fast.is_native_available():
+    if not quant_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
-    if not fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks"):
+    if not quant_fast.has_symbol("affine_gather_qmm_pair_concat_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
     from omlx.patches.deepseek_v4 import switch_layers
@@ -883,8 +885,8 @@ def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch)
     model.down_proj = quantized_affine(model.down_proj)
 
     calls = {"pair": 0, "single": 0, "pair_dtype": None, "single_dtype": None}
-    orig_pair = fast.deepseek_affine_gather_qmm_pair_concat_blocks
-    orig_single = fast.deepseek_affine_gather_qmm_blocks
+    orig_pair = quant_fast.affine_gather_qmm_pair_concat_blocks
+    orig_single = quant_fast.affine_gather_qmm_blocks
 
     def pair_spy(x, *args, **kwargs):
         calls["pair"] += 1
@@ -896,8 +898,8 @@ def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch)
         calls["single_dtype"] = x.dtype
         return orig_single(x, *args, **kwargs)
 
-    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_pair_concat_blocks", pair_spy)
-    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
+    monkeypatch.setattr(quant_fast, "affine_gather_qmm_pair_concat_blocks", pair_spy)
+    monkeypatch.setattr(quant_fast, "affine_gather_qmm_blocks", single_spy)
 
     # Reach the 1024-route affine block threshold.
     x = mx.random.normal((1, 512, 128), dtype=mx.bfloat16)
@@ -921,14 +923,14 @@ def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch)
 def test_deepseek_switchglu_does_not_use_native_weighted_sum(monkeypatch):
     mx = pytest.importorskip("mlx.core")
 
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
     from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 
-    orig_has_symbol = fast.has_symbol
+    orig_has_symbol = quant_fast.has_symbol
     calls = {"weighted_sum": 0}
 
     def has_symbol(name):
-        if name == "glm_moe_weighted_sum":
+        if name == "moe_weighted_sum":
             return True
         return orig_has_symbol(name)
 
@@ -936,8 +938,8 @@ def test_deepseek_switchglu_does_not_use_native_weighted_sum(monkeypatch):
         calls["weighted_sum"] += 1
         raise AssertionError("DeepSeek V4 must use the reference scatter path")
 
-    monkeypatch.setattr(fast, "has_symbol", has_symbol)
-    monkeypatch.setattr(fast, "glm_moe_weighted_sum", weighted_sum_spy)
+    monkeypatch.setattr(quant_fast, "has_symbol", has_symbol)
+    monkeypatch.setattr(quant_fast, "moe_weighted_sum", weighted_sum_spy)
 
     mx.random.seed(17)
     model = SwitchGLU(16, 8, 8)
@@ -976,7 +978,7 @@ def test_glm_moe_sums_routes_when_weighted_sum_declines(monkeypatch):
 
     monkeypatch.setattr(deepseek_v32, "_use_glm_moe_weighted_sum", lambda c: True)
     monkeypatch.setattr(
-        deepseek_v32, "glm_fast", SimpleNamespace(glm_moe_weighted_sum=None)
+        deepseek_v32, "glm_fast", SimpleNamespace(moe_weighted_sum=None)
     )
     moe = SimpleNamespace(
         sharding_group=None,
@@ -1006,7 +1008,7 @@ def test_glm_direct_sparse_mla_threshold_requires_native(monkeypatch):
     monkeypatch.setattr(
         glm_moe_dsa,
         "glm_fast",
-        SimpleNamespace(has=lambda name: name == "glm_dsa_sparse_mla_attention"),
+        SimpleNamespace(has=lambda name: name == "sparse_mla_attention"),
     )
     assert glm_moe_dsa._native_sparse_mla_default_min_k() == "11264"
 
@@ -1386,12 +1388,12 @@ def test_deepseek_switchglu_keeps_small_windows_off_the_block_kernels(monkeypatc
     """Small affine windows use stock gather_qmm after sorting."""
     mx = pytest.importorskip("mlx.core")
     pytest.importorskip("mlx.nn")
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
     from omlx.patches.deepseek_v4 import switch_layers as sl
     from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 
-    if not fast.is_native_available() or not fast.has_symbol(
-        "deepseek_affine_gather_qmm_blocks"
+    if not quant_fast.is_native_available() or not quant_fast.has_symbol(
+        "affine_gather_qmm_blocks"
     ):
         pytest.skip("native affine block kernels unavailable")
 
@@ -1404,13 +1406,13 @@ def test_deepseek_switchglu_keeps_small_windows_off_the_block_kernels(monkeypatc
         setattr(model, name, layer)
 
     calls = {"single": 0}
-    orig_single = fast.deepseek_affine_gather_qmm_blocks
+    orig_single = quant_fast.affine_gather_qmm_blocks
 
     def single_spy(*args, **kwargs):
         calls["single"] += 1
         return orig_single(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_blocks", single_spy)
+    monkeypatch.setattr(quant_fast, "affine_gather_qmm_blocks", single_spy)
 
     x = mx.random.normal((1, 8, 128), dtype=mx.float16)  # 8 tokens x 8 = 64 routes
     indices = mx.array(

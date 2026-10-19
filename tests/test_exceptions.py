@@ -501,8 +501,9 @@ class TestCeilingBindingAdvice:
         assert "close other apps" in advice.lower()
         assert "raise memory_guard_tier (safe → balanced → aggressive)" in advice
         assert "lower memory_guard_tier" not in advice
-        # Reclaimable headroom, not the whole dynamic ceiling.
-        assert "6.00GB is reclaimable" in advice
+        # Headroom above oMLX's use, not the whole dynamic ceiling.
+        assert "leave oMLX 7.00GB of the 12.00GB static cap" in advice
+        assert "uses all but 6.00GB of it" in advice
         assert advice.endswith("or use a smaller model")
 
     def test_metal_cap_binding_names_sysctl(self):

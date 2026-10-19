@@ -51,27 +51,17 @@
     </div>
 </div>
 
-<!-- Stat cards: label above a left-aligned figure -->
-<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6 mb-8">
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
-        <p class="text-xs font-semibold text-neutral-500">{{ t('status.kpi.requests') }}</p>
-        <p class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_requests)"></p>
-    </div>
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
-        <p class="text-xs font-semibold text-neutral-500">{{ t('status.stat.total_tokens') }}</p>
-        <p class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_prompt_tokens)"></p>
-    </div>
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
-        <p class="text-xs font-semibold text-neutral-500">{{ t('status.stat.cached_tokens') }}</p>
-        <p class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="formatNumber((statsScope === 'alltime' ? alltimeStats : stats).total_cached_tokens)"></p>
-    </div>
-    <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
-        <p class="text-xs font-semibold text-neutral-500">{{ t('status.stat.cache_efficiency') }}</p>
-        <p class="flex items-baseline gap-1">
-            <span class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="(statsScope === 'alltime' ? alltimeStats : stats).cache_efficiency.toFixed(1)"></span>
-            <span class="text-sm text-neutral-500">%</span>
-        </p>
-    </div>
+<!-- Stat cards: label above a left-aligned figure. Tiles and order come from the dashboard layout. -->
+<div class="grid grid-cols-1 gap-4 sm:gap-6 mb-8" :class="servingStatGridClass">
+    <template x-for="tile in servingStatTiles" :key="tile.id">
+        <div class="bg-white rounded-2xl border border-neutral-200 p-5 flex flex-col gap-1 min-w-0">
+            <p class="text-xs font-semibold text-neutral-500" x-text="tile.label"></p>
+            <p class="flex items-baseline gap-1">
+                <span class="text-2xl lg:text-[32px] leading-tight font-semibold tracking-tight text-neutral-900 tabular-nums" x-text="tile.value"></span>
+                <span x-show="tile.unit" class="text-sm text-neutral-500" x-text="tile.unit"></span>
+            </p>
+        </div>
+    </template>
 </div>
 
 <!-- Speed Stats -->

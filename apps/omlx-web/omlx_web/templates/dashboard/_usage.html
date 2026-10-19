@@ -12,7 +12,7 @@
             </select>
             <select x-model="model" @change="load()" aria-label="{{ t('usage.model') }}" class="border rounded-lg px-3 py-2 text-sm min-w-0 max-w-48">
                 <option value="">{{ t('usage.all_models') }}</option>
-                <template x-for="id in models" :key="id"><option :value="id" x-text="id"></option></template>
+                <template x-for="id in modelIds" :key="id"><option :value="id" x-text="id"></option></template>
             </select>
         </div>
     </div>
@@ -51,7 +51,19 @@
                         <tbody>
                             <template x-for="row in data.models" :key="row.model_id">
                                 <tr class="border-t border-neutral-200">
-                                    <th scope="row" class="p-3 text-left font-medium" x-text="row.model_id"></th>
+                                    <th scope="row" class="p-3 text-left font-medium">
+                                        <div class="flex items-center gap-1 min-w-0">
+                                            <span x-text="row.model_id"></span>
+                                            <button x-data="{ copied: false }"
+                                                    @click="copyToClipboard(apiModelName(row.model_id)); copied = true; setTimeout(() => copied = false, 2000)"
+                                                    class="p-1 rounded-md transition-all flex-shrink-0"
+                                                    :class="copied ? 'text-green-500' : 'text-neutral-300 hover:text-neutral-600 hover:bg-neutral-100'"
+                                                    :title="window.t('usage.copy_model_name_tooltip')">
+                                                <svg x-show="!copied" class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                                <svg x-show="copied" x-cloak class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+                                            </button>
+                                        </div>
+                                    </th>
                                     <template x-for="key in ['requests', 'prompt_tokens', 'completion_tokens', 'cached_tokens', 'total_tokens']" :key="key">
                                         <td class="p-3" x-text="number(row[key])" :title="row[key].toLocaleString()"></td>
                                     </template>

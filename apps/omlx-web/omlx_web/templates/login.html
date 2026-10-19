@@ -77,6 +77,7 @@
                                 :type="showSetupKey ? 'text' : 'password'"
                                 id="setup_api_key"
                                 x-model="apiKey"
+                                x-init="$el.focus()"
                                 placeholder="{{ t('login.setup.placeholder_new') }}"
                                 class="flex-1 px-4 py-3 border border-neutral-200 rounded-lg text-sm
                                        placeholder-neutral-400 focus:ring-2 focus:ring-neutral-900
@@ -173,6 +174,7 @@
                             type="password"
                             id="api_key"
                             x-model="apiKey"
+                            x-init="$el.focus()"
                             placeholder="{{ t('login.login.placeholder') }}"
                             class="w-full px-4 py-3 border border-neutral-200 rounded-lg text-sm
                                    placeholder-neutral-400 focus:ring-2 focus:ring-neutral-900
@@ -275,6 +277,8 @@
                     console.error('Login error:', err);
                 } finally {
                     this.loading = false;
+                    // The input loses focus while it is disabled for the request.
+                    if (this.error) this.$nextTick(() => document.getElementById('api_key').focus());
                 }
             },
 
@@ -321,6 +325,7 @@
                     console.error('Setup error:', err);
                 } finally {
                     this.loading = false;
+                    if (this.error) this.$nextTick(() => document.getElementById('setup_api_key').focus());
                 }
             }
         }

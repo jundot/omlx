@@ -466,18 +466,14 @@ def test_idle_and_ttl_not_computed_for_loading_model():
     assert model["ttl_remaining_seconds"] is None
 
 
-# ── DFlash engine visibility (#2396) ──────────────────────────────────────
+# ── engines without an AsyncEngineCore (#2396) ────────────────────────────
 
 
-class FakeDFlashPool:
-    """Pool whose engine has no AsyncEngineCore, mirroring DFlashEngine.
-
-    ``scheduler`` stands in for DFlashEngine's property that surfaces the
-    fallback engine's scheduler (None while in primary mode).
-    """
+class FakeCorelessPool:
+    """Pool whose engine has no AsyncEngineCore; ``scheduler`` may be None."""
 
     def __init__(self, engine):
-        self._entries = {"dflash-model": SimpleNamespace(engine=engine)}
+        self._entries = {"coreless-model": SimpleNamespace(engine=engine)}
 
     def get_status(self):
         return {
@@ -485,7 +481,7 @@ class FakeDFlashPool:
             "final_ceiling": 2048,
             "models": [
                 {
-                    "id": "dflash-model",
+                    "id": "coreless-model",
                     "loaded": True,
                     "is_loading": False,
                     "estimated_size": 1024,
@@ -510,8 +506,8 @@ def _build_with_pool(pool):
         return admin_routes._build_active_models_data()
 
 
-def test_active_models_dflash_primary_counts_activity():
-    """Primary mode: no scheduler anywhere, activity snapshot drives the count."""
+def test_active_models_coreless_engine_counts_activity():
+    """No scheduler anywhere: the activity snapshot drives the count."""
 
     class Engine:
         scheduler = None
@@ -530,7 +526,7 @@ def test_active_models_dflash_primary_counts_activity():
                 ],
             }
 
-    data = _build_with_pool(FakeDFlashPool(Engine()))
+    data = _build_with_pool(FakeCorelessPool(Engine()))
 
     model = data["models"][0]
     assert data["total_active_requests"] == 1
@@ -538,9 +534,65 @@ def test_active_models_dflash_primary_counts_activity():
     assert model["activities"][0]["detail"] == "generating"
 
 
+class FakeLivePool:
+    """Fake EnginePool whose engine reports its own live request rows."""
+
+    def __init__(self, engine):
+        self._entries = {"live-model": SimpleNamespace(engine=engine)}
+
+    def get_status(self):
+        return {
+            "current_model_memory": 1024,
+            "final_ceiling": 2048,
+            "models": [
+                {
+                    "id": "live-model",
+                    "loaded": True,
+                    "is_loading": False,
+                    "estimated_size": 1024,
+                    "pinned": False,
+                }
+            ],
+        }
+
+
+def test_active_models_includes_engine_live_request_rows():
+    """Engines without an oMLX scheduler (Splash) supply their own rows."""
+    prefill_row = {
+        "request_id": "req-pp-1",
+        "processed": 50,
+        "total": 100,
+        "speed": 100.0,
+        "eta": 0.5,
+        "elapsed": 1.2,
+        "detail": None,
+    }
+    generating_row = {
+        "request_id": "req-gen-1",
+        "elapsed_seconds": 2.5,
+        "generated_tokens": 30,
+        "tokens_per_second": 12.0,
+        "last_activity_age_seconds": 0.1,
+        "prompt_tokens": 100,
+        "max_tokens": 256,
+    }
+
+    class Engine:
+        def get_live_requests(self):
+            return {"prefilling": [prefill_row], "generating": [generating_row]}
+
+    data = _build_with_pool(FakeLivePool(Engine()))
+
+    model = data["models"][0]
+    assert data["total_active_requests"] == 2
+    assert model["active_requests"] == 2
+    assert model["prefilling"] == [prefill_row]
+    assert model["generating"] == [generating_row]
+
+
 def test_active_models_resolves_scheduler_property_without_async_core():
-    """Fallback mode: the engine exposes a scheduler property instead of an
-    AsyncEngineCore, and the snapshot path must still be taken."""
+    """The engine exposes a scheduler property instead of an AsyncEngineCore,
+    and the snapshot path must still be taken."""
     running_request = SimpleNamespace(
         request_id="gen-1",
         generation_started_at=100.0,
@@ -561,55 +613,10 @@ def test_active_models_resolves_scheduler_property_without_async_core():
         def get_activity_snapshot(self):
             return {"active_requests": 0, "activities": []}
 
-    data = _build_with_pool(FakeDFlashPool(Engine()))
+    data = _build_with_pool(FakeCorelessPool(Engine()))
 
     model = data["models"][0]
     assert data["total_active_requests"] == 1
     assert model["active_requests"] == 1
     assert model["generating"][0]["request_id"] == "gen-1"
     assert model["activities"] == []
-
-
-def test_active_models_surfaces_dflash_guardrail_stats():
-    """DFlash warning and exact speculation counters reach the dashboard API."""
-
-    speculation = {
-        "last": {
-            "generation_tokens": 768,
-            "cycles": 377,
-            "acceptance_ratio": 391 / 768,
-            "accepted_draft_tokens": 391,
-            "tokens_per_cycle": 768 / 377,
-            "accepted_draft_tokens_per_cycle": 391 / 377,
-            "fallback_ar": False,
-            "fallback_reason": None,
-        },
-        "totals": {
-            "requests": 1,
-            "speculative_requests": 1,
-            "fallback_requests": 0,
-            "generation_tokens": 768,
-            "accepted_draft_tokens": 391,
-            "cycles": 377,
-            "acceptance_ratio": 391 / 768,
-            "tokens_per_cycle": 768 / 377,
-            "accepted_draft_tokens_per_cycle": 391 / 377,
-        },
-    }
-
-    class Engine:
-        scheduler = None
-        pairing_warning = "Possible DFlash precision mismatch"
-
-        def get_activity_snapshot(self):
-            return {"active_requests": 0, "activities": []}
-
-        def get_speculation_stats(self):
-            return speculation
-
-    data = _build_with_pool(FakeDFlashPool(Engine()))
-
-    assert data["models"][0]["dflash"] == {
-        "speculation": speculation,
-        "pairing_warning": "Possible DFlash precision mismatch",
-    }

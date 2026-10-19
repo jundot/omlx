@@ -140,6 +140,8 @@ class Processor:
             if not messages or messages[0]["role"] != "system":
                 messages.insert(0, {"role": "system", "content": ""})
             messages[0]["tools"] = tools
+        if continue_final_message and messages and messages[-1]["role"] == "assistant":
+            messages[-1]["wo_eos"] = True
         mode = thinking_mode or ("thinking" if enable_thinking else "chat")
         prompt = encode_messages(
             messages, thinking_mode=mode, reasoning_effort=reasoning_effort
@@ -147,10 +149,6 @@ class Processor:
         header = "<｜Assistant｜>" + ("<think>" if mode == "thinking" else "</think>")
         if not add_generation_prompt and prompt.endswith(header):
             prompt = prompt[: -len(header)]
-        if continue_final_message:
-            raise ValueError(
-                "DeepSeek V4.1 partial assistant continuation is not yet supported"
-            )
         return (
             self.tokenizer.encode(prompt, add_special_tokens=False)
             if tokenize

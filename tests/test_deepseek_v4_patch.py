@@ -1386,17 +1386,17 @@ class TestDeepseekV4SwitchGLU:
         from omlx.patches.deepseek_v4 import switch_layers
 
         monkeypatch.setattr(
-            switch_layers.glm_fast,
+            switch_layers.quant_fast,
             "has_symbol",
-            lambda name: name == "glm_moe_weighted_sum",
+            lambda name: name == "moe_weighted_sum",
         )
 
         def fail_weighted_sum(*args, **kwargs):
             raise AssertionError("DeepSeek V4 must not use fused weighted sum")
 
         monkeypatch.setattr(
-            switch_layers.glm_fast,
-            "glm_moe_weighted_sum",
+            switch_layers.quant_fast,
+            "moe_weighted_sum",
             fail_weighted_sum,
             raising=False,
         )
@@ -1467,7 +1467,7 @@ class TestDeepseekV4CompressedNativeAttention:
     ):
         import mlx.core as mx
 
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         layer = dsv4.CompressedAttention(self._attention_config(dsv4), 0)
@@ -1604,7 +1604,7 @@ class TestDeepseekV4CompressedNativeAttention:
     ):
         import mlx.core as mx
 
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         mx.random.seed(41)
@@ -1631,8 +1631,8 @@ class TestDeepseekV4CompressedNativeAttention:
         )
         pooled_mask = pooled_positions <= offset + query_rows
         scale = 512**-0.5
-        if not fast.has_symbol("deepseek_v4_sparse_attention"):
-            pytest.skip("deepseek_v4_sparse_attention native kernel is unavailable")
+        if not fast.has_symbol("compressed_sparse_attention"):
+            pytest.skip("compressed_sparse_attention native kernel is unavailable")
 
         previous = dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
         try:
@@ -2440,7 +2440,7 @@ class TestAffineBlockRouteThreshold:
 
         from omlx.patches.deepseek_v4 import switch_layers as sl
 
-        monkeypatch.setattr(sl.glm_fast, "has_symbol", lambda name: True)
+        monkeypatch.setattr(sl.quant_fast, "has_symbol", lambda name: True)
         linear = self._linear()
         below = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES - 1, 1, 64), dtype=mx.bfloat16)
         at = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES, 1, 64), dtype=mx.bfloat16)

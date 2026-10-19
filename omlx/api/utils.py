@@ -21,6 +21,7 @@ _NATIVE_REASONING_MODEL_TYPES = {
     # Muse Glimmer's chat template renders history reasoning_content into
     # <|start|>assistant to=self<|message|> blocks.
     "muse_glimmer",
+    "muse_spark",
     # K2 requires a reasoning field for every assistant turn.
     "k2_horizon",
 }
@@ -690,6 +691,36 @@ def _rewrite_user_content_with_note(
     return rewritten
 
 
+# Claude Code sends this marker with a new N on every request.
+# Nothing reads it, and it breaks prefix reuse, so it is stripped.
+_TOTAL_TOKENS_MARKER_RE = re.compile(
+    r"\n{0,2}<total_tokens>\d+ tokens left</total_tokens>"
+)
+
+
+def _strip_client_budget_markers(text: str) -> str:
+    """Remove Claude Code per-request token-budget markers from system text."""
+    if "<total_tokens>" not in text:
+        return text
+
+    return _TOTAL_TOKENS_MARKER_RE.sub("", text)
+
+
+def _drop_client_budget_markers(messages: list[dict]) -> list[dict]:
+    """Strip budget markers from system content and drop marker-only messages."""
+    kept: list[dict] = []
+    for msg in messages:
+        if _is_system_role(msg.get("role")):
+            content = msg.get("content")
+            if isinstance(content, str) and "<total_tokens>" in content:
+                stripped = _strip_client_budget_markers(content)
+                if not stripped.strip():
+                    continue
+                msg = {**msg, "content": stripped}
+        kept.append(msg)
+    return kept
+
+
 def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | None:
     """Move unsupported non-leading system runs into adjacent safe user text.
 
@@ -765,7 +796,6 @@ def prepare_system_messages_for_template(
     tools: list[dict] | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     is_partial: bool = False,
-    merge_consecutive_roles: bool = True,
     unsupported_mid_system_policy: str = "strict",
 ) -> list[dict]:
     """Preserve cache-friendly mid-system turns when the template supports them.
@@ -774,15 +804,12 @@ def prepare_system_messages_for_template(
     native reminder role. Unsupported placements or templates then use the
     configured strict or user-note fallback.
     """
-    messages = [dict(msg) for msg in messages]
+    messages = _drop_client_budget_markers([dict(msg) for msg in messages])
     if unsupported_mid_system_policy not in {"strict", "user_note_safe"}:
         unsupported_mid_system_policy = "strict"
 
     def strict_fallback() -> list[dict]:
-        prepared = _consolidate_system_messages(messages)
-        if merge_consecutive_roles:
-            prepared = _merge_consecutive_roles(prepared)
-        return prepared
+        return _merge_consecutive_roles(_consolidate_system_messages(messages))
 
     def unsupported_fallback() -> list[dict]:
         if unsupported_mid_system_policy == "user_note_safe":
@@ -792,9 +819,7 @@ def prepare_system_messages_for_template(
                 # consecutive system messages so strict templates (Qwen3.6+)
                 # that require a single leading system message don't fail.
                 prepared = _merge_consecutive_system_messages(prepared)
-                if merge_consecutive_roles:
-                    prepared = _merge_consecutive_roles(prepared)
-                return prepared
+                return _merge_consecutive_roles(prepared)
         return strict_fallback()
 
     if not is_partial and has_nonleading_system_message(messages):
@@ -1341,7 +1366,7 @@ def extract_multimodal_content(
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
         processed_messages = _consolidate_system_messages(processed_messages)
-    return processed_messages
+    return _merge_consecutive_roles(processed_messages)
 
 
 # =============================================================================

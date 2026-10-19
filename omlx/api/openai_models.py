@@ -325,6 +325,11 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+def _check_ngram_window(size: int | None, window: int | None) -> None:
+    if size and window and window < size:
+        raise ValueError("ngram_window must be 0 or at least no_repeat_ngram_size")
+
+
 class ChatCompletionRequest(BaseModel):
     """Request for chat completion."""
 
@@ -335,6 +340,8 @@ class ChatCompletionRequest(BaseModel):
     top_k: int | None = None
     repetition_penalty: float | None = None
     repetition_context_size: Optional[int] = Field(default=None, gt=0)
+    no_repeat_ngram_size: int | None = Field(default=None, ge=0)
+    ngram_window: int | None = Field(default=None, ge=0)
     max_tokens: Optional[int] = Field(
         default=None,
         validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
@@ -387,6 +394,11 @@ class ChatCompletionRequest(BaseModel):
         return v
 
     @model_validator(mode="after")
+    def check_ngram_window(self) -> "ChatCompletionRequest":
+        _check_ngram_window(self.no_repeat_ngram_size, self.ngram_window)
+        return self
+
+    @model_validator(mode="after")
     def normalize_top_level_enable_thinking(self) -> "ChatCompletionRequest":
         """Preserve the alias and reject contradictory request controls."""
         if self.enable_thinking is None:
@@ -427,6 +439,12 @@ class PromptTokensDetails(BaseModel):
     audio_tokens: Optional[int] = None
 
 
+class CompletionTokensDetails(BaseModel):
+    """Breakdown of completion tokens used."""
+
+    reasoning_tokens: int = 0
+
+
 class Usage(BaseUsage):
     """Token usage statistics for OpenAI API.
 
@@ -435,6 +453,7 @@ class Usage(BaseUsage):
     """
 
     prompt_tokens_details: Optional[PromptTokensDetails] = None
+    completion_tokens_details: Optional[CompletionTokensDetails] = None
     # Timing metrics (oMLX extension, seconds)
     model_load_duration: Optional[float] = None
     time_to_first_token: Optional[float] = None
@@ -476,6 +495,8 @@ class CompletionRequest(BaseModel):
     top_k: int | None = None
     repetition_penalty: float | None = None
     repetition_context_size: Optional[int] = Field(default=None, gt=0)
+    no_repeat_ngram_size: int | None = Field(default=None, ge=0)
+    ngram_window: int | None = Field(default=None, ge=0)
     max_tokens: Optional[int] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
@@ -499,6 +520,11 @@ class CompletionRequest(BaseModel):
         if isinstance(v, str):
             return [v]
         return v
+
+    @model_validator(mode="after")
+    def check_ngram_window(self) -> "CompletionRequest":
+        _check_ngram_window(self.no_repeat_ngram_size, self.ngram_window)
+        return self
 
 
 class CompletionChoice(BaseModel):

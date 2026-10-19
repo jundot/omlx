@@ -3,13 +3,13 @@ requires = [
     "setuptools>=61.0",
     "wheel",
     "cmake>=3.27",
-    # Pin nanobind to match the ABI version MLX 0.32.3 was built with
-    # (MLX pins nanobind v3.0.1 via FetchContent in its CMakeLists.txt).
+    # Pin nanobind to match the ABI version MLX 0.32.4 was built with
+    # (MLX pins nanobind v3.1.0 via FetchContent in its CMakeLists.txt).
     # A mismatched nanobind isolates the `mlx` NB_DOMAIN, so custom kernel
     # extensions (omlx.custom_kernels.*) reject every mlx.core.array at the
     # type caster with `incompatible function arguments`.
-    "nanobind==3.0.1",
-    "mlx==0.32.3",
+    "nanobind==3.1.0",
+    "mlx==0.32.4",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -38,11 +38,11 @@ classifiers = [
 ]
 
 dependencies = [
-    # Vanilla MLX v0.32.3; optional custom kernels live under
+    # Vanilla MLX v0.32.4; optional custom kernels live under
     # omlx.custom_kernels.* when built for release. The bundled kernel
     # binaries are ABI-coupled to this exact mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
-    "mlx==0.32.3",
+    "mlx==0.32.4",
     # mlx-lm main after 0.32.0. setuptools-scm derives the version from the
     # v0.31.3 tag, so it reports 0.31.4.devN; the 0.32.0 features are present.
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
@@ -110,26 +110,12 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit 4f4634b (v0.7.7). oMLX model implementations remain registered
+    # mlx-vlm from commit 9790231 (v0.7.8). oMLX model implementations remain registered
     # by their pre-load patches.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@4f4634bb813c0298cb1467bed2e957526c71d0b4",
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@9790231827a890eade1a626643a6bc94a1317c72",
     # mlx-vlm requires mlx-audio>=0.5.2 in the shared runtime.
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
     "Pillow>=9.0.0",
-    # dflash-mlx v0.1.10+omlx.9 (71f7c2c) - jundot fork of bstnxbt 0.1.10 (9ca0028).
-    # Carries the trimmed-sidecar prefix cache fix (repeat-prompt L1 hits never
-    # fired upstream), the single-host-sync decode cycle (one D2H transfer
-    # per cycle instead of four syncs plus a hard eval), Gemma 4 unified
-    # target exports, and Muse Glimmer target/drafter support (bundled
-    # text-only mlx-lm module + MuseGlimmerAssistantModel dispatch), plus
-    # FP32 Muse Glimmer query scaling parity with mlx-vlm, DFlash 2 runtime
-    # support (sampling params + candidate selector, PR 6), min_p with the
-    # mlx-lm sampler filter order, the sink=0 empty-chunk L2 write fix,
-    # repetition penalty support across speculative and fallback sampling,
-    # Muse Glimmer target registration and live KV snapshots on mlx-lm 0.32
-    # (PR 11), Muse Glimmer prefix snapshots (PR 5), and GDN verify q/k
-    # normalization that follows mlx-lm normalize_qk.
-    "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@71f7c2cae42a968ddc981972a8ad35368dc587a9",
     "markitdown[pdf,docx,pptx]==0.1.8",
 ]
 
@@ -262,17 +248,16 @@ include = ["omlx*"]
 "omlx_web" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]
 "omlx.patches.deepseek_v41" = ["LICENSE"]
-"omlx.custom_kernels.glm_moe_dsa" = ["*.metallib", "*.dylib", "*.so"]
-"omlx.custom_kernels.decode_fast" = ["*.metallib", "*.dylib", "*.so"]
-"omlx.custom_kernels.minimax_m3" = ["*.metallib", "*.dylib", "*.so"]
-"omlx.custom_kernels.qwen35_prefill" = ["*.metallib", "*.dylib", "*.so"]
-"omlx.custom_kernels.bonsai" = ["*.metallib", "*.dylib", "*.so"]
+"omlx.custom_kernels.attention" = ["*.metallib", "*.so"]
+"omlx.custom_kernels.lowbit" = ["*.metallib", "*.so"]
+"omlx.custom_kernels.quant_matmul" = ["*.metallib", "*.so"]
+"omlx.custom_kernels.sparse_index" = ["*.metallib", "*.so"]
 
 [tool.uv]
 # mlx and mlx-lm are git-pinned; override transitive pins
 # so dependency resolution retains the selected runtime versions.
 override-dependencies = [
-    "mlx==0.32.3",
+    "mlx==0.32.4",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
 ]
 

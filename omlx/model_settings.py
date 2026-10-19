@@ -118,6 +118,19 @@ def validate_ane_prefill(settings: dict, model_type: str | None) -> None:
                 raise ValueError(f"K2 ANE prefill cannot be combined with {name}.")
 
 
+def validate_kv_compression_settings(scheme: str, bits: float) -> None:
+    """Validate the persisted KV cache format and bit depth."""
+    affine_bits = {"affine4": 4, "affine8": 8}
+    if scheme not in ("turboquant", *affine_bits):
+        raise ValueError(
+            "turboquant_kv_scheme must be 'turboquant', 'affine4', or 'affine8'"
+        )
+    if scheme in affine_bits and bits != affine_bits[scheme]:
+        raise ValueError(f"{scheme} requires turboquant_kv_bits={affine_bits[scheme]}")
+    if bits not in (2, 2.5, 3, 3.5, 4, 6, 8):
+        raise ValueError("turboquant_kv_bits must be one of 2, 2.5, 3, 3.5, 4, 6, 8")
+
+
 def vlm_mtp_processor_conflicts(data: dict) -> list:
     """Names of settings that need per-request logits processors and
     therefore cannot combine with ``vlm_mtp_enabled``.
@@ -184,6 +197,33 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
 
 PROFILES_VERSION = 1
 TEMPLATES_VERSION = 1
+_LEGACY_TURBOQUANT_PROFILE_FIELDS = frozenset(
+    {"turboquant_kv_enabled", "turboquant_kv_bits"}
+)
+
+
+def _validate_profile_kv_settings(
+    base: "ModelSettings | None", settings: dict
+) -> None:
+    """Validate a profile's KV format when it sets one."""
+    if not settings.keys() & {"turboquant_kv_scheme", "turboquant_kv_bits"}:
+        return
+    base = base or ModelSettings()
+    validate_kv_compression_settings(
+        settings.get("turboquant_kv_scheme", base.turboquant_kv_scheme),
+        settings.get("turboquant_kv_bits", base.turboquant_kv_bits),
+    )
+
+
+def _profile_settings_with_legacy_kv_scheme(settings: dict) -> dict:
+    """Restore TurboQuant semantics for profiles saved before scheme selection."""
+    if "turboquant_kv_scheme" in settings or not (
+        settings.keys() & _LEGACY_TURBOQUANT_PROFILE_FIELDS
+    ):
+        return settings
+    normalized = dict(settings)
+    normalized["turboquant_kv_scheme"] = "turboquant"
+    return normalized
 
 
 @dataclass
@@ -215,8 +255,9 @@ class ModelSettings:
         reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
         guided_grammar_enabled: Whether a default guided grammar is active.
         guided_grammar: Default EBNF grammar for constrained decoding.
-        turboquant_kv_enabled: Enable TurboQuant KV cache compression.
-        turboquant_kv_bits: TurboQuant bit depth (2/2.5/3/3.5/4/6/8).
+        turboquant_kv_enabled: Enable KV cache compression.
+        turboquant_kv_scheme: Cache format: "turboquant", "affine4", or "affine8".
+        turboquant_kv_bits: Cache bit depth (2/2.5/3/3.5/4/6/8); affine formats require their named depth.
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
         qwen35_ane_prefill_enabled: Enable ANE/GPU prompt processing for a
             supported model. Model metadata selects the implementation.
@@ -266,31 +307,26 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
-        dflash_enabled: Enable DFlash speculative decoding. Qwen3.5-family VLM
-            targets draft inside the batched engine (Lightning MTP verify path
-            with greedy or sampled acceptance, continuous batching); other
-            targets use the single-stream DFlash engine, which alone honours
-            the max_ctx, cache, window, sink and verify_mode settings below.
-        dflash_draft_model: Path/repo for DFlash draft checkpoint.
+        dflash_enabled: Enable DFlash speculative decoding. Qwen3.5-family,
+            Qwen3, Laguna and MiMo V2 targets, and GLM-5.3, Gemma 4 and Muse
+            Glimmer VLM targets, draft inside the batched engine (Lightning
+            MTP verify path with greedy or sampled acceptance; Qwen3, Laguna,
+            MiMo V2, Gemma 4 and Muse Glimmer speculate for single requests
+            only). Other model types load without DFlash.
+        dflash_draft_model: Path/repo for DFlash draft checkpoint (None = the
+            draft bundled in the target's ``dflash/`` directory, as MiMo V2
+            ships it).
         dflash_draft_quant_enabled: Enable draft model quantization.
         dflash_draft_quant_weight_bits: Quantization weight bits (2, 4, 8).
-        dflash_draft_quant_activation_bits: Quantization activation bits (16, 32).
         dflash_draft_quant_group_size: Quantization group size (32, 64, 128).
-        dflash_max_ctx: Token threshold to fall back to BatchedEngine (None = unlimited).
-        dflash_in_memory_cache: Enable DFlash L1 (RAM) prefix cache.
-        dflash_in_memory_cache_max_entries: L1 cache max entries (default 4, matches dflash balanced profile).
-        dflash_in_memory_cache_max_bytes: L1 cache byte budget.
-        dflash_ssd_cache: Enable DFlash L2 (SSD) prefix cache spill (uses omlx SSD cache dir).
-        dflash_ssd_cache_max_bytes: L2 (SSD) disk budget; dflash evicts oldest entries when exceeded.
-        dflash_draft_window_size: Draft model sliding-attention window
-            (None = use the draft checkpoint's sliding_window when present).
-            Helps stabilise acceptance rate on long-context prompts.
-        dflash_draft_sink_size: Attention-sink tokens always kept regardless of window
-            (default 0, disabling sink tokens).
+        dflash_draft_window_size: Context tokens the drafter attends to
+            (None = the draft checkpoint's sliding_window, else 2048).
         dflash_block_size: Draft/verify tokens per cycle (None = checkpoint default).
-        dflash_verify_mode: Verifier algorithm — "dflash", "adaptive", "ddtree", or "off"
-            (None = dflash default "adaptive"). "adaptive" can shrink block size when
-            acceptance drops.
+        dflash_verify_mode: "adaptive", "dflash" or "off" (None = "adaptive").
+            "adaptive" verifies the number of drafts per cycle that the
+            Lightning MTP depth controllers pick from measured cost and
+            acceptance; "dflash" and "off" verify the whole block. A stored
+            "ddtree" from older versions loads as "adaptive".
         mtp_enabled: Enable native multi-token prediction (mlx-lm PR 990 / PR 15 monkey-patch).
             When True, BatchGenerator uses MTP draft+verify for singleton decode and
             for multi-row decode batches whose cache positions are aligned. Unaligned
@@ -344,6 +380,9 @@ class ModelSettings:
     # through mmap. The runtime may force this on when resident loading cannot
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    # Qwen4-Exp only: admit any canonical affine GDN projection recipe to the
+    # fused one-row decode route, not only the oQe allow-list.
+    qwen4_gdn_decode_wide_proj: bool = False
     deepseek_v41_engram_ssd_offload: bool = False
     # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
     # last window-size tokens; decoder global KV is the encoder-final
@@ -363,8 +402,9 @@ class ModelSettings:
     guided_grammar_enabled: bool = False
     guided_grammar: Optional[str] = None
 
-    # TurboQuant KV cache (mlx-vlm backend)
+    # KV cache compression
     turboquant_kv_enabled: bool = False
+    turboquant_kv_scheme: str = "turboquant"
     turboquant_kv_bits: float = 4  # 2, 2.5, 3, 3.5, 4, 6, 8
     turboquant_skip_last: bool = (
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
@@ -424,30 +464,11 @@ class ModelSettings:
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
     dflash_draft_quant_enabled: Optional[bool] = None
     dflash_draft_quant_weight_bits: Optional[int] = None  # 2, 4, 8
-    dflash_draft_quant_activation_bits: Optional[int] = None  # 16, 32
     dflash_draft_quant_group_size: Optional[int] = None  # 32, 64, 128
-    dflash_max_ctx: Optional[int] = (
-        None  # None = unlimited; trigger BatchedEngine fallback when prompt_len >= this
-    )
-    # DFlash prefix cache (private to dflash; separate from omlx tiered cache because
-    # snapshots include draft model GDN state and target hidden chunks omlx never tracks)
-    dflash_in_memory_cache: bool = True
-    dflash_in_memory_cache_max_entries: int = (
-        4  # Matches dflash balanced profile default
-    )
-    dflash_in_memory_cache_max_bytes: int = (
-        8 * 1024 * 1024 * 1024
-    )  # 8 GiB (balanced profile default)
-    dflash_ssd_cache: bool = (
-        False  # Requires in-memory cache and an omlx paged SSD cache dir
-    )
-    dflash_ssd_cache_max_bytes: int = 20 * 1024 * 1024 * 1024  # 20 GiB L2 disk budget
-    # DFlash runtime tuning knobs. None window size uses the draft checkpoint's
-    # sliding_window when present; sink size defaults to no attention-sink tokens.
+    # None uses the draft checkpoint's sliding_window.
     dflash_draft_window_size: Optional[int] = None
-    dflash_draft_sink_size: Optional[int] = 0
     dflash_block_size: Optional[int] = None
-    dflash_verify_mode: Optional[str] = None  # "dflash" | "adaptive" | "ddtree" | "off"
+    dflash_verify_mode: Optional[str] = None  # "adaptive" | "dflash" | "off"
 
     # Lightning MTP uses the embedded head for single and concurrent requests.
     # Equal-depth rows share target verification when supported by the backbone;
@@ -485,10 +506,24 @@ class ModelSettings:
     is_hidden: bool = False  # Hidden from /v1/models (still shown, badged, in admin)
     is_favorite: bool = False  # Listed first in /v1/models and admin lists
 
+    # External engine serving this model instead of oMLX's MLX engines
+    # (omlx/engine/splash.py). None runs the model in-process.
+    external_engine: Optional[str] = None
+
     # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
     # loaders are allowed to execute custom Python from the model repository
     # (modeling_*.py, tokenization_*.py). Off by default — see issue #926.
     trust_remote_code: bool = False
+
+    # Embedding models with an audio tower (EmbeddingGemma 2): load it so
+    # /v1/embeddings accepts items[].audio. Off by default because the tower is
+    # resident even for text-only requests (EmbeddingGemma 2: 0.88 -> 1.46 GB).
+    embedding_audio_enabled: bool = False
+    # Longest audio item, in seconds, an embedding model reads before cutting
+    # the waveform. None keeps the processor default (Gemma 4 audio: 30 s).
+    # The model's context still bounds it: EmbeddingGemma 2 fits about 327 s
+    # (8192 tokens at 40 ms each); longer inputs get the token-limit error.
+    embedding_audio_max_seconds: Optional[float] = None
 
     # Metadata
     display_name: Optional[str] = None
@@ -498,6 +533,9 @@ class ModelSettings:
     def __post_init__(self) -> None:
         # Profiles retain raw JSON types; engine signatures use repr().
         self.turboquant_kv_bits = normalize_turboquant_kv_bits(self.turboquant_kv_bits)
+        # The ddtree verify mode was removed; stored settings run as adaptive.
+        if self.dflash_verify_mode == "ddtree":
+            self.dflash_verify_mode = "adaptive"
         if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
             raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
@@ -509,6 +547,11 @@ class ModelSettings:
             raise ValueError(
                 "qwen35_oq_a8_enabled and qwen35_ane_prefill_enabled cannot "
                 "both be True; choose one Qwen3.5 prefill accelerator per model"
+            )
+        # Legacy TurboQuant bit values stay loadable; see normalize_turboquant_kv_bits.
+        if self.turboquant_kv_scheme != "turboquant":
+            validate_kv_compression_settings(
+                self.turboquant_kv_scheme, self.turboquant_kv_bits
             )
         # Native MTP is mutually exclusive with DFlash (also speculative).
         # Reject the combo at construction time so the conflict surfaces in
@@ -522,7 +565,7 @@ class ModelSettings:
             )
         # vlm_mtp wraps mlx-vlm's MTP loop and bypasses mlx-lm BatchGenerator
         # at decode time, so it cannot coexist with any other speculative path
-        # or with TurboQuant (which mutates the same cache objects).
+        # or with KV compression (which mutates the same cache objects).
         if self.vlm_mtp_enabled:
             conflicts = [
                 ("dflash_enabled", self.dflash_enabled),
@@ -812,7 +855,11 @@ class ModelSettingsManager:
                 for model_id, settings in self._settings.items()
             },
         }
+        self._write_settings_file(data)
+        logger.debug(f"Saved settings for {len(self._settings)} models")
 
+    def _write_settings_file(self, data: dict) -> None:
+        """Replace the settings file with ``data`` atomically."""
         # Write to temp file first, then rename for atomicity. The pid in
         # the temp name keeps concurrent processes from sharing a temp path
         # and renaming each other's partial writes into place.
@@ -826,7 +873,6 @@ class ModelSettingsManager:
                 os.fsync(f.fileno())
 
             temp_file.replace(self.settings_file)
-            logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
             logger.error(f"Failed to save settings file: {e}")
@@ -849,6 +895,47 @@ class ModelSettingsManager:
                 return ModelSettings.from_dict(settings.to_dict())
 
             return ModelSettings()
+
+    def has_settings(self, model_id: str) -> bool:
+        """Return True when settings for the model are saved."""
+        with self._lock:
+            return model_id in self._settings
+
+    def add_initial_settings(self, initial: dict[str, dict[str, Any]]) -> list[str]:
+        """Save settings for models that have none yet.
+
+        Only the new records are added to the file. Records already on disk
+        keep their content, including fields or records this build cannot
+        load. Nothing is written when the file cannot be read. Returns the
+        IDs of the models that were added.
+        """
+        with self._lock:
+            pending = [mid for mid in initial if mid not in self._settings]
+            if not pending:
+                return []
+            data: Any = {"version": SETTINGS_VERSION, "models": {}}
+            if self.settings_file.exists():
+                try:
+                    data = json.loads(self.settings_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as e:
+                    logger.warning(f"Initial model settings not saved: {e}")
+                    return []
+            models = data.setdefault("models", {}) if isinstance(data, dict) else None
+            if not isinstance(models, dict):
+                logger.warning("Initial model settings not saved: invalid file")
+                return []
+            added = {
+                mid: ModelSettings.from_dict(initial[mid])
+                for mid in pending
+                if mid not in models
+            }
+            if not added:
+                return []
+            for mid, settings in added.items():
+                models[mid] = settings.to_dict()
+            self._write_settings_file(data)
+            self._settings.update(added)
+            return list(added)
 
     def get_settings_for_request(
         self,
@@ -999,6 +1086,17 @@ class ModelSettingsManager:
                         del settings["ttl_seconds"]
                         changed = True
                         model_changed = True
+                    if settings:
+                        normalized = _profile_settings_with_legacy_kv_scheme(settings)
+                        if normalized is not settings:
+                            profile["settings"] = normalized
+                            changed = True
+                            model_changed = True
+                            logger.info(
+                                "Migrated legacy TurboQuant profile '%s' for model '%s'",
+                                name,
+                                model_id,
+                            )
                     current_api_name = profile.get("api_name")
                     if current_api_name:
                         try:
@@ -1334,6 +1432,7 @@ class ModelSettingsManager:
         validate_profile_name(name)
         filtered = filter_profile_fields(settings or {})
         with self._lock:
+            _validate_profile_kv_settings(self._settings.get(model_id), filtered)
             per_model = self._profiles.setdefault(model_id, {})
             if name in per_model:
                 raise ValueError(
@@ -1411,6 +1510,9 @@ class ModelSettingsManager:
                 profile["description"] = description
             if settings is not None:
                 profile["settings"] = filter_profile_fields(settings)
+                _validate_profile_kv_settings(
+                    self._settings.get(model_id), profile["settings"]
+                )
             if source_template is not None:
                 profile["source_template"] = source_template or None
             if expose_as_model is not None:

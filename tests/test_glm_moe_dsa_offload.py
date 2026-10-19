@@ -148,8 +148,8 @@ def kernels(request, monkeypatch):
     from omlx.patches.glm_moe_dsa import kernels as k
 
     if request.param == "fallback":
-        monkeypatch.setattr(k, "_native_fast", None)
-    elif not k.fast.has("glm_moe_weighted_sum"):
+        monkeypatch.setattr(k, "_native_modules", ())
+    elif not k.fast.has("moe_weighted_sum"):
         pytest.skip("native GLM kernels are not built here")
     return request.param
 

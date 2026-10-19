@@ -4,7 +4,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.custom_kernels.glm_moe_dsa import fast
+from omlx.custom_kernels.quant_matmul import fast
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.patches.deepseek_v41.language import Expert
 from omlx.patches.deepseek_v41.quantization import QuantizedProjection
@@ -37,7 +37,7 @@ def expert_for(bits):
 
 @pytest.mark.parametrize("bits", [2, 3, 4, 6, 8, (2, 3, 6)])
 @pytest.mark.skipif(
-    not fast.has_symbol("deepseek_v41_grouped_expert"),
+    not fast.has_symbol("grouped_expert"),
     reason="Requires the native extension",
 )
 def test_affine_decode_grouped_matches_stock(monkeypatch, bits):
@@ -47,13 +47,13 @@ def test_affine_decode_grouped_matches_stock(monkeypatch, bits):
     ids = mx.array([[[0, 2]]], mx.uint32)
     weights = mx.array([[[0.3, 0.7]]])
     calls = []
-    original = fast.deepseek_v41_grouped_expert
+    original = fast.grouped_expert
 
     def counted(*args):
         calls.append(True)
         return original(*args)
 
-    monkeypatch.setattr(fast, "deepseek_v41_grouped_expert", counted)
+    monkeypatch.setattr(fast, "grouped_expert", counted)
     actual = expert(x, ids, weights)
     repeated = expert(x, ids, weights)
     assert len(calls) == 2
@@ -70,7 +70,7 @@ def test_affine_decode_grouped_matches_stock(monkeypatch, bits):
 
 @pytest.mark.parametrize("bits", [2, 3, 4, 6, 8, (2, 3, 6)])
 @pytest.mark.skipif(
-    not fast.has_symbol("deepseek_affine_gather_qmm_blocks"),
+    not fast.has_symbol("affine_gather_qmm_blocks"),
     reason="Requires the native extension",
 )
 def test_affine_prefill_native_blocks_and_pair(monkeypatch, bits):
@@ -84,13 +84,13 @@ def test_affine_prefill_native_blocks_and_pair(monkeypatch, bits):
     ids = mx.repeat(mx.arange(4, dtype=mx.uint32), 256)
     weights = mx.random.uniform(shape=(1024,))
     calls = []
-    original = fast.deepseek_affine_gather_qmm_pair_concat_blocks
+    original = fast.affine_gather_qmm_pair_concat_blocks
 
     def counted(*args):
         calls.append(True)
         return original(*args)
 
-    monkeypatch.setattr(fast, "deepseek_affine_gather_qmm_pair_concat_blocks", counted)
+    monkeypatch.setattr(fast, "affine_gather_qmm_pair_concat_blocks", counted)
     actual = expert(x, ids, weights, sorted_indices=True)
     assert calls == ([True] if isinstance(bits, int) else [])
     with monkeypatch.context() as patch:

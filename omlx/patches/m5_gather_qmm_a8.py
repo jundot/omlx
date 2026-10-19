@@ -524,9 +524,9 @@ def supports(
 
 
 def _stage_a(x):
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
-    return fast.qwen35_oq_a8_stage_a_v8(x, 0)
+    return fast.oq_a8_stage_a_v8(x, 0)
 
 
 def _staged(groups: int) -> bool:
@@ -539,7 +539,7 @@ def _launch(
     x, w, scales, biases, indices, row_map, *, bm, swiglu, init_value=None
 ):
     """Stage A, the tile scan and the gather kernel; None when unavailable."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     if not fast.oq_a8_available():
         return None

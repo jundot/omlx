@@ -17,6 +17,7 @@ _SUPPORTED_TYPES = frozenset(
         "olmoe",
         "glm_moe_dsa",
         "glm5_next",
+        "minicpmv4_7",
     }
 )
 
@@ -95,7 +96,7 @@ def _inspect(path, signature):
         if kind in ("olmoe", "glm_moe_dsa"):
             parent = f"model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
-        elif kind in ("qwen4_exp", "qwen3_5_moe"):
+        elif kind in ("qwen4_exp", "qwen3_5_moe", "minicpmv4_7"):
             parent = f"language_model.model.layers.{layer}.mlp"
             prefix = parent + ".switch_mlp"
         elif kind == "deepseek_v4":
@@ -107,11 +108,14 @@ def _inspect(path, signature):
         else:
             parent = f"language_model.model.layers.{layer}.experts"
             prefix = parent + ".switch_glu"
-        if kind == "qwen3_5_moe":
+        if kind in ("qwen3_5_moe", "minicpmv4_7"):
             prefix = _qwen35_checkpoint_prefix(store, prefix)
-        if kind in ("deepseek_v4", "glm5_next", "qwen3_5_moe") and not store.has(
-            prefix + ".gate_proj.weight"
-        ):
+        if kind in (
+            "deepseek_v4",
+            "glm5_next",
+            "qwen3_5_moe",
+            "minicpmv4_7",
+        ) and not store.has(prefix + ".gate_proj.weight"):
             # These adapters read the stacked slabs positionally; a
             # per-expert layout wraps nothing.
             return (

@@ -1060,27 +1060,21 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
 
 
 def test_qwen4_decode_setting_is_captured_per_model():
-    from omlx.scheduler import SchedulerConfig
-
     module = _canonical_qwen4_decode_module(((8, 64),) * 4)
     module.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
-    model = SimpleNamespace(modules=lambda: [module])
-    config = SchedulerConfig(qwen4_gdn_decode_wide_proj=True)
     assert not prework_mod._qwen4_decode_static_eligible(module)
 
     prework_mod.configure_qwen4_decode(
-        model, wide_projections=config.qwen4_gdn_decode_wide_proj
+        SimpleNamespace(modules=lambda: [module]), wide_projections=True
     )
-    config.qwen4_gdn_decode_wide_proj = False
     assert prework_mod._qwen4_decode_static_eligible(module)
 
-    reloaded = _canonical_qwen4_decode_module(((8, 64),) * 4)
-    reloaded.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
+    other = _canonical_qwen4_decode_module(((8, 64),) * 4)
+    other.out_proj = _fake_quantized_linear(6144, 2560, 8, 64)
     prework_mod.configure_qwen4_decode(
-        SimpleNamespace(modules=lambda: [reloaded]),
-        wide_projections=config.qwen4_gdn_decode_wide_proj,
+        SimpleNamespace(modules=lambda: [other]), wide_projections=False
     )
-    assert not prework_mod._qwen4_decode_static_eligible(reloaded)
+    assert not prework_mod._qwen4_decode_static_eligible(other)
     assert prework_mod._qwen4_decode_static_eligible(module)
 
 

@@ -23,6 +23,9 @@ _ALLOWED_DOWNLOAD_KWARGS = {
     "token",
 }
 
+# Hub writes an HTTP stream once per full chunk; the stall watchdog sees only writes.
+_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
 
 def _download_without_xet(
     kwargs: dict[str, Any],
@@ -31,8 +34,9 @@ def _download_without_xet(
     """Run snapshot_download after disabling xet before its first import."""
     os.environ["HF_HUB_DISABLE_XET"] = "1"
     if download_fn is None:
-        from huggingface_hub import snapshot_download
+        from huggingface_hub import constants, snapshot_download
 
+        constants.DOWNLOAD_CHUNK_SIZE = _DOWNLOAD_CHUNK_SIZE
         download_fn = snapshot_download
     download_fn(**kwargs)
 

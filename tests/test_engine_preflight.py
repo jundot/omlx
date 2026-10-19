@@ -1082,7 +1082,7 @@ class TestRejectionMessageNamesBindingCeiling:
             "(dynamic ceiling 32.00 GB - hot cache 8.00 GB - safety margin 1.92 GB)"
             in rej.message
         )
-        assert "only 24.00 GB is reclaimable right now" in rej.message
+        assert "oMLX already uses all but 24.00 GB of it" in rej.message
         assert "lower hot_cache_max_size" in rej.message
 
     def test_static_binding_falls_back_to_generic_advice(self, monkeypatch):

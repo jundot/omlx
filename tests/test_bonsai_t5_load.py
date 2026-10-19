@@ -22,7 +22,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import omlx.patches.bonsai_t5_load as bonsai_t5_load
-from omlx.custom_kernels.bonsai.fast import _dequant_1bit
+from omlx.custom_kernels.lowbit.fast import _dequant_1bit
 from omlx.patches import bonsai_qmv
 from omlx.patches.bonsai_t5_load import (
     _is_t5_weight_replacement,
@@ -387,7 +387,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["fired"] = True
             return mx.zeros((1, 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_t5_qmv", fake_qmv)
+        monkeypatch.setattr(bonsai_t5_load, "t5_qmv", fake_qmv)
         x, w, scales, biases = self._t5_inputs(M=1)
         _t5_quantized_matmul(x, w, scales, biases, transpose=True, bits=2)
         assert called.get("fired") is True
@@ -400,7 +400,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["fired"] = True
             return mx.zeros((3, 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_t5_qmv_wide", fake_wide)
+        monkeypatch.setattr(bonsai_t5_load, "t5_qmv_wide", fake_wide)
         x, w, scales, biases = self._t5_inputs(M=3)
         _t5_quantized_matmul(x, w, scales, biases, transpose=True, bits=2)
         assert called.get("fired") is True
@@ -413,7 +413,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["M"] = x_flat.shape[0]
             return mx.zeros((x_flat.shape[0], 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_t5_qmm", fake_qmm)
+        monkeypatch.setattr(bonsai_t5_load, "t5_qmm", fake_qmm)
         x, w, scales, biases = self._t5_inputs(M=32)
         out = _t5_quantized_matmul(x, w, scales, biases, transpose=True, bits=2)
         assert called["M"] == 32
@@ -427,7 +427,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["fired"] = True
             return mx.zeros((1, 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_q1_affine_qmv", fake_q1)
+        monkeypatch.setattr(bonsai_t5_load, "q1_affine_qmv", fake_q1)
         x = mx.zeros((1, 64), dtype=mx.float16)
         w = mx.zeros((4, 2), dtype=mx.uint32)
         scales = mx.ones((4, 2), dtype=mx.float16)
@@ -443,7 +443,7 @@ class TestT5QuantizedMatmulNativeRouting:
             called["bits"] = bits
             return mx.zeros((3, 4), dtype=mx.float16)
 
-        monkeypatch.setattr(bonsai_t5_load, "bonsai_qmv_wide", fake_wide)
+        monkeypatch.setattr(bonsai_t5_load, "qmv_wide", fake_wide)
         x = mx.zeros((3, 64), dtype=mx.float16)
         w = mx.zeros((4, 2), dtype=mx.uint32)
         scales = mx.ones((4, 2), dtype=mx.float16)

@@ -8,7 +8,7 @@ round trips remain available for projection arithmetic and numerical tests.
 import mlx.core as mx
 import mlx.nn as nn
 
-from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
 from ..deepseek_v4.switch_layers import _AFFINE_NATIVE_MIN_ROUTES, QuantizedSwitchLinear
 from .activation import pack_fp8_activation, quantize_fp8_activation
@@ -199,7 +199,7 @@ class QuantizedProjection(QuantizedSwitchLinear):
             and self.group_size == 64
             and self.bits in (2, 3, 4, 6, 8)
             and self._has_affine_metadata_dtype(dtype)
-            and glm_fast.has_symbol("deepseek_affine_gather_qmm_blocks")
+            and quant_fast.has_symbol("affine_gather_qmm_blocks")
         )
 
     def _native_block_kind(self, x, sorted_indices, dtype=None):

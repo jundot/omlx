@@ -84,6 +84,42 @@ def glm5_fused_decode():
     return language
 
 
+@pytest.fixture
+def apply_drafter_target(monkeypatch):
+    """``drafter_target.apply`` that restores the patched classes afterwards.
+
+    The patch rewrites shared mlx-lm/mlx-vlm model and layer classes, which
+    other tests in the session build too.
+    """
+    from omlx.patches.mlx_lm_mtp import drafter_target
+
+    model_names = (
+        "__call__",
+        "mtp_partial_rollback",
+        "rollback_speculative_cache",
+        "_omlx_drafter_single_row",
+        "_omlx_drafter_target",
+    )
+    layer_names = ("__call__", "_omlx_drafter_capture_wrapped")
+
+    def apply(model):
+        targets = [(type(model), model_names)]
+        targets += [
+            (cls, layer_names) for cls in {type(layer) for layer in model.model.layers}
+        ]
+        for cls, names in targets:
+            for name in names:
+                if name in cls.__dict__:
+                    monkeypatch.setattr(cls, name, cls.__dict__[name])
+                else:
+                    # Records the name as absent so teardown deletes it.
+                    monkeypatch.setattr(cls, name, None, raising=False)
+                    delattr(cls, name)
+        return drafter_target.apply(model)
+
+    return apply
+
+
 @pytest.fixture(autouse=True)
 def cluster_home(tmp_path, monkeypatch):
     from omlx.cluster import ssh_keys, worker_shim

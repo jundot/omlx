@@ -66,8 +66,9 @@ brew update && brew upgrade omlx
 # Lancer en service en arrière-plan (redémarre automatiquement en cas de crash)
 brew services start omlx
 
-# Optionnel : support MCP (Model Context Protocol)
+# Optionnel : support MCP (Model Context Protocol), puis redémarrer pour le charger
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
+omlx restart
 ```
 
 ### Depuis les sources
@@ -77,7 +78,7 @@ git clone https://github.com/jundot/omlx.git
 cd omlx
 make install                # Installation editable avec l'interface web et les kernels natifs
 # Sans Xcode complet : make install-no-kernels installe sans les kernels
-make mcp                    # Optionnel : ajoute le support MCP (Model Context Protocol)
+make mcp                    # Optionnel : support MCP, redémarrer `omlx serve` pour le charger
 ```
 
 Nécessite macOS 15.0+ (Sequoia), Python 3.11–3.13, et Apple Silicon (M1/M2/M3/M4/M5).
@@ -232,7 +233,7 @@ Remplacement direct des APIs OpenAI et Anthropic. Supporte les statistiques d'us
 | `POST /v1/messages` | API Messages Anthropic |
 | `POST /v1/embeddings` | Embeddings texte |
 | `POST /v1/rerank` | Reranking de documents |
-| `POST /v1/systemone` | Décisions typées avec les modèles de décision (TypeSafe System One) |
+| `POST /v1/systemone` | Décisions typées avec les modèles de décision ou de chat (TypeSafe System One) |
 | `GET /v1/models` | Lister les modèles disponibles |
 | `POST /tokenize`, `POST /detokenize` | API de tokenisation compatible vLLM (aussi sous `/v1`) |
 
@@ -277,7 +278,7 @@ Les modèles sont auto-détectés par type. Vous pouvez aussi télécharger des 
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
-| Decision | Clef, Clef-Flash, OpenJev |
+| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
 
 ## Configuration CLI
 

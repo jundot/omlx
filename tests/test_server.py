@@ -1134,6 +1134,9 @@ class TestExposedProfileModels:
                     return source
             return model_id
 
+        def get_entry(self, model_id):
+            return None
+
     @staticmethod
     def _save_exposed_profile(manager, settings):
         return manager.save_profile(

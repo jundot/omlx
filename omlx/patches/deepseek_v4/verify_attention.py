@@ -24,10 +24,10 @@ def rowwise_gemm(lhs: mx.array, rhs: mx.array, transpose_rhs: bool) -> mx.array:
     try:
         architecture = str(mx.device_info().get("architecture", ""))
         if architecture.endswith(("d", "g", "p")):
-            from omlx.custom_kernels.glm_moe_dsa import fast
+            from omlx.custom_kernels.attention import fast
 
-            if fast.has_symbol("dspark_rowwise_gemm"):
-                return fast.dspark_rowwise_gemm(
+            if fast.has_symbol("rowwise_gemm"):
+                return fast.rowwise_gemm(
                     mx.contiguous(lhs),
                     mx.contiguous(rhs),
                     transpose_rhs,

@@ -22,12 +22,23 @@
         full: 'max-w-none',
     };
     const WIDTH_IDS = Object.keys(WIDTH_CLASSES);
+    // Serving Stats tiles, in picker order. The saved list is the left-to-right order.
+    const SERVING_TILE_IDS = [
+        'requests',
+        'prefill_tokens',
+        'cached_tokens',
+        'cache_efficiency',
+        'generated_tokens',
+    ];
+    const SERVING_TILE_MAX = 4;
+    const DEFAULT_SERVING_TILES = SERVING_TILE_IDS.slice(0, SERVING_TILE_MAX);
 
     function defaultLayout() {
         return {
             version: 1,
             width: 'default',
             blocks: BLOCK_IDS.map((id, index) => ({ id, x: 0, y: index, w: COLUMNS })),
+            serving_stats_tiles: [...DEFAULT_SERVING_TILES],
         };
     }
 
@@ -47,6 +58,13 @@
         return { id, x, y, w };
     }
 
+    function normalizeServingTiles(raw) {
+        if (!Array.isArray(raw)) return [...DEFAULT_SERVING_TILES];
+        const tiles = [...new Set(raw.filter(id => SERVING_TILE_IDS.includes(id)))]
+            .slice(0, SERVING_TILE_MAX);
+        return tiles.length ? tiles : [...DEFAULT_SERVING_TILES];
+    }
+
     // Accepts anything the server or a hand-edited settings.json may hold and
     // returns a layout the grid can load. Unknown blocks are dropped, so a
     // layout may legitimately contain fewer than BLOCK_IDS.length blocks.
@@ -57,7 +75,8 @@
         const seen = new Set();
         const blocks = raw.blocks.map(b => normalizeBlock(b, seen)).filter(Boolean);
         const width = WIDTH_IDS.includes(raw.width) ? raw.width : 'default';
-        return { version: 1, width, blocks };
+        const serving_stats_tiles = normalizeServingTiles(raw.serving_stats_tiles);
+        return { version: 1, width, blocks, serving_stats_tiles };
     }
 
     function widthClass(width) {
@@ -70,6 +89,9 @@
         MIN_W,
         WIDTH_CLASSES,
         WIDTH_IDS,
+        SERVING_TILE_IDS,
+        SERVING_TILE_MAX,
+        DEFAULT_SERVING_TILES,
         defaultLayout,
         normalizeLayout,
         widthClass,
