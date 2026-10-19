@@ -1860,6 +1860,10 @@ class VLMBatchedEngine(BaseEngine):
     during prefill while maintaining full BatchGenerator compatibility.
     """
 
+    @property
+    def supports_cache_namespace(self) -> bool:
+        return not self.is_diffusion_model
+
     def __init__(
         self,
         model_name: str,

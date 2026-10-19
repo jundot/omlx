@@ -661,6 +661,7 @@ class AuthSettings:
     secret_key: str | None = None
     skip_api_key_verification: bool = False
     allow_unauthenticated_inference: bool = False
+    cache_isolation: str = "shared"  # "api_key" isolates reusable KV by credential.
     sub_keys: list[SubKeyEntry] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -670,6 +671,7 @@ class AuthSettings:
             "secret_key": self.secret_key,
             "skip_api_key_verification": self.skip_api_key_verification,
             "allow_unauthenticated_inference": self.allow_unauthenticated_inference,
+            "cache_isolation": self.cache_isolation,
             "sub_keys": [sk.to_dict() for sk in self.sub_keys],
         }
 
@@ -683,6 +685,7 @@ class AuthSettings:
             allow_unauthenticated_inference=data.get(
                 "allow_unauthenticated_inference", False
             ),
+            cache_isolation=data.get("cache_isolation", "shared"),
             sub_keys=[SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])],
         )
 
@@ -1656,6 +1659,18 @@ class GlobalSettings:
 
         if type(self.auth.allow_unauthenticated_inference) is not bool:
             errors.append("auth.allow_unauthenticated_inference must be a boolean")
+        if self.auth.cache_isolation not in ("shared", "api_key"):
+            errors.append("auth.cache_isolation must be shared or api_key")
+        if self.auth.cache_isolation == "api_key" and (
+            not self.auth.api_key
+            or self.auth.skip_api_key_verification
+            or self.auth.allow_unauthenticated_inference
+            or self.server.distributed_inference_enabled
+        ):
+            errors.append(
+                "API-key cache isolation requires authenticated local inference "
+                "with verification enabled"
+            )
 
         # Server validation
         if not 1 <= self.server.port <= 65535:

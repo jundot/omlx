@@ -240,6 +240,11 @@ class BaseEngine(ABC):
     """
 
     @property
+    def supports_cache_namespace(self) -> bool:
+        """Whether every reusable KV path carries the request namespace."""
+        return False
+
+    @property
     def supports_early_tool_call_streaming(self) -> bool:
         """Whether Chat may parse raw tool envelopes before engine finish.
 
