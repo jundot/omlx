@@ -89,6 +89,13 @@ def can_fuse(switch_mlp: Any) -> bool:
             return False
         if g is not None and (tuple(g.shape) != tuple(u.shape) or g.dtype != u.dtype):
             return False
+    # The fused projection keeps the gate's per-expert NVFP4 global scale, so
+    # it has to be the up projection's as well.
+    g, u = gate.get("global_scale"), up.get("global_scale")
+    if (g is None) != (u is None):
+        return False
+    if g is not None and not mx.array_equal(g, u).item():
+        return False
     # DeepSeek V4 formats with native pair kernels keep their tuned path.
     return not (family == "deepseek_v4" and has_native_block_kernels(gate))
 
