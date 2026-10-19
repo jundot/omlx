@@ -31,10 +31,10 @@ Affine4. Recurrent and sliding-window layers in hybrid models retain native
 caches. MLA and composite caches that expose tensors directly remain ineligible,
 matching existing quantized-cache restrictions.
 
-TensorOps attention covers decode and verification queries of one to four rows,
+TensorOps attention covers decode and verification queries of up to 24 rows,
 head dimensions divisible by 32 through 512, and attention sinks. Grouped query
-rows that do not fit one threadgroup run as several launches. Other dimensions
-and longer queries use portable MLX attention. Boolean and additive masks retain
+rows that do not fit one launch run as several launches. Other dimensions and
+longer queries use portable MLX attention. Boolean and additive masks retain
 their meaning.
 
 New full-attention KV is compressed during each layer's prefill update, so cold

@@ -190,6 +190,7 @@ def test_portable_attention_masks_sinks_and_dimensions(
         (1, 1, 32, 1, 256, 150000, mx.bfloat16, Affine4KVCache, False),
         (1, 1, 4, 1, 512, 259, mx.float16, Affine8KVCache, False),
         (1, 4, 8, 4, 512, 1025, mx.bfloat16, Affine4KVCache, True),
+        (1, 4, 6, 8, 256, 1025, mx.bfloat16, Affine8KVCache, False),
         (1, 8, 8, 1, 64, 1025, mx.bfloat16, Affine8KVCache, True),
     ],
 )
@@ -283,6 +284,8 @@ def test_bf16_prefill_forces_fused_sdpa_only_where_supported(
         random((1, 2, 513, dim), mx.bfloat16, 1),
     )
     queries = random((1, 2 * repeats, rows, dim), mx.bfloat16, 2)
+    # Keep decode-sized rows off the TensorOps kernel.
+    monkeypatch.setattr(affine4, "_tensor_ops_available", lambda: False)
     original = mx.fast.scaled_dot_product_attention
     calls = []
 

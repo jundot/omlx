@@ -39,7 +39,8 @@ __all__ = [
 
 _BITS = 4
 _MIN_NATIVE_TOKENS = 256
-_MAX_PADDED_ROWS = 32
+# 32-row launches ran slower than two 16-row launches on M3 Ultra and M5 Max.
+_MAX_PADDED_ROWS = 24
 _MAX_THREADGROUP_BYTES = 32 * 1024
 # Bound each unfused float32 score matrix to 64 MiB, or one query row.
 _MAX_SCORE_ELEMENTS = 16 * 1024 * 1024
@@ -734,11 +735,9 @@ def _padded_rows(active_rows: int) -> int:
     return max(8, ((active_rows + 7) // 8) * 8)
 
 
-def _attention_blocks(tokens: int, kv_heads: int, dim: int, rows: int = 1) -> int:
+def _attention_blocks(tokens: int, kv_heads: int, dim: int) -> int:
     token_tiles = (tokens + 63) // 64
     target_groups = 256 if dim <= 64 else 168
-    if dim == 256 and rows == 32 and kv_heads <= 2 and tokens >= 150000:
-        target_groups = 336
     return min(token_tiles, max(1, (target_groups + kv_heads - 1) // kv_heads))
 
 
@@ -814,7 +813,6 @@ def _native_attention(
         or dim > 512
         or query_heads % kv_heads
         or query_length < 1
-        or query_length > 4
         or (sinks is not None and sinks.size != query_heads)
     ):
         return None
@@ -849,7 +847,7 @@ def _native_attention(
         return None
     valid_ends = mx.full((batch,), tokens, dtype=mx.int32)
 
-    blocks = _attention_blocks(tokens, kv_heads, dim, padded_rows if batch == 1 else 1)
+    blocks = _attention_blocks(tokens, kv_heads, dim)
     partition_tiles = ((tokens + 63) // 64 + blocks - 1) // blocks
     # Normalized probabilities are <= 1. Keep FP16 partials only when the
     # signed-code bound leaves headroom below 65,504.
