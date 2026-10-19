@@ -492,6 +492,41 @@ _HC_POST = r"""
 """
 
 
+# Batched single-query attention over REQ requests: the request index selects that request's
+# window rows (WSTRIDE bytes each), its compressed rows (offset meta[5] into the concatenated
+# pooled buffer), its window / compressed index lists and its slice of every output; blocks
+# beyond the request's own count exit. The body is the single-request source.
+_ATTN_PRELUDE_B = r"""
+    const uint REQ = threadgroup_position_in_grid.z;
+    const device int* meta = meta_all + REQ * 8;
+    if (int(threadgroup_position_in_grid.y) >= meta[4]) return;
+    auto window = window_all + size_t(REQ) * size_t(WSTRIDE);
+    auto pooled = pooled_all + size_t(meta[5]) * size_t(D / 2 + D / 16);
+    auto wi = wi_all + size_t(REQ) * size_t(WIS);
+    auto ci = ci_all + size_t(REQ) * size_t(CMAX);
+"""
+_ATTN_SCORES_B = _ATTN_PRELUDE_B + r"""
+    auto q = q_all + size_t(REQ) * size_t(H * D);
+    auto S = S_all + size_t(REQ) * size_t(H * NBMAX * 64);
+    auto BMAX = BMAX_all + size_t(REQ) * size_t(H * NBMAX);
+""" + _ATTN_SCORES
+_ATTN_PV_B = _ATTN_PRELUDE_B + r"""
+    auto S = S_all + size_t(REQ) * size_t(H * NBMAX * 64);
+    auto BMAX = BMAX_all + size_t(REQ) * size_t(H * NBMAX);
+    auto PV = PV_all + size_t(REQ) * size_t(H * NBMAX * D);
+    auto DEN = DEN_all + size_t(REQ) * size_t(H * NBMAX);
+""" + _ATTN_PV
+_O_MERGE_B = r"""
+    const uint REQ = threadgroup_position_in_grid.y;
+    const device int* meta = meta_all + REQ * 8;
+    auto PV = PV_all + size_t(REQ) * size_t(NH * NBMAX * HD);
+    auto DEN = DEN_all + size_t(REQ) * size_t(NH * NBMAX);
+    auto BMAX = BMAX_all + size_t(REQ) * size_t(NH * NBMAX);
+    auto cosv = cosv_all + REQ * (RD / 2);
+    auto sinv = sinv_all + REQ * (RD / 2);
+    auto oq = oq_all + size_t(REQ) * size_t(NH * HD);
+""" + _O_MERGE
+
 # Per-request kernels in a batch: request b = threadgroup_position_in_grid.y reads and writes
 # its own slice (stride per buffer) and otherwise runs the single-request source unchanged.
 _BATCHED_STRIDES = {
@@ -523,6 +558,12 @@ def kernel(name):
         "gemv_fp8_nb": (["x", "wa", "sa", "wb", "sb"], ["ya", "yb"], _GEMV_FP8_NB),
         "wqb_rope_nb": (["x", "w", "sc", "cosv", "sinv"], ["y"], _WQB_ROPE_NB),
         "woa_nb": (["x", "w", "sc"], ["yq"], _WOA_NB),
+        "attn_scores_bq": (["q_all", "window_all", "pooled_all", "wi_all", "ci_all", "meta_all", "scalep"],
+                           ["S_all", "BMAX_all"], _ATTN_SCORES_B),
+        "attn_pv_bq": (["window_all", "pooled_all", "wi_all", "ci_all", "meta_all", "S_all", "BMAX_all"],
+                       ["PV_all", "DEN_all"], _ATTN_PV_B),
+        "o_merge_bq": (["PV_all", "DEN_all", "BMAX_all", "sink", "meta_all", "cosv_all", "sinv_all"],
+                       ["oq_all"], _O_MERGE_B),
     }
     batched = name.endswith("_b") and name[:-2] in _BATCHED_STRIDES
     base = name[:-2] if batched else name

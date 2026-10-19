@@ -166,6 +166,15 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block_nb", counted)
+    real_attention = decode_fused.batched_attention
+    attention = {"batched": 0}
+
+    def counted_attention(*args, **kwargs):
+        out = real_attention(*args, **kwargs)
+        attention["batched"] += out is not None
+        return out
+
+    monkeypatch.setattr(decode_fused, "batched_attention", counted_attention)
     rng = np.random.default_rng(11)
     prompts = [rng.integers(3, 60, 13 + 2 * r).tolist() for r in range(batch)]   # different lengths
     singles, rows = [], []
@@ -183,6 +192,7 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch):
             np.testing.assert_allclose(got[r], expected[r], rtol=0, atol=1e-6 * np.abs(expected[r]).max())
         tokens = [int(e.argmax()) for e in expected]
     assert calls["nb"] == 4 * model._config.n_layers
+    assert attention["batched"] == 4 * model._config.n_layers   # windows are full: request-batched attention
 
 
 @pytest.mark.parametrize("nb", [2, 3, 8])

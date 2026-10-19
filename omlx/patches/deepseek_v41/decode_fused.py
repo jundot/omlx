@@ -215,39 +215,44 @@ def split_attention(q, window, pooled, wi, ci, sink, cos, sin, c, raw=False):
         output_shapes=[(h * d,)], output_dtypes=[mx.float32])[0]
 
 
+def compress_index(att, x, qr, cache, shared, start, c):
+    """Compressor and indexer bookkeeping of one request at `start` (the compressed part of
+    Attention.__call__). Returns its compressed rows and selected compressed indices."""
+    layer = att._layer
+    ratio = c.compress_ratios[layer]
+    if not ratio:
+        return _empty((1, 0, c.head_dim // 2 + c.head_dim // 16), mx.uint8), _empty((1, 1, 0), mx.int32)
+    x3 = x.reshape(1, 1, -1)
+    latent = None
+    if layer in c.kv_source_layers:
+        latent = att.compressor(x3, cache, start)
+        if cache[2] is None:
+            cache[2] = pack_activation(mx.zeros((1, 0, c.head_dim), x.dtype), bits=4, group_size=16, e4m3_scale=True)
+        shared["kv"] = cache[2][:, : start // ratio]
+    if layer in c.index_source_layers:
+        shared["idx"] = att.indexer(x3, qr.reshape(1, 1, -1), latent, cache, shared, start, ratio)
+    if latent is not None:
+        from .language import rope
+
+        compressed = rope(latent, range(start // ratio * ratio, (start + 1) // ratio * ratio, ratio), c, True)
+        compressed = pack_activation(compressed, bits=4, group_size=16, e4m3_scale=True)
+        shared["kv"] = cache[2] = growth.append(cache, 2, shared["kv"], compressed, start // ratio)
+    return shared["kv"], shared["idx"]
+
+
 def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
     """One request's attention after its projections: window KV update, compressor, indexer,
     sparse attention and o epilogue. x: [dim] bf16, qr: [q_lora] bf16, q: [H*D] bf16 (RoPE'd),
     packed: the new window row. Returns act_quant(o) [H*D] fp32 (the wo_a input)."""
     from .language import packed_sparse_attention
 
-    layer = att._layer
-    ratio = c.compress_ratios[layer]
     new = packed.reshape(1, 1, -1)
     old = cache[1]
     old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
     kv = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
     cache[1] = kv[:, -c.window_size:]
     idx = _window_idx(c.window_size, start, old_len)
-    pooled = _empty((1, 0, c.head_dim // 2 + c.head_dim // 16), mx.uint8)
-    ci = _empty((1, 1, 0), mx.int32)
-    x3 = x.reshape(1, 1, -1)
-    if ratio:
-        latent = None
-        if layer in c.kv_source_layers:
-            latent = att.compressor(x3, cache, start)
-            if cache[2] is None:
-                cache[2] = pack_activation(mx.zeros((1, 0, c.head_dim), x.dtype), bits=4, group_size=16, e4m3_scale=True)
-            shared["kv"] = cache[2][:, : start // ratio]
-        if layer in c.index_source_layers:
-            shared["idx"] = att.indexer(x3, qr.reshape(1, 1, -1), latent, cache, shared, start, ratio)
-        if latent is not None:
-            from .language import rope
-
-            compressed = rope(latent, range(start // ratio * ratio, (start + 1) // ratio * ratio, ratio), c, True)
-            compressed = pack_activation(compressed, bits=4, group_size=16, e4m3_scale=True)
-            shared["kv"] = cache[2] = growth.append(cache, 2, shared["kv"], compressed, start // ratio)
-        ci, pooled = shared["idx"], shared["kv"]
+    pooled, ci = compress_index(att, x, qr, cache, shared, start, c)
     if split_attention_supported(c):
         return split_attention(q.reshape(-1), kv, pooled, idx, ci, att.attn_sink, cos, sin, c)
     out = packed_sparse_attention(q.reshape(1, 1, c.n_heads, c.head_dim), kv, pooled, idx, ci, att.attn_sink, c.head_dim**-0.5)
@@ -312,6 +317,71 @@ def gemv_fp8_nb(x, a, b=None):
     return ya.reshape(b_n, na), (yb.reshape(b_n, nb) if b is not None else None)
 
 
+@lru_cache(maxsize=None)
+def _arange_i32(n):
+    a = mx.arange(n, dtype=mx.int32)
+    mx.eval(a)
+    return a
+
+
+def batched_attention(att, q, packed, x, qr, caches, shareds, starts, cos, sin, c):
+    """Attention for B requests whose windows are full (start >= window_size): one window
+    shift for the batch, per-request compressor / indexer, then the split attention with a
+    request grid axis. Each request's keys, their order and the arithmetic are those of
+    attention_core (window rows old[1:] + new are exactly the rows it attends to). Returns
+    act_quant(o) [B, H*D], or None when a request's window is not full yet."""
+    b_n, w = q.shape[0], c.window_size
+    if not split_attention_supported(c) or any(
+        s < w or caches[r][1] is None or caches[r][1].shape[1] != w for r, s in enumerate(starts)
+    ):
+        return None
+    old = mx.concatenate([caches[r][1] for r in range(b_n)], 0)
+    win = mx.concatenate([old[:, 1:], packed[:, None, :]], 1)
+    for r in range(b_n):
+        caches[r][1] = win[r : r + 1]
+    h, d = c.n_heads, c.head_dim
+    if c.compress_ratios[att._layer]:
+        xs, qrs = mx.split(x, b_n), mx.split(qr, b_n)
+        parts = [compress_index(att, xs[r].reshape(-1), qrs[r].reshape(-1), caches[r], shareds[r], starts[r], c)
+                 for r in range(b_n)]
+        # Layers that reuse a source layer's rows get the same arrays back: concatenate once.
+        # The entry holds those arrays, so an identity match can never be a recycled id().
+        key = [a for p in parts for a in p]
+        cat = shareds[0].get("_batched_compressed")
+        if cat is None or len(cat[0]) != len(key) or any(a is not b for a, b in zip(cat[0], key)):
+            ncs = [int(p.shape[1]) for p, _ in parts]
+            cs_ = [int(i.shape[-1]) for _, i in parts]
+            offs = [sum(ncs[:r]) for r in range(b_n)]
+            pooled = (mx.concatenate([p.reshape(-1, p.shape[-1]) for p, _ in parts if p.shape[1]], 0)
+                      if sum(ncs) else _dummy(mx.uint8))
+            cmax = max(max(cs_), 1)
+            ci = mx.concatenate([mx.pad(i.reshape(1, -1).astype(mx.int32), [(0, 0), (0, cmax - i.shape[-1])], constant_values=-1)
+                                 for _, i in parts], 0)
+            cat = (key, pooled, ncs, cs_, offs, ci, cmax)
+            shareds[0]["_batched_compressed"] = cat
+        _, pooled, ncs, cs_, offs, ci, cmax = cat
+    else:
+        pooled, ncs, cs_, offs, ci, cmax = _dummy(mx.uint8), [0] * b_n, [0] * b_n, [0] * b_n, _dummy(mx.int32), 1
+    nbs = [max(1, (w + cr + 63) // 64) for cr in cs_]
+    nbmax = max(nbs)
+    meta = mx.array([[w, cs_[r], w, ncs[r], nbs[r], offs[r], 0, 0] for r in range(b_n)], mx.int32)
+    tmpl = [("D", d), ("H", h), ("NBMAX", nbmax), ("WSTRIDE", w * (d + d // 32)), ("WIS", 0), ("CMAX", cmax)]
+    grid = (h // 8 * 1024, nbmax, b_n)
+    s, bmax = DL.kernel("attn_scores_bq")(
+        inputs=[q, win, pooled, _arange_i32(w), ci, meta, _const((d**-0.5,))],
+        template=tmpl, grid=grid, threadgroup=(1024, 1, 1),
+        output_shapes=[(b_n * h * nbmax * 64,), (b_n * h * nbmax,)], output_dtypes=[mx.float32, mx.float32])
+    pv, den = DL.kernel("attn_pv_bq")(
+        inputs=[win, pooled, _arange_i32(w), ci, meta, s, bmax],
+        template=tmpl, grid=grid, threadgroup=(1024, 1, 1),
+        output_shapes=[(b_n * h * nbmax * d,), (b_n * h * nbmax,)], output_dtypes=[mx.float32, mx.float32])
+    return DL.kernel("o_merge_bq")(
+        inputs=[pv, den, bmax, att.attn_sink, meta, cos, sin],
+        template=[("NH", h), ("HD", d), ("RD", c.rope_head_dim), ("TPG", 1024), ("RAWO", False), ("NBMAX", nbmax)],
+        grid=((h * d // 32 + 31) // 32 * 1024, b_n, 1), threadgroup=(1024, 1, 1),
+        output_shapes=[(b_n * h * d,)], output_dtypes=[mx.float32])[0].reshape(b_n, h * d)
+
+
 def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
     """decode_block for B requests at their own positions. h: [B, 1, hc, dim] bf16, pre:
     [B, 1, hc]; caches / shareds / starts: per request. Weight-streaming kernels run once for
@@ -340,8 +410,13 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
         template=[("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n)],
         grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
-    oq = mx.stack([attention_core(att, x[r], qr[r], q[r], packed[r], caches[r], shareds[r], starts[r], cos[r], sin[r], c)
-                   for r in range(b_n)])
+    oq = batched_attention(att, q, packed, x, qr, caches, shareds, starts, cos, sin, c)
+    if oq is None:   # a request still filling its window: per-request attention
+        xs, qrs, qs, ps = mx.split(x, b_n), mx.split(qr, b_n), mx.split(q, b_n), mx.split(packed, b_n)
+        cs, ss = mx.split(cos, b_n), mx.split(sin, b_n)
+        oq = mx.concatenate([attention_core(att, xs[r].reshape(-1), qrs[r].reshape(-1), qs[r].reshape(-1), ps[r].reshape(-1),
+                                            caches[r], shareds[r], starts[r], cs[r].reshape(-1), ss[r].reshape(-1), c)[None]
+                             for r in range(b_n)])
     wq, ws = _woa_mxfp8(att)
     rows = c.o_groups * c.o_lora_rank
     yq = DL.kernel("woa_nb")(
