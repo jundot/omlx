@@ -372,6 +372,12 @@ def rounded_packed_attention(q, window, pooled, wi, ci, sink, scale):
     _, length, heads, dim = q.shape
     window_slots, pooled_slots = wi.shape[-1], ci.shape[-1]
     if heads >= 8 and dim <= 512 and window_slots + pooled_slots >= 512:
+        # Same arithmetic as _mma_attention, fused (bitwise identical, see
+        # fused_attention.py); other dtypes and shapes keep the three-kernel path.
+        from . import fused_attention
+
+        if fused_attention.supported(q):
+            return fused_attention.fused_mma_attention(q, window, pooled, wi, ci, sink, scale)
         return _mma_attention(q, window, pooled, wi, ci, sink, scale)
     if window_slots + pooled_slots <= 2048:
         return _fused_attention(q, window, pooled, wi, ci, sink, scale)
