@@ -19,7 +19,7 @@ from omlx.custom_kernels.attention import fast as attention_fast
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
 from ..deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
-from . import growth
+from . import decode_fused, growth
 from .activation import quantize_paired_swiglu_activation, quantize_swiglu_activation
 from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
@@ -827,6 +827,15 @@ class Block(nn.Module):
             self.engram = Engram(c, list(c.engram_layer_ids).index(layer))
 
     def __call__(self, h, pre, cache, shared, start, image_mask, ced_tail=None):
+        if (
+            ced_tail is None
+            and image_mask is None
+            and h.shape[0] == 1
+            and h.shape[1] == 1
+            and getattr(cache, "_mtp_verify_state", None) is None
+            and decode_fused.supported(self, self._config)
+        ):
+            return decode_fused.decode_block(self, h, pre, cache, shared, start, self._config)
         ced_kv = ced_kv_start = None
         if ced_tail is not None:
             # CED bounded replay: queries, SWA KV and MoE run on the tail
