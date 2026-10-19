@@ -250,25 +250,6 @@ _WQB_ROPE = r"""
     }
 """
 
-# K7: attention output epilogue: inverse RoPE on each head's tail, bf16, act_quant (1017
-# reference: quantize/dequantize o before the wo_a einsum). One simdgroup per 32-group.
-_O_EPI = r"""
-    const uint lane = thread_index_in_simdgroup;
-    const uint grp = threadgroup_position_in_grid.x * (TPG / 32) + simdgroup_index_in_threadgroup;
-    if (grp * 32 >= uint(NH * HD)) return;
-    const uint idx = grp * 32 + lane, d = idx % HD;
-    float v = float(o[idx]);
-    const float partner = simd_shuffle_xor(v, 1u);
-    if (d >= uint(HD - RD)) {
-        const uint p = (d - (HD - RD)) / 2;
-        const float cs = cosv[p], sn = -sinv[p];          // conj(freqs_cis)
-        const float a = (lane & 1u) ? partner : v, b = (lane & 1u) ? v : partner;
-        v = float(bfloat16_t((lane & 1u) ? a * sn + b * cs : a * cs - b * sn));
-    }
-    const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-    oq[idx] = act_quant_value(v, s);
-"""
-
 # K8: wo_a as a grouped MXFP8 GEMV (the bf16 checkpoint tensor is exactly FP8 * 2^k per
 # 32-group, so the products are the same exact values), bf16 einsum output, then act_quant
 # over each 32-row block (= one threadgroup) as the wo_b input.
@@ -284,7 +265,7 @@ _WOA = r"""
     if (sg == 0) {
         const float v = yb[lane];
         const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-        yq[threadgroup_position_in_grid.x * 32 + lane] = RAW ? v : act_quant_value(v, s);   // RAW: audit only
+        yq[threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
     }
 """
 
@@ -420,7 +401,6 @@ _O_MERGE = r"""
     }
     den += exp(float(sink[head]) - m);
     float v = float(bfloat16_t(acc / den));                // attention output o (bf16)
-    if (RAWO) { oq[idx] = v; return; }                     // audit only: o before the epilogue
     const float partner = simd_shuffle_xor(v, 1u);
     if (d >= uint(HD - RD)) {
         const uint p = (d - (HD - RD)) / 2;
@@ -602,7 +582,6 @@ def kernel(name):
         "gemv_fp8": (["x", "wa", "sa", "wb", "sb"], ["ya", "yb"], _GEMV_FP8),
         "attn_mid": (["qa", "kv", "qnw", "kvnw", "cosv", "sinv", "eps"], ["qr", "qrq", "packed"], _ATTN_MID),
         "wqb_rope": (["x", "w", "sc", "cosv", "sinv"], ["y"], _WQB_ROPE),
-        "o_epi": (["o", "cosv", "sinv"], ["oq"], _O_EPI),
         "woa": (["x", "w", "sc"], ["yq"], _WOA),
         "hc_post": (["sub", "res", "post", "comb"], ["out"], _HC_POST),
         "attn_scores": (["q", "window", "pooled", "wi", "ci", "meta", "scalep"], ["S", "BMAX"], _ATTN_SCORES),

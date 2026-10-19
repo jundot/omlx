@@ -158,21 +158,12 @@ def wqb_rope(att, qrq, cos, sin, c):
         output_shapes=[(nq,)], output_dtypes=[mx.bfloat16])[0]
 
 
-def o_epi(out, cos, sin, c):
-    nq = c.n_heads * c.head_dim
-    return DL.kernel("o_epi")(
-        inputs=[out, cos, sin],
-        template=[("NH", c.n_heads), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("TPG", 1024)],
-        grid=((nq // 32 + 31) // 32 * 1024, 1, 1), threadgroup=(1024, 1, 1),
-        output_shapes=[(nq,)], output_dtypes=[mx.float32])[0]
-
-
-def woa(att, oq, c, raw=False):
+def woa(att, oq, c):
     wq, ws = _woa_mxfp8(att)
     rows = c.o_groups * c.o_lora_rank
     return DL.kernel("woa")(
         inputs=[oq, wq, ws],
-        template=[("R", c.o_lora_rank), ("K", c.n_heads * c.head_dim // c.o_groups), ("RAW", raw)],
+        template=[("R", c.o_lora_rank), ("K", c.n_heads * c.head_dim // c.o_groups)],
         grid=(rows // 32 * 256, 1, 1), threadgroup=(256, 1, 1),
         output_shapes=[(rows,)], output_dtypes=[mx.float32])[0]
 
@@ -185,11 +176,7 @@ def hc_post(f, h, post, comb, c):
         output_shapes=[(hc * dim,)], output_dtypes=[mx.bfloat16])[0]
 
 
-def split_attention_supported(c):
-    return c.head_dim % 256 == 0 and c.n_heads % 8 == 0
-
-
-def split_attention(q, window, pooled, wi, ci, sink, cos, sin, c, raw=False):
+def split_attention(q, window, pooled, wi, ci, sink, cos, sin, c):
     """Single-query sparse attention + o epilogue (see decode_layer._ATTN_SCORES / _ATTN_PV /
     _O_MERGE). q: [H*D] bf16; window / pooled: packed rows; wi / ci: [1, 1, W] / [1, 1, C]."""
     h, d = c.n_heads, c.head_dim
@@ -211,7 +198,7 @@ def split_attention(q, window, pooled, wi, ci, sink, cos, sin, c, raw=False):
         output_shapes=[(h * nb * d,), (h * nb,)], output_dtypes=[mx.float32, mx.float32])
     return DL.kernel("o_merge")(
         inputs=[pv, den, bmax, sink, meta, cos, sin],
-        template=[("NH", h), ("HD", d), ("RD", c.rope_head_dim), ("TPG", 1024), ("RAWO", raw)],
+        template=[("NH", h), ("HD", d), ("RD", c.rope_head_dim), ("TPG", 1024)],
         grid=((h * d // 32 + 31) // 32 * 1024, 1, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(h * d,)], output_dtypes=[mx.float32])[0]
 
@@ -245,8 +232,6 @@ def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
     """One request's attention after its projections: window KV update, compressor, indexer,
     sparse attention and o epilogue. x: [dim] bf16, qr: [q_lora] bf16, q: [H*D] bf16 (RoPE'd),
     packed: the new window row. Returns act_quant(o) [H*D] fp32 (the wo_a input)."""
-    from .language import packed_sparse_attention
-
     new = packed.reshape(1, 1, -1)
     old = cache[1]
     old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
@@ -254,10 +239,7 @@ def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
     cache[1] = kv[:, -c.window_size:]
     idx = _window_idx(c.window_size, start, old_len)
     pooled, ci = compress_index(att, x, qr, cache, shared, start, c)
-    if split_attention_supported(c):
-        return split_attention(q.reshape(-1), kv, pooled, idx, ci, att.attn_sink, cos, sin, c)
-    out = packed_sparse_attention(q.reshape(1, 1, c.n_heads, c.head_dim), kv, pooled, idx, ci, att.attn_sink, c.head_dim**-0.5)
-    return o_epi(out.reshape(-1), cos, sin, c)
+    return split_attention(q.reshape(-1), kv, pooled, idx, ci, att.attn_sink, cos, sin, c)
 
 
 def decode_attention(att, x, xq, cache, shared, start, c):
@@ -408,7 +390,7 @@ def batched_attention(att, q, packed, x, qr, caches, shareds, starts, cos, sin, 
     attention_core (window rows old[1:] + new are exactly the rows it attends to). Returns
     act_quant(o) [B, H*D], or None when a request's window is not full yet."""
     b_n, w = q.shape[0], c.window_size
-    if not split_attention_supported(c) or any(
+    if any(
         s < w or caches[r][1] is None or caches[r][1].shape[1] != w for r, s in enumerate(starts)
     ):
         return None
@@ -467,7 +449,7 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
         output_shapes=[(b_n * h * nbmax * d,), (b_n * h * nbmax,)], output_dtypes=[mx.float32, mx.float32])
     return DL.kernel("o_merge_bq")(
         inputs=[pv, den, bmax, att.attn_sink, meta, cos, sin],
-        template=[("NH", h), ("HD", d), ("RD", c.rope_head_dim), ("TPG", 1024), ("RAWO", False), ("NBMAX", nbmax)],
+        template=[("NH", h), ("HD", d), ("RD", c.rope_head_dim), ("TPG", 1024), ("NBMAX", nbmax)],
         grid=((h * d // 32 + 31) // 32 * 1024, b_n, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(b_n * h * d,)], output_dtypes=[mx.float32])[0].reshape(b_n, h * d)
 
@@ -540,7 +522,7 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
         pending = [(cache[4][:, :rem], cache[5][:, :rem])] if rem else []
     tokens = shared.setdefault("_verify_tokens", [{} for _ in range(r_n)])
     w = c.window_size
-    if split_attention_supported(c) and old_len == w:
+    if old_len == w:
         # Full window: token j attends to rows j+1 .. j+w of (kept window + block rows), the
         # window attention_core builds for it; one dispatch set serves the whole block.
         full = mx.concatenate([old[:, :old_len], packed.reshape(1, r_n, -1)], 1)
@@ -590,7 +572,7 @@ def supported(blk, c):
         ok = bool(
             c.hc_mult == 4
             and c.dim % 1024 == 0
-            and c.head_dim % 32 == 0
+            and c.head_dim % 256 == 0   # split_attention's layout (V4.1: 512)
             and c.n_heads % 8 == 0
             and all(_mxfp8_projection(getattr(att, n)) for n in ("wq_a", "wkv", "wq_b", "wo_b"))
             and DM.supported(blk.ffn, _empty((1, 1, c.dim), mx.bfloat16), c)

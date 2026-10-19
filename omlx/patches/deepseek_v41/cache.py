@@ -86,10 +86,10 @@ class DeepseekV41Cache(ArraysCache):
             return [self._row_copy()]
         return [self._dense_extract(i) for i in range(self.batch_size)]
 
-    def _set_rows(self, rows, left_padding=None, lengths=None):
+    def _set_rows(self, rows, left_padding=None):
         self._rows, self._dense = list(rows), None
         self._lp = None if left_padding is None else [int(v) for v in left_padding]
-        self._len = None if lengths is None else [int(v) for v in lengths]
+        self._len = None
         self._sync_padding()
 
     def _sync_padding(self):

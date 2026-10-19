@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
-"""Fused packed sparse attention for DeepSeek V4.1, bitwise identical to _mma_attention.
+"""Fused packed sparse attention for DeepSeek V4.1, bitwise identical to the three-kernel
+matrix path it replaced (kept as the oracle in tests/test_deepseek_v41_fused_attention.py).
 
 Exactness contract (C0, bitwise). For every (query, head, dim) the arithmetic is the
 reference's, in the reference's order:
