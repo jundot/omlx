@@ -81,7 +81,7 @@ def quantize_activation(x, bits=8, group_size=32, e4m3_scale=False):
 
 
 @mx.compile
-def pack_activation(x, bits=8, group_size=32, e4m3_scale=False):
+def _pack_activation_reference(x, bits=8, group_size=32, e4m3_scale=False):
     """Pack each row as value bytes followed by one scale byte per group."""
     if bits not in (4, 8) or x.shape[-1] % group_size:
         raise ValueError("Invalid packed activation geometry")
@@ -133,6 +133,21 @@ def _pack_activation(x, bits, group_size, e4m3_scale):
         code = code.astype(mx.uint8) | ((scaled < 0).astype(mx.uint8) << 3)
         values = code[..., ::2] | (code[..., 1::2] << 4)
     return mx.concatenate([values, scale_bytes], -1)
+
+
+def pack_activation(x, bits=8, group_size=32, e4m3_scale=False):
+    if (
+        mx.default_device() == mx.gpu
+        and x.size
+        and x.shape[-1] % 32 == 0
+        and (bits, group_size, e4m3_scale)
+        in ((8, 32, False), (4, 32, False), (4, 16, True))
+        and x.dtype in (mx.float32, mx.float16, mx.bfloat16)
+    ):
+        from .packed_kv import fused_pack_activation
+
+        return fused_pack_activation(x, bits, group_size, e4m3_scale)
+    return _pack_activation_reference(x, bits, group_size, e4m3_scale)
 
 
 def unpack_activation(
