@@ -451,6 +451,14 @@ class ModelSettings:
     moe_expert_offload_enabled: bool = False
     moe_expert_offload_resident_fraction: float = 0.25  # 0 < fraction <= 1
 
+    # Opt-in batched expert install (atomic reserve + one _write_many burst);
+    # off by default (= upstream per-expert install), only honored when moe_expert_offload_enabled.
+    moe_expert_offload_batch_enabled: bool = False
+    # Install chunk cap: split the miss batch into install chunks of at most
+    # this many experts. Clamped to [2, io_window] (default io_window=48, i.e.
+    # the in-flight read window); ignored when moe_expert_offload_batch_enabled is off.
+    moe_expert_offload_batch_chunk: int = 4
+
     # SpecPrefill (experimental: attention-based sparse prefill for MoE models)
     specprefill_enabled: bool = False
     specprefill_draft_model: Optional[str] = (

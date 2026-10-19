@@ -866,6 +866,29 @@
                                         <span class="text-xs text-neutral-500">{{ t('modal.model_settings.moe_expert_offload_resident_range') }}</span>
                                     </div>
                                     <p x-show="moeExpertOffloadResidentInvalid() && modelSettings.moe_expert_offload_resident_touched" x-cloak class="mt-1.5 text-xs text-red-600">{{ t('modal.model_settings.moe_expert_offload_resident_range_error') }}</p>
+                                    <div class="mt-3 flex items-start justify-between gap-3">
+                                        <div class="min-w-0">
+                                            <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.moe_expert_offload_batch') }}</span>
+                                            <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.moe_expert_offload_batch_hint') }}</p>
+                                        </div>
+                                        <button type="button"
+                                                @click="modelSettings.moe_expert_offload_batch_enabled = !modelSettings.moe_expert_offload_batch_enabled"
+                                                :class="[modelSettings.moe_expert_offload_batch_enabled ? 'bg-black' : 'bg-neutral-200']"
+                                                class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                            <span :class="modelSettings.moe_expert_offload_batch_enabled ? 'translate-x-5' : 'translate-x-0'" class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                        </button>
+                                    </div>
+                                    <div x-show="modelSettings.moe_expert_offload_batch_enabled" x-transition class="pt-2">
+                                        <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1">{{ t('modal.model_settings.moe_expert_offload_batch_chunk') }}</label>
+                                        <div class="flex items-center gap-2">
+                                            <input type="number" min="2" max="48" step="1"
+                                                   aria-label="{{ t('modal.model_settings.moe_expert_offload_batch_chunk') }" :value="modelSettings.moe_expert_offload_batch_chunk"
+                                                   @input="modelSettings.moe_expert_offload_batch_chunk = $event.target.valueAsNumber"
+                                                   class="w-24 px-2 py-1.5 text-xs border border-neutral-200 rounded-md focus:outline-none focus:ring-2 focus:ring-neutral-900 bg-white"
+                                                   />
+                                            <span class="text-xs text-neutral-500">{{ t('modal.model_settings.moe_expert_offload_batch_chunk_hint') }}</span>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                         </template>

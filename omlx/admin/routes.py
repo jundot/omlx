@@ -405,6 +405,9 @@ class ModelSettingsRequest(BaseModel):
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool | None = None
     moe_expert_offload_resident_fraction: float | None = None
+    # Opt-in batched expert install for the offload path above
+    moe_expert_offload_batch_enabled: bool | None = None
+    moe_expert_offload_batch_chunk: int | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -3077,6 +3080,13 @@ async def update_model_settings(
             if request.moe_expert_offload_resident_fraction is None
             else request.moe_expert_offload_resident_fraction
         )
+    if "moe_expert_offload_batch_enabled" in sent:
+        current_settings.moe_expert_offload_batch_enabled = (
+            request.moe_expert_offload_batch_enabled or False
+        )
+    if "moe_expert_offload_batch_chunk" in sent:
+        raw = int(request.moe_expert_offload_batch_chunk or 4)
+        current_settings.moe_expert_offload_batch_chunk = min(max(raw, 2), 48)
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False

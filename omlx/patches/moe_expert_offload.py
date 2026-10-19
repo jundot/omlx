@@ -1045,6 +1045,7 @@ def apply_moe_expert_offload(
     resident_fraction: float = 0.25,
     *,
     mtp_resident: bool = False,
+    model_settings: object | None = None,
 ) -> int:
     """Replace covered SwitchGLU instances with offloaded ones.
 
@@ -1132,6 +1133,18 @@ def apply_moe_expert_offload(
         else:
             parent[key] = new  # plain list / plain dict
         wrapped += 1
+        # Opt-in batched install switch: when the model settings flag is on,
+        # hand this fresh cache to moe_expert_batch, which binds its batched
+        # _ensure_ids in place of upstream's per-expert install loop. When the
+        # flag is off (default), moe_expert_batch is never imported and this
+        # cache keeps the pristine upstream install path untouched.
+        if model_settings is not None and bool(
+            getattr(model_settings, "moe_expert_offload_batch_enabled", False)
+        ):
+            from . import moe_expert_batch
+
+            new.cache.model_settings = model_settings
+            moe_expert_batch.apply_batch_install(new.cache, True)
         # Dropped source buffers land in the MLX pool, which the server pins
         # to total RAM, so drain per layer to bound the load transient
         # (same reasoning as the gate/up fusion patch, #2304).
