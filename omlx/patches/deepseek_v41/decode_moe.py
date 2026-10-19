@@ -379,17 +379,20 @@ _GATE_NB = r"""
     }
 """
 
-# Up: threadgroup column y < NB * TOPK is (token y / TOPK, routed slot y % TOPK) and runs
-# _UP's routed path on that token; the last column runs the shared expert for all NB tokens
-# with one weight read (fp8_rows_nb).
+# Up: threadgroup (x, y) = (column, 32-row block). Column x < NB * TOPK is (token x / TOPK,
+# routed slot x % TOPK) and runs _UP's routed path on that token; the last column runs the
+# shared expert for all NB tokens with one weight read (fp8_rows_nb). Columns vary fastest in
+# dispatch order, so tokens routed to the same expert read the same 32 rows at about the same
+# time and the repeats hit the GPU caches instead of DRAM (real decode at B = 8 routes 48 slots
+# to ~34 distinct experts; row-block-major order: B = 8 +9%, B = 4 +4%).
 _UP_NB = r"""
     threadgroup int chosen[8];
     threadgroup float sv[32]; threadgroup int si[32];
     threadgroup float hblock[NB][32];
     const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
-    const uint ys = threadgroup_position_in_grid.y;
-    const uint row0 = threadgroup_position_in_grid.x * 32 + sg * 4;
+    const uint ys = threadgroup_position_in_grid.x, rb = threadgroup_position_in_grid.y;
+    const uint row0 = rb * 32 + sg * 4;
     if (ys < uint(NB * TOPK)) {
         const uint b = ys / TOPK, slot = ys % TOPK;
         const device float* sc_b = scores + b * NE;
@@ -397,7 +400,7 @@ _UP_NB = r"""
         float wsum = 0.0f;
         for (int j = 0; j < TOPK; ++j) wsum += sc_b[chosen[j]];
         const float rw = sc_b[chosen[slot]] / (wsum + 1e-20f) * route_scale[0];
-        if (tid == 0 && threadgroup_position_in_grid.x == 0 && slot == 0)
+        if (tid == 0 && rb == 0 && slot == 0)
             for (int j = 0; j < TOPK; ++j) {
                 out_idx[b * TOPK + j] = chosen[j];
                 out_w[b * TOPK + j] = sc_b[chosen[j]] / (wsum + 1e-20f) * route_scale[0];
@@ -417,7 +420,7 @@ _UP_NB = r"""
         if (sg == 0) {
             const float v = hblock[0][lane];
             const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hq[(b * TOPK + slot) * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+            hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = act_quant_value(v, s);
         }
     } else {
         float g4[4 * NB], u4[4 * NB];
@@ -433,7 +436,7 @@ _UP_NB = r"""
         if (sg < uint(NB)) {
             const float v = hblock[sg][lane];
             const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hqs[sg * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+            hqs[sg * INTER + rb * 32 + lane] = act_quant_value(v, s);
         }
     }
 """
@@ -444,8 +447,8 @@ _UP_NB_MMA = r"""
     threadgroup float hblock[NB][32];
     const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
-    const uint ys = threadgroup_position_in_grid.y;
-    const uint row0 = threadgroup_position_in_grid.x * 32 + sg * 4;
+    const uint ys = threadgroup_position_in_grid.x, rb = threadgroup_position_in_grid.y;
+    const uint row0 = rb * 32 + sg * 4;
     if (ys < uint(NB * TOPK)) {
         const uint b = ys / TOPK, slot = ys % TOPK;
         const device float* sc_b = scores + b * NE;
@@ -453,7 +456,7 @@ _UP_NB_MMA = r"""
         float wsum = 0.0f;
         for (int j = 0; j < TOPK; ++j) wsum += sc_b[chosen[j]];
         const float rw = sc_b[chosen[slot]] / (wsum + 1e-20f) * route_scale[0];
-        if (tid == 0 && threadgroup_position_in_grid.x == 0 && slot == 0)
+        if (tid == 0 && rb == 0 && slot == 0)
             for (int j = 0; j < TOPK; ++j) {
                 out_idx[b * TOPK + j] = chosen[j];
                 out_w[b * TOPK + j] = sc_b[chosen[j]] / (wsum + 1e-20f) * route_scale[0];
@@ -473,12 +476,12 @@ _UP_NB_MMA = r"""
         if (sg == 0) {
             const float v = hblock[0][lane];
             const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hq[(b * TOPK + slot) * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+            hq[(b * TOPK + slot) * INTER + rb * 32 + lane] = act_quant_value(v, s);
         }
     } else {
         // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups
         threadgroup float red[4][2 * 64], tg_g[4][64], tg_u[4][64];
-        const uint t = sg / 2, ks = sg % 2, r0 = threadgroup_position_in_grid.x * 32 + t * 8;
+        const uint t = sg / 2, ks = sg % 2, r0 = rb * 32 + t * 8;
         fp8_mma8<DIM, 2, NB>(sw1, ss1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[t]);
         fp8_mma8<DIM, 2, NB>(sw3, ss3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[t]);
         for (uint i = tid; i < uint(32 * NB); i += 256) {
@@ -491,17 +494,18 @@ _UP_NB_MMA = r"""
         if (sg < uint(NB)) {
             const float v = hblock[sg][lane];
             const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-            hqs[sg * INTER + threadgroup_position_in_grid.x * 32 + lane] = act_quant_value(v, s);
+            hqs[sg * INTER + rb * 32 + lane] = act_quant_value(v, s);
         }
     }
 """
 
-# Down, routed: one threadgroup per (4 output rows, token), simdgroup = routed slot; the fp32
-# sum over slots in slot order is kept unrounded for the shared expert's addition.
+# Down, routed: one threadgroup per (token x, 4 output rows y), simdgroup = routed slot; the
+# fp32 sum over slots in slot order is kept unrounded for the shared expert's addition.
+# Tokens vary fastest in dispatch order (shared experts' rows read together, as in up).
 _DOWN_R_NB = r"""
     threadgroup float part[TOPK * 4];
     const uint lane = thread_index_in_simdgroup, slot = simdgroup_index_in_threadgroup;
-    const uint row0 = threadgroup_position_in_grid.x * 4, b = threadgroup_position_in_grid.y;
+    const uint b = threadgroup_position_in_grid.x, row0 = threadgroup_position_in_grid.y * 4;
     float acc[4];
     const uint e = uint(idx[b * TOPK + slot]);
     fp4_rows<INTER, 4>(w2 + size_t(e) * DIM * (INTER / 8), s2p + size_t(e) * DIM * (INTER / 32), row0,
@@ -595,13 +599,13 @@ def fused_decode_moe_nb(moe, x, config):
         inputs=[scores, moe.gate.bias, _const((config.route_scale,)), _const((config.swiglu_limit,)), xq,
                 e.w1.weight, e.w1.scales, e.w3.weight, e.w3.scales, s.w1.weight, s.w1.scales, s.w3.weight, s.w3.scales],
         template=[("NE", ne), ("TOPK", topk), ("DIM", dim), ("INTER", inter), ("NB", nb)],
-        grid=(inter // 32 * 256, nb * topk + 1, 1), threadgroup=(256, 1, 1),
+        grid=((nb * topk + 1) * 256, inter // 32, 1), threadgroup=(256, 1, 1),
         output_shapes=[(nb * topk * inter,), (nb * inter,), (nb * topk,), (nb * topk,)],
         output_dtypes=[mx.float32, mx.float32, mx.int32, mx.float32])
     partial = down_r(
         inputs=[hq, idx, e.w2.weight, e.w2.scales],
         template=[("TOPK", topk), ("DIM", dim), ("INTER", inter)],
-        grid=(dim // 4 * topk * 32, nb, 1), threadgroup=(topk * 32, 1, 1),
+        grid=(nb * topk * 32, dim // 4, 1), threadgroup=(topk * 32, 1, 1),
         output_shapes=[(nb * dim,)], output_dtypes=[mx.float32])[0]
     out = down_s(
         inputs=[hqs, partial, s.w2.weight, s.w2.scales],
