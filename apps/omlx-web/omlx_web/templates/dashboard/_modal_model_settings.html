@@ -882,7 +882,7 @@
                                         <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-1">{{ t('modal.model_settings.moe_expert_offload_batch_chunk') }}</label>
                                         <div class="flex items-center gap-2">
                                             <input type="number" min="2" max="48" step="1"
-                                                   aria-label="{{ t('modal.model_settings.moe_expert_offload_batch_chunk') }" :value="modelSettings.moe_expert_offload_batch_chunk"
+                                                   aria-label="{{ t('modal.model_settings.moe_expert_offload_batch_chunk') }}" :value="modelSettings.moe_expert_offload_batch_chunk"
                                                    @input="modelSettings.moe_expert_offload_batch_chunk = $event.target.valueAsNumber"
                                                    class="w-24 px-2 py-1.5 text-xs border border-neutral-200 rounded-md focus:outline-none focus:ring-2 focus:ring-neutral-900 bg-white"
                                                    />

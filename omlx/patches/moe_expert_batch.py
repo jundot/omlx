@@ -23,7 +23,15 @@ _gpu_keepalive = _m._gpu_keepalive
 
 
 def _reserve_many(cache, experts, protected=frozenset()) -> list:
-    """Reserve one slot per expert atomically in a single simulation pass."""
+    """Reserve one slot per expert atomically in a single simulation pass.
+
+    Every touched state field is written back at its own declared type:
+    ``slot_expert`` (np.int64, len=capacity), ``map`` (mx.int32,
+    len=n_experts), ``slot_of`` (dict) and ``free`` (list) — never a
+    local-copy diff that skips the evicted expert (the forward reads
+    ``c.map[expert]``, so an evicted expert left in ``map`` reads another
+    expert's weights as a hit).
+    """
     free_set = set(cache.free)
     current_slot_expert = dict(
         zip(range(len(cache.slot_expert)), cache.slot_expert.tolist())
@@ -34,53 +42,65 @@ def _reserve_many(cache, experts, protected=frozenset()) -> list:
     )
     current_score = cache.score.copy()
 
+    # score is indexed by EXPERT id (len n_experts); protection must mark
+    # the expert's current slot only via slot_of lookup, and victims are
+    # chosen as the expert (not slot) with the lowest score.
     for e in protected:
-        slot = current_slot_of.get(e)
-        if slot is not None:
-            current_score[slot] = np.inf
+        if e in current_slot_of:
+            current_score[e] = np.inf
 
     new_slots: dict = {}
     free_stack = list(free_set)
-    batch_slots: set = set()
+    taken_slots: set = set()
 
     for e in experts:
         if e in current_slot_of:
             new_slots[e] = current_slot_of[e]
+            taken_slots.add(current_slot_of[e])
             continue
         if free_stack:
             slot = free_stack.pop()
+            free_stack.discard(slot)
         else:
-            best_slot, best_score = None, None
-            for s, exp_id in current_slot_expert.items():
-                if exp_id == -1 or s in batch_slots:
+            best_e, best_sc = None, None
+            for e2, s2 in current_slot_of.items():
+                if e2 not in current_map or s2 in taken_slots:
                     continue
-                sc = current_score[s]
-                if best_score is None or sc < best_score:
-                    best_score, best_slot = sc, s
-            slot = best_slot
-            evicted_exp = current_slot_expert[slot]
-            if evicted_exp != -1:
-                del current_slot_of[evicted_exp]
-                current_map[evicted_exp] = -1
-                current_score[slot] = 0.0
+                sc = current_score.get(e2, 0.0)
+                if best_sc is None or sc < best_sc:
+                    best_sc, best_e = sc, e2
+            if best_e is None:
+                # No evictable expert: skip this one, retry next decode step.
+                slot = None
+            else:
+                slot = current_slot_of[best_e]
+                del current_slot_of[best_e]
+                current_map[best_e] = -1
+                current_score[best_e] = 0.0
                 current_slot_expert[slot] = -1
         current_slot_expert[slot] = e
         current_slot_of[e] = slot
         current_map[e] = slot
-        batch_slots.add(slot)
         new_slots[e] = slot
+        if slot is not None:
+            taken_slots.add(slot)
+        # slot is None => no evictable expert was found for this expert this
+        # step; _write_many skips it and the next decode step retries.
 
-    for e2 in list(current_slot_of.keys()):
-        if e2 not in new_slots:
-            del current_slot_of[e2]
-    for e, slot in new_slots.items():
-        cache.map[e] = slot
-        cache.slot_expert[slot] = e
-        cache.slot_of[e] = slot
+    # Full writeback at each field's own type — every surviving expert keeps
+    # a valid slot, and every evicted expert is removed from slot_of /
+    # marked -1 in map; the forward's mx.take(c.map, ...) only ever sees
+    # slots that hold that expert's own weights.
+    cache.slot_expert = np.array(
+        [current_slot_expert.get(s, -1) for s in range(len(current_slot_expert))],
+        dtype=np.int64,
+    )
+    cache.map = mx.array(
+        [current_map.get(e, -1) for e in range(cache.n_experts)], dtype=mx.int32
+    )
+    cache.slot_of = dict(new_slots)
     cache.score = current_score
-    cache.free = [
-        s for s in range(len(cache.slot_expert)) if cache.slot_expert[s] == -1
-    ]
+    cache.free = [s for s, exp in current_slot_expert.items() if exp == -1]
     return [(e, new_slots[e]) for e in experts]
 
 
@@ -118,6 +138,8 @@ def _write_many(
             slot_of = dict(assignments)
             for e, payload in batch:
                 slot = slot_of[e]
+                if slot is None:
+                    continue  # _reserve_many returned -1 (no free/evictable slot)
                 for name, field, plan, raw in payload:
                     t = convert(plan, raw)
                     cache.resident[name][field][slot] = t
