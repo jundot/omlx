@@ -971,9 +971,9 @@ class LanguageModel(DSparkMixin, nn.Module):
         """_forward for B single-token requests with the weights read once per step.
 
         Same per-request semantics as the row loop below (positions, caches, Engram history,
-        cache bookkeeping); the decoder blocks run decode_fused.decode_block_nb, whose kernels
-        give each request the single-request result, and Engram projects each request's row
-        on its own (Engram.__call__).
+        cache bookkeeping). decode_fused.decode_block_nb, Engram (each request's row projected
+        on its own) and project_logits give each request bit for bit its single-request
+        result.
         """
         c = self._config
         b_n = input_ids.shape[0]

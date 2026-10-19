@@ -87,24 +87,31 @@ inline void fp8_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
 }
 // fp8_rows for NB activation vectors (x + b * XS) sharing each weight load: the per-vector
 // arithmetic is fp8_rows' (same lane split, same in-group order), so each vector's result
-// is the single-vector result. acc[r * NB + b].
+// is the single-vector result. acc[r * NB + b]. The ROWS weight groups are decoded once per
+// step and each vector's 8 values are loaded once and applied to all ROWS rows: loading x
+// per (row, vector) made the activation loads 4x the needed ones, which bound the kernel
+// from NB = 4 up (wo_b at NB = 8: 35 GB/s).
 template <int K, int ROWS, int NB, typename W, typename S, typename X>
 inline void fp8_rows_nb(W w, S s, uint row0, X x, uint XS, uint lane, thread float* acc) {
     static_assert(K % 256 == 0, "K must be a multiple of 32 lanes x 8 values");
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
     for (uint k = lane * 8; k < uint(K); k += 256) {
+        float wv[ROWS][8], sc[ROWS];
         for (int r = 0; r < ROWS; ++r) {
             const auto wr = w + size_t(row0 + r) * (K / 4) + k / 4;
             const uint p0 = wr[0], p1 = wr[1];
-            float wv[8];
-            for (int j = 0; j < 4; ++j) wv[j] = fp8_shifted((p0 >> (8 * j)) & 255u);
-            for (int j = 0; j < 4; ++j) wv[4 + j] = fp8_shifted((p1 >> (8 * j)) & 255u);
-            const float sc = e8m0(s[size_t(row0 + r) * (K / 32) + k / 32]);
-            for (int b = 0; b < NB; ++b) {
-                const auto xb = x + size_t(b) * XS + k;
+            for (int j = 0; j < 4; ++j) wv[r][j] = fp8_shifted((p0 >> (8 * j)) & 255u);
+            for (int j = 0; j < 4; ++j) wv[r][4 + j] = fp8_shifted((p1 >> (8 * j)) & 255u);
+            sc[r] = e8m0(s[size_t(row0 + r) * (K / 32) + k / 32]);
+        }
+        for (int b = 0; b < NB; ++b) {
+            const auto xb = x + size_t(b) * XS + k;
+            float xv[8];
+            for (int j = 0; j < 8; ++j) xv[j] = float(xb[j]);
+            for (int r = 0; r < ROWS; ++r) {
                 float a = 0.0f;
-                for (int j = 0; j < 8; ++j) a += wv[j] * float(xb[j]);
-                acc[r * NB + b] += (a * 256.0f) * sc;
+                for (int j = 0; j < 8; ++j) a += wv[r][j] * xv[j];
+                acc[r * NB + b] += (a * 256.0f) * sc[r];
             }
         }
     }
