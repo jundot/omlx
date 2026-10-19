@@ -4863,3 +4863,69 @@ def test_load_model_dequantizes_quantized_router_gate(monkeypatch):
 @pytest.fixture(autouse=True)
 def _pin_verify_router(monkeypatch):
     monkeypatch.setattr(dk, "moe_router", _stock_verify_router(dk.moe_router))
+
+
+@pytest.mark.parametrize("rows", [1, 4, 8])
+def test_mxfp8_dense_kda_decode_groups_match_reference(monkeypatch, rows):
+    import copy
+
+    model, language = _kda_model(159)
+    if not language._DECODE_FUSION:
+        pytest.skip("short KDA kernels are unavailable")
+    attn = model.model.layers[0].self_attn
+    for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+        setattr(
+            attn,
+            name,
+            nn.QuantizedLinear.from_linear(
+                getattr(attn, name), group_size=32, bits=8, mode="mxfp8"
+            ),
+        )
+    attn.forget_gate.A_log = attn.forget_gate.A_log.astype(mx.float32)
+    attn.forget_gate.dt_bias = attn.forget_gate.dt_bias.astype(mx.float32)
+    x = mx.random.normal((1, rows, model.args.hidden_size)).astype(mx.bfloat16)
+    mx.eval(x, model.parameters())
+    cache = model.make_cache()[0]
+    reference_cache = copy.deepcopy(cache)
+    with monkeypatch.context() as patch:
+        patch.setattr(type(attn), "_decode_step", lambda *args, **kwargs: None)
+        reference = attn(x, cache=reference_cache)
+        mx.eval(reference, reference_cache[0], reference_cache[1])
+    result = attn._decode_step(x, None, cache)
+    assert result is not None
+    mx.eval(result, cache[0], cache[1])
+    assert mx.allclose(result, reference, rtol=0.015625, atol=0.001).item()
+    assert mx.allclose(cache[0], reference_cache[0], rtol=0.015625, atol=0.001).item()
+    assert mx.allclose(cache[1], reference_cache[1], rtol=0.015625, atol=0.001).item()
+
+
+@pytest.mark.parametrize("field", ["scales", "biases"])
+def test_kda_decode_groups_preserve_sidecar_dtypes(field):
+    from mlx.utils import tree_flatten
+
+    model, _ = _kda_model(163)
+    attn = model.model.layers[0].self_attn
+    for name in ("q_proj", "k_proj", "v_proj"):
+        projection = nn.QuantizedLinear.from_linear(
+            getattr(attn, name), group_size=32, bits=8
+        )
+        projection.scales = projection.scales.astype(mx.bfloat16)
+        projection.biases = projection.biases.astype(mx.bfloat16)
+        setattr(attn, name, projection)
+    attn.q_proj[field] = attn.q_proj[field].astype(mx.float32)
+    before = dict(tree_flatten(attn.parameters()))
+    x = mx.random.normal((1, 4, model.args.hidden_size)).astype(mx.bfloat16)
+    outputs = [proj(x) for proj in (attn.q_proj, attn.k_proj, attn.v_proj)]
+    mx.eval(before, outputs)
+    groups = attn._build_decode_groups()
+    assert groups
+    after = dict(tree_flatten(attn.parameters()))
+    assert before.keys() == after.keys()
+    for name, value in before.items():
+        assert value.dtype == after[name].dtype, name
+        assert value.shape == after[name].shape, name
+        assert _mismatches(value, after[name]) == 0, name
+    for reference, proj in zip(outputs, (attn.q_proj, attn.k_proj, attn.v_proj)):
+        result = proj(x)
+        assert reference.dtype == result.dtype
+        assert _mismatches(reference, result) == 0

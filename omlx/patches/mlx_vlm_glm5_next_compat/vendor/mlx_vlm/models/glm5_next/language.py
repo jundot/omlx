@@ -503,9 +503,12 @@ class Glm5NextLinearAttention(nn.Module):
         return mx.split(out, self._split_pts, axis=-1)
 
     def _build_decode_groups(self):
-        """One fused weight per quantization for projections that mix bit
-        widths (e.g. a 5-bit v_proj among 8-bit q/k/gates): row blocks in
-        q|k|v|f_a|g_a|b order within each group. False when not covered."""
+        """Group input projections without changing their quantized values.
+
+        Floating-point quantized and dense gate projections keep their own
+        arithmetic. The concatenated outputs also feed the existing short
+        KDA kernel, whose gate inputs may be computed outside that kernel.
+        """
         mods = [
             self.q_proj,
             self.k_proj,
@@ -514,29 +517,62 @@ class Glm5NextLinearAttention(nn.Module):
             self.g_a_proj,
             self.b_proj,
         ]
-        for m in mods:
-            if (
-                not isinstance(m, nn.QuantizedLinear)
-                or getattr(m, "mode", "affine") != "affine"
-                or "bias" in m
-                or getattr(m, "biases", None) is None
-            ):
-                return False
         order = {}
         for i, m in enumerate(mods):
-            order.setdefault((int(m.bits), int(m.group_size)), []).append(i)
+            if "bias" in m:
+                return False
+            if isinstance(m, nn.QuantizedLinear):
+                mode = getattr(m, "mode", "affine")
+                if mode == "affine":
+                    if m.get("biases") is None:
+                        return False
+                elif mode != "mxfp8" or (m.bits, m.group_size) != (8, 32):
+                    return False
+                bits, gs = int(m.bits), int(m.group_size)
+            elif isinstance(m, nn.Linear) and m.weight.dtype in (
+                mx.bfloat16,
+                mx.float16,
+            ):
+                mode, bits, gs = "dense", 0, 0
+            else:
+                return False
+            key = (
+                bits,
+                gs,
+                mode,
+                m.weight.dtype,
+                m.scales.dtype if mode != "dense" else None,
+                m.biases.dtype if mode == "affine" else None,
+                i if mode == "dense" else None,
+            )
+            order.setdefault(key, []).append(i)
         if len(order) < 2:
             return False
         groups = []
-        for (bits, gs), members in order.items():
-            parts = [(mods[i].weight, mods[i].scales, mods[i].biases) for i in members]
-            if len(parts) == 1:
-                w, sc, bi = parts[0]
-            else:
-                w, sc, bi = (mx.concatenate(list(t), axis=0) for t in zip(*parts))
-            groups.append((bits, gs, members, w, sc, bi))
-        # Runs of consecutive projections that sit next to each other in one
-        # group's output: (group index, first row, last row) in q..b order.
+        for (bits, gs, mode, *_dtypes), members in order.items():
+
+            def joined(field, members=members):
+                values = [mods[i][field] for i in members]
+                return values[0] if len(values) == 1 else mx.concatenate(values, axis=0)
+
+            w = joined("weight")
+            sc = joined("scales") if mode != "dense" else None
+            bi = joined("biases") if mode == "affine" else None
+            if len(members) > 1:
+                # Keep one storage allocation: individual prefill/verify calls
+                # and serialized parameters use views of the grouped weights.
+                # Output-axis slices preserve the packed values and layout.
+                start = 0
+                for i in members:
+                    m = mods[i]
+                    stop = start + m.weight.shape[0]
+                    m.weight = w[start:stop]
+                    if sc is not None:
+                        m.scales = sc[start:stop]
+                    if bi is not None:
+                        m.biases = bi[start:stop]
+                    start = stop
+            groups.append((bits, gs, members, w, sc, bi, mode))
         rows = [m.weight.shape[0] for m in mods]
         where = {}
         for g, (_, _, members, *_rest) in enumerate(groups):
@@ -559,15 +595,23 @@ class Glm5NextLinearAttention(nn.Module):
         return (groups, runs)
 
     def _grouped_in_proj(self, inputs):
-        """``[linear_forward(m, inputs) for m in q..b]`` concatenated, with one
-        matmul per quantization (each row is its own layer's matmul row)."""
+        """Concatenate input projections, retaining each group's mode."""
         if not self._decode_groups:
             return None
         groups, runs = self._decode_groups
-        outs = [
-            fused_quantized_matmul(inputs, w, sc, bi, bits=bits, group_size=gs)
-            for bits, gs, _, w, sc, bi in groups
-        ]
+        outs = []
+        for bits, gs, _, w, sc, bi, mode in groups:
+            if mode == "affine":
+                out = fused_quantized_matmul(
+                    inputs, w, sc, bi, bits=bits, group_size=gs
+                )
+            elif mode == "mxfp8":
+                out = mx.quantized_matmul(
+                    inputs, w, sc, transpose=True, bits=bits, group_size=gs, mode=mode
+                )
+            else:
+                out = inputs @ w.T
+            outs.append(out)
         return mx.concatenate([outs[g][..., a:b] for g, a, b in runs], axis=-1)
 
     def _decode_step(self, inputs, mask, cache, capture=None):

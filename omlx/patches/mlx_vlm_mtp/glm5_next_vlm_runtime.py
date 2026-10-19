@@ -40,6 +40,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .. import glm53_kda_prework
+from ..qwen35_verify_qmm import takes_verify_route
 from ..mlx_lm_mtp import prompt_priming
 from .glm5_next_batch_rollback import rollback_rows
 
@@ -352,10 +353,21 @@ def _verify_qmm_may_route(g5_lang: Any, attn: Any, inputs: mx.array) -> bool:
     then runs them one by one, e.g. GLM-5.3's layer 40 with a 5-bit v_proj),
     while the fused step's grouped matmuls are never routed. Those blocks
     keep the reference body, so the verify values do not depend on the path.
+    Floating-point quantization and dense gates stay eligible for the fused
+    body unless row-exact routing actually changes their individual calls.
     """
     if getattr(attn, "_fused_ready", False):
         return False
-    return g5_lang.verify_qmm_routed(inputs.shape[0] * inputs.shape[1])
+    rows = inputs.shape[0] * inputs.shape[1]
+    projections = (
+        attn.q_proj,
+        attn.k_proj,
+        attn.v_proj,
+        attn.forget_gate.f_a_proj,
+        attn.g_a_proj,
+        attn.b_proj,
+    )
+    return any(takes_verify_route(p, rows, inputs.dtype) for p in projections)
 
 
 def _patch_decoder_layer(g5_lang: Any) -> None:

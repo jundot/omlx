@@ -1362,7 +1362,25 @@ def check_verify_matches_reference(
             for attn, entry in zip(kda, fused_out.gdn_states):
                 # Under armed routes a layer with separately quantized
                 # projections keeps the reference body for multi-row blocks.
-                reference_body = armed and width >= 2 and not attn._fused_ready
+                verify_qmm.set_verify_qmm_armed(armed)
+                reference_body = (
+                    armed
+                    and not attn._fused_ready
+                    and any(
+                        verify_qmm.takes_verify_route(
+                            p, width, fused_out.hidden_states[-1].dtype
+                        )
+                        for p in (
+                            attn.q_proj,
+                            attn.k_proj,
+                            attn.v_proj,
+                            attn.forget_gate.f_a_proj,
+                            attn.g_a_proj,
+                            attn.b_proj,
+                        )
+                    )
+                )
+                verify_qmm.set_verify_qmm_armed(False)
                 assert isinstance(
                     entry, tuple if reference_body else language.KdaStepCapture
                 )
@@ -1935,3 +1953,65 @@ def test_block_drafter_generation_matches_plain_decode(monkeypatch):
     drafted = _generate(model, prompt, 24, True, True)
     assert drafted == plain
     assert 4 in widths, widths
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("rows", [2, 4, 8])
+@pytest.mark.parametrize("row_exact", [False, True])
+def test_mixed_verify_capture_keeps_projection_arithmetic(monkeypatch, rows, row_exact):
+    from omlx.patches import qwen35_verify_qmm as verify_qmm
+
+    rt, language = _runtime()
+    model = _model(162, [(4, 4), (4, 5)])
+    attn = model.model.layers[0].self_attn
+    for owner, name in [
+        (attn, n) for n in ("q_proj", "k_proj", "v_proj", "g_a_proj", "b_proj")
+    ] + [(attn.forget_gate, "f_a_proj")]:
+        old = getattr(owner, name)
+        dense = nn.Linear(attn.hidden_size, old.weight.shape[0], bias=False)
+        dense.weight = (mx.random.normal(dense.weight.shape) * 0.02).astype(mx.bfloat16)
+        setattr(
+            owner,
+            name,
+            (
+                nn.QuantizedLinear.from_linear(
+                    dense, group_size=32, bits=8, mode="mxfp8"
+                )
+                if name in ("q_proj", "k_proj", "v_proj")
+                else dense
+            ),
+        )
+    original_params = dict(tree_flatten(attn.parameters()))
+    x = mx.random.normal((1, rows, attn.hidden_size)).astype(mx.bfloat16) * 0.05
+    mx.eval(x, attn.parameters())
+    assert verify_qmm.apply_verify_qmm_patch()
+    cache = model.make_cache()[0]
+    reference_cache = copy.deepcopy(cache)
+    verify_qmm.set_verify_qmm_armed(True, row_exact=row_exact)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(language, "_DECODE_FUSION", False)
+            reference = attn(x, cache=reference_cache, gdn_sink=[])
+            mx.eval(reference, reference_cache[0], reference_cache[1])
+        sink = []
+        before = dk.STATS["kda"]
+        result = attn(x, cache=cache, gdn_sink=sink)
+        mx.eval(result, cache[0], cache[1])
+        assert dk.STATS["kda"] - before == (0 if row_exact else 1)
+        assert isinstance(sink[0], tuple if row_exact else language.KdaStepCapture)
+        for a, b in [
+            (reference, result),
+            (reference_cache[0], cache[0]),
+            (reference_cache[1], cache[1]),
+        ]:
+            assert mx.allclose(a, b, rtol=0.015625, atol=0.001).item()
+        if not row_exact:
+            # Rebinding group storage must preserve serialization and individual calls.
+            current_params = dict(tree_flatten(attn.parameters()))
+            for key, value in original_params.items():
+                assert key in current_params
+                assert _bitwise_equal(value, current_params[key]), key
+            for m in (attn.q_proj, attn.k_proj, attn.v_proj):
+                assert m.mode == "mxfp8" and m.bits == 8 and m.group_size == 32
+    finally:
+        verify_qmm.set_verify_qmm_armed(False)
