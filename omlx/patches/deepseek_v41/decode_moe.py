@@ -581,11 +581,12 @@ def _kernels_nb(mma=False):
     return gate, up, down_r, down_s
 
 
-def fused_decode_moe_nb(moe, x, config):
+def fused_decode_moe_nb(moe, x, config, mma=None):
     """NB tokens at once. x: [NB, dim] bf16 (ffn_norm outputs). Returns [NB, dim] bf16; each
-    token's result equals fused_decode_moe on that token alone."""
+    token's result equals fused_decode_moe on that token alone, bit for bit without matrix
+    tiles (mma=False) and within fp32 summation rounding with them (default: use_mma(NB))."""
     nb = x.shape[0]
-    gate_k, up_k, down_r, down_s = _kernels_nb(use_mma(nb))
+    gate_k, up_k, down_r, down_s = _kernels_nb(use_mma(nb) if mma is None else mma)
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
     tpg = 256
     n_tg = (ne + tpg // 32 - 1) // (tpg // 32)

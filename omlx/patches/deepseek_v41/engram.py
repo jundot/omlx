@@ -130,6 +130,10 @@ class NgramHash:
         return np.concatenate(hashes, -1) + self.offsets, joined[:, -depth:]
 
 
+# Inputs of up to this many rows (batched decode, MTP verify) are projected row by row.
+_ROWWISE_ROWS = 8
+
+
 class Engram(nn.Module):
     def __init__(self, config, table_index):
         super().__init__()
@@ -150,12 +154,16 @@ class Engram(nn.Module):
     def __call__(self, h, ids, image_mask=None):
         c = self._config
         rows = self.embed(mx.array(ids)).flatten(-2)
-        if rows.ndim == 3 and rows.shape[0] > 1 and rows.shape[1] == 1:
-            # Batched decode (one token for each of B requests): project each request's row
-            # on its own, exactly as when it decodes alone. A B-row quantized_matmul runs a
-            # different MLX kernel whose fp32 sums round differently (the reference leaves
-            # GEMM order free, but a request's tokens would then depend on its batch).
-            kv = mx.concatenate([self.wkv(rows[r : r + 1]) for r in range(rows.shape[0])])
+        count = rows.shape[0] * rows.shape[1] if rows.ndim == 3 else 1
+        if 1 < count <= _ROWWISE_ROWS:
+            # Decode-sized inputs (one token for each of B requests, or an MTP verify block
+            # of one request): project each row on its own, exactly as a single-token
+            # decode does. A multi-row quantized_matmul runs a different MLX kernel whose
+            # fp32 sums round differently (the reference leaves GEMM order free, but a
+            # token's output would then depend on its batch or on speculation).
+            flat = rows.reshape(count, 1, -1)
+            kv = mx.concatenate([self.wkv(flat[r : r + 1]) for r in range(count)])
+            kv = kv.reshape(*rows.shape[:2], -1)
         else:
             kv = self.wkv(rows)
         key, value = mx.split(kv, [c.dim * c.hc_mult], axis=-1)

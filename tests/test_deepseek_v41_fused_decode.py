@@ -377,3 +377,85 @@ def test_batched_engram_projects_each_request_like_a_single_request(batch):
     batched = engram(h, ids)
     single = mx.concatenate([engram(h[r : r + 1], ids[r : r + 1]) for r in range(batch)])
     assert mx.array_equal(batched, single).item()
+
+
+@pytest.mark.parametrize("prompt_length", [11, 2])   # full window (batched attention) / filling
+@pytest.mark.parametrize("rows,accepted", [(2, 0), (3, 2), (4, 1), (6, 3)])
+def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted, prompt_length):
+    """An MTP verify block through the fused kernels gives every token bit for bit the
+    logits of decoding it alone, and after a partial rollback the cache continues exactly
+    like one that decoded only the accepted tokens."""
+    model = build(vocab_size=4096)   # the vocab head kernel (per-row exact) needs >= 4096 rows
+    calls = []
+    real = decode_fused.decode_block_verify
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(decode_fused, "decode_block_verify", counted)
+    rng = np.random.default_rng(29 + rows)
+    prompt = rng.integers(3, 60, prompt_length).tolist()
+    tokens = rng.integers(3, 60, rows + 1).tolist()   # confirmed token, drafts, next step
+    sequential, verified, accepted_only = (model.make_cache() for _ in range(3))
+    for cache in (sequential, verified, accepted_only):
+        mx.eval(model(mx.array([prompt]), cache=cache))
+    expected = [model(mx.array([[t]]), cache=sequential)[0, -1] for t in tokens[:rows]]
+    got = model(mx.array([tokens[:rows]]), cache=verified, n_confirmed=1)
+    for j in range(rows):
+        assert mx.array_equal(got[0, j], expected[j]).item(), f"row {j}"
+    assert len(calls) == model._config.n_layers
+    assert model.mtp_partial_rollback(verified, accepted, rows - 1)
+    for t in tokens[: accepted + 1]:
+        mx.eval(model(mx.array([[t]]), cache=accepted_only))
+    assert verified[0].size() == accepted_only[0].size()
+    nxt = mx.array([[tokens[accepted + 1]]])
+    assert mx.array_equal(model(nxt, cache=verified), model(nxt, cache=accepted_only)).item()
+
+
+def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch):
+    """DSpark speculation over the fused decode kernels reproduces greedy decoding token for
+    token (verify blocks are token-exact, rejected drafts roll back exactly)."""
+    from mlx_lm.generate import BatchGenerator
+
+    from omlx.patches.mlx_lm_mtp import batch_generator
+
+    batch_generator.apply()
+    model = build(
+        vocab_size=4096,
+        preserve_mtp=True,
+        n_mtp_layers=1,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_markov_rank=32,
+    )
+    prompt = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+    expected, cache = [], model.make_cache()
+    ids = mx.array([prompt])
+    for _ in range(24):
+        token = int(mx.argmax(model(ids, cache=cache)[0, -1]).item())
+        expected.append(token)
+        ids = mx.array([[token]])
+    calls = []
+    real = decode_fused.decode_block_verify
+
+    def counted(*args, **kwargs):
+        calls.append(args[1].shape[1])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(decode_fused, "decode_block_verify", counted)
+    model.configure_mtp(True, 3)
+    generator = BatchGenerator(model, max_tokens=24, prefill_step_size=4, sampler=lambda logits: mx.argmax(logits, -1))
+    result = []
+    try:
+        generator.insert([prompt])
+        for _ in range(96):
+            _, responses = generator.next()
+            result.extend(response.token for response in responses)
+            if len(result) >= 24:
+                break
+    finally:
+        generator.close()
+    assert calls and max(calls) > 1, "verify blocks must take the fused path"
+    assert result[:24] == expected

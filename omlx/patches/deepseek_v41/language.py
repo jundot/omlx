@@ -836,6 +836,13 @@ class Block(nn.Module):
             and decode_fused.supported(self, self._config)
         ):
             return decode_fused.decode_block(self, h, pre, cache, shared, start, self._config)
+        if (
+            shared.get("_verify_rows")
+            and ced_tail is None
+            and image_mask is None
+            and getattr(cache, "_mtp_verify_state", None) is not None
+        ):
+            return decode_fused.decode_block_verify(self, h, pre, cache, shared, start, self._config)
         ced_kv = ced_kv_start = None
         if ced_tail is not None:
             # CED bounded replay: queries, SWA KV and MoE run on the tail
@@ -1102,6 +1109,16 @@ class LanguageModel(DSparkMixin, nn.Module):
                 (mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1]
             )
             shared = {}
+            # An MTP verify block runs through the fused decode kernels token-exactly
+            # (decode_fused.decode_block_verify: each token gets its single-token decode
+            # result, so speculation cannot change greedy output) when every layer has them.
+            if (
+                verify_states is not None
+                and inputs_embeds is None
+                and 1 <= end - begin <= decode_fused.MAX_BATCH
+                and all(decode_fused.supported(layer, c) for layer in self.layers)
+            ):
+                shared["_verify_rows"] = True
             # Only cache-only scheduler calls may omit decoder logits. A short
             # contiguous suffix retains its existing window rather than
             # pretending that a full replay window was present in this chunk.
