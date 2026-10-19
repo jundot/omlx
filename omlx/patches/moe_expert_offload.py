@@ -550,6 +550,7 @@ class ExpertCache:
         sent = 0
         keepalive = barrier = None
         slow = False
+        _bench_t0 = time.perf_counter()
 
         def prefetch(upto: int) -> None:
             nonlocal sent
@@ -593,6 +594,8 @@ class ExpertCache:
                 del pending[e], group
         finally:
             _drain(pending)
+        from .moe_expert_batch import _bench_record as _br
+        _br(self, len(misses), _bench_t0, "stock")
         # No mx.eval here: installs are already-materialized host arrays, and
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the

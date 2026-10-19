@@ -76,13 +76,12 @@ def _reserve_many(cache, experts, protected=frozenset()) -> list:
                 slot = current_slot_of[best_e]
                 del current_slot_of[best_e]
                 current_map[best_e] = -1
-                current_score[best_e] = 0.0
                 current_slot_expert[slot] = -1
-        current_slot_expert[slot] = e
-        current_slot_of[e] = slot
-        current_map[e] = slot
-        new_slots[e] = slot
         if slot is not None:
+            current_slot_expert[slot] = e
+            current_slot_of[e] = slot
+            current_map[e] = slot
+            new_slots[e] = slot
             taken_slots.add(slot)
         # slot is None => no evictable expert was found for this expert this
         # step; _write_many skips it and the next decode step retries.
@@ -103,6 +102,20 @@ def _reserve_many(cache, experts, protected=frozenset()) -> list:
     cache.free = [s for s, exp in current_slot_expert.items() if exp == -1]
     return [(e, new_slots[e]) for e in experts]
 
+
+def _bench_record(cache, n_miss, t0, label):
+    """OMLX_MOE_BENCH=1 时记录本次安装的 miss 数与耗时，用于 before/after 对比。"""
+    import os
+    if os.environ.get("OMLX_MOE_BENCH") != "1":
+        return
+    import time
+    elapsed = time.perf_counter() - t0
+    per = elapsed / n_miss if n_miss else 0.0
+    print(
+        f"[MOE_BENCH] {label}: miss={n_miss} install_total={elapsed:.4f}s "
+        f"per_expert={per*1000:.2f}ms",
+        flush=True,
+    )
 
 def _store(cache):
     """Resolve staging/checkpoint store ops for ``cache`` (may be None)."""
@@ -184,6 +197,7 @@ def batch_ensure_ids(cache, ids, on_slow_read=None, pending=None) -> bool:
     pool = _io_pool()
     window = _io_batch()
     sent = 0
+    _bench_t0 = time.perf_counter()
     keepalive = barrier = None
     slow = False
 
@@ -252,6 +266,7 @@ def batch_ensure_ids(cache, ids, on_slow_read=None, pending=None) -> bool:
                 protected=protected,
                 chunk=chunk,
             )
+            _bench_record(cache, len(misses), _bench_t0, "batch")
     finally:
         _drain(pending)
     return slow
