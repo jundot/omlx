@@ -89,15 +89,18 @@ def _woa_mxfp8(att):
     return cached or None
 
 
-def _mxfp8_projection(p):
-    """A projection the fused GEMVs can read: MXFP8, group 32, FP8-quantized input."""
+def _fused_projection(p):
+    """A projection the fused GEMVs can read: MXFP8 or affine, FP8-quantized input."""
     return (
         isinstance(p, QuantizedProjection)
-        and p.mode == "mxfp8"
-        and p.group_size == 32
         and getattr(p, "quantize_input", False)
-        and "biases" not in p
+        and DM.weight_format(p) not in (None, DM.MXFP4)
     )
+
+
+def _wb(p):
+    """(weight, scales, biases) kernel inputs of a projection; MXFP passes a dummy bias."""
+    return p.weight, p.scales, DM._biases(p)
 
 
 def mix(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
@@ -126,13 +129,23 @@ def mix(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
     return coef, xn, xq, h
 
 
+def _pair_formats(a, b):
+    fa = DM.weight_format(a)
+    return (fa, fa if b is None else DM.weight_format(b))
+
+
+def _pair_inputs(x, a, b):
+    # 8-element dummies: smaller inputs are passed in constant address space.
+    dummy = (_const((0,) * 8, mx.uint32), _const((0,) * 8, mx.uint8), _const((0,) * 8))
+    return [x, *_wb(a), *(_wb(b) if b is not None else dummy)]
+
+
 def gemv_fp8(x, a, b=None):
-    na, k = a.weight.shape[0], a.weight.shape[1] * 4
+    na, k = a.weight.shape[0], a.input_dims
     nb = 0 if b is None else b.weight.shape[0]
     assert na % 4 == 0 and nb % 4 == 0, "4-row simdgroups must not straddle the two matrices"
-    dummy_w, dummy_s = _dummy(mx.uint32), _dummy(mx.uint8)
-    ya, yb = DL.kernel("gemv_fp8")(
-        inputs=[x, a.weight, a.scales, b.weight if b is not None else dummy_w, b.scales if b is not None else dummy_s],
+    ya, yb = DL.kernel("gemv_fp8", _pair_formats(a, b))(
+        inputs=_pair_inputs(x, a, b),
         template=[("NA", na), ("NB", nb), ("K", k)],
         grid=((na + nb + 7) // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(na,), (max(nb, 1),)], output_dtypes=[mx.bfloat16, mx.bfloat16])
@@ -151,8 +164,8 @@ def attn_mid(att, qa, kv_in, cos, sin, c):
 
 def wqb_rope(att, qrq, cos, sin, c):
     nq = c.n_heads * c.head_dim
-    return DL.kernel("wqb_rope")(
-        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin],
+    return DL.kernel("wqb_rope", (DM.weight_format(att.wq_b),))(
+        inputs=[qrq, *_wb(att.wq_b), cos, sin],
         template=[("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim)],
         grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(nq,)], output_dtypes=[mx.bfloat16])[0]
@@ -297,10 +310,16 @@ def gemv_fp8_nb(x, a, b=None, mma=None):
     """gemv_fp8 for x [B, K]: one weight read for all B vectors. Bit for bit gemv_fp8 per
     vector without matrix tiles (mma=False); default DM.use_mma(B)."""
     b_n = x.shape[0]
-    na, k = a.weight.shape[0], a.weight.shape[1] * 4
+    na, k = a.weight.shape[0], a.input_dims
     nb = 0 if b is None else b.weight.shape[0]
     assert na % 4 == 0 and nb % 4 == 0
-    if (DM.use_mma(b_n) if mma is None else mma) and na % 8 == 0 and nb % 8 == 0:
+    formats = _pair_formats(a, b)
+    if (
+        (DM.use_mma(b_n) if mma is None else mma)
+        and na % 8 == 0
+        and nb % 8 == 0
+        and formats == (DM.MXFP8, DM.MXFP8)
+    ):
         # 8-element dummies: inputs under 8 elements are passed in constant address space.
         dw, ds = _const((0,) * 8, mx.uint32), _const((0,) * 8, mx.uint8)
         tiles = (na + nb) // 8
@@ -311,9 +330,8 @@ def gemv_fp8_nb(x, a, b=None, mma=None):
             grid=(tiles * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
             output_shapes=[(b_n * na,), (b_n * max(nb, 1),)], output_dtypes=[mx.bfloat16, mx.bfloat16])
         return ya.reshape(b_n, na), (yb.reshape(b_n, nb) if b is not None else None)
-    dummy_w, dummy_s = _dummy(mx.uint32), _dummy(mx.uint8)
-    ya, yb = DL.kernel("gemv_fp8_nb")(
-        inputs=[x, a.weight, a.scales, b.weight if b is not None else dummy_w, b.scales if b is not None else dummy_s],
+    ya, yb = DL.kernel("gemv_fp8_nb", formats)(
+        inputs=_pair_inputs(x, a, b),
         template=[("NA", na), ("NB_ROWS", nb), ("K", k), ("NB", b_n)],
         grid=((na + nb + 7) // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(b_n * na,), (b_n * max(nb, 1),)], output_dtypes=[mx.bfloat16, mx.bfloat16])
@@ -343,14 +361,15 @@ def wqb_rope_nb(att, qrq, cos, sin, c, mma):
     b_n = qrq.shape[0]
     nq = c.n_heads * c.head_dim
     tmpl = [("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n)]
-    if mma:
+    fmt = DM.weight_format(att.wq_b)
+    if mma and fmt == DM.MXFP8:
         ks = _mma_split(nq // 8, c.q_lora_rank // 32)
         return DL.kernel("wqb_rope_mma")(
             inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl + [("KS", ks)],
             grid=(nq // 8 * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
             output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
-    return DL.kernel("wqb_rope_nb")(
-        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl,
+    return DL.kernel("wqb_rope_nb", (fmt,))(
+        inputs=[qrq, *_wb(att.wq_b), cos, sin], template=tmpl,
         grid=(nq // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
 
@@ -563,9 +582,9 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
 
 def supported(blk, c):
     """Static support check for a decoder block (cached on the block): the layouts the fused
-    kernels read (MXFP8 attention projections, an exactly MXFP8-representable bf16 wo_a, MXFP4
-    routed and MXFP8 shared experts) and the shapes they assume. Anything else, e.g. an oQ
-    export below oQ4 with affine-requantized projections, keeps the unfused path."""
+    kernels read (MXFP8 or affine attention projections with FP8-quantized inputs, an exactly
+    MXFP8-representable bf16 wo_a, MXFP4 / MXFP8 / affine routed and MXFP8 / affine shared
+    experts) and the shapes they assume. Anything else keeps the unfused path."""
     ok = getattr(blk, "_fused_decode_ok", None)
     if ok is None:
         att = blk.attn
@@ -574,7 +593,7 @@ def supported(blk, c):
             and c.dim % 1024 == 0
             and c.head_dim % 256 == 0   # split_attention's layout (V4.1: 512)
             and c.n_heads % 8 == 0
-            and all(_mxfp8_projection(getattr(att, n)) for n in ("wq_a", "wkv", "wq_b", "wo_b"))
+            and all(_fused_projection(getattr(att, n)) for n in ("wq_a", "wkv", "wq_b", "wo_b"))
             and DM.supported(blk.ffn, _empty((1, 1, c.dim), mx.bfloat16), c)
             and _woa_mxfp8(att) is not None
         )

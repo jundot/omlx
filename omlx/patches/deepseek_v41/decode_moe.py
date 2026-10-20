@@ -5,7 +5,7 @@ Follows DeepSeek-V4.1-Flash-1017 inference/model.py (Gate, Expert, MoE) and kern
   gate:    scores = sqrt(softplus(linear(x.float(), W.float()) / gate_temp)), softplus with
            torch's threshold 20; top-k of (scores + bias) picks experts, weights are the
            unbiased scores, w / (sum(w) + 1e-20) * route_scale
-  expert:  act_quant(x) -> fp4/fp8 GEMM -> bf16 gate, up; clamp(up, +-limit),
+  expert:  act_quant(x) -> fp4/fp8/affine GEMM -> bf16 gate, up; clamp(up, +-limit),
            min(gate, limit); silu(gate) * up * weight in fp32 -> bf16 -> act_quant ->
            w2 GEMM -> bf16
   combine: fp32 sum of the routed bf16 outputs plus the shared expert's, stored as bf16
@@ -14,11 +14,12 @@ reference): fp32 accumulation order of each GEMM row and of the expert sum, the 
 tied top-k candidates, and the transcendentals (exp, log1p, sqrt). Weight times activation
 products are exact in fp32 (fp4 or fp8 times a power-of-two scale times bf16), so each
 GEMM row differs from any other fp32 order by at most gamma_K * sum|x_i w_i| before its
-bf16 rounding (K = 5120 or 2304, gamma_K = K 2^-24 / (1 - K 2^-24)).
+bf16 rounding (K = 5120 or 2304, gamma_K = K 2^-24 / (1 - K 2^-24)). Affine weights (oQ
+exports) add scale * sum(q x) + bias * sum(x) per group, the order MLX's qdot uses.
 
 Why this differs from upstream oMLX's decode MoE (language.MoE): same math, but gate, top-k,
 quantization, the seven expert GEMMs, SwiGLU and the combine run in three kernels with the
-selected experts' packed MXFP4 / MXFP8 weights read in place.
+selected experts' packed MXFP4 / MXFP8 / affine weights read in place (weight_format).
 """
 
 from functools import cache
@@ -210,6 +211,201 @@ inline void fp4_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
     }
     for (int r = 0; r < ROWS; ++r) acc[r] = simd_sum(acc[r]);
 }
+// Affine weights (MLX layout, as oQ exports store them), read like MLX's qdot: x is pre-scaled
+// per term so each code is multiplied masked in place (no shifts, ~35% faster at 3 bits); a code
+// that straddles a byte (3, 5, 6 bits) gives two terms. A lane covers 16 contiguous values:
+// aff_x16 gives their terms' x and their sum, aff_w16 one row's masked codes. Their dot is
+// order-fixed (explicit fma), so the one- and multi-vector helpers give a vector the same value.
+template <int BITS>
+constexpr int aff_terms16() { return BITS == 3 ? 20 : (BITS == 5 || BITS == 6) ? 24 : 16; }
+template <int BITS, typename X>
+inline float aff_x16(X x, thread float* t) {
+    float xv[16], sum = 0.0f;
+    for (int i = 0; i < 16; ++i) { xv[i] = float(x[i]); sum += xv[i]; }
+    if (BITS == 2) {
+        for (int i = 0; i < 16; i += 4) { t[i] = xv[i]; t[i + 1] = xv[i + 1] / 4.0f; t[i + 2] = xv[i + 2] / 16.0f; t[i + 3] = xv[i + 3] / 64.0f; }
+    } else if (BITS == 3) {
+        for (int i = 0, o = 0; i < 16; i += 8, o += 10) {
+            t[o] = xv[i]; t[o + 1] = xv[i + 1] / 8.0f; t[o + 2] = xv[i + 2] / 64.0f; t[o + 3] = xv[i + 2] * 4.0f;
+            t[o + 4] = xv[i + 3] / 2.0f; t[o + 5] = xv[i + 4] / 16.0f; t[o + 6] = xv[i + 5] / 128.0f; t[o + 7] = xv[i + 5] * 2.0f;
+            t[o + 8] = xv[i + 6] / 4.0f; t[o + 9] = xv[i + 7] / 32.0f;
+        }
+    } else if (BITS == 4) {
+        for (int i = 0; i < 16; i += 4) { t[i] = xv[i]; t[i + 1] = xv[i + 1] / 16.0f; t[i + 2] = xv[i + 2] / 256.0f; t[i + 3] = xv[i + 3] / 4096.0f; }
+    } else if (BITS == 5) {
+        for (int i = 0, o = 0; i < 16; i += 8, o += 12) {
+            t[o] = xv[i]; t[o + 1] = xv[i + 1] / 32.0f; t[o + 2] = xv[i + 1] * 8.0f; t[o + 3] = xv[i + 2] / 4.0f;
+            t[o + 4] = xv[i + 3] / 128.0f; t[o + 5] = xv[i + 3] * 2.0f; t[o + 6] = xv[i + 4] / 16.0f; t[o + 7] = xv[i + 4] * 16.0f;
+            t[o + 8] = xv[i + 5] / 2.0f; t[o + 9] = xv[i + 6] / 64.0f; t[o + 10] = xv[i + 6] * 4.0f; t[o + 11] = xv[i + 7] / 8.0f;
+        }
+    } else if (BITS == 6) {
+        for (int i = 0, o = 0; i < 16; i += 4, o += 6) {
+            t[o] = xv[i]; t[o + 1] = xv[i + 1] / 64.0f; t[o + 2] = xv[i + 1] * 4.0f;
+            t[o + 3] = xv[i + 2] / 16.0f; t[o + 4] = xv[i + 2] * 16.0f; t[o + 5] = xv[i + 3] / 4.0f;
+        }
+    } else {
+        for (int i = 0; i < 16; ++i) t[i] = xv[i];
+    }
+    return sum;
+}
+template <int BITS>
+inline void aff_w16(const device uchar* p, thread float* m) {
+    if (BITS == 2) {
+        for (int i = 0; i < 4; ++i) {
+            const uint b = p[i];
+            m[4 * i] = float(b & 0x03u); m[4 * i + 1] = float(b & 0x0cu); m[4 * i + 2] = float(b & 0x30u); m[4 * i + 3] = float(b & 0xc0u);
+        }
+    } else if (BITS == 3) {
+        for (int i = 0; i < 2; ++i) {
+            const uint b0 = p[3 * i], b1 = p[3 * i + 1], b2 = p[3 * i + 2];
+            thread float* o = m + 10 * i;
+            o[0] = float(b0 & 0x07u); o[1] = float(b0 & 0x38u); o[2] = float(b0 & 0xc0u); o[3] = float(b1 & 0x01u);
+            o[4] = float(b1 & 0x0eu); o[5] = float(b1 & 0x70u); o[6] = float(b1 & 0x80u); o[7] = float(b2 & 0x03u);
+            o[8] = float(b2 & 0x1cu); o[9] = float(b2 & 0xe0u);
+        }
+    } else if (BITS == 4) {
+        const device ushort* h = reinterpret_cast<const device ushort*>(p);
+        for (int i = 0; i < 4; ++i) {
+            const uint w = h[i];
+            m[4 * i] = float(w & 0x000fu); m[4 * i + 1] = float(w & 0x00f0u); m[4 * i + 2] = float(w & 0x0f00u); m[4 * i + 3] = float(w & 0xf000u);
+        }
+    } else if (BITS == 5) {
+        for (int i = 0; i < 2; ++i) {
+            const device uchar* q = p + 5 * i;
+            thread float* o = m + 12 * i;
+            o[0] = float(q[0] & 0x1fu); o[1] = float(q[0] & 0xe0u); o[2] = float(q[1] & 0x03u); o[3] = float(q[1] & 0x7cu);
+            o[4] = float(q[1] & 0x80u); o[5] = float(q[2] & 0x0fu); o[6] = float(q[2] & 0xf0u); o[7] = float(q[3] & 0x01u);
+            o[8] = float(q[3] & 0x3eu); o[9] = float(q[3] & 0xc0u); o[10] = float(q[4] & 0x07u); o[11] = float(q[4] & 0xf8u);
+        }
+    } else if (BITS == 6) {
+        for (int i = 0; i < 4; ++i) {
+            const uint b0 = p[3 * i], b1 = p[3 * i + 1], b2 = p[3 * i + 2];
+            thread float* o = m + 6 * i;
+            o[0] = float(b0 & 0x3fu); o[1] = float(b0 & 0xc0u); o[2] = float(b1 & 0x0fu);
+            o[3] = float(b1 & 0xf0u); o[4] = float(b2 & 0x03u); o[5] = float(b2 & 0xfcu);
+        }
+    } else {
+        for (int i = 0; i < 16; ++i) m[i] = float(p[i]);
+    }
+}
+// ROWS rows of an affine matrix (MLX layout: K * BITS / 32 uint32 words per row, a scale and
+// bias per GS values) dotted with an fp32 vector: scale * sum(q x) + bias * sum(x) per lane slice.
+template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
+inline void aff16_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* acc) {
+    static_assert(K % 256 == 0 && GS % 16 == 0, "K must be a multiple of 16 lanes x 16 values");
+    constexpr int NT = aff_terms16<BITS>();
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+    for (uint k = lane * 16; k < uint(K); k += 512) {
+        float t[NT];
+        const float xs = aff_x16<BITS>(x + k, t);
+        for (int r = 0; r < ROWS; ++r) {
+            float m[NT];
+            aff_w16<BITS>(reinterpret_cast<const device uchar*>(w + size_t(row0 + r) * (K * BITS / 32)) + k * BITS / 8, m);
+            float a = 0.0f;
+            for (int i = 0; i < NT; ++i) a = fma(m[i], t[i], a);
+            const size_t g = size_t(row0 + r) * (K / GS) + k / GS;
+            acc[r] = fma(float(s[g]), a, fma(float(b[g]), xs, acc[r]));
+        }
+    }
+    for (int r = 0; r < ROWS; ++r) acc[r] = simd_sum(acc[r]);
+}
+// aff16_rows for NB vectors (x + v * XS) sharing each row's masked codes.
+template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
+inline void aff16_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
+    static_assert(K % 256 == 0 && GS % 16 == 0, "K must be a multiple of 16 lanes x 16 values");
+    constexpr int NT = aff_terms16<BITS>();
+    for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
+    for (uint k = lane * 16; k < uint(K); k += 512) {
+        float m[ROWS][NT], sc[ROWS], bi[ROWS];
+        for (int r = 0; r < ROWS; ++r) {
+            aff_w16<BITS>(reinterpret_cast<const device uchar*>(w + size_t(row0 + r) * (K * BITS / 32)) + k * BITS / 8, m[r]);
+            const size_t g = size_t(row0 + r) * (K / GS) + k / GS;
+            sc[r] = float(s[g]);
+            bi[r] = float(b[g]);
+        }
+        for (int v = 0; v < NB; ++v) {
+            float t[NT];
+            const float xs = aff_x16<BITS>(x + size_t(v) * XS + k, t);
+            for (int r = 0; r < ROWS; ++r) {
+                float a = 0.0f;
+                for (int i = 0; i < NT; ++i) a = fma(m[r][i], t[i], a);
+                acc[r * NB + v] = fma(sc[r], a, fma(bi[r], xs, acc[r * NB + v]));
+            }
+        }
+    }
+    for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
+}
+// Affine weights read with shifts, 8 contiguous values per lane per step (MLX layout as above).
+// Faster than the masked-term helpers for 2, 4, 6 and 8 bits, where no code straddles a byte
+// boundary within its 8-value pack except at 6 bits, and the multi-vector form keeps the codes
+// of 4 rows in registers cheaply. q[j] = code of value j of the 8 values starting at byte p.
+template <int BITS>
+inline void affine_codes8(const device uchar* p, thread float* q) {
+    constexpr uint MASK = (1u << BITS) - 1u;
+    if (BITS == 8) {
+        const uint2 v = *reinterpret_cast<const device uint2*>(p);
+        for (int j = 0; j < 4; ++j) { q[j] = float((v.x >> (8 * j)) & MASK); q[j + 4] = float((v.y >> (8 * j)) & MASK); }
+    } else if (BITS == 4) {
+        const uint v = *reinterpret_cast<const device uint*>(p);
+        for (int j = 0; j < 8; ++j) q[j] = float((v >> (4 * j)) & MASK);
+    } else if (BITS == 2) {
+        const uint v = *reinterpret_cast<const device ushort*>(p);
+        for (int j = 0; j < 8; ++j) q[j] = float((v >> (2 * j)) & MASK);
+    } else {   // 6 bits: 6 bytes
+        const device ushort* h = reinterpret_cast<const device ushort*>(p);
+        const uint lo = uint(h[0]) | (uint(h[1]) << 16), hi = h[2];
+        for (int j = 0; j < 5; ++j) q[j] = float((lo >> (6 * j)) & MASK);
+        q[5] = float(((lo >> 30) | (hi << 2)) & MASK);
+        q[6] = float((hi >> 4) & MASK);
+        q[7] = float((hi >> 10) & MASK);
+    }
+}
+template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
+inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* acc) {
+    static_assert(K % 256 == 0 && GS % 8 == 0, "K must be a multiple of 32 lanes x 8 values");
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+    for (uint k = lane * 8; k < uint(K); k += 256) {
+        float xv[8], xs = 0.0f;
+        for (int i = 0; i < 8; ++i) { xv[i] = x[k + i]; xs += xv[i]; }
+        for (int r = 0; r < ROWS; ++r) {
+            const auto wr = reinterpret_cast<const device uchar*>(w + size_t(row0 + r) * (K * BITS / 32)) + k * BITS / 8;
+            float q[8];
+            affine_codes8<BITS>(wr, q);
+            float a = 0.0f;
+            for (int j = 0; j < 8; ++j) a = fma(q[j], xv[j], a);
+            const size_t g = size_t(row0 + r) * (K / GS) + k / GS;
+            acc[r] = fma(float(s[g]), a, fma(float(b[g]), xs, acc[r]));
+        }
+    }
+    for (int r = 0; r < ROWS; ++r) acc[r] = simd_sum(acc[r]);
+}
+// aff8_rows for NB vectors sharing each weight decode; per vector the arithmetic is aff8_rows'.
+template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
+inline void aff8_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
+    static_assert(K % 256 == 0 && GS % 8 == 0, "K must be a multiple of 32 lanes x 8 values");
+    for (int i = 0; i < ROWS * NB; ++i) acc[i] = 0.0f;
+    for (uint k = lane * 8; k < uint(K); k += 256) {
+        float q[ROWS][8], sc[ROWS], bi[ROWS];
+        for (int r = 0; r < ROWS; ++r) {
+            const auto wr = reinterpret_cast<const device uchar*>(w + size_t(row0 + r) * (K * BITS / 32)) + k * BITS / 8;
+            affine_codes8<BITS>(wr, q[r]);
+            const size_t g = size_t(row0 + r) * (K / GS) + k / GS;
+            sc[r] = float(s[g]);
+            bi[r] = float(b[g]);
+        }
+        for (int v = 0; v < NB; ++v) {
+            const auto xb = x + size_t(v) * XS + k;
+            float xv[8], xs = 0.0f;
+            for (int i = 0; i < 8; ++i) { xv[i] = float(xb[i]); xs += xv[i]; }
+            for (int r = 0; r < ROWS; ++r) {
+                float a = 0.0f;
+                for (int j = 0; j < 8; ++j) a = fma(q[r][j], xv[j], a);
+                acc[r * NB + v] = fma(sc[r], a, fma(bi[r], xs, acc[r * NB + v]));
+            }
+        }
+    }
+    for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
+}
 // Top-k of scores + bias with ties to the lower index (any tie order is spec-conformant).
 template <int NE, int K>
 inline void topk_select(const device float* scores, const device float* bias, threadgroup int* chosen,
@@ -293,11 +489,11 @@ _UP = r"""
     const uint row0 = threadgroup_position_in_grid.x * 32 + sg * 4;
     if (slot < uint(TOPK)) {
         const uint e = uint(chosen[slot]);
-        fp4_rows<DIM, 4>(w1 + size_t(e) * INTER * (DIM / 8), s1p + size_t(e) * INTER * (DIM / 32), row0, xq, lane, g4);
-        fp4_rows<DIM, 4>(w3 + size_t(e) * INTER * (DIM / 8), s3p + size_t(e) * INTER * (DIM / 32), row0, xq, lane, u4);
+        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, xq, lane, g4);
+        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, xq, lane, u4);
     } else {
-        fp8_rows<DIM, 4>(sw1, ss1, row0, xq, lane, g4);
-        fp8_rows<DIM, 4>(sw3, ss3, row0, xq, lane, u4);
+        S1_ROWS(DIM, 4, sw1, ss1, sb1, row0, xq, lane, g4);
+        S3_ROWS(DIM, 4, sw3, ss3, sb3, row0, xq, lane, u4);
     }
     if (lane < 4) {
         float gate = float(bfloat16_t(g4[lane])), up = float(bfloat16_t(u4[lane]));   // bf16 GEMM outputs
@@ -326,9 +522,9 @@ _DOWN = r"""
         const device float* hrow = hq + slot * INTER;
         if (slot < uint(TOPK)) {
             const uint e = uint(idx[slot]);
-            fp4_rows<INTER, 4>(w2 + size_t(e) * DIM * (INTER / 8), s2p + size_t(e) * DIM * (INTER / 32), row0, hrow, lane, acc);
+            R2_ROWS(INTER, 4, w2 + size_t(e) * DIM * R2_WPR(INTER), s2p + size_t(e) * DIM * R2_SPR(INTER), b2p + size_t(e) * DIM * R2_SPR(INTER), row0, hrow, lane, acc);
         } else {
-            fp8_rows<INTER, 4>(sw2, ss2, row0, hrow, lane, acc);
+            S2_ROWS(INTER, 4, sw2, ss2, sb2, row0, hrow, lane, acc);
         }
         if (lane < 4) part[slot * 4 + lane] = float(bfloat16_t(acc[lane]));   // each expert's w2 output is bf16
     }
@@ -407,8 +603,8 @@ _UP_NB = r"""
             }
         const uint e = uint(chosen[slot]);
         float g4[4], u4[4];
-        fp4_rows<DIM, 4>(w1 + size_t(e) * INTER * (DIM / 8), s1p + size_t(e) * INTER * (DIM / 32), row0, xq + b * DIM, lane, g4);
-        fp4_rows<DIM, 4>(w3 + size_t(e) * INTER * (DIM / 8), s3p + size_t(e) * INTER * (DIM / 32), row0, xq + b * DIM, lane, u4);
+        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, xq + b * DIM, lane, g4);
+        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, xq + b * DIM, lane, u4);
         if (lane < 4) {
             float gate = float(bfloat16_t(g4[lane])), up = float(bfloat16_t(u4[lane]));
             if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
@@ -424,8 +620,8 @@ _UP_NB = r"""
         }
     } else {
         float g4[4 * NB], u4[4 * NB];
-        fp8_rows_nb<DIM, 4, NB>(sw1, ss1, row0, xq, uint(DIM), lane, g4);
-        fp8_rows_nb<DIM, 4, NB>(sw3, ss3, row0, xq, uint(DIM), lane, u4);
+        S1_ROWS_NB(DIM, 4, NB, sw1, ss1, sb1, row0, xq, uint(DIM), lane, g4);
+        S3_ROWS_NB(DIM, 4, NB, sw3, ss3, sb3, row0, xq, uint(DIM), lane, u4);
         if (lane < 4)
             for (int b = 0; b < NB; ++b) {
                 float gate = float(bfloat16_t(g4[lane * NB + b])), up = float(bfloat16_t(u4[lane * NB + b]));
@@ -463,8 +659,8 @@ _UP_NB_MMA = r"""
             }
         const uint e = uint(chosen[slot]);
         float g4[4], u4[4];
-        fp4_rows<DIM, 4>(w1 + size_t(e) * INTER * (DIM / 8), s1p + size_t(e) * INTER * (DIM / 32), row0, xq + b * DIM, lane, g4);
-        fp4_rows<DIM, 4>(w3 + size_t(e) * INTER * (DIM / 8), s3p + size_t(e) * INTER * (DIM / 32), row0, xq + b * DIM, lane, u4);
+        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, xq + b * DIM, lane, g4);
+        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, xq + b * DIM, lane, u4);
         if (lane < 4) {
             float gate = float(bfloat16_t(g4[lane])), up = float(bfloat16_t(u4[lane]));
             if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
@@ -508,8 +704,8 @@ _DOWN_R_NB = r"""
     const uint b = threadgroup_position_in_grid.x, row0 = threadgroup_position_in_grid.y * 4;
     float acc[4];
     const uint e = uint(idx[b * TOPK + slot]);
-    fp4_rows<INTER, 4>(w2 + size_t(e) * DIM * (INTER / 8), s2p + size_t(e) * DIM * (INTER / 32), row0,
-                       hq + (b * TOPK + slot) * INTER, lane, acc);
+    R2_ROWS(INTER, 4, w2 + size_t(e) * DIM * R2_WPR(INTER), s2p + size_t(e) * DIM * R2_SPR(INTER),
+            b2p + size_t(e) * DIM * R2_SPR(INTER), row0, hq + (b * TOPK + slot) * INTER, lane, acc);
     if (lane < 4) part[slot * 4 + lane] = float(bfloat16_t(acc[lane]));
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (slot == 0 && lane < 4) {
@@ -524,7 +720,7 @@ _DOWN_S_NB = r"""
     const uint lane = thread_index_in_simdgroup;
     const uint row0 = (threadgroup_position_in_grid.x * 2 + simdgroup_index_in_threadgroup) * 4;
     float acc[4 * NB];
-    fp8_rows_nb<INTER, 4, NB>(sw2, ss2, row0, hqs, uint(INTER), lane, acc);
+    S2_ROWS_NB(INTER, 4, NB, sw2, ss2, sb2, row0, hqs, uint(INTER), lane, acc);
     if (lane < 4)
         for (int b = 0; b < NB; ++b)
             out[b * DIM + row0 + lane] = bfloat16_t(partial[b * DIM + row0 + lane] + float(bfloat16_t(acc[lane * NB + b])));
@@ -551,42 +747,115 @@ _DOWN_S_NB_MMA = r"""
 # (BatchGenerator decode, M3 Ultra, 1017 weights: B=2 -8%, B=4 +4%, B=8 +31% on matrices).
 MMA_MIN_BATCH = 4
 
+MXFP8 = ("mxfp8", 8, 32)
+MXFP4 = ("mxfp4", 4, 32)
+
 
 def use_mma(nb):
     return nb >= MMA_MIN_BATCH
 
 
+def weight_format(p):
+    """(mode, bits, group_size) of a projection the fused kernels read, or None: MXFP8 /
+    MXFP4 with group 32, or affine (oQ exports) with bf16 / fp16 scales and biases."""
+    mode = getattr(p, "mode", None)
+    if p is None or not getattr(p, "quantize_input", True):
+        return None
+    if mode in ("mxfp8", "mxfp4"):
+        fmt = MXFP8 if mode == "mxfp8" else MXFP4
+        return fmt if p.group_size == 32 and "biases" not in p else None
+    if (
+        mode == "affine"
+        and p.bits in (2, 3, 4, 5, 6, 8)
+        and p.group_size in (32, 64, 128)
+        and "biases" in p
+        and p.scales.dtype in (mx.bfloat16, mx.float16)
+        and p.biases.dtype == p.scales.dtype
+    ):
+        return ("affine", p.bits, p.group_size)
+    return None
+
+
+def format_macros(roles):
+    """Per-role weight access for the kernel sources: <role>_WPR(K) uint32 words and
+    <role>_SPR(K) scales per row, <role>_ROWS / <role>_ROWS_NB the row dot products."""
+    lines = []
+    for role, (mode, bits, gs) in roles:
+        if mode == "affine":
+            # Masked terms for 3 and 5 bits (codes straddle bytes), shifts otherwise.
+            helper = "aff16" if bits in (3, 5) else "aff8"
+            wpr, spr = f"((K_) * {bits} / 32)", f"((K_) / {gs})"
+            rows = f"{helper}_rows<K_, R_, {bits}, {gs}>(w_, s_, b_, r0_, x_, l_, acc_)"
+            nb = f"{helper}_rows_nb<K_, R_, NB_, {bits}, {gs}>(w_, s_, b_, r0_, x_, xs_, l_, acc_)"
+        elif mode == "mxfp8":
+            wpr, spr = "((K_) / 4)", "((K_) / 32)"
+            rows = "fp8_rows<K_, R_>(w_, s_, r0_, x_, l_, acc_)"
+            nb = "fp8_rows_nb<K_, R_, NB_>(w_, s_, r0_, x_, xs_, l_, acc_)"
+        else:
+            wpr, spr = "((K_) / 8)", "((K_) / 32)"
+            rows = "fp4_rows<K_, R_>(w_, s_, r0_, x_, l_, acc_)"
+            nb = "static_assert(false, \"no MXFP4 multi-vector rows\")"
+        lines += [
+            f"#define {role}_WPR(K_) {wpr}",
+            f"#define {role}_SPR(K_) {spr}",
+            f"#define {role}_ROWS(K_, R_, w_, s_, b_, r0_, x_, l_, acc_) {rows}",
+            f"#define {role}_ROWS_NB(K_, R_, NB_, w_, s_, b_, r0_, x_, xs_, l_, acc_) {nb}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def format_tag(formats):
+    return "_".join(f"{m[0]}{b}g{g}" for m, b, g in formats)
+
+
+def _biases(p):
+    return p.biases if "biases" in p else _const((0,) * 8)
+
+
+def _formats(moe):
+    e, s = moe.experts, moe.shared_experts
+    return tuple(weight_format(getattr(m, n, None)) for m in (e, s) for n in ("w1", "w3", "w2"))
+
+
+_ROLES = ("R1", "R3", "R2", "S1", "S3", "S2")
+
+
 @cache
-def _kernels_nb(mma=False):
+def _kernels_nb(mma, formats):
+    header = format_macros(zip(_ROLES, formats)) + _HEADER
+    tag = format_tag(formats)
+    up_inputs = ["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "b1p", "w3", "s3p", "b3p",
+                 "sw1", "ss1", "sb1", "sw3", "ss3", "sb3"]
     gate = mx.fast.metal_kernel(name="v41_decode_moe_gate_nb", input_names=["x", "w", "temp"],
                                 output_names=["scores", "xq"], source=_GATE_NB, header=_HEADER)
     up = mx.fast.metal_kernel(
-        name="v41_decode_moe_up_nb",
-        input_names=["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "w3", "s3p",
-                     "sw1", "ss1", "sw3", "ss3"],
-        output_names=["hq", "hqs", "out_idx", "out_w"], source=_UP_NB, header=_HEADER)
-    down_r = mx.fast.metal_kernel(name="v41_decode_moe_down_routed_nb", input_names=["hq", "idx", "w2", "s2p"],
-                                  output_names=["partial"], source=_DOWN_R_NB, header=_HEADER)
-    down_s = mx.fast.metal_kernel(name="v41_decode_moe_down_shared_nb", input_names=["hqs", "partial", "sw2", "ss2"],
-                                  output_names=["out"], source=_DOWN_S_NB, header=_HEADER)
+        name=f"v41_decode_moe_up_nb_{tag}", input_names=up_inputs,
+        output_names=["hq", "hqs", "out_idx", "out_w"], source=_UP_NB, header=header)
+    down_r = mx.fast.metal_kernel(name=f"v41_decode_moe_down_routed_nb_{tag}",
+                                  input_names=["hq", "idx", "w2", "s2p", "b2p"],
+                                  output_names=["partial"], source=_DOWN_R_NB, header=header)
+    down_s = mx.fast.metal_kernel(name=f"v41_decode_moe_down_shared_nb_{tag}",
+                                  input_names=["hqs", "partial", "sw2", "ss2", "sb2"],
+                                  output_names=["out"], source=_DOWN_S_NB, header=header)
     if mma:
         up = mx.fast.metal_kernel(
-            name="v41_decode_moe_up_nb_mma",
-            input_names=["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "w3", "s3p",
-                         "sw1", "ss1", "sw3", "ss3"],
-            output_names=["hq", "hqs", "out_idx", "out_w"], source=_UP_NB_MMA, header=_HEADER)
-        down_s = mx.fast.metal_kernel(name="v41_decode_moe_down_shared_nb_mma",
-                                      input_names=["hqs", "partial", "sw2", "ss2"],
-                                      output_names=["out"], source=_DOWN_S_NB_MMA, header=_HEADER)
+            name=f"v41_decode_moe_up_nb_mma_{tag}", input_names=up_inputs,
+            output_names=["hq", "hqs", "out_idx", "out_w"], source=_UP_NB_MMA, header=header)
+        down_s = mx.fast.metal_kernel(name=f"v41_decode_moe_down_shared_nb_mma_{tag}",
+                                      input_names=["hqs", "partial", "sw2", "ss2", "sb2"],
+                                      output_names=["out"], source=_DOWN_S_NB_MMA, header=header)
     return gate, up, down_r, down_s
 
 
 def fused_decode_moe_nb(moe, x, config, mma=None):
     """NB tokens at once. x: [NB, dim] bf16 (ffn_norm outputs). Returns [NB, dim] bf16; each
     token's result equals fused_decode_moe on that token alone, bit for bit without matrix
-    tiles (mma=False) and within fp32 summation rounding with them (default: use_mma(NB))."""
+    tiles (mma=False) and within fp32 summation rounding with them (default: use_mma(NB)).
+    Matrix tiles exist for MXFP8 shared experts only."""
     nb = x.shape[0]
-    gate_k, up_k, down_r, down_s = _kernels_nb(use_mma(nb) if mma is None else mma)
+    formats = _formats(moe)
+    mma = (use_mma(nb) if mma is None else mma) and formats[3:] == (MXFP8,) * 3
+    gate_k, up_k, down_r, down_s = _kernels_nb(mma, formats)
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
     tpg = 256
     n_tg = (ne + tpg // 32 - 1) // (tpg // 32)
@@ -598,18 +867,19 @@ def fused_decode_moe_nb(moe, x, config, mma=None):
     e, s = moe.experts, moe.shared_experts
     hq, hqs, idx, w = up_k(
         inputs=[scores, moe.gate.bias, _const((config.route_scale,)), _const((config.swiglu_limit,)), xq,
-                e.w1.weight, e.w1.scales, e.w3.weight, e.w3.scales, s.w1.weight, s.w1.scales, s.w3.weight, s.w3.scales],
+                e.w1.weight, e.w1.scales, _biases(e.w1), e.w3.weight, e.w3.scales, _biases(e.w3),
+                s.w1.weight, s.w1.scales, _biases(s.w1), s.w3.weight, s.w3.scales, _biases(s.w3)],
         template=[("NE", ne), ("TOPK", topk), ("DIM", dim), ("INTER", inter), ("NB", nb)],
         grid=((nb * topk + 1) * 256, inter // 32, 1), threadgroup=(256, 1, 1),
         output_shapes=[(nb * topk * inter,), (nb * inter,), (nb * topk,), (nb * topk,)],
         output_dtypes=[mx.float32, mx.float32, mx.int32, mx.float32])
     partial = down_r(
-        inputs=[hq, idx, e.w2.weight, e.w2.scales],
+        inputs=[hq, idx, e.w2.weight, e.w2.scales, _biases(e.w2)],
         template=[("TOPK", topk), ("DIM", dim), ("INTER", inter)],
         grid=(nb * topk * 32, dim // 4, 1), threadgroup=(topk * 32, 1, 1),
         output_shapes=[(nb * dim,)], output_dtypes=[mx.float32])[0]
     out = down_s(
-        inputs=[hqs, partial, s.w2.weight, s.w2.scales],
+        inputs=[hqs, partial, s.w2.weight, s.w2.scales, _biases(s.w2)],
         template=[("DIM", dim), ("INTER", inter), ("NB", nb)],
         grid=(dim // 8 * 64, 1, 1), threadgroup=(64, 1, 1),
         output_shapes=[(nb * dim,)], output_dtypes=[mx.bfloat16])[0]
@@ -625,31 +895,32 @@ def _const(values):
 
 
 @cache
-def _kernels():
+def _kernels(formats):
+    header = format_macros(zip(_ROLES, formats)) + _HEADER
+    tag = format_tag(formats)
     gate = mx.fast.metal_kernel(name="v41_decode_moe_gate", input_names=["x", "w", "temp"],
                                 output_names=["scores", "xq"], source=_GATE, header=_HEADER)
     up = mx.fast.metal_kernel(
-        name="v41_decode_moe_up",
-        input_names=["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "w3", "s3p",
-                     "sw1", "ss1", "sw3", "ss3"],
-        output_names=["hq", "out_idx", "out_w"], source=_UP, header=_HEADER)
+        name=f"v41_decode_moe_up_{tag}",
+        input_names=["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "b1p", "w3", "s3p", "b3p",
+                     "sw1", "ss1", "sb1", "sw3", "ss3", "sb3"],
+        output_names=["hq", "out_idx", "out_w"], source=_UP, header=header)
     down = mx.fast.metal_kernel(
-        name="v41_decode_moe_down",
-        input_names=["hq", "idx", "w2", "s2p", "sw2", "ss2"],
-        output_names=["out"], source=_DOWN, header=_HEADER)
+        name=f"v41_decode_moe_down_{tag}",
+        input_names=["hq", "idx", "w2", "s2p", "b2p", "sw2", "ss2", "sb2"],
+        output_names=["out"], source=_DOWN, header=header)
     return gate, up, down
 
 
 def supported(moe, x, config):
-    e, s = moe.experts, moe.shared_experts
     # Offloaded experts (OffloadedExpert) hold resident slots, not w1 / w2 / w3.
-    routed = [getattr(e, name, None) for name in ("w1", "w2", "w3")]
+    formats = _formats(moe)
     return (
         x.size == config.dim
         and x.dtype == mx.bfloat16
         and getattr(config, "score_func", "sqrtsoftplus") == "sqrtsoftplus"
-        and all(getattr(p, "mode", None) == "mxfp4" and p.group_size == 32 and "biases" not in p for p in routed)
-        and all(getattr(p, "mode", None) == "mxfp8" and p.group_size == 32 and "biases" not in p for p in (s.w1, s.w2, s.w3))
+        and all(f is not None for f in formats)
+        and formats[3] != MXFP4 and formats[4] != MXFP4 and formats[5] != MXFP4
         and config.n_activated_experts <= 31
         and config.dim % 256 == 0 and config.moe_inter_dim % 256 == 0
     )
@@ -657,7 +928,7 @@ def supported(moe, x, config):
 
 def fused_decode_moe(moe, x, config):
     """x: [1, 1, dim] bf16 (ffn_norm output). Returns ([1, 1, dim] bf16, idx, weights)."""
-    gate_k, up_k, down_k = _kernels()
+    gate_k, up_k, down_k = _kernels(_formats(moe))
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
     xf = x.reshape(-1)
     tpg = 256
@@ -671,14 +942,14 @@ def fused_decode_moe(moe, x, config):
     hq, idx, w = up_k(
         inputs=[scores, moe.gate.bias, _const((config.route_scale,)),
                 _const((config.swiglu_limit,)), xq,
-                e.w1.weight, e.w1.scales, e.w3.weight, e.w3.scales,
-                s.w1.weight, s.w1.scales, s.w3.weight, s.w3.scales],
+                e.w1.weight, e.w1.scales, _biases(e.w1), e.w3.weight, e.w3.scales, _biases(e.w3),
+                s.w1.weight, s.w1.scales, _biases(s.w1), s.w3.weight, s.w3.scales, _biases(s.w3)],
         template=[("NE", ne), ("TOPK", topk), ("DIM", dim), ("INTER", inter)],
         grid=(inter // 32 * 256, topk + 1, 1), threadgroup=(256, 1, 1),
         output_shapes=[((topk + 1) * inter,), (topk,), (topk,)],
         output_dtypes=[mx.float32, mx.int32, mx.float32])
     out = down_k(
-        inputs=[hq, idx, e.w2.weight, e.w2.scales, s.w2.weight, s.w2.scales],
+        inputs=[hq, idx, e.w2.weight, e.w2.scales, _biases(e.w2), s.w2.weight, s.w2.scales, _biases(s.w2)],
         template=[("TOPK", topk), ("DIM", dim), ("INTER", inter)],
         grid=(dim // 4 * (topk + 1) * 32, 1, 1), threadgroup=((topk + 1) * 32, 1, 1),
         output_shapes=[(dim,)], output_dtypes=[mx.bfloat16])[0]

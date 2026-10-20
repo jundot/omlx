@@ -21,6 +21,7 @@ from functools import cache
 import mlx.core as mx
 
 from .decode_moe import _HEADER as _MOE_HEADER
+from .decode_moe import format_macros, format_tag
 
 _HEADER = _MOE_HEADER + r"""
 // E4M3FN code of a value already on the E4M3 grid (|v| <= 448).
@@ -168,10 +169,10 @@ _GEMV_FP8 = r"""
     if (row0 >= uint(NA + NB)) return;
     float acc[4];
     if (row0 >= uint(NA)) {
-        fp8_rows<K, 4>(wb, sb, row0 - NA, x, lane, acc);
+        B_ROWS(K, 4, wb, sb, bb, row0 - NA, x, lane, acc);
         if (lane < 4) yb[row0 - NA + lane] = bfloat16_t(acc[lane]);
     } else {
-        fp8_rows<K, 4>(wa, sa, row0, x, lane, acc);
+        A_ROWS(K, 4, wa, sa, ba, row0, x, lane, acc);
         if (lane < 4) ya[row0 + lane] = bfloat16_t(acc[lane]);
     }
 """
@@ -234,7 +235,7 @@ _WQB_ROPE = r"""
     const uint row0 = (threadgroup_position_in_grid.x * 2 + simdgroup_index_in_threadgroup) * 4;
     if (row0 >= uint(N)) return;
     float acc[4];
-    fp8_rows<K, 4>(w, sc, row0, x, lane, acc);
+    W_ROWS(K, 4, w, sc, bi, row0, x, lane, acc);
     if (lane < 2) {
         // rows (row0 + 2*lane, +1) form one RoPE pair; GEMM output is bf16 first
         float a = float(bfloat16_t(acc[2 * lane])), b = float(bfloat16_t(acc[2 * lane + 1]));
@@ -421,10 +422,10 @@ _GEMV_FP8_NB = r"""
     if (row0 >= uint(NA + NB_ROWS)) return;
     float acc[4 * NB];
     if (row0 >= uint(NA)) {
-        fp8_rows_nb<K, 4, NB>(wb, sb, row0 - NA, x, uint(K), lane, acc);
+        B_ROWS_NB(K, 4, NB, wb, sb, bb, row0 - NA, x, uint(K), lane, acc);
         if (lane < 4) for (int b = 0; b < NB; ++b) yb[b * NB_ROWS + row0 - NA + lane] = bfloat16_t(acc[lane * NB + b]);
     } else {
-        fp8_rows_nb<K, 4, NB>(wa, sa, row0, x, uint(K), lane, acc);
+        A_ROWS_NB(K, 4, NB, wa, sa, ba, row0, x, uint(K), lane, acc);
         if (lane < 4) for (int b = 0; b < NB; ++b) ya[b * NA + row0 + lane] = bfloat16_t(acc[lane * NB + b]);
     }
 """
@@ -433,7 +434,7 @@ _WQB_ROPE_NB = r"""
     const uint row0 = (threadgroup_position_in_grid.x * 2 + simdgroup_index_in_threadgroup) * 4;
     if (row0 >= uint(N)) return;
     float acc[4 * NB];
-    fp8_rows_nb<K, 4, NB>(w, sc, row0, x, uint(K), lane, acc);
+    W_ROWS_NB(K, 4, NB, w, sc, bi, row0, x, uint(K), lane, acc);
     if (lane < 2 * NB) {
         const uint b = lane / 2, pr = lane % 2;      // request b, RoPE pair (row0 + 2 pr, +1)
         float a = float(bfloat16_t(acc[(2 * pr) * NB + b])), c = float(bfloat16_t(acc[(2 * pr + 1) * NB + b]));
@@ -574,21 +575,23 @@ _BATCHED_STRIDES = {
 
 
 @cache
-def kernel(name):
+def kernel(name, formats=()):
+    """The decode kernel ``name``; kernels that read attention projections take their
+    weight formats (decode_moe.weight_format) for the roles A, B (gemv pair) or W (wq_b)."""
     specs = {
         "mix_partial": (["res", "fn", "sub", "post", "comb"], ["partial", "hout"], _MIX_PARTIAL),
         "mix_final": (["partial", "h", "pre_in", "norm_w", "scale", "base", "eps", "hc_eps"],
                       ["mix_out", "xn", "xq"], _MIX_FINAL),
-        "gemv_fp8": (["x", "wa", "sa", "wb", "sb"], ["ya", "yb"], _GEMV_FP8),
+        "gemv_fp8": (["x", "wa", "sa", "ba", "wb", "sb", "bb"], ["ya", "yb"], _GEMV_FP8),
         "attn_mid": (["qa", "kv", "qnw", "kvnw", "cosv", "sinv", "eps"], ["qr", "qrq", "packed"], _ATTN_MID),
-        "wqb_rope": (["x", "w", "sc", "cosv", "sinv"], ["y"], _WQB_ROPE),
+        "wqb_rope": (["x", "w", "sc", "bi", "cosv", "sinv"], ["y"], _WQB_ROPE),
         "woa": (["x", "w", "sc"], ["yq"], _WOA),
         "hc_post": (["sub", "res", "post", "comb"], ["out"], _HC_POST),
         "attn_scores": (["q", "window", "pooled", "wi", "ci", "meta", "scalep"], ["S", "BMAX"], _ATTN_SCORES),
         "attn_pv": (["window", "pooled", "wi", "ci", "meta", "S", "BMAX"], ["PV", "DEN"], _ATTN_PV),
         "o_merge": (["PV", "DEN", "BMAX", "sink", "meta", "cosv", "sinv"], ["oq"], _O_MERGE),
-        "gemv_fp8_nb": (["x", "wa", "sa", "wb", "sb"], ["ya", "yb"], _GEMV_FP8_NB),
-        "wqb_rope_nb": (["x", "w", "sc", "cosv", "sinv"], ["y"], _WQB_ROPE_NB),
+        "gemv_fp8_nb": (["x", "wa", "sa", "ba", "wb", "sb", "bb"], ["ya", "yb"], _GEMV_FP8_NB),
+        "wqb_rope_nb": (["x", "w", "sc", "bi", "cosv", "sinv"], ["y"], _WQB_ROPE_NB),
         "woa_nb": (["x", "w", "sc"], ["yq"], _WOA_NB),
         "gemv_fp8_mma": (["x", "wa", "sa", "wb", "sb"], ["ya", "yb"], _GEMV_FP8_MMA),
         "wqb_rope_mma": (["x", "w", "sc", "cosv", "sinv"], ["y"], _WQB_ROPE_MMA),
@@ -615,5 +618,10 @@ def kernel(name):
         from .packed_attention import _READ
 
         header = _READ + "\n#include <metal_simdgroup_matrix>\n" + _HEADER
-    return mx.fast.metal_kernel(name="v41_decode_" + name, input_names=inputs,
+    full = "v41_decode_" + name
+    if formats:
+        roles = ("W",) if base.startswith("wqb") else ("A", "B")
+        header = format_macros(zip(roles, formats)) + header
+        full += "_" + format_tag(formats)
+    return mx.fast.metal_kernel(name=full, input_names=inputs,
                                 output_names=outputs, source=source, header=header)
