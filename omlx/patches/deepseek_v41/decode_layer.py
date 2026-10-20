@@ -472,8 +472,8 @@ _GEMV_FP8_MMA = r"""
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
     const uint r0 = threadgroup_position_in_grid.x * 8;
     const bool in_b = r0 >= uint(NA);                      // uniform per threadgroup
-    if (in_b) fp8_mma8<K, KS, NB>(wb, sb, r0 - NA, x, uint(K), lane, sg, red, tile);
-    else fp8_mma8<K, KS, NB>(wa, sa, r0, x, uint(K), lane, sg, red, tile);
+    if (in_b) B_MMA8(K, KS, NB, wb, sb, bb, r0 - NA, x, uint(K), lane, sg, red, tile);
+    else A_MMA8(K, KS, NB, wa, sa, ba, r0, x, uint(K), lane, sg, red, tile);
     for (uint i = tid; i < uint(8 * NB); i += KS * 32) {
         const uint r = i % 8, b = i / 8;
         if (in_b) yb[b * NB_ROWS + r0 - NA + r] = bfloat16_t(tile[r * 8 + b]);
@@ -484,7 +484,7 @@ _WQB_ROPE_MMA = r"""
     threadgroup float red[KS * 64], tile[64];
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
     const uint r0 = threadgroup_position_in_grid.x * 8;
-    fp8_mma8<K, KS, NB>(w, sc, r0, x, uint(K), lane, sg, red, tile);
+    W_MMA8(K, KS, NB, w, sc, bi, r0, x, uint(K), lane, sg, red, tile);
     for (uint i = tid; i < uint(4 * NB); i += KS * 32) {
         const uint pr = i % 4, b = i / 4;                 // request b, RoPE pair (r0 + 2 pr, +1)
         float a = float(bfloat16_t(tile[(2 * pr) * 8 + b])), c = float(bfloat16_t(tile[(2 * pr + 1) * 8 + b]));
@@ -593,8 +593,8 @@ def kernel(name, formats=()):
         "gemv_fp8_nb": (["x", "wa", "sa", "ba", "wb", "sb", "bb"], ["ya", "yb"], _GEMV_FP8_NB),
         "wqb_rope_nb": (["x", "w", "sc", "bi", "cosv", "sinv"], ["y"], _WQB_ROPE_NB),
         "woa_nb": (["x", "w", "sc"], ["yq"], _WOA_NB),
-        "gemv_fp8_mma": (["x", "wa", "sa", "wb", "sb"], ["ya", "yb"], _GEMV_FP8_MMA),
-        "wqb_rope_mma": (["x", "w", "sc", "cosv", "sinv"], ["y"], _WQB_ROPE_MMA),
+        "gemv_fp8_mma": (["x", "wa", "sa", "ba", "wb", "sb", "bb"], ["ya", "yb"], _GEMV_FP8_MMA),
+        "wqb_rope_mma": (["x", "w", "sc", "bi", "cosv", "sinv"], ["y"], _WQB_ROPE_MMA),
         "woa_mma": (["x", "w", "sc"], ["yq"], _WOA_MMA),
         "attn_scores_bq": (["q_all", "window_all", "pooled_all", "wi_all", "ci_all", "meta_all", "scalep"],
                            ["S_all", "BMAX_all"], _ATTN_SCORES_B),

@@ -140,7 +140,16 @@ def _pair_inputs(x, a, b):
     return [x, *_wb(a), *(_wb(b) if b is not None else dummy)]
 
 
-def gemv_fp8(x, a, b=None):
+def _affine(formats):
+    return any(f[0] == "affine" for f in formats)
+
+
+def gemv_fp8(x, a, b=None, tiles=False):
+    """MXFP8 / affine GEMV of one vector. tiles: affine projections take the matrix-tile
+    kernel of gemv_fp8_nb (as verify blocks do) instead of the faster rows kernel."""
+    if tiles and _affine(_pair_formats(a, b)):
+        ya, yb = gemv_fp8_nb(x.reshape(1, -1), a, b)
+        return ya.reshape(-1), (yb.reshape(-1) if b is not None else None)
     na, k = a.weight.shape[0], a.input_dims
     nb = 0 if b is None else b.weight.shape[0]
     assert na % 4 == 0 and nb % 4 == 0, "4-row simdgroups must not straddle the two matrices"
@@ -162,7 +171,9 @@ def attn_mid(att, qa, kv_in, cos, sin, c):
         output_dtypes=[mx.bfloat16, mx.float32, mx.uint8])
 
 
-def wqb_rope(att, qrq, cos, sin, c):
+def wqb_rope(att, qrq, cos, sin, c, tiles=False):
+    if tiles and _affine((DM.weight_format(att.wq_b),)):
+        return wqb_rope_nb(att, qrq.reshape(1, -1), cos.reshape(1, -1), sin.reshape(1, -1), c, True).reshape(-1)
     nq = c.n_heads * c.head_dim
     return DL.kernel("wqb_rope", (DM.weight_format(att.wq_b),))(
         inputs=[qrq, *_wb(att.wq_b), cos, sin],
@@ -255,16 +266,16 @@ def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
     return split_attention(q.reshape(-1), kv, pooled, idx, ci, att.attn_sink, cos, sin, c)
 
 
-def decode_attention(att, x, xq, cache, shared, start, c):
+def decode_attention(att, x, xq, cache, shared, start, c, tiles=False):
     """Attention.__call__ for one token. x: [dim] bf16 (attn_norm output), xq: act_quant(x)."""
     ratio = c.compress_ratios[att._layer]
-    qa, kv_in = gemv_fp8(xq, att.wq_a, att.wkv)
+    qa, kv_in = gemv_fp8(xq, att.wq_a, att.wkv, tiles)
     cos, sin = _cos_sin(c, bool(ratio), start)
     qr, qrq, packed = attn_mid(att, qa, kv_in, cos, sin, c)
-    q = wqb_rope(att, qrq, cos, sin, c)
+    q = wqb_rope(att, qrq, cos, sin, c, tiles)
     oq = attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c)
     yq = woa(att, oq, c)
-    return gemv_fp8(yq, att.wo_b)[0]
+    return gemv_fp8(yq, att.wo_b, tiles=tiles)[0]
 
 
 # ---- batched decode: B requests, one token each --------------------------------------------
@@ -306,26 +317,36 @@ def _mma_split(tiles, groups):
     return 1
 
 
+def _aff_mma_split(tiles, groups):
+    """K split for aff_mma8 (fixed per matrix, so results do not depend on the vector count)."""
+    for ks in ((1,) if tiles >= 2048 else (4, 2, 1)):
+        if groups % ks == 0:
+            return ks
+    return 1
+
+
 def gemv_fp8_nb(x, a, b=None, mma=None):
-    """gemv_fp8 for x [B, K]: one weight read for all B vectors. Bit for bit gemv_fp8 per
-    vector without matrix tiles (mma=False); default DM.use_mma(B)."""
+    """gemv_fp8 for x [B, K]: one weight read for all B vectors. MXFP8: bit for bit gemv_fp8
+    per vector without matrix tiles (mma=False); default DM.use_mma(B). Affine projections
+    always run on matrix tiles, which give a vector the same result for any B (aff_mma8): on
+    rows kernels their B >= 4 throughput fell to about half (ALU bound). One-token decode
+    keeps the faster rows kernel unless the model verifies drafts (gemv_fp8 tiles)."""
     b_n = x.shape[0]
     na, k = a.weight.shape[0], a.input_dims
     nb = 0 if b is None else b.weight.shape[0]
     assert na % 4 == 0 and nb % 4 == 0
     formats = _pair_formats(a, b)
+    affine = _affine(formats)
     if (
-        (DM.use_mma(b_n) if mma is None else mma)
+        (affine or ((DM.use_mma(b_n) if mma is None else mma) and formats == (DM.MXFP8, DM.MXFP8)))
         and na % 8 == 0
         and nb % 8 == 0
-        and formats == (DM.MXFP8, DM.MXFP8)
     ):
-        # 8-element dummies: inputs under 8 elements are passed in constant address space.
-        dw, ds = _const((0,) * 8, mx.uint32), _const((0,) * 8, mx.uint8)
         tiles = (na + nb) // 8
-        ks = _mma_split(tiles, k // 32)
-        ya, yb = DL.kernel("gemv_fp8_mma")(
-            inputs=[x, a.weight, a.scales, b.weight if b is not None else dw, b.scales if b is not None else ds],
+        group = max(f[2] for f in formats)
+        ks = _aff_mma_split(tiles, k // group) if affine else _mma_split(tiles, k // 32)
+        ya, yb = DL.kernel("gemv_fp8_mma", formats)(
+            inputs=_pair_inputs(x, a, b),
             template=[("NA", na), ("NB_ROWS", nb), ("K", k), ("NB", b_n), ("KS", ks)],
             grid=(tiles * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
             output_shapes=[(b_n * na,), (b_n * max(nb, 1),)], output_dtypes=[mx.bfloat16, mx.bfloat16])
@@ -357,15 +378,17 @@ def attn_mid_nb(att, qa, kv_in, cos, sin, c):
 
 
 def wqb_rope_nb(att, qrq, cos, sin, c, mma):
-    """wqb_rope for B rows: bit for bit per row without matrix tiles (mma=False)."""
+    """wqb_rope for B rows: bit for bit per row without matrix tiles (mma=False); affine
+    wq_b always runs on matrix tiles (as gemv_fp8_nb)."""
     b_n = qrq.shape[0]
     nq = c.n_heads * c.head_dim
     tmpl = [("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", b_n)]
     fmt = DM.weight_format(att.wq_b)
-    if mma and fmt == DM.MXFP8:
-        ks = _mma_split(nq // 8, c.q_lora_rank // 32)
-        return DL.kernel("wqb_rope_mma")(
-            inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl + [("KS", ks)],
+    affine = _affine((fmt,))
+    if affine or (mma and fmt == DM.MXFP8):
+        ks = (_aff_mma_split if affine else _mma_split)(nq // 8, c.q_lora_rank // fmt[2])
+        return DL.kernel("wqb_rope_mma", (fmt,))(
+            inputs=[qrq, *_wb(att.wq_b), cos, sin], template=tmpl + [("KS", ks)],
             grid=(nq // 8 * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
             output_shapes=[(b_n * nq,)], output_dtypes=[mx.bfloat16])[0].reshape(b_n, nq)
     return DL.kernel("wqb_rope_nb", (fmt,))(
@@ -607,7 +630,9 @@ def decode_block(blk, h, pre, cache, shared, start, c):
     hf = h.reshape(-1)
     coef_a, x, xq, _ = mix(blk, "attn", c, hf, pre.reshape(-1))
     ap, ao, ac = coef_a[:hc], coef_a[hc:2 * hc], coef_a[2 * hc:]
-    a = blk.sum_ranks(decode_attention(blk.attn, x, xq, cache, shared, start, c))
+    # A model that verifies MTP drafts decodes on the verify blocks' kernels (configure_mtp).
+    tiles = getattr(blk, "_omlx_verify_exact", False)
+    a = blk.sum_ranks(decode_attention(blk.attn, x, xq, cache, shared, start, c, tiles))
     coef_f, x2, _, h2 = mix(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
     fp, fo, fc = coef_f[:hc], coef_f[hc:2 * hc], coef_f[2 * hc:]
     f = blk.sum_ranks(DM.fused_decode_moe(blk.ffn, x2.reshape(1, 1, -1), c)[0].reshape(-1))

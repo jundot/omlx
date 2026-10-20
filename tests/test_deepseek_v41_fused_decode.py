@@ -105,9 +105,16 @@ def build(seed=4121, fmt="mxfp", **overrides):
     return model
 
 
-@pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-def test_fused_decode_matches_unfused_block(monkeypatch, fmt):
-    model = build(fmt=fmt)
+def verify_exact(model):
+    """Decode on the verify blocks' kernels, as configure_mtp(True) sets it up."""
+    for layer in model.layers:
+        object.__setattr__(layer, "_omlx_verify_exact", True)
+    return model
+
+
+@pytest.mark.parametrize("fmt,tiles", [("mxfp", False), ("affine", False), ("affine", True)])
+def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles):
+    model = verify_exact(build(fmt=fmt)) if tiles else build(fmt=fmt)
     c = model._config
     assert all(decode_fused.supported(layer, c) for layer in model.layers)
     calls = {"fused": 0}
@@ -199,7 +206,7 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
     from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
-    model = build(fmt=fmt)
+    model = verify_exact(build(fmt=fmt))   # affine batches always run on matrix tiles
     calls = {"nb": 0}
     real = decode_fused.decode_block_nb
 
@@ -289,8 +296,8 @@ def test_batched_mma_kernels_match_rows_kernels(monkeypatch, nb):
     sin = mx.array(rng.normal(0, 1, (nb, c.rope_head_dim // 2)).astype(np.float32))
     ks = decode_fused._mma_split(nq // 8, c.q_lora_rank // 32)
     tmpl = [("N", nq), ("K", c.q_lora_rank), ("HD", c.head_dim), ("RD", c.rope_head_dim), ("NB", nb)]
-    q_mma = DL.kernel("wqb_rope_mma")(
-        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, cos, sin], template=tmpl + [("KS", ks)],
+    q_mma = DL.kernel("wqb_rope_mma", (decode_moe.MXFP8,))(
+        inputs=[qrq, att.wq_b.weight, att.wq_b.scales, decode_moe._biases(att.wq_b), cos, sin], template=tmpl + [("KS", ks)],
         grid=(nq // 8 * ks * 32, 1, 1), threadgroup=(ks * 32, 1, 1),
         output_shapes=[(nb * nq,)], output_dtypes=[mx.bfloat16])[0]
     q_rows = DL.kernel("wqb_rope_nb", (decode_moe.MXFP8,))(
@@ -426,7 +433,7 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
     """An MTP verify block through the fused kernels gives every token bit for bit the
     logits of decoding it alone, and after a partial rollback the cache continues exactly
     like one that decoded only the accepted tokens."""
-    model = build(fmt=fmt, vocab_size=4096)   # the vocab head kernel (per-row exact) needs >= 4096 rows
+    model = verify_exact(build(fmt=fmt, vocab_size=4096))   # the vocab head kernel (per-row exact) needs >= 4096 rows
     calls = []
     real = decode_fused.decode_block_verify
 
@@ -474,6 +481,7 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch, fmt):
         dspark_markov_rank=32,
     )
     prompt = [3, 4, 5, 6, 7, 8, 9, 10, 11]
+    model.configure_mtp(True, 3)
     expected, cache = [], model.make_cache()
     ids = mx.array([prompt])
     for _ in range(24):
@@ -488,7 +496,6 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch, fmt):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block_verify", counted)
-    model.configure_mtp(True, 3)
     generator = BatchGenerator(model, max_tokens=24, prefill_step_size=4, sampler=lambda logits: mx.argmax(logits, -1))
     result = []
     try:

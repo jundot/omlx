@@ -336,9 +336,8 @@ inline void aff16_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thr
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
 }
 // Affine weights read with shifts, 8 contiguous values per lane per step (MLX layout as above).
-// Faster than the masked-term helpers for 2, 4, 6 and 8 bits, where no code straddles a byte
-// boundary within its 8-value pack except at 6 bits, and the multi-vector form keeps the codes
-// of 4 rows in registers cheaply. q[j] = code of value j of the 8 values starting at byte p.
+// Faster than the masked-term helpers at 2, 4, 6 and 8 bits, and the multi-vector form keeps the
+// codes of 4 rows in registers cheaply. q[j] = code of value j of the 8 values starting at byte p.
 template <int BITS>
 inline void affine_codes8(const device uchar* p, thread float* q) {
     constexpr uint MASK = (1u << BITS) - 1u;
@@ -351,13 +350,22 @@ inline void affine_codes8(const device uchar* p, thread float* q) {
     } else if (BITS == 2) {
         const uint v = *reinterpret_cast<const device ushort*>(p);
         for (int j = 0; j < 8; ++j) q[j] = float((v >> (2 * j)) & MASK);
-    } else {   // 6 bits: 6 bytes
+    } else if (BITS == 6) {   // 6 bytes
         const device ushort* h = reinterpret_cast<const device ushort*>(p);
         const uint lo = uint(h[0]) | (uint(h[1]) << 16), hi = h[2];
         for (int j = 0; j < 5; ++j) q[j] = float((lo >> (6 * j)) & MASK);
         q[5] = float(((lo >> 30) | (hi << 2)) & MASK);
         q[6] = float((hi >> 4) & MASK);
         q[7] = float((hi >> 10) & MASK);
+    } else {   // 3 or 5 bits: 3 or 5 bytes, byte aligned
+        uint lo = 0, hi = 0;
+        for (int i = 0; i < min(BITS, 4); ++i) lo |= uint(p[i]) << (8 * i);
+        if (BITS > 4) hi = p[4];
+        for (int j = 0; j < 8; ++j) {
+            const int bit = BITS * j;
+            const uint v = bit + BITS <= 32 ? lo >> bit : bit >= 32 ? hi >> (bit - 32) : (lo >> bit) | (hi << (32 - bit));
+            q[j] = float(v & MASK);
+        }
     }
 }
 template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
@@ -405,6 +413,64 @@ inline void aff8_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thre
         }
     }
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
+}
+// fp8_mma8 for affine weights: rows r0..r0+7 against NB <= 8 vectors on simdgroup matrices, with
+// fp8_mma8's k mapping (column c of a 32-value sub-block is k = base + 4c + j for MMA j), so a lane
+// decodes 8 contiguous codes of its row. Per GS-group: scale * sum(q x) (MMA) + bias * sum(x),
+// sum(x) reduced over the lanes of the 8 k-rows. A vector's result does not depend on NB (padded
+// columns never mix into another column), so one-token decode and verify blocks agree bitwise.
+template <int K, int KS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
+inline void aff_mma8(W w, S s, B b, uint r0, X x, uint XS, uint lane, uint ks,
+                     threadgroup float* red, threadgroup float* tile) {
+    constexpr int G = K / GS;
+    static_assert(GS % 32 == 0 && G % KS == 0, "K split must cover whole groups");
+    constexpr int GPS = G / KS;
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    simdgroup_matrix<float, 8, 8> part, a, bm;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    const device uchar* wrow = reinterpret_cast<const device uchar*>(w + size_t(r0 + fm) * (K * BITS / 32));
+    const bool v0 = int(fn) < NB, v1 = int(fn + 1) < NB;
+    const auto x0 = x + size_t(v0 ? fn : 0) * XS;
+    const auto x1 = x + size_t(v1 ? fn + 1 : 0) * XS;
+    for (int g = int(ks) * GPS; g < int(ks + 1) * GPS; ++g) {
+        part.thread_elements()[0] = 0.0f; part.thread_elements()[1] = 0.0f;
+        float xs0 = 0.0f, xs1 = 0.0f;
+        for (int sb = 0; sb < GS / 32; ++sb) {
+            const uint base = uint(g) * GS + uint(sb) * 32;
+            float q[8], xa[4], xb[4];
+            affine_codes8<BITS>(wrow + (base + 4 * fn) * BITS / 8, q);
+            for (int j = 0; j < 4; ++j) {
+                xa[j] = v0 ? float(x0[base + 4 * fm + j]) : 0.0f;
+                xb[j] = v1 ? float(x1[base + 4 * fm + j]) : 0.0f;
+                xs0 += xa[j]; xs1 += xb[j];
+            }
+            for (int j = 0; j < 4; ++j) {
+                a.thread_elements()[0] = q[j];
+                a.thread_elements()[1] = q[j + 4];
+                bm.thread_elements()[0] = xa[j];
+                bm.thread_elements()[1] = xb[j];
+                simdgroup_multiply_accumulate(part, a, bm, part);
+            }
+        }
+        xs0 += simd_shuffle_xor(xs0, 2u); xs0 += simd_shuffle_xor(xs0, 4u); xs0 += simd_shuffle_xor(xs0, 16u);
+        xs1 += simd_shuffle_xor(xs1, 2u); xs1 += simd_shuffle_xor(xs1, 4u); xs1 += simd_shuffle_xor(xs1, 16u);
+        const size_t gi = size_t(r0 + fm) * G + g;
+        const float sc = float(s[gi]), bi = float(b[gi]);
+        acc0 = fma(sc, part.thread_elements()[0], fma(bi, xs0, acc0));
+        acc1 = fma(sc, part.thread_elements()[1], fma(bi, xs1, acc1));
+    }
+    red[ks * 64 + fm * 8 + fn] = acc0;
+    red[ks * 64 + fm * 8 + fn + 1] = acc1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0) {
+        for (int e = 0; e < 2; ++e) {
+            float t = 0.0f;
+            for (int q = 0; q < KS; ++q) t += red[q * 64 + fm * 8 + fn + e];
+            tile[fm * 8 + fn + e] = t;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 // Top-k of scores + bias with ties to the lower index (any tie order is spec-conformant).
 template <int NE, int K>
@@ -778,7 +844,8 @@ def weight_format(p):
 
 def format_macros(roles):
     """Per-role weight access for the kernel sources: <role>_WPR(K) uint32 words and
-    <role>_SPR(K) scales per row, <role>_ROWS / <role>_ROWS_NB the row dot products."""
+    <role>_SPR(K) scales per row, <role>_ROWS / <role>_ROWS_NB / <role>_MMA8 the row dot
+    products (one vector, NB vectors, NB vectors on simdgroup matrices)."""
     lines = []
     for role, (mode, bits, gs) in roles:
         if mode == "affine":
@@ -787,19 +854,23 @@ def format_macros(roles):
             wpr, spr = f"((K_) * {bits} / 32)", f"((K_) / {gs})"
             rows = f"{helper}_rows<K_, R_, {bits}, {gs}>(w_, s_, b_, r0_, x_, l_, acc_)"
             nb = f"{helper}_rows_nb<K_, R_, NB_, {bits}, {gs}>(w_, s_, b_, r0_, x_, xs_, l_, acc_)"
+            mma = f"aff_mma8<K_, KS_, NB_, {bits}, {gs}>(w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, tile_)"
         elif mode == "mxfp8":
             wpr, spr = "((K_) / 4)", "((K_) / 32)"
             rows = "fp8_rows<K_, R_>(w_, s_, r0_, x_, l_, acc_)"
             nb = "fp8_rows_nb<K_, R_, NB_>(w_, s_, r0_, x_, xs_, l_, acc_)"
+            mma = "fp8_mma8<K_, KS_, NB_>(w_, s_, r0_, x_, xs_, l_, ks_, red_, tile_)"
         else:
             wpr, spr = "((K_) / 8)", "((K_) / 32)"
             rows = "fp4_rows<K_, R_>(w_, s_, r0_, x_, l_, acc_)"
             nb = "static_assert(false, \"no MXFP4 multi-vector rows\")"
+            mma = "static_assert(false, \"no MXFP4 matrix rows\")"
         lines += [
             f"#define {role}_WPR(K_) {wpr}",
             f"#define {role}_SPR(K_) {spr}",
             f"#define {role}_ROWS(K_, R_, w_, s_, b_, r0_, x_, l_, acc_) {rows}",
             f"#define {role}_ROWS_NB(K_, R_, NB_, w_, s_, b_, r0_, x_, xs_, l_, acc_) {nb}",
+            f"#define {role}_MMA8(K_, KS_, NB_, w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, tile_) {mma}",
         ]
     return "\n".join(lines) + "\n"
 

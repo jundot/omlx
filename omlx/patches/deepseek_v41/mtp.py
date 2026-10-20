@@ -52,6 +52,10 @@ class DSparkMixin:
         self._omlx_mtp_rowwise_unsupported = True
         self._omlx_mtp_independent_verify = True
         self._omlx_mtp_depth = max(1, min(depth, self._config.dspark_block_size))
+        # One-token decode then runs the kernels of verify blocks (decode_fused), so a
+        # verified draft gets the logits that decoding it alone gives.
+        for layer in getattr(self, "layers", ()):
+            object.__setattr__(layer, "_omlx_verify_exact", bool(enabled))
 
     def make_mtp_depth_controller(self, depth):
         return AcceptanceDepthController(depth)
