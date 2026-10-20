@@ -1124,9 +1124,7 @@ class TestResolveSpecprefillKwargs:
     def test_settings_fill_missing_values(self):
         from omlx.model_settings import ModelSettings
 
-        settings = ModelSettings(
-            specprefill_keep_pct=0.1, specprefill_threshold=32768
-        )
+        settings = ModelSettings(specprefill_keep_pct=0.1, specprefill_threshold=32768)
         resolved = self._resolve({}, settings)
         assert resolved == {
             "specprefill_keep_pct": 0.1,
@@ -1136,9 +1134,7 @@ class TestResolveSpecprefillKwargs:
     def test_request_value_wins_over_settings(self):
         from omlx.model_settings import ModelSettings
 
-        settings = ModelSettings(
-            specprefill_keep_pct=0.1, specprefill_threshold=32768
-        )
+        settings = ModelSettings(specprefill_keep_pct=0.1, specprefill_threshold=32768)
         kwargs = {"specprefill_keep_pct": 0.4, "specprefill_threshold": 2048}
         resolved = self._resolve(kwargs, settings)
         assert resolved["specprefill_keep_pct"] == 0.4
@@ -1287,9 +1283,7 @@ class TestEngineSettingsFallback:
         from omlx.model_settings import ModelSettings
 
         engine = self._batched_engine(ModelSettings(specprefill_threshold=32768))
-        await engine.generate(
-            prompt="hi", max_tokens=4, specprefill_keep_pct=0.25
-        )
+        await engine.generate(prompt="hi", max_tokens=4, specprefill_keep_pct=0.25)
         sent = engine._engine.generate_kwargs
         assert sent["specprefill_keep_pct"] == 0.25
         assert sent["specprefill_threshold"] == 32768
@@ -1324,3 +1318,31 @@ class TestEngineSettingsFallback:
         engine = self._vlm_engine(ModelSettings(specprefill_threshold=32768))
         await engine.generate(prompt=[1, 2, 3], max_tokens=4)
         assert engine._engine.generate_kwargs["specprefill_threshold"] == 32768
+
+
+@pytest.mark.parametrize("engine_type", ["batched", "vlm"])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.asyncio
+async def test_settings_fallback_keeps_generation_prompt_markers(
+    engine_type, streaming
+):
+    from omlx.model_settings import ModelSettings
+
+    engine = getattr(TestEngineSettingsFallback(), "_" + engine_type + "_engine")(
+        ModelSettings(specprefill_threshold=32768)
+    )
+    kwargs = {
+        "prompt": [1, 2, 3],
+        "generation_prompt_text": "<think>",
+        "generation_prompt_persists": True,
+    }
+    if streaming:
+        async for _ in engine.stream_generate(**kwargs):
+            pass
+        sent = engine._engine.add_request_kwargs
+    else:
+        await engine.generate(**kwargs)
+        sent = engine._engine.generate_kwargs
+    assert sent["specprefill_threshold"] == 32768
+    assert sent["generation_prompt_text"] == "<think>"
+    assert sent["generation_prompt_persists"] is True

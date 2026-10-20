@@ -193,8 +193,8 @@ async def _run_scheduler_preflight_with_cleanup_retry(
 
 
 def resolve_specprefill_kwargs(
-    kwargs: Dict[str, Any], model_settings: Any
-) -> Dict[str, Any]:
+    kwargs: dict[str, Any], model_settings: Any
+) -> dict[str, Any]:
     """Pop per-request SpecPrefill overrides from ``kwargs``, falling back
     to per-model settings for keep_pct/threshold (issue #1263).
 
@@ -208,7 +208,7 @@ def resolve_specprefill_kwargs(
     enables SpecPrefill whenever the draft model is loaded, and the draft
     model only loads when ``specprefill_enabled`` was set.
     """
-    resolved: Dict[str, Any] = {}
+    resolved: dict[str, Any] = {}
     if kwargs.get("specprefill") is not None:
         resolved["specprefill"] = kwargs.pop("specprefill")
     keep_pct = kwargs.pop("specprefill_keep_pct", None)
