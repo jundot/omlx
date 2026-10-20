@@ -33,7 +33,7 @@ def _client() -> TestClient:
     return TestClient(app)
 
 
-def _layout(path):
+def _layout(path, text_only=False):
     return ModelLayout(
         source=path,
         fixed_weight_bytes=1,
@@ -108,7 +108,7 @@ class _RecordingPool:
         self.entry = SimpleNamespace(engine=None)
         self.reloads = 0
 
-    def resolve_cluster_model_id(self, model_path):
+    def resolve_cluster_model_id(self, model_path, *, text_only=False):
         assert model_path == self.model_path
         return self.model_id
 
@@ -266,7 +266,7 @@ def test_replan_inherits_tensor_parallelism_and_context(tmp_path, monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: replace(
+        lambda path, *, text_only=False: replace(
             _layout(path),
             tensor_parallel_heads=2,
             tensor_parallel_kv_heads=2,

@@ -206,7 +206,7 @@ def test_plan_route_runs_proportional_allocator(monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: _model(layers=(10,) * 12),
+        lambda path, *, text_only=False: _model(layers=(10,) * 12),
     )
 
     response = _client().post(
@@ -234,7 +234,7 @@ def test_plan_route_defaults_to_balanced_allocator(monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: _model(layers=(10,) * 12),
+        lambda path, *, text_only=False: _model(layers=(10,) * 12),
     )
 
     response = _client().post(
@@ -256,7 +256,7 @@ def test_plan_route_rejects_proportional_tensor_parallel(monkeypatch):
     monkeypatch.setattr(
         routes,
         "inspect_safetensors_layout",
-        lambda path: _model(layers=(10,) * 12),
+        lambda path, *, text_only=False: _model(layers=(10,) * 12),
     )
 
     response = _client().post(
