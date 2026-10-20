@@ -472,19 +472,27 @@ class ThinkingParser:
             Tuple of (thinking_text, content_text) from remaining buffer
             (plus recovered content if applicable).
         """
-        thinking_delta, content_delta, _ = self._finish_impl(False, truncated=truncated, has_tool_calls=has_tool_calls)
+        thinking_delta, content_delta, _ = self._finish_impl(
+            False, truncated=truncated, has_tool_calls=has_tool_calls
+        )
         return (thinking_delta, content_delta)
 
-    def finish_with_logprob(self, *, truncated: bool = False, has_tool_calls: bool = False):
+    def finish_with_logprob(
+        self, *, truncated: bool = False, has_tool_calls: bool = False
+    ):
         """Logprob-aware flush; returns (thinking_delta, content_delta, content_logprobs).
 
         The malformed-thinking recovery path re-emits accumulated thinking text
         as content; those tokens were never tracked as content, so the recovered
         content carries no logprobs (empty list).
         """
-        return self._finish_impl(True, truncated=truncated, has_tool_calls=has_tool_calls)
+        return self._finish_impl(
+            True, truncated=truncated, has_tool_calls=has_tool_calls
+        )
 
-    def _finish_impl(self, track: bool, *, truncated: bool = False, has_tool_calls: bool = False):
+    def _finish_impl(
+        self, track: bool, *, truncated: bool = False, has_tool_calls: bool = False
+    ):
         partial = self._buffer
         partial_lps = self._buffer_lps
         self._buffer = ""
