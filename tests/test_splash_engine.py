@@ -11,6 +11,8 @@ import stat
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -682,6 +684,32 @@ class TestStreaming:
         assert body["model"] == REPO_ID
         assert body["reasoning_effort"] == "high"
         assert body["stream"] is True and body["return_progress"] is True
+
+    async def test_a_malformed_chunk_fails_with_a_clean_error(self, tmp_path):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = b"data: {not json\n\ndata: [DONE]\n\n"
+            return httpx.Response(200, content=body)
+
+        engine = _engine_with_transport(tmp_path, handler)
+
+        with pytest.raises(RuntimeError, match="malformed stream chunk") as error:
+            async for _ in engine.stream_chat([{"role": "user", "content": "hi"}]):
+                pass
+        # The offending line, truncated, travels with the error.
+        assert "{not json" in str(error.value)
+
+    async def test_a_malformed_chunk_is_truncated_in_the_error(self, tmp_path):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = b"data: {" + b"x" * 300 + b"\n\ndata: [DONE]\n\n"
+            return httpx.Response(200, content=body)
+
+        engine = _engine_with_transport(tmp_path, handler)
+
+        with pytest.raises(RuntimeError) as error:
+            async for _ in engine.stream_chat([{"role": "user", "content": "hi"}]):
+                pass
+        # Only the first 120 characters of the offending line are quoted.
+        assert len(str(error.value)) == len("Splash: malformed stream chunk: ") + 120
         assert engine.has_active_requests() is False
 
     async def test_unfinished_reasoning_is_closed(self, tmp_path):
@@ -910,6 +938,32 @@ class TestLifecycle:
         process = subprocess.Popen(command, start_new_session=True)
         try:
             assert process.wait(timeout=10) is not None
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+        assert not _group_alive(process.pid)
+
+    def test_watchdog_kills_splash_that_ignores_sigterm(self, monkeypatch):
+        # A parent that dies must not leave a stuck Splash holding memory:
+        # the watchdog escalates to SIGKILL once SIGTERM is ignored.
+        monkeypatch.setattr(splash_mod, "STOP_TIMEOUT_SECONDS", 1)
+        monkeypatch.setattr(splash_mod, "WATCHDOG_POLL_SECONDS", 0.2)
+        dead_parent = os.fork()
+        if dead_parent == 0:
+            os._exit(0)
+        os.waitpid(dead_parent, 0)
+        stuck = [
+            sys.executable,
+            "-c",
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "while True: time.sleep(0.1)",
+        ]
+        command = splash_mod._watchdog_command(stuck)
+        command[command.index(str(os.getpid()))] = str(dead_parent)
+        process = subprocess.Popen(command, start_new_session=True)
+        try:
+            assert process.wait(timeout=15) is not None
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
@@ -1317,6 +1371,48 @@ class TestAdminAPI:
         entry.model_path = str(bf16)
         (row,) = admin_routes._external_engines_for_model(pool, info, None)
         assert row["draft_repo"] is None
+
+    async def test_model_list_probes_splash_off_the_event_loop(
+        self, tmp_path, launchers, global_settings
+    ):
+        # The launcher probe runs the Splash binary and can block for its
+        # whole timeout; the models route must not stall the loop on it.
+        launchers("splash")
+        pool, _ = _pool(tmp_path)
+        probe_threads = []
+
+        def blocking_probe(model_id, model_settings):
+            probe_threads.append(threading.current_thread())
+            time.sleep(0.2)
+            return None, "probe offline"
+
+        pool.splash_target = blocking_probe
+        manager = MagicMock()
+        manager.get_all_settings.return_value = {}
+        manager.list_profiles.return_value = []
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            patch.object(admin_routes, "_get_server_state", return_value=MagicMock()),
+        ):
+            ticker = asyncio.create_task(heartbeat())
+            try:
+                await admin_routes.list_models(is_admin=True)
+            finally:
+                ticker.cancel()
+
+        assert probe_threads  # the model was probed
+        assert all(thread is not threading.main_thread() for thread in probe_threads)
+        # The loop kept serving other tasks while the probe blocked.
+        assert ticks > 1
 
 
 # -- native response_format ---------------------------------------------------

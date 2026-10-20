@@ -863,12 +863,19 @@ def _watchdog_command(command: list[str]) -> list[str]:
 
     The shell stops the whole group when oMLX (its parent) or Splash exits,
     so a crashed or force-killed oMLX never leaves Splash holding memory.
+    A Splash that ignores SIGTERM is killed after STOP_TIMEOUT_SECONDS, like
+    the engine's own stop() path.
     """
+    term_waits = max(1, STOP_TIMEOUT_SECONDS // WATCHDOG_POLL_SECONDS)
     script = (
         'parent=$1; shift; "$@" & child=$!; '
         'while kill -0 "$parent" 2>/dev/null && kill -0 "$child" 2>/dev/null; '
         f"do sleep {WATCHDOG_POLL_SECONDS}; done; "
-        'if kill -0 "$child" 2>/dev/null; then trap "" TERM; kill -TERM 0; fi; '
+        'if kill -0 "$child" 2>/dev/null; then trap "" TERM; kill -TERM 0; '
+        f"left={term_waits}; "
+        'while kill -0 "$child" 2>/dev/null && [ "$left" -gt 0 ]; do '
+        f"sleep {WATCHDOG_POLL_SECONDS}; left=$((left - 1)); done; "
+        'kill -0 "$child" 2>/dev/null && kill -KILL 0; fi; '
         'wait "$child"'
     )
     return ["/bin/sh", "-c", script, "splash-watchdog", str(os.getpid()), *command]
@@ -1271,7 +1278,12 @@ class SplashEngine(BaseEngine):
             data = line[5:].strip()
             if data == "[DONE]":
                 return
-            chunk = json.loads(data)
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(
+                    f"Splash: malformed stream chunk: {data[:120]}"
+                ) from e
             if chunk.get("error"):
                 raise RuntimeError(f"Splash error: {chunk['error']}")
             yield chunk

@@ -2388,8 +2388,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
-        external_engines = _external_engines_for_model(
-            engine_pool, model_info, settings
+        # The Splash launcher check runs the binary to read its version;
+        # keep that blocking probe off the event loop (see the external
+        # engine check in update_model_settings).
+        external_engines = await asyncio.to_thread(
+            _external_engines_for_model, engine_pool, model_info, settings
         )
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
