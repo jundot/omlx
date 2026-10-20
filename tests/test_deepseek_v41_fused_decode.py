@@ -442,6 +442,9 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block_verify", counted)
+    blocks = []
+    real_block = decode_fused.compress_index_block
+    monkeypatch.setattr(decode_fused, "compress_index_block", lambda *a: (blocks.append(1), real_block(*a))[1])
     rng = np.random.default_rng(29 + rows)
     prompt = rng.integers(3, 60, prompt_length).tolist()
     tokens = rng.integers(3, 60, rows + 1).tolist()   # confirmed token, drafts, next step
@@ -453,6 +456,8 @@ def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted,
     for j in range(rows):
         assert mx.array_equal(got[0, j], expected[j]).item(), f"row {j}"
     assert len(calls) == model._config.n_layers
+    # A full window with enough index keys runs the compressor and indexer once per block.
+    assert len(blocks) == (4 if prompt_length == 11 else 0)
     assert model.mtp_partial_rollback(verified, accepted, rows - 1)
     for t in tokens[: accepted + 1]:
         mx.eval(model(mx.array([[t]]), cache=accepted_only))

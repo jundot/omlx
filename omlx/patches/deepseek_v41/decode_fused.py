@@ -18,7 +18,8 @@ import numpy as np
 from . import decode_layer as DL
 from . import decode_moe as DM
 from . import growth
-from .quantization import QuantizedProjection, pack_activation
+from .kernels import packed_index_scores, packed_index_topk
+from .quantization import QuantizedProjection, pack_activation, quantize_activation
 
 
 def _cos_sin(c, compressed, start):
@@ -232,6 +233,134 @@ def compress_index(att, x, qr, cache, shared, start, c):
         compressed = pack_activation(compressed, bits=4, group_size=16, e4m3_scale=True)
         shared["kv"] = cache[2] = growth.append(cache, 2, shared["kv"], compressed, start // ratio)
     return shared["kv"], shared["idx"]
+
+
+def _rows(p, v):
+    """p applied to each row of v ([1, R, K]) on its own, as when each token decodes alone
+    (a multi-row MLX GEMV rounds its fp32 sums differently)."""
+    return mx.concatenate([p(v[:, j : j + 1]) for j in range(v.shape[1])], 1)
+
+
+def block_index_ok(c, start):
+    """Whether compress_index_block applies to a verify block from `start`: every token
+    then selects index_topk keys in every compressed layer, so the per-token selections
+    have the same width (the -1 padding of a narrower one would move its keys)."""
+    for r in {r for r in c.compress_ratios[: c.n_layers] if r}:
+        if (start + 1) // r < c.index_topk:
+            return False
+    src = c.candidate_source_layer
+    if src >= 0:
+        visible = (start + 1) // c.compress_ratios[src]
+        blocks = min(c.candidate_topk_blocks, -(-visible // c.candidate_block_size))
+        if blocks * c.candidate_block_size < c.index_topk:
+            return False
+    return True
+
+
+def _compress_block(comp, x, cache, start):
+    """Compressor.__call__ for the R tokens x [1, R, dim] at once."""
+    r = comp.ratio
+    if r == 1:
+        return comp.norm(_rows(comp.wkv, x))
+    x32 = x.astype(mx.float32)
+    kv, gate = _rows(comp.wkv, x32), _rows(comp.wgate, x32)
+    rem = start % r
+    if rem:
+        kv = mx.concatenate([cache[4][:, :rem], kv], 1)
+        gate = mx.concatenate([cache[5][:, :rem], gate], 1)
+    verify_state = getattr(cache, "_mtp_verify_state", None)
+    if verify_state is not None:
+        verify_state["compressor"] = (kv, gate)
+    cutoff = kv.shape[1] // r * r
+    cache[4], cache[5] = kv[:, cutoff:], gate[:, cutoff:]
+    if not cutoff:
+        return None
+    pooled = mx.sum(
+        kv[:, :cutoff].reshape(1, -1, r, kv.shape[-1])
+        * mx.softmax(gate[:, :cutoff].reshape(1, -1, r, gate.shape[-1]), axis=2),
+        axis=2,
+    )
+    return comp.norm(pooled.astype(x.dtype))
+
+
+def _index_block(idx, x, qr, latent, cache, shared, start, ratio):
+    """Indexer.__call__ for the R tokens x [1, R, dim], qr [1, R, q_lora] at once."""
+    from .language import rope
+
+    c, layer = idx._config, idx._layer
+    r_n = x.shape[1]
+    end = start + r_n
+    if layer in c.kv_source_layers:
+        previous = cache[3]
+        previous = (
+            previous[:, : start // ratio]
+            if previous is not None
+            else pack_activation(mx.zeros((1, 0, c.index_head_dim), x.dtype), bits=4)
+        )
+        if latent is not None:
+            pos = range(start // ratio * ratio, end // ratio * ratio, ratio)
+            key = pack_activation(rope(idx.k_norm(_rows(idx.wk, latent)), pos, c, True), bits=4)
+            previous = growth.append(cache, 3, previous, key, start // ratio)
+        shared["block_index_k"] = cache[3] = previous
+    key = shared["block_index_k"]
+    q = _rows(idx.wq_b, qr).reshape(1, r_n, c.index_n_heads, c.index_head_dim)
+    q = quantize_activation(rope(q, range(start, end), c, True), bits=4)
+    weights = (
+        _rows(idx.weights_proj, x)
+        * mx.array(c.index_head_dim**-0.5 * c.index_n_heads**-0.5, mx.float32)
+    ).astype(x.dtype).astype(mx.float32)
+    if not 0 <= c.candidate_source_layer < layer:
+        ids, blocks = packed_index_topk(
+            q, key, weights, start, ratio, c.index_topk,
+            block_count=c.candidate_topk_blocks if layer == c.candidate_source_layer else 0,
+            block_size=c.candidate_block_size,
+        )
+        if layer == c.candidate_source_layer:
+            # A token that sees fewer blocks than the block gets leading -1 slots; they
+            # only add -inf candidates and keep the order of the others.
+            shared["block_candidates"] = blocks
+        return ids
+    blocks = shared["block_candidates"]
+    candidates = blocks[..., None] * c.candidate_block_size + mx.arange(c.candidate_block_size)
+    candidates = mx.where(blocks[..., None] >= 0, candidates, -1).reshape(1, r_n, -1)
+    scores = packed_index_scores(q, key, weights, start, ratio, candidates)
+    order = mx.argsort(-scores, axis=-1)[..., : c.index_topk].astype(mx.int32)
+    valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
+    ids = mx.take_along_axis(candidates, order, -1)
+    return mx.sort(mx.where(valid, ids, -1), axis=-1)
+
+
+def compress_index_block(att, x, qr, cache, shared, start, c):
+    """compress_index for the R tokens of a verify block at once (x: [R, dim], qr:
+    [R, q_lora]; requires block_index_ok). The compressed rows, the cache updates and each
+    token's selected indices equal R calls of compress_index; projections still run one
+    row at a time. Returns per token (compressed rows of the block, its indices [1, 1, k]),
+    the same list for the layers that reuse a source layer's arrays."""
+    from .language import rope
+
+    layer = att._layer
+    ratio = c.compress_ratios[layer]
+    kv_source, index_source = layer in c.kv_source_layers, layer in c.index_source_layers
+    if not (kv_source or index_source):
+        return shared["block_parts"]
+    r_n = x.shape[0]
+    x3 = x.reshape(1, r_n, -1)
+    latent = None
+    if kv_source:
+        latent = _compress_block(att.compressor, x3, cache, start)
+        if cache[2] is None:
+            cache[2] = pack_activation(mx.zeros((1, 0, c.head_dim), x.dtype), bits=4, group_size=16, e4m3_scale=True)
+        shared["block_kv"] = cache[2][:, : start // ratio]
+    if index_source:
+        shared["block_idx"] = _index_block(att.indexer, x3, qr.reshape(1, r_n, -1), latent, cache, shared, start, ratio)
+    if latent is not None:
+        first = start // ratio
+        compressed = rope(latent, range(first * ratio, (start + r_n) // ratio * ratio, ratio), c, True)
+        compressed = pack_activation(compressed, bits=4, group_size=16, e4m3_scale=True)
+        shared["block_kv"] = cache[2] = growth.append(cache, 2, shared["block_kv"], compressed, first)
+    kv, idx = shared["block_kv"], shared["block_idx"]
+    shared["block_parts"] = [(kv, idx[:, j : j + 1]) for j in range(r_n)]
+    return shared["block_parts"]
 
 
 def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
@@ -449,12 +578,18 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
         if cat is None or len(cat[0]) != len(key) or any(a is not b for a, b in zip(cat[0], key)):
             ncs = [int(p.shape[1]) for p, _ in parts]
             cs_ = [int(i.shape[-1]) for _, i in parts]
-            offs = [sum(ncs[:r]) for r in range(b_n)]
-            pooled = (mx.concatenate([p.reshape(-1, p.shape[-1]) for p, _ in parts if p.shape[1]], 0)
-                      if sum(ncs) else _dummy(mx.uint8))
+            if all(p is parts[0][0] for p, _ in parts):
+                # One array for the block (compress_index_block): a query's indices stay below
+                # its own row count, so all queries can read the block's rows.
+                offs = [0] * b_n
+                pooled = parts[0][0].reshape(-1, parts[0][0].shape[-1]) if ncs[0] else _dummy(mx.uint8)
+            else:
+                offs = [sum(ncs[:r]) for r in range(b_n)]
+                pooled = (mx.concatenate([p.reshape(-1, p.shape[-1]) for p, _ in parts if p.shape[1]], 0)
+                          if sum(ncs) else _dummy(mx.uint8))
             cmax = max(max(cs_), 1)
             ci = mx.concatenate([mx.pad(i.reshape(1, -1).astype(mx.int32), [(0, 0), (0, cmax - i.shape[-1])], constant_values=-1)
-                                 for _, i in parts], 0)
+                                 if i.shape[-1] < cmax else i.reshape(1, -1).astype(mx.int32) for _, i in parts], 0)
             cat = (key, pooled, ncs, cs_, offs, ci, cmax)
             memo["_batched_compressed"] = cat
         _, pooled, ncs, cs_, offs, ci, cmax = cat
@@ -521,8 +656,10 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
     decoded one at a time, so speculative decoding cannot change greedy output:
       * the stages that stream weights run once for the R rows with the batch-invariant
         kernels (no matrix tiles: each row is the single-token arithmetic);
-      * the compressor and indexer run token by token in order, each token with its own
-        shared-state dict, since a token only sees the cache up to itself;
+      * the compressor and indexer run once for the block (compress_index_block: projections
+        row by row, each token's selection masked to the keys it sees) when every token
+        selects index_topk keys, else token by token, each token with its own shared-state
+        dict, since a token only sees the cache up to itself;
       * the sparse attention runs once for the block, each token over the window
         attention_core would build for it (window_attention_bq), or token by token while
         the window is still filling.
@@ -557,7 +694,11 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
         win = mx.concatenate([full[:, j + 1 : j + 1 + w] for j in range(r_n)], 0)
         cache[1] = full[:, -w:]
         parts = None
-        if ratio:
+        if ratio and block_index_ok(c, start):
+            # Records the compressor's verify state itself.
+            parts = compress_index_block(att, x, qr, cache, tokens[0], start, c)
+            pooling = False
+        elif ratio:
             parts = []
             for j in range(r_n):
                 parts.append(compress_index(att, x[j], qr[j], cache, tokens[j], start + j, c))
