@@ -27,7 +27,7 @@
             <div class="flex-1 min-w-0">
                 <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('status.claude_code.command') }}</label>
                 <div class="relative group">
-                    <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all leading-relaxed"
+                    <pre class="px-4 py-3 pr-12 bg-neutral-100 text-neutral-800 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap [overflow-wrap:anywhere] leading-relaxed"
                          x-text="claudeCodeCommand"></pre>
                     <button x-data="{ copied: false }"
                             @click="copyToClipboard(claudeCodeCommand); copied = true; setTimeout(() => copied = false, 2000)"
