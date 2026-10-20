@@ -8,12 +8,6 @@ math, plain `nn.Embedding` + separate weightless `embed_norm`) synced in
 2026-08-16 (vendor commit 3a82f856). Vendored because these PRs are newer
 than oMLX's mlx-vlm pin (`78b96eb`).
 
-The CenteredRMSNorm implementation is duplicated in dflash-mlx's
-`dflash_mlx/models/muse_glimmer.py`; the two must stay numerically
-identical or DFlash verify logits drift from serving logits
-(tests/test_dflash_muse_glimmer.py guards this). The FP32 qk_scale math
-is mirrored in the dflash-mlx fork (commit cc57617) for the same reason.
-
 ## oMLX deltas against the PR head (marked with `oMLX:` comments)
 
 1. `language.py` — `initialize_rope` is imported from

@@ -7,6 +7,7 @@ import mlx.core as mx
 import pytest
 
 import omlx.patches.m5_gather_qmm as patch_mod
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
 
 
@@ -16,11 +17,8 @@ def _fresh_state(monkeypatch):
 
     Restoration pins everything to the raw builtin captured at setup —
     monkeypatched stand-ins (e.g. call spies on ``_original_gather_qmm``)
-    must never leak into ``mx.gather_qmm`` for later test files. The
-    reinstall bypasses ``apply`` so a kill-switch env var set by the
-    test cannot leave the session unwrapped.
+    must never leak into ``mx.gather_qmm`` for later test files.
     """
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_FIX", raising=False)
     was_installed = getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
     raw = patch_mod._original_gather_qmm if was_installed else mx.gather_qmm
     saved_defective = patch_mod._defective
@@ -40,12 +38,6 @@ def test_apply_idempotent():
     assert not apply_m5_gather_qmm_workaround()
 
 
-def test_env_kill_switch(monkeypatch):
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_FIX", "0")
-    assert not apply_m5_gather_qmm_workaround()
-    assert not getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
-
-
 def _call(x_shape, **kwargs):
     x = mx.zeros(x_shape, dtype=mx.bfloat16)
     return patch_mod._needs_reroute(x, (), kwargs)
@@ -59,8 +51,8 @@ def test_needs_reroute_conditions():
     assert _call((80, 1, 96), rhs_indices=rows, sorted_indices=True)
     # Aligned K with a small row count stays on the fast path.
     assert not _call((80, 1, 128), rhs_indices=rows, sorted_indices=True)
-    # ml-explore/mlx#3856: row counts above 32768 trigger even aligned.
-    assert _call((32769, 1, 128), rhs_indices=big, sorted_indices=True)
+    # Row counts above 32768 stay sorted (ml-explore/mlx#3922).
+    assert not _call((32769, 1, 128), rhs_indices=big, sorted_indices=True)
     # Unsorted calls never reroute.
     assert not _call((80, 1, 96), rhs_indices=rows, sorted_indices=False)
     assert not _call((80, 1, 96), rhs_indices=rows)
@@ -116,8 +108,19 @@ def _kernel_defective_here() -> bool:
     not _kernel_defective_here(),
     reason="sorted gather_qmm NAX kernel is healthy on this machine",
 )
-def test_reroute_restores_correct_output_on_defective_hardware():
-    """On affected hardware the patched call matches the fp32 reference."""
+@pytest.mark.parametrize("poisoned", [False, True])
+@pytest.mark.parametrize("nax_route", ["1", "0"])
+def test_reroute_restores_correct_output_on_defective_hardware(
+    monkeypatch, nax_route, poisoned
+):
+    """On affected hardware the patched call matches the fp32 reference.
+
+    Covered with the NAX route (m5_gather_qmm_nax) and with only the stock
+    reroute (flag dropped for K % 64 != 0). ``poisoned`` puts NaN right after
+    the last expert: mlx 0.32.3's kernel reads it for K % 64 != 0.
+    """
+    if nax_route == "0":
+        monkeypatch.setattr(patch_mod._nax, "supports", lambda *a, **k: False)
     assert apply_m5_gather_qmm_workaround()
 
     n, e, out_dim, k = 80, 8, 64, 96
@@ -129,6 +132,10 @@ def test_reroute_restores_correct_output_on_defective_hardware():
     wd = mx.dequantize(wq, scales, biases, group_size=32, bits=4)
     ref = x.astype(mx.float32) @ wd[idx].swapaxes(-1, -2).astype(mx.float32)
 
+    if poisoned:
+        wq = patch_mod._poisoned_tail(wq, 0xFFFFFFFF)
+        scales = patch_mod._poisoned_tail(scales, float("nan"))
+        biases = patch_mod._poisoned_tail(biases, float("nan"))
     out = mx.gather_qmm(
         x,
         wq,
@@ -142,3 +149,37 @@ def test_reroute_restores_correct_output_on_defective_hardware():
     )
     err = mx.abs(out.astype(mx.float32) - ref).max().item()
     assert err < 0.2, f"still corrupt through the reroute: max err {err}"
+
+
+@pytest.mark.skipif(not is_nax_available(), reason="needs an M5 (NAX) GPU")
+@pytest.mark.parametrize("nax_route", ["1", "0"])
+def test_sorted_call_past_32768_rows_matches_reference(monkeypatch, nax_route):
+    """>32768 sorted rows run as one call and match fp32: the NAX route, or
+    (route off) mlx's own kernel, whose row offsets no longer overflow."""
+    if nax_route == "0":
+        monkeypatch.setattr(patch_mod._nax, "supports", lambda *a, **k: False)
+    assert apply_m5_gather_qmm_workaround()
+
+    n, e, out_dim, k = 32768 + 4096, 8, 64, 64
+    keys = mx.random.split(mx.random.key(3856), 3)
+    w = mx.random.normal((e, out_dim, k), key=keys[0]).astype(mx.bfloat16)
+    wq, scales, biases = mx.quantize(w, group_size=64, bits=4)
+    x = (mx.random.normal((n, 1, k), key=keys[1]) * 0.5).astype(mx.bfloat16)
+    idx = mx.sort(mx.random.randint(0, e, (n,), key=keys[2]).astype(mx.uint32))
+    wd = mx.dequantize(wq, scales, biases, group_size=64, bits=4)
+    ref = x.astype(mx.float32) @ wd[idx].swapaxes(-1, -2).astype(mx.float32)
+
+    out = mx.gather_qmm(
+        x,
+        wq,
+        scales,
+        biases,
+        rhs_indices=idx,
+        transpose=True,
+        group_size=64,
+        bits=4,
+        sorted_indices=True,
+    )
+    assert out.shape == ref.shape
+    err = mx.abs(out.astype(mx.float32) - ref).max().item()
+    assert err < 0.2, f"sorted call past 32768 rows is corrupt: max err {err}"

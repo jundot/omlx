@@ -46,17 +46,20 @@ from omlx.api.utils import (
     _drop_void_assistant_messages,
     _extract_multimodal_content_list,
     _merge_consecutive_roles,
+    cache_reasoning_output,
     chat_template_preserves_mid_system,
     clean_output_text,
     detect_and_strip_partial,
     extract_harmony_messages,
     extract_multimodal_content,
     extract_text_content,
+    find_lone_surrogate,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
     uses_native_reasoning_content,
 )
 from omlx.exceptions import InvalidRequestError
+from omlx.model_settings import ModelSettings
 
 
 class TestReasoningEffortChatTemplateKwargs:
@@ -651,18 +654,33 @@ class TestUsesNativeReasoningContent:
             preserve_thinking_default=True,
         )
 
-    def test_detects_muse_glimmer(self):
+    @pytest.mark.parametrize("model_type", ["muse_glimmer", "muse_spark"])
+    def test_detects_muse_family(self, model_type):
         assert uses_native_reasoning_content(
             "any-name",
-            config_model_type="muse_glimmer",
+            config_model_type=model_type,
         )
         assert uses_native_reasoning_content(
             "any-name",
-            engine_model_type="muse_glimmer",
+            engine_model_type=model_type,
         )
 
     def test_plain_model_is_not_native(self):
         assert not uses_native_reasoning_content("llama-3")
+
+    def test_detects_deepseek_v4_family(self):
+        assert uses_native_reasoning_content(
+            "any-name",
+            config_model_type="deepseek_v41",
+        )
+        assert uses_native_reasoning_content(
+            "any-name",
+            engine_model_type="deepseek_v4",
+        )
+        assert not uses_native_reasoning_content(
+            "any-name",
+            config_model_type="deepseek_v3",
+        )
 
 
 class TestConvertAnthropicToInternal:
@@ -1028,11 +1046,21 @@ class TestConvertAnthropicToInternal:
         assert len(image_parts) == 1
         assert "iVBOR" in image_parts[0]["image_url"]["url"]
 
-    def test_document_block_text_plain(self):
-        """Test converting text/plain document block decodes content."""
+    @pytest.mark.parametrize(
+        "source_type,text",
+        [
+            ("base64", "Hello from document"),
+            ("text", "Hello from document\n你好"),
+            ("text", "SGVsbG8="),
+        ],
+    )
+    def test_document_block_text_plain(self, source_type, text):
+        """Document text is decoded only when the source declares base64."""
         import base64
 
-        text_data = base64.b64encode(b"Hello from document").decode()
+        text_data = (
+            base64.b64encode(text.encode()).decode() if source_type == "base64" else text
+        )
         request = MessagesRequest(
             model="claude-3",
             max_tokens=1024,
@@ -1042,7 +1070,7 @@ class TestConvertAnthropicToInternal:
                     content=[
                         ContentBlockDocument(
                             source={
-                                "type": "base64",
+                                "type": source_type,
                                 "media_type": "text/plain",
                                 "data": text_data,
                             },
@@ -1057,8 +1085,7 @@ class TestConvertAnthropicToInternal:
 
         assert len(result) == 1
         assert result[0]["role"] == "user"
-        assert "Hello from document" in result[0]["content"]
-        assert "[Document: notes.txt]" in result[0]["content"]
+        assert result[0]["content"] == f"[Document: notes.txt]\n{text}"
 
     def test_document_block_pdf_placeholder(self):
         """Test converting PDF document block returns placeholder."""
@@ -2682,6 +2709,95 @@ class TestPrepareSystemMessagesForTemplate:
         assert after_user is True
         assert after_tool is False
 
+    def test_budget_marker_system_after_tool_result_keeps_prompt_append_only(self):
+        tokenizer = self.UserOnlyMidSystemTokenizer()
+
+        def conversation(turns):
+            messages = [
+                {"role": "system", "content": "You are an agent."},
+                {"role": "user", "content": "Fix the bug."},
+            ]
+            for turn in range(turns):
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": f"c{turn}",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"c{turn}",
+                        "content": f"result {turn}",
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"<total_tokens>{150000 - 1000 * turn} tokens left"
+                            "</total_tokens>"
+                        ),
+                    }
+                )
+            return messages
+
+        prompts = [
+            tokenizer.apply_chat_template(
+                prepare_system_messages_for_template(
+                    conversation(turns),
+                    tokenizer,
+                    unsupported_mid_system_policy="user_note_safe",
+                )
+            )
+            for turns in (1, 2, 3)
+        ]
+
+        for earlier, later in zip(prompts, prompts[1:]):
+            assert later.startswith(earlier)
+
+    def test_strips_marker_appended_to_leading_system(self):
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an agent."
+                    "\n\n<total_tokens>150000 tokens left</total_tokens>"
+                ),
+            },
+            {"role": "user", "content": "Hello"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert result[0]["content"] == "You are an agent."
+
+    def test_drops_marker_only_system_even_when_template_preserves_it(self):
+        messages = [
+            {"role": "system", "content": "You are an agent."},
+            {"role": "user", "content": "Hello"},
+            {
+                "role": "system",
+                "content": "<total_tokens>42 tokens left</total_tokens>",
+            },
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert [message["role"] for message in result] == ["system", "user"]
+        assert result[0]["content"] == "You are an agent."
+
 
 class TestMergeConsecutiveRoles:
     """Tests for consecutive same-role message merging."""
@@ -3111,11 +3227,19 @@ class TestExtractMultimodalContent:
         assert parts[0]["input_audio"]["format"] == "wav"
 
     @pytest.mark.parametrize("part_type", ["video_url", "input_video"])
-    def test_video_input_is_rejected(self, part_type):
-        with pytest.raises(InvalidRequestError, match="Video input is not supported"):
-            _extract_multimodal_content_list(
-                [{"type": part_type, part_type: {"url": "data:video/mp4;base64,AA=="}}]
-            )
+    @pytest.mark.parametrize(
+        "value", [{"url": "data:video/mp4;base64,AA=="}, "data:video/mp4;base64,AA=="]
+    )
+    def test_video_input_is_preserved(self, part_type, value):
+        message = Message(role="user", content=[{"type": part_type, part_type: value}])
+        parts = _extract_multimodal_content_list(message.content)
+
+        assert parts == [
+            {
+                "type": "video_url",
+                "video_url": {"url": "data:video/mp4;base64,AA=="},
+            }
+        ]
 
 
 # =============================================================================
@@ -3433,6 +3557,29 @@ class TestDropVoidAssistantMessages:
         assert "hello" in result[0]["content"]
         assert "world" in result[0]["content"]
 
+    def test_multimodal_void_drop_then_merge_consecutive_users(self):
+        """The VLM path must also merge users left adjacent by the drop."""
+        msgs = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "data:,a"}},
+                ],
+            ),
+            Message(role="assistant", content=""),
+            Message(role="user", content="world"),
+        ]
+        result = extract_multimodal_content(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [p["type"] for p in result[0]["content"]] == [
+            "text",
+            "image_url",
+            "text",
+        ]
+        assert result[0]["content"][2]["text"] == "world"
+
     def test_multiple_void_assistants_merge_surrounding_users(self):
         """Multiple void assistants should be dropped and adjacent users merged."""
         msgs = [
@@ -3596,3 +3743,57 @@ class TestToolResultWithToolAwareTokenizer:
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
         # Arguments are parsed into dict for the chat template.
         assert result[0]["tool_calls"][0]["function"]["arguments"] == {"city": "Seoul"}
+
+
+class TestCacheReasoningOutput:
+    """Whether a reasoning request's output tokens are cacheable for the next turn."""
+
+    @pytest.mark.parametrize(
+        "forced, expected", [(None, False), (True, True), (False, False)]
+    )
+    def test_explicit_retention_off_with_native_reasoning(self, forced, expected):
+        assert (
+            cache_reasoning_output(
+                ModelSettings(cache_reasoning_output=forced),
+                native_reasoning=True,
+                chat_template_kwargs={"preserve_thinking": False},
+            )
+            is expected
+        )
+
+    def test_follows_history_retention_by_default(self):
+        from omlx.api.utils import cache_reasoning_output
+
+        assert cache_reasoning_output(None, native_reasoning=False, chat_template_kwargs={}) is False
+        assert cache_reasoning_output(None, native_reasoning=True, chat_template_kwargs={}) is True
+        assert (
+            cache_reasoning_output(
+                None, native_reasoning=False, chat_template_kwargs={"preserve_thinking": True}
+            )
+            is True
+        )
+
+    def test_model_setting_overrides_detection(self):
+        from types import SimpleNamespace
+
+        from omlx.api.utils import cache_reasoning_output
+
+        forced_on = SimpleNamespace(cache_reasoning_output=True)
+        forced_off = SimpleNamespace(cache_reasoning_output=False)
+        assert cache_reasoning_output(forced_on, native_reasoning=False, chat_template_kwargs={}) is True
+        assert (
+            cache_reasoning_output(
+                forced_off, native_reasoning=True, chat_template_kwargs={"preserve_thinking": True}
+            )
+            is False
+        )
+
+
+class TestFindLoneSurrogate:
+    def test_reports_lone_surrogate_path_and_accepts_paired(self):
+        part = {"type": "text", "text": "hi \U0001f600"}
+        body = {"messages": [{"content": [part]}]}
+        assert find_lone_surrogate(body) is None
+
+        part["text"] = "hi \ud83d"
+        assert find_lone_surrogate(body) == "messages[0].content[0].text"

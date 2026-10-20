@@ -9,22 +9,23 @@ import mlx.nn as nn
 import pytest
 
 import omlx.patches.qwen35_ane_prefill as ane_patch
-from omlx.custom_kernels.qwen35_prefill import fast
+from omlx.custom_kernels.quant_matmul import ane as fast
+from omlx.patches import qwen35_packed_linear
 
 
 def test_ane_compile_bindings_release_the_python_gil():
     bindings = (
         Path(__file__).resolve().parents[1]
-        / "omlx/custom_kernels/qwen35_prefill/csrc/bindings.cpp"
+        / "omlx/custom_kernels/quant_matmul/csrc/bindings.cpp"
     ).read_text(encoding="utf-8")
     blocks = bindings.split("  m.def(")
     guard = "nb::call_guard<nb::gil_scoped_release>()"
 
     for name in (
-        "qwen35_ane_compile_linear",
-        "qwen35_ane_compile_linear_bank",
-        "qwen35_ane_compile_fp16_linear",
-        "qwen35_ane_compile_swiglu_down",
+        "ane_compile_linear",
+        "ane_compile_linear_bank",
+        "ane_compile_fp16_linear",
+        "ane_compile_swiglu_down",
     ):
         block = next(part for part in blocks if f'"{name}"' in part)
         assert guard in block
@@ -33,10 +34,10 @@ def test_ane_compile_bindings_release_the_python_gil():
 def test_dual_ane_ticket_acquisition_rolls_back_the_first_ticket():
     source = (
         Path(__file__).resolve().parents[1]
-        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+        / "omlx/custom_kernels/quant_matmul/csrc/ane/ane_hybrid.mm"
     ).read_text(encoding="utf-8")
     helper = source.split("static AneTicketPair begin_ane_ticket_pair(", 1)[1]
-    helper = helper.split("bool qwen35_ane_available()", 1)[0]
+    helper = helper.split("bool ane_available()", 1)[0]
 
     assert "first->cancel_ticket(first_ticket);" in helper
     assert source.count("begin_ane_ticket_pair(") == 3
@@ -46,7 +47,7 @@ def test_ane_dispatch_guard_transfers_each_ticket_after_thread_spawn():
     """A thread-constructor failure must leave every unowned ticket guarded."""
     source = (
         Path(__file__).resolve().parents[1]
-        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+        / "omlx/custom_kernels/quant_matmul/csrc/ane/ane_hybrid.mm"
     ).read_text(encoding="utf-8")
     dual = source.split("class DualAneHybridPrimitive", 1)[1]
     dual = dual.split("class AneHybridQ4SwiGLUDownPrimitive", 1)[0]
@@ -74,7 +75,7 @@ def test_hybrid_merge_waits_for_gpu_suffix_completion():
     """ANE completion alone must not let merge race an in-flight GPU qmm."""
     source = (
         Path(__file__).resolve().parents[1]
-        / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+        / "omlx/custom_kernels/quant_matmul/csrc/ane/ane_hybrid.mm"
     ).read_text(encoding="utf-8")
     single = source.split("class AneHybridQ4Primitive", 1)[1]
     single = single.split("class DualAneHybridPrimitive", 1)[0]
@@ -188,13 +189,46 @@ def test_q6_mlp_and_gdn_are_eligible_for_ane_hybrid_prefill():
     assert ane_patch._eligible_gdn(_Q6GDN())
 
 
+def _q4_bf16(input_dims, output_dims):
+    linear = nn.QuantizedLinear(
+        input_dims, output_dims, bias=False, group_size=64, bits=4
+    )
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    return linear
+
+
+def test_packed_projections_are_ineligible_instead_of_raising():
+    # Packing leaves GDN b/a (narrower than a tile) stock beside packed qkv/z.
+    gdn = SimpleNamespace(
+        in_proj_qkv=_q4_bf16(256, 256),
+        in_proj_z=_q4_bf16(256, 128),
+        in_proj_b=_q4_bf16(256, 48),
+        in_proj_a=_q4_bf16(256, 48),
+    )
+    mlp = SimpleNamespace(
+        gate_proj=_q4_bf16(256, 256),
+        up_proj=_q4_bf16(256, 256),
+        down_proj=_q4_bf16(256, 256),
+    )
+    assert ane_patch._eligible_gdn(gdn)
+    assert ane_patch._eligible_pair(mlp)
+
+    qwen35_packed_linear._pack_layer(SimpleNamespace(linear_attn=gdn, mlp=mlp))
+
+    assert isinstance(gdn.in_proj_qkv, qwen35_packed_linear.PackedLinear)
+    assert type(gdn.in_proj_b) is nn.QuantizedLinear
+    assert not ane_patch._eligible_gdn(gdn)
+    assert not ane_patch._eligible_pair(mlp)
+
+
 @pytest.mark.parametrize(
     ("bits", "symbol"),
     [
-        (4, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"),
-        (5, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
-        (6, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
-        (8, "qwen35_ane_dual_cpu_fp16_swiglu_t"),
+        (4, "ane_dual_cpu_fp16_q4_swiglu_t"),
+        (5, "ane_dual_cpu_fp16_swiglu_t"),
+        (6, "ane_dual_cpu_fp16_swiglu_t"),
+        (8, "ane_dual_cpu_fp16_swiglu_t"),
     ],
 )
 def test_cpu_gate_kernel_keeps_q4_specialized(bits, symbol):
@@ -204,10 +238,10 @@ def test_cpu_gate_kernel_keeps_q4_specialized(bits, symbol):
 @pytest.mark.parametrize(
     ("bits", "symbol"),
     [
-        (4, "qwen35_ane_cpu_fp16_q4_swiglu_t"),
-        (5, "qwen35_ane_cpu_fp16_swiglu_t"),
-        (6, "qwen35_ane_cpu_fp16_swiglu_t"),
-        (8, "qwen35_ane_cpu_fp16_swiglu_t"),
+        (4, "ane_cpu_fp16_q4_swiglu_t"),
+        (5, "ane_cpu_fp16_swiglu_t"),
+        (6, "ane_cpu_fp16_swiglu_t"),
+        (8, "ane_cpu_fp16_swiglu_t"),
     ],
 )
 def test_cpu_gate_kernel_selects_single_ane_symbols(bits, symbol):
@@ -302,16 +336,15 @@ def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
         block_aware_cache=object(),
     )
 
-    # Boundary snapshots cap delivered chunks at the 2048 block edge, so a
-    # 4096 shape can never receive a full tile and must warn loudly.
+    # Boundary snapshots cap chunks below the compiled shape.
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
-    assert "never execute" in caplog.text
+    assert "require eligible tail padding" in caplog.text
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
-    assert "never execute" not in caplog.text
+    assert "require eligible tail padding" not in caplog.text
 
     caplog.clear()
     no_boundary = SimpleNamespace(
@@ -320,7 +353,68 @@ def test_configure_scheduler_warns_when_shape_exceeds_delivered_width(caplog):
     )
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
         assert ane_patch.configure_qwen35_ane_prefill_scheduler(no_boundary, 4096)
-    assert "never execute" not in caplog.text
+    assert "require eligible tail padding" not in caplog.text
+
+
+@pytest.mark.parametrize("width, recommended", [(2048, 2048), (1500, 1472)])
+def test_oversized_shape_recommends_a_valid_sequence_length(caplog, width, recommended):
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=width),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 4096)
+
+    assert "require eligible tail padding" in caplog.text
+    assert f"Set sequence_length={recommended} or a smaller valid shape" in caplog.text
+    caplog.clear()
+    ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, recommended)
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+
+def test_sub_minimum_width_requires_padding_or_wider_chunks(caplog):
+    scheduler = SimpleNamespace(
+        config=SimpleNamespace(prefill_step_size=2048, paged_cache_block_size=512),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 2048)
+
+    assert "require eligible tail padding" in caplog.text
+    assert str(ane_patch._ANE_MIN_SEQUENCE_LENGTH) in caplog.text
+    assert "prefill chunk width" in caplog.text
+    assert "Set sequence_length=" not in caplog.text
+    assert "changing sequence_length alone" in caplog.text
+
+    with pytest.raises(ValueError):
+        ane_patch.configure_qwen35_ane_prefill_scheduler(scheduler, 512)
+
+
+def test_validator_and_warning_share_one_minimum(caplog):
+    minimum = ane_patch._ANE_MIN_SEQUENCE_LENGTH
+    alignment = ane_patch._ANE_SEQUENCE_LENGTH_ALIGNMENT
+
+    with pytest.raises(ValueError):
+        ane_patch.configure_qwen35_ane_prefill_scheduler(object(), minimum - alignment)
+    with pytest.raises(ValueError):
+        ane_patch.enable_qwen35_ane_prefill(
+            SimpleNamespace(), sequence_length=minimum - alignment
+        )
+
+    exact = SimpleNamespace(
+        config=SimpleNamespace(
+            prefill_step_size=2048, paged_cache_block_size=minimum
+        ),
+        _qwen35_prefill_floor=4096,
+        block_aware_cache=object(),
+    )
+    with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
+        assert ane_patch.configure_qwen35_ane_prefill_scheduler(exact, minimum)
+    assert "require eligible tail padding" not in caplog.text
 
 
 def test_short_chunks_exit_before_the_tiling_planner(monkeypatch):
@@ -446,7 +540,8 @@ def test_mlp_profitable_tail_is_padded_and_sliced(monkeypatch):
     assert bool(mx.all(result == 7))
 
 
-def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
+@pytest.mark.parametrize("rows, threshold", [(1400, 1358), (512, 512)])
+def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch, rows, threshold):
     seen = []
 
     def exact(_mlp, block, _target_verify=False):
@@ -456,10 +551,10 @@ def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
     monkeypatch.setattr(ane_patch, "_backend_exact", exact)
     mlp = SimpleNamespace(
         _omlx_ane_prefill_config=ane_patch._AnePrefillConfig(
-            2048, 0.53, 8, tail_padding_min_tokens=1358
+            2048, 0.53, 8, tail_padding_min_tokens=threshold
         )
     )
-    x = mx.ones((1, 1400, 8), dtype=mx.float16)
+    x = mx.ones((1, rows, 8), dtype=mx.float16)
 
     result = ane_patch._backend(mlp, x)
     assert result is not None
@@ -467,8 +562,8 @@ def test_profitable_short_prefill_uses_one_padded_tile(monkeypatch):
 
     assert result.shape == x.shape
     assert seen[0].shape == (1, 2048, 8)
-    assert bool(mx.all(seen[0][:, :1400] == 1))
-    assert bool(mx.all(seen[0][:, 1400:] == 0))
+    assert bool(mx.all(seen[0][:, :rows] == 1))
+    assert bool(mx.all(seen[0][:, rows:] == 0))
     assert bool(mx.all(result == 3))
 
 
@@ -577,47 +672,18 @@ def test_gdn_profitable_tail_is_padded_before_recurrence(monkeypatch):
     assert [part[0, -1, 0].item() for part in result] == [1, 2, 3, 4]
 
 
-def test_install_dispatch_adds_gdn_projection_compatibility_hook(monkeypatch):
-    fallback = object()
-    accelerated = object()
+def test_install_dispatch_adds_gdn_projection_hook(monkeypatch):
+    import omlx.patches.qwen35_q4_mlp as q4patch
 
-    def target_linears(linears, x, target_verify=False):
-        return fallback
-
-    vlm = SimpleNamespace(
-        Qwen3_5MLP=None,
-        register_qwen3_5_mlp_prefill_backend=lambda backend: None,
-        _target_verify_linears=target_linears,
-    )
-    lm = SimpleNamespace(MLP=None)
-
-    def import_module(name):
-        if name == "mlx_vlm.models.qwen3_5.language":
-            return vlm
-        if name == "mlx_lm.models.qwen3_5":
-            return lm
-        raise ImportError(name)
-
-    monkeypatch.setattr(ane_patch.importlib, "import_module", import_module)
-    monkeypatch.setattr(ane_patch, "_VLM_HOOK_INSTALLED", False)
-    monkeypatch.setattr(ane_patch, "_VLM_GDN_HOOK_INSTALLED", False)
-    monkeypatch.setattr(ane_patch, "_GDN_MODULES", weakref.WeakValueDictionary())
+    calls = []
     monkeypatch.setattr(
-        ane_patch, "_gdn_backend", lambda gdn, x, target_verify=False: accelerated
+        q4patch, "apply_qwen35_vlm_gdn_projection_hook", lambda: calls.append("vlm")
     )
-
-    gdn = _GDN()
-    ane_patch._register_gdn_module(gdn)
+    monkeypatch.setattr(q4patch, "register_qwen35_lm_gdn_prefill_backend", calls.append)
+    monkeypatch.setattr(ane_patch, "_wrap_class", lambda cls: None)
 
     assert ane_patch._install_dispatch()
-    assert (
-        vlm._target_verify_linears(
-            (gdn.in_proj_qkv, gdn.in_proj_z, gdn.in_proj_b, gdn.in_proj_a),
-            mx.zeros((1, 1, 128)),
-        )
-        is accelerated
-    )
-    assert vlm._target_verify_linears((object(),), mx.zeros((1, 1, 128))) is fallback
+    assert calls == [ane_patch._gdn_backend, "vlm"]
 
 
 def test_install_dispatch_registers_mlx_lm_gdn_backend(monkeypatch):
@@ -646,7 +712,7 @@ def test_install_dispatch_registers_mlx_lm_gdn_backend(monkeypatch):
 
 
 def test_enable_marks_only_requested_number_of_loaded_mlps(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -681,9 +747,9 @@ def test_enable_marks_only_requested_number_of_loaded_mlps(monkeypatch):
 def test_cpu_shared_resource_scheduler_is_capability_guarded(
     monkeypatch, available
 ):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(
-        fast, "qwen35_cpu_shared_resource_available", lambda: available
+        fast, "cpu_shared_resource_available", lambda: available
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -730,12 +796,11 @@ def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
         captured.append(args)
         return mx.zeros((1, 1, 128), dtype=mx.float16)
 
-    monkeypatch.setattr(fast, "qwen35_cpu_fp16_affine_qmm_t", hybrid)
+    monkeypatch.setattr(fast, "cpu_fp16_affine_qmm_t", hybrid)
     result = ane_patch._post_ane_linear(
         linear,
         mx.zeros((1, 1, 256), dtype=mx.float16),
         8,
-        q8_threshold_env="OMLX_TEST_Q8_THRESHOLD",
         cpu_state=state,
         cpu_threads=8,
         cpu_shared_resource=True,
@@ -746,7 +811,7 @@ def test_down_projection_cpu_share_is_prepared_and_dispatched(monkeypatch):
 
 
 def test_enable_caps_dual_layers_at_resident_program_budget(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -772,7 +837,7 @@ def test_enable_caps_dual_layers_at_resident_program_budget(monkeypatch):
 
 
 def test_enable_logs_gdn_starvation_when_budget_exhausted(monkeypatch, caplog):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -803,10 +868,10 @@ def test_enable_logs_gdn_starvation_when_budget_exhausted(monkeypatch, caplog):
 
 
 def test_enable_packs_all_dual_layers_into_two_procedure_banks(monkeypatch):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -817,7 +882,7 @@ def test_enable_packs_all_dual_layers_into_two_procedure_banks(monkeypatch):
         compiled.append((len(weights), sequence_length, ane_instance, models))
         return models
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     model = _Model(4)
 
     count = ane_patch.enable_qwen35_ane_prefill(
@@ -974,7 +1039,7 @@ def test_compile_single_banks_stops_retrying_when_headroom_runs_out(monkeypatch)
         calls.append(len(weights))
         raise RuntimeError("ANE procedure bank load failed: 0x20004")
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
 
     headroom_calls = []
 
@@ -1003,8 +1068,7 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
         calls.append((len(values), sequence_length, ane_instance))
         return [object() for _ in values]
 
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
 
     result = ane_patch._compile_single_banks(weights, 2048)
@@ -1017,11 +1081,10 @@ def test_compile_single_bank_targets_unpinned_instance(monkeypatch):
 
 
 def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -1035,7 +1098,7 @@ def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
             raise RuntimeError("ANE procedure bank load failed: 0x20004")
         return [object() for _ in weights]
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     model = _Model(4)
 
     count = ane_patch.enable_qwen35_ane_prefill(
@@ -1070,11 +1133,10 @@ def test_enable_splits_banks_when_monolithic_load_fails(monkeypatch):
 
 
 def test_enable_first_retry_is_a_near_half_split(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -1088,7 +1150,7 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
             raise RuntimeError("ANE procedure bank load failed: 0x20004")
         return [object() for _ in weights]
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     model = _Model(4)
 
     count = ane_patch.enable_qwen35_ane_prefill(
@@ -1104,46 +1166,11 @@ def test_enable_first_retry_is_a_near_half_split(monkeypatch):
     assert model._omlx_ane_resident_program_count == 4
 
 
-def test_enable_env_cap_forces_split_banks(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "1")
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
-    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
-    monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
-    )
-    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
-    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
-    monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
-    monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
-    compiled = []
-
-    def compile_bank(weights, sequence_length, ane_instance):
-        compiled.append((len(weights), ane_instance))
-        return [object() for _ in weights]
-
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
-    model = _Model(4)
-
-    count = ane_patch.enable_qwen35_ane_prefill(
-        model,
-        sequence_length=2048,
-        fraction=0.5,
-        max_layers=4,
-        dual_ane=True,
-    )
-
-    assert count == 4
-    assert all(size == 1 for size, _ in compiled)
-    assert len(compiled) == 8
-    assert model._omlx_ane_resident_program_count == 8
-
-
 def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_BANK_MAX_BYTES", raising=False)
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -1153,12 +1180,16 @@ def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
     def compile_bank(weights, sequence_length, ane_instance):
         raise RuntimeError("ANE procedure bank load failed: 0x20004")
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     per_layer = []
+    warmed = []
 
     def compile_pair(mlp, config):
         per_layer.append(mlp)
-        return SimpleNamespace(model1=object())
+        return SimpleNamespace(
+            model=SimpleNamespace(warmup=lambda: warmed.append("ane0")),
+            model1=SimpleNamespace(warmup=lambda: warmed.append("ane1")),
+        )
 
     monkeypatch.setattr(ane_patch, "_compile_pair", compile_pair)
     model = _Model(4)
@@ -1174,6 +1205,9 @@ def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
     assert count == 4
     assert len(per_layer) == 4
     assert model._omlx_ane_dual_prefill_count == 4
+    # Per-layer programs own their I/O surfaces; warming them at load puts
+    # the surfaces in phys_footprint before admission prices a prefill.
+    assert warmed == ["ane0", "ane1"] * 4
 
 
 def test_compile_pair_builds_one_combined_ane_program(monkeypatch):
@@ -1189,7 +1223,7 @@ def test_compile_pair_builds_one_combined_ane_program(monkeypatch):
         compiled.append((weight.shape, weight.dtype, sequence_length))
         return object()
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     monkeypatch.setattr(
         fast,
         "has_symbol",
@@ -1220,15 +1254,15 @@ def test_compile_pair_splits_one_prompt_across_two_ane_instances(monkeypatch):
         compiled.append((weight.shape, sequence_length, ane_instance, model))
         return model
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     monkeypatch.setattr(
         fast,
         "has_symbol",
         lambda name: (
             name
             in {
-                "qwen35_ane_dual_affine_qmm_t",
-                "qwen35_ane_dual_q4_swiglu_t",
+                "ane_dual_affine_qmm_t",
+                "ane_dual_q4_swiglu_t",
             }
         ),
     )
@@ -1307,11 +1341,11 @@ def test_q6_mlp_is_eligible_and_uses_generic_fused_swiglu(monkeypatch, dual):
     assert ane_patch._eligible_pair(_make_affine_mlp(6, 64))
     generic_name = ane_patch._fused_swiglu_symbol(6, dual=dual)
     assert generic_name == (
-        "qwen35_ane_dual_affine_swiglu_t"
+        "ane_dual_affine_swiglu_t"
         if dual
-        else "qwen35_ane_affine_swiglu_t"
+        else "ane_affine_swiglu_t"
     )
-    q4_name = "qwen35_ane_dual_q4_swiglu_t" if dual else "qwen35_ane_q4_swiglu_t"
+    q4_name = "ane_dual_q4_swiglu_t" if dual else "ane_q4_swiglu_t"
     captured = {}
     activation = mx.zeros((1, 1, 4), dtype=mx.bfloat16)
 
@@ -1377,14 +1411,14 @@ def test_compile_pair_cache_identity_includes_bits_and_group_size(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_swiglu_t",
+        lambda name: name == "ane_affine_swiglu_t",
     )
 
     def compile_linear(weight, sequence_length):
         compiled.append((weight.shape, sequence_length))
         return object()
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     config = ane_patch._AnePrefillConfig(2048, 0.5, 8)
 
     first = ane_patch._compile_pair(mlp, config)
@@ -1410,7 +1444,7 @@ def test_prepare_pair_tracks_q8_bits_and_packed_shape(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_dual_affine_swiglu_t",
+        lambda name: name == "ane_dual_affine_swiglu_t",
     )
 
     prepared = ane_patch._prepare_pair_for_bank(
@@ -1436,7 +1470,7 @@ def test_compile_pair_skips_q8_without_generic_fused_swiglu(monkeypatch):
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear",
+        "ane_compile_linear",
         lambda *args: pytest.fail("Q8 must not prepare an unfused ANE path"),
     )
 
@@ -1466,11 +1500,11 @@ def test_compile_gdn_accepts_q8_and_propagates_bits(monkeypatch):
         compiled.append((weight.shape, weight.dtype, sequence_length))
         return object()
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_qmm_t",
+        lambda name: name == "ane_affine_qmm_t",
     )
 
     state = ane_patch._compile_gdn(gdn, ane_patch._AneGDNConfig(2048, 0.5, 8))
@@ -1490,13 +1524,13 @@ def test_q6_gdn_packs_suffix_and_extracts_b_a(group_size, monkeypatch):
 
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear",
+        "ane_compile_linear",
         lambda weight, sequence_length: compiled.append(weight.shape) or object(),
     )
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_qmm_t",
+        lambda name: name == "ane_affine_qmm_t",
     )
 
     config = ane_patch._AneGDNConfig(1, 0.5, 8)
@@ -1519,7 +1553,7 @@ def test_q6_gdn_packs_suffix_and_extracts_b_a(group_size, monkeypatch):
     )
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_affine_qmm_t",
+        "ane_affine_qmm_t",
         lambda *args: combined,
     )
 
@@ -1553,14 +1587,14 @@ def test_backend_dispatches_single_q8_swiglu_with_bits(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_swiglu_t",
+        lambda name: name == "ane_affine_swiglu_t",
     )
 
     def fused(*args):
         captured["args"] = args
         return activation
 
-    monkeypatch.setattr(fast, "qwen35_ane_affine_swiglu_t", fused, raising=False)
+    monkeypatch.setattr(fast, "ane_affine_swiglu_t", fused, raising=False)
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
@@ -1603,7 +1637,7 @@ def test_backend_dispatches_dual_q8_swiglu_with_bits(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_dual_affine_swiglu_t",
+        lambda name: name == "ane_dual_affine_swiglu_t",
     )
 
     def fused(*args):
@@ -1612,7 +1646,7 @@ def test_backend_dispatches_dual_q8_swiglu_with_bits(monkeypatch):
 
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_dual_affine_swiglu_t",
+        "ane_dual_affine_swiglu_t",
         fused,
         raising=False,
     )
@@ -1652,6 +1686,48 @@ def test_backend_dispatches_dual_q8_swiglu_with_bits(monkeypatch):
         8,
         128,
     )
+
+
+def test_split_suffix_keeps_gate_and_up_rows_in_place(monkeypatch):
+    """A view-backed suffix passes gate and up rows as two blocks to the kernel."""
+    mlp = SimpleNamespace(
+        gate_proj=nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=8),
+        up_proj=nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=8),
+        down_proj=nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=8),
+    )
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    config = ane_patch._AnePrefillConfig(
+        1, 0.5, 8, dual_ane=True, gpu_suffix_views=True
+    )
+    model0, model1 = object(), object()
+    state = ane_patch._prepare_pair_runtime_state(mlp, config, model0, model1)
+
+    gpu_start = state.ane_outputs
+    assert state.gpu_outputs == 128
+    assert mx.array_equal(state.weight, mlp.gate_proj.weight[gpu_start:])
+    assert mx.array_equal(state.scales, mlp.gate_proj.scales[gpu_start:])
+    up_weight, up_scales, up_biases = state.up_suffix
+    assert mx.array_equal(up_weight, mlp.up_proj.weight[gpu_start:])
+    assert mx.array_equal(up_biases, mlp.up_proj.biases[gpu_start:])
+
+    captured = {}
+
+    def fused(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return mx.zeros((1, 1, 4), dtype=mx.bfloat16)
+
+    monkeypatch.setattr(fast, "ane_dual_affine_swiglu_t", fused, raising=False)
+    monkeypatch.setattr(ane_patch, "_post_ane_down", lambda *args: args[1])
+    mlp._omlx_ane_prefill_config = config
+    mlp._omlx_ane_prefill_state = state
+    mx.eval(ane_patch._backend(mlp, mx.zeros((1, 1, 128), dtype=mx.bfloat16)))
+
+    assert captured["kwargs"] == {"up_suffix": state.up_suffix}
+
+
 @pytest.mark.parametrize("bits", [5, 6, 8])
 def test_prepare_pair_enables_cpu_gate_share_for_q5_plus(monkeypatch, bits):
     mlp = SimpleNamespace(
@@ -1671,7 +1747,7 @@ def test_prepare_pair_enables_cpu_gate_share_for_q5_plus(monkeypatch, bits):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_dual_cpu_fp16_swiglu_t",
+        lambda name: name == "ane_dual_cpu_fp16_swiglu_t",
     )
 
     state = ane_patch._prepare_pair_runtime_state(
@@ -1745,11 +1821,11 @@ def test_compile_gdn_combines_z_then_qkv_and_keeps_q5_suffix(monkeypatch):
         compiled.append((weight.shape, weight.dtype, sequence_length))
         return object()
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear", compile_linear)
+    monkeypatch.setattr(fast, "ane_compile_linear", compile_linear)
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_affine_qmm_t",
+        lambda name: name == "ane_affine_qmm_t",
     )
 
     state = ane_patch._compile_gdn(gdn, ane_patch._AneGDNConfig(2048, 0.5, 8))
@@ -1827,7 +1903,7 @@ def test_prepare_gdn_splits_residual_qkv_across_cpu_and_gpu(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_dual_cpu_fp16_affine_qmm_t",
+        lambda name: name == "ane_dual_cpu_fp16_affine_qmm_t",
     )
 
     prepared = ane_patch._prepare_gdn_for_bank(
@@ -1861,7 +1937,7 @@ def test_prepare_gdn_splits_cpu_work_with_single_ane(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_cpu_fp16_affine_qmm_t",
+        lambda name: name == "ane_cpu_fp16_affine_qmm_t",
     )
 
     prepared = ane_patch._prepare_gdn_for_bank(
@@ -1889,7 +1965,7 @@ def test_gdn_backend_routes_cpu_split_through_three_way_native_merge(monkeypatch
         calls.append(args)
         return combined
 
-    monkeypatch.setattr(fast, "qwen35_ane_dual_cpu_fp16_affine_qmm_t", hybrid)
+    monkeypatch.setattr(fast, "ane_dual_cpu_fp16_affine_qmm_t", hybrid)
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
     monkeypatch.setattr(
@@ -1939,7 +2015,7 @@ def test_gdn_backend_routes_single_ane_cpu_split(monkeypatch):
         calls.append(args)
         return combined
 
-    monkeypatch.setattr(fast, "qwen35_ane_cpu_fp16_affine_qmm_t", hybrid)
+    monkeypatch.setattr(fast, "ane_cpu_fp16_affine_qmm_t", hybrid)
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
     monkeypatch.setattr(
@@ -1984,7 +2060,7 @@ def test_gdn_backend_routes_single_ane_cpu_split(monkeypatch):
 def test_gdn_backend_restores_projection_order_and_keeps_b_a_exact(monkeypatch):
     combined = mx.array([[[1, 2, 10, 20, 30, 40]]], dtype=mx.bfloat16)
     captured = []
-    monkeypatch.setattr(fast, "qwen35_ane_affine_qmm_t", lambda *args: combined)
+    monkeypatch.setattr(fast, "ane_affine_qmm_t", lambda *args: combined)
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
@@ -2043,7 +2119,7 @@ def test_backend_reassembles_combined_gate_and_up_outputs(monkeypatch):
         captured["up"] = up
         return gate
 
-    monkeypatch.setattr(fast, "qwen35_ane_q4_affine_qmm_t", hybrid)
+    monkeypatch.setattr(fast, "ane_q4_affine_qmm_t", hybrid)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "swiglu", capture_swiglu)
 
@@ -2079,11 +2155,11 @@ def test_backend_uses_fused_merge_swiglu_when_available(monkeypatch):
     monkeypatch.setattr(
         fast,
         "has_symbol",
-        lambda name: name == "qwen35_ane_q4_swiglu_t",
+        lambda name: name == "ane_q4_swiglu_t",
     )
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_q4_affine_qmm_t",
+        "ane_q4_affine_qmm_t",
         lambda *args: pytest.fail("raw merge path should not run"),
     )
 
@@ -2091,7 +2167,7 @@ def test_backend_uses_fused_merge_swiglu_when_available(monkeypatch):
         captured["fused_args"] = args
         return activation
 
-    monkeypatch.setattr(fast, "qwen35_ane_q4_swiglu_t", fused)
+    monkeypatch.setattr(fast, "ane_q4_swiglu_t", fused)
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
@@ -2140,7 +2216,7 @@ def test_backend_uses_both_ane_models_for_one_prompt(monkeypatch):
         captured["dual_args"] = args
         return activation
 
-    monkeypatch.setattr(fast, "qwen35_ane_dual_q4_swiglu_t", dual)
+    monkeypatch.setattr(fast, "ane_dual_q4_swiglu_t", dual)
 
     import omlx.patches.qwen35_q4_mlp as q4_patch
 
@@ -2186,7 +2262,7 @@ def test_fused_down_backend_runs_compatible_cpu_hidden_branch(monkeypatch):
         return output
 
     monkeypatch.setattr(
-        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t", fused
+        fast, "ane_dual_cpu_fp16_q4_swiglu_down_t", fused
     )
     model0, model1 = object(), object()
     state = ane_patch._FusedDownMLPState(
@@ -2262,10 +2338,10 @@ def test_cpu_gate_uses_bit_appropriate_fused_swiglu(
         return activation
 
     monkeypatch.setattr(
-        fast, "qwen35_ane_dual_cpu_fp16_q4_swiglu_t", q4_fused
+        fast, "ane_dual_cpu_fp16_q4_swiglu_t", q4_fused
     )
     monkeypatch.setattr(
-        fast, "qwen35_ane_dual_cpu_fp16_swiglu_t", generic_fused
+        fast, "ane_dual_cpu_fp16_swiglu_t", generic_fused
     )
     monkeypatch.setattr(
         ane_patch,
@@ -2345,8 +2421,8 @@ def test_single_ane_cpu_gate_uses_bit_appropriate_fused_swiglu(
         captured["args"] = args
         return activation
 
-    monkeypatch.setattr(fast, "qwen35_ane_cpu_fp16_q4_swiglu_t", q4_fused)
-    monkeypatch.setattr(fast, "qwen35_ane_cpu_fp16_swiglu_t", generic_fused)
+    monkeypatch.setattr(fast, "ane_cpu_fp16_q4_swiglu_t", q4_fused)
+    monkeypatch.setattr(fast, "ane_cpu_fp16_swiglu_t", generic_fused)
     monkeypatch.setattr(
         ane_patch,
         "_post_ane_linear",
@@ -2405,6 +2481,8 @@ def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
         def __call__(self, x):
             return x
 
+    import omlx.patches.qwen35_q4_mlp as q4patch
+
     registrations = []
     gdn_registrations = []
     vlm = SimpleNamespace(
@@ -2422,6 +2500,11 @@ def test_install_dispatch_wraps_outer_q4_mlp_dispatch(monkeypatch):
     monkeypatch.setattr(ane_patch, "_PATCHED_CLASSES", set())
     monkeypatch.setattr(ane_patch, "_VLM_HOOK_INSTALLED", False)
     monkeypatch.setattr(ane_patch, "_VLM_GDN_HOOK_INSTALLED", False)
+
+    monkeypatch.setattr(q4patch, "apply_qwen35_vlm_gdn_projection_hook", lambda: None)
+    monkeypatch.setattr(
+        q4patch, "register_qwen35_lm_gdn_prefill_backend", gdn_registrations.append
+    )
 
     assert ane_patch._install_dispatch()
     assert PatchedMLP in ane_patch._PATCHED_CLASSES
@@ -2446,8 +2529,7 @@ def test_enable_rejects_unsafe_fixed_shape_settings(
 
 
 def test_enable_uses_ane_on_nax_gpu_when_model_setting_enabled(monkeypatch):
-    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: False)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -2457,35 +2539,6 @@ def test_enable_uses_ane_on_nax_gpu_when_model_setting_enabled(monkeypatch):
     count = ane_patch.enable_qwen35_ane_prefill(model, sequence_length=2048)
 
     assert count == 2
-
-
-def test_enable_env_forces_ane_on_nax_gpu(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "1")
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
-    monkeypatch.setattr(fast, "has_symbol", lambda name: False)
-    monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
-    monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
-    monkeypatch.setattr(ane_patch, "_compile_pair", lambda mlp, config: object())
-    model = _Model(2)
-
-    count = ane_patch.enable_qwen35_ane_prefill(
-        model, sequence_length=2048, max_layers=2
-    )
-
-    assert count == 2
-
-
-def test_enable_env_kill_switch_wins(monkeypatch):
-    monkeypatch.setenv("OMLX_QWEN35_ANE_PREFILL", "0")
-    installed = []
-    monkeypatch.setattr(
-        ane_patch, "_install_dispatch", lambda: installed.append(True) or True
-    )
-
-    count = ane_patch.enable_qwen35_ane_prefill(_Model(1), sequence_length=2048)
-
-    assert count == 0
-    assert installed == []
 
 
 def test_prefill_status_reports_configured_layers():
@@ -2519,6 +2572,35 @@ def test_prefill_status_flags_attempted_but_empty():
     assert status["configured"] is False
 
 
+def test_release_qwen35_ane_prefill_drops_all_native_state_and_is_idempotent():
+    """Unload releases ordinary, fused, and GDN ANE state exactly once."""
+    ordinary = SimpleNamespace(_omlx_ane_prefill_state=object())
+    fused = SimpleNamespace(_omlx_ane_fused_down_state=object())
+    gdn = SimpleNamespace(_omlx_ane_gdn_state=object())
+    model = SimpleNamespace(
+        modules=lambda: (ordinary, fused, gdn),
+        _omlx_ane_mlp_prefill_count=2,
+        _omlx_ane_gdn_prefill_count=1,
+        _omlx_ane_dual_prefill_count=3,
+        _omlx_ane_resident_program_count=7,
+    )
+
+    assert ane_patch.release_qwen35_ane_prefill(model) == (3, 7)
+    assert ordinary._omlx_ane_prefill_state is None
+    assert ordinary._omlx_ane_prefill_failed is True
+    assert fused._omlx_ane_fused_down_state is None
+    assert fused._omlx_ane_prefill_failed is True
+    assert gdn._omlx_ane_gdn_state is None
+    assert gdn._omlx_ane_gdn_failed is True
+    assert model._omlx_ane_prefill_shed is True
+    assert model._omlx_ane_mlp_prefill_count == 0
+    assert model._omlx_ane_gdn_prefill_count == 0
+    assert model._omlx_ane_dual_prefill_count == 0
+    assert model._omlx_ane_resident_program_count == 0
+
+    assert ane_patch.release_qwen35_ane_prefill(model) == (0, 0)
+
+
 def test_prefill_status_safe_on_untouched_model():
     status = ane_patch.qwen35_ane_prefill_status(SimpleNamespace())
     assert status["attempted"] is False
@@ -2527,12 +2609,11 @@ def test_prefill_status_safe_on_untouched_model():
 
 
 def test_enable_warns_when_no_eligible_layers(monkeypatch, caplog):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(
         ane_patch, "_enable_dual_procedure_banks", lambda *args, **kwargs: None
     )
-    monkeypatch.delenv("OMLX_QWEN35_ANE_PREFILL", raising=False)
 
     model = SimpleNamespace(modules=lambda: [])
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
@@ -2564,10 +2645,10 @@ def test_bank_prepare_keeps_packed_q6_suffix():
 
 
 def test_enable_survives_warmup_failure(monkeypatch, caplog):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -2578,7 +2659,7 @@ def test_enable_survives_warmup_failure(monkeypatch, caplog):
 
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear_bank",
+        "ane_compile_linear_bank",
         lambda weights, sequence_length, ane_instance: [
             _FailingModel() for _ in weights
         ],
@@ -2606,20 +2687,20 @@ def test_prepare_cpu_linear_needs_the_native_symbol(monkeypatch):
     assert ane_patch._prepare_cpu_linear(linear, 0.25) is None
 
     monkeypatch.setattr(
-        fast, "has_symbol", lambda name: name == "qwen35_cpu_fp16_affine_qmm_t"
+        fast, "has_symbol", lambda name: name == "cpu_fp16_affine_qmm_t"
     )
     assert ane_patch._prepare_cpu_linear(linear, 0.25) is not None
 
 
 def test_enable_warms_the_cpu_sharing_path(monkeypatch):
     """CPU-shared modules get one dummy dispatch at load, not at first use."""
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear_bank",
+        "ane_compile_linear_bank",
         lambda weights, sequence_length, ane_instance: [object() for _ in weights],
     )
     warmed = []
@@ -2662,29 +2743,26 @@ def test_enable_warms_the_cpu_sharing_path(monkeypatch):
 # --- ANE prefill transient memory estimate (issue #2841) ---
 
 
-def test_ane_prefill_transient_bytes_reads_live_model_dims():
-    """The estimate sums (input + output) * seq * 2 over the compiled models."""
-    seq = 2048
+def test_ane_prefill_transient_bytes_sums_program_weights():
+    """The estimate sums the native program weight bytes, not the I/O surfaces."""
 
-    def _ane_model(input_dim, output_dim):
+    def _ane_model(weight_bytes):
         return SimpleNamespace(
-            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+            input_dim=5120, output_dim=4608, sequence_length=2048,
+            weight_bytes=weight_bytes,
         )
 
     mlp = SimpleNamespace(
         _omlx_ane_prefill_state=SimpleNamespace(
-            model=_ane_model(5120, 4608), model1=_ane_model(5120, 4608)
+            model=_ane_model(100), model1=_ane_model(200)
         )
     )
     gdn = SimpleNamespace(
-        _omlx_ane_gdn_state=SimpleNamespace(
-            model=_ane_model(5120, 768), model1=None
-        )
+        _omlx_ane_gdn_state=SimpleNamespace(model=_ane_model(30), model1=None)
     )
     model = SimpleNamespace(modules=lambda: [mlp, gdn, SimpleNamespace()])
 
-    expected = 2 * (5120 + 4608) * seq * 2 + (5120 + 768) * seq * 2
-    assert ane_patch.ane_prefill_transient_bytes(model) == expected
+    assert ane_patch.ane_prefill_transient_bytes(model) == 330
 
 
 def test_ane_prefill_transient_bytes_zero_without_ane():
@@ -2695,12 +2773,11 @@ def test_ane_prefill_transient_bytes_zero_without_ane():
 
 
 def test_ane_prefill_transient_bytes_prices_fused_and_down_states():
-    """Fused SwiGLU/down banks and ANE down slices hold IOSurfaces too."""
-    seq = 2048
+    """Fused and down slices count too; older extensions fall back to INT8 rows."""
 
     def _ane_model(input_dim, output_dim):
         return SimpleNamespace(
-            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+            input_dim=input_dim, output_dim=output_dim, sequence_length=2048
         )
 
     fused = SimpleNamespace(
@@ -2719,11 +2796,7 @@ def test_ane_prefill_transient_bytes_prices_fused_and_down_states():
     )
     model = SimpleNamespace(modules=lambda: [fused, down])
 
-    expected = (
-        2 * (5120 + 5120) * seq * 2
-        + (5120 + 4608) * seq * 2
-        + 2 * (4608 + 5120) * seq * 2
-    )
+    expected = 2 * 5120 * 5120 + 5120 * 4608 + 2 * 4608 * 5120
     assert ane_patch.ane_prefill_transient_bytes(model) == expected
 
 
@@ -2754,18 +2827,18 @@ class _RecorderBankBuilder:
 
 
 def _builder_test_setup(monkeypatch, builders):
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
     monkeypatch.setattr(ane_patch, "_ane_bank_memory_headroom_ok", lambda: True)
     monkeypatch.setattr(ane_patch.time, "sleep", lambda *_a: None)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", lambda seq: builders.pop(0)
+        fast, "ane_linear_bank_builder", lambda seq: builders.pop(0)
     )
     monkeypatch.setattr(
         fast,
-        "qwen35_ane_compile_linear_bank",
+        "ane_compile_linear_bank",
         lambda *a, **k: pytest.fail(
             "the builder path must not stage all weights at once"
         ),
@@ -2824,10 +2897,10 @@ def test_builder_split_ladder_retries_without_restaging(monkeypatch):
 
 def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
     """One broken procedure disables its module; the rest keep warming (#2940)."""
-    monkeypatch.setattr(fast, "qwen35_ane_available", lambda: True)
+    monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "has_symbol", lambda name: True)
     monkeypatch.setattr(
-        fast, "qwen35_ane_linear_bank_builder", _no_bank_builder
+        fast, "ane_linear_bank_builder", _no_bank_builder
     )
     monkeypatch.setattr(ane_patch, "_install_dispatch", lambda: True)
     monkeypatch.setattr(ane_patch, "_eligible_pair", lambda mlp: True)
@@ -2846,7 +2919,7 @@ def test_warmup_failure_latches_only_the_owning_module(monkeypatch, caplog):
     def compile_bank(weights, sequence_length, ane_instance):
         return [_WarmModel(i) for i in range(len(weights))]
 
-    monkeypatch.setattr(fast, "qwen35_ane_compile_linear_bank", compile_bank)
+    monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     model = _Model(3)
 
     with caplog.at_level(logging.WARNING, logger="omlx.patches.qwen35_ane_prefill"):
@@ -2998,7 +3071,7 @@ def test_fused_bank_staging_streams_through_builder(monkeypatch):
         return builder
 
     monkeypatch.setattr(
-        fast, "qwen35_ane_fused_bank_builder", _make_builder, raising=False
+        fast, "ane_fused_bank_builder", _make_builder, raising=False
     )
     monkeypatch.setattr(
         ane_patch,
@@ -3031,7 +3104,7 @@ def test_fused_bank_staging_streams_through_builder(monkeypatch):
 
 def test_fused_bank_staging_falls_back_without_builder(monkeypatch):
     """Old extensions without the fused builder keep the one-shot path."""
-    monkeypatch.delattr(fast, "qwen35_ane_fused_bank_builder", raising=False)
+    monkeypatch.delattr(fast, "ane_fused_bank_builder", raising=False)
     compiled = []
 
     def _compile_bank(gates, ups, downs, sequence_length, ane_instance):
@@ -3039,7 +3112,7 @@ def test_fused_bank_staging_falls_back_without_builder(monkeypatch):
         return [object() for _ in gates]
 
     monkeypatch.setattr(
-        fast, "qwen35_ane_compile_swiglu_down_bank", _compile_bank
+        fast, "ane_compile_swiglu_down_bank", _compile_bank
     )
     monkeypatch.setattr(
         ane_patch,
@@ -3097,7 +3170,7 @@ def test_warm_cpu_sharing_path_dispatches_mlp_and_gdn(monkeypatch):
 
 _ANE_MM_PATH = (
     Path(__file__).resolve().parents[1]
-    / "omlx/custom_kernels/qwen35_prefill/csrc/qwen35_ane.mm"
+    / "omlx/custom_kernels/quant_matmul/csrc/ane/ane_hybrid.mm"
 )
 
 
@@ -3113,10 +3186,9 @@ def test_compile_cache_native_gate_is_exact_opt_in(ane_mm):
     assert 'strcmp(value, "1") == 0' in gate.group()
 
 
-def test_compile_cache_covers_all_four_native_compile_sites(ane_mm):
-    """Individual linear, single fused SwiGLU/down, linear banks, and fused
-    banks use one content-hash cache/fallback implementation."""
-    assert ane_mm.count("load_or_compile_ane_model(") == 5
+def test_compile_cache_covers_all_five_native_compile_sites(ane_mm):
+    """Qwen and K2 compile sites share the content-hash cache."""
+    assert ane_mm.count("load_or_compile_ane_model(") == 6
     assert ane_mm.count("model, identifier, ane_instance") == 4
     assert ane_mm.count("@selector(compileWithQoS:options:error:)") == 1
 
@@ -3217,6 +3289,7 @@ class _NativeHandle:
 
 def test_release_latches_modules_drops_states_and_zeroes_counters():
     import gc
+
     model = _ReleasableModel()
     handle = _NativeHandle()
     ref = weakref.ref(handle)
@@ -3246,6 +3319,55 @@ def test_release_latches_modules_drops_states_and_zeroes_counters():
     assert status["configured"] is False
     assert status["shed"] is True
     assert status["resident_programs"] == 0
+
+
+def test_release_clears_the_state_cache_that_pins_the_same_states():
+    import gc
+
+    model = _ReleasableModel()
+    mlp_handle = _NativeHandle()
+    gdn_handle = _NativeHandle()
+    mlp_ref = weakref.ref(mlp_handle)
+    gdn_ref = weakref.ref(gdn_handle)
+    mlp_state = SimpleNamespace(model=mlp_handle)
+    gdn_state = SimpleNamespace(model=gdn_handle)
+    model.mlp._omlx_ane_prefill_state = mlp_state
+    # _compile_pair and _compile_gdn cache the state per module, so this is a
+    # second reference to everything the release drops.
+    model.mlp._omlx_ane_prefill_cache = {("mlp-key",): mlp_state}
+    model.gdn._omlx_ane_gdn_state = gdn_state
+    model.gdn._omlx_ane_gdn_cache = {("gdn-key",): gdn_state}
+
+    released, _ = ane_patch.release_qwen35_ane_prefill(model)
+    del mlp_state, gdn_state, mlp_handle, gdn_handle
+    gc.collect()
+
+    assert released == 2
+    assert mlp_ref() is None
+    assert gdn_ref() is None
+    assert model.mlp._omlx_ane_prefill_cache == {}
+    assert model.gdn._omlx_ane_gdn_cache == {}
+
+
+def test_release_clears_a_stale_state_cache_entry():
+    import gc
+
+    model = _ReleasableModel()
+    handle = _NativeHandle()
+    ref = weakref.ref(handle)
+    # An entry can outlive its state attribute -- an earlier release, or a
+    # slice replaced at a different chunk width.
+    model.mlp._omlx_ane_prefill_cache = {("stale",): SimpleNamespace(model=handle)}
+
+    released, _ = ane_patch.release_qwen35_ane_prefill(model)
+    del handle
+    gc.collect()
+
+    # Nothing to latch, so nothing counts as released -- but the bank the entry
+    # pinned still has to be handed back.
+    assert released == 0
+    assert ref() is None
+    assert model.mlp._omlx_ane_prefill_cache == {}
 
 
 def test_release_is_idempotent_and_noop_without_slices():

@@ -81,6 +81,21 @@ class TestThinkingBudgetProcessor:
         assert target_logit == 0.0
         assert other_logit == float("-inf")
 
+    def test_repeated_history_preserves_budget_and_forced_sequence(self):
+        proc = self._make_processor(budget=3, end_ids=[50, 51], trailing_ids=[99])
+        history = [10]
+        for token in [20, 30, 50, 51, 99, 25]:
+            logits = proc(_make_tokens(*history), _make_logits())
+            state = proc.snapshot_state()
+            repeated = proc(_make_tokens(*history), _make_logits())
+            assert proc.snapshot_state() == state
+            assert mx.array_equal(repeated, logits)
+            if token in [50, 51, 99]:
+                assert logits[0, token].item() == 0.0
+                assert logits[0, 0].item() == float("-inf")
+            history.append(token)
+        assert proc._done
+
     def test_done_after_forced_sequence(self):
         """After forcing the close sequence, processor should become a no-op."""
         proc = self._make_processor(budget=1)
@@ -319,6 +334,52 @@ class TestParserBackedThinkingBudgetWiring:
         )
         request.needs_think_prefix = False
         return request
+
+    @pytest.mark.parametrize("kind", ["k2_horizon", "legacy"])
+    def test_prompt_markers_bind_request_budget(self, kind):
+        pairs = tuple(
+            (f"<ifm|{mode}>", f"</ifm|{mode}>")
+            for mode in ("think", "think_fast", "think_faster")
+        )
+        ids = {text: 10 + i for i, text in enumerate(sum(pairs, ()))}
+        factory = OutputParserFactory(
+            kind=kind,
+            create_session=MagicMock(),
+            thinking_start_text=pairs[0][0],
+            thinking_end_text=pairs[0][1],
+            thinking_marker_pairs=pairs if kind == "k2_horizon" else (),
+        )
+        scheduler = self._make_scheduler(factory, {k: [v] for k, v in ids.items()})
+        scheduler.tokenizer.convert_tokens_to_ids.side_effect = ids.get
+        scheduler.tokenizer.think_start_id = ids[pairs[0][0]]
+        scheduler.tokenizer.think_end_id = ids[pairs[0][1]]
+        if kind == "k2_horizon":
+            scheduler._resolve_think_end_token_ids = MagicMock(
+                side_effect=AssertionError
+            )
+        requests = []
+        for start, end in pairs if kind == "k2_horizon" else pairs[:1]:
+            request = self._make_request()
+            request.prompt_token_ids = [1, ids[start], 2]
+            request.sampling_params.thinking_budget = 1
+            request.needs_think_prefix = Scheduler._detect_needs_think_prefix(
+                scheduler, request
+            )
+            assert request.needs_think_prefix
+            requests.append((request, ids[end]))
+        for request, end in reversed(requests):
+            _, processors = scheduler._build_sampler_and_processors(
+                request.sampling_params, request
+            )
+            budget = next(
+                p for p in processors if isinstance(p, ThinkingBudgetProcessor)
+            )
+            logits = budget(request.prompt_token_ids, mx.zeros((1, 32)))
+            assert mx.argmax(logits).item() == end
+            request.prompt_token_ids.append(end)
+            assert not Scheduler._detect_needs_think_prefix(scheduler, request)
+        request.prompt_token_ids = []
+        assert not Scheduler._detect_needs_think_prefix(scheduler, request)
 
     def test_gemma4_uses_parser_thinking_close_marker(self):
         factory = OutputParserFactory(
@@ -817,3 +878,41 @@ class TestCompletionsStreamThinkPrefixParity:
                 )
                 return
         raise AssertionError("create_completion not found in server.py")
+
+
+class TestResolveThinkClosePattern:
+    ENCODE = {"\n": [198], "\n\n": [271]}
+
+    def _make_scheduler(self, template_text):
+        scheduler = MagicMock(spec=Scheduler)
+        scheduler._resolve_think_close_pattern = (
+            Scheduler._resolve_think_close_pattern.__get__(scheduler, Scheduler)
+        )
+        scheduler._get_chat_template_text = MagicMock(return_value=template_text)
+        tokenizer = MagicMock()
+        tokenizer.think_end = "</think>"
+        tokenizer.encode = lambda text, add_special_tokens=False: self.ENCODE[text]
+        scheduler.tokenizer = tokenizer
+        return scheduler
+
+    def test_qwen_template_skips_bare_history_literal(self):
+        template = (
+            "{%- if '</think>' in content %}\n"
+            "{{- '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' }}\n"
+            "{{- '<think>\\n\\n</think>\\n\\n' }}\n"
+        )
+        scheduler = self._make_scheduler(template)
+        assert scheduler._resolve_think_close_pattern() == ([198], [271])
+
+    def test_bare_close_template_still_resolves_bare(self):
+        template = (
+            "{%- set content = content.split('</think>')[-1] %}\n"
+            "{{- '<think>' + reasoning + '</think>' + content }}\n"
+        )
+        scheduler = self._make_scheduler(template)
+        assert scheduler._resolve_think_close_pattern() == (None, None)
+
+    def test_parser_marker_is_used_instead_of_tokenizer_marker(self):
+        template = "{{ '<channel|>' }} {{ '\\n<channel|>\\n\\n' }}"
+        scheduler = self._make_scheduler(template)
+        assert scheduler._resolve_think_close_pattern("<channel|>") == ([198], [271])

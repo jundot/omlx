@@ -2,20 +2,26 @@
 """HuggingFace model downloader for oMLX admin panel.
 
 Downloads models with huggingface_hub's snapshot_download, filesystem-based
-progress polling, and an isolated HTTP retry for xet transport failures.
+progress polling fed by disk allocation and xet wire bytes, and an isolated
+HTTP retry for xet transport failures. The task queue persists beside
+settings.json so a restart resumes interrupted downloads.
 """
 
 import asyncio
 import enum
 import errno
+import fcntl
+import functools
+import glob
 import json
 import logging
 import os
-import shutil
 import signal
 import sys
+import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,16 +29,20 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub._local_folder import read_download_metadata
 from huggingface_hub.utils import (
     GatedRepoError,
     HfHubHTTPError,
     RepositoryNotFoundError,
+    filter_repo_objects,
 )
 from huggingface_hub.utils import tqdm as _hf_tqdm
 
-# Private-module import; the pyproject floor (huggingface-hub>=1.19.0)
-# guarantees it exists. Re-verify the symbol when bumping the hub version.
+# Private-module imports (also read_download_metadata above); the pyproject floor
+# (huggingface-hub>=1.19.0) guarantees them. Re-verify both when bumping the hub.
 from huggingface_hub.utils._xet import abort_xet_session
+
+from .. import gguf
 
 logger = logging.getLogger(__name__)
 
@@ -40,16 +50,79 @@ logger = logging.getLogger(__name__)
 # Prevents server from hanging when HF is unreachable.
 _HF_API_TIMEOUT = 10
 
-# Seconds with no download progress before considering the download stalled.
+# Seconds with no disk or wire activity before considering the download
+# stalled.
 _STALL_TIMEOUT = 300
 
 # A separate first-activity deadline catches xet token/CAS hangs that never
-# create a payload file. Once any write is observed, the more tolerant stall
-# timeout above applies so slow but active connections are left alone.
+# move the wire counter or create a payload file. Once any payload activity
+# is observed, the more tolerant stall timeout above applies so slow but
+# active connections are left alone.
 _STARTUP_STALL_TIMEOUT = 120
 
-_PROGRESS_POLL_INTERVAL = 2
+_PROGRESS_POLL_INTERVAL = 0.5
 _SUBPROCESS_TERMINATE_TIMEOUT = 5
+
+# Seconds between xet aborts while a cancelled download's worker unwinds.
+_REAP_INTERVAL = 0.5
+
+# Seconds of byte-count history the reported speed averages over.
+_SPEED_WINDOW = 1.0
+
+# Seconds of byte-count history the ETA averages over.
+_ETA_WINDOW = 60.0
+
+# Seconds of transfer before the ETA shows; the slow start reads as hours.
+_ETA_WARMUP = 10.0
+
+
+class _SlidingRate:
+    """Mean bytes/second over a sliding window of cumulative byte samples."""
+
+    def __init__(self, window: float = _SPEED_WINDOW) -> None:
+        self.window = window
+        self._samples: deque[tuple[float, float]] = deque()
+
+    def _record(self, total: float, now: float) -> float:
+        self._samples.append((now, float(total)))
+        # Keep one sample older than the window as the anchor.
+        while len(self._samples) > 2 and self._samples[1][0] < now - self.window:
+            self._samples.popleft()
+        if len(self._samples) < 2:
+            return 0.0
+        start_t, start_b = self._samples[0]
+        end_t, end_b = self._samples[-1]
+        span = end_t - start_t
+        if span <= 0:
+            return 0.0
+        return (end_b - start_b) / span
+
+
+class _SpeedMeter(_SlidingRate):
+    """Bytes/second from per-file allocated-block growth between walks.
+
+    Only growth of a path seen in the previous walk counts, so files that
+    appear at full size (resume, partial walk) do not read as a spike.
+    """
+
+    def __init__(self, window: float = _SPEED_WINDOW) -> None:
+        super().__init__(window)
+        self._prev: dict[str, int] = {}
+
+    def add(self, files: dict, now: float | None = None) -> float:
+        """Record a per-file sample and return the mean rate over the window."""
+        now = time.monotonic() if now is None else now
+        growth = 0
+        prev = self._prev
+        for path, allocated in files.items():
+            before = prev.get(path)
+            if before is not None and allocated > before:
+                growth += allocated - before
+        # Replace, not merge: vanished paths drop their baseline.
+        self._prev = dict(files)
+        total = (self._samples[-1][1] if self._samples else 0.0) + growth
+        return self._record(total, now)
+
 
 _NON_XET_WORKER_MODULE = "omlx._hf_download_worker"
 
@@ -155,6 +228,40 @@ class _NonXetDownloadError(RuntimeError):
     """Raised when the isolated HTTP fallback process fails."""
 
 
+class _MissingFilesError(ValueError):
+    """Raised when selected files are not in the repository."""
+
+
+class _UnsupportedRepoError(ValueError):
+    """Raised for a repository no engine oMLX runs can load."""
+
+
+def _unsupported_repo_reason(model_info) -> str | None:
+    if getattr(model_info, "library_name", None) != "splash":
+        return None
+    card = getattr(model_info, "card_data", None)
+    base = getattr(card, "base_model", None) or []
+    base = [base] if isinstance(base, str) else list(base)
+    mlx = next((name for name in base if name.startswith("mlx-community/")), None)
+    instead = mlx or "an MLX or GGUF checkpoint of the model"
+    return (
+        "This is a Splash package, a prebuilt format Splash stopped loading in "
+        f"1.3.1. Download {instead} instead."
+    )
+
+
+def _check_selected_files(task: "DownloadTask", model_info) -> None:
+    siblings = getattr(model_info, "siblings", None)
+    if not task.files or not isinstance(siblings, (list, tuple)):
+        return
+    names = {getattr(sibling, "rfilename", None) for sibling in siblings}
+    missing = [name for name in task.files if name not in names]
+    if missing:
+        raise _MissingFilesError(
+            f"Not in repository '{task.repo_id}': {', '.join(missing)}"
+        )
+
+
 @dataclass(frozen=True)
 class _DownloadActivity:
     """Filesystem signals used to distinguish slow transfers from stalls."""
@@ -163,6 +270,8 @@ class _DownloadActivity:
     logical_size: int = 0
     allocated_size: int = 0
     latest_mtime_ns: int = 0
+    # Per-file allocated bytes for _SpeedMeter.
+    files: dict = field(default_factory=dict)
 
 
 def _is_xet_transport_error(error: BaseException) -> bool:
@@ -187,7 +296,44 @@ def _is_xet_transport_error(error: BaseException) -> bool:
     return any(marker in detail for marker in _XET_ERROR_MARKERS)
 
 
-def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
+class _WireCounter:
+    """Cumulative network bytes from xet's transfer progress bar.
+
+    During xet's fetch phase bytes arrive on the wire long before they are
+    written to disk, so the disk meter alone reads 0 B/s.
+    """
+
+    __slots__ = ("_value", "_lock")
+
+    def __init__(self) -> None:
+        self._value = 0
+        self._lock = threading.Lock()
+
+    def add(self, n: int) -> None:
+        if n <= 0:
+            return
+        with self._lock:
+            self._value += int(n)
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
+
+
+class _WireSpeedMeter(_SlidingRate):
+    """Sliding-window bytes/second over a cumulative wire-byte counter."""
+
+    def add(self, total: int, now: float | None = None) -> float:
+        """Record a cumulative sample and return the mean rate over the window."""
+        now = time.monotonic() if now is None else now
+        return self._record(max(0.0, float(total)), now)
+
+
+def _make_cancellable_tqdm(
+    should_cancel: Callable[[], bool],
+    on_wire_bytes: Callable[[int], None] | None = None,
+) -> type:
     """Build a tqdm subclass that aborts the download when cancelled.
 
     huggingface_hub's http_get calls ``progress.update(len(chunk))`` once per
@@ -201,10 +347,28 @@ def _make_cancellable_tqdm(should_cancel: Callable[[], bool]) -> type:
     callback exception until the whole transfer finishes (issue #1322), so
     cancellation there is driven by ``abort_xet_session()`` instead; this
     class is kept as the raise-on-next-chunk backstop for http_get.
+
+    When ``on_wire_bytes`` is given, increments of snapshot_download's xet
+    transfer bar are passed to it. That bar is the only one whose format
+    has no ``{total_fmt}``, so disk and file-count bars are not counted.
     """
 
     class _CancellableTqdm(_hf_tqdm):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            fmt = kwargs.get("bar_format")
+            self._wire_bar = (
+                on_wire_bytes is not None
+                and isinstance(fmt, str)
+                and "total_fmt" not in fmt
+            )
+
         def update(self, n=1):
+            if self._wire_bar and n:
+                try:
+                    on_wire_bytes(int(n))
+                except Exception:  # noqa: BLE001 - metering must not break a transfer
+                    logger.debug("wire-byte hook failed", exc_info=True)
             if should_cancel():
                 raise _DownloadCancelled()
             return super().update(n)
@@ -281,11 +445,26 @@ class DownloadTask:
     progress: float = 0.0
     total_size: int = 0
     downloaded_size: int = 0
+    # Bytes/second over the last _SPEED_WINDOW; 0.0 when not transferring.
+    speed_bps: float = 0.0
+    # Bytes/second over the last _ETA_WINDOW. Never in to_dict().
+    eta_speed_bps: float = 0.0
     error: str = ""
+    # Request-supplied HF/MS token for restart resume. Never in to_dict().
+    token: str = ""
     created_at: float = field(default_factory=time.time)
     started_at: float = 0.0
     completed_at: float = 0.0
     retry_count: int = 0
+    # Repo paths to fetch; None fetches the whole repo.
+    files: list[str] | None = None
+
+    def eta_seconds(self) -> int | None:
+        """Seconds left at the _ETA_WINDOW rate, or None when unknown."""
+        remaining = self.total_size - self.downloaded_size
+        if self.total_size <= 0 or remaining <= 0 or self.eta_speed_bps <= 0:
+            return None
+        return round(remaining / self.eta_speed_bps)
 
     def to_dict(self) -> dict:
         """Serialize task to a JSON-compatible dict."""
@@ -296,12 +475,34 @@ class DownloadTask:
             "progress": round(self.progress, 1),
             "total_size": self.total_size,
             "downloaded_size": self.downloaded_size,
+            "speed_bps": round(self.speed_bps, 1),
+            "eta_seconds": self.eta_seconds(),
             "error": self.error,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "retry_count": self.retry_count,
+            "files": self.files,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DownloadTask":
+        """Rebuild a persisted task row."""
+        return cls(
+            task_id=data["task_id"],
+            repo_id=data["repo_id"],
+            status=DownloadStatus(data["status"]),
+            progress=float(data.get("progress", 0.0)),
+            total_size=int(data.get("total_size", 0)),
+            downloaded_size=int(data.get("downloaded_size", 0)),
+            error=data.get("error", ""),
+            token=data.get("token", ""),
+            created_at=float(data.get("created_at", time.time())),
+            started_at=float(data.get("started_at", 0.0)),
+            completed_at=float(data.get("completed_at", 0.0)),
+            retry_count=int(data.get("retry_count", 0)),
+            files=data.get("files") or None,
+        )
 
 
 _DTYPE_BYTES = {
@@ -314,17 +515,425 @@ _DTYPE_BYTES = {
 # Minimum downloads to be included in recommendations.
 _MIN_DOWNLOADS = 100
 
+# Follow-up model_info(files_metadata=True) calls for U32-packed repos.
+_BLOB_FETCH_CONCURRENCY = 8
+_BLOB_FETCH_BATCH_TIMEOUT = 15
+_BLOB_SIZE_CACHE_TTL = 3600.0
+_BLOB_SIZE_CACHE_MAX = 512
+_blob_size_cache: dict[str, tuple[int, float]] = {}
 
-def _calc_safetensors_disk_size(safetensors: dict) -> int:
-    """Calculate actual disk size in bytes from safetensors parameters.
 
-    safetensors.total is the parameter count, not bytes.
-    We need to multiply each dtype's parameter count by its byte width.
+def _stale_local_files(local_dir: Path, dry_result) -> dict[str, tuple[int, int]]:
+    """Map local files snapshot_download will refetch to (inode, size).
+
+    The dry run reports outdated files as cached; only kept files get the
+    target commit in their metadata.
     """
-    params = safetensors.get("parameters", {})
+    stale: dict[str, tuple[int, int]] = {}
+    for info in dry_result:
+        # Keyed like _get_download_activity's scan of the same directory.
+        path = Path(local_dir) / info.filename
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if not info.will_download:
+            metadata = read_download_metadata(local_dir, info.filename)
+            if metadata is not None and metadata.commit_hash == info.commit_hash:
+                continue
+        stale[str(path)] = (stat.st_ino, stat.st_size)
+    return stale
+
+
+def _stale_bytes(stale: dict[str, tuple[int, int]], files: dict) -> int:
+    """Sum outdated bytes in one scan; forget files deleted or replaced (new inode)."""
+    total = 0
+    for path, (inode, size) in list(stale.items()):
+        if path not in files:
+            del stale[path]
+            continue
+        try:
+            if os.stat(path).st_ino != inode:
+                del stale[path]
+                continue
+        except OSError:
+            pass  # Deleted after the scan, which still counted it.
+        total += size
+    return total
+
+
+def _hub_lock_held(staging_dir: Path) -> bool:
+    """True when a hub file lock in ``staging_dir`` is held or cannot be checked.
+
+    Hub holds a file's lock for as long as its temp file exists.
+    """
+    for lock_path in staging_dir.rglob("*.lock"):
+        try:
+            fd = os.open(lock_path, os.O_RDONLY)
+        except FileNotFoundError:
+            continue  # Released by a holder that removes its lock file.
+        except OSError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        finally:
+            os.close(fd)  # Also releases a lock taken above.
+    return False
+
+
+def _safetensors_parameters(safetensors) -> dict:
+    """Return the dtype → count map from HF safetensors metadata."""
+    if not safetensors:
+        return {}
+    if isinstance(safetensors, dict):
+        params = safetensors.get("parameters") or {}
+        return params if isinstance(params, dict) else {}
+    params = getattr(safetensors, "parameters", None)
+    return params if isinstance(params, dict) else {}
+
+
+def _histogram_has_packed_u32(safetensors) -> bool:
+    """True when HF reports U32 weights — packed MLX quants, not 4-byte params."""
+    return "U32" in _safetensors_parameters(safetensors)
+
+
+def _sibling_sizes(siblings) -> dict[str, int]:
+    """Map model_info siblings with a known size to that size."""
+    sizes: dict[str, int] = {}
+    if not isinstance(siblings, (list, tuple)):
+        return sizes
+    for sibling in siblings:
+        name = getattr(sibling, "rfilename", None)
+        if not name:
+            continue
+        try:
+            size = int(getattr(sibling, "size", None) or 0)
+        except (TypeError, ValueError):
+            continue
+        if size > 0:
+            sizes[str(name)] = size
+    return sizes
+
+
+def _sum_safetensors_blob_bytes(siblings) -> int | None:
+    """Sum current-revision *.safetensors blob sizes from model_info siblings.
+
+    Returns None when siblings are missing or have no sizes (list_models does
+    not populate them). Does not use usedStorage, which includes old revisions.
+    """
+    sizes = [
+        size
+        for name, size in _sibling_sizes(siblings).items()
+        if name.endswith(".safetensors")
+    ]
+    return sum(sizes) if sizes else None
+
+
+def _sum_snapshot_bytes(
+    siblings,
+    ignore_patterns: list[str] | None,
+    allow_patterns: list[str] | None = None,
+) -> int | None:
+    """Sum sizes of the files snapshot_download fetches under these patterns.
+
+    Returns None when siblings are missing or have no sizes.
+    """
+    sizes = _sibling_sizes(siblings)
+    if not sizes:
+        return None
+    kept = filter_repo_objects(
+        sizes, allow_patterns=allow_patterns, ignore_patterns=ignore_patterns
+    )
+    return sum(sizes[name] for name in kept)
+
+
+def _normalize_files(files) -> list[str] | None:
+    if files is None:
+        return None
+    cleaned: set[str] = set()
+    for name in files:
+        if not isinstance(name, str):
+            raise ValueError(f"Invalid file path: {name!r}")
+        name = name.strip()
+        parts = name.split("/")
+        if not name or any(part in ("", ".", "..") for part in parts):
+            raise ValueError(f"Invalid file path: '{name}'")
+        cleaned.add(name)
+    if not cleaned:
+        raise ValueError("No files selected")
+    return sorted(cleaned)
+
+
+def _file_patterns(files: list[str]) -> list[str]:
+    """Hub matches allow_patterns with fnmatch; escape names to match literally."""
+    return [glob.escape(name) for name in files]
+
+
+MODEL_FORMATS = ("mlx", "gguf", "all")
+
+# PyTorch copies a whole-repo download skips when safetensors exist.
+_SAFETENSORS_REPO_IGNORE = ["*.bin", "original/**", "consolidated.*.pth"]
+
+# Files a safetensors checkpoint loads without: docs, media, other formats.
+_OPTIONAL_SUFFIXES = (
+    ".md", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".pdf",
+    ".gguf", ".bin", ".pth", ".pt", ".onnx", ".onnx_data", ".h5",
+    ".msgpack", ".ckpt", ".tflite",
+)
+_OPTIONAL_DIRS = frozenset({"original", "onnx", "openvino", "coreml"})
+
+
+def _repo_layout(names: list[str]) -> str:
+    """'safetensors', 'gguf' or 'other', by the weight files a repo holds."""
+    if any(name.endswith(".safetensors") for name in names):
+        return "safetensors"
+    if any(name.lower().endswith(".gguf") for name in names):
+        return "gguf"
+    return "other"
+
+
+def _optional_for_safetensors(name: str) -> bool:
+    lower = name.lower()
+    base = lower.rsplit("/", 1)[-1]
+    if base == ".gitattributes" or base.startswith(("readme", "license")):
+        return True
+    if "/" in lower and lower.split("/", 1)[0] in _OPTIONAL_DIRS:
+        return True
+    return lower.endswith(_OPTIONAL_SUFFIXES)
+
+
+def _default_mmproj(names: list[str]) -> dict[str, str]:
+    """Map each folder to the vision projector its GGUFs pair with."""
+    by_folder: dict[str, list[str]] = {}
+    for name in names:
+        if name.lower().endswith(".gguf") and gguf.file_kind(name) == "mmproj":
+            by_folder.setdefault(name.rpartition("/")[0], []).append(name)
+    return {
+        folder: min(candidates, key=gguf.projector_rank)
+        for folder, candidates in by_folder.items()
+    }
+
+
+def _is_local_copy(path: Path, size: int) -> bool:
+    try:
+        return path.is_file() and (size <= 0 or path.stat().st_size == size)
+    except OSError:
+        return False
+
+
+def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
+    """Add download hints to model-info file rows; return the repo layout.
+
+    Only root GGUFs are models (subfolders hold split copies and MTP heads).
+    """
+    names = [row["name"] for row in files]
+    layout = _repo_layout(names)
+    projectors = _default_mmproj(names)
+    # A selection starts from what downloading the whole repo would fetch.
+    preselected = (
+        set(filter_repo_objects(names, ignore_patterns=_SAFETENSORS_REPO_IGNORE))
+        if layout == "safetensors"
+        else set()
+    )
+    for row in files:
+        name = row["name"]
+        lower = name.lower()
+        row["group"] = None
+        row["mmproj"] = None
+        if lower.endswith(".gguf") and "/" not in name:
+            row["kind"] = gguf.file_kind(name)
+            if row["kind"] == "gguf":
+                split = gguf.SPLIT_RE.match(name)
+                row["group"] = split["prefix"] if split else None
+                row["mmproj"] = projectors.get(name.rpartition("/")[0])
+        elif lower.endswith(".safetensors"):
+            row["kind"] = "weights"
+        else:
+            row["kind"] = "other"
+        optional = _optional_for_safetensors(name)
+        row["required"] = layout == "safetensors" and not optional
+        row["preselected"] = name in preselected
+        row["local"] = local_dir is not None and _is_local_copy(
+            local_dir / name, row["size"]
+        )
+    return layout
+
+
+def _gguf_params(model) -> int | None:
+    gguf = getattr(model, "gguf", None)
+    if not isinstance(gguf, dict):
+        return None
+    try:
+        total = int(gguf.get("total") or 0)
+    except (TypeError, ValueError):
+        return None
+    return total if total > 0 else None
+
+
+def _gguf_architecture(model) -> str | None:
+    gguf = getattr(model, "gguf", None)
+    if not isinstance(gguf, dict):
+        return None
+    architecture = gguf.get("architecture")
+    return architecture if isinstance(architecture, str) else None
+
+
+def _fetch_safetensors_blob_bytes(api: HfApi, repo_id: str) -> int:
+    """Look up *.safetensors blob bytes for one repo. 0 on failure."""
+    try:
+        info = api.model_info(
+            repo_id, files_metadata=True, timeout=_HF_API_TIMEOUT
+        )
+    except HfHubHTTPError as e:
+        if e.response is None or e.response.status_code != 401:
+            logger.debug("Could not fetch blob sizes for %s: %s", repo_id, e)
+            return 0
+        try:
+            info = api.model_info(
+                repo_id, files_metadata=True, token=False, timeout=_HF_API_TIMEOUT
+            )
+        except Exception as retry_error:
+            logger.debug(
+                "Could not fetch blob sizes for %s: %s", repo_id, retry_error
+            )
+            return 0
+    except Exception as e:
+        logger.debug("Could not fetch blob sizes for %s: %s", repo_id, e)
+        return 0
+    return _sum_safetensors_blob_bytes(getattr(info, "siblings", None)) or 0
+
+
+def _cached_blob_size(repo_id: str) -> int | None:
+    """Return a still-fresh cached positive blob size, or None."""
+    entry = _blob_size_cache.get(repo_id)
+    if entry is None:
+        return None
+    size, stored_at = entry
+    if time.monotonic() - stored_at > _BLOB_SIZE_CACHE_TTL:
+        _blob_size_cache.pop(repo_id, None)
+        return None
+    return size
+
+
+def _prune_blob_size_cache() -> None:
+    """Drop expired entries, then the oldest if still over the cap."""
+    now = time.monotonic()
+    expired = [
+        repo_id
+        for repo_id, (_, stored_at) in _blob_size_cache.items()
+        if now - stored_at > _BLOB_SIZE_CACHE_TTL
+    ]
+    for repo_id in expired:
+        _blob_size_cache.pop(repo_id, None)
+    overflow = len(_blob_size_cache) - _BLOB_SIZE_CACHE_MAX
+    if overflow <= 0:
+        return
+    oldest = sorted(_blob_size_cache.items(), key=lambda item: item[1][1])
+    for repo_id, _ in oldest[:overflow]:
+        _blob_size_cache.pop(repo_id, None)
+
+
+def _store_blob_size(repo_id: str, size: int) -> None:
+    """Cache Hub blob sizes that actually resolved. Failures stay uncached."""
+    if size > 0:
+        _blob_size_cache[repo_id] = (size, time.monotonic())
+        _prune_blob_size_cache()
+
+
+async def _blob_bytes_for_repos(api: HfApi, repo_ids: list[str]) -> dict[str, int]:
+    """Fetch blob sizes for U32-packed repos, concurrently, with a batch cap."""
+    unique_ids = list(dict.fromkeys(repo_ids))
+    if not unique_ids:
+        return {}
+
+    sizes: dict[str, int] = {}
+    to_fetch: list[str] = []
+    for repo_id in unique_ids:
+        cached = _cached_blob_size(repo_id)
+        if cached is not None:
+            sizes[repo_id] = cached
+        else:
+            to_fetch.append(repo_id)
+    if not to_fetch:
+        return sizes
+
+    semaphore = asyncio.Semaphore(_BLOB_FETCH_CONCURRENCY)
+
+    async def _one(repo_id: str) -> tuple[str, int]:
+        async with semaphore:
+            try:
+                size = await asyncio.to_thread(
+                    _fetch_safetensors_blob_bytes, api, repo_id
+                )
+                return repo_id, size
+            except Exception:
+                return repo_id, 0
+
+    tasks = [asyncio.create_task(_one(repo_id)) for repo_id in to_fetch]
+    done, pending = await asyncio.wait(tasks, timeout=_BLOB_FETCH_BATCH_TIMEOUT)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        logger.warning(
+            "Timed out fetching safetensors blob sizes for %d U32-packed repo(s)",
+            len(pending),
+        )
+
+    for repo_id in to_fetch:
+        sizes.setdefault(repo_id, 0)
+    for task in done:
+        try:
+            repo_id, size = task.result()
+        except Exception:
+            continue
+        sizes[repo_id] = size
+        _store_blob_size(repo_id, size)
+    return sizes
+
+
+def _needs_u32_blob_fetch(model) -> bool:
+    """True when the listing has a U32 histogram but no sibling blob sizes."""
+    if not _histogram_has_packed_u32(getattr(model, "safetensors", None)):
+        return False
+    return _sum_safetensors_blob_bytes(getattr(model, "siblings", None)) is None
+
+
+def _list_disk_size(model, blob_sizes: dict[str, int]) -> int:
+    """On-disk size for a list_models row: dtype formula, or U32 blob bytes."""
+    safetensors = getattr(model, "safetensors", None)
+    params = _safetensors_parameters(safetensors)
     if not params:
         return 0
-    return sum(count * _DTYPE_BYTES.get(dtype, 1) for dtype, count in params.items())
+    if "U32" in params:
+        blob = _sum_safetensors_blob_bytes(getattr(model, "siblings", None))
+        if blob is not None:
+            return blob
+        return int(blob_sizes.get(getattr(model, "id", ""), 0) or 0)
+    return _calc_safetensors_disk_size({"parameters": params})
+
+
+def _calc_safetensors_disk_size(safetensors: dict) -> int:
+    """Estimate disk size from a dtype histogram.
+
+    Accurate for BF16/F16/F32. Wrong for U32-packed MLX quants: HF reports
+    logical parameter counts under U32, not packed word counts (#3401).
+
+    Malformed counts (None, non-int) return 0 rather than raising, so one
+    bad Hub row cannot take down Browse/Search/Recommended.
+    """
+    params = safetensors.get("parameters", {}) or {}
+    if not params:
+        return 0
+    try:
+        return sum(
+            int(count) * _DTYPE_BYTES.get(dtype, 1)
+            for dtype, count in params.items()
+        )
+    except (TypeError, ValueError):
+        return 0
 
 
 def _format_model_size(size_bytes: int) -> str:
@@ -350,10 +959,13 @@ def _format_param_count(total_params: int) -> str:
 
 def _get_param_count(safetensors: dict) -> int:
     """Get total parameter count from safetensors metadata."""
-    params = safetensors.get("parameters", {})
+    params = safetensors.get("parameters", {}) or {}
     if not params:
         return 0
-    return sum(params.values())
+    try:
+        return sum(int(count) for count in params.values())
+    except (TypeError, ValueError):
+        return 0
 
 
 # HF API sort field mapping for search.
@@ -369,7 +981,162 @@ _SORT_MAP = {
 }
 
 
-class HFDownloader:
+def _write_tasks_file(path: Path, tasks) -> None:
+    """Atomically write task rows to an owner-only (0600) file."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = []
+        for task in sorted(tasks, key=lambda t: t.created_at):
+            row = task.to_dict()
+            # Only a row that can still resume keeps its token on disk.
+            row["token"] = (
+                task.token
+                if task.status
+                in (DownloadStatus.PENDING, DownloadStatus.DOWNLOADING)
+                else ""
+            )
+            payload.append(row)
+        tmp_path = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # O_CREAT's mode does not apply to an existing temp file.
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload))
+        tmp_path.replace(path)
+    except OSError as exc:
+        logger.warning(
+            "Could not persist download tasks to %s: %s", path, exc
+        )
+
+
+def _read_tasks_file(path: Path | None) -> list[dict]:
+    """Read persisted task rows; a missing or corrupt file yields []."""
+    if path is None or not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "Could not read persisted download tasks from %s: %s", path, exc
+        )
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _scanned_paths(path: Path, only: list[str] | None):
+    """Every path under ``path``, or the ``only`` repo paths plus Hub staging."""
+    if only is None:
+        yield from path.rglob("*")
+        return
+    for name in only:
+        yield path / name
+    staging_dir = path / ".cache" / "huggingface" / "download"
+    if staging_dir.is_dir():
+        yield from staging_dir.rglob("*")
+
+
+class _QueuePersistenceMixin:
+    """Restart-surviving task queue shared by the HF and MS downloaders."""
+
+    @staticmethod
+    def _get_download_activity(
+        path: Path, only: list[str] | None = None
+    ) -> _DownloadActivity:
+        """Return size, allocation, and mtime signals including Hub temp files.
+
+        ``only`` limits the scan to those repo paths and Hub's staging files,
+        so files already in the folder do not count as progress.
+        """
+        if not path.exists():
+            return _DownloadActivity()
+        file_count = 0
+        logical_size = 0
+        allocated_size = 0
+        latest_mtime_ns = 0
+        files: dict[str, int] = {}
+        try:
+            for file_path in _scanned_paths(path, only):
+                if not file_path.is_file():
+                    continue
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                file_count += 1
+                logical_size += stat.st_size
+                blocks = getattr(stat, "st_blocks", 0) * 512
+                allocated_size += blocks
+                files[str(file_path)] = blocks
+                latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+        except OSError:
+            pass
+        return _DownloadActivity(
+            file_count=file_count,
+            logical_size=logical_size,
+            allocated_size=allocated_size,
+            latest_mtime_ns=latest_mtime_ns,
+            files=files,
+        )
+
+    def _init_queue(self, tasks_file: str | Path | None) -> None:
+        # None disables persistence.
+        self._tasks_file = Path(tasks_file) if tasks_file else None
+        self._shutting_down = False
+        self._restoring = False
+
+    def _persist(self) -> None:
+        # Skipped during restore (the file is still being read) and shutdown
+        # (interrupted rows must stay resumable on disk).
+        if self._tasks_file is None or self._restoring or self._shutting_down:
+            return
+        _write_tasks_file(self._tasks_file, self._tasks.values())
+
+    async def restore_tasks(self) -> None:
+        """Resume interrupted rows and restore failed/cancelled rows.
+
+        Completed rows are dropped. A row that cannot be read or started is
+        logged and skipped.
+        """
+        entries = _read_tasks_file(self._tasks_file)
+        if not entries:
+            return
+        self._restoring = True
+        try:
+            for entry in entries:
+                try:
+                    status = DownloadStatus(entry["status"])
+                    if status in (
+                        DownloadStatus.PENDING,
+                        DownloadStatus.DOWNLOADING,
+                    ):
+                        # Only HF rows carry a file selection.
+                        selection = (
+                            {"files": entry["files"]} if entry.get("files") else {}
+                        )
+                        task = await self.start_download(
+                            entry["repo_id"], entry.get("token", ""), **selection
+                        )
+                        task.created_at = float(
+                            entry.get("created_at", task.created_at)
+                        )
+                        task.retry_count = int(entry.get("retry_count", 0))
+                        logger.info(
+                            "Resumed interrupted download: %s", task.repo_id
+                        )
+                    elif status in (
+                        DownloadStatus.FAILED,
+                        DownloadStatus.CANCELLED,
+                    ):
+                        task = DownloadTask.from_dict(entry)
+                        self._tasks.setdefault(task.task_id, task)
+                except Exception as exc:
+                    logger.warning("Skipping persisted download row: %s", exc)
+        finally:
+            self._restoring = False
+        self._persist()
+
+
+class HFDownloader(_QueuePersistenceMixin):
     """Manages HuggingFace model downloads with progress tracking.
 
     Uses huggingface_hub.snapshot_download() for actual downloads and polls
@@ -385,18 +1152,19 @@ class HFDownloader:
         max_memory_bytes: int,
         limit: int = 60,
         result_limit: int = 50,
-        mlx_only: bool = True,
+        model_format: str = "mlx",
     ) -> dict:
         """Fetch trending and popular models that fit in memory.
 
-        Queries HuggingFace Hub for models, optionally restricted to
-        mlx-community. Filtered by system memory capacity.
+        Queries HuggingFace Hub for models: mlx-community's for "mlx", GGUF
+        repos for "gguf", any for "all". Safetensors models are filtered by
+        system memory; a GGUF repo's size depends on the files picked.
 
         Args:
             max_memory_bytes: Maximum model size in bytes (typically system memory).
             limit: Number of models to fetch per category from HF API.
             result_limit: Maximum number of models to return per category.
-            mlx_only: If True, restrict to mlx-community author.
+            model_format: One of MODEL_FORMATS.
 
         Returns:
             Dict with 'trending' and 'popular' lists, plus 'hf_token_invalid'
@@ -405,58 +1173,94 @@ class HFDownloader:
         """
         api, _endpoint = _get_hf_api()
 
-        async def _fetch(sort: str) -> tuple[list[dict], bool]:
+        async def _list(sort: str) -> tuple[list, bool]:
             kwargs = {
                 "sort": sort,
                 "limit": limit,
-                "expand": ["safetensors", "downloads", "likes", "trendingScore"],
+                "expand": [
+                    "safetensors",
+                    "gguf",
+                    "downloads",
+                    "likes",
+                    "trendingScore",
+                ],
             }
-            if mlx_only:
+            if model_format == "mlx":
                 kwargs["author"] = "mlx-community"
+            elif model_format == "gguf":
+                kwargs["filter"] = "gguf"
             # list_models returns a lazy generator; drain it inside the worker
             # thread so the paginated HTTP calls never block the event loop.
-            models, token_rejected = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 asyncio.to_thread(_list_models_stale_token_fallback, api, kwargs),
                 timeout=_HF_API_TIMEOUT,
             )
-            results = []
-            for m in models:
-                if not m.safetensors or not m.safetensors.get("parameters"):
-                    continue
-                downloads = m.downloads or 0
-                if downloads < _MIN_DOWNLOADS:
-                    continue
-                size = _calc_safetensors_disk_size(m.safetensors)
-                if size <= 0 or size > max_memory_bytes:
-                    continue
-                params = _get_param_count(m.safetensors)
-                results.append(
-                    {
-                        "repo_id": m.id,
-                        "name": m.id.split("/")[-1],
-                        "downloads": downloads,
-                        "likes": m.likes or 0,
-                        "trending_score": m.trending_score or 0,
-                        "size": size,
-                        "size_formatted": _format_model_size(size),
-                        "params": params if params > 0 else None,
-                        "params_formatted": (
-                            _format_param_count(params) if params > 0 else None
-                        ),
-                    }
-                )
-            return results, token_rejected
 
-        (trending, trending_rejected), (popular, popular_rejected) = (
+        (trending_models, trending_rejected), (popular_models, popular_rejected) = (
             await asyncio.gather(
-                _fetch("trendingScore"),
-                _fetch("downloads"),
+                _list("trendingScore"),
+                _list("downloads"),
             )
         )
 
+        def _eligible(model) -> bool:
+            if (model.downloads or 0) < _MIN_DOWNLOADS:
+                return False
+            has_safetensors = bool(
+                _safetensors_parameters(getattr(model, "safetensors", None))
+            )
+            has_gguf = _gguf_params(model) is not None
+            if model_format == "mlx":
+                return has_safetensors
+            if model_format == "gguf":
+                return has_gguf
+            return has_safetensors or has_gguf
+
+        need_blob: list[str] = []
+        for models in (trending_models, popular_models):
+            for model in models:
+                if _eligible(model) and _needs_u32_blob_fetch(model):
+                    need_blob.append(model.id)
+        blob_sizes = await _blob_bytes_for_repos(api, need_blob)
+
+        def _build(models) -> list[dict]:
+            results = []
+            for model in models:
+                if not _eligible(model):
+                    continue
+                size = _list_disk_size(model, blob_sizes)
+                if size > max_memory_bytes:
+                    continue
+                params = _get_param_count(
+                    {"parameters": _safetensors_parameters(model.safetensors)}
+                )
+                if size <= 0:
+                    params = _gguf_params(model)
+                    if params is None:
+                        continue
+                results.append(
+                    {
+                        "repo_id": model.id,
+                        "name": model.id.split("/")[-1],
+                        "architecture": _gguf_architecture(model),
+                        "downloads": model.downloads or 0,
+                        "likes": model.likes or 0,
+                        "trending_score": model.trending_score or 0,
+                        "size": size,
+                        "size_formatted": (
+                            _format_model_size(size) if size > 0 else ""
+                        ),
+                        "params": params if params else None,
+                        "params_formatted": (
+                            _format_param_count(params) if params else None
+                        ),
+                    }
+                )
+            return results
+
         return {
-            "trending": trending[:result_limit],
-            "popular": popular[:result_limit],
+            "trending": _build(trending_models)[:result_limit],
+            "popular": _build(popular_models)[:result_limit],
             "hf_token_invalid": trending_rejected or popular_rejected,
         }
 
@@ -465,7 +1269,7 @@ class HFDownloader:
         query: str,
         sort: str = "trending",
         limit: int = 100,
-        mlx_only: bool = True,
+        model_format: str = "mlx",
         # Filtering options
         min_params: Optional[int] = None,
         max_params: Optional[int] = None,
@@ -477,14 +1281,14 @@ class HFDownloader:
     ) -> dict:
         """Search HuggingFace models by query string with filtering and sorting.
 
-        When mlx_only is True, results are restricted to the MLX library
-        (same as https://huggingface.co/models?library=mlx).
+        "mlx" and "gguf" restrict results to that library, as
+        https://huggingface.co/models?library=mlx does; "all" does not.
 
         Args:
             query: Search query string.
             sort: Sort order (trending/downloads/created/updated/most_params/least_params/largest/smallest).
             limit: Maximum number of results to return.
-            mlx_only: If True, restrict to MLX library models only.
+            model_format: One of MODEL_FORMATS.
             min_params: Minimum parameter count filter.
             max_params: Maximum parameter count filter.
             min_size: Minimum model size in bytes filter.
@@ -510,10 +1314,10 @@ class HFDownloader:
             "search": query,
             "sort": base_sort,
             "limit": limit,
-            "expand": ["safetensors", "downloads", "likes", "trendingScore"],
+            "expand": ["safetensors", "gguf", "downloads", "likes", "trendingScore"],
         }
-        if mlx_only:
-            kwargs["filter"] = "mlx"
+        if model_format in ("mlx", "gguf"):
+            kwargs["filter"] = model_format
 
         # list_models returns a lazy generator; drain it inside the worker
         # thread so the paginated HTTP calls never block the event loop.
@@ -522,24 +1326,32 @@ class HFDownloader:
             timeout=_HF_API_TIMEOUT,
         )
 
-        results = []
+        pending: list[tuple[object, int | None, dict]] = []
         for m in models:
             params = None
-            params_formatted = None
-            size = 0
-
-            if m.safetensors and m.safetensors.get("parameters"):
-                params = _get_param_count(m.safetensors)
-                params_formatted = _format_param_count(params) if params > 0 else None
-                size = _calc_safetensors_disk_size(m.safetensors)
-                if params and params <= 0:
-                    params = None
-
-            # Apply filters
+            st_params = _safetensors_parameters(getattr(m, "safetensors", None))
+            if st_params:
+                params = _get_param_count({"parameters": st_params}) or None
+            else:
+                params = _gguf_params(m)
             if min_params is not None and (params is None or params < min_params):
                 continue
             if max_params is not None and (params is None or params > max_params):
                 continue
+            pending.append((m, params, st_params))
+
+        need_blob = [m.id for m, _, _ in pending if _needs_u32_blob_fetch(m)]
+        blob_sizes = await _blob_bytes_for_repos(api, need_blob)
+
+        results = []
+        for m, params, st_params in pending:
+            size = 0
+            params_formatted = (
+                _format_param_count(params) if params and params > 0 else None
+            )
+            if st_params:
+                size = _list_disk_size(m, blob_sizes)
+
             if min_size is not None and size < min_size:
                 continue
             if max_size is not None and size > max_size:
@@ -549,6 +1361,7 @@ class HFDownloader:
                 {
                     "repo_id": m.id,
                     "name": m.id,
+                    "architecture": _gguf_architecture(m),
                     "downloads": m.downloads or 0,
                     "likes": m.likes or 0,
                     "trending_score": m.trending_score or 0,
@@ -579,11 +1392,16 @@ class HFDownloader:
         }
 
     @staticmethod
-    async def get_model_info(repo_id: str) -> dict:
+    async def get_model_info(
+        repo_id: str, local_dir: Path | None = None, token: str | None = None
+    ) -> dict:
         """Fetch detailed model information from HuggingFace.
 
         Args:
             repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
+            local_dir: The folder the repo downloads into, to mark files
+                already there.
+            token: HF token for a gated or private repo; None uses the stored one.
 
         Returns:
             Dict with model details including description, files, tags, etc.
@@ -594,6 +1412,7 @@ class HFDownloader:
                 api.model_info,
                 repo_id,
                 files_metadata=True,
+                token=token,
             ),
             timeout=_HF_API_TIMEOUT,
         )
@@ -612,20 +1431,27 @@ class HFDownloader:
                     }
                 )
 
+        layout = await asyncio.to_thread(_describe_repo_files, files, local_dir)
+
         # Detect LoRA/adapter repos (adapter_config.json is peft standard)
         is_adapter = any(f["name"] == "adapter_config.json" for f in files)
 
-        # Extract params and size from safetensors
+        # Params from the dtype histogram (logical count). Size from current
+        # revision blob bytes — U32 packed quants are not 4 bytes/param (#3401).
         params = None
         params_formatted = None
-        size = 0
+        size = _sum_safetensors_blob_bytes(info.siblings) or 0
         safetensors = getattr(info, "safetensors", None)
-        if safetensors:
-            st_dict = dict(safetensors) if not isinstance(safetensors, dict) else safetensors
-            if st_dict.get("parameters"):
-                params = _get_param_count(st_dict)
-                params_formatted = _format_param_count(params) if params > 0 else None
-                size = _calc_safetensors_disk_size(st_dict)
+        st_params = _safetensors_parameters(safetensors)
+        if st_params:
+            params = _get_param_count({"parameters": st_params})
+            params_formatted = _format_param_count(params) if params > 0 else None
+            if size == 0 and "U32" not in st_params:
+                size = _calc_safetensors_disk_size({"parameters": st_params})
+        # What "download all" fetches, by the rules of a whole-repo download.
+        download_all_size = _sum_snapshot_bytes(
+            info.siblings, _SAFETENSORS_REPO_IGNORE if st_params else None
+        )
 
         # Fetch model card (README.md) content
         model_card = ""
@@ -636,6 +1462,7 @@ class HFDownloader:
                     repo_id=repo_id,
                     filename="README.md",
                     endpoint=endpoint,
+                    token=token,
                 ),
                 timeout=_HF_API_TIMEOUT,
             )
@@ -656,6 +1483,9 @@ class HFDownloader:
             "model_card": model_card,
             "description": "",  # kept for backward compat
             "files": files,
+            "layout": layout,
+            "download_all_size": download_all_size or 0,
+            "unsupported_reason": _unsupported_repo_reason(info),
             "tags": list(info.tags) if info.tags else [],
             "pipeline_tag": info.pipeline_tag or "",
             "params": params,
@@ -675,6 +1505,7 @@ class HFDownloader:
         self,
         model_dir: str,
         on_complete: Optional[Callable] = None,
+        tasks_file: str | Path | None = None,
     ):
         self._model_dir = Path(model_dir)
         self._tasks: dict[str, DownloadTask] = {}
@@ -682,6 +1513,7 @@ class HFDownloader:
         self._progress_tasks: dict[str, asyncio.Task] = {}
         self._on_complete = on_complete
         self._cancelled: set[str] = set()
+        self._init_queue(tasks_file)
         self._stalled: dict[str, _DownloadStalledError] = {}
         self._fallback_processes: dict[str, asyncio.subprocess.Process] = {}
         self._download_sem = asyncio.Semaphore(1)
@@ -695,30 +1527,37 @@ class HFDownloader:
         self._model_dir = Path(new_dir)
 
     async def start_download(
-        self, repo_id: str, hf_token: str = ""
+        self,
+        repo_id: str,
+        hf_token: str = "",
+        files: list[str] | None = None,
     ) -> DownloadTask:
         """Start downloading a model from HuggingFace.
 
         Args:
             repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
             hf_token: Optional HuggingFace token for gated models.
+            files: Repo paths to fetch; None fetches the whole repo.
 
         Returns:
             The created DownloadTask.
 
         Raises:
-            ValueError: If repo_id format is invalid or download is already queued.
+            ValueError: If repo_id or a file path is invalid, or the repo
+                already has a download queued.
         """
         repo_id = repo_id.strip()
-        if "/" not in repo_id or len(repo_id.split("/")) != 2:
+        parts = repo_id.split("/")
+        if len(parts) != 2 or any(part in ("", ".", "..") for part in parts):
             raise ValueError(
                 f"Invalid repository ID: '{repo_id}'. "
                 "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
             )
+        files = _normalize_files(files)
 
-        # Check for duplicate active downloads
+        # One download per repo folder; Hub resolves repo IDs case-insensitively.
         for task in self._tasks.values():
-            if task.repo_id == repo_id and task.status in (
+            if task.repo_id.lower() == repo_id.lower() and task.status in (
                 DownloadStatus.PENDING,
                 DownloadStatus.DOWNLOADING,
             ):
@@ -727,13 +1566,15 @@ class HFDownloader:
                 )
 
         task_id = str(uuid.uuid4())
-        task = DownloadTask(task_id=task_id, repo_id=repo_id)
+        task = DownloadTask(task_id=task_id, repo_id=repo_id, files=files)
+        task.token = hf_token or ""
         self._tasks[task_id] = task
 
         # Start download in background
         self._active_tasks[task_id] = asyncio.create_task(
             self._run_download(task_id, hf_token)
         )
+        self._persist()
 
         logger.info(f"Download queued: {repo_id} (task_id={task_id})")
         return task
@@ -759,12 +1600,10 @@ class HFDownloader:
         # Mark as cancelled
         self._cancelled.add(task_id)
         task.status = DownloadStatus.CANCELLED
+        self._persist()
 
-        # A task in DOWNLOADING owns the download semaphore, so the in-flight
-        # xet transfer is necessarily this one; aborting the (global) session
-        # makes its snapshot_download thread unwind immediately. Pending tasks
-        # must not abort, that would kill another task's transfer. The next
-        # download lazily creates a fresh session.
+        # Only the DOWNLOADING task owns the semaphore and the xet transfer.
+        # A pending cancel must not abort another task's transfer.
         if was_downloading:
             abort_xet_session()
 
@@ -773,13 +1612,31 @@ class HFDownloader:
         if progress_task and not progress_task.done():
             progress_task.cancel()
 
-        # Cancel the download task
-        active_task = self._active_tasks.pop(task_id, None)
+        # The task stays in _active_tasks until its worker stops writing.
+        active_task = self._active_tasks.get(task_id)
         if active_task and not active_task.done():
             active_task.cancel()
 
         logger.info(f"Download cancelled: {task.repo_id} (task_id={task_id})")
         return True
+
+    async def cancel_download_for_dir(
+        self, target_dir: Path, files: list[str] | None = None
+    ) -> None:
+        """Cancel the download writing into ``target_dir`` and wait for it.
+
+        With ``files``, only a download that fetches one of them is cancelled.
+        """
+        resolved = Path(target_dir).resolve()
+        for task_id, active in list(self._active_tasks.items()):
+            task = self._tasks.get(task_id)
+            if task is None or (self._model_dir / task.repo_id).resolve() != resolved:
+                continue
+            if files is not None and task.files is not None:
+                if not set(task.files) & set(files):
+                    continue
+            await self.cancel_download(task_id)
+            await asyncio.gather(active, return_exceptions=True)
 
     def remove_task(self, task_id: str) -> bool:
         """Remove a completed, failed, or cancelled task from the list.
@@ -799,6 +1656,7 @@ class HFDownloader:
 
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
+        self._persist()
         return True
 
     async def retry_download(
@@ -835,9 +1693,13 @@ class HFDownloader:
         del self._tasks[task_id]
         self._cancelled.discard(task_id)
 
-        # Start fresh download (snapshot_download resumes from existing files)
-        new_task = await self.start_download(repo_id, hf_token)
+        # Start fresh download (snapshot_download resumes from existing files).
+        # An empty retry token keeps the stored one.
+        new_task = await self.start_download(
+            repo_id, hf_token or old_task.token, files=old_task.files
+        )
         new_task.retry_count = old_retry_count + 1
+        self._persist()
         return new_task
 
     def get_tasks(self) -> list[dict]:
@@ -849,6 +1711,9 @@ class HFDownloader:
 
     async def shutdown(self) -> None:
         """Cancel all active downloads and clean up."""
+        # Keep persisted rows as pending/downloading so the next boot
+        # resumes them.
+        self._shutting_down = True
         # Cancel all progress polling tasks
         for task_id, progress_task in list(self._progress_tasks.items()):
             if not progress_task.done():
@@ -871,6 +1736,16 @@ class HFDownloader:
         abort_xet_session()
 
         logger.info("HF Downloader shut down")
+
+    async def _reap_payload(self, payload: asyncio.Future) -> None:
+        """Abort xet until the cancelled download call returns.
+
+        One abort misses the next file, which hub starts on a fresh session.
+        """
+        while not payload.done():
+            await asyncio.sleep(_REAP_INTERVAL)
+            abort_xet_session()
+        await asyncio.gather(payload, return_exceptions=True)
 
     async def _run_download(self, task_id: str, hf_token: str) -> None:
         """Execute a download task.
@@ -895,36 +1770,57 @@ class HFDownloader:
                 # when sharing a model directory.
                 target_dir = self._model_dir / task.repo_id
 
+                # Hub never resumes leftover temp files; they only inflate progress.
+                try:
+                    await asyncio.to_thread(
+                        self._cleanup_partial, task, orphans_only=True
+                    )
+                except Exception as e:  # noqa: BLE001 - progress only
+                    logger.warning(
+                        f"Could not clean up partial files for {task.repo_id}: {e}"
+                    )
+
                 api, endpoint = _get_hf_api()
 
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
                 ignore_patterns = None
-                st_estimate = 0
+                allow_patterns = _file_patterns(task.files) if task.files else None
+                size_estimate = 0
                 try:
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
                             api.model_info,
                             task.repo_id,
                             token=hf_token or None,
-                            expand=["safetensors"],
+                            files_metadata=True,
                         ),
                         timeout=_HF_API_TIMEOUT,
                     )
-                    if model_info.safetensors and model_info.safetensors.get(
-                        "parameters"
-                    ):
-                        ignore_patterns = [
-                            "*.bin",
-                            "original/**",
-                            "consolidated.*.pth",
-                        ]
-                        # Computed inside this try so malformed metadata
-                        # (non-int counts) degrades to no estimate instead
-                        # of failing the download from the dry-run handler.
-                        st_estimate = _calc_safetensors_disk_size(
-                            model_info.safetensors
+                    st_params = _safetensors_parameters(
+                        getattr(model_info, "safetensors", None)
+                    )
+                    _check_selected_files(task, model_info)
+                    unsupported = _unsupported_repo_reason(model_info)
+                    if unsupported:
+                        raise _UnsupportedRepoError(unsupported)
+                    if st_params and allow_patterns is None:
+                        ignore_patterns = _SAFETENSORS_REPO_IGNORE
+                    # Blob sizes of every file the snapshot fetches.
+                    snapshot_bytes = _sum_snapshot_bytes(
+                        getattr(model_info, "siblings", None),
+                        ignore_patterns,
+                        allow_patterns,
+                    )
+                    if snapshot_bytes is not None:
+                        size_estimate = snapshot_bytes
+                    elif st_params and "U32" not in st_params:
+                        # Weights-only fallback; U32 counts are not disk bytes (#3401).
+                        size_estimate = _calc_safetensors_disk_size(
+                            {"parameters": st_params}
                         )
+                except (_MissingFilesError, _UnsupportedRepoError):
+                    raise
                 except Exception as e:
                     logger.warning(
                         f"Could not fetch repo info for {task.repo_id}: {e}"
@@ -939,10 +1835,13 @@ class HFDownloader:
                 }
                 if ignore_patterns:
                     dl_kwargs["ignore_patterns"] = ignore_patterns
+                if allow_patterns:
+                    dl_kwargs["allow_patterns"] = allow_patterns
 
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
                 size_estimated = False
+                stale: dict[str, tuple[int, int]] = {}
                 try:
                     dry_result = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -953,33 +1852,51 @@ class HFDownloader:
                         timeout=30,
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
+                    try:
+                        stale = await asyncio.to_thread(
+                            _stale_local_files, target_dir, dry_result
+                        )
+                    except Exception as e:  # noqa: BLE001 - progress only
+                        logger.debug(
+                            "Could not find outdated files for %s: %s",
+                            task.repo_id,
+                            e,
+                        )
                 except Exception as e:
-                    if st_estimate:
-                        task.total_size = st_estimate
+                    if size_estimate:
+                        task.total_size = size_estimate
                         size_estimated = True
-                        detail = "Estimated total size from safetensors metadata."
+                        detail = "Estimated total size from Hub metadata."
                     else:
                         detail = "Progress estimation will be unavailable."
                     logger.warning(
                         f"Dry run failed for {task.repo_id}: {e}. {detail}"
                     )
 
+                wire_counter = _WireCounter()
                 self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, target_dir)
+                    self._poll_progress(task_id, target_dir, wire_counter, stale)
                 )
 
-                xet_error: Exception | None = None
-                try:
-                    # Awaiting the thread here is intentional: after a stall,
-                    # fallback cannot start until abort_xet_session() has made
-                    # the original writer return.
-                    await asyncio.to_thread(
+                payload = asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(
                         snapshot_download,
                         **dl_kwargs,
                         tqdm_class=_make_cancellable_tqdm(
-                            lambda: task_id in self._cancelled
+                            lambda: task_id in self._cancelled,
+                            on_wire_bytes=wire_counter.add,
                         ),
-                    )
+                    ),
+                )
+                xet_error: Exception | None = None
+                try:
+                    # The HTTP fallback must not overlap this writer.
+                    # A cancel holds the semaphore until the writer stops.
+                    await asyncio.shield(payload)
+                except asyncio.CancelledError:
+                    await self._reap_payload(payload)
+                    raise
                 except Exception as error:
                     stalled = self._stalled.pop(task_id, None)
                     if stalled is not None:
@@ -1003,8 +1920,10 @@ class HFDownloader:
                     progress_task = self._progress_tasks.pop(task_id, None)
                     if progress_task and not progress_task.done():
                         progress_task.cancel()
+                    # The HTTP worker refetches the payload, so xet's wire
+                    # bytes do not carry over.
                     self._progress_tasks[task_id] = asyncio.create_task(
-                        self._poll_progress(task_id, target_dir)
+                        self._poll_progress(task_id, target_dir, _WireCounter(), stale)
                     )
                     try:
                         await self._run_http_fallback(task_id, dl_kwargs)
@@ -1025,10 +1944,11 @@ class HFDownloader:
                 # Success
                 task.status = DownloadStatus.COMPLETED
                 task.progress = 100.0
+                task.speed_bps = 0.0
                 if size_estimated or not task.total_size:
                     # The estimate was only a progress denominator; report
                     # the measured on-disk size once the download is done.
-                    task.downloaded_size = self._get_dir_size(target_dir)
+                    task.downloaded_size = self._get_dir_size(target_dir, task.files)
                 else:
                     task.downloaded_size = task.total_size
                 task.completed_at = time.time()
@@ -1059,13 +1979,7 @@ class HFDownloader:
                 logger.error(
                     f"Failed to clean up cancelled download {task.repo_id}: {e}"
                 )
-        except RepositoryNotFoundError:
-            task.status = DownloadStatus.FAILED
-            task.error = (
-                f"Repository not found: {task.repo_id}. "
-                "This may be a gated model that requires HuggingFace authentication."
-            )
-            logger.error(f"Repository not found: {task.repo_id}")
+        # GatedRepoError subclasses RepositoryNotFoundError.
         except GatedRepoError:
             task.status = DownloadStatus.FAILED
             task.error = (
@@ -1073,6 +1987,13 @@ class HFDownloader:
                 "Please provide a valid HF token with access."
             )
             logger.error(f"Gated repo access denied: {task.repo_id}")
+        except RepositoryNotFoundError:
+            task.status = DownloadStatus.FAILED
+            task.error = (
+                f"Repository not found: {task.repo_id}. "
+                "This may be a gated model that requires HuggingFace authentication."
+            )
+            logger.error(f"Repository not found: {task.repo_id}")
         except Exception as e:
             # Do not clobber an earlier terminal error or a user cancellation.
             if (
@@ -1082,6 +2003,14 @@ class HFDownloader:
                 task.status = DownloadStatus.FAILED
                 task.error = str(e)
                 logger.error(f"Download failed for {task.repo_id}: {e}")
+                # A killed HTTP fallback child skips hub's own temp file cleanup.
+                try:
+                    self._cleanup_partial(task, orphans_only=True)
+                except Exception as cleanup_error:
+                    logger.error(
+                        f"Failed to clean up failed download {task.repo_id}: "
+                        f"{cleanup_error}"
+                    )
         finally:
             # Stop progress polling
             progress_task = self._progress_tasks.pop(task_id, None)
@@ -1091,6 +2020,8 @@ class HFDownloader:
 
             # Remove from active tasks
             self._active_tasks.pop(task_id, None)
+
+            self._persist()
 
     async def _run_http_fallback(
         self,
@@ -1160,7 +2091,13 @@ class HFDownloader:
                 return
             await process.wait()
 
-    async def _poll_progress(self, task_id: str, target_dir: Path) -> None:
+    async def _poll_progress(
+        self,
+        task_id: str,
+        target_dir: Path,
+        wire: _WireCounter | None = None,
+        stale: dict[str, tuple[int, int]] | None = None,
+    ) -> None:
         """Poll the target directory to estimate download progress.
 
         Uses both directory size and file modification times to detect
@@ -1168,14 +2105,38 @@ class HFDownloader:
         in, so size alone may not change for extended periods. File mtimes
         are updated on each write syscall and serve as a more reliable
         liveness signal.
+
+        The wire counter covers xet's fetch phase, where bytes arrive on the
+        network long before they reach disk: it feeds progress, speed, and
+        stall liveness.
+
+        ``stale`` files are left out of the disk reading. Hub deletes them
+        before refetching, which would otherwise hide disk growth.
         """
+        wire = wire or _WireCounter()
+        # Own copy: _stale_bytes forgets replaced files as they go.
+        stale = dict(stale or {})
         task = self._tasks.get(task_id)
         if task is None:
             return
 
-        last_activity = self._get_download_activity(target_dir)
+        last_activity = self._get_download_activity(target_dir, task.files)
         last_activity_at = time.monotonic()
         observed_activity = False
+        # Prime both meters before the first sleep.
+        speed_meter = _SpeedMeter()
+        speed_meter.add(last_activity.files, now=last_activity_at)
+        wire_meter = _WireSpeedMeter()
+        wire_meter.add(wire.value, now=last_activity_at)
+        # Rate of the reported bytes, so a disk flush of fetched bytes does not
+        # count twice. Fed from the first moving tick to skip startup idle time.
+        eta_meter = _WireSpeedMeter(window=_ETA_WINDOW)
+        eta_started_at: float | None = None
+        last_wire = wire.value
+        # A resume fetches only missing bytes, so wire bytes add to this.
+        base_logical = last_activity.logical_size - _stale_bytes(
+            stale, last_activity.files
+        )
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -1184,15 +2145,35 @@ class HFDownloader:
                 if task.status != DownloadStatus.DOWNLOADING:
                     break
 
-                activity = self._get_download_activity(target_dir)
-                task.downloaded_size = activity.logical_size
+                activity = self._get_download_activity(target_dir, task.files)
+                wire_now = wire.value
+                logical = activity.logical_size - _stale_bytes(stale, activity.files)
 
+                # Add wire bytes the disk has not caught up with yet.
+                disk_growth = max(0, logical - base_logical)
+                reported = logical + max(0, wire_now - disk_growth)
                 if task.total_size > 0:
+                    reported = min(reported, task.total_size)
                     # Cap at 99% until snapshot_download confirms completion
                     task.progress = min(
-                        (activity.logical_size / task.total_size) * 100,
+                        (reported / task.total_size) * 100,
                         99.0,
                     )
+                task.downloaded_size = reported
+
+                disk_bps = speed_meter.add(activity.files)
+                wire_bps = wire_meter.add(wire_now)
+                # Both meters see the same payload, so never sum them.
+                task.speed_bps = max(disk_bps, wire_bps)
+                if eta_started_at is None and task.speed_bps > 0:
+                    eta_started_at = time.monotonic()
+                if eta_started_at is not None:
+                    eta_bps = eta_meter.add(task.downloaded_size)
+                    if time.monotonic() - eta_started_at >= _ETA_WARMUP:
+                        task.eta_speed_bps = eta_bps
+
+                wire_moved = wire_now > last_wire
+                last_wire = wire_now
 
                 if activity != last_activity:
                     # A zero-byte temp file or metadata touch is not payload
@@ -1201,6 +2182,12 @@ class HFDownloader:
                     if activity.allocated_size > last_activity.allocated_size:
                         observed_activity = True
                     last_activity = activity
+                    last_activity_at = time.monotonic()
+                    continue
+
+                if wire_moved:
+                    # Wire bytes mean the token/CAS handshake is done.
+                    observed_activity = True
                     last_activity_at = time.monotonic()
                     continue
 
@@ -1232,61 +2219,18 @@ class HFDownloader:
                     break
         except asyncio.CancelledError:
             pass
+        finally:
+            task.speed_bps = 0.0
+            task.eta_speed_bps = 0.0
 
     @staticmethod
-    def _get_download_activity(path: Path) -> _DownloadActivity:
-        """Return size, allocation, and mtime signals including Hub temp files."""
-        if not path.exists():
-            return _DownloadActivity()
-        file_count = 0
-        logical_size = 0
-        allocated_size = 0
-        latest_mtime_ns = 0
-        try:
-            for file_path in path.rglob("*"):
-                if not file_path.is_file():
-                    continue
-                try:
-                    stat = file_path.stat()
-                except OSError:
-                    continue
-                file_count += 1
-                logical_size += stat.st_size
-                allocated_size += getattr(stat, "st_blocks", 0) * 512
-                latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
-        except OSError:
-            pass
-        return _DownloadActivity(
-            file_count=file_count,
-            logical_size=logical_size,
-            allocated_size=allocated_size,
-            latest_mtime_ns=latest_mtime_ns,
-        )
-
-    @staticmethod
-    def _get_latest_mtime(path: Path) -> float:
-        """Return the most recent modification time of any file in a directory."""
-        if not path.exists():
-            return 0.0
-        latest = 0.0
-        try:
-            for f in path.rglob("*"):
-                if f.is_file():
-                    try:
-                        mt = f.stat().st_mtime
-                        if mt > latest:
-                            latest = mt
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-        return latest
-
-    @staticmethod
-    def _get_dir_size(path: Path) -> int:
-        """Calculate total size of all files in a directory."""
+    def _get_dir_size(path: Path, only: list[str] | None = None) -> int:
+        """Total size of the files in a directory, or of its ``only`` paths."""
         if not path.exists():
             return 0
+        if only is not None:
+            files = (path / name for name in only)
+            return sum(f.stat().st_size for f in files if f.is_file())
         total = 0
         try:
             for f in path.rglob("*"):
@@ -1299,20 +2243,35 @@ class HFDownloader:
             pass
         return total
 
-    def _cleanup_partial(self, task: DownloadTask) -> None:
-        """Remove in-progress shards while keeping finalized files for resume.
+    def _cleanup_partial(
+        self, task: DownloadTask, *, orphans_only: bool = False
+    ) -> None:
+        """Remove hub's partial files and keep finished files for resume.
 
-        Hub stages partial downloads inside a hidden ``._____temp`` directory
-        and only renames a shard into the target on completion. Wiping the
-        whole target dir would also nuke shards the user has already paid
-        for; finalized files are visible in the file browser, so users can
-        keep them for auto-resume on retry or remove them themselves.
+        ``.metadata`` files stay so a retry can skip files it already verified.
+        With ``orphans_only``, files stay while any hub lock here is held.
         """
-        target_dir = self._model_dir / task.repo_id
-        temp_dir = target_dir / "._____temp"
-        if temp_dir.exists():
+        staging_dir = (
+            self._model_dir / task.repo_id / ".cache" / "huggingface" / "download"
+        )
+        if not staging_dir.is_dir():
+            return
+        # List first: a live writer already holds the lock of any file seen now.
+        partials = list(staging_dir.rglob("*.incomplete"))
+        if orphans_only and partials and _hub_lock_held(staging_dir):
+            logger.info(
+                f"Kept {len(partials)} in-progress file(s), a hub lock is held "
+                f"or could not be checked: {staging_dir}"
+            )
+            return
+        for partial in partials:
             try:
-                shutil.rmtree(temp_dir)
-                logger.info(f"Cleaned up in-progress shards: {temp_dir}")
-            except Exception as e:
-                logger.error(f"Failed to clean up {temp_dir}: {e}")
+                # A writer that finished after the listing renamed its file.
+                partial.unlink(missing_ok=True)
+            except OSError as e:
+                logger.error(f"Failed to clean up {partial}: {e}")
+        if partials:
+            logger.info(
+                f"Cleaned up {len(partials)} in-progress file(s): "
+                f"{staging_dir}"
+            )

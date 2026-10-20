@@ -324,7 +324,7 @@ def _patch_model(dsv4: Any) -> None:
             # mtp_partial_rollback, and the head cache is a RotatingKVCache
             # (not exactly trimmable once rotated) so the chain runs its
             # speculative head steps on a per-cycle clone.
-            from . import get_mtp_depth
+            from . import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             depth = get_mtp_depth()
@@ -343,6 +343,7 @@ def _patch_model(dsv4: Any) -> None:
             else:
                 self._omlx_mtp_head_clone = True
             self._omlx_mtp_depth = depth
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     def __call__(
         self,

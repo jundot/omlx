@@ -10,7 +10,6 @@ from __future__ import annotations
 import gc
 import importlib
 import logging
-import os
 import threading
 import time
 import weakref
@@ -22,6 +21,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 
+from omlx.patches import qwen35_packed_linear
 from omlx.utils import hardware, proc_memory
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,9 @@ _GDN_MODULES: weakref.WeakValueDictionary[int, Any] = weakref.WeakValueDictionar
 # all slices into one multi-procedure program per ANE instance and bypass this
 # fallback-only budget.
 _ANE_RESIDENT_PROGRAM_LIMIT = 120
+# Shared shape limits for compilation validation and scheduler guidance.
+_ANE_MIN_SEQUENCE_LENGTH = 1024
+_ANE_SEQUENCE_LENGTH_ALIGNMENT = 64
 # First retry cap for split procedure banks after a monolithic bank fails to
 # load. Program-create maps a bank's whole weight blob into the owning ANE's
 # ~4 GiB device address window, so single-die chips reject two monolithic
@@ -95,6 +98,7 @@ class _AnePrefillConfig:
     ane_down_fraction: float = 0.0
     fused_down: bool = False
     tail_padding_min_tokens: int = 0
+    gpu_suffix_views: bool = False
 
 
 @dataclass(frozen=True)
@@ -151,6 +155,8 @@ class _CombinedMLPState:
     cpu_outputs: int = 0
     down_cpu: _CpuLinearState | None = None
     down_ane: _AneDownState | None = None
+    # Up rows of a view-backed suffix; weight/scales/biases then hold gate rows.
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None
 
 
 @dataclass(frozen=True)
@@ -191,9 +197,10 @@ def _target_verify(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
 
 
 def _eligible_affine_linear(
-    linear: Any, dtype: mx.Dtype, *, bits: int, group_size: int
+    linear: Any, dtype: mx.Dtype | None, *, bits: int, group_size: int
 ) -> bool:
-    if not isinstance(linear, nn.QuantizedLinear):
+    # dtype is None when the sibling it came from has no stock scales.
+    if dtype is None or not isinstance(linear, nn.QuantizedLinear):
         return False
     weight = getattr(linear, "weight", None)
     scales = getattr(linear, "scales", None)
@@ -219,7 +226,7 @@ def _eligible_affine_linear(
 
 def _affine_spec(
     linear: Any,
-    dtype: mx.Dtype,
+    dtype: mx.Dtype | None,
     *,
     allowed_bits: tuple[int, ...] = (4, 5, 6, 8),
 ) -> tuple[int, int] | None:
@@ -240,12 +247,12 @@ def _affine_spec(
 
 def _fused_swiglu_symbol(bits: int, *, dual: bool) -> str:
     if bits == 4:
-        return "qwen35_ane_dual_q4_swiglu_t" if dual else "qwen35_ane_q4_swiglu_t"
+        return "ane_dual_q4_swiglu_t" if dual else "ane_q4_swiglu_t"
     if bits in (5, 6, 8):
         return (
-            "qwen35_ane_dual_affine_swiglu_t"
+            "ane_dual_affine_swiglu_t"
             if dual
-            else "qwen35_ane_affine_swiglu_t"
+            else "ane_affine_swiglu_t"
         )
     raise ValueError(f"Unsupported ANE SwiGLU bit width: {bits}")
 
@@ -300,17 +307,14 @@ def _tail_qmm_or_linear(linear: Any, x: mx.array, variant: int) -> mx.array:
     # min-tokens boundary (2048 default, 16384 for q8); shorter tails use
     # stock MLX.
     from omlx.patches.qwen35_q4_mlp import (
+        _MIN_TOKENS,
         _Q8_MIN_TOKENS,
         _linear_qmm,
         _route_min_tokens_for_bits,
     )
 
     bits = getattr(linear, "bits", None)
-    min_tokens = int(os.environ.get("OMLX_QWEN35_Q4_LINEAR_MIN_TOKENS", "2048"))
-    q8_min_tokens = int(
-        os.environ.get("OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS", str(_Q8_MIN_TOKENS))
-    )
-    if x.shape[-2] < _route_min_tokens_for_bits(bits, min_tokens, q8_min_tokens):
+    if x.shape[-2] < _route_min_tokens_for_bits(bits, _MIN_TOKENS, _Q8_MIN_TOKENS):
         return linear(x)
     return _linear_qmm(linear, x, variant)
 
@@ -320,9 +324,13 @@ def configure_qwen35_ane_prefill_scheduler(
     sequence_length: int,
 ) -> bool:
     """Keep normal wide prompt chunks; projection backends tile internally."""
-    if sequence_length < 1024 or sequence_length % 64:
+    if (
+        sequence_length < _ANE_MIN_SEQUENCE_LENGTH
+        or sequence_length % _ANE_SEQUENCE_LENGTH_ALIGNMENT
+    ):
         raise ValueError(
-            "ANE prefill sequence_length must be a multiple of 64 >= 1024"
+            "ANE prefill sequence_length must be a multiple of "
+            f"{_ANE_SEQUENCE_LENGTH_ALIGNMENT} >= {_ANE_MIN_SEQUENCE_LENGTH}"
         )
     config = getattr(scheduler, "config", None)
     if config is None:
@@ -337,15 +345,36 @@ def configure_qwen35_ane_prefill_scheduler(
         # configured step or the qwen35 floor.
         delivered_cap = min(delivered_cap, block_size) if delivered_cap else block_size
     if delivered_cap and sequence_length > delivered_cap:
-        logger.warning(
-            "Qwen ANE prefill sequence_length=%d exceeds the delivered prefill "
-            "chunk width (~%d tokens). Chunks narrower than the compiled shape "
-            "cannot tile onto it, so the ANE will compile but never execute. "
-            "Set sequence_length=%d or smaller.",
-            sequence_length,
-            delivered_cap,
-            delivered_cap,
-        )
+        # Round down so the recommended shape passes alignment validation.
+        usable = (
+            delivered_cap // _ANE_SEQUENCE_LENGTH_ALIGNMENT
+        ) * _ANE_SEQUENCE_LENGTH_ALIGNMENT
+        if usable < _ANE_MIN_SEQUENCE_LENGTH:
+            usable = 0
+        if usable:
+            logger.warning(
+                "Qwen ANE prefill sequence_length=%d exceeds the delivered "
+                "prefill chunk width (~%d tokens). Chunks narrower than the "
+                "compiled shape require eligible tail padding to execute on "
+                "ANE. Set sequence_length=%d or a smaller valid shape to "
+                "use unpadded tiles.",
+                sequence_length,
+                delivered_cap,
+                usable,
+            )
+        else:
+            logger.warning(
+                "Qwen ANE prefill chunk width (~%d tokens) is below the "
+                "minimum ANE sequence length (%d). These chunks require "
+                "eligible tail padding to execute on ANE; changing "
+                "sequence_length alone cannot provide an unpadded tile. "
+                "For unpadded tiles, raise the effective prefill chunk width "
+                "to at least %d (capped by the paged cache block size with "
+                "block-aware caching).",
+                delivered_cap,
+                _ANE_MIN_SEQUENCE_LENGTH,
+                _ANE_MIN_SEQUENCE_LENGTH,
+            )
     logger.info(
         "Qwen ANE prefill preserving scheduler chunks; projection tile=%d "
         "(step=%d, floor=%d)",
@@ -384,24 +413,24 @@ def _eligible_pair(mlp: Any) -> bool:
 def _cpu_gate_kernel_symbol(bits: int, *, dual: bool = True) -> str | None:
     if bits == 4:
         return (
-            "qwen35_ane_dual_cpu_fp16_q4_swiglu_t"
+            "ane_dual_cpu_fp16_q4_swiglu_t"
             if dual
-            else "qwen35_ane_cpu_fp16_q4_swiglu_t"
+            else "ane_cpu_fp16_q4_swiglu_t"
         )
     if bits in (5, 6, 8):
         return (
-            "qwen35_ane_dual_cpu_fp16_swiglu_t"
+            "ane_dual_cpu_fp16_swiglu_t"
             if dual
-            else "qwen35_ane_cpu_fp16_swiglu_t"
+            else "ane_cpu_fp16_swiglu_t"
         )
     return None
 
 
 def _cpu_gdn_kernel_symbol(*, dual: bool) -> str:
     return (
-        "qwen35_ane_dual_cpu_fp16_affine_qmm_t"
+        "ane_dual_cpu_fp16_affine_qmm_t"
         if dual
-        else "qwen35_ane_cpu_fp16_affine_qmm_t"
+        else "ane_cpu_fp16_affine_qmm_t"
     )
 
 
@@ -409,13 +438,13 @@ def _prepare_cpu_linear(
     linear: Any, fraction: float
 ) -> _CpuLinearState | None:
     """Eagerly split one affine projection into FP16 CPU and quantized GPU rows."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     if fraction <= 0 or getattr(linear, "scales", None) is None:
         return None
     # Without the native symbol the dispatch wrapper would raise at first use
     # and latch the whole layer off; stay a clean no-op like the other sites.
-    if not fast.has_symbol("qwen35_cpu_fp16_affine_qmm_t"):
+    if not fast.has_symbol("cpu_fp16_affine_qmm_t"):
         return None
     spec = _affine_spec(linear, mx.float16)
     if spec is None:
@@ -538,8 +567,35 @@ def _prepare_down_for_bank(
     )
 
 
+def _gate_up_gpu_suffix(
+    gate: Any, up: Any, gpu_start: int, config: _AnePrefillConfig
+) -> tuple[mx.array, mx.array, mx.array, tuple[mx.array, mx.array, mx.array] | None]:
+    """Return the GPU gate/up suffix rows and, for views, the separate up rows."""
+    if config.gpu_suffix_views:
+        return (
+            gate.weight[gpu_start:],
+            gate.scales[gpu_start:],
+            gate.biases[gpu_start:],
+            (up.weight[gpu_start:], up.scales[gpu_start:], up.biases[gpu_start:]),
+        )
+    weight = mx.contiguous(
+        mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
+    )
+    scales = mx.contiguous(
+        mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
+    )
+    biases = mx.contiguous(
+        mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
+    )
+    return weight, scales, biases, None
+
+
+def _split_suffix_kwargs(state: _CombinedMLPState) -> dict[str, Any]:
+    return {} if state.up_suffix is None else {"up_suffix": state.up_suffix}
+
+
 def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | None:
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
@@ -556,7 +612,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
     group_size = int(gate.group_size)
     dual_ane = bool(
         config.dual_ane
-        and fast.has_symbol("qwen35_ane_dual_affine_qmm_t")
+        and fast.has_symbol("ane_dual_affine_qmm_t")
         and fast.has_symbol(_fused_swiglu_symbol(bits, dual=True))
     )
     if bits != 4 and not fast.has_symbol(_fused_swiglu_symbol(bits, dual=dual_ane)):
@@ -585,6 +641,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
         config.cpu_down_fraction,
         group_size,
         "dual" if dual_ane else "linear",
+        config.gpu_suffix_views,
     )
     if key in cache:
         return cache[key]
@@ -634,28 +691,22 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
                     axis=0,
                 )
             )
-        weight = mx.contiguous(
-            mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
+        weight, scales, biases, up_suffix = _gate_up_gpu_suffix(
+            gate, up, gpu_start, config
         )
-        scales = mx.contiguous(
-            mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
-        )
-        biases = mx.contiguous(
-            mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
-        )
-        values = [dense0, weight, scales, biases]
+        values = [dense0, weight, scales, biases, *(up_suffix or ())]
         if cpu_weight is not None:
             values.append(cpu_weight)
         if dense1 is not None:
             values.append(dense1)
         mx.eval(*values)
         model = (
-            fast.qwen35_ane_compile_linear(dense0, config.sequence_length, 1)
+            fast.ane_compile_linear(dense0, config.sequence_length, 1)
             if dual_ane
-            else fast.qwen35_ane_compile_linear(dense0, config.sequence_length)
+            else fast.ane_compile_linear(dense0, config.sequence_length)
         )
         model1 = (
-            fast.qwen35_ane_compile_linear(dense1, config.sequence_length, 2)
+            fast.ane_compile_linear(dense1, config.sequence_length, 2)
             if dense1 is not None
             else None
         )
@@ -674,6 +725,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
             down_cpu=_prepare_cpu_linear(
                 mlp.down_proj, config.cpu_down_fraction
             ),
+            up_suffix=up_suffix,
         )
         cache[key] = state
         logger.debug(
@@ -689,7 +741,7 @@ def _compile_pair(mlp: Any, config: _AnePrefillConfig) -> _CombinedMLPState | No
 def _prepare_pair_for_bank(
     mlp: Any, config: _AnePrefillConfig
 ) -> tuple[_CombinedMLPState, mx.array, mx.array | None] | None:
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
@@ -760,16 +812,8 @@ def _prepare_pair_for_bank(
                 axis=0,
             )
         )
-    weight = mx.contiguous(
-        mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
-    )
-    scales = mx.contiguous(
-        mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
-    )
-    biases = mx.contiguous(
-        mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
-    )
-    values = [dense0, weight, scales, biases]
+    weight, scales, biases, up_suffix = _gate_up_gpu_suffix(gate, up, gpu_start, config)
+    values = [dense0, weight, scales, biases, *(up_suffix or ())]
     if dense1 is not None:
         values.append(dense1)
     if cpu_weight is not None:
@@ -797,6 +841,7 @@ def _prepare_pair_for_bank(
                 )
             ),
             down_ane=down_ane,
+            up_suffix=up_suffix,
         ),
         dense0,
         dense1,
@@ -818,7 +863,7 @@ def _prepare_pair_runtime_state(
     tuner exercises the same row alignment, q4 eligibility, and down-split
     implementation as normal inference.
     """
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
@@ -862,16 +907,8 @@ def _prepare_pair_runtime_state(
                 axis=0,
             )
         )
-    weight = mx.contiguous(
-        mx.concatenate((gate.weight[gpu_start:], up.weight[gpu_start:]), axis=0)
-    )
-    scales = mx.contiguous(
-        mx.concatenate((gate.scales[gpu_start:], up.scales[gpu_start:]), axis=0)
-    )
-    biases = mx.contiguous(
-        mx.concatenate((gate.biases[gpu_start:], up.biases[gpu_start:]), axis=0)
-    )
-    values = [weight, scales, biases]
+    weight, scales, biases, up_suffix = _gate_up_gpu_suffix(gate, up, gpu_start, config)
+    values = [weight, scales, biases, *(up_suffix or ())]
     if cpu_weight is not None:
         values.append(cpu_weight)
     mx.eval(*values)
@@ -888,6 +925,7 @@ def _prepare_pair_runtime_state(
         cpu_weight=cpu_weight,
         cpu_outputs=cpu_outputs,
         down_cpu=_prepare_cpu_linear(mlp.down_proj, config.cpu_down_fraction),
+        up_suffix=up_suffix,
     )
 
 
@@ -905,7 +943,6 @@ def _post_ane_linear(
     x: mx.array,
     variant: int,
     *,
-    q8_threshold_env: str,
     cpu_state: _CpuLinearState | None = None,
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
@@ -918,9 +955,9 @@ def _post_ane_linear(
     gain. Other quantizations retain the existing exact native route.
     """
     if cpu_state is not None:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
 
-        return fast.qwen35_cpu_fp16_affine_qmm_t(
+        return fast.cpu_fp16_affine_qmm_t(
             x,
             cpu_state.weight,
             cpu_state.gpu_weight,
@@ -933,11 +970,10 @@ def _post_ane_linear(
             cpu_shared_resource,
         )
 
-    from omlx.patches.qwen35_q4_mlp import _linear_qmm
+    from omlx.patches.qwen35_q4_mlp import _Q8_MIN_TOKENS, _linear_qmm
 
     if getattr(linear, "bits", None) == 8:
-        q8_min_tokens = int(os.environ.get(q8_threshold_env, "16384"))
-        if x.ndim >= 3 and int(x.shape[-2]) < q8_min_tokens:
+        if x.ndim >= 3 and int(x.shape[-2]) < _Q8_MIN_TOKENS:
             return linear(x)
     return _linear_qmm(linear, x, variant)
 
@@ -954,7 +990,6 @@ def _post_ane_down(
             linear,
             x,
             config.variant,
-            q8_threshold_env="OMLX_QWEN35_Q8_MLP_MIN_TOKENS",
             cpu_state=fallback,
             cpu_threads=config.cpu_threads,
             cpu_shared_resource=config.cpu_shared_resource,
@@ -966,10 +1001,10 @@ def _post_ane_down(
     ):
         raise RuntimeError("ANE down-projection state is incomplete")
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     if state.cpu_weight is not None:
-        return fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+        return fast.ane_dual_cpu_fp16_affine_qmm_t(
             x,
             state.cpu_weight,
             state.weight,
@@ -984,7 +1019,7 @@ def _post_ane_down(
             config.cpu_threads,
             config.cpu_shared_resource,
         )
-    return fast.qwen35_ane_dual_affine_qmm_t(
+    return fast.ane_dual_affine_qmm_t(
         x,
         state.weight,
         state.scales,
@@ -1075,9 +1110,9 @@ def _pack_affine_gdn_suffix(
 
 
 def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
-    if not _eligible_gdn(gdn) or not fast.has_symbol("qwen35_ane_affine_qmm_t"):
+    if not _eligible_gdn(gdn) or not fast.has_symbol("ane_affine_qmm_t"):
         return None
     qkv, z, b, a = _gdn_linears(gdn)
     cache = getattr(gdn, "_omlx_ane_gdn_cache", None)
@@ -1097,7 +1132,7 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
     if qkv_spec is None or z_spec is None:
         return None
     qkv_bits, qkv_group_size = qkv_spec
-    dual_ane = bool(config.dual_ane and fast.has_symbol("qwen35_ane_dual_affine_qmm_t"))
+    dual_ane = bool(config.dual_ane and fast.has_symbol("ane_dual_affine_qmm_t"))
     alignment = 128 if dual_ane else 64
     ane_outputs = _recurrent_safe_gdn_ane_outputs(
         z_outputs,
@@ -1208,12 +1243,12 @@ def _compile_gdn(gdn: Any, config: _AneGDNConfig) -> _CombinedGDNState | None:
             values.append(dense1)
         mx.eval(*values)
         model = (
-            fast.qwen35_ane_compile_linear(dense0, config.sequence_length, 1)
+            fast.ane_compile_linear(dense0, config.sequence_length, 1)
             if dual_ane
-            else fast.qwen35_ane_compile_linear(dense0, config.sequence_length)
+            else fast.ane_compile_linear(dense0, config.sequence_length)
         )
         model1 = (
-            fast.qwen35_ane_compile_linear(dense1, config.sequence_length, 2)
+            fast.ane_compile_linear(dense1, config.sequence_length, 2)
             if dense1 is not None
             else None
         )
@@ -1349,7 +1384,7 @@ def _prepare_gdn_for_bank(
         config.fraction,
         alignment,
     )
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     cpu_enabled = bool(
         config.cpu_fraction > 0
@@ -1457,7 +1492,7 @@ def _prepare_gdn_runtime_state(
     model1: Any,
 ) -> _CombinedGDNState | None:
     """Move the CPU/GPU QKV boundary without recompiling the ANE prefix."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     if not _eligible_gdn(gdn):
         return None
@@ -1564,13 +1599,13 @@ def _gdn_backend_exact(
     if state is None or state.scales.dtype != x.dtype:
         return None
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
         from omlx.patches.qwen35_q4_mlp import _post_ane_qmm_or_linear
 
         _raise_if_latched(state.model, state.model1)
         if state.cpu_weight is not None:
             if state.model1 is not None:
-                combined = fast.qwen35_ane_dual_cpu_fp16_affine_qmm_t(
+                combined = fast.ane_dual_cpu_fp16_affine_qmm_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1586,7 +1621,7 @@ def _gdn_backend_exact(
                     config.cpu_shared_resource,
                 )
             else:
-                combined = fast.qwen35_ane_cpu_fp16_affine_qmm_t(
+                combined = fast.ane_cpu_fp16_affine_qmm_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1601,7 +1636,7 @@ def _gdn_backend_exact(
                     config.cpu_shared_resource,
                 )
         elif state.model1 is not None:
-            combined = fast.qwen35_ane_dual_affine_qmm_t(
+            combined = fast.ane_dual_affine_qmm_t(
                 x,
                 state.weight,
                 state.scales,
@@ -1613,7 +1648,7 @@ def _gdn_backend_exact(
                 state.group_size,
             )
         else:
-            combined = fast.qwen35_ane_affine_qmm_t(
+            combined = fast.ane_affine_qmm_t(
                 x,
                 state.weight,
                 state.scales,
@@ -1738,13 +1773,13 @@ def _backend_exact(
     fused_down_state = getattr(mlp, "_omlx_ane_fused_down_state", None)
     if fused_down_state is not None:
         try:
-            from omlx.custom_kernels.qwen35_prefill import fast
+            from omlx.custom_kernels.quant_matmul import ane as fast
 
             _raise_if_latched(fused_down_state.model, fused_down_state.model1)
             if fused_down_state.cpu_gate_up_weight is not None:
                 if fused_down_state.cpu_down_weight is None:
                     raise RuntimeError("Incomplete fused CPU MLP state")
-                return fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t(
+                return fast.ane_dual_cpu_fp16_q4_swiglu_down_t(
                     x,
                     fused_down_state.cpu_gate_up_weight,
                     fused_down_state.cpu_down_weight,
@@ -1761,7 +1796,7 @@ def _backend_exact(
                     config.cpu_threads,
                     config.cpu_shared_resource,
                 )
-            return fast.qwen35_ane_dual_q4_swiglu_down_t(
+            return fast.ane_dual_q4_swiglu_down_t(
                 x,
                 fused_down_state.gate_up_weight,
                 fused_down_state.gate_up_scales,
@@ -1803,12 +1838,12 @@ def _backend_exact(
         return None
 
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
 
         _raise_if_latched(state.model, state.model1, state.down_ane)
         if state.cpu_weight is not None:
             if state.model1 is not None and state.bits == 4:
-                activation = fast.qwen35_ane_dual_cpu_fp16_q4_swiglu_t(
+                activation = fast.ane_dual_cpu_fp16_q4_swiglu_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1820,9 +1855,10 @@ def _backend_exact(
                     state.group_size,
                     config.cpu_threads,
                     config.cpu_shared_resource,
+                    **_split_suffix_kwargs(state),
                 )
             elif state.model1 is not None:
-                activation = fast.qwen35_ane_dual_cpu_fp16_swiglu_t(
+                activation = fast.ane_dual_cpu_fp16_swiglu_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1835,9 +1871,10 @@ def _backend_exact(
                     state.group_size,
                     config.cpu_threads,
                     config.cpu_shared_resource,
+                    **_split_suffix_kwargs(state),
                 )
             elif state.bits == 4:
-                activation = fast.qwen35_ane_cpu_fp16_q4_swiglu_t(
+                activation = fast.ane_cpu_fp16_q4_swiglu_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1848,9 +1885,10 @@ def _backend_exact(
                     state.group_size,
                     config.cpu_threads,
                     config.cpu_shared_resource,
+                    **_split_suffix_kwargs(state),
                 )
             else:
-                activation = fast.qwen35_ane_cpu_fp16_swiglu_t(
+                activation = fast.ane_cpu_fp16_swiglu_t(
                     x,
                     state.cpu_weight,
                     state.weight,
@@ -1862,6 +1900,7 @@ def _backend_exact(
                     state.group_size,
                     config.cpu_threads,
                     config.cpu_shared_resource,
+                    **_split_suffix_kwargs(state),
                 )
             return _post_ane_down(
                 mlp.down_proj,
@@ -1873,7 +1912,7 @@ def _backend_exact(
 
         if state.model1 is not None:
             if state.bits == 4:
-                activation = fast.qwen35_ane_dual_q4_swiglu_t(
+                activation = fast.ane_dual_q4_swiglu_t(
                     x,
                     state.weight,
                     state.scales,
@@ -1882,11 +1921,12 @@ def _backend_exact(
                     state.model1,
                     config.variant,
                     state.group_size,
+                    **_split_suffix_kwargs(state),
                 )
             else:
                 if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=True)):
                     return None
-                activation = fast.qwen35_ane_dual_affine_swiglu_t(
+                activation = fast.ane_dual_affine_swiglu_t(
                     x,
                     state.weight,
                     state.scales,
@@ -1896,6 +1936,7 @@ def _backend_exact(
                     state.bits,
                     config.variant,
                     state.group_size,
+                    **_split_suffix_kwargs(state),
                 )
             return _post_ane_down(
                 mlp.down_proj,
@@ -1908,7 +1949,7 @@ def _backend_exact(
         if state.bits != 4:
             if not fast.has_symbol(_fused_swiglu_symbol(state.bits, dual=False)):
                 return None
-            activation = fast.qwen35_ane_affine_swiglu_t(
+            activation = fast.ane_affine_swiglu_t(
                 x,
                 state.weight,
                 state.scales,
@@ -1917,6 +1958,7 @@ def _backend_exact(
                 state.bits,
                 config.variant,
                 state.group_size,
+                **_split_suffix_kwargs(state),
             )
             return _post_ane_down(
                 mlp.down_proj,
@@ -1926,8 +1968,8 @@ def _backend_exact(
                 state.down_cpu,
             )
 
-        if fast.has_symbol("qwen35_ane_q4_swiglu_t"):
-            activation = fast.qwen35_ane_q4_swiglu_t(
+        if fast.has_symbol("ane_q4_swiglu_t"):
+            activation = fast.ane_q4_swiglu_t(
                 x,
                 state.weight,
                 state.scales,
@@ -1935,6 +1977,7 @@ def _backend_exact(
                 state.model,
                 config.variant,
                 state.group_size,
+                **_split_suffix_kwargs(state),
             )
             return _post_ane_down(
                 mlp.down_proj,
@@ -1944,7 +1987,7 @@ def _backend_exact(
                 state.down_cpu,
             )
 
-        combined = fast.qwen35_ane_q4_affine_qmm_t(
+        combined = fast.ane_q4_affine_qmm_t(
             x,
             state.weight,
             state.scales,
@@ -2074,45 +2117,19 @@ def _wrap_class(cls: type) -> None:
 
 
 def _install_dispatch() -> bool:
-    global _VLM_GDN_HOOK_INSTALLED, _VLM_HOOK_INSTALLED
+    from omlx.patches.qwen35_q4_mlp import (
+        apply_qwen35_vlm_gdn_projection_hook,
+        register_qwen35_lm_gdn_prefill_backend,
+    )
+
+    register_qwen35_lm_gdn_prefill_backend(_gdn_backend)
     installed = False
     try:
         vlm = importlib.import_module("mlx_vlm.models.qwen3_5.language")
-        register = getattr(vlm, "register_qwen3_5_mlp_prefill_backend", None)
-        register_gdn = getattr(vlm, "register_qwen3_5_gdn_prefill_backend", None)
-        cls = getattr(vlm, "Qwen3_5MLP", None)
-        if cls is not None and getattr(cls, "_omlx_q4_mlp_patched", False):
-            # The exact q4 MLP patch replaces __call__ and therefore bypasses
-            # mlx-vlm's inner registration hook. Wrap that dispatcher so ANE
-            # gets first refusal and the q4 implementation remains fallback.
-            _wrap_class(cls)
-            installed = True
-        elif callable(register):
-            if not _VLM_HOOK_INSTALLED:
-                register(_backend)
-                _VLM_HOOK_INSTALLED = True
-            installed = True
-        else:
-            if cls is not None:
-                _wrap_class(cls)
-                installed = True
-        if callable(register_gdn) and not _VLM_GDN_HOOK_INSTALLED:
-            register_gdn(_gdn_backend)
-            _VLM_GDN_HOOK_INSTALLED = True
-        elif not _VLM_GDN_HOOK_INSTALLED:
-            target_linears = getattr(vlm, "_target_verify_linears", None)
-            if callable(target_linears):
-
-                def ane_target_linears(linears, x, target_verify=False):
-                    gdn = _GDN_MODULES.get(id(linears[0])) if linears else None
-                    if gdn is not None:
-                        output = _gdn_backend(gdn, x, target_verify)
-                        if output is not None:
-                            return output
-                    return target_linears(linears, x, target_verify)
-
-                vlm._target_verify_linears = ane_target_linears
-                _VLM_GDN_HOOK_INSTALLED = True
+        if vlm.Qwen3_5MLP is not None:
+            _wrap_class(vlm.Qwen3_5MLP)
+        apply_qwen35_vlm_gdn_projection_hook()
+        installed = True
     except Exception:
         logger.debug("mlx-vlm Qwen ANE dispatch hook unavailable", exc_info=True)
 
@@ -2121,21 +2138,22 @@ def _install_dispatch() -> bool:
         cls = getattr(lm, "MLP", None)
         if cls is not None:
             _wrap_class(cls)
-            installed = True
-        from omlx.patches.qwen35_q4_mlp import (
-            register_qwen35_lm_gdn_prefill_backend,
-        )
-
-        # The mlx-lm GDN implementation does not use mlx-vlm's
-        # _target_verify_linears helper.  Its q4 compatibility wrapper owns
-        # the projection call site, so register there on every install.  The
-        # assignment is deliberately idempotent and avoids stale process-wide
-        # hook state across VLM -> LLM fallback and model reloads.
-        register_qwen35_lm_gdn_prefill_backend(_gdn_backend)
         installed = True
     except Exception:
         logger.debug("mlx-lm Qwen ANE dispatch hook unavailable", exc_info=True)
     return installed
+
+
+def install_qwen35_ane_prefill_dispatch() -> bool:
+    """Install the class hooks that route prefill to the compiled slices."""
+    if _install_dispatch():
+        return True
+    logger.warning(
+        "Qwen ANE prefill: dispatch hook could not be installed "
+        "(mlx-vlm/mlx-lm Qwen backend not registered); ANE prefill inactive, "
+        "running prefill on GPU"
+    )
+    return False
 
 
 def _bank_chunk_spans(
@@ -2177,19 +2195,10 @@ def _bank_split_ladder(
     returns ``(models0, models1)``. Returns ``(models0, models1,
     resident_program_count)``, or ``None`` when every attempt failed and the
     caller should use the per-layer fallback.
-    ``OMLX_QWEN35_ANE_BANK_MAX_BYTES`` forces an initial per-bank byte cap.
-    The cap counts the packed source weights handed to the bank compiler,
-    which run about four times the compiled INT8 program size.
+    The per-bank byte cap counts the packed source weights handed to the bank
+    compiler, which run about four times the compiled INT8 program size.
     """
     cap = 0
-    raw = os.environ.get("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "").strip()
-    if raw:
-        try:
-            cap = max(int(raw), 0)
-        except ValueError:
-            logger.warning(
-                "Ignoring non-integer OMLX_QWEN35_ANE_BANK_MAX_BYTES=%r", raw
-            )
     total_bytes = sum(source_bytes)
     largest_bytes = max(source_bytes, default=0)
 
@@ -2282,15 +2291,15 @@ def _compile_dual_banks(
     enable path streams slices through the incremental builder instead
     (issue #2781). See :func:`_bank_split_ladder` for the retry contract.
     """
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     return _bank_split_ladder(
         [int(weight.nbytes) for weight in weights0],
         lambda start, stop: (
-            fast.qwen35_ane_compile_linear_bank(
+            fast.ane_compile_linear_bank(
                 weights0[start:stop], sequence_length, 1
             ),
-            fast.qwen35_ane_compile_linear_bank(
+            fast.ane_compile_linear_bank(
                 weights1[start:stop], sequence_length, 2
             ),
         ),
@@ -2302,17 +2311,9 @@ def _compile_single_banks(
     sequence_length: int,
 ) -> tuple[list[Any], int] | None:
     """Compile instance-0 procedure banks with the same split retry ladder."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     cap = 0
-    raw = os.environ.get("OMLX_QWEN35_ANE_BANK_MAX_BYTES", "").strip()
-    if raw:
-        try:
-            cap = max(int(raw), 0)
-        except ValueError:
-            logger.warning(
-                "Ignoring non-integer OMLX_QWEN35_ANE_BANK_MAX_BYTES=%r", raw
-            )
     total_bytes = sum(weight.nbytes for weight in weights)
     largest_bytes = max((weight.nbytes for weight in weights), default=0)
 
@@ -2337,7 +2338,7 @@ def _compile_single_banks(
             models: list[Any] = []
             for start, stop in spans:
                 models.extend(
-                    fast.qwen35_ane_compile_linear_bank(
+                    fast.ane_compile_linear_bank(
                         weights[start:stop], sequence_length, 0
                     )
                 )
@@ -2469,19 +2470,19 @@ def _enable_dual_procedure_banks(
     gdn_max_layers: int,
     cpu_gdn_fraction: float = 0.0,
 ) -> tuple[int, int, int, int] | None:
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     if not (
         config.dual_ane
-        and fast.has_symbol("qwen35_ane_compile_linear_bank")
-        and fast.has_symbol("qwen35_ane_dual_affine_qmm_t")
+        and fast.has_symbol("ane_compile_linear_bank")
+        and fast.has_symbol("ane_dual_affine_qmm_t")
     ):
         return None
     candidate_bits = {
         int(getattr(getattr(module, "gate_proj", None), "bits", 0))
         for module in mlp_candidates
     }
-    if 4 in candidate_bits and not fast.has_symbol("qwen35_ane_dual_q4_swiglu_t"):
+    if 4 in candidate_bits and not fast.has_symbol("ane_dual_q4_swiglu_t"):
         return None
     if any(
         bits != 4
@@ -2513,10 +2514,10 @@ def _enable_dual_procedure_banks(
         builder0 = builder1 = None
         if fast.has_symbol("AneLinearBankBuilder"):
             try:
-                builder0 = fast.qwen35_ane_linear_bank_builder(
+                builder0 = fast.ane_linear_bank_builder(
                     config.sequence_length
                 )
-                builder1 = fast.qwen35_ane_linear_bank_builder(
+                builder1 = fast.ane_linear_bank_builder(
                     config.sequence_length
                 )
             except Exception:
@@ -2575,41 +2576,18 @@ def _enable_dual_procedure_banks(
                     _stage(dense0, dense1)
                     prepared_gdns.append((module, state))
 
-        try:
-            down_layer_stride = max(
-                1,
-                int(os.environ.get("OMLX_QWEN35_ANE_DOWN_LAYER_STRIDE", "1")),
-            )
-        except ValueError:
-            down_layer_stride = 1
         down_entries = [
             (index, state.down_ane)
             for index, (_, state) in enumerate(prepared_mlps)
-            if state.down_ane is not None and index % down_layer_stride == 0
+            if state.down_ane is not None
         ]
-        combine_down = bool(
-            down_entries
-            and os.environ.get(
-                "OMLX_QWEN35_ANE_DOWN_COMBINED_BANK", ""
-            ).strip().lower()
-            in ("1", "true", "on")
-        )
         procedure_entries: list[tuple[str, int]] = [
             *(("mlp", index) for index in range(len(prepared_mlps))),
             *(("gdn", index) for index in range(len(prepared_gdns))),
         ]
-        if combine_down:
-            for index, down_state in down_entries:
-                _stage(down_state.compile_weight0, down_state.compile_weight1)
-                procedure_entries.append(("down", index))
-        separate_down_entries = [] if combine_down else down_entries
-        down_weights0 = [
-            state.compile_weight0 for _, state in separate_down_entries
-        ]
-        down_weights1 = [
-            state.compile_weight1 for _, state in separate_down_entries
-        ]
-        procedure_count = len(procedure_entries) + len(separate_down_entries)
+        down_weights0 = [state.compile_weight0 for _, state in down_entries]
+        down_weights1 = [state.compile_weight1 for _, state in down_entries]
+        procedure_count = len(procedure_entries) + len(down_entries)
         if not procedure_count:
             return (0, 0, 0, 0)
         if procedure_count > 256:
@@ -2639,7 +2617,7 @@ def _enable_dual_procedure_banks(
         models0, models1, resident_program_count = banked_models
         down_models0: list[Any] = []
         down_models1: list[Any] = []
-        if separate_down_entries:
+        if down_entries:
             down_banks = _compile_dual_banks(
                 down_weights0,
                 down_weights1,
@@ -2651,7 +2629,6 @@ def _enable_dual_procedure_banks(
                     "continuing with the established gate/GDN bank"
                 )
                 down_entries = []
-                separate_down_entries = []
             else:
                 down_models0, down_models1, down_programs = down_banks
                 resident_program_count += down_programs
@@ -2682,21 +2659,6 @@ def _enable_dual_procedure_banks(
                     model=models0[procedure],
                     model1=models1[procedure],
                 )
-            elif kind == "down":
-                state = assigned_mlp_states[index]
-                down_state = state.down_ane
-                if down_state is None:
-                    raise RuntimeError("Missing prepared ANE down state")
-                assigned_mlp_states[index] = replace(
-                    state,
-                    down_ane=replace(
-                        down_state,
-                        model=models0[procedure],
-                        model1=models1[procedure],
-                        compile_weight0=None,
-                        compile_weight1=None,
-                    ),
-                )
             else:
                 assigned_gdn_states[index] = replace(
                     assigned_gdn_states[index],
@@ -2704,7 +2666,7 @@ def _enable_dual_procedure_banks(
                     model1=models1[procedure],
                 )
 
-        for procedure, (index, down_state) in enumerate(separate_down_entries):
+        for procedure, (index, down_state) in enumerate(down_entries):
             state = assigned_mlp_states[index]
             down_state = replace(
                 down_state,
@@ -2771,7 +2733,7 @@ def _enable_dual_procedure_banks(
                     "GDN" if kind == "gdn" else "MLP",
                     exc_info=True,
                 )
-        for procedure, (index, _) in enumerate(separate_down_entries):
+        for procedure, (index, _) in enumerate(down_entries):
             module = prepared_mlps[index][0]
             try:
                 for warm_model in (
@@ -2833,8 +2795,10 @@ def _enable_dual_procedure_banks(
     # are done. Synchronize first so no in-flight command buffer still
     # references a cached allocation (the issue #300 recipe); this runs on
     # the MLX executor thread like the engine pool's own calls (issue #2781).
+    # The native INT8 chunks are freed malloc blocks that stay resident.
     mx.synchronize()
     mx.clear_cache()
+    proc_memory.release_free_malloc_memory()
 
     return (
         len(prepared_mlps),
@@ -2852,7 +2816,7 @@ def _enable_fused_down_banks(
     """Compile contiguous 32-layer dual-ANE fused SwiGLU/down banks."""
     if not config.fused_down or not config.dual_ane or not candidates:
         return None
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     count = 0
     resident_programs = 0
@@ -2863,12 +2827,12 @@ def _enable_fused_down_banks(
         # the next layer dequantizes (the issue #2781 recipe; the one-shot
         # path below kept a whole 32-layer chunk of fp32 alive at once).
         builder0 = builder1 = None
-        if hasattr(fast, "qwen35_ane_fused_bank_builder"):
+        if hasattr(fast, "ane_fused_bank_builder"):
             try:
-                builder0 = fast.qwen35_ane_fused_bank_builder(
+                builder0 = fast.ane_fused_bank_builder(
                     config.sequence_length
                 )
-                builder1 = fast.qwen35_ane_fused_bank_builder(
+                builder1 = fast.ane_fused_bank_builder(
                     config.sequence_length
                 )
             except Exception:
@@ -2894,14 +2858,14 @@ def _enable_fused_down_banks(
             models1 = builder1.compile(2, 0, builder1.size)
         else:
             mx.eval(*[w for weights in legacy_weights for w in weights])
-            models0 = fast.qwen35_ane_compile_swiglu_down_bank(
+            models0 = fast.ane_compile_swiglu_down_bank(
                 [weights[0] for weights in legacy_weights],
                 [weights[1] for weights in legacy_weights],
                 [weights[2] for weights in legacy_weights],
                 config.sequence_length,
                 1,
             )
-            models1 = fast.qwen35_ane_compile_swiglu_down_bank(
+            models1 = fast.ane_compile_swiglu_down_bank(
                 [weights[3] for weights in legacy_weights],
                 [weights[4] for weights in legacy_weights],
                 [weights[5] for weights in legacy_weights],
@@ -3127,14 +3091,27 @@ def enable_qwen35_ane_prefill(
     cpu_threads: int = 8,
     cpu_shared_resource: bool = True,
     tail_padding_min_tokens: int = 0,
+    install_dispatch: bool = True,
+    packed_projections: bool = False,
 ) -> int:
     """Enable the private ANE backend on eligible MLPs in ``model``.
 
     Returns the number of marked dense Qwen MLP modules. A return value of zero
     is a safe no-op for other model families and unsupported runtimes.
+
+    With ``install_dispatch=False`` only the slices are compiled. The caller
+    must then call ``install_qwen35_ane_prefill_dispatch`` before serving.
+    ``packed_projections`` tells it that ``qwen35_packed_linear.pack_model``
+    replaces the dense projections after this call.
     """
-    if sequence_length < 1024 or sequence_length % 64:
-        raise ValueError("ANE prefill sequence_length must be a multiple of 64 >= 1024")
+    if (
+        sequence_length < _ANE_MIN_SEQUENCE_LENGTH
+        or sequence_length % _ANE_SEQUENCE_LENGTH_ALIGNMENT
+    ):
+        raise ValueError(
+            "ANE prefill sequence_length must be a multiple of "
+            f"{_ANE_SEQUENCE_LENGTH_ALIGNMENT} >= {_ANE_MIN_SEQUENCE_LENGTH}"
+        )
     if not 0.05 <= fraction <= 0.90:
         raise ValueError("ANE prefill fraction must be between 0.05 and 0.90")
     if max_layers < 1:
@@ -3165,25 +3142,16 @@ def enable_qwen35_ane_prefill(
             "ANE tail padding threshold must be zero or less than sequence_length"
         )
 
-    env = os.environ.get("OMLX_QWEN35_ANE_PREFILL", "").strip().lower()
-    if env in ("0", "false", "off"):
-        logger.info("Qwen ANE prefill disabled by OMLX_QWEN35_ANE_PREFILL")
-        return 0
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
 
-        if not fast.qwen35_ane_available():
+        if not fast.ane_available():
             logger.warning("Private ANE runtime unavailable; Qwen ANE prefill skipped")
             return 0
     except Exception:
         logger.warning("ANE native extension unavailable; Qwen ANE prefill skipped")
         return 0
-    if not _install_dispatch():
-        logger.warning(
-            "Qwen ANE prefill: dispatch hook could not be installed "
-            "(mlx-vlm/mlx-lm Qwen backend not registered); ANE prefill inactive, "
-            "running prefill on GPU"
-        )
+    if install_dispatch and not install_qwen35_ane_prefill_dispatch():
         return 0
 
     config = _AnePrefillConfig(
@@ -3220,6 +3188,14 @@ def enable_qwen35_ane_prefill(
         if len(candidates) >= max_layers:
             break
 
+    # Row-slice suffixes keep the checkpoint gate/up alive, so keep a copy when
+    # packed projections replace those layers after this compile.
+    if candidates and fast.has_symbol("ane_split_gate_up_suffix"):
+        packed = packed_projections and any(
+            qwen35_packed_linear.eligible(module.gate_proj) for module in candidates
+        )
+        config = replace(config, gpu_suffix_views=not packed)
+
     if not candidates:
         logger.warning(
             "Qwen ANE prefill requested but no eligible MLP layers found "
@@ -3242,7 +3218,7 @@ def enable_qwen35_ane_prefill(
             )
             cpu_gdn_fraction = 0.0
         elif cpu_shared_resource:
-            if fast.qwen35_cpu_shared_resource_available():
+            if fast.cpu_shared_resource_available():
                 logger.info(
                     "Qwen ANE CPU sharing using performance-aware scheduling "
                     "with %d workers",
@@ -3309,7 +3285,7 @@ def enable_qwen35_ane_prefill(
                 sequence_length,
                 (
                     "NAX"
-                    if fast.qwen35_ane_hybrid_nax_enabled()
+                    if fast.ane_hybrid_nax_enabled()
                     else "classic Metal"
                 ),
             )
@@ -3339,6 +3315,7 @@ def enable_qwen35_ane_prefill(
             # dual-bank epilogue that normally does this (issue #2781).
             mx.synchronize()
             mx.clear_cache()
+            proc_memory.release_free_malloc_memory()
             return count
 
     banked = _enable_dual_procedure_banks(
@@ -3382,6 +3359,7 @@ def enable_qwen35_ane_prefill(
     dual_count = 0
     resident_programs = 0
     mlp_budget_exhausted = False
+    compiled_models: list[Any] = []
     for module in candidates:
         requested_programs = 2 if dual_ane else 1
         if resident_programs + requested_programs > _ANE_RESIDENT_PROGRAM_LIMIT:
@@ -3400,6 +3378,9 @@ def enable_qwen35_ane_prefill(
             continue
         module._omlx_ane_prefill_config = config
         module._omlx_ane_prefill_state = state
+        compiled_models.extend(
+            (getattr(state, "model", None), getattr(state, "model1", None))
+        )
         actual_programs = 2 if getattr(state, "model1", None) is not None else 1
         resident_programs += actual_programs
         dual_count += int(actual_programs == 2)
@@ -3441,8 +3422,17 @@ def enable_qwen35_ane_prefill(
             module._omlx_ane_gdn_config = gdn_config
             module._omlx_ane_gdn_state = state
             _register_gdn_module(module)
+            compiled_models.extend(
+                (getattr(state, "model", None), getattr(state, "model1", None))
+            )
             resident_programs += 2 if getattr(state, "model1", None) is not None else 1
             gdn_count += 1
+    # Per-layer programs own their I/O surfaces. Dirty them at load like the
+    # banks so phys_footprint counts them before admission prices a prefill.
+    _warm_ane_models([m for m in compiled_models if m is not None])
+    mx.synchronize()
+    mx.clear_cache()
+    proc_memory.release_free_malloc_memory()
     model._omlx_ane_mlp_prefill_count = count
     model._omlx_ane_gdn_prefill_count = gdn_count
     model._omlx_ane_dual_prefill_count = dual_count
@@ -3495,13 +3485,12 @@ def enable_qwen35_ane_prefill(
 
 
 def ane_prefill_transient_bytes(model: Any) -> int:
-    """Bytes of fp16 ANE I/O surfaces held by ``model``'s compiled slices.
+    """Bytes of ANE program weights for ``model``'s compiled slices.
 
-    Every compiled procedure owns a fixed-shape input and output IOSurface of
-    ``dim * sequence_length * 2`` bytes, allocated at compile time and dirtied
-    at first use, which is exactly the first-request spike of issue #2841.
-    Reads the dims off the live native models, so packing, dual splits, and
-    partial banks are all accounted exactly. 0 when no ANE slice is attached.
+    The ANE driver wires these outside phys_footprint while a prefill runs
+    and for several seconds after (issue #2841). The fixed-shape I/O surfaces
+    are resident from compile time, so phys_footprint already counts them.
+    0 when no ANE slice is attached.
     """
     total = 0
     for module in model.modules() if hasattr(model, "modules") else ():
@@ -3520,12 +3509,17 @@ def ane_prefill_transient_bytes(model: Any) -> int:
                 states.append(down_ane)
         for state in states:
             for ane_model in (state.model, getattr(state, "model1", None)):
-                input_dim = getattr(ane_model, "input_dim", 0)
-                output_dim = getattr(ane_model, "output_dim", 0)
-                seq = getattr(ane_model, "sequence_length", 0)
+                if ane_model is None:
+                    continue
                 try:
-                    total += (int(input_dim) + int(output_dim)) * int(seq) * 2
-                except (TypeError, ValueError):
+                    weight_bytes = getattr(ane_model, "weight_bytes", None)
+                    if weight_bytes is None:
+                        # Extensions without the counter: INT8 rows.
+                        weight_bytes = int(ane_model.input_dim) * int(
+                            ane_model.output_dim
+                        )
+                    total += int(weight_bytes)
+                except (AttributeError, TypeError, ValueError):
                     continue
     return total
 
@@ -3556,14 +3550,14 @@ def qwen35_ane_prefill_status(model: Any) -> dict:
 def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
     """Drop every compiled ANE prefill slice on ``model``; GPU-only from here.
 
-    The compiled procedure banks keep the packed weight blobs they were built
-    from mapped for the lifetime of the native programs (roughly 13 GB for a
-    27B at mlp 0.35 / gdn 0.45) — exactly the resident memory a long-context
-    prefill needs back once the KV cache has grown into the guard's sizing
-    target. Latches every sliced module through the existing per-module
+    The native programs own the ANE I/O surfaces and the program weights the
+    ANE driver wires during every prefill, memory a long-context prefill
+    needs back once the KV cache has grown into the guard's sizing target.
+    Latches every sliced module through the existing per-module
     failure flags first (so the dispatch sites fall back to stock GPU compute
-    and never lazily recompile), then drops the state references; the native
-    models free their programs and mapped blobs when the last reference dies.
+    and never lazily recompile), then drops the state references and clears the
+    per-module state caches that hold the same objects; the native models free
+    their programs and mapped blobs when the last reference dies.
     Idempotent, and scoped to this engine instance: the next load of the
     model rebuilds the banks from its settings.
 
@@ -3587,6 +3581,12 @@ def release_qwen35_ane_prefill(model: Any) -> tuple[int, int]:
             setattr(module, failed_attr, True)
             setattr(module, state_attr, None)
             modules_released += 1
+        # Clear cached references too, including states no longer attached.
+        # Loading has finished and the engine step loop is paused for release.
+        for cache_attr in ("_omlx_ane_prefill_cache", "_omlx_ane_gdn_cache"):
+            cache = getattr(module, cache_attr, None)
+            if cache:
+                cache.clear()
     if modules_released:
         # Zero (not delete) the status counters and set the shed marker:
         # attempted=True/configured=False alone is indistinguishable from a

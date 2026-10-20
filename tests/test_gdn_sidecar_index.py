@@ -311,13 +311,25 @@ def test_sidecar_deletion_rejects_swapped_root_symlink(tmp_path, operation):
         manager.close()
 
 
-def test_sidecars_are_indexed_from_stat_and_lru_survives_restart(tmp_path):
+@pytest.mark.parametrize("auto_size", [False, True])
+def test_sidecars_are_indexed_from_stat_and_lru_survives_restart(
+    tmp_path, monkeypatch, auto_size
+):
+    import shutil
+
     cache_dir = tmp_path / "cache"
+
+    def disk_usage(path):
+        cached = sum(p.stat().st_size for p in cache_dir.rglob("*.safetensors"))
+        return shutil._ntuple_diskusage(1000, 964 + cached, 36 - cached)
+
+    monkeypatch.setattr(shutil, "disk_usage", disk_usage)
     signature = "signature-v1"
     source_a = b"a"
     source_b = b"b"
-    manager = _make_manager(cache_dir)
+    manager = _make_manager(cache_dir, auto_size=auto_size)
     try:
+        initial_limit = manager.max_size
         paths = []
         for source_hash, content in ((source_a, b"a" * 7), (source_b, b"b" * 11)):
             staged = tmp_path / f"{source_hash.decode()}.stage"
@@ -340,8 +352,9 @@ def test_sidecars_are_indexed_from_stat_and_lru_survives_restart(tmp_path):
     finally:
         manager.close()
 
-    restarted = _make_manager(cache_dir)
+    restarted = _make_manager(cache_dir, auto_size=auto_size)
     try:
+        assert restarted.max_size == initial_limit
         assert restarted._gdn_sidecar_index.count == 2
         assert restarted._gdn_sidecar_index.total_size == 18
         oldest = restarted._gdn_sidecar_index.get_lru_entries(1)[0]
@@ -354,9 +367,29 @@ def test_sidecars_are_indexed_from_stat_and_lru_survives_restart(tmp_path):
         restarted.close()
 
 
-def test_sidecar_and_main_block_share_global_lru_budget(tmp_path):
+    if auto_size:
+        monkeypatch.setattr(
+            shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(1000, 996, 4)
+        )
+        reduced = _make_manager(cache_dir, auto_size=True)
+        try:
+            assert reduced.max_size == 11
+            assert reduced._tracked_ssd_size() == 7
+            assert not paths[1].exists()
+        finally:
+            reduced.close()
+
+@pytest.mark.parametrize("auto_size", [False, True])
+def test_sidecar_and_main_block_share_global_lru_budget(
+    tmp_path, monkeypatch, auto_size
+):
+    import shutil
+
     cache_dir = tmp_path / "cache"
-    manager = _make_manager(cache_dir, max_size=12)
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda path: shutil._ntuple_diskusage(1000, 976, 24)
+    )
+    manager = _make_manager(cache_dir, max_size=12, auto_size=auto_size)
     signature = "signature-v1"
     first_source = b"first"
     second_source = b"second"

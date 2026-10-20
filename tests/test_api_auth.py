@@ -1,11 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for API key authentication."""
 
+import json
+import os
+import subprocess
+import sys
+import textwrap
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
 
+from omlx import server
+from omlx.admin import auth
+from omlx.admin import routes as admin_routes
+from omlx.api.audio_routes import _verify_ws_api_key
+from omlx.settings import GlobalSettings, SubKeyEntry
+
 # Note: These tests need a mock server setup since the actual server requires models
+
+
+_LOOPBACK_CLIENT = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 
 def _mock_request(headers=None):
@@ -272,8 +288,10 @@ class TestSkipApiKeyVerification:
         import asyncio
 
         original_key = _server_state.api_key
+        original_host = _server_state.bind_host
         original_gs = _server_state.global_settings
         _server_state.api_key = "test-key"
+        _server_state.bind_host = "127.0.0.1"
         _server_state.global_settings = self._make_global_settings(
             host="127.0.0.1", skip=True
         )
@@ -283,25 +301,90 @@ class TestSkipApiKeyVerification:
             assert result is True
         finally:
             _server_state.api_key = original_key
+            _server_state.bind_host = original_host
             _server_state.global_settings = original_gs
 
-    def test_skip_verification_on_any_host(self):
-        """Skip verification when enabled regardless of host."""
-        from omlx.server import verify_api_key, _server_state
+    def test_skip_verification_is_ignored_on_network_host(self):
+        """The no-auth switch must not bypass API auth on a network bind."""
         import asyncio
 
+        from fastapi import HTTPException
+
+        from omlx.server import _server_state, verify_api_key
+
         original_key = _server_state.api_key
+        original_host = _server_state.bind_host
         original_gs = _server_state.global_settings
         _server_state.api_key = "test-key"
+        _server_state.bind_host = "0.0.0.0"
         _server_state.global_settings = self._make_global_settings(
             host="0.0.0.0", skip=True
         )
 
         try:
-            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
-            assert result is True
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
         finally:
             _server_state.api_key = original_key
+            _server_state.bind_host = original_host
+            _server_state.global_settings = original_gs
+
+    def test_network_host_without_configured_key_requires_auth(self):
+        """A missing key cannot turn a network-facing API into no-auth mode."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.server import _server_state, verify_api_key
+
+        original_key = _server_state.api_key
+        original_host = _server_state.bind_host
+        original_gs = _server_state.global_settings
+        _server_state.api_key = None
+        _server_state.bind_host = "0.0.0.0"
+        _server_state.global_settings = self._make_global_settings(
+            host="0.0.0.0", skip=False
+        )
+
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+            _server_state.bind_host = original_host
+            _server_state.global_settings = original_gs
+
+    def test_saved_loopback_host_does_not_change_live_network_auth(self):
+        """A pending host change cannot disable auth before restart."""
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from omlx.server import _server_state, verify_api_key
+
+        original_key = _server_state.api_key
+        original_host = _server_state.bind_host
+        original_gs = _server_state.global_settings
+        settings = self._make_global_settings(host="127.0.0.1", skip=True)
+        _server_state.api_key = "test-key"
+        _server_state.bind_host = "0.0.0.0"
+        _server_state.global_settings = settings
+
+        try:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
+        finally:
+            _server_state.api_key = original_key
+            _server_state.bind_host = original_host
             _server_state.global_settings = original_gs
 
     def test_skip_verification_disabled_by_default(self):
@@ -340,13 +423,9 @@ class TestAdminAuth:
     def test_verify_session_token_expired(self):
         """Test expired session token verification."""
         from omlx.admin.auth import create_session_token, verify_session_token
-        import time
 
         token = create_session_token()
-        # Wait a moment and verify with very short max_age
-        time.sleep(0.1)
-        # With max_age=0, token should be expired after any delay
-        # Note: itsdangerous rounds to nearest second, so we use a small delay
+        # A negative max_age is expired immediately and does not need a delay.
         assert verify_session_token(token, max_age=-1) is False
 
     def test_verify_api_key_constant_time(self):
@@ -542,3 +621,309 @@ class TestRejectedKeyFingerprint:
             assert fingerprint_key(bad_key) in rejection_logs
         finally:
             _server_state.api_key = original_key
+
+
+class TestUnauthenticatedInference:
+    @pytest.fixture
+    def configured_server(self, monkeypatch, tmp_path):
+        from omlx import server
+        from omlx.admin import auth
+        from omlx.settings import GlobalSettings
+
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "management-key"
+        settings.auth.allow_unauthenticated_inference = True
+        monkeypatch.setattr(server._server_state, "global_settings", settings)
+        monkeypatch.setattr(server._server_state, "api_key", "management-key")
+        monkeypatch.setattr(server._server_state, "bind_host", "0.0.0.0")
+        monkeypatch.setattr(auth, "_get_global_settings", lambda: settings)
+        return server, settings
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/embeddings",
+            "/v1/rerank",
+            "/v1/systemone",
+            "/v1/decisions",
+            "/v1/responses",
+            "/v1/audio/speech",
+            "/tokenize",
+            "/v1/tokenize",
+            "/detokenize",
+            "/v1/detokenize",
+        ],
+    )
+    def test_http_inference_auth_gate(self, configured_server, path):
+        server, settings = configured_server
+        client = TestClient(server.app)
+        settings.auth.allow_unauthenticated_inference = False
+        assert client.post(path, json={}).status_code == 401
+        response = client.post(
+            path, json={}, headers={"Authorization": "Bearer management-key"}
+        )
+        assert response.status_code == 422
+        settings.auth.allow_unauthenticated_inference = True
+        # An empty payload reaches request validation only after auth succeeds.
+        assert client.post(path, json={}).status_code == 422
+
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("GET", "/api/status"),
+            ("GET", "/v1/models/status"),
+            ("POST", "/v1/models/example/load"),
+            ("POST", "/v1/models/example/unload"),
+            ("GET", "/admin/api/global-settings"),
+            ("POST", "/admin/api/server/restart"),
+        ],
+    )
+    def test_management_routes_still_reject_anonymous_requests(
+        self, configured_server, method, path
+    ):
+        server, _ = configured_server
+        response = TestClient(server.app).request(method, path)
+        assert response.status_code == 401
+
+    def test_admin_api_accepts_the_main_key_as_bearer(
+        self, configured_server, monkeypatch
+    ):
+        from omlx.admin import routes as admin_routes
+
+        server, settings = configured_server
+        # Other suites can leave a stale settings getter on the routes module.
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        response = TestClient(server.app).get(
+            "/admin/api/global-settings",
+            headers={"Authorization": "Bearer management-key"},
+        )
+        assert response.status_code == 200
+
+    def test_admin_settings_toggle_applies_without_restart(
+        self, configured_server, monkeypatch, tmp_path
+    ):
+        from omlx.admin import routes as admin_routes
+
+        server, settings = configured_server
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        settings.auth.allow_unauthenticated_inference = False
+        client = TestClient(server.app)
+        admin = {"Authorization": "Bearer management-key"}
+        assert client.post("/v1/chat/completions", json={}).status_code == 401
+
+        response = client.post(
+            "/admin/api/global-settings",
+            json={"allow_unauthenticated_inference": True},
+            headers=admin,
+        )
+        assert response.status_code == 200, response.text
+        saved = json.loads((tmp_path / "settings.json").read_text())
+        assert saved["auth"]["allow_unauthenticated_inference"] is True
+        auth = client.get("/admin/api/global-settings", headers=admin).json()["auth"]
+        assert auth["allow_unauthenticated_inference"] is True
+        assert client.post("/v1/chat/completions", json={}).status_code == 422
+        assert client.get("/admin/api/global-settings").status_code == 401
+
+    @pytest.mark.parametrize("token", ["sub-key-1234", "wrong-key"])
+    def test_admin_api_rejects_other_bearer_keys(
+        self, configured_server, token, caplog
+    ):
+        server, settings = configured_server
+        settings.auth.sub_keys = [SubKeyEntry(key="sub-key-1234", name="sub")]
+        response = TestClient(server.app, follow_redirects=False).get(
+            "/admin/api/global-settings",
+            headers={"Authorization": f"Bearer {token}", "Accept": "text/html"},
+        )
+        # A rejected key gets 401 even from a browser, never the login redirect.
+        assert response.status_code == 401
+        assert "Rejected admin API key" in caplog.text
+
+    def test_tool_routes_execute_without_key(self, configured_server, monkeypatch):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from omlx.api import mcp_routes, websearch_routes
+
+        server, _ = configured_server
+        result = SimpleNamespace(
+            tool_name="example", content=[], is_error=False, error_message=None
+        )
+        manager = SimpleNamespace(execute_tool=AsyncMock(return_value=result))
+        monkeypatch.setattr(mcp_routes, "_get_mcp_manager", lambda: manager)
+        search = AsyncMock(return_value={"ok": True, "results": []})
+        monkeypatch.setattr(websearch_routes, "run_web_search", search)
+        monkeypatch.setattr(
+            websearch_routes,
+            "_get_global_settings",
+            lambda: server._server_state.global_settings,
+        )
+        client = TestClient(server.app)
+        response = client.post(
+            "/v1/mcp/execute", json={"tool_name": "example", "arguments": {}}
+        )
+        assert response.status_code == 200
+        manager.execute_tool.assert_awaited_once_with("example", {})
+        assert client.post("/v1/web/search", json={"query": "example"}).json()["ok"]
+        search.assert_awaited_once()
+
+    def test_stored_responses_can_be_read_and_deleted(
+        self, configured_server, monkeypatch
+    ):
+        from omlx.api.responses_utils import ResponseStore
+
+        server, _ = configured_server
+        store = ResponseStore()
+        store.put("resp_test", {"id": "resp_test", "object": "response"})
+        monkeypatch.setattr(server._server_state, "responses_store", store)
+        client = TestClient(server.app)
+        assert client.get("/v1/responses/resp_test").json()["id"] == "resp_test"
+        assert client.delete("/v1/responses/resp_test").json()["deleted"] is True
+        assert client.get("/v1/responses/resp_test").status_code == 404
+
+    def test_realtime_audio_uses_manual_opt_in(self, configured_server):
+        from omlx.api.audio_routes import _verify_ws_api_key
+
+        _, settings = configured_server
+        assert _verify_ws_api_key(_LOOPBACK_CLIENT, None) is True
+        settings.auth.allow_unauthenticated_inference = False
+        assert _verify_ws_api_key(_LOOPBACK_CLIENT, None) is False
+        assert _verify_ws_api_key(_LOOPBACK_CLIENT, "management-key") is True
+
+
+class TestApiKeyLockout:
+    """Wrong API keys share one budget per remote client on every key endpoint."""
+
+    def test_key_endpoints_share_one_budget(self, monkeypatch, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "management-key"
+        monkeypatch.setattr(server._server_state, "global_settings", settings)
+        monkeypatch.setattr(server._server_state, "api_key", "management-key")
+        monkeypatch.setattr(server._server_state, "bind_host", "0.0.0.0")
+        monkeypatch.setattr(auth, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(auth, "_web_ui_enabled", True)
+        client = TestClient(server.app)
+        ws_client = SimpleNamespace(client=SimpleNamespace(host="testclient"))
+        wrong = {"Authorization": "Bearer wrong-key"}
+        good = {"Authorization": "Bearer management-key"}
+
+        login = client.post("/admin/api/login", json={"api_key": "wrong-key"})
+        assert login.status_code == 401
+        auto_login = client.get(
+            "/admin/auto-login?key=wrong-key", follow_redirects=False
+        )
+        assert auto_login.status_code == 302
+        admin = client.get("/admin/api/grammar/parsers", headers=wrong)
+        assert admin.status_code == 401
+        cli = client.post("/admin/api/models/m/load", headers=wrong)
+        assert cli.status_code == 401
+        assert _verify_ws_api_key(ws_client, "wrong-key") is False
+        for _ in range(auth.KEY_FAILURES_PER_LOCKOUT - 5):
+            assert client.get("/v1/models/status", headers=wrong).status_code == 401
+
+        locked = client.get("/v1/models/status", headers=good)
+        assert locked.status_code == 429
+        assert locked.headers["retry-after"] == "30"
+        login = client.post("/admin/api/login", json={"api_key": "management-key"})
+        assert login.status_code == 429
+        with pytest.raises(auth.KeyLockout):
+            _verify_ws_api_key(ws_client, "management-key")
+
+    def test_lockout_escalates_and_resets_on_success(self, monkeypatch):
+        now = [0.0]
+        monkeypatch.setattr(auth, "time", SimpleNamespace(monotonic=lambda: now[0]))
+        remote = SimpleNamespace(client=SimpleNamespace(host="192.168.1.50"))
+
+        def fail_until_locked():
+            for _ in range(auth.KEY_FAILURES_PER_LOCKOUT):
+                assert auth.check_api_key(remote, lambda: False) is False
+
+        def retry_after():
+            with pytest.raises(auth.KeyLockout) as exc_info:
+                auth.check_api_key(remote, lambda: pytest.fail("key compared"))
+            return exc_info.value.headers["Retry-After"]
+
+        fail_until_locked()
+        assert retry_after() == "30"
+        now[0] += 30
+        fail_until_locked()
+        assert retry_after() == "300"
+        now[0] += 300
+        assert auth.check_api_key(remote, lambda: True) is True
+        fail_until_locked()
+        assert retry_after() == "30"
+
+        # The Mac app reaches a LAN-IP bind from the server's own address.
+        same_host = SimpleNamespace(
+            client=SimpleNamespace(host="192.168.1.30"),
+            scope={"server": ("192.168.1.30", 8000)},
+        )
+        for local in (_LOOPBACK_CLIENT, same_host):
+            for _ in range(3 * auth.KEY_FAILURES_PER_LOCKOUT):
+                assert auth.check_api_key(local, lambda: False) is False
+
+
+HEADLESS_PROBE = textwrap.dedent("""
+    import json
+    import sys
+    from pathlib import Path
+
+    from fastapi.testclient import TestClient
+
+    from omlx import server
+    from omlx.admin import auth
+    from omlx.admin import routes as admin_routes
+    from omlx.settings import GlobalSettings
+
+    settings = GlobalSettings(base_path=Path(sys.argv[1]))
+    settings.auth.api_key = "main-key-1234"
+    server._server_state.global_settings = settings
+    server._server_state.api_key = "main-key-1234"
+    server._server_state.bind_host = "127.0.0.1"
+    auth._get_global_settings = lambda: settings
+    admin_routes._get_global_settings = lambda: settings
+
+    client = TestClient(server.app, follow_redirects=False)
+    html = {"Accept": "text/html"}
+    status = {
+        "login_page": client.get("/admin", headers=html).status_code,
+        "dashboard": client.get("/admin/dashboard", headers=html).status_code,
+        "static": client.get("/admin/static/favicon.svg").status_code,
+        "auto_login": client.get(
+            "/admin/auto-login", params={"key": "main-key-1234"}
+        ).status_code,
+        "api_html_no_session": client.get(
+            "/admin/api/global-settings", headers=html
+        ).status_code,
+    }
+    client.post("/admin/api/login", json={"api_key": "main-key-1234"})
+    status["api_with_session"] = client.get("/admin/api/global-settings").status_code
+    print(json.dumps(status))
+    """)
+
+
+def test_headless_serves_admin_api_without_pages(tmp_path):
+    env = {**os.environ, "OMLX_HEADLESS": "1", "HOME": str(tmp_path)}
+    env["OMLX_BASE_PATH"] = str(tmp_path / "base")
+    result = subprocess.run(
+        [sys.executable, "-c", HEADLESS_PROBE, str(tmp_path / "base")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    status = json.loads(result.stdout.strip().splitlines()[-1])
+    assert status == {
+        "login_page": 404,
+        "dashboard": 404,
+        "static": 404,
+        "auto_login": 404,
+        "api_html_no_session": 401,
+        "api_with_session": 200,
+    }

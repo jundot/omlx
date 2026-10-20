@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for accuracy evaluation modules."""
 
+import asyncio
 from unittest.mock import MagicMock
 
 import pytest
 
+from omlx.eval.base import BaseBenchmark
 from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
-from omlx.eval.livecodebench import _extract_code
+from omlx.eval.livecodebench import LiveCodeBenchBenchmark, _extract_code
 from omlx.eval.mmlu import MMLUBenchmark, _parse_choices
 from omlx.eval.truthfulqa import TruthfulQABenchmark
 
@@ -51,6 +53,16 @@ class TestMMLU:
     def test_extract_answer_last_letter(self):
         """When no 'answer is' pattern, use last valid letter."""
         assert self.bench.extract_answer("Looking at A and B, B is correct", {}) == "B"
+
+    def test_extract_answer_stated_answer_beats_later_letter(self):
+        """An explicit 'answer is X' wins even when another letter comes after it."""
+        assert self.bench.extract_answer("The answer is B. Note that A is a distractor.", {}) == "B"
+        assert self.bench.extract_answer("Answer: C. Option D looks similar.", {}) == "C"
+
+    def test_extract_answer_stated_answer_any_case(self):
+        """The 'answer is' cue is matched whatever casing the model used."""
+        assert self.bench.extract_answer("ANSWER IS D. A is incorrect.", {}) == "D"
+        assert self.bench.extract_answer("the answer is a, not b", {}) == "A"
 
     def test_check_answer_correct(self):
         assert self.bench.check_answer("A", {"answer": "A"}) is True
@@ -156,6 +168,23 @@ class TestGSM8K:
         assert _extract_numeric_answer("The answer is 42.") == "42"
         assert _extract_numeric_answer("She has 15 apples and 20 oranges, so 35 total.") == "35"
 
+    def test_extract_numeric_answer_trailing_comma_after_last_number(self):
+        # A bare "," is not a number: punctuation after the final digit must
+        # not become the extracted answer.
+        assert _extract_numeric_answer("The total is 72 clips, altogether.") == "72"
+        assert (
+            _extract_numeric_answer("Thus, the answer is 18, which is the total.")
+            == "18"
+        )
+        assert _extract_numeric_answer("He gave away 8 lollipops,") == "8"
+
+    def test_extract_numeric_answer_keeps_thousands_separator(self):
+        assert _extract_numeric_answer("The final total is 1,234 dollars.") == "1234"
+        assert _extract_numeric_answer("That comes to 1,234.50, in the end.") == "1234.50"
+
+    def test_extract_numeric_answer_commas_only(self):
+        assert _extract_numeric_answer("Well, hmm, no idea,") == ""
+
     def test_extract_numeric_answer_empty(self):
         assert _extract_numeric_answer("I don't know") == ""
         assert _extract_numeric_answer("") == ""
@@ -191,6 +220,12 @@ class TestGSM8K:
 # --- LiveCodeBench Tests ---
 
 
+@pytest.fixture(scope="module")
+def lcb_items():
+    bench = LiveCodeBenchBenchmark()
+    return {item["id"]: item for item in asyncio.run(bench.load_dataset())}
+
+
 class TestLiveCodeBench:
     def test_extract_code_python_block(self):
         response = "Here's my solution:\n```python\ndef solve():\n    print(42)\n```\nDone."
@@ -211,6 +246,30 @@ class TestLiveCodeBench:
     def test_extract_code_empty(self):
         code = _extract_code("")
         assert code == ""
+
+    def test_format_prompt_functional_shows_signature(self, lcb_items):
+        prompt = LiveCodeBenchBenchmark().format_prompt(lcb_items["2727"])[0]["content"]
+        assert "def countSeniors(self, details: List[str]) -> int:" in prompt
+        assert "Read input from stdin" not in prompt
+
+    def test_check_answer_functional_compares_return_value(self, lcb_items):
+        bench = LiveCodeBenchBenchmark()
+        item = lcb_items["2791"]
+        signature = (
+            "class Solution:\n"
+            "    def circularGameLosers(self, n: int, k: int) -> List[int]:\n"
+        )
+        gold = signature + (
+            "        seen = set()\n"
+            "        i, r = 0, 1\n"
+            "        while i not in seen:\n"
+            "            seen.add(i)\n"
+            "            i = (i + r * k) % n\n"
+            "            r += 1\n"
+            "        return [j + 1 for j in range(n) if j not in seen]\n"
+        )
+        assert bench.check_answer(gold, item) is True
+        assert bench.check_answer(signature + "        return []\n", item) is False
 
 
 # --- HumanEval Tests ---
@@ -277,6 +336,30 @@ class TestHumanEval:
         code = benchmark.extract_answer(visible, item)
 
         assert code == "def add(a, b):\n    return a + b"
+        assert benchmark.check_answer(code, item) is True
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            "return a + b",
+            "   return a + b",
+            "```python\n    return a + b\n```",
+            "total = a + b\n    return total",
+            "total = a + b\nreturn total",
+        ],
+    )
+    def test_body_only_answer_lands_in_the_function(self, response):
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        benchmark = HumanEvalBenchmark()
+        item = {
+            "prompt": 'def add(a, b):\n    """Add two numbers."""\n',
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+
+        code = benchmark.extract_answer(response, item)
+
         assert benchmark.check_answer(code, item) is True
 
 
@@ -349,6 +432,79 @@ class TestThinkingMode:
         result = BaseBenchmark._strip_think_tags(text)
         assert "<think>" not in result
         assert "The answer is A" in result
+
+
+class TestLocalStopReason:
+    """Local runs keep the engine's stop reason and token count (#3772)."""
+
+    class _Bench(MMLUBenchmark):
+        def format_prompt(self, item):
+            return [{"role": "user", "content": item["id"]}]
+
+    class _Engine:
+        is_external_api = False
+        model_type = None
+
+        async def chat(self, messages, **kwargs):
+            from omlx.engine.base import GenerationOutput
+
+            if messages[0]["content"] == "cut":
+                return GenerationOutput(
+                    text="<think>still reasoning", prompt_tokens=40,
+                    completion_tokens=8192, finish_reason="length",
+                )
+            if messages[0]["content"] == "cut-after-answer":
+                return GenerationOutput(
+                    text="The answer is A. To explain, first", prompt_tokens=40,
+                    completion_tokens=128, finish_reason="length",
+                )
+            if messages[0]["content"] == "boom":
+                raise RuntimeError("engine failed")
+            return GenerationOutput(
+                text="The answer is A", prompt_tokens=40,
+                completion_tokens=300, finish_reason="stop",
+            )
+
+    @pytest.mark.asyncio
+    async def test_budget_limited_answer_recorded(self):
+        items = [
+            {"id": "done", "answer": "A"},
+            {"id": "cut", "answer": "A"},
+        ]
+        result = await self._Bench().run(self._Engine(), items, enable_thinking=True)
+        by_id = {qr.question_id: qr for qr in result.question_results}
+        assert by_id["done"].finish_reason == "stop"
+        assert by_id["done"].completion_tokens == 300
+        assert by_id["done"].correct is True
+        assert by_id["cut"].finish_reason == "length"
+        assert by_id["cut"].completion_tokens == 8192
+        assert by_id["cut"].correct is False
+        # Local answers stay on the legacy scoring path.
+        assert by_id["cut"].status is None
+
+    @pytest.mark.asyncio
+    async def test_truncated_answer_can_score_correct(self):
+        # Scoring is unchanged: an answer stated before the cut still counts.
+        items = [{"id": "cut-after-answer", "answer": "A"}]
+        result = await self._Bench().run(self._Engine(), items)
+        qr = result.question_results[0]
+        assert qr.finish_reason == "length"
+        assert qr.correct is True
+
+    @pytest.mark.asyncio
+    async def test_engine_error_has_no_stop_reason(self):
+        items = [{"id": "boom", "answer": "A"}]
+        result = await self._Bench().run(self._Engine(), items)
+        qr = result.question_results[0]
+        assert qr.finish_reason is None
+        assert qr.completion_tokens == 0
+        assert qr.correct is False
+
+    def test_output_without_stop_reason(self):
+        diagnostics = BaseBenchmark._local_diagnostics(MagicMock(spec=["text"]))
+        assert diagnostics == {
+            "finish_reason": None, "prompt_tokens": 0, "completion_tokens": 0,
+        }
 
 
 # --- Dataset Sampling Tests ---

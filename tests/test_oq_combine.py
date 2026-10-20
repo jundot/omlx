@@ -128,6 +128,32 @@ def test_validate_rejects_non_gemma4_base():
         validate_gemma4_assistant_pair(base, ASSISTANT_CONFIG)
 
 
+def test_combine_routes_unified_assistant_to_assistant_merge(tmp_path):
+    out = _write_base_output(tmp_path)
+    base = dict(BASE_CONFIG, model_type="gemma4_unified")
+    (out / "config.json").write_text(json.dumps(base))
+    asst_config = dict(ASSISTANT_CONFIG, model_type="gemma4_unified_assistant")
+    asst = _write_assistant(tmp_path, config=asst_config)
+
+    combine_mtp_into_output(out, asst)
+
+    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    assert GEMMA4_ASSISTANT_MTP_PREFIX + "pre_projection.weight" in merged
+    config = json.loads((out / "config.json").read_text())
+    assert config["text_config"]["mtp_assistant_config"] == asst_config
+
+
+@pytest.mark.parametrize(
+    ("base_type", "assistant_type"),
+    [("gemma4", "gemma4_unified_assistant"), ("gemma4_unified", "gemma4_assistant")],
+)
+def test_validate_rejects_assistant_for_other_gemma4_variant(base_type, assistant_type):
+    base = dict(BASE_CONFIG, model_type=base_type)
+    asst = dict(ASSISTANT_CONFIG, model_type=assistant_type)
+    with pytest.raises(ValueError, match="must have model_type"):
+        validate_gemma4_assistant_pair(base, asst)
+
+
 def test_validate_rejects_headless_assistant():
     headless = dict(ASSISTANT_CONFIG)
     headless["text_config"] = {"model_type": "gemma4_text"}
@@ -191,6 +217,7 @@ def _write_qwen_donor(
     quantized=False,
     headless=False,
     tokenizer=TOKENIZER_BYTES,
+    conv1d_layout=None,
     **scope_overrides,
 ):
     donor = tmp_path / ("qwen-donor-vlm" if vlm else "qwen-donor")
@@ -202,6 +229,12 @@ def _write_qwen_donor(
     weights = {
         prefix + "model.embed_tokens.weight": mx.zeros((16, 8), dtype=bf16),
     }
+    if conv1d_layout is not None:
+        # Raw-HF stores conv1d as (C, 1, K); MLX conversions as (C, K, 1).
+        shape = (8, 1, 4) if conv1d_layout == "raw" else (8, 4, 1)
+        weights[prefix + "model.layers.0.linear_attn.conv1d.weight"] = mx.zeros(
+            shape, dtype=bf16
+        )
     if not headless:
         weights.update(
             {
@@ -337,6 +370,31 @@ def test_graft_quantized_donor_synthesizes_per_layer_entries(tmp_path):
         merged["mtp.layers.0.self_attn.q_proj.scales"],
         donor_weights["mtp.layers.0.self_attn.q_proj.scales"],
     )
+
+
+@pytest.mark.parametrize(
+    ("conv1d_layout", "expected"),
+    [("raw", 2.0), ("mlx", 1.0), (None, 1.0)],
+)
+def test_graft_shifts_head_norms_only_for_raw_hf_donor(
+    tmp_path, conv1d_layout, expected
+):
+    out = _write_qwen_output(tmp_path)
+    donor = _write_qwen_donor(tmp_path, conv1d_layout=conv1d_layout)
+
+    combine_mtp_donor(out, donor)
+
+    merged = mx.load(str(out / GEMMA4_ASSISTANT_MTP_SHARD))
+    for key in (
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.input_layernorm.weight",
+    ):
+        assert float(merged[key][0].item()) == expected, key
+    donor_weights = mx.load(str(donor / "model.safetensors"))
+    assert mx.array_equal(merged["mtp.fc.weight"], donor_weights["mtp.fc.weight"])
+    assert "model.layers.0.linear_attn.conv1d.weight" not in merged
 
 
 def test_graft_remaps_vlm_donor_prefix_into_text_recipient(tmp_path):

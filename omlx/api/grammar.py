@@ -33,7 +33,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def create_grammar_compiler(tokenizer, model):
+def create_grammar_compiler(tokenizer, model, *, cache_limit_bytes=-1):
     """Create an xgrammar GrammarCompiler for the given tokenizer and model.
 
     Returns None if vocab_size cannot be determined.
@@ -51,7 +51,29 @@ def create_grammar_compiler(tokenizer, model):
         kwargs["vocab_size"] = vocab_size
 
     tokenizer_info = xgr.TokenizerInfo.from_huggingface(hf_tokenizer, **kwargs)
-    return xgr.GrammarCompiler(tokenizer_info)
+    return xgr.GrammarCompiler(tokenizer_info, cache_limit_bytes=cache_limit_bytes)
+
+
+def mark_grammar_thinking_phase(
+    compiled_grammar, *, enabled: bool, optional: bool = False
+):
+    """Record whether oMLX compiled a separate reasoning phase.
+
+    Metadata travels with the Python CompiledGrammar wrapper through every
+    engine path. Bare or externally compiled grammars are conservative by
+    default: their accepted tokens need not include a forced thinking close.
+    An optional phase is opened by the model, not by the prompt, so a thinking
+    budget must wait for the opener before it counts.
+    """
+    from .._torch_stub import install as _install_torch_stub
+
+    _install_torch_stub()
+    import xgrammar as xgr
+
+    if isinstance(compiled_grammar, xgr.CompiledGrammar):
+        compiled_grammar._omlx_has_thinking_phase = enabled
+        compiled_grammar._omlx_thinking_phase_optional = optional
+    return compiled_grammar
 
 
 class GrammarConstraintProcessor:
@@ -102,6 +124,10 @@ class GrammarConstraintProcessor:
 
         mx_bitmask = mx.array(self._bitmask)
         return self._apply_mask(mx_bitmask, logits, self._vocab_size)
+
+    def discard_pending(self) -> None:
+        """Forget the in-flight token; its row was dropped before it was sent."""
+        self._pending = False
 
     def accept_token(self, token_id: int) -> None:
         """Accept a generated token to advance matcher state."""

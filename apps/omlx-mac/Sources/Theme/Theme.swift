@@ -7,6 +7,23 @@
 
 import SwiftUI
 
+extension Color {
+    /// Initialize from a 0xRRGGBB hex value.
+    init(hex: UInt32) {
+        let r = Double((hex >> 16) & 0xFF) / 255.0
+        let g = Double((hex >> 8) & 0xFF) / 255.0
+        let b = Double(hex & 0xFF) / 255.0
+        self.init(red: r, green: g, blue: b)
+    }
+}
+
+// MARK: - Enhanced Readability (global)
+
+/// Persisted preference key for the Enhanced Readability toggle.
+enum EnhancedReadability {
+    static let enabledKey = "OMLXEnhancedReadability"
+}
+
 // MARK: - Token table
 
 struct OMLXTheme: Sendable {
@@ -26,8 +43,8 @@ struct OMLXTheme: Sendable {
 
     // Text
     let text: Color
-    let textSecondary: Color
-    let textTertiary: Color
+    var textSecondary: Color
+    var textTertiary: Color
 
     // Accent + selection
     let accent: Color
@@ -48,13 +65,13 @@ struct OMLXTheme: Sendable {
     // Status
     let greenDot: Color
     let amberDot: Color
-    let redDot: Color
+    var redDot: Color
     let blueDot: Color
 
     // Code + status backgrounds
     let codeBg: Color
     let warningBg: Color
-    let warningText: Color
+    var warningText: Color
     let successBg: Color
     let successText: Color
 
@@ -71,6 +88,18 @@ struct OMLXTheme: Sendable {
 }
 
 extension OMLXTheme {
+    static func resolved(for scheme: ColorScheme, enhancedReadability: Bool) -> OMLXTheme {
+        var theme = scheme == .dark ? dark : light
+        if enhancedReadability {
+            theme.textSecondary = theme.text
+            theme.textTertiary = theme.text
+            let danger = Color(hex: scheme == .dark ? 0xef5b54 : 0xd92d20)
+            theme.redDot = danger
+            theme.warningText = danger
+        }
+        return theme
+    }
+
     static let light = OMLXTheme(
         isDark: false,
         windowBg: systemWindowBgLight,
@@ -249,16 +278,35 @@ extension EnvironmentValues {
 
 private struct OMLXThemeBinder: ViewModifier {
     @Environment(\.colorScheme) private var scheme
+    @AppStorage(EnhancedReadability.enabledKey) private var enhancedReadability = false
+
     func body(content: Content) -> some View {
-        content.environment(\.omlxTheme, scheme == .dark ? .dark : .light)
+        content.environment(\.omlxTheme, .resolved(
+            for: scheme, enhancedReadability: enhancedReadability
+        ))
     }
 }
 
 extension View {
-    /// Resolves `\.omlxTheme` from the current `\.colorScheme`. Apply once at
-    /// the AppView shell (PR 6) so every descendant primitive reads the right
-    /// palette without explicit prop-drilling.
+    /// Applies the current appearance and saved readability preference to child views.
     func omlxThemed() -> some View { modifier(OMLXThemeBinder()) }
+}
+
+// MARK: - Control metrics
+
+/// Standard widths for trailing controls (text inputs, selects) in settings
+/// rows. Every `TextInput`/`Popup` picks the smallest token that fits its
+/// content instead of hand-tuning a per-row width, so control edges line up
+/// between rows and across screens.
+extension CGFloat {
+    /// Bare numbers: ports, counts, factors.
+    static let controlNarrow: CGFloat = 90
+    /// Numbers with a suffix or stepper, short enum selects.
+    static let controlCompact: CGFloat = 130
+    /// Names, keys, typical selects.
+    static let controlMedium: CGFloat = 220
+    /// Paths, URLs, model-id selects.
+    static let controlWide: CGFloat = 320
 }
 
 // MARK: - Color helpers

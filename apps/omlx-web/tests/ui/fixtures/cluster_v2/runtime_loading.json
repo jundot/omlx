@@ -1,0 +1,15 @@
+{
+  "_comment": "GET /admin/api/cluster/runtime — a fresh rank marker belongs to an in-flight pool load.",
+  "jobs": [
+    {
+      "deployment_id": "minimax-m3-9f2ab41cd0e1",
+      "rank": 0,
+      "world_size": 2,
+      "phase": "loading",
+      "live": true,
+      "ownership": "loading"
+    }
+  ],
+  "launchers": [],
+  "warnings": []
+}

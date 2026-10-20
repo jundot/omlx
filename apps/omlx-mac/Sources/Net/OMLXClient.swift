@@ -45,7 +45,7 @@ final class OMLXClient: ObservableObject {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil) {
+    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil, session: URLSession? = nil) {
         self.host = host
         self.port = port
         self.apiKey = apiKey
@@ -56,7 +56,7 @@ final class OMLXClient: ObservableObject {
         cfg.httpCookieAcceptPolicy = .always
         cfg.timeoutIntervalForRequest = 15
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
-        self.session = URLSession(configuration: cfg)
+        self.session = session ?? URLSession(configuration: cfg)
 
         let enc = JSONEncoder()
         enc.keyEncodingStrategy = .convertToSnakeCase
@@ -79,12 +79,23 @@ final class OMLXClient: ObservableObject {
         try await get("/admin/api/global-settings")
     }
 
+    func getGlobalSettingsDefaults() async throws -> GlobalSettingsDTO {
+        try await get("/admin/api/global-settings/defaults")
+    }
+
     func updateGlobalSettings(_ patch: GlobalSettingsPatch) async throws -> UpdateGlobalSettingsResponse {
         try await post("/admin/api/global-settings", body: patch)
     }
 
     func getServerInfo() async throws -> ServerInfoDTO {
         try await get("/admin/api/server-info")
+    }
+
+    func getUsage(range: String = "today", model: String = "") async throws -> UsageHistoryDTO {
+        try await get(AdminAPI.usage, query: [
+            URLQueryItem(name: "range", value: range),
+            URLQueryItem(name: "model", value: model),
+        ])
     }
 
     func getStats(scope: String = "session", model: String = "") async throws -> StatsDTO {
@@ -148,6 +159,42 @@ final class OMLXClient: ObservableObject {
         try await put(AdminAPI.modelSettings(id), body: patch)
     }
 
+    /// Settings write with explicit JSON nulls, for clearing fields.
+    @discardableResult
+    func updateModelSettings(id: String, settings: [String: AnyCodable]) async throws -> SimpleStatusResponse {
+        try await put(AdminAPI.modelSettings(id), body: settings)
+    }
+
+    func resetModelSettings(id: String) async throws -> SettingsApplyResultDTO {
+        try await postEmpty(AdminAPI.modelSettingsReset(id))
+    }
+
+    func getGenerationConfig(id: String) async throws -> GenerationConfigDTO {
+        try await get(AdminAPI.modelGenerationConfig(id))
+    }
+
+    /// Server-side lookup of the best omlx.ai benchmarks for this device
+    /// and model (proxied like the preset refresh).
+    func listOptimalCandidates(id: String) async throws -> OptimalCandidatesDTO {
+        try await get(AdminAPI.modelSettingsOptimal(id))
+    }
+
+    func applyOptimalCandidate(id: String, benchmarkId: String) async throws -> SettingsApplyResultDTO {
+        try await post(AdminAPI.modelSettingsOptimal(id), body: ApplyOptimalRequest(benchmarkId: benchmarkId))
+    }
+
+    func applyRecipe(id: String, recipe: String) async throws -> SettingsApplyResultDTO {
+        try await post(AdminAPI.modelSettingsRecipe(id), body: ApplyRecipeRequest(recipe: recipe))
+    }
+
+    /// Normalize an MTPLX MTP sidecar into the model checkpoint so native
+    /// MTP can load it. The server validates the runtime contract before
+    /// changing the local model files.
+    @discardableResult
+    func importMtplxSidecar(id: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.importMtplx(id))
+    }
+
     func listModelProfiles(id: String) async throws -> ProfileListResponse {
         try await get(AdminAPI.modelProfiles(id))
     }
@@ -168,6 +215,10 @@ final class OMLXClient: ObservableObject {
     @discardableResult
     func applyModelProfile(id: String, name: String) async throws -> ApplyProfileResponse {
         try await postEmpty(AdminAPI.applyModelProfile(id, name))
+    }
+
+    func applyModelTemplate(id: String, name: String) async throws -> ApplyProfileResponse {
+        try await postEmpty(AdminAPI.applyModelTemplate(id, name))
     }
 
     func listProfileTemplates() async throws -> TemplateListResponse {
@@ -198,9 +249,13 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.hfTasks)
     }
 
-    func startHFDownload(repoId: String, hfToken: String = "") async throws -> StartHFDownloadResponse {
+    func startHFDownload(
+        repoId: String,
+        hfToken: String = "",
+        files: [String]? = nil
+    ) async throws -> StartHFDownloadResponse {
         try await post(AdminAPI.hfDownload, body: StartHFDownloadRequest(
-            repoId: repoId, hfToken: hfToken
+            repoId: repoId, hfToken: hfToken, files: files
         ))
     }
 
@@ -219,9 +274,9 @@ final class OMLXClient: ObservableObject {
         try await delete(AdminAPI.hfTask(taskId))
     }
 
-    func getHFRecommended(mlxOnly: Bool = true) async throws -> HFRecommendedResponse {
+    func getHFRecommended(modelFormat: HFModelFormat = .mlx) async throws -> HFRecommendedResponse {
         try await get(AdminAPI.hfRecommended, query: [
-            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+            URLQueryItem(name: "model_format", value: modelFormat.rawValue),
         ])
     }
 
@@ -233,13 +288,13 @@ final class OMLXClient: ObservableObject {
         query: String,
         sort: String = "trending",
         limit: Int = 20,
-        mlxOnly: Bool = true
+        modelFormat: HFModelFormat = .mlx
     ) async throws -> HFSearchResponse {
         try await get(AdminAPI.hfSearch, query: [
             URLQueryItem(name: "q", value: query),
             URLQueryItem(name: "sort", value: sort),
             URLQueryItem(name: "limit", value: String(limit)),
-            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+            URLQueryItem(name: "model_format", value: modelFormat.rawValue),
         ])
     }
 

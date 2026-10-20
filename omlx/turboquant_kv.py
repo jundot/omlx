@@ -44,11 +44,44 @@ from mlx_vlm.turboquant import (
 
 logger = logging.getLogger(__name__)
 
+
+@classmethod
+def _from_cache(cls, cache, bits, seed=0):
+    result = cls(bits=bits, seed=seed)
+    if callable(getattr(cache, "keys_and_values", None)):
+        keys, values = (
+            cache.keys_and_values() if cache.keys is not None else (None, None)
+        )
+    else:
+        keys, values = cache.state
+    if keys is not None:
+        result.update_and_fetch(keys, values)
+    return result
+
+
+TurboQuantKVCache.from_cache = _from_cache
+
+
 __all__ = [
     "TurboQuantKVCache",
     "BatchTurboQuantKVCache",
     "turboquant_enabled",
 ]
+
+
+def quantized_cache_class(scheme: str = "turboquant"):
+    """Resolve the packed cache format without loading native kernels."""
+    if scheme == "turboquant":
+        return TurboQuantKVCache
+    if scheme in ("affine4", "affine8"):
+        from .affine4 import Affine4KVCache, Affine8KVCache
+
+        return Affine8KVCache if scheme == "affine8" else Affine4KVCache
+    raise ValueError(f"Unknown KV cache quantization scheme: {scheme}")
+
+
+def _quantization_config(cache):
+    return (getattr(cache, "quantization_scheme", "turboquant"), cache.bits, cache.seed)
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +243,54 @@ def _pad_state_left(state, pad_length: int):
     return _concat_state(pad, state)
 
 
+def _roll_state(state, shifts, axis: int = 2):
+    """Roll a quantized state along its token axis by per-row ``shifts``.
+
+    Mirrors dynamic_roll's per-batch-row dynamic shift (same axis/shifts
+    convention as _slice_state/_concat_state above), applied directly to the
+    packed representation instead of dequantize -> roll -> requantize: roll
+    is pure reindexing along the token axis, so applying it independently to
+    every field that shares that axis (norms, packed indices, radii, ...)
+    preserves their per-token pairing exactly, with no fp16 materialization
+    and no re-rounding through the codec on the way back in.
+    """
+    if state is None:
+        return None
+    if isinstance(state, TurboQuantMSEState):
+        return TurboQuantMSEState(
+            dynamic_roll(state.norms, shifts, axis=axis),
+            dynamic_roll(state.indices, shifts, axis=axis),
+        )
+    if isinstance(state, TurboQuantProdState):
+        return TurboQuantProdState(
+            dynamic_roll(state.norms, shifts, axis=axis),
+            dynamic_roll(state.mse_indices, shifts, axis=axis),
+            dynamic_roll(state.residual_norms, shifts, axis=axis),
+            dynamic_roll(state.qjl_signs, shifts, axis=axis),
+        )
+    if isinstance(state, TurboQuantPolarState):
+        return TurboQuantPolarState(
+            dynamic_roll(state.radii, shifts, axis=axis),
+            tuple(
+                dynamic_roll(level, shifts, axis=axis)
+                for level in state.level_indices
+            ),
+        )
+    if isinstance(state, TurboQuantPolarProdState):
+        return TurboQuantPolarProdState(
+            dynamic_roll(state.norms, shifts, axis=axis),
+            _roll_state(state.polar_state, shifts, axis=axis),
+            dynamic_roll(state.residual_norms, shifts, axis=axis),
+            dynamic_roll(state.qjl_signs, shifts, axis=axis),
+        )
+    if isinstance(state, TurboQuantSplitState):
+        return TurboQuantSplitState(
+            _roll_state(state.low, shifts, axis=axis),
+            _roll_state(state.high, shifts, axis=axis),
+        )
+    raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
+
+
 def _empty_state_batch_like(state, batch_size: int):
     """Allocate an empty token state with the requested batch size."""
     if state is None:
@@ -252,10 +333,22 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         # every logical offset is short of the written end, and an
         # offset-derived position writes INSIDE the survivors' live KV. It
         # also must not be derived from _state_length(self.keys): that is the
-        # step-allocated capacity, not the written end. (Deliberately not
-        # named `_idx` — mlx-vlm's rollback_speculative_cache changes
-        # behavior on that attribute.)
+        # step-allocated capacity, not the written end.
         self._phys_end = 0
+
+    @property
+    def _idx(self):
+        # mlx-vlm uses this cursor for rollback and padded attention masks.
+        return self.offset if isinstance(self.offset, int) else self._phys_end
+
+    def trim(self, n):
+        position = self._idx
+        n = min(position, n)
+        self.offset -= n
+        self._phys_end = position - n
+        self._cached_state = None
+        self._cached_state_offset = -1
+        return n
 
     # ---- update_and_fetch override for B>1 only ----------------------------
 
@@ -364,11 +457,15 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             return
         padding = self._right_padding
         if self.keys is not None:
-            k_fp16, v_fp16 = self.dequantize()
-            k_rolled = dynamic_roll(k_fp16, padding[:, None], axis=2)
-            v_rolled = dynamic_roll(v_fp16, padding[:, None], axis=2)
-            self.keys = self.key_codec.quantize(k_rolled)
-            self.values = self.value_codec.quantize(v_rolled)
+            # Roll the already-quantized state directly (_roll_state) rather
+            # than dequantize -> dynamic_roll -> requantize: roll only
+            # reindexes along the token axis, so it's exact on the packed
+            # representation and skips both the fp16 materialization and the
+            # requantization codec's re-rounding of an already-quantized
+            # value.
+            shifts = padding[:, None]
+            self.keys = _roll_state(self.keys, shifts, axis=2)
+            self.values = _roll_state(self.values, shifts, axis=2)
             mx.eval(self.keys, self.values)
         self.offset -= (
             padding if isinstance(self.offset, mx.array) else padding[0].item()
@@ -409,6 +506,8 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 "BatchTurboQuantKVCache.extend expected BatchTurboQuantKVCache, "
                 f"got {type(other).__name__}"
             )
+        if _quantization_config(self) != _quantization_config(other):
+            raise ValueError("Cannot extend caches with mixed quantization configs")
         self._ensure_array_offset()
         other._ensure_array_offset()
         max_off = max(self.offset.max().item(), other.offset.max().item())
@@ -460,6 +559,9 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             self.key_codec = other.key_codec
             self.value_codec = other.value_codec
 
+    def _new_single_cache(self):
+        return TurboQuantKVCache(bits=self.bits, seed=self.seed)
+
     def extract(self, idx: int) -> TurboQuantKVCache:
         padding = self.left_padding[idx].item()
         total = (
@@ -469,7 +571,7 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
         )
         end = padding + total
 
-        tq = TurboQuantKVCache(bits=self.bits, seed=self.seed)
+        tq = self._new_single_cache()
         if self.keys is not None:
             ks = _slice_state_range(self.keys, padding, end)
             vs = _slice_state_range(self.values, padding, end)
@@ -490,8 +592,10 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
                 )
         bits = caches[0].bits
         seed = caches[0].seed
-        configs = {(c.bits, c.seed) for c in caches}
-        if len(configs) > 1:
+        configs = {_quantization_config(c) for c in caches}
+        if len(configs) > 1 or _quantization_config(caches[0])[0] != getattr(
+            cls, "quantization_scheme", "turboquant"
+        ):
             # Packed state width is ceil(head_dim * bits / 32) and codecs are
             # rebuilt from (head_dim, bits, seed), so members quantized under
             # different configs cannot share a batch. Without this guard the

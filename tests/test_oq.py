@@ -28,8 +28,10 @@ from omlx.oq import (
     OQ_LEVELS,
     OQImatrixCollector,
     OQImatrixEntry,
+    _affine_minmax_params,
     _affine_perturb_group_size,
     _bpw_targets_for_level,
+    _build_model_sanitizer,
     _build_proxy_for_sensitivity,
     _build_quant_plan,
     _build_streaming_proxy_for_sensitivity,
@@ -42,6 +44,7 @@ from omlx.oq import (
     _discover_sanitize_plan,
     _DiscoveredPlan,
     _extract_layer_index,
+    _find_model_layers,
     _format_size,
     _forward_layer,
     _forward_layer_result,
@@ -52,7 +55,6 @@ from omlx.oq import (
     _ImatrixCaptureWrapper,
     _is_audio_tensor,
     _is_moe_router,
-    _is_vision_tensor,
     _LazyTensorIndex,
     _load_builtin_calibration,
     _measure_sensitivity,
@@ -69,9 +71,12 @@ from omlx.oq import (
     _should_quantize_tensor,
     _source_imatrix_signature,
     _source_has_nextn_tensors,
+    _source_weight_files,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
     _uses_minimax_mxfp8_scale_inv_source,
+    _weighted_lsq_refit,
+    _weighted_lsq_refit_metal,
     estimate_bpw_and_size,
     estimate_memory,
     make_predicate,
@@ -400,14 +405,6 @@ class TestUniversalQuantPredicate:
         )
         assert result is True
 
-    # Group size
-
-    def test_moe_router_fp16_group_size(self, moe_config, module):
-        result = universal_quant_predicate(
-            "model.layers.0.mlp.gate", module, moe_config
-        )
-        assert result is False  # MoE router gates kept fp16
-
     def test_150_expert_group_size_128(self, module):
         config = {
             "num_hidden_layers": 32,
@@ -547,6 +544,9 @@ class TestHelpers:
 
     def test_is_moe_router_router(self):
         assert _is_moe_router("model.layers.0.block_sparse_moe.router") is True
+
+    def test_is_moe_router_gemma4_router_proj(self):
+        assert _is_moe_router("language_model.model.layers.0.router.proj") is True
 
     def test_is_moe_router_gate_proj_not_router(self):
         assert _is_moe_router("model.layers.0.mlp.gate_proj") is False
@@ -1183,6 +1183,13 @@ class TestStreamingHelpers:
         bits, gs, mode = _get_predicate_bits("model.layers.0.mlp.gate", config, 4, 64)
         assert bits is None  # Router → fp16 (not quantized)
 
+    def test_get_predicate_bits_gemma4_router_fp16(self):
+        config = {"num_hidden_layers": 30, "text_config": {"num_experts": 128}}
+        bits, gs, mode = _get_predicate_bits(
+            "language_model.model.layers.0.router.proj.weight", config, 4, 64
+        )
+        assert bits is None
+
     def test_get_predicate_bits_default_affine4(self):
         config = {"num_hidden_layers": 32}
         bits, gs, mode = _get_predicate_bits(
@@ -1292,8 +1299,70 @@ class TestStreamingHelpers:
         assert importance is None
         assert report["missing"] == []
 
-    def test_qwen4_ngram_group32_is_priced_into_budget_plan(self):
-        from omlx.oq import _structural_quant_overrides
+    def test_glm5_next_indexer_weights_proj_reuses_wk_imatrix(self):
+        from omlx.oq import OQImatrixData, _lookup_imatrix_importance
+
+        wk_base = "language_model.model.layers.11.self_attn.indexer.wk"
+        values = np.arange(64, dtype=np.float32) + 1
+        imatrix = OQImatrixData(
+            entries={
+                wk_base: OQImatrixEntry(
+                    in_sum2=values * 4,
+                    counts=np.array([4], dtype=np.int64),
+                )
+            },
+            metadata={},
+            path="unused.npz",
+        )
+        report = {"missing": [], "mismatched": [], "applied": []}
+        weights_proj = wk_base[: -len("wk")] + "weights_proj.weight"
+
+        importance = _lookup_imatrix_importance(
+            imatrix,
+            weights_proj,
+            (32, 64),
+            config={
+                "model_type": "glm5_next",
+                "text_config": {"model_type": "glm5_next_text"},
+            },
+            strict=True,
+            report=report,
+        )
+
+        np.testing.assert_array_equal(np.asarray(importance), values)
+        assert report["applied"] == [weights_proj.removesuffix(".weight")]
+        assert report["missing"] == []
+
+    def test_non_glm_weights_proj_still_requires_its_own_imatrix(self):
+        from omlx.oq import OQImatrixData, _lookup_imatrix_importance
+
+        base = "model.layers.0.self_attn.indexer"
+        imatrix = OQImatrixData(
+            entries={
+                f"{base}.wk": OQImatrixEntry(
+                    in_sum2=np.ones(64, dtype=np.float32),
+                    counts=np.ones(1, dtype=np.int64),
+                )
+            },
+            metadata={},
+            path="unused.npz",
+        )
+        report = {"missing": [], "mismatched": [], "applied": []}
+
+        with pytest.raises(RuntimeError, match="missing entry"):
+            _lookup_imatrix_importance(
+                imatrix,
+                f"{base}.weights_proj.weight",
+                (32, 64),
+                config={"model_type": "deepseek_v4"},
+                strict=True,
+                report=report,
+            )
+
+        assert report["missing"] == [f"{base}.weights_proj"]
+
+    def test_qwen4_ngram_table_stays_outside_budget_plan(self):
+        from omlx.oq import _budgeted_shapes, _get_predicate_bits
 
         ple = (
             "language_model.model.layers.1.ple.ple_embedding."
@@ -1315,32 +1384,21 @@ class TestStreamingHelpers:
             "_oq_sensitivity_map": {"0": 1.0, "1": 0.5},
         }
 
-        unpriced = _build_quant_plan(
-            named_shapes,
-            config,
-            4,
-            target_bpw=4.6,
-            hard_cap_bpw=4.7,
-        )
-        fixed = _structural_quant_overrides(named_shapes, config, 4)
         plan = _build_quant_plan(
-            named_shapes,
+            _budgeted_shapes(named_shapes, config),
             config,
-            4,
-            target_bpw=4.6,
-            hard_cap_bpw=4.7,
-            fixed_overrides=fixed,
+            2.5,
+            target_bpw=3.1,
+            hard_cap_bpw=3.3,
         )
 
-        assert unpriced.effective_bpw > 5.5
-        assert fixed[ple] == {
-            "bits": 4,
-            "group_size": 32,
-            "mode": "affine",
-        }
-        assert plan.effective_bpw <= 4.7
         assert ple not in plan.boost_map
+        assert plan.effective_bpw <= 3.3
         assert plan.boost_map["language_model.lm_head"]["bits"] == 8
+        # The table keeps its own group-32 policy and never drops below 4 bits.
+        weight = f"{ple}.weight"
+        assert _get_predicate_bits(weight, config, 2.5, 64) == (4, 32, "affine")
+        assert _get_predicate_bits(weight, config, 6, 64) == (6, 32, "affine")
 
     def test_build_quant_plan_respects_hard_cap(self):
         named_shapes = {
@@ -1823,6 +1881,29 @@ class TestForwardLayer:
         assert seen == [("mask", None, "prev_topk")]
 
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_failed_signature_probe_does_not_retain_block(self):
+        # Streaming calibration frees each layer by reference count. A failed
+        # probe kept with its traceback forms a cycle that holds the block.
+        import gc
+        import weakref
+
+        class Block(nn.Module):
+            def __call__(self, x, mask=None, cache=None):
+                return x * 2
+
+        gc.disable()
+        try:
+            block = Block()
+            ref = weakref.ref(block)
+            result, _ = _forward_layer_result(block, mx.ones((2, 4)), None, None)
+            assert isinstance(result, mx.array)
+            del block
+            assert ref() is None
+        finally:
+            gc.enable()
+
+
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestGemma4StatefulLayerForward:
     @staticmethod
@@ -1968,6 +2049,18 @@ class TestGemma4StatefulLayerForward:
         assert state["kind"] == "gemma4_shared_kv"
         assert state["previous_kvs"] == [0, 0]
 
+    def test_noncausal_layer_inputs_drop_every_mask(self):
+        """Decision 3.0 calibrates with the non-causal attention it serves with."""
+        tokens = mx.array([[1, 2, 3, 4]])
+        inputs = mx.zeros((1, 4, 8))
+        layers = [object(), object(), object()]
+        out, masks, positions = _prepare_layer_inputs(
+            object(), layers, tokens, inputs, noncausal=True
+        )
+        assert out is inputs
+        assert masks == [None, None, None]
+        assert positions.tolist() == [[0, 1, 2, 3]]
+
     def test_cache_signature_invalidates_only_stateful_gemma4(self, tmp_path):
         common = {
             "model_type": "gemma4",
@@ -2067,6 +2160,69 @@ def _write_safetensors(path, tensors):
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestEmbeddingGemma2Calibration:
+    _TEXT = {
+        "vocab_size": 32,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "hidden_size_per_layer_input": 4,
+        "embedding_dim": 8,
+        "sliding_window": 2,
+        "layer_types": ["sliding_attention", "full_attention"],
+    }
+
+    def test_layer_walk_matches_the_encoder_forward(self):
+        """Calibration replays the bidirectional encoder with its PLE inputs."""
+        pytest.importorskip("mlx_vlm.models.embedding_gemma2")
+        from mlx_vlm.models.embedding_gemma2 import Model, ModelConfig
+
+        mx.random.seed(0)
+        model = Model(
+            ModelConfig.from_dict(
+                {
+                    "model_type": "embedding_gemma2",
+                    "text_config": self._TEXT,
+                    "vision_config": None,
+                    "audio_config": None,
+                }
+            )
+        )
+        ids = mx.array([[3, 7, 1, 9, 4, 2, 8, 5]])
+        embed_fn, layers = _find_model_layers(model)
+        assert embed_fn is model.language_model.embed_tokens
+
+        hidden, masks, state = _prepare_layer_inputs(model, layers, ids, embed_fn(ids))
+        for layer_idx, layer in enumerate(layers):
+            hidden, _ = _forward_layer_result(
+                layer, hidden, masks[layer_idx], state, layer_idx=layer_idx
+            )
+        text = model.language_model
+        walked = text.embedding_projection(text.norm(hidden))
+        scaled = embed_fn(ids) * mx.array(16**0.5, dtype=mx.float32)
+        expected = text(scaled, mx.ones_like(ids))
+        assert mx.allclose(walked, expected, atol=1e-5)
+
+    def test_vlm_sanitizer_keeps_vision_weights(self):
+        """The sanitize proxy answers EmbeddingGemma 2's vision_tower check."""
+        pytest.importorskip("mlx_vlm.models.embedding_gemma2")
+        config = {
+            "model_type": "embedding_gemma2",
+            "architectures": ["EmbeddingGemma2Model"],
+            "text_config": self._TEXT,
+            "vision_config": {"hidden_size": 8},
+        }
+        sanitize = _build_model_sanitizer(config, text_only=False)
+        weights = {
+            "vision_tower.encoder.layers.0.mlp.up_proj.weight": mx.zeros((2, 2)),
+            "language_model.norm.weight": mx.zeros((16,)),
+        }
+        assert set(sanitize(weights)) == set(weights)
+
+
 class TestLazyTensorIndex:
     @pytest.fixture
     def sf_file(self, tmp_path):
@@ -2143,6 +2299,38 @@ class TestLazyTensorIndex:
         idx = _LazyTensorIndex([path])
         del idx["layer.0.weight"]
         assert "layer.0.weight" not in idx
+
+    @pytest.fixture
+    def scalar_sf_file(self, tmp_path):
+        # Gemma 4 audio-tower clamp bounds are 0-dim BF16 (0x414D == 12.8125).
+        import struct
+
+        path = tmp_path / "scalars.safetensors"
+        tensors = {
+            "audio_tower.input_max": (struct.pack("<H", 0x414D), [], "BF16"),
+            "layer.0.weight": np.random.randn(4, 8).astype(np.float16),
+        }
+        _write_safetensors(str(path), tensors)
+        return str(path)
+
+    def test_scalar_items_getitem_and_pop(self, scalar_sf_file):
+        idx = _LazyTensorIndex([scalar_sf_file])
+        key = "audio_tower.input_max"
+        loaded = [dict(idx.items())[key], idx[key], idx.pop(key)]
+        for arr in loaded:
+            assert arr.shape == ()
+            assert arr.dtype == mx.bfloat16
+            assert arr.item() == 12.8125
+
+    def test_scalar_through_discovered_plan(self, scalar_sf_file):
+        idx = _LazyTensorIndex([scalar_sf_file])
+        plan = _discover_sanitize_plan(
+            lambda weights: {"m." + k: v for k, v in weights.items()}, idx
+        )
+        assert plan is not None
+        arr = _DiscoveredPlan(plan, idx).pop("m.audio_tower.input_max")
+        assert arr.shape == ()
+        assert arr.item() == 12.8125
 
 
 # =============================================================================
@@ -2247,6 +2435,56 @@ class TestQuantizeChunked:
         weighted_err = mx.sum(((w - y_weighted) ** 2) * imp)
         mx.eval(ref_err, weighted_err)
         assert weighted_err.item() < ref_err.item()
+
+    @staticmethod
+    def _stored_weighted_error(grouped, imp, scales, biases, bits, dtype):
+        s = scales.astype(dtype).astype(mx.float32)
+        b = biases.astype(dtype).astype(mx.float32)
+        codes = mx.clip(mx.round((grouped - b) / s), 0, (1 << bits) - 1)
+        return mx.sum(imp * (grouped - (codes * s + b)) ** 2, axis=-1)
+
+    @pytest.mark.parametrize("bits", [2, 3, 4, 8])
+    def test_lsq_refit_never_raises_stored_weighted_error(self, bits):
+        mx.random.seed(0)
+        grouped = mx.random.normal((32, 4, 64)) * mx.exp(mx.random.normal((32, 4, 1)))
+        imp = mx.broadcast_to(mx.exp(mx.random.normal((64,))), grouped.shape)
+
+        scales, biases = _affine_minmax_params(grouped, bits)
+        refit = _weighted_lsq_refit(grouped, imp, scales, biases, bits, mx.bfloat16)
+        args = (grouped, imp)
+        before = self._stored_weighted_error(*args, scales, biases, bits, mx.bfloat16)
+        after = self._stored_weighted_error(*args, *refit, bits, mx.bfloat16)
+
+        assert mx.all(after <= before).item()
+        assert mx.sum(after).item() < mx.sum(before).item()
+
+    @pytest.mark.skipif(
+        not HAS_MLX or not mx.metal.is_available(), reason="Metal not available"
+    )
+    @pytest.mark.parametrize("group_size", [32, 64, 128])
+    @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+    def test_metal_lsq_refit_matches_reference(self, group_size, dtype):
+        dtype = getattr(mx, dtype)
+        mx.random.seed(1)
+        shape = (64, 512 // group_size, group_size)
+        scale = mx.exp(mx.random.normal((*shape[:2], 1)))
+        grouped = (mx.random.normal(shape) * scale).astype(dtype).astype(mx.float32)
+        imp = mx.broadcast_to(mx.exp(mx.random.normal((group_size,))), shape)
+        scales, biases = _affine_minmax_params(grouped, 3)
+
+        ref = _weighted_lsq_refit(grouped, imp, scales, biases, 3, dtype)
+        out = _weighted_lsq_refit_metal(grouped, imp, scales, biases, 3, dtype)
+        args = (grouped, imp)
+        start = self._stored_weighted_error(*args, scales, biases, 3, dtype)
+        ref_err = self._stored_weighted_error(*args, *ref, 3, dtype)
+        out_err = self._stored_weighted_error(*args, *out, 3, dtype)
+
+        for value in out:
+            assert mx.array_equal(value.astype(dtype).astype(mx.float32), value)
+        assert mx.all(out_err <= start * (1 + 1e-6)).item()
+        same = (out[0] == ref[0]) & (out[1] == ref[1])
+        assert mx.mean(same.astype(mx.float32)).item() > 0.98
+        assert abs(mx.sum(out_err).item() / mx.sum(ref_err).item() - 1) < 1e-4
 
     def test_weighted_3d_expert_importance_chunked(self, monkeypatch):
         monkeypatch.setattr("omlx.oq._QUANTIZE_CHUNK_BYTES", 128)
@@ -2379,6 +2617,30 @@ class TestOQImatrixCollector:
         np.testing.assert_allclose(entry.in_sum2[0], np.array([1.0, 4.0, 9.0, 16.0]))
         np.testing.assert_allclose(entry.in_sum2[1], np.array([25.0, 36.0, 49.0, 64.0]))
         np.testing.assert_allclose(entry.in_sum2[2], np.array([26.0, 40.0, 58.0, 80.0]))
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
+    def test_muse_spark_scaled_experts_are_captured_with_tensor_scales(self):
+        from omlx.patches.muse_spark.muse_spark_model import ScaledSwitchGLU
+
+        mx.random.seed(0)
+        glu = ScaledSwitchGLU(32, 16, 4)
+        for proj in (glu.gate_proj, glu.up_proj, glu.down_proj):
+            proj.global_scale = mx.random.uniform(1.0, 4.0, (4,))
+        x = mx.random.normal((1, 3, 32))
+        indices = mx.array([[[0, 2], [1, 3], [2, 0]]], dtype=mx.int32)
+        expected = glu(x, indices)
+
+        collector = OQImatrixCollector()
+        assert collector.install(glu, name_prefix="mlp.switch_mlp.") == 3
+        got = glu(x, indices)
+        collector.restore(glu)
+
+        # The wrapped projections still apply their NVFP4 tensor scales.
+        assert mx.array_equal(got, expected).item()
+        assert collector.switch_capture_modules == 3
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            counts = collector.entries[f"mlp.switch_mlp.{proj}"].counts
+            np.testing.assert_array_equal(counts, np.array([2, 1, 2, 1]))
 
 
 class TestOQECalibrationData:
@@ -2870,39 +3132,6 @@ class TestDiscoverSanitizePlan:
             np.array(discovered.pop("switch.down.weight")), expected_down
         )
 
-    def test_conditional_mtp_norm_add_materializes_by_mean(self, tmp_path):
-        path = tmp_path / "mtp_norms.safetensors"
-        tensors = {
-            "raw.weight": np.full((8,), 0.04, dtype=np.float16),
-            "shifted.weight": np.full((8,), 1.27, dtype=np.float16),
-        }
-        _write_safetensors(str(path), tensors)
-        idx = _LazyTensorIndex([str(path)])
-
-        plan = {
-            "raw.weight": {
-                "sources": ["raw.weight"],
-                "transform": "add_if_mean_lt_0_5",
-                "shape": (8,),
-                "axis": None,
-            },
-            "shifted.weight": {
-                "sources": ["shifted.weight"],
-                "transform": "add_if_mean_lt_0_5",
-                "shape": (8,),
-                "axis": None,
-            },
-        }
-        discovered = _DiscoveredPlan(plan, idx)
-
-        raw = discovered.pop("raw.weight")
-        shifted = discovered.pop("shifted.weight")
-
-        assert float(raw.astype(mx.float32)[0].item()) == pytest.approx(1.04, abs=1e-3)
-        assert float(shifted.astype(mx.float32)[0].item()) == pytest.approx(
-            1.27, abs=1e-3
-        )
-
 
 # =============================================================================
 # Test _model_exceeds_ram guard
@@ -2963,6 +3192,68 @@ class TestModelExceedsRamGuard:
         assert index.nbytes() == weight.nbytes
         assert _checkpoint_storage_bytes([path]) >= weight.nbytes + scales.nbytes
 
+    def test_qwen4_calibration_charges_only_touched_resident_storage(self, tmp_path):
+        from safetensors.numpy import save_file as np_save
+
+        from omlx.oq import _calibration_resident_checkpoint_bytes
+
+        resident = np.zeros((32, 64), dtype=np.float16)
+        ple_weight = np.zeros((256, 20), dtype=np.uint32)
+        ple_scales = np.zeros((256, 5), dtype=np.float16)
+        ple_biases = np.zeros((256, 5), dtype=np.float16)
+        vision = np.zeros((16, 64), dtype=np.float16)
+        lm_head = np.zeros((32, 64), dtype=np.float16)
+        ple = (
+            "language_model.model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.0"
+        )
+        tensors = {
+            "language_model.model.layers.0.self_attn.q_proj.weight": resident,
+            f"{ple}.weight": ple_weight,
+            f"{ple}.scales": ple_scales,
+            f"{ple}.biases": ple_biases,
+            "vision_tower.blocks.0.attn.q_proj.weight": vision,
+            "language_model.lm_head.weight": lm_head,
+        }
+        path = tmp_path / "model.safetensors"
+        np_save(tensors, str(path))
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {"model_type": "qwen4_exp_text"},
+        }
+
+        deferred = sum(
+            tensor.nbytes
+            for name, tensor in tensors.items()
+            if name.startswith(ple)
+            or name.startswith("vision_tower.")
+            or name.endswith("lm_head.weight")
+        )
+        assert _calibration_resident_checkpoint_bytes(tmp_path, config) == (
+            path.stat().st_size - deferred
+        )
+
+    def test_non_qwen4_resident_accounting_remains_complete_storage(self, tmp_path):
+        from safetensors.numpy import save_file as np_save
+
+        from omlx.oq import _calibration_resident_checkpoint_bytes
+
+        path = tmp_path / "model.safetensors"
+        np_save(
+            {
+                "model.layers.0.weight": np.zeros((32, 64), dtype=np.float16),
+                # A similarly named tensor has no mmap contract on other models.
+                "model.ngram_embedding.shards.0.weight": np.zeros(
+                    (128, 64), dtype=np.float16
+                ),
+            },
+            str(path),
+        )
+
+        assert _calibration_resident_checkpoint_bytes(
+            tmp_path, {"model_type": "llama"}
+        ) == path.stat().st_size
+
     @pytest.mark.parametrize("capacity_gib", [16, 32, 64])
     def test_budget_reserves_25_percent_on_smaller_systems(
         self, monkeypatch, capacity_gib
@@ -3016,8 +3307,50 @@ class TestModelExceedsRamGuard:
         assert _calibration_memory_budget(at_limit)["requires_proxy"] is False
         assert _calibration_memory_budget(at_limit + 1)["requires_proxy"] is True
 
+    def test_budget_uses_live_memory_pressure(self, monkeypatch):
+        from omlx import oq as oq_module
+
+        gib = 1024**3
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", lambda: int(72.9 * gib)
+        )
+        monkeypatch.setattr(
+            oq_module, "_metal_available_memory_bytes", lambda: int(107.5 * gib)
+        )
+
+        budget = _calibration_memory_budget(int(67.0 * gib))
+
+        capacity = int(72.9 * gib)
+        assert budget["capacity_bytes"] == capacity
+        assert budget["model_limit_bytes"] == int(capacity * 0.75)
+        assert budget["requires_proxy"] is True
+
 
 class TestOqeCalibrationBatchPlan:
+    def test_qwen4_calibration_forces_ssd_ple_and_keeps_mtp(self):
+        from omlx.oq import _calibration_model_settings
+
+        settings = _calibration_model_settings(
+            {"model_type": "qwen4_exp"},
+            has_mtp_heads=True,
+            has_mtp_weights=True,
+        )
+
+        assert settings.qwen4_ple_ssd_offload is True
+        assert settings.mtp_enabled is True
+
+    def test_ordinary_non_mtp_calibration_has_no_serving_override(self):
+        from omlx.oq import _calibration_model_settings
+
+        assert (
+            _calibration_model_settings(
+                {"model_type": "llama"},
+                has_mtp_heads=False,
+                has_mtp_weights=False,
+            )
+            is None
+        )
+
     def test_subtracts_lazy_model_footprint(self, monkeypatch):
         from omlx import oq as oq_module
 
@@ -3356,6 +3689,80 @@ class TestBuildProxyForSensitivity:
         assert f"{prefix}.key_proj" not in quantization
         assert f"{prefix}.value_proj" not in quantization
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_qwen4_proxy_quantizes_packed_experts_and_preserves_mtp_vision(
+        self, tmp_path, monkeypatch
+    ):
+        """Exercise the source layout that produced the 263.1 GiB proxy."""
+        from safetensors import safe_open
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        out = tmp_path / "proxy"
+        src.mkdir()
+        config = {
+            "model_type": "qwen4_exp",
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "text_config": {"model_type": "qwen4_exp_text"},
+            "vision_config": {"hidden_size": 16},
+        }
+        (src / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        raw = "model.language_model.layers.0.mlp.experts"
+        ngram = (
+            "model.language_model.layers.0.ple.ple_embedding."
+            "ngram_embedding.shard_0"
+        )
+        vision = "model.visual.blocks.0.attn.q_proj.weight"
+        np_save(
+            {
+                f"{raw}.gate_up_proj": np.ones((2, 128, 64), dtype=np.float16),
+                f"{raw}.down_proj": np.ones((2, 64, 64), dtype=np.float16),
+                f"{ngram}.weight": np.ones((4, 160), dtype=np.float16),
+                "mtp.fc_hidden.weight": np.ones((64, 64), dtype=np.float16),
+                vision: np.ones((16, 64), dtype=np.float16),
+            },
+            str(src / "model.safetensors"),
+        )
+
+        def qwen4_sanitize(weights):
+            gate_up = weights.pop(f"{raw}.gate_up_proj")
+            gate, up = mx.split(gate_up, 2, axis=-2)
+            prefix = "language_model.model.layers.0.mlp.switch_mlp"
+            weights[f"{prefix}.gate_proj.weight"] = gate
+            weights[f"{prefix}.up_proj.weight"] = up
+            weights[f"{prefix}.down_proj.weight"] = weights.pop(
+                f"{raw}.down_proj"
+            )
+            return weights
+
+        monkeypatch.setattr(
+            "omlx.oq._build_model_sanitizer",
+            lambda *_args, **_kwargs: qwen4_sanitize,
+        )
+        monkeypatch.setattr("omlx.oq._build_non_quantizable_set", lambda _c: set())
+        _build_streaming_proxy_for_sensitivity(
+            str(src),
+            out,
+            dtype="bfloat16",
+            preserve_mtp=True,
+        )
+
+        keys = set()
+        for path in out.glob("*.safetensors"):
+            with safe_open(str(path), framework="numpy") as file:
+                keys.update(file.keys())
+        prefix = "language_model.model.layers.0.mlp.switch_mlp"
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            assert f"{prefix}.{projection}.scales" in keys
+        assert not any("mlp.experts.gate_up_proj" in key for key in keys)
+        assert f"{ngram}.scales" in keys
+        assert "mtp.fc_hidden.scales" in keys
+        assert vision in keys
+        assert vision.removesuffix(".weight") + ".scales" not in keys
+
+        quantization = json.loads((out / "config.json").read_text())["quantization"]
+        assert quantization[ngram]["group_size"] == 32
+
 
 class TestSensitivityRequiredEnforcement:
     """Regression tests: quantize_oq_streaming must abort when sensitivity
@@ -3523,7 +3930,9 @@ class TestSensitivityRequiredEnforcement:
 
         assert not proxy.exists()
 
-    def test_oqe_uses_proxy_when_source_exceeds_live_limit(self, tmp_path, monkeypatch):
+    def test_proxy_reuses_prebuild_live_budget(
+        self, tmp_path, monkeypatch
+    ):
         if not HAS_MLX:
             pytest.skip("mlx not available")
         from safetensors.numpy import save_file as np_save
@@ -3538,7 +3947,10 @@ class TestSensitivityRequiredEnforcement:
 
         from omlx import oq as oq_module
 
-        monkeypatch.setattr(oq_module, "_system_available_memory_bytes", lambda: 1000)
+        system_available = MagicMock(side_effect=[1000, 1])
+        monkeypatch.setattr(
+            oq_module, "_system_available_memory_bytes", system_available
+        )
         monkeypatch.setattr(oq_module, "_metal_available_memory_bytes", lambda: 1000)
         proxy = tmp_path / "proxy"
         build_proxy = MagicMock()
@@ -3566,6 +3978,7 @@ class TestSensitivityRequiredEnforcement:
             )
 
         build_proxy.assert_called_once()
+        system_available.assert_called_once()
         assert not proxy.exists()
 
 
@@ -3965,6 +4378,123 @@ class TestPreQuantizedSource:
         assert tid.dtype == mx.int32
         assert mx.array_equal(tid, mx.arange(8, dtype=mx.int32).reshape(2, 4)).item()
 
+    def test_muse_spark_nvfp4_experts_pass_through(self, tmp_path):
+        from omlx.patches.muse_spark import muse_spark_model as msm
+
+        prefix = "model.language_model.layers.0.mlp.experts."
+        rng = np.random.default_rng(0)
+        packed = rng.integers(0, 256, (2, 32, 16), dtype=np.uint8)
+        block = rng.integers(0x68, 0x7F, (2, 32, 2), dtype=np.uint8)
+        scale2 = np.array([[1e-5, 2e-5], [3e-5, 4e-5]], dtype=np.float32)
+
+        def f32(a):
+            return (np.ascontiguousarray(a).tobytes(), list(a.shape), "F32")
+
+        path = str(tmp_path / "experts.safetensors")
+        _write_safetensors(
+            path,
+            {
+                prefix + "gate_up_proj": (packed.tobytes(), [2, 32, 16], "U8"),
+                prefix + "gate_up_proj_weight_scale": (
+                    block.tobytes(),
+                    [2, 32, 2],
+                    "F8_E4M3",
+                ),
+                prefix + "gate_up_proj_weight_scale_2": f32(scale2),
+                prefix + "gate_up_proj_input_scale": f32(scale2),
+                prefix + "down_proj": (packed[:, :16].tobytes(), [2, 16, 16], "U8"),
+                prefix + "down_proj_weight_scale": (
+                    block[:, :16].tobytes(),
+                    [2, 16, 2],
+                    "F8_E4M3",
+                ),
+                prefix + "down_proj_weight_scale_2": f32(scale2[:, 0]),
+                prefix + "down_proj_input_scale": f32(scale2[:, 0]),
+            },
+        )
+        config = {
+            "model_type": "muse_spark",
+            "quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        }
+        idx = _LazyTensorIndex([path], config=config)
+        nvfp4 = {"kind": "nvfp4", "bits": 4, "group_size": 16, "mode": "nvfp4"}
+        assert idx.source_quant_info(prefix + "gate_up_proj") == nvfp4
+        logical = idx.logical_metadata()
+        assert logical[prefix + "gate_up_proj"] == ((2, 32, 32), "BF16")
+        assert prefix + "gate_up_proj_weight_scale" not in logical
+
+        dp = _DiscoveredPlan(_discover_sanitize_plan(msm.sanitize_experts, idx), idx)
+        switch = "model.language_model.layers.0.mlp.switch_mlp."
+        # oQ3 requantizes gate/up and folds their tensor scales into the
+        # weights; projections passed through as NVFP4 (all of them at oQ4)
+        # keep their scales.
+        from omlx.oq import _fold_nvfp4_tensor_scale, _muse_spark_folded_scales
+
+        folded = _muse_spark_folded_scales(dp, config, 3, 64)
+        assert f"{switch}gate_proj.global_scale" in folded
+        assert f"{switch}up_proj.global_scale" in folded
+        assert not _muse_spark_folded_scales(dp, config, 4, 64)
+        # The fused gate_up source splits into two packed halves, gate first.
+        for proj, rows in (("gate_proj", slice(0, 16)), ("up_proj", slice(16, 32))):
+            out = f"{switch}{proj}.weight"
+            assert dp.source_quant_info(out) == nvfp4
+            weight, scales = dp.pop_packed(out)
+            expected = mx.array(packed[:, rows]).view(mx.uint32)
+            assert mx.array_equal(weight, expected).item()
+            assert mx.array_equal(scales, mx.array(block[:, rows])).item()
+        assert dp.source_quant_info(f"{switch}down_proj.weight") == nvfp4
+        # Tensor scales become the amax mlx-lm stores: scale * 6 * 448.
+        amax = scale2 * np.float32(6 * 448)
+        for proj, value in (
+            ("gate_proj", amax[:, 0]),
+            ("up_proj", amax[:, 1]),
+            ("down_proj", amax[:, 0]),
+        ):
+            assert mx.array_equal(
+                dp.pop(f"{switch}{proj}.global_scale"), mx.array(value)
+            ).item()
+
+        # Sourced dequantized (streamed calibration), the tensor scale is left
+        # to the model, which applies global_scale at run time.
+        expected = mx.dequantize(
+            mx.array(packed).view(mx.uint32),
+            mx.array(block),
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+        )
+        assert mx.array_equal(
+            idx._dequant_one(prefix + "gate_up_proj"),
+            expected.astype(mx.bfloat16),
+        ).item()
+        # Folding restores the real weights: NVFP4 units times weight_scale_2.
+        units = expected[:, :16]
+        folded = _fold_nvfp4_tensor_scale(units, mx.array(amax[:, 0]))
+        real = units.astype(mx.float32) * mx.array(scale2[:, 0])[:, None, None]
+        assert folded.dtype == units.dtype
+        assert mx.allclose(folded.astype(mx.float32), real, rtol=1e-2, atol=0).item()
+
+    def test_muse_spark_imatrix_cache_serves_passthrough_levels(self):
+        from omlx.oq import OQImatrixData, _oqe_cache_covers_capture_skip
+
+        experts = ["language_model.model.layers.1.mlp.switch_mlp.gate_proj"]
+
+        def cache(metadata):
+            return OQImatrixData(entries={}, metadata=metadata, path="unused.npz")
+
+        full = cache({"capture_skip": []})
+        partial = cache({"capture_skip": experts})
+        legacy = cache({"capture_skip_hash": "0" * 64})
+        passthrough = {"_oq_imatrix_capture_skip": frozenset(experts)}
+        requantize = {}
+        # A full collection (oQ3e) also serves a level that passes the NVFP4
+        # experts through (oQ4e), but not the other way around.
+        assert _oqe_cache_covers_capture_skip(full, passthrough)
+        assert _oqe_cache_covers_capture_skip(partial, passthrough)
+        assert not _oqe_cache_covers_capture_skip(partial, requantize)
+        # Hash-only caches do not record which modules they skipped.
+        assert not _oqe_cache_covers_capture_skip(legacy, passthrough)
+
     def test_stack_pop_packed(self, tmp_path):
         path = str(tmp_path / "experts.safetensors")
         tensors = {}
@@ -4177,6 +4707,137 @@ class TestEstimateBpwHeaderOnly:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestQuantizeOqStreamingPassthroughDtypes:
+    def test_clef_joint_head_is_copied_beside_an_indexed_backbone(self, tmp_path):
+        """The Clef decision head is not a backbone weight. It must stay out of
+        the quantized shards, and a single-shard output still needs an index
+        so mlx-vlm does not load every *.safetensors file."""
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        np_save(
+            {
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+        np_save(
+            {
+                "layers.0.linear1.weight": np.ones((hidden, hidden), dtype=np.float32),
+                "hidden_norm.weight": np.ones(hidden, dtype=np.float32),
+            },
+            str(src / "joint_head.safetensors"),
+        )
+        (src / "joint_head_config.json").write_text('{"hidden_size": 64}')
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_passthrough",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+        assert [f.name for f in _source_weight_files(src)] == ["model.safetensors"]
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        index = json.loads((out / "model.safetensors.index.json").read_text())
+        assert set(index["weight_map"]) == {
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.scales",
+            "model.layers.0.self_attn.q_proj.biases",
+        }
+        assert set(index["weight_map"].values()) == {"model.safetensors"}
+        for name in ("joint_head.safetensors", "joint_head_config.json"):
+            assert (out / name).read_bytes() == (src / name).read_bytes()
+
+    def _d3_source(self, tmp_path):
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        np_save(
+            {
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+        np_save(
+            {"weight": np.ones((255, hidden), dtype=np.float32)},
+            str(src / "readout.safetensors"),
+        )
+        (src / "decision_config.json").write_text(
+            json.dumps(
+                {
+                    "format_id": "d3-code-readout-v1",
+                    "attention_mode": "noncausal_full_attention",
+                }
+            )
+        )
+        (src / "MODEL_MANIFEST.json").write_text("{}")
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_passthrough",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+        return src
+
+    def test_d3_readout_is_copied_beside_an_indexed_backbone(self, tmp_path):
+        """The d3 readout stays FP32 outside the shards with its decision
+        config; the package manifest no longer matches and is not copied."""
+        src = self._d3_source(tmp_path)
+        assert [f.name for f in _source_weight_files(src)] == ["model.safetensors"]
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4)
+
+        index = json.loads((out / "model.safetensors.index.json").read_text())
+        assert set(index["weight_map"].values()) == {"model.safetensors"}
+        assert not any("weight" == key for key in index["weight_map"])
+        for name in ("readout.safetensors", "decision_config.json"):
+            assert (out / name).read_bytes() == (src / name).read_bytes()
+        assert not (out / "MODEL_MANIFEST.json").exists()
+        config = json.loads((out / "config.json").read_text())
+        assert "_oq_noncausal_attention" not in config
+
+    def test_d3_rejects_text_only_output(self, tmp_path):
+        src = self._d3_source(tmp_path)
+        with pytest.raises(ValueError, match="vision tower"):
+            quantize_oq_streaming(
+                str(src), str(tmp_path / "out"), oq_level=4, text_only=True
+            )
+
     def test_float16_keeps_vision_audio_passthrough_tensors_float32(self, tmp_path):
         """Protected VLM/audio tensors must not be saved as FP16."""
         from safetensors.numpy import save_file as np_save
@@ -4242,6 +4903,63 @@ class TestQuantizeOqStreamingPassthroughDtypes:
         )
         assert tensors["model.layers.0.input_layernorm.weight"].dtype == mx.float16
         assert tensors["model.layers.0.self_attn.q_proj.weight"].dtype == mx.uint32
+
+    @pytest.mark.parametrize(
+        ("source_dtype", "target_dtype"),
+        [("bfloat16", "float16"), ("float16", "bfloat16")],
+    )
+    def test_output_config_reports_the_dtype_it_wrote(
+        self, tmp_path, source_dtype, target_dtype
+    ):
+        """A build must report its own dtype, not the one it read."""
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        hidden = 64
+        np_save(
+            {
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    hidden, dtype=np.float32
+                ),
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (hidden, hidden), dtype=np.float32
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["TestModelForCausalLM"],
+                    "model_type": "test_passthrough",
+                    "num_hidden_layers": 1,
+                    "hidden_size": hidden,
+                    "vocab_size": 256,
+                    "dtype": source_dtype,
+                    "torch_dtype": source_dtype,
+                    "text_config": {"dtype": source_dtype},
+                }
+            ),
+            encoding="utf-8",
+        )
+        (src / "oq_sensitivity_map.json").write_text(
+            json.dumps({"0": 0.1}), encoding="utf-8"
+        )
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(str(src), str(out), oq_level=4, dtype=target_dtype)
+
+        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        assert config["dtype"] == target_dtype
+        assert config["torch_dtype"] == target_dtype
+        assert config["text_config"]["dtype"] == target_dtype
+
+        tensors = {}
+        for sf in out.glob("*.safetensors"):
+            tensors.update(mx.load(str(sf)))
+        stored = mx.float16 if target_dtype == "float16" else mx.bfloat16
+        assert tensors["model.layers.0.input_layernorm.weight"].dtype == stored
 
 
 # =============================================================================
@@ -4912,6 +5630,110 @@ class TestBuildModelSanitizerMiniMaxCompat:
         assert sanitize({"weight": 1}) == {"weight": 1}
 
 
+class TestBuildModelSanitizerQwen4Compat:
+    def test_qwen4_applies_compat_before_model_lookup(self, monkeypatch):
+        pytest.importorskip("mlx_vlm.utils")
+        from types import SimpleNamespace
+
+        import mlx_vlm.utils as vlm_utils
+
+        from omlx.oq import _build_model_sanitizer
+
+        class _Cfg:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+
+            @classmethod
+            def from_dict(cls, fields):
+                return cls(**fields)
+
+        class _FakeModel:
+            @staticmethod
+            def sanitize(_proxy, weights):
+                return weights
+
+        fake_module = SimpleNamespace(
+            Model=_FakeModel,
+            ModelConfig=_Cfg,
+            VisionConfig=_Cfg,
+            TextConfig=_Cfg,
+            VisionModel=object,
+            LanguageModel=object,
+        )
+        applied = []
+
+        def unsupported_get_model_and_args(_config):
+            raise ValueError("Model type qwen4_exp not supported")
+
+        def apply_compat_patch():
+            applied.append(True)
+            vlm_utils.get_model_and_args = lambda _config: (fake_module, "qwen4_exp")
+            return True
+
+        monkeypatch.setattr(
+            vlm_utils,
+            "get_model_and_args",
+            unsupported_get_model_and_args,
+        )
+        monkeypatch.setattr(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat."
+            "apply_mlx_vlm_qwen4_exp_compat_patch",
+            apply_compat_patch,
+        )
+        monkeypatch.setattr(
+            "mlx_vlm.utils.sanitize_weights",
+            lambda _model, weights, _config: weights,
+        )
+        config = {
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "num_hidden_layers": 1,
+                "hidden_size": 16,
+            },
+            "vision_config": {"hidden_size": 8},
+        }
+
+        sanitize = _build_model_sanitizer(config, text_only=False)
+
+        assert applied == [True]
+        assert sanitize is not None
+
+    def test_qwen4_model_path_binds_mmap_and_preserve_mtp(
+        self, tmp_path, monkeypatch
+    ):
+        from omlx import oq
+
+        configured = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            oq,
+            "_configure_qwen4_exp_quantization_runtime",
+            configured,
+        )
+        # The registration behavior itself is covered above; this assertion
+        # isolates the path/MTP state passed by quantization call sites.
+        monkeypatch.setattr(
+            "omlx.patches.mlx_vlm_qwen4_exp_compat."
+            "apply_mlx_vlm_qwen4_exp_compat_patch",
+            lambda: True,
+        )
+        oq._build_model_sanitizer(
+            {
+                "model_type": "qwen4_exp",
+                "architectures": [],
+                "text_config": {"model_type": "qwen4_exp_text"},
+            },
+            model_path=tmp_path,
+            preserve_mtp=True,
+        )
+
+        configured.assert_called_once()
+        assert configured.call_args.args[0] == tmp_path
+        assert configured.call_args.args[1]["model_type"] == "qwen4_exp"
+        assert configured.call_args.kwargs == {"preserve_mtp": True}
+
+
 # =============================================================================
 # Test _vlm_sanitize proxy exposes the gemma-4 audio-guard attributes
 # =============================================================================
@@ -5214,17 +6036,14 @@ class TestMeasureSensitivityVlmMtp:
         mock_set_active.assert_not_called()
 
     def test_text_load_forwards_trust_remote_code(self, monkeypatch):
-        """Text sensitivity load forwards the mlx-lm custom-code opt-in when
-        the installed mlx-lm supports it."""
+        """Text sensitivity load forwards the mlx-lm custom-code opt-in."""
         import omlx.utils.model_loading as real_ml
 
         self._patch_common(monkeypatch, has_mtp=True)
         mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
         # _patch_common swapped model_loading for a MagicMock; oq imports
-        # lm_load_compat from it. Expose the real shim and pin the capability
-        # flag so forwarding is deterministic regardless of installed mlx-lm.
-        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", True)
+        # lm_load_compat from it, so expose the real shim.
         sys.modules["omlx.utils.model_loading"].lm_load_compat = real_ml.lm_load_compat
 
         _measure_sensitivity(
@@ -5238,14 +6057,13 @@ class TestMeasureSensitivityVlmMtp:
 
 
 class TestCollectImatrixTextLoad:
-    def test_uses_compat_loader_without_trust_remote_code(self, monkeypatch):
-        """oQe calibration works with current mlx-lm, which removed this kwarg."""
+    def test_uses_compat_loader_with_trust_remote_code(self, monkeypatch):
+        """oQe calibration forwards the custom-code opt-in to mlx-lm."""
         from omlx import oq as oq_mod
         import omlx.utils.model_loading as real_ml
 
         mock_load = MagicMock(return_value=(MagicMock(), MagicMock()))
         monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=mock_load))
-        monkeypatch.setattr(real_ml, "_LM_LOAD_ACCEPTS_TRC", False)
         monkeypatch.setattr(real_ml, "_has_mtp_heads", MagicMock(return_value=False))
         monkeypatch.setattr(
             real_ml, "_checkpoint_has_mtp_weights", MagicMock(return_value=False)
@@ -5257,7 +6075,79 @@ class TestCollectImatrixTextLoad:
 
         oq_mod._collect_imatrix("/fake/text", {}, trust_remote_code=True)
 
-        assert "trust_remote_code" not in mock_load.call_args.kwargs
+        assert mock_load.call_args.kwargs["trust_remote_code"] is True
+
+    def test_vlm_proxy_passes_lenient_load_directly(self, monkeypatch):
+        """SSD-mapped proxy tensors are not normal model parameters.
+
+        The supported mlx-vlm ``strict`` option must reach load_model itself;
+        patching Module.load_weights globally did not reliably affect the real
+        Qwen4 proxy load and rejected every retained PLE shard.
+        """
+        import omlx.utils.model_loading as model_loading
+
+        from omlx import oq as oq_mod
+
+        vlm_load = MagicMock(return_value=MagicMock())
+        tokenizer_load = MagicMock(return_value=MagicMock())
+        monkeypatch.setitem(
+            sys.modules, "mlx_vlm.utils", MagicMock(load_model=vlm_load)
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx_lm.tokenizer_utils",
+            MagicMock(load=tokenizer_load),
+        )
+        monkeypatch.setattr(
+            model_loading, "_checkpoint_has_mtp_weights", lambda _path: False
+        )
+        monkeypatch.setattr(model_loading, "_has_mtp_heads", lambda _config: False)
+        monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", MagicMock())
+        monkeypatch.setattr(
+            oq_mod, "_collect_imatrix_from_model", MagicMock(return_value=({}, {}))
+        )
+
+        oq_mod._collect_imatrix(
+            "/fake/qwen4-proxy",
+            {
+                "model_type": "qwen4_exp",
+                "vision_config": {"hidden_size": 8},
+                "text_config": {"model_type": "qwen4_exp_text"},
+            },
+            trust_remote_code=True,
+        )
+
+        assert vlm_load.call_args.kwargs["strict"] is False
+        assert vlm_load.call_args.kwargs["trust_remote_code"] is True
+
+    def test_empty_collection_reports_the_failed_stage(self, monkeypatch, tmp_path):
+        from omlx import oq as oq_mod
+
+        monkeypatch.setattr(
+            oq_mod,
+            "_collect_imatrix",
+            MagicMock(
+                return_value=(
+                    {},
+                    {
+                        "failure_stage": "collector_install",
+                        "failure_reason": "no supported capture modules found",
+                    },
+                )
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="stage=collector_install"):
+            oq_mod._load_or_collect_imatrix(
+                str(tmp_path),
+                {},
+                cache_path=str(tmp_path / "imatrix.npz"),
+                reuse_cache=False,
+                num_samples=1,
+                seq_length=8,
+                strict=False,
+                trust_remote_code=False,
+            )
 
 
 class TestMeasureSensitivityQuantizedVlm:
@@ -5313,6 +6203,7 @@ class TestMeasureSensitivityQuantizedVlm:
         assert vlm_load.call_args.args[0] == Path("/fake/minimax-proxy")
         assert vlm_load.call_args.kwargs["lazy"] is True
         assert vlm_load.call_args.kwargs["trust_remote_code"] is True
+        assert vlm_load.call_args.kwargs["strict"] is False
         tokenizer_load.assert_called_once_with(Path("/fake/minimax-proxy"))
         lm_load.assert_not_called()
 
@@ -6575,7 +7466,7 @@ class TestGlm5NextLayerWalk:
             calib_dataset="test",
         )
 
-        assert signature["layer_walk"] == "glm5_next_hc_moe_lm_head_v3"
+        assert signature["layer_walk"] == "glm5_next_hc_moe_lm_head_v4"
 
     def test_hyper_connections_and_moe_imatrix_hooks_execute(self):
         from omlx.patches import mlx_vlm_glm5_next_compat
@@ -6590,6 +7481,7 @@ class TestGlm5NextLayerWalk:
         config.text_config.n_shared_experts = 1
         config.text_config.first_k_dense_replace = 1
         config.text_config.mlp_layer_types = ["dense", "sparse"]
+        config.text_config.index_topk = 2048
         model = Model(config)
         tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
         layers = model.language_model.model.layers
@@ -6634,6 +7526,50 @@ class TestGlm5NextLayerWalk:
         finally:
             collector.restore(model)
         assert linear_attention.fuse_in
+
+    def test_mtp_head_imatrix_hooks_execute(self):
+        from omlx.oq import _collect_mtp_head_imatrix, _run_glm5_next_mtp_blocks
+        from omlx.patches import mlx_vlm_glm5_next_compat
+        from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+        from tests.test_mlx_vlm_glm5_next_compat import _tiny_config
+
+        mlx_vlm_glm5_next_compat.apply_mlx_vlm_glm5_next_compat_patch()
+        assert glm5_next_vlm_runtime.apply()
+        from mlx_vlm.models.glm5_next import Model
+
+        config = _tiny_config()
+        config.text_config.index_topk = 2048
+        config.text_config.num_nextn_predict_layers = 1
+        model = Model(config)
+        language_model = model.language_model
+        # Past 8 rows, attention reads embed_q only through q_b_proj's hook.
+        tokens = mx.arange(1, 13, dtype=mx.int32)[None]
+        layers = language_model.model.layers
+        inputs = language_model.model.embed_tokens(tokens)
+        inputs, masks, state = _prepare_layer_inputs(model, layers, tokens, inputs)
+
+        collector = OQImatrixCollector()
+        collector.install(model)
+        try:
+            for layer_idx, layer in enumerate(layers):
+                inputs, _ = _forward_layer_result(
+                    layer, inputs, masks[layer_idx], state, layer_idx=layer_idx
+                )
+            assert _collect_mtp_head_imatrix(model, tokens, inputs)
+        finally:
+            collector.restore(model)
+        assert "language_model.mtp.0.eh_proj" in collector.entries
+
+        # The streamed collector installs the head alone under its entry prefix.
+        head = language_model.mtp[0]
+        collector = OQImatrixCollector()
+        collector.install(head, name_prefix="language_model.mtp.0.")
+        try:
+            embed = language_model.model.embed_tokens
+            _run_glm5_next_mtp_blocks([head], inputs, embed, tokens[:, 1:])
+        finally:
+            collector.restore(head)
+        assert "language_model.mtp.0.block.self_attn.embed_q" in collector.entries
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
@@ -6791,3 +7727,260 @@ class TestEstimateBpwPostSanitizeNames:
         # Experts dominate the parameter count; a raw-name scan reports
         # ~15-16 bpw because none of them end in ".weight".
         assert est["effective_bpw"] < 8.0, est
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestStreamedCalibration:
+    @pytest.fixture
+    def checkpoint(self, tmp_path, monkeypatch):
+        from dataclasses import asdict
+        from mlx.utils import tree_flatten
+        from tests.test_mlx_vlm_qwen4_exp_compat import _tiny_config
+        import omlx.oq as oq
+
+        cfg = _tiny_config()
+        cfg.text_config.linear_key_head_dim = 32
+        cfg.text_config.linear_value_head_dim = 32
+        from mlx_vlm.models.qwen4_exp.language import (
+            configure_mtp_runtime,
+            configure_ple_runtime,
+        )
+        from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+
+        source = tmp_path / "source"
+        source.mkdir()
+        index = source / "model.safetensors.index.json"
+        index.write_text(
+            json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}})
+        )
+        configure_ple_runtime(source, mode="resident")
+        configure_mtp_runtime(source, enabled=True)
+        mx.random.seed(7)
+        model = Model(cfg)
+        model.eval()
+        weights = {
+            key: value.astype(mx.bfloat16) if value.dtype == mx.float32 else value
+            for key, value in tree_flatten(model.parameters())
+        }
+        scale_key = next(
+            key for key in weights if key.endswith("ngram_embedding.weight_scale")
+        )
+        weights[scale_key] = mx.array([0.25], dtype=mx.bfloat16)
+        model.load_weights(list(weights.items()))
+        mx.eval(model.parameters())
+        config = asdict(cfg)
+        config["architectures"] = ["Qwen4ExpForConditionalGeneration"]
+        config["text_config"]["mtp_num_hidden_layers"] = 1
+        (source / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(str(source / "model.safetensors"), weights)
+        index.write_text(
+            json.dumps({"weight_map": {key: "model.safetensors" for key in weights}})
+        )
+        tokens = mx.array(
+            [
+                [1, 2, 3, 4, 5, 6],
+                [2, 3, 4, 5, 6, 7],
+                [3, 4, 5, 6, 7, 8],
+                [4, 5, 6, 7, 8, 9],
+            ],
+            dtype=mx.int32,
+        )
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: object())
+        yield source, config, model, tokens, scale_key
+        configure_mtp_runtime(source, enabled=False)
+        configure_ple_runtime(source, mode="resident")
+        mx.synchronize()
+        mx.clear_cache()
+
+    @pytest.mark.parametrize("keep_mtp", [False, True])
+    def test_imatrix_parity_and_cache_reuse(
+        self, checkpoint, tmp_path, monkeypatch, keep_mtp
+    ):
+        import omlx.oq as oq
+
+        source, config, model, tokens, _ = checkpoint
+        resident, _ = oq._collect_imatrix_from_model(
+            model,
+            object(),
+            config,
+            calib_dataset=oq._OQE_CALIB_DATASET,
+            num_samples=2,
+            seq_length=6,
+        )
+        monkeypatch.setattr(
+            "mlx_vlm.utils.load_model",
+            MagicMock(
+                side_effect=AssertionError("streaming must not load the whole model")
+            ),
+        )
+        kwargs = dict(
+            cache_path=str(tmp_path / "imatrix.npz"),
+            reuse_cache=True,
+            num_samples=2,
+            seq_length=6,
+            strict=False,
+            trust_remote_code=False,
+            stream_calibration=True,
+            require_mtp_entries=keep_mtp,
+            measure_sensitivity=True,
+            sensitivity_oq_level=4,
+            sensitivity_num_samples=2,
+            sensitivity_seq_length=6,
+        )
+        first = oq._load_or_collect_imatrix(str(source), config, **kwargs)
+        assert first.metadata["collection"]["processed_samples"] == 4
+        expected = {
+            key: value
+            for key, value in resident.items()
+            if keep_mtp or not key.startswith("mtp.")
+        }
+        assert first.entries.keys() == expected.keys()
+        for key, entry in expected.items():
+            np.testing.assert_array_equal(first.entries[key].counts, entry.counts)
+            np.testing.assert_array_equal(
+                first.entries[key].in_sum2, entry.in_sum2, err_msg=key
+            )
+        reference = oq._measure_sensitivity_from_model(
+            model, object(), config, 4, num_samples=2, seq_length=6
+        )
+        fused = first.metadata["collection"]["sensitivity_map"]
+        assert fused.keys() == reference.keys()
+        assert any(value > 0 for value in reference.values())
+        for key, value in reference.items():
+            assert fused[key] == pytest.approx(value, abs=1e-6)
+        second = oq._load_or_collect_imatrix(str(source), config, **kwargs)
+        assert not first.reused and second.reused
+
+    @pytest.mark.parametrize("keep_mtp", [False, True])
+    def test_output_preserves_ple_scale_and_reloads(
+        self, checkpoint, tmp_path, monkeypatch, keep_mtp
+    ):
+        from mlx.utils import tree_flatten
+        from mlx_vlm.utils import load_model
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
+        import omlx.oq as oq
+
+        source, config, model, tokens, scale_key = checkpoint
+
+        def unexpected_measurement(*args, **kwargs):
+            raise AssertionError("explicit sensitivity override must skip measurement")
+
+        monkeypatch.setattr(oq, "_streamed_sensitivity_state", unexpected_measurement)
+        output = tmp_path / "output"
+        oq.quantize_oq_streaming(
+            str(source),
+            str(output),
+            4,
+            group_size=32,
+            enhanced=True,
+            stream_calibration=True,
+            imatrix_num_samples=2,
+            imatrix_seq_length=6,
+            sensitivity_map_override={0: 1, 1: 1},
+            preserve_mtp=keep_mtp,
+        )
+        configure_qwen4_exp_runtime(output, mode="resident", mtp_enabled=keep_mtp)
+        loaded = load_model(output, lazy=True, strict=True)
+        parameters = dict(tree_flatten(loaded.parameters()))
+        assert parameters[scale_key].item() == 0.25
+        assert any(key.startswith("mtp.") for key in parameters) == keep_mtp
+        assert mx.isfinite(loaded(tokens).logits).all().item()
+
+    @pytest.mark.parametrize(
+        "explicit,kind,over_budget,expected",
+        [
+            (None, "llama", True, False),
+            (None, "minimax_m3_vl", True, True),
+            (None, "glm5_next", True, True),
+            (None, "qwen4_exp", False, False),
+            (False, "qwen4_exp", True, False),
+            (True, "qwen4_exp", False, True),
+        ],
+    )
+    def test_selection(self, explicit, kind, over_budget, expected):
+        import omlx.oq as oq
+
+        assert (
+            oq._resolve_stream_calibration(
+                explicit, model_exceeds_ram=over_budget, model_type=kind
+            )
+            is expected
+        )
+
+    def test_explicit_unsupported_layout_fails_before_loading(self):
+        import omlx.oq as oq
+
+        with pytest.raises(ValueError, match="streaming imatrix sourcer"):
+            oq._resolve_stream_calibration(
+                True, model_exceeds_ram=True, model_type="llama"
+            )
+
+    def test_mmap_ple_is_filtered_before_materialization(self):
+        import omlx.oq as oq
+
+        prefix = "language_model.model.layers.1."
+        skipped = prefix + "ple.ple_embedding.ngram_embedding.shards.0.weight"
+        kept = prefix + "self_attn.q_proj.weight"
+
+        class Plan(dict):
+            def pop(self, key):
+                assert key != skipped, "mmap PLE must not be materialized"
+                return super().pop(key)
+
+        plan = Plan({skipped: object(), kept: mx.ones((2, 2))})
+        items = oq._streamed_layer_items(plan, 1, skip_key=oq._qwen4_exp_mmap_skip_key)
+        assert [key for key, _ in items] == ["self_attn.q_proj.weight"]
+
+    def test_minimax_collection_matches_resident(self, tmp_path, monkeypatch):
+        from dataclasses import asdict
+        from mlx.utils import tree_flatten
+        from omlx.patches.mlx_vlm_minimax_m3_compat import (
+            apply_mlx_vlm_minimax_m3_compat_patch,
+        )
+        import omlx.oq as oq
+
+        apply_mlx_vlm_minimax_m3_compat_patch()
+        from tests.test_mlx_vlm_minimax_m3_compat import _tiny_text_config
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3Model
+
+        args = _tiny_text_config(pack_shared_expert=False)
+        args.vocab_size = 64
+        args.num_hidden_layers = 2
+        args.moe_layer_freq = [0, 1]
+        args.layer_types = ["full_attention", "full_attention"]
+        model = nn.Module()
+        model.language_model = nn.Module()
+        model.language_model.model = MiniMaxM3Model(args)
+        model.eval()
+        config = {
+            "model_type": "minimax_m3_vl",
+            "text_config": asdict(args),
+            "architectures": ["MiniMaxM3ForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+        )
+        tokens = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        resident, _ = oq._collect_imatrix_from_model(
+            model,
+            object(),
+            config,
+            calib_dataset=oq._OQE_CALIB_DATASET,
+            num_samples=1,
+            seq_length=4,
+        )
+        streamed, _ = oq._collect_imatrix_streaming(
+            tmp_path,
+            object(),
+            config,
+            num_samples=1,
+            seq_length=4,
+            calib_data=tokens,
+        )
+        assert resident.keys() == streamed.keys()
+        for key, entry in resident.items():
+            np.testing.assert_array_equal(streamed[key].counts, entry.counts)
+            np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2)

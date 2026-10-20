@@ -15,6 +15,9 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from omlx.cache.paged_cache import PagedCacheManager
+from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
+from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.exceptions import PrefillMemoryExceededError
 from omlx.memory_monitor import MemoryMonitor
 from omlx.request import Request, SamplingParams
@@ -53,7 +56,11 @@ def _make_scheduler() -> Scheduler:
         prefill_step_size=2048,
         paged_cache_block_size=0,
     )
-    return Scheduler(model=model, tokenizer=tokenizer, config=config)
+    scheduler = Scheduler(model=model, tokenizer=tokenizer, config=config)
+    # Admission also plans against hard limit * headroom safety; tests that
+    # pin other terms keep that line at the hard limit.
+    scheduler._prefill_headroom_safety = 1.0
+    return scheduler
 
 
 def _make_request(prompt_tokens: int = 65536) -> Request:
@@ -89,6 +96,20 @@ def test_estimator_produces_nonzero_peak_after_init():
     assert peak > 0
 
 
+def test_paused_request_hot_cache_blocks_stay_protected():
+    """A request paused for prefill eviction waits in the queue with its block
+    table. Releasing its prefix blocks would re-prefill it next turn (#4213)."""
+    scheduler = _make_scheduler()
+    scheduler.paged_cache_manager = SimpleNamespace(
+        blocks={7: SimpleNamespace(block_hash=b"prefix")}
+    )
+    req = _make_request(1024)
+    req.block_table = SimpleNamespace(block_ids=[7])
+    scheduler.waiting.append(req)
+
+    assert scheduler.get_active_hot_cache_block_hashes() == {b"prefix"}
+
+
 def test_preflight_positive_control_passes_normal_request():
     """Positive-control: a normal prompt under a generous limit must NOT
     be rejected. Defends against an accidental sign-flip on the
@@ -121,6 +142,42 @@ def test_preflight_rejects_when_estimated_peak_exceeds_hard_limit():
     assert "KV+SDPA" in rejection.message
     assert rejection.estimated_bytes > 0
     assert rejection.limit_bytes == 1
+
+
+def test_preflight_does_not_charge_a_resumed_request_for_its_own_reserve():
+    """A request resumed after an eviction pause keeps its reserved cache.
+
+    That spare capacity is part of the KV the estimate prices, so it must
+    not also count as current usage.
+    """
+    from mlx_lm.models.cache import KVCache
+
+    from omlx import scheduler as sched_mod
+
+    cache = KVCache()
+    keys = mx.zeros((1, 1, 256, 8), dtype=mx.float16)
+    cache.update_and_fetch(keys, keys)
+    sched_mod._grow_kv_capacity(cache, 4096)
+    spare = sched_mod._reserved_spare_bytes([cache])
+    assert spare == (4096 - 256) * 8 * 2 * 2
+
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    req = _make_request(65536)
+    req.cached_tokens = 256
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=65536, cached_tokens=256, current=0
+    )
+    scheduler._memory_hard_limit_bytes = est.estimated + spare // 2
+    # Isolate the admission line from the physical safety cap.
+    scheduler._memory_abort_limit_bytes = 10**18
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=spare),
+    ):
+        assert scheduler._preflight_memory_check(req) is not None
+        req.prompt_cache = [cache]
+        assert scheduler._preflight_memory_check(req) is None
 
 
 def test_route_preflight_requests_eviction_before_safety_cap_rejection(monkeypatch):
@@ -183,6 +240,22 @@ def test_current_usage_keeps_mlx_active_as_floor_after_hot_cache_subtract():
         patch("omlx.scheduler.get_phys_footprint", return_value=10 * 1024**3),
     ):
         assert scheduler._current_usage_bytes() == 6 * 1024**3
+
+
+def test_current_usage_discounts_pool_release_the_kernel_still_charges():
+    """A just-cleared pool stays in phys_footprint for a moment (#3917)."""
+    gb = 1024**3
+    scheduler = _make_scheduler()
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=22 * gb),
+        patch("omlx.scheduler.mx.get_cache_memory", side_effect=[8 * gb, 0]),
+        patch("omlx.scheduler.get_phys_footprint", return_value=40 * gb),
+        patch("omlx.utils.metal_sync.get_graphics_footprint", return_value=30.5 * gb),
+    ):
+        # Settled: 0.5 GB of Metal memory outside MLX, all of it charged.
+        assert scheduler._current_usage_bytes() == 40 * gb
+        # MLX released its 8 GB pool; the ledgers still charge it.
+        assert scheduler._current_usage_bytes() == 32 * gb
 
 
 def test_current_usage_falls_back_to_local_hot_cache_counter():
@@ -294,7 +367,11 @@ def _make_vlm_scheduler() -> Scheduler:
         prefill_step_size=2048,
         paged_cache_block_size=0,
     )
-    return Scheduler(model=model, tokenizer=tokenizer, config=config)
+    scheduler = Scheduler(model=model, tokenizer=tokenizer, config=config)
+    # Admission also plans against hard limit * headroom safety; tests that
+    # pin other terms keep that line at the hard limit.
+    scheduler._prefill_headroom_safety = 1.0
+    return scheduler
 
 
 def test_vlm_nested_config_populates_estimator_dims():
@@ -382,10 +459,66 @@ def test_rejection_releases_block_aware_cache_when_present():
 
     scheduler._release_paged_cache_for_request("req-leak")
 
-    # When block_aware_cache is present it owns the cleanup chain
-    # (release_cache → paged_cache_manager.delete_block_table).
+    # When block_aware_cache is present, release_cache owns the cleanup.
     block_aware_cache.release_cache.assert_called_once_with("req-leak")
     paged_cache_manager.delete_block_table.assert_not_called()
+
+
+def test_rejection_after_cache_hit_releases_prefix_blocks(tmp_path):
+    """A rejected cache hit must not pin its prefix blocks (#4213).
+
+    fetch_cache records the hit only in the paged manager. A pinned block
+    keeps its hash after the hot-cache-only tier drops its payload, so the
+    next store deduplicates against it and each turn regains one block.
+    """
+    paged = PagedCacheManager(
+        block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=tmp_path / "unused",
+        max_size_bytes=100 * 1024**2,
+        hot_cache_max_bytes=10 * 1024**2,
+        hot_cache_only=True,
+    )
+    cache = BlockAwarePrefixCache(
+        model=SimpleNamespace(layers=[object()]),
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+    )
+    scheduler = _make_scheduler()
+    scheduler.block_aware_cache = cache
+    scheduler.paged_cache_manager = paged
+    tokens = list(range(12))
+    keys = mx.ones((1, 1, 12, 1))
+    kv = [{"state": (keys, keys), "meta_state": (12,), "class_name": "KVCache"}]
+
+    def finish(request_id):
+        table = paged.get_block_table(request_id)
+        paged.release_for_eviction(table.block_ids)
+        cache.clear_request_entry(request_id)
+
+    def restored_tokens(request_id):
+        table, _ = cache.fetch_cache(request_id, tokens)
+        restored = table is not None and cache.reconstruct_cache(table) is not None
+        if table is not None and not restored:
+            paged.delete_block_table(request_id)
+        return table.num_tokens if restored else 0
+
+    try:
+        cache.store_cache("first", tokens, kv)
+        finish("first")
+        assert restored_tokens("rejected") == 12
+        scheduler._release_paged_cache_for_request("rejected")
+        blocks = paged.allocated_blocks.values()
+        assert all(b.ref_count == 0 for b in blocks if not b.is_null)
+
+        ssd.clear_hot_cache()
+        assert restored_tokens("reprefill") == 0
+        cache.store_cache("reprefill", tokens, kv)
+        finish("reprefill")
+        assert restored_tokens("next") == 12
+    finally:
+        ssd.close()
 
 
 def test_rejection_releases_paged_cache_when_no_prefix_cache():
@@ -779,7 +912,7 @@ def test_admission_estimate_is_the_single_formula():
 
 
 def test_admission_charges_full_step_under_speed_priority():
-    """Speed priority prices the full prefill_step_size chunk instead of the
+    """Speed priority prices the widest scheduled step instead of the
     throttle floor, so admission only accepts what completes at full speed."""
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True
@@ -827,6 +960,17 @@ def test_admission_charges_full_step_under_speed_priority():
     assert est_small is not None
     assert est_small.floor_chunk == 1023
 
+    # Qwen4-Exp widens later chunks of a long prompt; the widest step is
+    # charged, not the configured one.
+    from omlx.scheduler import _QWEN4_WIDE_PREFILL_STEP
+
+    scheduler._qwen4_wide_prefill_step = _QWEN4_WIDE_PREFILL_STEP
+    with patches[0], patches[1]:
+        est_wide = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    assert est_wide.floor_chunk == _QWEN4_WIDE_PREFILL_STEP
+
 
 def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
     monkeypatch,
@@ -844,8 +988,6 @@ def test_deepseek_v4_200k_native_admission_avoids_81_gib_dense_charge(
         "native_indexer_eligible",
         lambda **kwargs: True,
     )
-    monkeypatch.setattr(wsdpa, "_ENABLED", True)
-    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_broken", False)
     monkeypatch.setattr(wsdpa, "_ready", False)
     monkeypatch.setattr(wsdpa, "_topk_ready", False)
@@ -949,7 +1091,7 @@ def test_preflight_charges_observed_max_transient():
     with patches[0], patches[1]:
         scheduler.preflight_or_raise(num_prompt_tokens=32768)  # fits
 
-    scheduler._prefill_transient_tracker._observed_max_bytes = (
+    scheduler._prefill_transient_tracker._dense_history.observed_max_bytes = (
         est.transient + 2 * 1024**3
     )
     with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError):
@@ -989,3 +1131,248 @@ def test_admission_compares_against_hard_watermark():
     scheduler._memory_hard_watermark_bytes = int(est.estimated) + 1
     with patches[0], patches[1]:
         scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def test_admission_plans_against_the_prefill_headroom_line():
+    """A final KV above hard * headroom runs its tail at the floor chunk and
+    dies in the watermark band, so admission stops at that line."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_abort_limit_bytes = 10**18  # keep safety cap out
+
+    patches = (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    )
+    with patches[0], patches[1]:
+        est = scheduler._admission_estimate(
+            num_prompt_tokens=32768, cached_tokens=0, current=0
+        )
+    hard = int(est.estimated) + 100 * 1024**2
+    scheduler._memory_hard_limit_bytes = hard
+    scheduler._memory_hard_watermark_bytes = hard
+
+    scheduler._prefill_headroom_safety = 0.9
+    with patches[0], patches[1], pytest.raises(PrefillMemoryExceededError) as ei:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+    assert ei.value.limit_bytes == int(hard * 0.9)
+
+    scheduler._prefill_headroom_safety = 1.0
+    with patches[0], patches[1]:
+        scheduler.preflight_or_raise(num_prompt_tokens=32768)
+
+
+def test_resumed_prefill_is_not_readmitted_against_the_full_prompt():
+    """A request paused mid-prefill for eviction resumes its own prefill."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 1
+    req = _make_request(65536)
+    req.cached_tokens = 16384
+    req.prompt_cache = [object()]
+    req._prefill_resumed = True
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=0),
+        patch("omlx.scheduler.get_phys_footprint", return_value=0),
+    ):
+        assert scheduler._preflight_memory_check(req) is None
+        # One-shot: a later admission of the same request is checked again.
+        assert scheduler._preflight_memory_check(req) is not None
+
+
+def _qwen4_prefill_profile():
+    from omlx.memory_monitor import make_prefill_memory_profile
+
+    return make_prefill_memory_profile(
+        SimpleNamespace(
+            model_type="qwen4_exp",
+            num_hidden_layers=48,
+            num_attention_heads=24,
+            num_key_value_heads=2,
+            head_dim=256,
+            indexer_n_heads=4,
+            indexer_head_dim=128,
+            indexer_budget=2048,
+            indexer_compress_ratio=4,
+            full_attention_interval=4,
+            layer_types=None,
+        ),
+        compute_dtype_size=2,
+    )
+
+
+def _attach_qwen4_profile(scheduler: Scheduler) -> None:
+    profile = _qwen4_prefill_profile()
+    scheduler.memory_monitor.set_model_info(
+        num_layers=48,
+        num_kv_heads=2,
+        head_dim=256,
+        dtype_size=2,
+        num_attention_heads=24,
+        compute_dtype_size=2,
+        prefill_memory_profile=profile,
+    )
+
+
+def test_qwen4_admission_prices_the_gathered_route():
+    """Admission prices the floor chunk by the shared execution predicate.
+
+    Execution gathers every text chunk, with or without images elsewhere in
+    the prompt, so the request's media type must not change the admission
+    price. Image-region chunks are re-priced exactly by the per-chunk guard,
+    which sees each real chunk's mRoPE position_ids.
+    """
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    current = 147 * 1024**3
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+    )
+    assert est is not None
+    assert est.kv_exact > 0
+    assert est.transient == int(
+        scheduler._admission_transient_bound(
+            est.floor_chunk, est.kv_len, gathered_core=True
+        )
+    )
+
+
+def test_qwen4_pricing_tracks_execution_route():
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        QSAKVCache,
+        QSAQuantizedKVCache,
+    )
+
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    route = scheduler._qwen4_text_gathered_pricing
+
+    assert route(query_tokens=2048, cache_tokens=0) is False
+    assert route(query_tokens=2048, cache_tokens=2048) is True
+    assert route(query_tokens=15, cache_tokens=2048) is False
+    assert route(query_tokens=16, cache_tokens=2048) is True
+
+    # Without position info the chunk is assumed text: execution gathers it.
+    assert route(query_tokens=2048, cache_tokens=2048) is True
+
+    # VLM text chunks (broadcast-identical mRoPE planes) gather exactly like
+    # execution; image-region chunks (differing planes) stay dense-priced.
+    n = 32
+    equal = mx.zeros((3, 1, n), dtype=mx.int64)
+    differing = mx.zeros((3, 1, n), dtype=mx.int64)
+    differing[2] = differing[2] + 1
+    assert route(query_tokens=n, cache_tokens=2048, position_ids=equal) is True
+    assert route(query_tokens=n, cache_tokens=2048, position_ids=differing) is False
+
+    # Runtime requires the exact floating-point QSA cache type. Quantized QSA
+    # caches use the official dense path and must be priced that way before it runs.
+    assert route(
+        query_tokens=n,
+        cache_tokens=2048,
+        position_ids=equal,
+        prompt_cache=[QSAKVCache()],
+    ) is True
+    assert route(
+        query_tokens=n,
+        cache_tokens=2048,
+        position_ids=equal,
+        prompt_cache=[QSAQuantizedKVCache()],
+    ) is False
+
+
+def test_qwen4_preflight_doors_admit_at_the_gathered_price():
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    scheduler._prefill_memory_guard = True
+    current = 147 * 1024**3
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+    )
+    assert est is not None
+    scheduler._memory_hard_limit_bytes = current + est.estimated
+    scheduler._memory_abort_limit_bytes = 10**18
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=current),
+        patch("omlx.scheduler.get_phys_footprint", return_value=current),
+    ):
+        scheduler.preflight_or_raise(num_prompt_tokens=233_472)
+        assert (
+            scheduler.preflight_eviction_request(num_prompt_tokens=233_472)
+            is None
+        )
+
+
+def test_qwen4_image_request_preflight_admits_at_gathered_price():
+    """Image-bearing requests admit at the gathered price.
+
+    Their text chunks execute gathered; the mid-prefill guard prices the
+    actual image-region chunks dense via their mRoPE position_ids (covered
+    by test_qwen4_pricing_tracks_execution_route).
+    """
+    scheduler = _make_scheduler()
+    _attach_qwen4_profile(scheduler)
+    scheduler._prefill_memory_guard = True
+    current = 147 * 1024**3
+    est = scheduler._admission_estimate(
+        num_prompt_tokens=233_472,
+        cached_tokens=0,
+        current=current,
+    )
+    assert est is not None
+    scheduler._memory_hard_limit_bytes = current + est.estimated
+    scheduler._memory_abort_limit_bytes = 10**18
+    request = _make_request(233_472)
+    request.vlm_inputs_embeds = object()
+    with (
+        patch("omlx.scheduler.mx.get_active_memory", return_value=current),
+        patch("omlx.scheduler.get_phys_footprint", return_value=current),
+    ):
+        rejection = scheduler._preflight_memory_check(request)
+    assert rejection is None
+
+
+@pytest.mark.parametrize(
+    "hard,abort,usage,reclaimed,raises,reclaims",
+    [
+        (200, 300, 250, 250, False, 0),  # Dynamic hard limit is not the abort cap.
+        (400, 300, 300, 300, False, 0),  # At the physical cap is allowed.
+        (400, 300, 301, 300, False, 1),  # Reclaim restores the physical bound.
+        (400, 300, 301, 301, True, 1),
+        (200, 0, 201, 201, True, 1),  # Before propagation, use the hard limit.
+    ],
+)
+def test_post_prefill_guard_uses_stable_physical_cap(
+    hard, abort, usage, reclaimed, raises, reclaims
+):
+    scheduler = SimpleNamespace(
+        _memory_limit_bytes=100,
+        _memory_hard_limit_bytes=hard,
+        _memory_abort_limit_bytes=abort,
+        _prefill_speed_priority=False,
+        _current_usage_bytes=MagicMock(return_value=usage),
+        _reclaim_prefill_headroom=MagicMock(return_value=reclaimed),
+    )
+
+    def check():
+        Scheduler._check_post_prefill_memory(
+            scheduler,
+            request_id="row",
+            chunk_tokens=4,
+            processed_tokens=4,
+            total_tokens=8,
+            loop_label="test",
+        )
+
+    if raises:
+        with pytest.raises(RuntimeError, match="Memory limit exceeded.*after reclaim"):
+            check()
+    else:
+        check()
+    assert scheduler._reclaim_prefill_headroom.call_count == reclaims

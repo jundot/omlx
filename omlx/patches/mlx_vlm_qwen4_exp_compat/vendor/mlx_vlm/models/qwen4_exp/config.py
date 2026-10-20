@@ -62,6 +62,8 @@ class TextConfig(BaseModelConfig):
     hidden_act: str = "silu"
     norm_topk_prob: bool = True
     mtp_num_hidden_layers: int = 1
+    mtp_num_experts: Optional[int] = None
+    mtp_num_experts_per_tok: Optional[int] = None
     mtp_use_dedicated_embeddings: bool = False
     mtp: Optional[Dict] = None
     eos_token_id: Optional[Union[int, List[int]]] = None

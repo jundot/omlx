@@ -20,7 +20,7 @@
 //                                         • install POSIX SignalHandlers
 //                                         • flip to .accessory next tick
 //                                           (Dock icon hides; menubar stays)
-//   applicationWillTerminate        → await server.stop(timeout: 10)
+//   applicationWillTerminate        → server.reapSync(timeout: 8)
 //
 // Dock-icon toggle
 //   Any time an in-app NSWindow becomes main → .regular (Dock icon shows).
@@ -200,22 +200,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleCLISetupResult(_ result: ShellEnvWriter.CLISetupResult) {
-        guard case .needsShellPathPrompt(let reason) = result else { return }
         guard !ShellEnvWriter.shouldSuppressCLIPathPrompt() else { return }
-        promptForShellPathExport(reason: reason)
+        switch result {
+        case .publicCommandReady:
+            break
+        case .needsShellPathPrompt(let reason):
+            var message = """
+            oMLX installed the `omlx` command at ~/.omlx/bin/omlx, but that folder is not on your PATH.
+
+            To make `omlx` available in new Terminal sessions, oMLX can add a small PATH block to your shell init file. This only happens if you choose Update Shell File.
+            """
+            if !reason.isEmpty {
+                message += "\n\n\(reason)"
+            }
+            promptForCLIPathChange(
+                title: "Enable `omlx` in Terminal?",
+                message: message,
+                confirmTitle: "Update Shell File"
+            ) {
+                try ShellEnvWriter.ensureShellPathExport()
+            }
+        case .legacyPublicLink(let path, let shellPathInstalled):
+            let folder = (path as NSString).deletingLastPathComponent
+            let next = shellPathInstalled
+                ? "The `omlx` command already works through ~/.omlx/bin, so this link is no longer needed."
+                : "oMLX can remove this link and add ~/.omlx/bin to PATH in your shell init file instead. The `omlx` command keeps working in new Terminal sessions."
+            promptForCLIPathChange(
+                title: "Move the `omlx` command out of \(folder)?",
+                message: """
+                An earlier version of oMLX created \(path). oMLX no longer puts files in shared folders like Homebrew's bin directory.
+
+                \(next)
+                """,
+                confirmTitle: shellPathInstalled ? "Remove Link" : "Remove Link and Update Shell File"
+            ) {
+                // Add the PATH block first so a failed rc write keeps the old link working.
+                try ShellEnvWriter.ensureShellPathExport()
+                try ShellEnvWriter.removeLegacyPublicLink(atPath: path)
+            }
+        }
     }
 
-    private func promptForShellPathExport(reason: String) {
+    private func promptForCLIPathChange(
+        title: String,
+        message: String,
+        confirmTitle: String,
+        onConfirm: () throws -> Void
+    ) {
         let alert = NSAlert()
-        alert.messageText = "Enable `omlx` in Terminal?"
-        alert.informativeText = """
-        oMLX could not create a public `omlx` command in /opt/homebrew/bin or /usr/local/bin.
-
-        To make `omlx` available in new Terminal sessions, oMLX can add a small PATH block to your shell init file. This only happens if you choose Update Shell File.
-
-        \(reason)
-        """
-        alert.addButton(withTitle: "Update Shell File")
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: confirmTitle)
         alert.addButton(withTitle: "Dismiss Now")
         alert.addButton(withTitle: "Don't Ask Again")
         alert.window.level = .floating
@@ -223,9 +258,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch alert.runModal() {
         case .alertFirstButtonReturn:
             do {
-                try ShellEnvWriter.ensureShellPathExport()
+                try onConfirm()
             } catch {
-                NSLog("oMLX: CLI shell path setup failed — \(error)")
+                NSLog("oMLX: CLI path setup failed: \(error)")
             }
         case .alertThirdButtonReturn:
             ShellEnvWriter.suppressCLIPathPromptForever()
@@ -480,23 +515,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Graceful stop. SIGKILL fallback is inside ServerProcess.stop().
-        // We can't await indefinitely here — AppKit will eventually time
-        // us out — so we run a short synchronous reap as belt-and-suspenders
-        // (SignalHandlers also covers most external-kill paths).
         NotificationCenter.default.removeObserver(self)
         controlServer?.stop()
         controlServer = nil
-
-        guard let server else { return }
-        let group = DispatchGroup()
-        group.enter()
-        Task { @MainActor in
-            await server.stop(timeout: 8)
-            group.leave()
-        }
-        _ = group.wait(timeout: .now() + 9)
-        server.reapSync(timeout: 1)
+        // Reap synchronously. An async stop needs the main actor, which this
+        // method blocks until it returns.
+        server?.reapSync(timeout: 8)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -505,11 +529,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Intercept terminate so Cmd-Q / Dock → Quit *only* close the window.
-    /// The single real-quit path is the menubar status item's "Quit oMLX",
-    /// which routes through `requestQuit()` to set the explicit flag.
+    /// Real quits are the menubar status item's "Quit oMLX", which routes
+    /// through `requestQuit()` to set the explicit flag, and system logout,
+    /// restart, or shutdown.
     ///
     /// Notes:
-    /// - We always cancel terminate when the explicit flag isn't set.
+    /// - We always cancel any other terminate.
     ///   SwiftUI's Window scene appears to dismiss the window before
     ///   `applicationShouldTerminate` runs, so a "no visible windows"
     ///   guard fires when we'd really want to keep cancelling.
@@ -520,9 +545,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///   `.accessory`.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if explicitQuitRequested { return .terminateNow }
+        // Cancelling this quit also cancels the logout, restart, or shutdown.
+        if Self.isSystemQuitEvent(NSAppleEventManager.shared().currentAppleEvent) {
+            return .terminateNow
+        }
         // Same close path used by the SwiftUI Cmd-Q command in oMLXApp.swift.
         hideWindowsAndDropDockIcon()
         return .terminateCancel
+    }
+
+    /// True for the quit event that macOS sends on logout, restart, or
+    /// shutdown. Dock Quit and AppleScript `quit` send no quit reason.
+    nonisolated static func isSystemQuitEvent(_ event: NSAppleEventDescriptor?) -> Bool {
+        guard let event,
+              event.eventClass == AEEventClass(kCoreEventClass),
+              event.eventID == AEEventID(kAEQuitApplication)
+        else { return false }
+        // The reason arrives as an attribute, but AERegistry.h documents it
+        // as a parameter, so accept both.
+        let keyword = AEKeyword(kAEQuitReason)
+        guard let reason = event.attributeDescriptor(forKeyword: keyword)
+            ?? event.paramDescriptor(forKeyword: keyword)
+        else { return false }
+        let systemReasons = [
+            OSType(kAEQuitAll), OSType(kAEShutDown),
+            OSType(kAERestart), OSType(kAEReallyLogOut),
+        ]
+        return systemReasons.contains(reason.typeCodeValue)
     }
 
     private func startControlServer() {

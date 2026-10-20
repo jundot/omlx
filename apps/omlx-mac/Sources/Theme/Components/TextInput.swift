@@ -40,7 +40,9 @@ struct TextInput: View {
         field
             .lineLimit(1)
             .textFieldStyle(.roundedBorder)
-            .font(mono ? .omlxMono(13, weight: .medium) : .omlxText(13, weight: .medium))
+            // Regular weight: native macOS fields never render medium-weight
+            // content, and the bolder text read as a foreign control.
+            .font(mono ? .omlxMono(13) : .omlxText(13))
             .foregroundStyle(theme.text)
             .overlay(alignment: .trailing) {
                 HStack(spacing: 0) {
@@ -55,7 +57,10 @@ struct TextInput: View {
                     }
                 }
             }
-            .frame(maxWidth: width)
+            // Fixed, not max: under `maxWidth` a long row label squeezes the
+            // field, so fields sharing a width token rendered ragged widths.
+            // A fixed frame makes equal tokens render equal; labels wrap.
+            .frame(width: width)
     }
 
     private var field: some View {
@@ -93,11 +98,11 @@ struct TextInput: View {
     @Previewable @State var showKey = false
     @Previewable @State var alias = ""
     VStack(alignment: .leading, spacing: 14) {
-        TextInput(text: $port, placeholder: "Port", mono: true, width: 110)
-        TextInput(text: $qty, placeholder: "Quantity", isNumeric: true, suffix: "qty", width: 160)
-        TextInput(text: $temperature, placeholder: "Temperature", isNumeric: true, range: 0...2, step: 0.1, width: 160)
+        TextInput(text: $port, placeholder: "Port", mono: true, width: .controlCompact)
+        TextInput(text: $qty, placeholder: "Quantity", isNumeric: true, suffix: "qty", width: .controlCompact)
+        TextInput(text: $temperature, placeholder: "Temperature", isNumeric: true, range: 0...2, step: 0.1, width: .controlCompact)
         HStack {
-            TextInput(text: $pwd, placeholder: "Admin password", isSecure: !showKey, width: 200)
+            TextInput(text: $pwd, placeholder: "Admin password", isSecure: !showKey, width: .controlMedium)
             Button {
                 showKey.toggle()
             } label: {
@@ -107,7 +112,7 @@ struct TextInput: View {
             .buttonStyle(.plain)
         }
         TextInput(text: $alias, placeholder: "model-id-suffix", mono: true,
-                  suffix: "alias", width: 240)
+                  suffix: "alias", width: .controlMedium)
     }
     .padding(24)
     .omlxThemed()
