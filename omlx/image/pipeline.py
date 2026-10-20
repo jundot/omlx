@@ -14,7 +14,7 @@ from PIL import Image
 from omlx.image_bundle import read_json
 from omlx.image_inspect import contained, inspect_bundle, tensor_header
 
-from .conditioning import check_cancel, encode_prompt, native_bundle
+from .conditioning import check_cancel, encode_prompt_steps, native_bundle, run_steps
 from .loading import load_transformer
 from .vae import Qwen21VAE
 
@@ -54,7 +54,9 @@ def release_gpu():
     mx.clear_cache()
 
 
-def generate_png(bundle, prompt, seed, *, cancel=None, progress=None):
+def generate_steps(
+    bundle, prompt, seed, *, cancel=None, progress=None, measure_peak=True
+):
     """Return PNG bytes and phase metrics, holding no model objects on return.
 
     Caller must serialize execution. Request cancellation is cooperative; this
@@ -75,7 +77,8 @@ def generate_png(bundle, prompt, seed, *, cancel=None, progress=None):
         "phase_seconds": {},
     }
     started = time.perf_counter()
-    mx.reset_peak_memory()
+    if measure_peak:
+        mx.reset_peak_memory()
 
     def stage(name, step=0):
         check_cancel(cancel)
@@ -85,20 +88,25 @@ def generate_png(bundle, prompt, seed, *, cancel=None, progress=None):
     try:
         stage("encoding")
         t = time.perf_counter()
-        embeddings = encode_prompt(root, prompt, cancel=cancel)
+        embeddings = yield from encode_prompt_steps(root, prompt, cancel=cancel)
         metrics["phase_seconds"]["encoding"] = time.perf_counter() - t
         embeddings = embeddings.astype(mx.bfloat16)
         mx.eval(embeddings)
         release_gpu()
+        yield ("loading_denoiser", 0, 1)
         stage("loading_denoiser")
         t = time.perf_counter()
         model = load_transformer(root, cancel=cancel)
         metrics["phase_seconds"]["denoiser_load"] = time.perf_counter() - t
+        yield ("loading_denoiser", 1, 1)
         latents = mx.array(noise).astype(mx.bfloat16)
         t = time.perf_counter()
         for i in range(8):
+            yield ("denoising", i, 8)
             stage("denoising", i)
-            prediction = model(latents, embeddings, SIGMAS[i], 64, 64, cancel=cancel)
+            prediction = yield from model.denoise_steps(
+                latents, embeddings, SIGMAS[i], 64, 64, cancel=cancel
+            )
             latents = latents + prediction * mx.array(
                 SIGMAS[i + 1] - SIGMAS[i], dtype=latents.dtype
             )
@@ -108,10 +116,11 @@ def generate_png(bundle, prompt, seed, *, cancel=None, progress=None):
         metrics["phase_seconds"]["denoising"] = time.perf_counter() - t
         model = prediction = embeddings = None
         release_gpu()
+        yield ("decoding", 8, 8)
         stage("decoding", 8)
         t = time.perf_counter()
         vae = load_vae(root)
-        pixels = vae.decode(
+        pixels = yield from vae.decode_steps(
             latents.astype(mx.float32).reshape(1, 64, 64, 64).transpose(0, 3, 1, 2),
             cancel=cancel,
         )
@@ -127,9 +136,15 @@ def generate_png(bundle, prompt, seed, *, cancel=None, progress=None):
         Image.fromarray(np.rint(array * 255).astype(np.uint8)).save(
             output, format="PNG"
         )
-        metrics["mlx_peak_bytes"] = mx.get_peak_memory()
+        metrics["mlx_peak_bytes"] = mx.get_peak_memory() if measure_peak else None
         metrics["total_seconds"] = time.perf_counter() - started
         return output.getvalue(), metrics
     finally:
         model = vae = embeddings = prediction = latents = pixels = None
         release_gpu()
+
+
+def generate_png(bundle, prompt, seed, *, cancel=None, progress=None):
+    return run_steps(
+        generate_steps(bundle, prompt, seed, cancel=cancel, progress=progress)
+    )
