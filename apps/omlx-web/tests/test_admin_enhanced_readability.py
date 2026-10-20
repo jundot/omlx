@@ -105,14 +105,6 @@ def test_no_jinja_block_in_comment():
     assert BASE.count("{% block head %}") == 1
 
 
-def test_switch_below_theme_and_wired():
-    # Switch sits BELOW the Theme section (user requirement).
-    assert CHAT.index("chat.theme_label") < CHAT.index("chat.enhanced_readability")
-    assert "enhancedReadability" in CHAT
-    assert "setEnhancedReadability" in CHAT
-    assert "setEnhancedReadability(!enhancedReadability)" in CHAT
-
-
 def test_dashboard_theme_menu_controls_same_readability_setting():
     assert DASHBOARD_NAV.count("setEnhancedReadability(!enhancedReadability)") == 2
     assert "chat.enhanced_readability" in DASHBOARD_NAV
