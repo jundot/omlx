@@ -58,10 +58,11 @@ def image_boundary(path: Path) -> bool:
         ("pipeline.json", "pipeline", {PIPELINE}),
         ("model_index.json", "_class_name", IMAGE_CLASSES),
         ("config.json", "_class_name", COMPONENT_CLASSES),
+        ("config.json", "model_type", {"qwen3_vl_image_text_encoder"}),
     ):
         try:
             if read_json(path / filename).get(key) in known:
                 return True
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, RecursionError):
             continue
     return False
