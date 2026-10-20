@@ -150,7 +150,7 @@ def encoder_shapes():
     return shapes
 
 
-def encode_prompt(bundle, prompt, *, cancel=None, on_layer=None):
+def encode_prompt_steps(bundle, prompt, *, cancel=None, on_layer=None):
     from mlx_vlm.models.qwen3_vl.config import TextConfig
     from mlx_vlm.models.qwen3_vl.language import Qwen3VLDecoderLayer
 
@@ -218,9 +218,26 @@ def encode_prompt(bundle, prompt, *, cancel=None, on_layer=None):
         if on_layer is not None:
             on_layer(i, h)
         del layer
+        yield ("encoding", i + 1, 36)
     check_cancel(cancel)
     h = mx.fast.rms_norm(h, weights.weight("norm.weight"), 1e-6)[:, drop:]
     mx.eval(h)
     if not bool(mx.all(mx.isfinite(h)).item()):
         raise ValueError("non-finite prompt conditioning")
     return h
+
+
+def run_steps(steps):
+    try:
+        while True:
+            next(steps)
+    except StopIteration as stop:
+        return stop.value
+    finally:
+        steps.close()
+
+
+def encode_prompt(bundle, prompt, *, cancel=None, on_layer=None):
+    return run_steps(
+        encode_prompt_steps(bundle, prompt, cancel=cancel, on_layer=on_layer)
+    )

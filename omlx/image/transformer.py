@@ -169,7 +169,7 @@ class Transformer(nn.Module):
         self.norm_out = OutputNorm()
         self.proj_out = nn.Linear(4096, 64, bias=False)
 
-    def __call__(self, latents, embeds, sigma, height, width, *, cancel=None):
+    def denoise_steps(self, latents, embeds, sigma, height, width, *, cancel=None):
         from .conditioning import check_cancel
 
         if not (
@@ -205,11 +205,19 @@ class Transformer(nn.Module):
         )
         cos, sin = rope(text_len, height, width)
         x = mx.concatenate([self.txt_in(embeds), self.img_in(latents)], axis=1)
-        for block in self.transformer_blocks:
+        for i, block in enumerate(self.transformer_blocks):
             check_cancel(cancel)
             x = block(x, mods, cos, sin, text_len)
             mx.eval(x)
+            yield ("denoiser_block", i + 1, 32)
         scale = self.norm_out.linear(nn.silu(t))[0][None, None]
         return self.proj_out(
             mx.fast.layer_norm(x[:, text_len:], None, None, 1e-6) * (1 + scale)
+        )
+
+    def __call__(self, latents, embeds, sigma, height, width, *, cancel=None):
+        from .conditioning import run_steps
+
+        return run_steps(
+            self.denoise_steps(latents, embeds, sigma, height, width, cancel=cancel)
         )
