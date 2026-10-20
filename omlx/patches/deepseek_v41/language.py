@@ -35,7 +35,12 @@ from .hyper_connection import (
     fused_hc_projection,
     sinkhorn,
 )
-from .kernels import packed_index_scores, packed_index_topk, packed_sparse_attention
+from .kernels import (
+    index_select,
+    packed_index_scores,
+    packed_index_topk,
+    packed_sparse_attention,
+)
 from .mtp import DSparkMixin
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 from .routing import combine_sorted_experts
@@ -308,6 +313,8 @@ class Indexer(nn.Module):
             return idx
         scores = packed_index_scores(q, key, weights, start, ratio, candidates)
         count = min(c.index_topk, scores.shape[-1])
+        if x.shape[1] <= 8:
+            return index_select(scores, count, candidates)
         order = mx.argsort(-scores, axis=-1)[..., :count].astype(mx.int32)
         valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
         idx = mx.take_along_axis(candidates, order, -1)

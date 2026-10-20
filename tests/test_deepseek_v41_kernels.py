@@ -583,6 +583,34 @@ def test_radix_selection_matches_tile_selection(width, distinct):
         )
 
 
+@pytest.mark.parametrize("width,distinct", [(7, 0), (2048, 0), (4096, 4), (9000, 0)])
+def test_index_select_matches_selection_pipelines(width, distinct):
+    """Decode / verify selection: the tile top-k + sort pipeline (packed_index_topk) and the
+    argsort pipeline over candidates (Indexer), ties to the lower position, -inf as -1."""
+    rng = np.random.default_rng(width + distinct)
+    if distinct:
+        data = rng.integers(0, distinct, (1, 4, width)).astype(np.float32)
+    else:
+        data = rng.normal(size=(1, 4, width)).astype(np.float32)
+    data[0, 0, : width * 4 // 5] = -np.inf   # fewer finite scores than selected
+    data[0, 1, ::3] = 0.0
+    data[0, 1, 1::3] = -0.0
+    scores = mx.array(data)
+    candidates = np.sort(rng.choice(10 * width, width, replace=False)).astype(np.int32)
+    candidates = mx.array(np.broadcast_to(candidates, (1, 4, width)).copy())
+    for count in (1, 512, 2048):
+        c = min(count, width)
+        values, ids = kernels._tile_topk(scores, c)
+        expected = mx.sort(mx.where(values > -float("inf"), ids, -1), axis=-1)
+        if c < count:
+            expected = mx.concatenate([mx.full((1, 4, count - c), -1, mx.int32), expected], -1)
+        assert mx.array_equal(kernels.index_select(scores, count), expected).item()
+        order = mx.argsort(-scores, axis=-1)[..., :c].astype(mx.int32)
+        valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
+        expected = mx.sort(mx.where(valid, mx.take_along_axis(candidates, order, -1), -1), axis=-1)
+        assert mx.array_equal(kernels.index_select(scores, c, candidates), expected).item()
+
+
 def test_deep_prefill_index_selection_matches_full_scores():
     mx.random.seed(4401)
     start, length, ratio = 16384, 37, 4

@@ -18,7 +18,7 @@ import numpy as np
 from . import decode_layer as DL
 from . import decode_moe as DM
 from . import growth
-from .kernels import packed_index_scores, packed_index_topk
+from .kernels import index_select, packed_index_scores, packed_index_topk
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 
 
@@ -324,10 +324,7 @@ def _index_block(idx, x, qr, latent, cache, shared, start, ratio):
     candidates = blocks[..., None] * c.candidate_block_size + mx.arange(c.candidate_block_size)
     candidates = mx.where(blocks[..., None] >= 0, candidates, -1).reshape(1, r_n, -1)
     scores = packed_index_scores(q, key, weights, start, ratio, candidates)
-    order = mx.argsort(-scores, axis=-1)[..., : c.index_topk].astype(mx.int32)
-    valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
-    ids = mx.take_along_axis(candidates, order, -1)
-    return mx.sort(mx.where(valid, ids, -1), axis=-1)
+    return index_select(scores, c.index_topk, candidates)
 
 
 def compress_index_block(att, x, qr, cache, shared, start, c):
