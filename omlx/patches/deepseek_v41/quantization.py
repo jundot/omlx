@@ -5,6 +5,9 @@ Persistent KV uses packed FP8/FP4 bytes and one-byte scales. Activation-only
 round trips remain available for projection arithmetic and numerical tests.
 """
 
+import re
+from functools import cache
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -13,6 +16,16 @@ from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from ..deepseek_v4.switch_layers import _AFFINE_NATIVE_MIN_ROUTES, QuantizedSwitchLinear
 from .activation import pack_fp8_activation, quantize_fp8_activation
 from .gemv import mxfp8_gemv
+
+
+@cache
+def _affine_blocks_beat_stock():
+    """Whether the native affine block-list kernels beat mx.gather_qmm for sorted prefill
+    routes. They do from ~1024 routes on M1 Ultra (#3409). From the M3 GPU (applegpu_g15) on,
+    mx.gather_qmm is 1-7% faster at every prefill size (V4.1 oQ3e 3-bit experts, 256-4096
+    tokens, M3 Ultra)."""
+    match = re.match(r"applegpu_g(\d+)", mx.device_info().get("architecture", ""))
+    return match is None or int(match.group(1)) < 15
 
 
 def _normal_power_of_two(exponent):
@@ -218,6 +231,7 @@ class QuantizedProjection(QuantizedSwitchLinear):
             and x.ndim == 3
             and x.shape[-2] == 1
             and x.shape[0] >= _AFFINE_NATIVE_MIN_ROUTES
+            and _affine_blocks_beat_stock()
             and dtype in (mx.float16, mx.bfloat16)
             and self.group_size == 64
             and self.bits in (2, 3, 4, 6, 8)

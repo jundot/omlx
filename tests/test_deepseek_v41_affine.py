@@ -76,8 +76,11 @@ def test_affine_decode_grouped_matches_stock(monkeypatch, bits):
 def test_affine_prefill_native_blocks_and_pair(monkeypatch, bits):
     from omlx.patches.deepseek_v4 import switch_layers
 
-    # Exercise the native kernels even when NAX prefers stock prefill GEMMs.
+    from omlx.patches.deepseek_v41 import quantization
+
+    # Exercise the native kernels even on GPUs that prefer stock prefill GEMMs.
     monkeypatch.setattr(switch_layers, "_nax_prefers_stock", lambda num_routes: False)
+    monkeypatch.setattr(quantization, "_affine_blocks_beat_stock", lambda: True)
     mx.random.seed(714)
     expert = expert_for(bits)
     x = mx.random.normal((1024, 1, 64)).astype(mx.bfloat16)
