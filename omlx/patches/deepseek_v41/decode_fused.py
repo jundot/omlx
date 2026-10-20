@@ -61,7 +61,8 @@ def _empty(shape, dtype):
 
 
 def _dummy(dtype):
-    return _const((0,), dtype)
+    # 8 elements: smaller inputs are passed in constant address space.
+    return _const((0,) * 8, dtype)
 
 
 def _scalars(c):
@@ -115,8 +116,7 @@ def _pair_formats(a, b):
 
 
 def _pair_inputs(x, a, b):
-    # 8-element dummies: smaller inputs are passed in constant address space.
-    dummy = (_const((0,) * 8, mx.uint32), _const((0,) * 8, mx.uint8), _const((0,) * 8))
+    dummy = (_dummy(mx.uint32), _dummy(mx.uint8), _dummy(mx.float32))
     return [x, *_wb(a), *(_wb(b) if b is not None else dummy)]
 
 
@@ -273,8 +273,7 @@ def mix_nb(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
     nparts = dim // 64
     mixw = (2 + hc) * hc
     eps, hc_eps = _scalars(c)
-    # 8 elements: smaller inputs are passed in constant address space.
-    dummy = _const((0,) * 8)
+    dummy = _dummy(mx.float32)
     posted = sub is not None
     partial, hout, xpre = DL.kernel("mix_partial_b")(
         inputs=[res, blk[f"hc_{kind}_fn"], sub if posted else dummy, post if posted else dummy,

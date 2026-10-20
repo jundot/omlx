@@ -282,6 +282,43 @@ _WOA = r"""
 """
 
 
+_KV_RUN = r"""
+// N consecutive decoded values of one packed KV row from dim d0 (d0 % N == 0; N = 2, 4 or a
+// multiple of 8): the read_kv values (exact products), read with vector loads and decoded through
+// fp16 bit patterns (fp8_decode4 / fp4_decode8 give the code value times 2^-8 / 2^-14).
+template <int N, typename W, typename P>
+inline void read_kv_run(W window, P pooled, int row, int d0, int dim, bool compressed, thread float* out) {
+    if (N < 4) {
+        for (int j = 0; j < N; ++j) out[j] = read_kv(window, pooled, row, d0 + j, dim, compressed, 0.0f, 0, false);
+    } else if (compressed) {
+        const size_t base = size_t(row) * (dim / 2 + dim / 16);
+        const device uint* c = (const device uint*)(pooled + base + d0 / 2);
+        for (int g = 0; g < N / 8; ++g) {
+            const float sc = rounded_fp8(pooled[base + dim / 2 + (d0 + 8 * g) / 16]) * 0x1p14f;
+            float v[8];
+            fp4_decode8(c[g], v);
+            for (int j = 0; j < 8; ++j) out[8 * g + j] = v[j] * sc;
+        }
+        if (N == 4) {
+            const float sc = rounded_fp8(pooled[base + dim / 2 + d0 / 16]) * 0x1p14f;
+            float v[8];
+            fp4_decode8(uint(*(const device ushort*)(pooled + base + d0 / 2)), v);
+            for (int j = 0; j < 4; ++j) out[j] = v[j] * sc;
+        }
+    } else {
+        const size_t base = size_t(row) * (dim + dim / 32);
+        const float sc = as_type<float>(uint(window[base + dim + d0 / 32] + 8) << 23);
+        const device uint* c = (const device uint*)(window + base + d0);
+        for (int g = 0; g < N / 4; ++g) {
+            float v[4];
+            fp8_decode4(c[g], v);
+            for (int j = 0; j < 4; ++j) out[4 * g + j] = v[j] * sc;
+        }
+    }
+}
+"""
+
+
 # Split single-query sparse attention (kernel.py sparse_attn). The reference processes the
 # selected keys in 64-key blocks per head: s = (q . k) * scale (fp32 accumulator, -inf for
 # invalid slots); M_b = max(M_{b-1}, rowmax(s_b)) from M_{-1} = -1e30; p = exp(s - M_b);
@@ -296,8 +333,8 @@ _WOA = r"""
 # upstream oMLX's fused kernel (one threadgroup per 8 heads walking the blocks serially, ~8
 # of 80 GPU cores busy, ~150 us/layer); those orders are free in the reference (tensor-core
 # GEMM, T.reduce_sum), error <= gamma_K * sum|terms| per sum (K = 512 / 64 / 64).
-# KV rows are decoded on the fly with the same read_kv expressions (fp8 * 2^e window rows,
-# fp4 * fp8 pooled rows), exact in fp32.
+# KV rows are decoded on the fly to the read_kv values (fp8 * 2^e window rows, fp4 * fp8 pooled
+# rows, exact in fp32), each thread reading a run of consecutive dims of a row (read_kv_run).
 _ATTN_COMMON = r"""
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     const uint hg = threadgroup_position_in_grid.x, b = threadgroup_position_in_grid.y;
@@ -319,26 +356,35 @@ _ATTN_COMMON = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
 """
 _ATTN_SCORES = _ATTN_COMMON + r"""
-    // 32 simdgroups: key tile = sg % 8 (8 keys), D quarter = sg / 8 (D/4 dims, D/32 MMA steps)
+    // S^T = K Q^T on 8x8 tiles. 32 simdgroups: key tile = sg % 8, D quarter = sg / 8. Thread (fm, fn)
+    // holds key fm of the tile and the CH = D / 16 consecutive dims of chunk fn / 2 of the quarter
+    // (one vector read of the row); MMA step s takes dims 2 s, 2 s + 1 of every chunk.
+    constexpr int CH = D / 16;
     threadgroup float dots[4 * 8 * 64];
     threadgroup float sblock[8 * 64];
+    threadgroup bfloat16_t qs[8 * D];
+    const uint tid = thread_index_in_threadgroup;
+    for (uint i = tid * 4; i < 8 * D; i += 4096) *(threadgroup packed_bfloat4*)(qs + i) = *(const device packed_bfloat4*)(q + hg * 8 * D + i);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint tile = sg % 8, quarter = sg / 8;
-    const int r0 = rowidx[tile * 8 + fn], r1 = rowidx[tile * 8 + fn + 1];
-    const bool c0 = iscomp[tile * 8 + fn], c1 = iscomp[tile * 8 + fn + 1];
-    const uint head = hg * 8 + fm;
+    const int r = rowidx[tile * 8 + fm];
+    const bool cmp = iscomp[tile * 8 + fm];
+    float kv[CH];
+    if (r >= 0) read_kv_run<CH>(window, pooled, r, int(quarter * (D / 4) + (fn / 2) * CH), D, cmp, kv);
+    else for (int j = 0; j < CH; ++j) kv[j] = 0.0f;
     simdgroup_matrix<float, 8, 8> score, a, bm;
     score.thread_elements()[0] = 0.0f; score.thread_elements()[1] = 0.0f;
-    for (int k = quarter * (D / 4); k < int(quarter + 1) * (D / 4); k += 8) {
-        a.thread_elements()[0] = float(q[head * D + k + fn]);
-        a.thread_elements()[1] = float(q[head * D + k + fn + 1]);
-        bm.thread_elements()[0] = r0 >= 0 ? read_kv(window, pooled, r0, k + fm, D, c0, 0.0f, 0, false) : 0.0f;
-        bm.thread_elements()[1] = r1 >= 0 ? read_kv(window, pooled, r1, k + fm, D, c1, 0.0f, 0, false) : 0.0f;
+    const uint qd = quarter * (D / 4) + (fm / 2) * CH + (fm & 1);
+    for (int s = 0; s < CH / 2; ++s) {
+        a.thread_elements()[0] = kv[2 * s];
+        a.thread_elements()[1] = kv[2 * s + 1];
+        bm.thread_elements()[0] = float(qs[fn * D + qd + 2 * s]);
+        bm.thread_elements()[1] = float(qs[(fn + 1) * D + qd + 2 * s]);
         simdgroup_multiply_accumulate(score, a, bm, score);
     }
-    dots[(quarter * 8 + fm) * 64 + tile * 8 + fn] = score.thread_elements()[0];
-    dots[(quarter * 8 + fm) * 64 + tile * 8 + fn + 1] = score.thread_elements()[1];
+    dots[(quarter * 8 + fn) * 64 + tile * 8 + fm] = score.thread_elements()[0];
+    dots[(quarter * 8 + fn + 1) * 64 + tile * 8 + fm] = score.thread_elements()[1];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint tid = thread_index_in_threadgroup;
     if (tid < 512) {   // (head, key): q.k = sum of the 4 quarter partials; * scale; -inf if invalid
         const uint hh = tid / 64, key = tid % 64;
         const float dot = dots[hh * 64 + key] + dots[(8 + hh) * 64 + key] + dots[(16 + hh) * 64 + key] + dots[(24 + hh) * 64 + key];
@@ -373,25 +419,28 @@ _ATTN_PV = _ATTN_COMMON + r"""
         if (lane == 0) DEN[head * NB + b] = psum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // PV: 32 simdgroups x D/32 dims each, K = 64 keys (8 tiles of 8)
+    // PV: simdgroup sg takes dims [sg D/32, (sg + 1) D/32), K = 64 keys (8 tiles of 8). In output
+    // tile v, MMA column n is dim sg D/32 + (n / 2) 2 TILES + 2 v + (n & 1), so a thread's
+    // 2 TILES values of a key row are consecutive (one read per tile).
     constexpr int TILES = D / 256;
     simdgroup_matrix<float, 8, 8> pv[TILES], a, bm;
     for (int v = 0; v < TILES; ++v) { pv[v].thread_elements()[0] = 0.0f; pv[v].thread_elements()[1] = 0.0f; }
+    const int d0 = int(sg) * (D / 32) + int(fn / 2) * 2 * TILES;
     for (uint tile = 0; tile < 8; ++tile) {
         a.thread_elements()[0] = prob[fm * 64 + tile * 8 + fn];
         a.thread_elements()[1] = prob[fm * 64 + tile * 8 + fn + 1];
         const int r = rowidx[tile * 8 + fm];
-        const bool cmp = iscomp[tile * 8 + fm];
+        float vv[2 * TILES];
+        if (r >= 0) read_kv_run<2 * TILES>(window, pooled, r, d0, D, iscomp[tile * 8 + fm], vv);
+        else for (int j = 0; j < 2 * TILES; ++j) vv[j] = 0.0f;
         for (int v = 0; v < TILES; ++v) {
-            const int d = int(sg) * (D / 32) + v * 8 + int(fn);
-            bm.thread_elements()[0] = r >= 0 ? read_kv(window, pooled, r, d, D, cmp, 0.0f, 0, false) : 0.0f;
-            bm.thread_elements()[1] = r >= 0 ? read_kv(window, pooled, r, d + 1, D, cmp, 0.0f, 0, false) : 0.0f;
+            bm.thread_elements()[0] = vv[2 * v];
+            bm.thread_elements()[1] = vv[2 * v + 1];
             simdgroup_multiply_accumulate(pv[v], a, bm, pv[v]);
         }
     }
     for (int v = 0; v < TILES; ++v) {
-        const uint d = sg * (D / 32) + v * 8 + fn;
-        const size_t o = (size_t(hg * 8 + fm) * NB + b) * D + d;
+        const size_t o = (size_t(hg * 8 + fm) * NB + b) * D + d0 + 2 * v;
         PV[o] = pv[v].thread_elements()[0];
         PV[o + 1] = pv[v].thread_elements()[1];
     }
@@ -626,7 +675,7 @@ def kernel(name, formats=()):
     if base.startswith("attn_"):
         from .packed_attention import _READ
 
-        header = _READ + "\n#include <metal_simdgroup_matrix>\n" + _HEADER
+        header = _READ + "\n#include <metal_simdgroup_matrix>\n" + _HEADER + _KV_RUN
     full = "v41_decode_" + name
     if formats:
         roles = ("W",) if base.startswith("wqb") else ("A", "B")
