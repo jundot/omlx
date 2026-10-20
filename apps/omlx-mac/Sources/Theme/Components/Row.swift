@@ -59,6 +59,24 @@ struct Row<Trailing: View>: View {
     }
 }
 
+/// Trailing on/off switch for a `Row`. One shared control so every screen
+/// gets the same size: `.small`, matching System Settings rows — the default
+/// regular switch reads oversized next to 13 pt row labels.
+struct RowSwitch: View {
+    @Binding var isOn: Bool
+
+    init(isOn: Binding<Bool>) {
+        self._isOn = isOn
+    }
+
+    var body: some View {
+        Toggle("", isOn: $isOn)
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+    }
+}
+
 extension Row where Trailing == EmptyView {
     /// Label-only row (no trailing slot).
     init(label: String, sublabel: String? = nil, isLast: Bool = false) {
@@ -140,8 +158,16 @@ struct LinkRow<Icon: View>: View {
         )
     }
 
+    @State private var hovering = false
+
+    // The whole row is one button (System Settings convention for rows
+    // that open a URL); the trailing ↗ is a passive indicator, not a
+    // separate control. Hover feedback replaces FreeRow so the highlight
+    // spans the full row width.
     var body: some View {
-        FreeRow(isLast: isLast) {
+        Button {
+            NSWorkspace.shared.open(url)
+        } label: {
             HStack(spacing: 10) {
                 iconView
                     .foregroundStyle(theme.textSecondary)
@@ -158,13 +184,95 @@ struct LinkRow<Icon: View>: View {
 
                 Spacer(minLength: 8)
 
-                Button {
-                    NSWorkspace.shared.open(url)
-                } label: {
-                    Label("common.open", systemImage: "arrow.up.right.square")
-                        .labelStyle(.iconOnly)
+                Image(systemName: "arrow.up.right.square")
+                    .font(.system(size: 14))
+                    .foregroundStyle(theme.textSecondary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(hovering ? theme.hoverBg : .clear)
+        .onHover { hovering = $0 }
+        .overlay(alignment: .bottom) {
+            if !isLast {
+                Rectangle()
+                    .fill(theme.rowSep)
+                    .frame(height: 0.5)
+                    .padding(.horizontal, 14)
+            }
+        }
+    }
+}
+
+/// Row that opens a sub-page, System Settings style: the trailing value
+/// summarizes the sub-page and the chevron marks the row as navigation.
+struct NavRow<Icon: View>: View {
+    let label: String
+    let value: String?
+    var isLast: Bool = false
+    var isDimmed: Bool = false
+    let action: () -> Void
+
+    private let icon: Icon
+
+    @Environment(\.omlxTheme) private var theme
+    @State private var hovering = false
+
+    init(
+        label: String,
+        value: String? = nil,
+        isLast: Bool = false,
+        isDimmed: Bool = false,
+        action: @escaping () -> Void,
+        @ViewBuilder icon: () -> Icon
+    ) {
+        self.label = label
+        self.value = value
+        self.isLast = isLast
+        self.isDimmed = isDimmed
+        self.action = action
+        self.icon = icon()
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                icon
+                Text(label)
+                    .font(.omlxText(13, weight: .medium))
+                    .foregroundStyle(theme.text)
+                    .lineLimit(1)
+                Spacer(minLength: 12)
+                if let value, !value.isEmpty {
+                    Text(value)
+                        .font(.omlxText(12))
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
-                .buttonStyle(.omlx(.plain, size: .small))
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(theme.textTertiary)
+            }
+            .opacity(isDimmed ? 0.5 : 1)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .frame(minHeight: 36)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(hovering ? theme.hoverBg : .clear)
+        .onHover { hovering = $0 }
+        .overlay(alignment: .bottom) {
+            if !isLast {
+                Rectangle()
+                    .fill(theme.rowSep)
+                    .frame(height: 0.5)
+                    .padding(.horizontal, 14)
             }
         }
     }
@@ -182,14 +290,14 @@ struct LinkRow<Icon: View>: View {
             CodeChip(value: "127.0.0.1:8000")
         }
         Row(label: "Auto-start on launch") {
-            Toggle("", isOn: $autoStart).labelsHidden().toggleStyle(.switch)
+            RowSwitch(isOn: $autoStart)
         }
         Row(
             label: "Require API Key",
             sublabel: "Reject unauthenticated /v1 requests",
             isLast: true
         ) {
-            Toggle("", isOn: $requireKey).labelsHidden().toggleStyle(.switch)
+            RowSwitch(isOn: $requireKey)
         }
     }
     .padding(.vertical, 14)

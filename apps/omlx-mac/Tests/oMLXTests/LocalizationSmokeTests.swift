@@ -60,6 +60,7 @@ final class LocalizationSmokeTests: XCTestCase {
         "server.section.advanced", "server.row.base_path",
         "security.section.api_key", "security.api_key.row_label",
         "integrations.section.claude_code", "integrations.tool.codex",
+        "integrations.section.external_engines",
         "performance.section.cache", "performance.cache.enabled",
         "status.section.system", "status.section.active_now",
         // High-density screens
@@ -73,6 +74,7 @@ final class LocalizationSmokeTests: XCTestCase {
         "bench.context.header.title", "bench.context.section.configuration",
         // Settings + helpers
         "settings.section.basic", "settings.advanced.experimental.section",
+        "settings.actions.reset", "settings.apply.choose.group_pp",
         "appearance.row.menubar_icon", "appearance.row.menubar_icon.restore",
         // Menubar + updates
         "menubar.item.quit", "menubar.stats.session_section",

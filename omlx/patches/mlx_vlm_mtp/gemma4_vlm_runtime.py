@@ -41,6 +41,7 @@ patched ``LanguageModel.__init__`` attaches the head for weight binding.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import Any
 
@@ -68,6 +69,22 @@ def apply() -> bool:
         logger.debug(f"mlx_vlm.gemma4 not importable for MTP runtime: {e}")
         return False
 
+    from mlx_vlm.models.gemma4 import Model
+    from mlx_vlm.models.gemma4_unified import Model as UnifiedModel
+
+    def keep_head(original_sanitize):
+        def sanitize(self, weights):
+            head = {
+                k: v for k, v in weights.items() if k.startswith("language_model.mtp.")
+            }
+            backbone = {k: v for k, v in weights.items() if k not in head}
+            return {**original_sanitize(self, backbone), **head}
+
+        return sanitize
+
+    # Text-only gemma4 checkpoints load as gemma4_unified; see omlx.engine.vlm.
+    Model.sanitize = keep_head(Model.sanitize)
+    UnifiedModel.sanitize = keep_head(UnifiedModel.sanitize)
     _patch_text_config(g4_config)
     # Gemma4 unified reuses Gemma4's LanguageModel but declares its own
     # TextConfig subclass. Retain the embedded assistant config there too so
@@ -81,9 +98,9 @@ def apply() -> bool:
 
     _patch_vlm_model_adapter()
 
-    # Small-L verify forwards otherwise pay gemma4's unfused multi-token
-    # attention (head_dim 256/512 has no fused SDPA above L=1); the
-    # decomposed route keeps shallow-depth speculation profitable.
+    # MLX 0.32.2 covers Gemma4's head-dim-256 small-L shapes natively. Global
+    # head-dim-512 verify still needs the custom fused route to keep
+    # shallow-depth speculation profitable.
     from ..gemma4_verify_attention import apply as apply_verify_attention
 
     apply_verify_attention()
@@ -128,6 +145,23 @@ def _patch_text_config(g4_config: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _align_drafter_dtype(drafter: Any, dtype: Any) -> None:
+    """Match the head to its activation dtype so matmuls don't promote to float32."""
+    from mlx.utils import tree_map
+
+    def _cast(value: Any) -> Any:
+        if (
+            isinstance(value, mx.array)
+            and value.dtype in (mx.float16, mx.bfloat16)
+            and value.dtype != dtype
+        ):
+            return value.astype(dtype)
+        return value
+
+    drafter.update(tree_map(_cast, drafter.parameters()))
+    logger.info("gemma4 vlm assistant head aligned to %s", dtype)
+
+
 def _patch_vlm_language_model(g4_lang: Any) -> None:
     cls = g4_lang.LanguageModel
     if "_omlx_mtp_runtime_patched" in cls.__dict__:
@@ -142,29 +176,30 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
 
     original_init = cls.__init__
     original_call = cls.__call__
+    original_rollback = cls.rollback_speculative_cache
 
     def __init__(self, config):
         from . import is_mtp_attach_enabled
-        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active
+        from ..mlx_lm_mtp import get_mtp_depth, is_mtp_active, is_mtp_depth_fixed
 
         original_init(self, config)
+        # A block drafter speculates for single rows only: a ragged accept
+        # cannot roll back the batched sliding-window (rotating) caches.
+        self._omlx_drafter_single_row = True
         asst_cfg = getattr(config, "mtp_assistant_config", None)
         attach = bool(asst_cfg) and bool(is_mtp_attach_enabled())
         self._omlx_mtp_decode_enabled = bool(attach and is_mtp_active())
         if attach:
             drafter_config = Gemma4AssistantConfig.from_dict(asst_cfg)
             self.mtp = Gemma4AssistantDraftModel(drafter_config)
-            # Binds the backbone's embed_tokens (+ scale) for the fused
-            # [token_embed, hidden] input and resolves the head's tied
-            # lm_head fn. Function refs read weights at call time, so
-            # binding before load_weights is safe.
-            self.mtp.bind(self)
+            # Defer binding until quantization replaces the initial embedding.
         if self._omlx_mtp_decode_enabled:
             # The chain cycle applies the backbone's final RMSNorm to the
             # verify hidden rows (HEAD_HIDDEN_POST_NORM) — exactly the
             # ``speculative_draft_hidden`` variant this drafter consumes.
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         """Backbone forward with MTP-cycle shared-K/V capture.
@@ -176,6 +211,9 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         has no SSM state) routes ``_chain_rollback`` to the stock
         ``rollback_speculative_cache``.
         """
+        drafter = getattr(self, "_omlx_drafter", None)
+        if drafter is not None:
+            return _drafter_call(self, drafter, inputs, inputs_embeds, mask, cache, kwargs)
         return_hidden = bool(kwargs.get("return_hidden", False))
         if not (return_hidden and getattr(self, "_omlx_mtp_decode_enabled", False)):
             return original_call(self, inputs, inputs_embeds, mask, cache, **kwargs)
@@ -205,6 +243,84 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             gdn_states=[],
             shared_kv_states=sink,
         )
+
+    def _drafter_call(self, drafter, inputs, inputs_embeds, mask, cache, kwargs):
+        """Backbone forward with a DFlash block drafter attached.
+
+        A verify forward returns the drafter's layer captures followed by
+        the last layer's hidden. An ordinary decode step feeds the drafter.
+        ``gdn_states=[]`` (no recurrent state) routes rollback to the stock
+        ``rollback_speculative_cache``.
+        """
+        return_hidden = kwargs.pop("return_hidden", False)
+        kwargs.pop("n_confirmed", None)
+        if not return_hidden:
+            requested = kwargs.pop("capture_layer_ids", None)
+            scope = drafter.scope_uids
+            observe = bool(
+                requested is None
+                and scope
+                and inputs is not None
+                and inputs.ndim == 2
+                and tuple(inputs.shape) == (len(scope), 1)
+            )
+            if observe:
+                requested = list(drafter.target_layer_ids)
+            if not requested:
+                return original_call(
+                    self, inputs, inputs_embeds, mask, cache, **kwargs
+                )
+            # The stock forward returns captures in layer order; the drafter
+            # concatenates them in its own order.
+            layer_ids = sorted(set(requested))
+            out = original_call(
+                self,
+                inputs,
+                inputs_embeds,
+                mask,
+                cache,
+                capture_layer_ids=layer_ids,
+                **kwargs,
+            )
+            by_layer = dict(zip(layer_ids, out.hidden_states))
+            captures = [by_layer[i] for i in requested]
+            if observe:
+                drafter.observe(scope, captures)
+                return out
+            return dataclasses.replace(out, hidden_states=captures)
+        requested = list(kwargs.pop("capture_layer_ids", None) or [])
+        last = len(self.model.layers) - 1
+        layer_ids = sorted({*requested, last})
+        out = original_call(
+            self,
+            inputs,
+            inputs_embeds,
+            mask,
+            cache,
+            capture_layer_ids=layer_ids,
+            **kwargs,
+        )
+        by_layer = dict(zip(layer_ids, out.hidden_states))
+        return LanguageModelOutput(
+            logits=out.logits,
+            hidden_states=[by_layer[i] for i in requested] + [by_layer[last]],
+            gdn_states=[],
+        )
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        """Trim one row's rejected verify rows without a device read.
+
+        The stock hook reads the accepted count back from an ``mx.array``,
+        which waits for the draft already queued behind the verify.
+        """
+        if not isinstance(accepted, int):
+            return original_rollback(self, caches, gdn_states, accepted, block_size)
+        trim = int(block_size) - accepted - 1
+        if trim > 0:
+            for cache in caches:
+                if cache is not None and hasattr(cache, "trim"):
+                    cache.trim(trim)
+        return accepted
 
     def _mtp_query_position(self) -> int:
         """Current committed length = the drafter's constant query position.
@@ -252,10 +368,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         """
         del mtp_cache, logits_keep  # stateless head; output is 1 position
         drafter = self.mtp
-        # Re-bind when the backbone embed module was swapped after the
-        # __init__-time bind — nn.quantize() replaces embed_tokens with a
-        # QuantizedEmbedding AFTER model construction, and a stale binding
-        # keeps a random-init nn.Embedding (garbage drafts, ~10% accept).
+        # Rebind if quantization replaced the backbone embedding.
         if drafter._input_embed is not self.model.embed_tokens:
             drafter.bind(self)
         shared_kv = getattr(self, "_omlx_mtp_shared_kv", None)
@@ -266,6 +379,11 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             )
 
         h = hidden_states[:, -1:, :]
+        # Compare strings because MLX dtype comparison with None raises TypeError.
+        want_dtype = str(h.dtype)
+        if getattr(drafter, "_omlx_head_dtype", None) != want_dtype:
+            _align_drafter_dtype(drafter, h.dtype)
+            drafter._omlx_head_dtype = want_dtype
         ids = next_token_ids[:, -1:]
         tok_embed = drafter._input_embed(ids) * drafter._input_embed_scale
         inputs_embeds = mx.concatenate([tok_embed.astype(h.dtype), h], axis=-1)
@@ -295,6 +413,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
 
     cls.__init__ = __init__
     cls.__call__ = __call__
+    cls.rollback_speculative_cache = rollback_speculative_cache
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls._omlx_mtp_runtime_patched = True

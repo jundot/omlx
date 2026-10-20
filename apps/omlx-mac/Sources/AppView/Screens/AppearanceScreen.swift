@@ -25,6 +25,8 @@ struct AppearanceScreen: View {
     private var showMemoryItem = false
     @AppStorage(MenubarMetricPrefs.modelLibraryScopeKey)
     private var modelLibraryScope = MenuBarModelScope.all.rawValue
+    @AppStorage(EnhancedReadability.enabledKey)
+    private var enhancedReadability = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -46,7 +48,7 @@ struct AppearanceScreen: View {
                         comment: "Appearance row sublabel for the menubar refresh cadence picker"
                     )
                 ) {
-                    Popup(selection: $refreshInterval, width: 110, options: [
+                    Popup(selection: $refreshInterval, width: .controlCompact, options: [
                         (0.5, "0.5 s"),
                         (1.0, "1 s"),
                         (2.0, "2 s"),
@@ -65,9 +67,7 @@ struct AppearanceScreen: View {
                         comment: "Appearance row sublabel for the permanent Dock icon toggle"
                     )
                 ) {
-                    Toggle("", isOn: $showDockIcon)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                    RowSwitch(isOn: $showDockIcon)
                 }
                 // Sits right under the Dock toggle because that's where people
                 // look for it — the Dock icon and the menu bar icon read as one
@@ -140,7 +140,6 @@ struct AppearanceScreen: View {
                             )
                         ),
                     ])
-                    .frame(width: 200)
                 }
             }
 
@@ -170,9 +169,7 @@ struct AppearanceScreen: View {
                         comment: "Appearance row sublabel for the LIV menubar item toggle"
                     )
                 ) {
-                    Toggle("", isOn: $showLiveActivity)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                    RowSwitch(isOn: $showLiveActivity)
                 }
                 Row(
                     label: String(
@@ -186,9 +183,7 @@ struct AppearanceScreen: View {
                         comment: "Appearance row sublabel for the AVG menubar item toggle"
                     )
                 ) {
-                    Toggle("", isOn: $showAverageActivity)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                    RowSwitch(isOn: $showAverageActivity)
                 }
                 Row(
                     label: String(
@@ -202,9 +197,7 @@ struct AppearanceScreen: View {
                         comment: "Appearance row sublabel for the ALL menubar item toggle"
                     )
                 ) {
-                    Toggle("", isOn: $showAlltimeActivity)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                    RowSwitch(isOn: $showAlltimeActivity)
                 }
                 Row(
                     label: String(
@@ -218,9 +211,7 @@ struct AppearanceScreen: View {
                         comment: "Appearance row sublabel for the CPU usage bar menubar item toggle"
                     )
                 ) {
-                    Toggle("", isOn: $showCPUItem)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                    RowSwitch(isOn: $showCPUItem)
                 }
                 Row(
                     label: String(
@@ -234,9 +225,7 @@ struct AppearanceScreen: View {
                         comment: "Appearance row sublabel for the GPU usage bar menubar item toggle"
                     )
                 ) {
-                    Toggle("", isOn: $showGPUItem)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                    RowSwitch(isOn: $showGPUItem)
                 }
                 Row(
                     label: String(
@@ -251,9 +240,30 @@ struct AppearanceScreen: View {
                     ),
                     isLast: true
                 ) {
-                    Toggle("", isOn: $showMemoryItem)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
+                    RowSwitch(isOn: $showMemoryItem)
+                }
+            }
+
+            SectionHeader(String(
+                localized: "appearance.section.readability",
+                defaultValue: "Enhanced Readability",
+                comment: "Appearance section header for the Enhanced Readability preference"
+            ))
+            ListGroup {
+                Row(
+                    label: String(
+                        localized: "appearance.row.enhanced_readability",
+                        defaultValue: "Enhanced Readability",
+                        comment: "Appearance row label for the Enhanced Readability toggle"
+                    ),
+                    sublabel: String(
+                        localized: "appearance.row.enhanced_readability.sub",
+                        defaultValue: "Raise low-contrast text to the primary color for higher readability.",
+                        comment: "Appearance row sublabel describing Enhanced Readability"
+                    ),
+                    isLast: true
+                ) {
+                    RowSwitch(isOn: $enhancedReadability)
                 }
             }
         }

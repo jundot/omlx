@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Monkey-patch for ml-explore/mlx-lm PR #990 — Qwen3.5/3.6 native MTP.
+"""Monkey-patch for ml-explore/mlx-lm PR #990 — Qwen3.5/3.6 Lightning MTP.
 
 Adds an MTP head to ``mlx_lm.models.qwen3_5.TextModel`` (the language-model
 half) and a pass-through on ``mlx_lm.models.qwen3_5.Model`` (the VLM-outer
@@ -49,6 +49,7 @@ The patch is intentionally limited to ``mlx_lm.models.qwen3_5``; mlx-vlm's
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from . import prompt_priming
@@ -58,10 +59,9 @@ logger = logging.getLogger(__name__)
 def _is_our_method(cls: Any, attr: str, marker: str) -> bool:
     """True iff ``cls.<attr>`` is the function we previously installed.
 
-    Used as a self-healing idempotency check: when another patch (e.g.
-    dflash's speculative hook) overwrites ``__call__`` between two
-    Native-MTP loads in the same process, the marker disappears and the
-    caller knows to re-apply. Reading from ``cls.__dict__`` instead of
+    Used as a self-healing idempotency check: when another patch overwrites
+    ``__call__`` between two Lightning MTP loads in the same process, the
+    marker disappears and the caller knows to re-apply. Reading from ``cls.__dict__`` instead of
     ``getattr`` avoids resolving inherited attributes — only what is
     actually defined on this class counts.
     """
@@ -75,8 +75,8 @@ def apply() -> bool:
     Self-healing. Each sub-patcher decides for itself whether the class
     still carries our installed method (marker-based identity check)
     and re-applies if something has clobbered it since the last call.
-    No module-level "patched once" flag so dflash → mtp transitions in
-    the same process re-establish ownership (issue #1388).
+    No module-level "patched once" flag so a later load in the same process
+    re-establishes ownership (issue #1388).
     """
     try:
         from mlx_lm.models import qwen3_5 as q35
@@ -84,6 +84,7 @@ def apply() -> bool:
         logger.debug("mlx_lm.models.qwen3_5 not importable; skipping MTP patch")
         return False
 
+    q35.TextModel._omlx_mtp_multi_request = True
     # Skip if upstream already merged PR 990: TextModel already has mtp_forward.
     if hasattr(q35.TextModel, "mtp_forward") and not hasattr(
         q35.TextModel, "_omlx_mtp_patched"
@@ -241,7 +242,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.nn.layers.distributed import sum_gradients
-    from mlx_lm.models.gated_delta import gated_delta_update
+    from mlx_lm.models.gated_delta import gated_delta_update, normalize_qk
 
     def _process_chunk(
         self,
@@ -272,9 +273,7 @@ def _patch_gated_delta_net(q35: Any) -> None:
                 [self.head_k_dim, self.head_k_dim, self.head_v_dim],
             )
         ]
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
         out, new_ssm_state = gated_delta_update(
             q,
@@ -372,11 +371,9 @@ def _patch_decoder_layer(q35: Any) -> None:
         if self.is_linear:
             h_in = self.input_layernorm(x)
             # n_confirmed is an MTP draft/verify concern and is always 0 on
-            # the stock and DFlash forward paths. Forward it only when it
-            # actually splits the sequence, so linear_attn implementations
-            # that don't accept the kwarg keep working — DFlash replaces
-            # linear_attn.__call__ with a hook that has no n_confirmed param.
-            # Mirrors the conditional in batch_generator._call_backbone.
+            # stock forwards. Forward it only when it actually splits the
+            # sequence, so linear_attn implementations without the kwarg keep
+            # working. Mirrors the conditional in batch_generator._call_backbone.
             if n_confirmed:
                 r = self.linear_attn(h_in, mask, cache, n_confirmed=n_confirmed)
             else:
@@ -409,23 +406,71 @@ def _patch_qwen3_5_text_model(q35: Any) -> None:
         cache=None,
         input_embeddings=None,
         n_confirmed: int = 0,
+        capture_layer_ids=None,
+        capture_sink=None,
     ):
+        import mlx.core as mx
+
         if input_embeddings is not None:
             hidden_states = input_embeddings
         else:
             hidden_states = self.embed_tokens(inputs)
 
+        # Pipeline-aware (oMLX #3518). Under ``pipeline(group)`` each rank owns
+        # ``pipeline_layers`` (``self.layers`` holds ``None`` for the other
+        # ranks' layers) and hands the hidden state to its neighbour. With one
+        # rank (``pipeline_rank=0``, ``pipeline_size=1``) this is exactly the
+        # single-host forward.
+        pipeline_rank = getattr(self, "pipeline_rank", 0)
+        pipeline_size = getattr(self, "pipeline_size", 1)
+        layers = self.pipeline_layers
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
 
-        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        fa_mask = None
+        ssm_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        if self.ssm_idx is not None:
+            ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        if pipeline_rank < pipeline_size - 1:
+            hidden_states = mx.distributed.recv_like(hidden_states, pipeline_rank + 1)
+
+        wanted = set(capture_layer_ids or ())
+        if wanted and pipeline_size > 1:
+            raise ValueError("layer captures need the whole model on one rank")
+        captured = {}
+        for index, (layer, c) in enumerate(zip(layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
                 hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
             )
+            if index in wanted:
+                captured[index] = hidden_states
+        if capture_sink is not None:
+            capture_sink.extend(captured[i] for i in capture_layer_ids or ())
+
+        if pipeline_rank != 0:
+            hidden_states = mx.distributed.send(
+                hidden_states, (pipeline_rank - 1) % pipeline_size
+            )
+            if cache and cache[-1] is not None:
+                # Keep the send in the lazy graph (same device as mlx-lm).
+                last = cache[-1]
+                if hasattr(last, "keys"):
+                    last.keys = mx.depends(last.keys, hidden_states)
+                else:
+                    last[0] = mx.depends(last[0], hidden_states)
+
+        if pipeline_size > 1:
+            # Every rank needs the final hidden state (norm, lm_head and the
+            # MTP head run redundantly on all ranks). Rank 0 holds the LAST
+            # layers, so its slice is the true output.
+            hidden_states = mx.distributed.all_gather(hidden_states)[
+                : hidden_states.shape[0]
+            ]
 
         # PR 990: return pre-norm hidden so the MTP head can fuse it. The
         # wrapping ``TextModel.__call__`` applies ``self.model.norm`` on top
@@ -472,10 +517,11 @@ def _patch_text_model(q35: Any) -> None:
             self.mtp = q35.MTPModule(args)
             # Depth-k chained drafting is available on this model: the qwen
             # patch supports return_hidden mtp_forward + partial rollback.
-            from . import get_mtp_depth
+            from . import get_mtp_depth, is_mtp_depth_fixed
 
             self._omlx_mtp_chain = True
             self._omlx_mtp_depth = get_mtp_depth()
+            self._omlx_mtp_depth_fixed = is_mtp_depth_fixed()
 
     def __call__(
         self,
@@ -484,12 +530,30 @@ def _patch_text_model(q35: Any) -> None:
         input_embeddings=None,
         return_hidden: bool = False,
         n_confirmed: int = 0,
+        capture_layer_ids=None,
     ):
+        drafter = getattr(self, "_omlx_drafter", None)
+        scope = getattr(drafter, "scope_uids", None)
+        # An ordinary decode step while a block drafter is attached keeps the
+        # committed token in the drafter context.
+        observe = bool(
+            capture_layer_ids is None
+            and not return_hidden
+            and scope
+            and inputs is not None
+            and inputs.ndim == 2
+            and tuple(inputs.shape) == (len(scope), 1)
+        )
+        if observe:
+            capture_layer_ids = list(drafter.target_layer_ids)
+        captured = [] if capture_layer_ids else None
         hidden = self.model(
             inputs,
             cache,
             input_embeddings=input_embeddings,
             n_confirmed=n_confirmed,
+            capture_layer_ids=capture_layer_ids,
+            capture_sink=captured,
         )
         normed = self.model.norm(hidden)
         if not return_hidden and not n_confirmed and input_embeddings is None:
@@ -505,9 +569,31 @@ def _patch_text_model(q35: Any) -> None:
             out = self.model.embed_tokens.as_linear(normed)
         else:
             out = self.lm_head(normed)
+        if observe:
+            drafter.observe(scope, captured)
+            return out
+        if captured is not None:
+            # Layer captures need an output object; a verify also carries
+            # the head's pre-norm hidden last. Rollback stays on
+            # mtp_partial_rollback (no gdn_states).
+            return SimpleNamespace(
+                logits=out,
+                hidden_states=captured + ([hidden] if return_hidden else []),
+                gdn_states=None,
+            )
         if return_hidden:
             return out, hidden
         return out
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        """Single-row rollback through ``mtp_partial_rollback``.
+
+        mlx-vlm's DFlash drafter bind requires this hook on the target.
+        """
+        accepted = int(accepted)
+        if not self.mtp_partial_rollback(caches, accepted, int(block_size) - 1):
+            raise RuntimeError("qwen3_5 cache rejected the speculative rollback")
+        return accepted
 
     def mtp_forward(
         self,
@@ -615,41 +701,6 @@ def _patch_text_model(q35: Any) -> None:
         )
         should_shift_norm_weights = has_unsanitized_conv1d
 
-        # MTP-head norms can use a *different* convention than the backbone,
-        # and can even be MIXED within the head itself. Observed in JANG MXFP4
-        # Qwen3.6 bundles: ``mtp.norm`` is already in MLX's +1 convention
-        # (mean ~= 1.27) while the per-layer head norms (input_layernorm /
-        # post_attention_layernorm / pre_fc_norm_*) are still in raw-HF
-        # convention (mean ~= 0). The backbone-only ``has_unsanitized_conv1d``
-        # signal evaluates False for such a checkpoint, so the +1 shift is
-        # never applied to the head norms; every RMSNorm in the head then
-        # multiplies by ~0, collapsing the head output to ~flat logits and
-        # driving MTP draft acceptance to ~0% (no speedup, MTP effectively
-        # disabled). A single global "shift or not" flag is wrong for the
-        # head, so decide PER-KEY for MTP norms from each weight's own
-        # magnitude: raw-HF RMSNorm weights center near 0, MLX-shifted near 1.
-        # The magnitude can't be read during oQ's streaming plan discovery
-        # (the weight is a no-data ``_TrackedTensor`` placeholder and
-        # ``mx.mean(...).item()`` raises), so emit a conditional replay
-        # transform there. A fixed fallback is wrong for Qwen3.6 sources
-        # where MTP norm conventions are mixed.
-        import mlx.core as _mx
-
-        def _is_oq_tracked_tensor(_w):
-            return (
-                _w.__class__.__name__ == "_TrackedTensor"
-                and hasattr(_w, "_clone")
-            )
-
-        def _mark_mtp_norm_conditional_add(_w):
-            return _w._clone(transform="add_if_mean_lt_0_5")
-
-        def _mtp_norm_is_raw_hf(_w, _fallback):
-            try:
-                return float(_mx.mean(_w.astype(_mx.float32)).item()) < 0.5
-            except Exception:
-                return _fallback
-
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
         elif not any("mtp." in k for k in weights):
@@ -680,31 +731,17 @@ def _patch_text_model(q35: Any) -> None:
         for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if v.ndim == 1 and any(k.endswith(sfx) for sfx in norm_keys):
-                # Note: keys may be prefixed (e.g. ``language_model.mtp.*``)
-                # when the outer Model wraps language_model, so test the
-                # ``mtp.`` substring rather than anchoring with startswith.
-                if "mtp." in k:
-                    if should_shift_norm_weights:
-                        # Raw-HF source: every Qwen3-Next RMSNorm gamma is
-                        # zero-centered, so head norms shift uniformly like
-                        # the backbone's. The mean heuristic below
-                        # misclassifies q_norm/k_norm (raw mean ~0.75) and
-                        # mtp.norm (raw ~1.27) as already-shifted, leaving
-                        # them -1 off — measured cost ~14pp of draft
-                        # acceptance on Qwen3.6-27B (prose 62.8% -> 76.3%).
-                        # ``v + 1.0`` also handles oQ _TrackedTensor (its
-                        # __add__ records an unconditional "add" transform).
-                        weights[k] = v + 1.0
-                    # Pre-converted checkpoints: per-key decision — a head
-                    # norm may still be raw-HF even when a sibling is
-                    # already +1 (JANG mixed bundles).
-                    elif _is_oq_tracked_tensor(v):
-                        weights[k] = _mark_mtp_norm_conditional_add(v)
-                    elif _mtp_norm_is_raw_hf(v, should_shift_norm_weights):
-                        weights[k] = v + 1.0
-                elif should_shift_norm_weights:
-                    weights[k] = v + 1.0
+            # MTP-head norms follow the backbone: a raw-HF checkpoint shifts
+            # every zero-centered gamma by +1, an MLX-format checkpoint is
+            # loaded as stored. Legacy mixed heads are repaired against the
+            # backbone in ``norm_repair`` at load_weights time; no per-tensor
+            # magnitude guess happens here (see #3742).
+            if (
+                should_shift_norm_weights
+                and v.ndim == 1
+                and any(k.endswith(sfx) for sfx in norm_keys)
+            ):
+                weights[k] = v + 1.0
         return weights
 
     def quant_predicate(self):
@@ -727,10 +764,15 @@ def _patch_text_model(q35: Any) -> None:
         cls.__init__ = __init__
         cls._omlx_mtp_init_wrapped = True
     __call__._omlx_mtp_call_marker = True
+    # Logits are lm_head(mtp(...)); draft chains may score candidates themselves.
+    mtp_forward._omlx_lm_head_logits = True
+    # The head reads only its own cache, so it can draft before the backbone commit.
+    mtp_forward._omlx_head_cache_only = True
     cls.__call__ = __call__
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
     cls.mtp_partial_rollback = mtp_partial_rollback
+    cls.rollback_speculative_cache = rollback_speculative_cache
     cls.sanitize = sanitize
     cls.quant_predicate = property(quant_predicate)
 
@@ -753,6 +795,7 @@ def _patch_outer_model(q35: Any) -> None:
         input_embeddings=None,
         return_hidden: bool = False,
         n_confirmed: int = 0,
+        capture_layer_ids=None,
     ):
         return self.language_model(
             inputs,
@@ -760,6 +803,7 @@ def _patch_outer_model(q35: Any) -> None:
             input_embeddings=input_embeddings,
             return_hidden=return_hidden,
             n_confirmed=n_confirmed,
+            capture_layer_ids=capture_layer_ids,
         )
 
     def mtp_forward(

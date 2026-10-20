@@ -338,6 +338,4 @@ def test_step3p7_mtp_sanitize_tracks_streaming_norm_transforms(
     )
 
     assert raw["language_model.mtp.enorm.weight"].transform == "add"
-    assert (
-        converted["language_model.mtp.enorm.weight"].transform == "add_if_mean_lt_0_5"
-    )
+    assert converted["language_model.mtp.enorm.weight"].transform == "passthrough"

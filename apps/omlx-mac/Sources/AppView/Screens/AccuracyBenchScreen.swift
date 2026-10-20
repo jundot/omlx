@@ -1,7 +1,7 @@
 // PR 12 — Accuracy Benchmark screen.
 //
 // Mirrors the "Accuracy" tab from the HTML admin panel
-// (omlx/admin/templates/dashboard/_bench.html + dashboard.js accBench*).
+// (apps/omlx-web/omlx_web/templates/dashboard/_bench.html + dashboard.js accBench*).
 // Wires the /admin/api/bench/accuracy/* endpoints — queue add / status /
 // remove / results / reset / cancel — onto a stack of sections:
 //
@@ -198,7 +198,7 @@ private struct ConfigurationSection: View {
                                  comment: "Sublabel under the Accuracy Bench model picker")) {
                 Popup(
                     selection: $selectedModelId,
-                    width: 320,
+                    width: .controlWide,
                     options: modelOptions
                 )
             }
@@ -222,7 +222,7 @@ private struct ConfigurationSection: View {
                                  defaultValue: "Enable per-question reasoning traces (slower)",
                                  comment: "Sublabel under the Accuracy Bench extended-thinking toggle")
             ) {
-                Toggle("", isOn: $enableThinking).labelsHidden().toggleStyle(.switch)
+                RowSwitch(isOn: $enableThinking)
             }
 
             FreeRow {
@@ -417,7 +417,7 @@ private struct BenchmarkCard: View {
                         .foregroundStyle(theme.textTertiary)
                     Popup(
                         selection: $sampleSize,
-                        width: 90,
+                        width: .controlNarrow,
                         options: sampleSizeOptions
                     )
                 }

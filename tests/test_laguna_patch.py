@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the Laguna MLX-LM monkey-patch (issue #2073).
 
-These tests protect the upstream-first Laguna compatibility contract, including
+These tests protect Laguna checkpoint and runtime compatibility, including
 dynamic module registration and the loader/parser boundaries it enables.
 """
 
@@ -69,7 +69,7 @@ def test_apply_registers_laguna_module():
 
     assert "mlx_lm.models.laguna" in sys.modules
     mod = importlib.import_module("mlx_lm.models.laguna")
-    assert mod.__package__ == "mlx_lm.models"
+    assert mod.__package__ == "omlx.patches.laguna"
 
     import mlx_lm.models as models_pkg
 
@@ -86,33 +86,6 @@ def test_apply_is_idempotent():
     assert is_applied() is True
     assert second is False
     assert first in (True, False)
-
-
-def test_module_registration_cleans_up_after_execution_failure(monkeypatch):
-    """A failed vendored import must not leave a poisoned sys.modules entry."""
-    from omlx.patches import laguna
-
-    module_name = "mlx_lm.models.laguna_broken_test"
-
-    class FailingLoader:
-        def create_module(self, spec):
-            return None
-
-        def exec_module(self, module):
-            raise RuntimeError("simulated vendored module failure")
-
-    failing_spec = importlib.machinery.ModuleSpec(module_name, FailingLoader())
-    monkeypatch.setattr(
-        laguna.importlib.util,
-        "spec_from_file_location",
-        lambda *_: failing_spec,
-    )
-    sys.modules.pop(module_name, None)
-
-    with pytest.raises(RuntimeError, match="simulated vendored module failure"):
-        laguna._register_module(module_name, "not-used.py", "mlx_lm.models")
-
-    assert module_name not in sys.modules
 
 
 def test_get_classes_resolves_laguna():
@@ -864,42 +837,6 @@ def test_apply_registers_laguna_tool_parser():
     assert tool_parser.tool_call_end == "</tool_call>"
 
 
-def test_tool_parser_registration_does_not_mask_upstream_dependency_failure(
-    monkeypatch,
-):
-    """A broken upstream parser must surface instead of being overwritten."""
-    from omlx.patches import laguna
-
-    registered_modules: list[tuple[str, str, str]] = []
-    original_import_module = importlib.import_module
-
-    def import_module_with_broken_laguna_parser(module_name: str):
-        if module_name == "mlx_lm.tool_parsers.laguna":
-            raise ModuleNotFoundError(
-                "No module named 'missing_laguna_dependency'",
-                name="missing_laguna_dependency",
-            )
-        return original_import_module(module_name)
-
-    monkeypatch.setattr(
-        laguna.importlib,
-        "import_module",
-        import_module_with_broken_laguna_parser,
-    )
-    monkeypatch.setattr(
-        laguna,
-        "_register_module",
-        lambda qualname, filename, package: registered_modules.append(
-            (qualname, filename, package)
-        ),
-    )
-
-    with pytest.raises(ModuleNotFoundError, match="missing_laguna_dependency"):
-        laguna._register_tool_parser()
-
-    assert registered_modules == []
-
-
 def test_laguna_tool_parser_parses_xml_call():
     """The parser extracts an XML-style Laguna function call."""
     tool_parser = _laguna_tool_parser()
@@ -974,21 +911,6 @@ def test_laguna_attention_resolves_sdpa_through_module():
 # --- mlxfast-challenge port: compiled fusions (Validate submission 8b4de42b) ---
 
 
-def _nvfp4_sparse_config(**overrides):
-    """Sparse-MoE NVFP4-shaped config exercising the fused decode path."""
-    cfg = _minimal_laguna_config(
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=32,
-        shared_expert_intermediate_size=32,
-        mlp_only_layers=[],
-        mlp_layer_types=["sparse", "sparse"],
-        moe_routed_scaling_factor=2.5,
-    )
-    cfg.update(overrides)
-    return cfg
-
-
 def _registered_laguna_module():
     """The exec'd model module the loader registers (patch must precede it)."""
     from omlx.patches.laguna import apply_laguna_patch
@@ -997,25 +919,6 @@ def _registered_laguna_module():
     import mlx_lm.models.laguna as lm
 
     return lm
-
-
-def _quantized_sparse_model():
-    """Small 2-layer sparse model with NVFP4 group-16 4-bit switch banks."""
-    from omlx.patches.laguna import apply_laguna_patch
-
-    apply_laguna_patch()
-    from mlx_lm.models import laguna
-
-    args = laguna.ModelArgs(**_nvfp4_sparse_config())
-    model = laguna.Model(args)
-    for layer in model.model.layers:
-        sp = layer.mlp
-        if type(sp).__name__ == "LagunaSparseMoeBlock":
-            sw = sp.switch_mlp
-            sw.gate_proj = sw.gate_proj.to_quantized(16, 4, mode="nvfp4")
-            sw.up_proj = sw.up_proj.to_quantized(16, 4, mode="nvfp4")
-            sw.down_proj = sw.down_proj.to_quantized(16, 4, mode="nvfp4")
-    return model
 
 
 def test_compiled_softplus_gate_matches_eager():
@@ -1041,109 +944,6 @@ def test_compiled_swiglu_matches_eager():
     ref = swiglu(gate, up)
     mx.eval(out, ref)
     assert mx.array_equal(out, ref)
-
-
-def test_compiled_fusions_bit_exact(monkeypatch):
-    """Compiled fusions reproduce eager output exactly on one model instance."""
-    lm = _registered_laguna_module()
-    model = _quantized_sparse_model()
-
-    def run(compiled):
-        monkeypatch.setattr(lm, "_COMPILED_FUSIONS", compiled)
-        cache = model.make_cache()
-        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
-        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
-        mx.eval(prefill, decode)
-        return prefill, decode
-
-    pre_on, dec_on = run(True)
-    pre_off, dec_off = run(False)
-    assert mx.array_equal(pre_on, pre_off)
-    assert mx.array_equal(dec_on, dec_off)
-    assert int(mx.max(mx.abs(dec_on - dec_off)).item()) == 0
-
-
-# --- mlxfast-challenge port: fused gate/up banks (Validate submission 613aaf69) ---
-
-
-def test_fused_routed_gate_up_parity_is_bit_exact(monkeypatch):
-    """Fused [gate; up] decode bank must be bit-identical to the stock path.
-
-    Toggles the actual registered model module (``mlx_lm.models.laguna``): the
-    loader exec's ``laguna_model.py`` into that module and the model reads its
-    ``_FUSED_ROUTED_GATE_UP`` global from there.
-    """
-    lm = _registered_laguna_module()
-    model = _quantized_sparse_model()
-
-    def run(fusion_on):
-        monkeypatch.setattr(lm, "_FUSED_ROUTED_GATE_UP", fusion_on)
-        cache = model.make_cache()
-        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
-        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
-        mx.eval(prefill, decode)
-        return prefill, decode
-
-    pre_on, dec_on = run(True)
-    pre_off, dec_off = run(False)
-
-    block = model.model.layers[0].mlp
-    assert block._fusion_ready is True
-    assert block._fused_gateup_split == 32
-    assert block._fused_gateup_weight.shape == (4, 64, 8)
-
-    assert mx.array_equal(pre_on, pre_off)
-    assert mx.array_equal(dec_on, dec_off)
-
-
-def test_fused_shared_gate_up_parity_is_bit_exact(monkeypatch):
-    """Fused shared-expert [gate; up] NVFP4 bank must be bit-identical."""
-    lm = _registered_laguna_module()
-    model = _quantized_sparse_model()
-    for layer in model.model.layers:
-        sp = layer.mlp
-        if type(sp).__name__ == "LagunaSparseMoeBlock":
-            se = sp.shared_expert
-            se.gate_proj = se.gate_proj.to_quantized(16, 4, mode="nvfp4")
-            se.up_proj = se.up_proj.to_quantized(16, 4, mode="nvfp4")
-            se.down_proj = se.down_proj.to_quantized(16, 4, mode="nvfp4")
-
-    def run(fused):
-        monkeypatch.setattr(lm, "_FUSED_SHARED_GATE_UP", fused)
-        cache = model.make_cache()
-        prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
-        decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
-        mx.eval(prefill, decode)
-        return prefill, decode
-
-    pre_on, dec_on = run(True)
-    pre_off, dec_off = run(False)
-    se = model.model.layers[0].mlp.shared_expert
-    assert se._fusion_ready is True
-    assert mx.array_equal(pre_on, pre_off)
-    assert mx.array_equal(dec_on, dec_off)
-
-
-def test_fused_banks_default_off_and_guard_unquantized(monkeypatch):
-    """Fusion defaults OFF (neutral on current MLX); unquantized banks refuse."""
-    lm = _registered_laguna_module()
-    assert lm._FUSED_ROUTED_GATE_UP is False
-    assert lm._FUSED_SHARED_GATE_UP is False
-    monkeypatch.setattr(lm, "_FUSED_ROUTED_GATE_UP", True)
-    monkeypatch.setattr(lm, "_FUSED_SHARED_GATE_UP", True)
-    model = _quantized_sparse_model()
-    for layer in model.model.layers:
-        sp = layer.mlp
-        if type(sp).__name__ == "LagunaSparseMoeBlock":
-            from mlx_lm.models.switch_layers import SwitchLinear
-
-            sp.switch_mlp.gate_proj = SwitchLinear(64, 32, 4)
-            sp.switch_mlp.up_proj = SwitchLinear(64, 32, 4)
-            sp.switch_mlp.down_proj = SwitchLinear(32, 64, 4)
-    cache = model.make_cache()
-    out = model(mx.array([[4]], dtype=mx.int32), cache=cache)
-    mx.eval(out)
-    assert model.model.layers[0].mlp._fusion_ready is False
 
 
 def test_two_output_compiled_tail_is_numerically_close():

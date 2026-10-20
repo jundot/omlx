@@ -20,20 +20,193 @@ struct IntegrationsScreen: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            ExternalEnginesSection(vm: vm, client: services.client)
             ClaudeCodeSection(vm: vm, client: services.client)
             ClaudeSetupCommandSection(vm: vm)
             OtherIntegrationsSection(vm: vm, client: services.client)
             MCPSection(vm: vm, client: services.client)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task { await vm.load(client: services.client) }
+    }
+}
+
+// MARK: - External engines
+
+/// Engines that serve a model from their own process. Each model picks its
+/// engine in Model Settings > Advanced; this section holds what they share.
+private struct ExternalEnginesSection: View {
+    @Bindable var vm: IntegrationsScreenVM
+    let client: OMLXClient
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        SectionHeader(
+            String(localized: "integrations.section.external_engines",
+                   defaultValue: "External Engines",
+                   comment: "Section header for engines that serve models from their own process"),
+            subtitle: String(localized: "integrations.section.external_engines.sub",
+                             defaultValue: "Serve a model with another inference engine in its own process. Choose the engine per model in Model Settings → Advanced.",
+                             comment: "Subtitle for the External Engines section")
+        )
+
+        ListGroup {
+            if vm.showsSplashPathField {
+                Row(
+                    label: String(localized: "integrations.splash.binary",
+                                  defaultValue: "Splash",
+                                  comment: "Row label for the Splash launcher"),
+                    sublabel: vm.splash?.available == true
+                        ? String(localized: "integrations.splash.binary.sub",
+                                 defaultValue: "Path to the splash or splash-m1 launcher.",
+                                 comment: "Sublabel for the Splash launcher path field")
+                        : (vm.splash?.reason ?? "")
+                ) {
+                    HStack(spacing: 7) {
+                        TextInput(text: $vm.splashPathDraft,
+                                  placeholder: "/opt/homebrew/bin/splash",
+                                  mono: true,
+                                  width: .controlMedium)
+                        Button {
+                            vm.chooseSplashLauncher()
+                        } label: {
+                            Image(systemName: "folder")
+                        }
+                        .buttonStyle(.omlx(.plain, size: .small))
+                        .help(String(localized: "integrations.splash.browse.help",
+                                     defaultValue: "Choose launcher",
+                                     comment: "Tooltip for choosing the Splash launcher"))
+                        Button(String(localized: "integrations.splash.apply",
+                                      defaultValue: "Apply",
+                                      comment: "Apply button for the Splash launcher path")) {
+                            Task { await vm.save(.splashPath, client: client) }
+                        }
+                        .buttonStyle(.omlx(.primary, size: .small))
+                        .disabled(vm.splashPathDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                        if !vm.splashPathSetting.isEmpty {
+                            Button(String(localized: "integrations.splash.use_auto",
+                                          defaultValue: "Detect Automatically",
+                                          comment: "Button that clears the Splash path so the server detects the launcher")) {
+                                vm.splashPathDraft = ""
+                                Task { await vm.save(.splashPath, client: client) }
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
+                        }
+                        if vm.editingSplashPath {
+                            Button(String(localized: "integrations.splash.cancel",
+                                          defaultValue: "Cancel",
+                                          comment: "Cancel editing the Splash launcher path")) {
+                                vm.editingSplashPath = false
+                            }
+                            .buttonStyle(.omlx(.plain, size: .small))
+                        }
+                    }
+                }
+            } else if let splash = vm.splash {
+                Row(
+                    label: String(localized: "integrations.splash.binary",
+                                  defaultValue: "Splash",
+                                  comment: "Row label for the Splash launcher"),
+                    sublabel: splash.path ?? ""
+                ) {
+                    HStack(spacing: 7) {
+                        StatusPill(status: .custom(
+                            color: theme.greenDot,
+                            label: "\(splash.label ?? "Splash") \(splash.version ?? "")",
+                            fillBg: true
+                        ))
+                        .help(splash.autoDetected == true
+                              ? String(localized: "integrations.splash.detected",
+                                       defaultValue: "Found automatically",
+                                       comment: "Tooltip when the Splash launcher was detected")
+                              : String(localized: "integrations.splash.configured",
+                                       defaultValue: "Set by path",
+                                       comment: "Tooltip when the Splash launcher path was set by the user"))
+                        Button(String(localized: "integrations.splash.change",
+                                      defaultValue: "Change",
+                                      comment: "Button to edit the detected Splash launcher path")) {
+                            vm.beginEditingSplashPath()
+                        }
+                        .buttonStyle(.omlx(.normal, size: .small))
+                    }
+                }
+            }
+
+            Row(label: String(localized: "integrations.splash.kv_format",
+                              defaultValue: "KV Cache Precision",
+                              comment: "Row label for the Splash KV cache format"),
+                sublabel: String(localized: "integrations.splash.kv_format.sub",
+                                 defaultValue: "int8 holds about twice the context of bf16 in the same memory.",
+                                 comment: "Sublabel for the Splash KV cache format")) {
+                Popup(selection: vm.bind($vm.splashKvFormat, save: {
+                    Task { await vm.save(.splashKvFormat, client: client) }
+                }), width: .controlCompact, options: [("int8", "int8"), ("bf16", "bf16")])
+            }
+
+            Row(label: String(localized: "integrations.splash.max_memory",
+                              defaultValue: "Memory Limit",
+                              comment: "Row label for the Splash memory limit"),
+                sublabel: String(localized: "integrations.splash.max_memory.sub",
+                                 defaultValue: "Empty gives Splash enough for the full context window; a larger limit gives its prefix cache more room.",
+                                 comment: "Sublabel for the Splash memory limit")) {
+                TextInput(text: $vm.splashMaxMemoryGb,
+                          placeholder: String(localized: "integrations.splash.auto",
+                                              defaultValue: "Auto",
+                                              comment: "Placeholder for an automatic Splash size"),
+                          suffix: "GB",
+                          width: .controlNarrow)
+            }
+
+            Row(label: String(localized: "integrations.splash.ssd_cache",
+                              defaultValue: "SSD Cache",
+                              comment: "Row label for the Splash SSD cache size"),
+                sublabel: String(localized: "integrations.splash.ssd_cache.sub",
+                                 defaultValue: "Splash's prefix cache in the oMLX SSD cache folder. Empty uses the oMLX SSD cache size; 0 turns it off.",
+                                 comment: "Sublabel for the Splash SSD cache size")) {
+                TextInput(text: $vm.splashSsdCacheGb,
+                          placeholder: String(localized: "integrations.splash.auto",
+                                              defaultValue: "Auto",
+                                              comment: "Placeholder for an automatic Splash size"),
+                          suffix: "GB",
+                          width: .controlNarrow)
+            }
+
+            let running = vm.splash?.models ?? []
+            Row(label: String(localized: "integrations.splash.ane_prefill",
+                              defaultValue: "Neural Engine Prefill",
+                              comment: "Row label for Splash Neural Engine prefill"),
+                sublabel: String(localized: "integrations.splash.ane_prefill.sub",
+                                 defaultValue: "Let Splash run part of long prompts on the Neural Engine when that is faster.",
+                                 comment: "Sublabel for Splash Neural Engine prefill"),
+                isLast: running.isEmpty) {
+                RowSwitch(isOn: vm.bind($vm.splashAnePrefill, save: {
+                    Task { await vm.save(.splashAnePrefill, client: client) }
+                }))
+            }
+
+            ForEach(Array(running.enumerated()), id: \.element.id) { index, model in
+                Row(label: model.id,
+                    sublabel: model.logPath,
+                    isLast: index == running.count - 1) {
+                    let used = UInt64(max(0, model.memoryBytes ?? 0))
+                    let budget = UInt64(max(0, model.memoryBudgetBytes ?? 0))
+                    Text("\(SystemMetricsPoller.formatBytesAsGiB(used)) / \(SystemMetricsPoller.formatBytesAsGiB(budget)) GB")
+                        .font(.omlxMono(11))
+                        .foregroundStyle(theme.textSecondary)
+                }
+            }
+        }
+        FooterBar {
+            Button(String(localized: "integrations.splash.limits.apply",
+                          defaultValue: "Apply",
+                          comment: "Apply button for the Splash memory and SSD cache sizes")) {
+                Task { await vm.save(.splashLimits, client: client) }
+            }
+            .buttonStyle(.omlx(.primary))
+            .disabled(!vm.hasPendingSplashLimits)
+        }
     }
 }
 
@@ -79,7 +252,7 @@ private struct ClaudeCodeSection: View {
                         selection: vm.bind($vm.opusModel, save: {
                             Task { await vm.save(.opusModel, client: client) }
                         }),
-                        width: 220,
+                        width: .controlMedium,
                         options: vm.modelOptions
                     )
                 }
@@ -90,7 +263,7 @@ private struct ClaudeCodeSection: View {
                         selection: vm.bind($vm.sonnetModel, save: {
                             Task { await vm.save(.sonnetModel, client: client) }
                         }),
-                        width: 220,
+                        width: .controlMedium,
                         options: vm.modelOptions
                     )
                 }
@@ -100,63 +273,41 @@ private struct ClaudeCodeSection: View {
                                   comment: "Row label for the Haiku model picker"),
                     sublabel: String(localized: "integrations.claude.haiku.sub",
                                      defaultValue: "Used for background tasks and tool calls",
-                                     comment: "Sublabel for the Haiku tier picker")
+                                     comment: "Sublabel for the Haiku tier picker"),
+                    isLast: true
                 ) {
                     Popup(
                         selection: vm.bind($vm.haikuModel, save: {
                             Task { await vm.save(.haikuModel, client: client) }
                         }),
-                        width: 220,
+                        width: .controlMedium,
                         options: vm.modelOptions
                     )
                 }
-            }
-            Row(
-                label: String(localized: "integrations.claude.context_scaling",
-                              defaultValue: "Context scaling",
-                              comment: "Row label for the Claude Code context scaling toggle"),
-                sublabel: String(localized: "integrations.claude.context_scaling.sub",
-                                 defaultValue: "Stretch context windows for long agentic sessions",
-                                 comment: "Sublabel for the context scaling toggle"),
-                isLast: !vm.contextScaling
-            ) {
-                Toggle("", isOn: vm.bind($vm.contextScaling, save: {
-                    Task { await vm.save(.contextScaling, client: client) }
-                }))
-                .labelsHidden().toggleStyle(.switch)
-            }
-            if vm.contextScaling {
                 Row(
-                    label: String(localized: "integrations.claude.target_context",
-                                  defaultValue: "Target context size",
-                                  comment: "Row label for the Claude Code target context size field"),
-                    sublabel: String(localized: "integrations.claude.target_context.sub",
-                                     defaultValue: "Per-request context window Claude Code will scale toward",
-                                     comment: "Sublabel for the target context size field"),
-                    isLast: true
+                    label: String(localized: "integrations.claude.desktop",
+                                  defaultValue: "Claude Desktop",
+                                  comment: "Row label for the Claude Desktop tier-alias toggle"),
+                    sublabel: String(localized: "integrations.claude.desktop.sub",
+                                     defaultValue: "Expose claude-opus / claude-sonnet / claude-haiku as aliases of the tier models",
+                                     comment: "Sublabel explaining the Claude Desktop tier-alias toggle")
                 ) {
-                    TextInput(
-                        text: $vm.targetContextSizeText,
-                        mono: true,
-                        suffix: "tk",
-                        width: 130
-                    )
+                    Toggle("", isOn: vm.bind($vm.desktopEnabled, save: {
+                        Task { await vm.save(.desktopEnabled, client: client) }
+                    }))
+                    .labelsHidden().toggleStyle(.switch)
+                }
+                if vm.desktopEnabled {
+                    FreeRow {
+                        CommandBlock(
+                            command: vm.claudeDesktopLaunchCommand,
+                            caption: String(localized: "integrations.claude.desktop.command",
+                                            defaultValue: "Claude Desktop",
+                                            comment: "Caption above the Claude Desktop launcher command block")
+                        )
+                    }
                 }
             }
-        }
-        if vm.contextScaling {
-            HStack {
-                Spacer()
-                Button(String(localized: "integrations.target_context.apply",
-                              defaultValue: "Apply",
-                              comment: "Apply button for the Claude Code target context size field")) {
-                    Task { await vm.save(.targetContextSize, client: client) }
-                }
-                .buttonStyle(.omlx(.primary))
-                .disabled(!vm.hasPendingContextSizeChange)
-            }
-            .padding(.horizontal, 18)
-            .padding(.top, 6)
         }
     }
 }
@@ -165,7 +316,7 @@ private struct ClaudeCodeSection: View {
 
 /// Houses both the primary `omlx launch claude` block and the "Advanced"
 /// env-var recipe that points the real `claude` binary at the local server.
-/// Mirrors `claudeCodeCommand` in `omlx/admin/static/js/dashboard.js`.
+/// Mirrors `claudeCodeCommand` in `apps/omlx-web/omlx_web/static/js/dashboard.js`.
 private struct ClaudeSetupCommandSection: View {
     var vm: IntegrationsScreenVM
     @State private var showAdvanced = false
@@ -237,36 +388,18 @@ private struct CommandBlock: View {
                     .strokeBorder(theme.groupBorder, lineWidth: 0.5)
             )
 
-            CopyButton(value: command)
-                .padding(.top, 6)
-                .padding(.trailing, 8)
+            // Same quiet copy affordance as `CodeChip`/`CopyIconButton`
+            // everywhere else — the previous locally-drawn boxed button was a
+            // second copy-button style.
+            CopyIconButton(
+                value: command,
+                helpText: String(localized: "integrations.command.copy",
+                                 defaultValue: "Copy command",
+                                 comment: "Tooltip for the copy button on a shell command block")
+            )
+            .padding(.top, 4)
+            .padding(.trailing, 4)
         }
-    }
-}
-
-private struct CopyButton: View {
-    let value: String
-    @State private var copied = false
-    @Environment(\.omlxTheme) private var theme
-
-    var body: some View {
-        Button {
-            let pb = NSPasteboard.general
-            pb.clearContents()
-            pb.setString(value, forType: .string)
-            copied = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-                copied = false
-            }
-        } label: {
-            Image(systemName: copied ? "checkmark" : "document.on.document")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(copied ? theme.successText : theme.textSecondary)
-                .padding(5)
-                .background(theme.controlBg)
-                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-        }
-        .buttonStyle(.plain)
     }
 }
 
@@ -351,6 +484,16 @@ private struct OtherIntegrationsSection: View {
                 command: vm.piCommand
             )
             IntegrationRow(
+                name: String(localized: "integrations.tool.vibe",
+                             defaultValue: "Mistral Vibe",
+                             comment: "Display name for the Mistral Vibe integration"),
+                modelBinding: vm.bind($vm.vibeModel, save: {
+                    Task { await vm.save(.vibeModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.vibeCommand
+            )
+            IntegrationRow(
                 name: String(localized: "integrations.tool.copilot",
                              defaultValue: "Copilot CLI",
                              comment: "Display name for the Copilot CLI integration"),
@@ -358,7 +501,17 @@ private struct OtherIntegrationsSection: View {
                     Task { await vm.save(.copilotModel, client: client) }
                 }),
                 modelOptions: vm.modelOptions,
-                command: vm.copilotCommand,
+                command: vm.copilotCommand
+            )
+            IntegrationRow(
+                name: String(localized: "integrations.tool.dsh",
+                             defaultValue: "DeepSeek Harness",
+                             comment: "Display name for the DeepSeek Harness (dsh) integration"),
+                modelBinding: vm.bind($vm.dshModel, save: {
+                    Task { await vm.save(.dshModel, client: client) }
+                }),
+                modelOptions: vm.modelOptions,
+                command: vm.dshCommand,
                 isLast: true
             )
         }
@@ -392,7 +545,7 @@ private struct IntegrationRow: View {
                     Spacer(minLength: 12)
                     Popup(
                         selection: modelBinding,
-                        width: 220,
+                        width: .controlMedium,
                         options: modelOptions
                     )
                 }
@@ -413,7 +566,7 @@ private struct IntegrationRow: View {
                         Spacer(minLength: 12)
                         Popup(
                             selection: profileBinding,
-                            width: 160,
+                            width: .controlMedium,
                             options: [
                                 ("minimal",   String(localized: "integrations.openclaw.profile.minimal",
                                                      defaultValue: "Minimal",
@@ -478,12 +631,11 @@ private struct MCPSection: View {
                     text: $vm.mcpConfigPath,
                     placeholder: "/path/to/mcp.json",
                     mono: true,
-                    width: 320
+                    width: .controlWide
                 )
             }
         }
-        HStack {
-            Spacer()
+        FooterBar {
             Button(String(localized: "integrations.mcp.apply",
                           defaultValue: "Apply",
                           comment: "Apply button for the MCP config path")) {
@@ -492,7 +644,5 @@ private struct MCPSection: View {
             .buttonStyle(.omlx(.primary))
             .disabled(!vm.hasPendingMCPChanges)
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 6)
     }
 }

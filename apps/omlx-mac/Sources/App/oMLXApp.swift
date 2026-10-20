@@ -51,15 +51,18 @@ struct OMLXApp: App {
         }
         .defaultLaunchBehavior(.suppressed)
         .handlesExternalEvents(matching: ["main"])
-        .windowResizability(.contentMinSize)
+        // Follows AppView's frame: fixed width, height from 600 up.
+        .windowResizability(.contentSize)
         // Replace the system "Quit oMLX" command (Cmd-Q from the in-app
         // menu). Cmd-Q hides every visible window AND drops the Dock icon
         // — same path as Dock → Quit (`applicationShouldTerminate`). The
-        // menubar status item's "Quit oMLX" remains the only path to fully
+        // menubar status item's "Quit oMLX" remains the only in-app path to fully
         // terminate.
         .commands {
             CommandGroup(replacing: .appTermination) {
-                Button("Close Window") {
+                Button(String(localized: "app.command.close_window",
+                              defaultValue: "Close Window",
+                              comment: "App menu command that hides all windows and drops the Dock icon")) {
                     appDelegate.hideWindowsAndDropDockIcon()
                 }
                 .keyboardShortcut("q", modifiers: .command)

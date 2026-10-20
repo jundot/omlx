@@ -265,6 +265,8 @@ struct ANETuningCandidateDTO: Codable, Equatable, Identifiable, Sendable {
 }
 
 struct ANETuningRecommendationDTO: Codable, Equatable, Sendable {
+    var backend: String? = nil
+    var sharedFraction: Double? = nil
     let enabled: Bool
     let mlpFraction: Double?
     let gdnEnabled: Bool

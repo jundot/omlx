@@ -1,6 +1,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from omlx.patches.deepseek_v4.switch_layers import install_nvfp4_global_scales
+
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
 from .language import LanguageModel
@@ -135,6 +137,10 @@ class Model(nn.Module):
                 nk = "vision_model." + nk[len("model.visual.") :]
             elif nk.startswith("visual."):
                 nk = "vision_model." + nk[len("visual.") :]
+            # Community GLM-5.3 exports (e.g. Vontra oQ checkpoints) ship the
+            # vision tower under the raw HF ``vision_tower.*`` names.
+            elif nk.startswith("vision_tower."):
+                nk = "vision_model." + nk[len("vision_tower.") :]
             elif nk.startswith("model.language_model."):
                 nk = "language_model.model." + nk[len("model.language_model.") :]
             elif nk.startswith("lm_head."):
@@ -159,7 +165,8 @@ class Model(nn.Module):
         out = {f"language_model.{k}": v for k, v in lang.items()}
         out.update({f"vision_model.{k}": v for k, v in vis.items()})
         out.update(other)
-        return out
+        # MTP sanitize maps nextn layers to their actual mtp.* module paths.
+        return install_nvfp4_global_scales(self, out)
 
     @property
     def layers(self):

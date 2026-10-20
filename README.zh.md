@@ -10,10 +10,6 @@
 <p align="center"><b>LLM 推理，为你的 Mac 优化</b><br>连续批处理和分层 KV 缓存，直接从菜单栏管理。</p>
 
 <p align="center">
-<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
@@ -60,7 +56,8 @@
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install omlx
+brew install omlx --with-custom-kernel   # 包含原生自定义内核（需要完整 Xcode）
+# 没有完整 Xcode 时，用 brew install omlx 安装不含内核的版本
 
 # 升级到最新版本
 brew update && brew upgrade omlx
@@ -68,14 +65,9 @@ brew update && brew upgrade omlx
 # 作为后台服务运行（崩溃时自动重启）
 brew services start omlx
 
-# 可选：MCP（Model Context Protocol）支持
+# 可选：MCP（Model Context Protocol）支持，安装后重启以加载
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
-```
-
-可选的 GLM-5.2 / MiniMax M3 原生自定义内核目前需要 HEAD 构建：
-
-```bash
-brew install omlx --HEAD --with-custom-kernel
+omlx restart
 ```
 
 ### 从源码安装
@@ -83,20 +75,24 @@ brew install omlx --HEAD --with-custom-kernel
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e .          # 仅核心
-pip install -e ".[mcp]"   # 含 MCP（Model Context Protocol）支持
-
-# 可选：GLM-5.2 / MiniMax M3 原生自定义内核
-OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
+make install                # 以 editable 模式安装（含 Web UI 和原生自定义内核）
+# 没有完整 Xcode 时，用 make install-no-kernels 安装不含内核的版本
+make mcp                    # 可选：添加 MCP 支持，重启 `omlx serve` 后加载
 ```
 
-需要 macOS 15.0+ (Sequoia), Python 3.10+ 和 Apple Silicon（M1/M2/M3/M4/M5）。
+需要 macOS 15.0+ (Sequoia)、Python 3.11–3.13 和 Apple Silicon（M1/M2/M3/M4/M5）。
+
+> **关于原生自定义内核：** GLM-5.2、MiniMax M3 和 Qwen3.5 需要这些内核，缺少时会在没有提示的情况下回退到慢得多的通用路径。`make install` 会一并构建内核并检查每个内核都能加载，这需要带 Metal 工具链的完整 Xcode（`xcodebuild -downloadComponent MetalToolchain`），仅有 Command Line Tools 不够。没有 Xcode 时，请使用已预编译内核的官方 DMG，或使用 `make install-no-kernels`。`make kernels` 只从头重新构建内核。检查安装：
+>
+> ```bash
+> python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
+> ```
 
 ## 快速开始
 
 ### macOS 应用
 
-从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。要连接 OpenClaw、OpenCode、Codex、Hermes Agent 或 Copilot，请参阅[集成](#集成)。
+从 Applications 文件夹启动 oMLX。欢迎界面会引导你完成三个步骤 — 模型目录设置、服务器启动、首个模型下载。就是这样。要连接 OpenClaw、OpenCode、Codex、Hermes Agent、Copilot 或 DeepSeek Harness，请参阅[集成](#集成)。
 
 <p align="center">
   <img src="docs/images/Screenshot 2026-02-10 at 00.36.32.png" alt="oMLX 欢迎界面" width="360">
@@ -140,9 +136,13 @@ brew services info omlx     # 查看状态
   <img src="docs/images/Screenshot 2026-02-10 at 00.45.34.png" alt="oMLX 管理后台" width="720">
 </p>
 
+### 实验性多 Mac 推理
+
+源码构建版本可通过基于 Ring 或雷雳（Thunderbolt）RDMA/JACCL 的 MLX 流水线秩，将已下载的单一语言模型拆分并运行在多台内存规格不等的 Mac 上。集群仪表盘支持只读节点发现、严格的 SSH/运行时校验、感知字节级差异的分片规划、实测算力与链路负载均衡、感知内存余量的执行调优、激活，并在两台 Mac 上提供实时的分片与性能图谱。交互模式、均衡模式与吞吐量配置模式公开了合并批处理、提示词缓存亲和性、轮换 KV 限制、Ring 连接调优以及受能力门禁控制的实验性纯 Token 输出路径。有关安装设置、安全边界、当前限制以及物理硬件验证清单，请参阅[跨 Mac 分布式推理](docs/experimental/distributed-cluster.md)。
+
 ### 视觉语言模型
 
-使用与文本 LLM 相同的连续批处理和分层 KV 缓存堆栈运行 VLM。支持多图聊天、base64/URL/文件图像输入，以及带视觉上下文的工具调用。OCR 模型（DeepSeek-OCR、DOTS-OCR、GLM-OCR）会被自动识别，并使用优化的提示词。
+使用与文本 LLM 相同的连续批处理和分层 KV 缓存堆栈运行 VLM。支持多图聊天、base64/URL/文件图像输入，以及带视觉上下文的工具调用。MiMo V2.6 权重（包含配套 sidecar）还支持抽帧视频和 24 kHz 音频输入。Qwen3.5、Qwen3.6 和 Qwen3.8 权重（包括密集模型与 MoE）支持通过 base64 `video_url` / `input_video` 数据 URI 进行原生视频输入；视频输入需要 OpenCV (`opencv-python-headless`)。官方 MiMo V2.6 权重的 oQ 格式转换完整保留图像和音频支持。OCR 模型（DeepSeek-OCR、DOTS-OCR、GLM-OCR）会被自动识别，并使用优化的提示词。
 
 ### 分层 KV 缓存（热缓存 + 冷缓存）
 
@@ -161,7 +161,7 @@ brew services info omlx     # 查看状态
 
 ### Claude Code 优化
 
-支持在 Claude Code 中使用较小上下文模型的上下文缩放。通过缩放上报的 Token 数量，让自动压缩在合适的时机触发，同时提供 SSE keep-alive 防止长时间预填充导致的读取超时。
+支持在 Claude Code 中使用较小上下文模型：不再缩放上报的 Token 数量，而是按模型真实的上下文窗口触发自动压缩，同时提供 SSE keep-alive 防止长时间预填充导致的读取超时。
 
 ### 多模型服务
 
@@ -196,7 +196,7 @@ brew services info omlx     # 查看状态
 
 ### 模型下载器
 
-在管理后台中直接搜索和下载 HuggingFace 上的 MLX 模型。浏览模型卡片、查看文件大小，一键下载。
+在管理后台中直接搜索和下载 HuggingFace 上的 MLX、GGUF 或所有格式的模型。浏览模型卡片后选择要下载的文件：MLX 检查点始终下载所需文件，GGUF 会一并下载其视觉投影器。
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX 模型下载器" width="720">
@@ -204,7 +204,7 @@ brew services info omlx     # 查看状态
 
 ### 集成
 
-在管理后台中一键设置 OpenClaw、OpenCode、Codex、Hermes Agent、Copilot 和 Pi。无需手动编辑配置文件。
+在管理后台中一键设置 OpenClaw、OpenCode、Codex、Hermes Agent、Copilot、Pi 和 DeepSeek Harness。无需手动编辑配置文件。
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX 集成" width="720">
@@ -228,7 +228,7 @@ brew services info omlx     # 查看状态
 
 ### API 兼容性
 
-OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、Anthropic adaptive thinking 和视觉输入（base64、URL）。
+OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream_options.include_usage`）、llama.cpp 风格的 prefill 进度（`return_progress`）、Anthropic adaptive thinking 和视觉输入（图像支持 base64 或 URL，视频支持 base64）。
 
 | 端点 | 说明 |
 |----------|------|
@@ -237,7 +237,11 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | 文本嵌入 |
 | `POST /v1/rerank` | 文档重排序 |
+| `POST /v1/systemone` | 决策模型或聊天模型的类型化判断 (TypeSafe System One) |
 | `GET /v1/models` | 列出可用模型 |
+| `POST /tokenize`, `POST /detokenize` | 兼容 vLLM 的分词器 API（也可通过 `/v1` 访问） |
+
+用于设置、模型、下载、量化和基准测试的管理 API 接受主 API 密钥作为 Bearer 令牌，在 headless 模式下同样可用。详见 [Admin API](docs/admin-api.md)。
 
 ### 工具调用与结构化输出
 
@@ -255,6 +259,8 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | Longcat | `<longcat_tool_call>` |
 
 上表未列出的模型，只要聊天模板支持 `tools` 参数且输出采用可识别的 `<tool_call>` XML 格式，也有可能正常工作。针对支持工具调用的流式请求，系统会增量发射助手文本，同时隐藏已知的工具调用控制标记；结构化工具调用将在完成整个回合解析后发射。
+
+裸 JSON、EBNF 或正则表达式语法会从第一个生成的 token 开始约束回答，因此会忽略 `thinking_budget`。如需将受约束的结构化输出与独立的、带预算的推理阶段相结合，请配置兼容的 `reasoning_parser`。
 
 ## 模型
 
@@ -276,8 +282,9 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | LLM | [mlx-lm](https://github.com/ml-explore/mlx-lm) 支持的所有模型 |
 | VLM | Qwen3.5 系列、GLM-4V、Pixtral 及其他 [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) 模型 |
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
-| 嵌入 | BERT、BGE-M3、ModernBERT |
+| 嵌入 | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | 重排序 | ModernBERT、XLM-RoBERTa |
+| 决策 | Clef、Clef-Flash、OpenJev、Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
 
 ## CLI 配置
 
@@ -306,6 +313,9 @@ omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 # API 密钥认证
 omlx serve --model-dir ~/models --api-key your-secret-key
 # 仅限 Localhost：在管理后台全局设置中跳过验证
+
+# 仅运行推理和管理 API，不启用 Web UI（不会保存到设置）
+omlx serve --model-dir ~/models --headless
 ```
 
 以上所有设置也可以在 `/admin` 的 Web 管理后台中配置。设置保存在 `~/.omlx/settings.json`，CLI 参数优先级更高。
@@ -320,7 +330,8 @@ FastAPI Server (OpenAI / Anthropic API)
     │   ├── BatchedEngine (LLM，连续批处理)
     │   ├── VLMEngine (视觉语言模型)
     │   ├── EmbeddingEngine
-    │   └── RerankerEngine
+    │   ├── RerankerEngine
+    │   └── DecisionEngine
     │
     ├── ProcessMemoryEnforcer (总内存限制、TTL 检查)
     │
@@ -337,31 +348,46 @@ FastAPI Server (OpenAI / Anthropic API)
 
 ## 开发
 
+### 构建命令
+
+| 命令 | 作用 |
+|---|---|
+| `make install` | 以 editable 模式安装服务器和 Web UI，并构建原生自定义内核 |
+| `make install-no-kernels` | 不含内核的相同安装（适用于没有完整 Xcode 的环境） |
+| `make mcp` | 添加 MCP（Model Context Protocol）支持 |
+| `make dev` | 与 `make install` 相同，另含开发工具（`make dev-no-kernels` 不含内核） |
+| `make kernels` | 删除已构建的原生自定义内核并重新编译，然后检查每个内核都能加载 |
+| `make web` | 重新构建 Web UI 的 CSS 并规范化翻译文件 |
+| `make app` | 暂存包含新编译原生自定义内核的 `oMLX.app` |
+
+构建原生自定义内核需要带 Metal 工具链的完整 Xcode（`xcodebuild -downloadComponent MetalToolchain`）。
+
 ### CLI 服务器
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e ".[dev]"
+make dev
 pytest -m "not slow"
 ```
 
+### Web UI
+
+Web 管理界面位于 `apps/omlx-web/`，并包含在同一个包中，因此 `make dev` 会一并安装。修改模板、JavaScript 或翻译后，运行 `make web` 重新构建 CSS 并规范化翻译文件。
+
 ### macOS 应用
 
-原生 SwiftUI 应用位于 `apps/omlx-mac/`，需要 Xcode 26.5+ 和 Python 3.11+。venvstacks 已声明为 dev 依赖，因此 `pip install -e ".[dev]"`（或 `uv sync --dev`）会引入固定版本。若偏好主机全局工具运行器，也可使用 `uvx venvstacks` 或 `pipx run venvstacks`。
+原生 SwiftUI 应用位于 `apps/omlx-mac/`，需要 Xcode 26.5+ 和 Python 3.11+。venvstacks 已声明为 dev 依赖，因此 `make dev`（或 `uv sync --dev`）会引入固定版本。若偏好主机全局工具运行器，也可使用 `uvx venvstacks` 或 `pipx run venvstacks`。
 
 ```bash
-# 暂存可运行的 oMLX.app（xcodebuild + venvstacks Python 层 + ad-hoc 签名）
-apps/omlx-mac/Scripts/build.sh release
+# 暂存可运行的 oMLX.app（xcodebuild + venvstacks Python 层 + 原生内核 + ad-hoc 签名）
+make app
 
 # 结果在 apps/omlx-mac/build/Stage/oMLX.app
 open apps/omlx-mac/build/Stage/oMLX.app
 
 # 强制重建 venvstacks（默认按指纹缓存）
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
-
-# 暂存包含可选 GLM-5.2 / MiniMax M3 原生自定义内核的应用
-apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 首次 cold 构建需要 10–20 分钟（venvstacks Python 层组装）。后续构建复用 `packaging/_export/` 缓存，约 4 分钟完成。层配置请参阅 [packaging/README.md](packaging/README.md)，Swift 源码请参阅 [apps/omlx-mac/](apps/omlx-mac/)。
@@ -386,3 +412,7 @@ apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 - [venvstacks](https://venvstacks.lmstudio.ai) - macOS 应用包的便携 Python 环境分层
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) - Apple Silicon 嵌入模型支持
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Apple Silicon 上的块扩散推测解码 (Block diffusion speculative decoding)
+- [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP 的验证形态 Metal 内核由 Youssof Altoukhi 的 MTPLX 提供支持，同时也启发了 depth-k 流水线设计
+- [mlx-serve](https://github.com/ddalcu/mlx-serve) - 融合 GDN 验证预处理内核改编自 mlx-serve 对 mlxfast-challenge qwen35_packed_gdn_prework 内核的移植，Qwen4 的融合 GDN decode 与 prefill 内核改编自 mlx-serve 的 MIT 开源 `transformer.zig`；Qwen4 QSA 的 128 位 K/V 暂存改编自 mlx-serve 的 MIT 开源 `msv_attn_p256` 内核
+- [Splash](https://github.com/incoai/splash) - 验证形态线性内核采用 Splash 的 bf16 `0x4300 | q` 权重操作数与分组输入求和（来自其 Apache-2.0 开源的 `linear_q4_sgmatrix.metal`），张量运算验证注意力借鉴了 Splash `paged_attention_tile.h` 的分块设计，GGUF 的分词器按照 Splash Apache-2.0 开源的 `install/gguf.py` 从文件头生成
+- [SiliconScope](https://github.com/kennss/SiliconScope) - 菜单栏统计信息的设计和渲染方法参考了 Kennt Kim 的 SiliconScope，这也启发了高能效重渲染门禁机制

@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Separate router for the realtime WebSocket: the main audio router is
-# mounted with an HTTP-only verify_api_key dependency that cannot resolve
+# mounted with an HTTP-only auth dependency that cannot resolve
 # in a websocket scope (and browsers cannot set an Authorization header on
 # WebSocket connections anyway). Auth happens in-band via the first
 # {"type": "start"} message instead.
@@ -617,26 +617,31 @@ async def create_transcription(
     )
 
 
-def _verify_ws_api_key(api_key: Optional[str]) -> bool:
-    """Verify an in-band API key with the same rules as verify_api_key.
+def _verify_ws_api_key(websocket: WebSocket, api_key: Optional[str]) -> bool:
+    """Verify an in-band API key, including the manual inference opt-in.
 
     WebSocket connections from browsers cannot carry an Authorization
     header, so the key arrives inside the {"type": "start"} message.
     """
-    from omlx.server import _server_state
+    from omlx.server import _server_state, allows_unauthenticated_inference
 
+    if allows_unauthenticated_inference():
+        return True
     if _server_state.api_key is None:
         return True
     gs = _server_state.global_settings
     if gs is not None and gs.auth.skip_api_key_verification:
         return True
-    if not api_key:
+    if not api_key or not isinstance(api_key, str):
         return False
 
-    from omlx.admin.auth import verify_any_api_key
+    from omlx.admin.auth import check_api_key, verify_any_api_key
 
     sub_keys = gs.auth.sub_keys if gs is not None else []
-    return verify_any_api_key(api_key, _server_state.api_key, sub_keys)
+    return check_api_key(
+        websocket,
+        lambda: verify_any_api_key(api_key, _server_state.api_key, sub_keys),
+    )
 
 
 @realtime_router.websocket("/v1/audio/transcriptions/realtime")
@@ -672,7 +677,12 @@ async def realtime_transcription(websocket: WebSocket) -> None:
     if not isinstance(start, dict) or start.get("type") != "start":
         await _reject("First message must be a {'type': 'start'} object")
         return
-    if not _verify_ws_api_key(start.get("api_key")):
+    try:
+        key_ok = _verify_ws_api_key(websocket, start.get("api_key"))
+    except HTTPException as exc:
+        await _reject(str(exc.detail))
+        return
+    if not key_ok:
         await _reject("Invalid API key")
         return
     model_id = start.get("model")

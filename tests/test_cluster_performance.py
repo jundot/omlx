@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
+from omlx.cluster import runtime_optimizations
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import run_cluster_performance_probe
 from omlx.cluster.performance import (
@@ -25,11 +26,24 @@ from omlx.cluster.planner import (
     plan_unequal_pipeline,
 )
 from omlx.cluster.runtime_optimizations import (
+    _agree_across_ranks,
     install_runtime_optimizations,
     pipeline_prefill_schedule,
+    wait_for_pipeline_peers_on_host,
 )
 
 mlx_generate = importlib.import_module("mlx_lm.generate")
+
+
+@pytest.fixture(autouse=True)
+def _ranks_agree(monkeypatch):
+    """The fake two-rank groups below cannot run a real collective, so model a
+    cluster whose other ranks validated exactly what this rank did."""
+    monkeypatch.setattr(
+        runtime_optimizations,
+        "_agree_across_ranks",
+        lambda group, local: dict(local),
+    )
 
 
 def _profile(node_id: str, rank: int, rate: float) -> NodePerformanceProfile:
@@ -351,6 +365,66 @@ def test_sampling_rank_optimization_is_capability_gated_and_restored():
     assert mlx_generate.PromptProcessingBatch.prompt is original_prompt
 
 
+def test_capability_vote_keeps_only_what_every_rank_supports(monkeypatch):
+    class Group:
+        @staticmethod
+        def size():
+            return 3
+
+    local = {"prompt": True, "rank_zero_logits": False, "sampling": True}
+    # The other two ranks support prompt overlap and sampling, but one of them
+    # rejects sampling, so only prompt overlap survives. Votes are sorted by name.
+    others = mx.array([2, 0, 1], dtype=mx.int32)
+    monkeypatch.setattr(
+        mx.distributed,
+        "all_sum",
+        lambda votes, group=None: votes + others,
+    )
+
+    assert _agree_across_ranks(Group(), local) == {
+        "prompt": True,
+        "rank_zero_logits": False,
+        "sampling": False,
+    }
+
+
+def test_rank_zero_sampling_stays_off_when_another_rank_cannot_use_it(monkeypatch):
+    """#3521: a rank that takes the token all-sum path while its peer runs
+    MLX-LM's hidden-state gather deadlocks both, so no rank may enable it alone."""
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+    )
+    model = SimpleNamespace(model=_ValidatedPipeline())
+    original_gather = mx.distributed.all_gather
+    original_send = mx.distributed.send
+    original_step = mlx_generate.GenerationBatch._step
+    votes = []
+
+    def peer_rejects_sampling(group, local):
+        votes.append(dict(local))
+        return {**local, "sampling": False}
+
+    monkeypatch.setattr(
+        runtime_optimizations, "_agree_across_ranks", peer_rejects_sampling
+    )
+
+    with install_runtime_optimizations(
+        model,
+        _WorkerGroup(),
+        settings,
+        batchable=True,
+    ) as capabilities:
+        assert votes == [{"prompt": True, "rank_zero_logits": False, "sampling": True}]
+        sampling = capabilities["sampling_rank_only"]
+        assert sampling["active"] is False
+        assert "another rank" in sampling["reason"]
+        assert capabilities["pipeline_prefill_overlap"]["active"] is False
+        assert mx.distributed.all_gather is original_gather
+        assert mx.distributed.send is original_send
+        assert mlx_generate.GenerationBatch._step is original_step
+
+
 def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
     monkeypatch,
 ):
@@ -565,6 +639,35 @@ def test_staggered_prompt_matches_stock_chunking_padding_and_cache_lifecycle(
     assert [len(chunk[0]) for chunk in patched.model.seen] == [8, 1]
     assert patched.tokens == stock.tokens == prompts
     assert patched.prompt_cache[0].events == stock.prompt_cache[0].events
+
+
+class _StagedPipeline:
+    pipeline_size = 2
+
+    def __call__(self, inputs, cache=None):
+        hidden = mx.distributed.recv_like(inputs, 1)
+        return mx.distributed.all_gather(mx.distributed.send(hidden, 1))
+
+
+def test_peer_transfers_finish_on_host_around_prefill(monkeypatch):
+    """#4547: Metal counts a GPU-side wait on a peer toward its ~5 s timeout."""
+
+    evaluated = []
+    monkeypatch.setattr(mx, "eval", lambda *values: evaluated.extend(values))
+    for name in ("send", "recv", "recv_like", "all_gather"):
+        monkeypatch.setattr(mx.distributed, name, lambda *a, _n=name, **k: (_n,))
+    model = SimpleNamespace(model=_StagedPipeline())
+
+    def forward(tokens):
+        evaluated.clear()
+        model.model(mx.zeros((1, tokens), dtype=mx.int32))
+        return [v[0] if isinstance(v, tuple) else "inputs" for v in evaluated]
+
+    with wait_for_pipeline_peers_on_host(model):
+        assert forward(8) == ["recv_like", "send"]
+        for _ in range(3):
+            assert forward(1) == ["inputs", "recv_like", "send", "all_gather"]
+        assert forward(1) == []
 
 
 def test_sampling_rank_optimization_keeps_normal_path_for_unvalidated_model():

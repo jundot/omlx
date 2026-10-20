@@ -40,7 +40,7 @@ class AdminStatsAccessFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
-        if "/admin/api/stats" in msg:
+        if "/admin/api/stats" in msg or "/admin/api/usage" in msg:
             return False
         if "/admin/api/login" in msg:
             return False

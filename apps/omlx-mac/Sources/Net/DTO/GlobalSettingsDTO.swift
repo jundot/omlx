@@ -49,7 +49,9 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     let network: NetworkDTO?
     let claudeCode: ClaudeCodeSettings?
     let integrations: IntegrationsSettings?
+    let externalEngines: ExternalEnginesStatus?
     let mcp: MCPSettings?
+    let usage: UsageSettings?
 
     struct ServerSettings: Codable, Equatable, Sendable {
         let host: String
@@ -105,6 +107,7 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let apiKeySet: Bool
         let apiKey: String?
         let skipApiKeyVerification: Bool?
+        let allowUnauthenticatedInference: Bool?
         let subKeys: [SubKeyDTO]?
     }
 
@@ -127,6 +130,21 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         /// What oMLX asked Metal to allow at start (static ceiling clamped
         /// below physical RAM). Kernel cap below this = red warning.
         let omlxWiredLimitRequestBytes: Int64?
+        /// Ceiling each memory guard tier would set right now, keyed by tier.
+        var memoryGuardPreview: [String: MemoryGuardTierPreview]? = nil
+    }
+
+    /// One tier of `system.memory_guard_preview` (server-side enforcer math).
+    struct MemoryGuardTierPreview: Codable, Equatable, Sendable {
+        let reserveBytes: Int64?
+        let freeBytes: Int64?
+        let inactiveBytes: Int64?
+        let otherAppsBytes: Int64?
+        let staticBytes: Int64?
+        let dynamicBytes: Int64?
+        let metalCapBytes: Int64?
+        let ceilingBytes: Int64?
+        let binding: String?
     }
 
     /// Mirrors `omlx.settings.HuggingFaceSettings`. Empty string means
@@ -151,12 +169,14 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     }
 
     struct ClaudeCodeSettings: Codable, Equatable, Sendable {
-        let contextScalingEnabled: Bool?
-        let targetContextSize: Int?
         let mode: String?
         let opusModel: String?
         let sonnetModel: String?
         let haikuModel: String?
+        /// Annotates the configured tier models with Anthropic family
+        /// metadata (anthropic_family_tier) for Claude Desktop. Optional so
+        /// older servers that omit the key still decode (nil = disabled).
+        let desktopEnabled: Bool?
     }
 
     struct IntegrationsSettings: Codable, Equatable, Sendable {
@@ -164,9 +184,40 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
         let opencodeModel: String?
         let openclawModel: String?
         let piModel: String?
+        let vibeModel: String?
         let openclawToolsProfile: String?
         let hermesModel: String?
         let copilotModel: String?
+        let dshModel: String?
+        /// Splash launcher path; nil means the server detects it.
+        let splashPath: String?
+        let splashKvFormat: String?
+        let splashMaxMemoryGb: Double?
+        let splashSsdCacheGb: Double?
+        let splashAnePrefill: Bool?
+    }
+
+    /// Read-only `external_engines` block: the launcher each external engine
+    /// would run on this Mac, and the models it serves now.
+    struct ExternalEnginesStatus: Codable, Equatable, Sendable {
+        let splash: SplashStatus?
+    }
+
+    struct SplashStatus: Codable, Equatable, Sendable {
+        let available: Bool
+        let path: String?
+        let autoDetected: Bool?
+        let version: String?
+        let label: String?
+        let reason: String?
+        let models: [SplashModel]?
+
+        struct SplashModel: Codable, Equatable, Sendable {
+            let id: String
+            let memoryBytes: Int?
+            let memoryBudgetBytes: Int?
+            let logPath: String?
+        }
     }
 
     /// Mirrors `omlx.settings.MCPSettings`. The server stores a single path to
@@ -174,6 +225,14 @@ struct GlobalSettingsDTO: Codable, Equatable, Sendable {
     /// Code, OpenClaw, Hermes, …). Empty / nil means no MCP server is wired.
     struct MCPSettings: Codable, Equatable, Sendable {
         let configPath: String?
+    }
+
+    /// Mirrors `omlx.settings.UsageSettings`. `usage_history` switches the
+    /// local hourly serving history behind Status → Usage History. Patched
+    /// via the flat `usage_history` key; the server applies it live and keeps
+    /// the existing usage.sqlite3 when it is turned off.
+    struct UsageSettings: Codable, Equatable, Sendable {
+        let usageHistory: Bool?
     }
 
     /// Mirrors `omlx.settings.ModelScopeSettings`. Empty string means
@@ -217,29 +276,46 @@ struct GlobalSettingsPatch: Encodable, Equatable, Sendable {
     var maxAudioUploadSize: String? = nil
 
     // Claude Code (PR 9)
-    var claudeCodeContextScalingEnabled: Bool? = nil
-    var claudeCodeTargetContextSize: Int? = nil
     var claudeCodeMode: String? = nil
     var claudeCodeOpusModel: String? = nil
     var claudeCodeSonnetModel: String? = nil
     var claudeCodeHaikuModel: String? = nil
+    /// This field (`claude_code_desktop_enabled` on the wire via
+    /// `convertToSnakeCase`): Claude Desktop tier-alias toggle.
+    var claudeCodeDesktopEnabled: Bool? = nil
 
     // Other integrations (PR 9)
     var integrationsCodexModel: String? = nil
     var integrationsOpencodeModel: String? = nil
     var integrationsOpenclawModel: String? = nil
     var integrationsPiModel: String? = nil
+    var integrationsVibeModel: String? = nil
     var integrationsOpenclawToolsProfile: String? = nil
     var integrationsHermesModel: String? = nil
     var integrationsCopilotModel: String? = nil
+    var integrationsDshModel: String? = nil
+
+    // External engines: Splash. An empty path returns to automatic
+    // detection; `.null` sizes return to automatic sizing.
+    var splashPath: String? = nil
+    var splashKvFormat: String? = nil
+    var splashMaxMemoryGb: PatchOptionalInt? = nil
+    var splashSsdCacheGb: PatchOptionalInt? = nil
+    var splashAnePrefill: Bool? = nil
 
     /// Path to an MCP server config file. Empty string clears the field on
     /// the server (`global_settings.mcp.config_path = None`). Shared across
     /// every integration launcher.
     var mcpConfig: String? = nil
 
+    /// Record local usage history (Status → Usage History). Applied at
+    /// runtime; turning it off keeps the existing usage.sqlite3 so turning
+    /// it back on resumes the same history.
+    var usageHistory: Bool? = nil
+
     // Auth (PR 9)
     var skipApiKeyVerification: Bool? = nil
+    var allowUnauthenticatedInference: Bool? = nil
     /// Update the configured API key. Server applies and persists via
     /// /admin/api/global-settings (`api_key` field). Only valid when an
     /// admin session is already authenticated — first-time setup still
