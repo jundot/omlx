@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 from transformers import AutoTokenizer
 
+from ..api.utils import _consolidate_system_messages, has_nonleading_system_message
 from ..exceptions import InvalidRequestError
 from ..utils.hardware import get_chip_name, parse_chip_info
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
@@ -83,6 +84,8 @@ SPLASH_INSTALL_HINT = (
 )
 
 # Splash's reasoning levels, and the oMLX spellings that map onto them.
+# Splash /status chat_template.later_system values (#4697).
+_LATER_SYSTEM_SUPPORT = {"native": True, "patched": True, "unsupported": False}
 _SPLASH_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _EFFORT_ALIASES = {"off": "none", "moderate": "medium", "maximum": "max"}
 
@@ -1109,8 +1112,32 @@ class SplashEngine(BaseEngine):
             data = response.json()
             if isinstance(data, dict):
                 self._status = data
+                self._apply_later_system_capability(data)
         except Exception:
             logger.debug("Splash: failed to fetch /status", exc_info=True)
+
+    def _apply_later_system_capability(self, status: dict[str, Any]) -> None:
+        """Tell request preparation whether Splash renders later system messages.
+
+        Splash renders a later system message in place when its chat template
+        allows it (natively or after its own patch), so oMLX must not fold it
+        into the leading system block (#4697). An unsupported template makes
+        Splash reject the request, so oMLX keeps folding.
+        """
+        if self._tokenizer is None:
+            return
+        chat_template = status.get("chat_template")
+        later_system = (
+            chat_template.get("later_system")
+            if isinstance(chat_template, dict)
+            else None
+        )
+        supported = _LATER_SYSTEM_SUPPORT.get(later_system)
+        if supported is None:
+            if hasattr(self._tokenizer, "_omlx_supports_mid_system_messages"):
+                del self._tokenizer._omlx_supports_mid_system_messages
+            return
+        self._tokenizer._omlx_supports_mid_system_messages = supported
 
     async def _poll_status(self) -> None:
         while True:
@@ -1339,9 +1366,10 @@ class SplashEngine(BaseEngine):
     async def chat(self, messages: list[dict[str, Any]], **kwargs) -> GenerationOutput:
         return await self._collect(self.stream_chat(messages, **kwargs))
 
-    def count_chat_tokens(
-        self, messages, tools=None, chat_template_kwargs=None, is_partial=None
-    ) -> int:
+    def _template_token_count(
+        self, messages, tools, chat_template_kwargs
+    ) -> int | None:
+        """Token count of the rendered prompt, or None if the template fails."""
         template = dict(chat_template_kwargs or {})
         attempts = (
             template,
@@ -1360,6 +1388,21 @@ class SplashEngine(BaseEngine):
                 return len(ids["input_ids"] if hasattr(ids, "keys") else ids)
             except Exception:  # an effort value this template rejects
                 logger.debug("Splash: chat template token count failed", exc_info=True)
+        return None
+
+    def count_chat_tokens(
+        self, messages, tools=None, chat_template_kwargs=None, is_partial=None
+    ) -> int:
+        count = self._template_token_count(messages, tools, chat_template_kwargs)
+        if count is None and has_nonleading_system_message(messages):
+            # Splash renders a later system message in place even when this
+            # local copy of the template rejects it (#4697). Folding it into
+            # the leading block counts the same text plus its wrapper tokens.
+            count = self._template_token_count(
+                _consolidate_system_messages(messages), tools, chat_template_kwargs
+            )
+        if count is not None:
+            return count
         # Count the text only: an image's base64 payload is not prompt text.
         return sum(
             len(self._tokenizer.encode(_text_of(m.get("content")))) for m in messages

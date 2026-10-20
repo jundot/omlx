@@ -1837,3 +1837,104 @@ class TestVision:
             {"type": "text", "text": "?"},
             {"type": "image_url", "image_url": {"url": url, "detail": "auto"}},
         ]
+
+
+# -- later system messages (#4697) -------------------------------------------------
+
+
+class TestLaterSystemCapability:
+    """Splash reports in /status whether its chat template renders a later
+    system message in place; oMLX must not fold such messages into the
+    leading system block when Splash already handles them."""
+
+    @staticmethod
+    def _engine_reporting(tmp_path, chat_template):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/status":
+                body = {"kv": {}}
+                if chat_template is not None:
+                    body["chat_template"] = chat_template
+                return httpx.Response(200, json=body)
+            return httpx.Response(404)
+
+        engine = _engine_with_transport(tmp_path, handler)
+        engine._tokenizer = SimpleNamespace()
+        return engine
+
+    @pytest.mark.parametrize(
+        ("later_system", "expected"),
+        [("native", True), ("patched", True), ("unsupported", False)],
+    )
+    async def test_status_sets_the_tokenizer_capability(
+        self, tmp_path, later_system, expected
+    ):
+        engine = self._engine_reporting(tmp_path, {"later_system": later_system})
+
+        await engine._refresh_status()
+
+        assert engine._tokenizer._omlx_supports_mid_system_messages is expected
+
+    @pytest.mark.parametrize(
+        "chat_template", [None, {}, {"later_system": "sometimes"}, "patched"]
+    )
+    async def test_unknown_status_leaves_the_capability_unset(
+        self, tmp_path, chat_template
+    ):
+        engine = self._engine_reporting(tmp_path, chat_template)
+
+        await engine._refresh_status()
+
+        assert not hasattr(engine._tokenizer, "_omlx_supports_mid_system_messages")
+
+    async def test_unknown_status_clears_an_earlier_capability(self, tmp_path):
+        engine = self._engine_reporting(tmp_path, {"later_system": "sometimes"})
+        engine._tokenizer._omlx_supports_mid_system_messages = True
+
+        await engine._refresh_status()
+
+        assert not hasattr(engine._tokenizer, "_omlx_supports_mid_system_messages")
+
+    async def test_failed_status_keeps_the_last_capability(self, tmp_path):
+        engine = _engine_with_transport(
+            tmp_path, lambda request: httpx.Response(500, text="boom")
+        )
+        engine._tokenizer = SimpleNamespace(_omlx_supports_mid_system_messages=True)
+
+        await engine._refresh_status()
+
+        assert engine._tokenizer._omlx_supports_mid_system_messages is True
+
+    def test_token_count_folds_later_system_when_the_local_template_rejects_it(
+        self, tmp_path
+    ):
+        """Splash renders a later system message in place, but the local copy
+        of a strict template rejects it; the count must still cover the whole
+        rendered prompt, not only the message text."""
+        engine = _engine(tmp_path)
+
+        class StrictTemplate:
+            def apply_chat_template(self, messages, **kwargs):
+                if any(m["role"] == "system" for m in messages[1:]):
+                    raise ValueError("System message must be at the beginning.")
+                rendered = "".join(
+                    f"<{m['role']}>{m['content']}</{m['role']}>" for m in messages
+                )
+                return list(rendered)
+
+            def encode(self, text, **kwargs):
+                return list(text)
+
+        engine._tokenizer = StrictTemplate()
+        messages = [
+            {"role": "system", "content": "lead"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "note"},
+        ]
+
+        folded = [
+            {"role": "system", "content": "lead\n\nnote"},
+            {"role": "user", "content": "hi"},
+        ]
+        assert engine.count_chat_tokens(messages) == len(
+            StrictTemplate().apply_chat_template(folded)
+        )

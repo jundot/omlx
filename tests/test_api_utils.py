@@ -2295,6 +2295,78 @@ class TestPrepareSystemMessagesForTemplate:
         assert [m["role"] for m in result] == ["user", "system"]
         assert result[1]["content"] == "Plan mode"
 
+    class DeclaredSupportTokenizer(ErrorTokenizer):
+        """An engine renders later system messages itself (#4697), even though
+        the local template that oMLX would probe rejects them."""
+
+        _omlx_supports_mid_system_messages = True
+
+    @staticmethod
+    def _agent_turn_with_tool_then_system():
+        return [
+            {"role": "system", "content": "Leading"},
+            {"role": "user", "content": "fix the bug"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "t1", "function": {"name": "Read", "arguments": {}}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "t1", "content": "print('hi')"},
+            {"role": "system", "content": "hook context"},
+        ]
+
+    def test_declared_support_keeps_system_after_tool_in_place(self):
+        messages = self._agent_turn_with_tool_then_system()
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.DeclaredSupportTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "system",
+        ]
+        assert result[0]["content"] == "Leading"
+        assert result[4]["content"] == "hook context"
+
+    def test_declared_support_keeps_system_after_assistant_in_place(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+            {"role": "system", "content": "reminder"},
+            {"role": "user", "content": "Next"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.DeclaredSupportTokenizer()
+        )
+
+        assert [m["role"] for m in result] == ["user", "assistant", "system", "user"]
+
+    def test_declared_support_still_consolidates_partial_requests(self):
+        messages = self._agent_turn_with_tool_then_system()
+
+        result = prepare_system_messages_for_template(
+            messages, self.DeclaredSupportTokenizer(), is_partial=True
+        )
+
+        assert [m["role"] for m in result] == ["system", "user", "assistant", "tool"]
+        assert "hook context" in result[0]["content"]
+
+    def test_declared_support_skips_the_template_probe(self):
+        assert chat_template_preserves_mid_system(
+            self.DeclaredSupportTokenizer(),
+            preceding_role="tool",
+            placement="between",
+        )
+
     def test_explicit_capability_overrides_marker_order_false_positive(self):
         messages = [
             {"role": "user", "content": "Hello"},
