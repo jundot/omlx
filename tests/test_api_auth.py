@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 from omlx import server
 from omlx.admin import auth
+from omlx.admin import routes as admin_routes
 from omlx.api.audio_routes import _verify_ws_api_key
 from omlx.settings import GlobalSettings, SubKeyEntry
 
@@ -804,6 +805,7 @@ class TestApiKeyLockout:
         monkeypatch.setattr(server._server_state, "api_key", "management-key")
         monkeypatch.setattr(server._server_state, "bind_host", "0.0.0.0")
         monkeypatch.setattr(auth, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
         monkeypatch.setattr(auth, "_web_ui_enabled", True)
         client = TestClient(server.app)
         ws_client = SimpleNamespace(client=SimpleNamespace(host="testclient"))
