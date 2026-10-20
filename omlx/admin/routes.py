@@ -943,7 +943,33 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     """Resolve dflash compatibility for an engine_pool model dict."""
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
     if is_paro:
-        return False, paro_reason
+        # The batched engines already use the ParoQuant loader. Only advertise
+        # the Qwen layouts whose rotated projections have capture/rollback
+        # coverage on the shared DFlash verify path.
+        try:
+            config = json.loads(
+                (Path(model_info["model_path"]) / "config.json").read_text()
+            )
+        except (OSError, ValueError):
+            return False, paro_reason
+        text = config.get("text_config") or config
+        quant = config.get("quantization_config") or {}
+        if (
+            config.get("model_type")
+            not in {"qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"}
+            or not isinstance(text, dict)
+            or any(
+                type(text.get(key)) is not int or text[key] <= 0
+                for key in ("hidden_size", "num_hidden_layers", "vocab_size")
+            )
+            or quant.get("bits") != 4
+            or quant.get("group_size") not in (32, 64, 128)
+            or (
+                "krot" in quant
+                and (type(quant["krot"]) is not int or quant["krot"] <= 0)
+            )
+        ):
+            return False, paro_reason
     return dflash_compatibility(
         model_info.get("config_model_type"), model_info.get("engine_type")
     )
