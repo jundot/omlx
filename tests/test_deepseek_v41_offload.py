@@ -103,6 +103,52 @@ def test_prefetch_drains_before_unmap(tmp_path, monkeypatch):
     disk.close()
 
 
+@pytest.mark.parametrize("tokens,admitted", [(8192, True), (16645, False)])
+def test_wide_affine_prefetch_keeps_rows_and_enforces_bound(
+    tmp_path, monkeypatch, tokens, admitted
+):
+    # The 1017 converted checkpoint has 24 IDs/token and 160 packed bytes/row.
+    path = tmp_path / "affine.safetensors"
+    raw_safetensors(
+        path,
+        {
+            "w": (np.arange(16 * 32, dtype=np.uint32).reshape(16, 32), "U32"),
+            "s": (np.full((16, 8), 0x3F80, dtype=np.uint16), "BF16"),
+            "b": (np.zeros((16, 8), dtype=np.uint16), "BF16"),
+        },
+    )
+    disk = DiskEngramEmbedding(path, "w", "s", bias_key="b", bits=4)
+    prefetch = EngramPrefetch()
+    ids = (np.arange(tokens * 24, dtype=np.int64) % 16).reshape(1, tokens, 24)
+    read = disk._read_rows
+    threads = []
+
+    def observe(rows):
+        threads.append(current_thread().name)
+        return read(rows)
+
+    monkeypatch.setattr(disk, "_read_rows", observe)
+    try:
+        expected = read(ids)
+        with prefetch.forward():
+            prefetch.submit(disk, ids)
+            assert (prefetch._pending is not None) is admitted
+            if admitted:
+                actual = prefetch._pending[1].result(timeout=10)
+                np.testing.assert_array_equal(disk._prefetched[0], ids)
+                assert threads == ["v41-engram_0"]
+            else:
+                assert threads == []
+                actual = disk._read_rows(ids)
+            for (got, got_dtype), (want, want_dtype) in zip(actual, expected):
+                assert got_dtype == want_dtype
+                np.testing.assert_array_equal(got, want)
+        assert prefetch._pending is None and disk._prefetched is None
+    finally:
+        prefetch.close()
+        disk.close()
+
+
 def test_prefetch_forward_error_releases_pending_rows(tmp_path):
     disk = table(tmp_path)
     prefetch = EngramPrefetch()

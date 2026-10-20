@@ -353,7 +353,9 @@ class DiskEngramEmbedding(nn.Module):
                 self._scales.close()
 
 
-PREFETCH_BYTES = 16 * 1024 * 1024
+# Include packed rows and their IDs for wider prefill chunks. Only one read
+# remains pending per model; larger gathers still use the synchronous path.
+PREFETCH_BYTES = 64 * 1024 * 1024
 
 
 class EngramPrefetch:
