@@ -213,3 +213,28 @@ def test_fp8_kernel_applies_reference_amax_floor():
     expected = (rows / scale).astype(ml_dtypes.float8_e4m3fn).astype(np.float32) * scale
     actual = quantize_activation(mx.array(rows))
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("shape", [(1, 37, 8, 512), (2, 5, 512), (1, 9, 4, 128)])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_rope_kernel_matches_reference_rotation(shape, inverse):
+    """The one-pass RoPE kernel rotates the tail pairs like the fp32 reference (_rope_apply;
+    FMA contraction may differ by one bf16 ulp), its fused act_quant is quantize_activation of
+    that rotation, and the heads-major input of the native attention output gives the same."""
+    from omlx.patches.deepseek_v41.activation import rope_activation
+    from omlx.patches.deepseek_v41.language import _rope_apply
+
+    rng = np.random.default_rng(len(shape) + shape[1])
+    x = mx.array(rng.normal(0, 3, shape).astype(np.float32)).astype(mx.bfloat16)
+    cos = mx.array(rng.uniform(-1, 1, (shape[1], 32)).astype(np.float32))
+    sin = mx.array(rng.uniform(-1, 1, (shape[1], 32)).astype(np.float32))
+    expected = _rope_apply(x, cos, sin, inverse).astype(mx.float32)
+    actual = rope_activation(x, cos, sin, inverse).astype(mx.float32)
+    ulp = 2.0 ** (np.floor(np.log2(np.maximum(np.abs(np.asarray(expected)), 2.0**-126))) - 7)
+    assert np.all(np.abs(np.asarray(actual - expected)) <= ulp)
+    np.testing.assert_array_equal(np.asarray(actual[..., :-64]), np.asarray(x[..., :-64].astype(mx.float32)))
+    fused = rope_activation(x, cos, sin, inverse, quantize=True)
+    assert mx.array_equal(fused, quantize_activation(rope_activation(x, cos, sin, inverse))).item()
+    if len(shape) == 4:
+        heads = mx.contiguous(x.transpose(0, 2, 1, 3))
+        assert mx.array_equal(rope_activation(heads, cos, sin, inverse, True, heads_major=True), fused).item()
