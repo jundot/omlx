@@ -20,8 +20,6 @@ from . import decode_moe as DM
 from . import growth
 from .quantization import QuantizedProjection, pack_activation
 
-_TPG = 256
-
 
 def _cos_sin(c, compressed, start):
     from .language import _rope_table
@@ -106,27 +104,9 @@ def _wb(p):
 def mix(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
     """(optional hc_post of the previous sublayer) + hc_mixes + hc_pre + RMSNorm + act_quant.
     Returns (coefficients[24] = pre, post, comb), normed input bf16, its act_quant, h."""
-    hc, dim = c.hc_mult, c.dim
-    n = hc * dim
-    nparts = (n + _TPG - 1) // _TPG
-    mixw = (2 + hc) * hc
-    eps, hc_eps = _scalars(c)
-    dummy = _dummy(mx.float32)
-    posted = sub is not None
-    partial, hout = DL.kernel("mix_partial")(
-        inputs=[res, blk[f"hc_{kind}_fn"], sub if posted else dummy, post if posted else dummy, comb if posted else dummy],
-        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("TPG", _TPG), ("POST", posted)],
-        grid=(nparts * _TPG, 1, 1), threadgroup=(_TPG, 1, 1),
-        output_shapes=[(nparts * (mixw + 1),), (n if posted else 1,)],
-        output_dtypes=[mx.float32, mx.bfloat16])
-    h = hout if posted else res
-    norm = blk.attn_norm if kind == "attn" else blk.ffn_norm
-    coef, xn, xq = DL.kernel("mix_final")(
-        inputs=[partial, h, pre_in, norm.weight, blk[f"hc_{kind}_scale"], blk[f"hc_{kind}_base"], eps, hc_eps],
-        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("NPART", nparts), ("ITERS", c.hc_sinkhorn_iters)],
-        grid=(1024, 1, 1), threadgroup=(1024, 1, 1),
-        output_shapes=[(mixw,), (dim,), (dim,)], output_dtypes=[mx.float32, mx.bfloat16, mx.float32])
-    return coef, xn, xq, h
+    coef, xn, xq, h = mix_nb(blk, kind, c, res.reshape(1, -1), pre_in.reshape(1, -1),
+                             *(x.reshape(1, -1) if x is not None else None for x in (sub, post, comb)))
+    return coef.reshape(-1), xn.reshape(-1), xq.reshape(-1), h.reshape(-1)
 
 
 def _pair_formats(a, b):
@@ -286,27 +266,30 @@ MAX_BATCH = 8
 
 def mix_nb(blk, kind, c, res, pre_in, sub=None, post=None, comb=None):
     """mix() for B requests (rows of res [B, hc*dim], pre_in [B, hc], sub [B, dim], post [B, hc],
-    comb [B, hc*hc]); each request runs the single-request kernels on its own slice."""
+    comb [B, hc*hc]); each request runs the kernels on its own slice."""
     b_n = res.shape[0]
     hc, dim = c.hc_mult, c.dim
     n = hc * dim
-    nparts = (n + _TPG - 1) // _TPG
+    nparts = dim // 64
     mixw = (2 + hc) * hc
     eps, hc_eps = _scalars(c)
-    dummy = _dummy(mx.float32)
+    # 8 elements: smaller inputs are passed in constant address space.
+    dummy = _const((0,) * 8)
     posted = sub is not None
-    partial, hout = DL.kernel("mix_partial_b")(
-        inputs=[res, blk[f"hc_{kind}_fn"], sub if posted else dummy, post if posted else dummy, comb if posted else dummy],
-        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("TPG", _TPG), ("POST", posted)],
-        grid=(nparts * _TPG, b_n, 1), threadgroup=(_TPG, 1, 1),
-        output_shapes=[(b_n * nparts * (mixw + 1),), (b_n * n if posted else 1,)],
-        output_dtypes=[mx.float32, mx.bfloat16])
+    partial, hout, xpre = DL.kernel("mix_partial_b")(
+        inputs=[res, blk[f"hc_{kind}_fn"], sub if posted else dummy, post if posted else dummy,
+                comb if posted else dummy, pre_in],
+        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("NPART", nparts), ("POST", posted)],
+        grid=(nparts * 64, b_n, 1), threadgroup=(64, 1, 1),
+        output_shapes=[(b_n * nparts * (mixw + 2),), (b_n * n if posted else 1,), (b_n * dim,)],
+        output_dtypes=[mx.float32, mx.bfloat16, mx.bfloat16])
     h = hout.reshape(b_n, n) if posted else res
     norm = blk.attn_norm if kind == "attn" else blk.ffn_norm
     coef, xn, xq = DL.kernel("mix_final_b")(
-        inputs=[partial, h, pre_in, norm.weight, blk[f"hc_{kind}_scale"], blk[f"hc_{kind}_base"], eps, hc_eps],
-        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("NPART", nparts), ("ITERS", c.hc_sinkhorn_iters)],
-        grid=(1024, b_n, 1), threadgroup=(1024, 1, 1),
+        inputs=[partial, xpre, norm.weight, blk[f"hc_{kind}_scale"], blk[f"hc_{kind}_base"], eps, hc_eps],
+        template=[("HC", hc), ("DIM", dim), ("MIX", mixw), ("NPART", nparts), ("ITERS", c.hc_sinkhorn_iters),
+                  ("TPG", 1024)],
+        grid=((dim // 1024 + 1) * 1024, b_n, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(b_n * mixw,), (b_n * dim,), (b_n * dim,)], output_dtypes=[mx.float32, mx.bfloat16, mx.float32])
     return coef.reshape(b_n, mixw), xn.reshape(b_n, dim), xq.reshape(b_n, dim), h
 
