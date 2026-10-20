@@ -1070,3 +1070,57 @@ class TestUndoLookahead:
         assert cache[0].caches[1] is window
         assert restored[0].tolist() == [[3.0, 3.0, 3.0]]
         assert window._idx == before[1][1]["_idx"]
+
+
+class TestSlidingWindowTailMergeKickoff:
+    """The rotating-window tail merge must not resurrect the kickoff token."""
+
+    class _Rope:
+        dims = 8
+        base = 10000.0
+        scale = 1.0
+
+        def __call__(self, x, offset=0):
+            return x
+
+    def _run(self, kickoff_index):
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        from omlx.patches.specprefill import sparse_prefill
+
+        class Layer:
+            def __init__(self):
+                self_attn = type("attn", (), {})()
+                self_attn.rope = TestSlidingWindowTailMergeKickoff._Rope()
+                self.self_attn = self_attn
+
+        processed = []
+
+        class Model:
+            def __init__(self):
+                self.layers = [Layer()]
+
+            def __call__(self, tokens, cache):
+                processed.append(int(tokens.shape[-1]))
+                return mx.zeros((1, tokens.shape[-1], 1))
+
+        M = 10
+        tokens = mx.arange(M)
+        cache = [RotatingKVCache(max_size=4), KVCache()]
+        sparse_prefill(
+            Model(), tokens, mx.array([0, 1, 2, 5]), cache,
+            kickoff_index=kickoff_index,
+        )
+        return sum(processed)
+
+    def test_tail_merge_excludes_kickoff(self):
+        # tail = {6,7,8,9}; kickoff 9 is written by BatchGenerator insert,
+        # so sparse prefill must process {0,1,2,5,6,7,8} = 7 tokens.
+        assert self._run(kickoff_index=9) == 7
+
+    def test_tail_merge_keeps_kickoff_when_not_removed(self):
+        # Without removal (kickoff_index=None) the merge keeps the whole
+        # tail: {0,1,2,5,6,7,8,9} = 8 tokens — the pre-existing behavior
+        # of this branch, unchanged.
+        assert self._run(kickoff_index=None) == 8

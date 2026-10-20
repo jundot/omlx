@@ -12781,8 +12781,16 @@ class Scheduler:
             elif batch_specprefill_status != request_is_specprefill:
                 self.waiting.appendleft(request)
                 break
-            if request_is_specprefill and len(scheduled) > 0:
-                # SpecPrefill request must be alone
+            if request_is_specprefill and (
+                len(scheduled) > 0 or self.running or self.prefilling
+            ):
+                # SpecPrefill request must be alone: its target sparse
+                # prefill installs _OffsetAdjustedRoPE on the shared model,
+                # and the adjustment applies to every row of the batch
+                # (per-row offsets + one adjustment). Mixing with requests
+                # that are already decoding silently shifts their RoPE
+                # positions; checking only this step's `scheduled` let a
+                # specprefill admission land next to live rows.
                 self.waiting.appendleft(request)
                 break
 

@@ -980,6 +980,7 @@ def sparse_prefill(
     step_size: int = 2048,
     position_offset: int = 0,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    kickoff_index: Optional[int] = None,
 ) -> mx.array:
     """Prefill model cache with selected tokens at their original positions.
 
@@ -1019,6 +1020,12 @@ def sparse_prefill(
     if max_rotating_size > 0:
         tail_start = max(0, M - max_rotating_size)
         tail_indices = set(range(tail_start, M))
+        if kickoff_index is not None:
+            # The generation-kickoff token's KV is written separately by
+            # BatchGenerator insert; re-adding it through the tail merge
+            # double-processed the final token (duplicate KV entry, double
+            # attention weight) on sliding-window models.
+            tail_indices.discard(kickoff_index)
         existing = set(selected_indices.tolist())
         merged = sorted(existing | tail_indices)
         selected_indices = mx.array(merged)

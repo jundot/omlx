@@ -211,6 +211,9 @@ def run_specprefill_target_prefill(
                 step_size=prefill_step_size,
                 position_offset=plan.position_offset,
                 progress_callback=report_sparse_progress,
+                kickoff_index=(
+                    generation_kickoff_index if plan.remove_kickoff_index else None
+                ),
             )
 
         # sparse_prefill computes adjustment for selected conversation tokens.
