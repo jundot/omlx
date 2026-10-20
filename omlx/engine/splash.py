@@ -83,9 +83,10 @@ SPLASH_INSTALL_HINT = (
     "or splash-m1 for M1/M2 Macs (https://github.com/paperniuk/splash/releases)"
 )
 
-# Splash's reasoning levels, and the oMLX spellings that map onto them.
 # Splash /status chat_template.later_system values (#4697).
 _LATER_SYSTEM_SUPPORT = {"native": True, "patched": True, "unsupported": False}
+
+# Splash's reasoning levels, and the oMLX spellings that map onto them.
 _SPLASH_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _EFFORT_ALIASES = {"off": "none", "moderate": "medium", "maximum": "max"}
 
@@ -945,6 +946,7 @@ class SplashEngine(BaseEngine):
         self._tokenizer: Any = None
         self._model_type: str | None = None
         self._status: dict[str, Any] | None = None
+        self._unknown_later_system: set[str] = set()
         self._status_task: asyncio.Task | None = None
         self._status_refresh: asyncio.Task | None = None
         self._vision = splash_has_vision(_read_config(self._path) or {})
@@ -1110,11 +1112,12 @@ class SplashEngine(BaseEngine):
             response = await self._client.get("/status", timeout=2)
             response.raise_for_status()
             data = response.json()
-            if isinstance(data, dict):
-                self._status = data
-                self._apply_later_system_capability(data)
         except Exception:
             logger.debug("Splash: failed to fetch /status", exc_info=True)
+            return
+        if isinstance(data, dict):
+            self._status = data
+            self._apply_later_system_capability(data)
 
     def _apply_later_system_capability(self, status: dict[str, Any]) -> None:
         """Tell request preparation whether Splash renders later system messages.
@@ -1132,11 +1135,25 @@ class SplashEngine(BaseEngine):
             if isinstance(chat_template, dict)
             else None
         )
-        supported = _LATER_SYSTEM_SUPPORT.get(later_system)
-        if supported is None:
-            if hasattr(self._tokenizer, "_omlx_supports_mid_system_messages"):
-                del self._tokenizer._omlx_supports_mid_system_messages
-            return
+        supported = None
+        if isinstance(later_system, str):
+            supported = _LATER_SYSTEM_SUPPORT.get(later_system)
+        # repr() because a malformed status can carry an unhashable value.
+        unknown = repr(later_system)
+        if (
+            later_system is not None
+            and supported is None
+            and unknown not in self._unknown_later_system
+        ):
+            self._unknown_later_system.add(unknown)
+            logger.warning(
+                "Splash: unknown chat_template.later_system %r for %s; "
+                "later system messages are folded into the first one",
+                later_system,
+                self.model_name,
+            )
+        # None leaves the decision to the local template probe, the behaviour
+        # before this field existed.
         self._tokenizer._omlx_supports_mid_system_messages = supported
 
     async def _poll_status(self) -> None:
@@ -1403,6 +1420,11 @@ class SplashEngine(BaseEngine):
             )
         if count is not None:
             return count
+        logger.warning(
+            "Splash: chat template token count failed for %s; "
+            "counting message text only",
+            self.model_name,
+        )
         # Count the text only: an image's base64 payload is not prompt text.
         return sum(
             len(self._tokenizer.encode(_text_of(m.get("content")))) for m in messages

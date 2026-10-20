@@ -7,6 +7,7 @@ text processing, content extraction, and format conversion.
 """
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -43,6 +44,7 @@ from omlx.api.utils import (
     SPECIAL_TOKENS_PATTERN,
     _chat_template_supports_tool_role,
     _consolidate_system_messages,
+    _declared_mid_system_support,
     _drop_void_assistant_messages,
     _extract_multimodal_content_list,
     _merge_consecutive_roles,
@@ -2360,12 +2362,24 @@ class TestPrepareSystemMessagesForTemplate:
         assert [m["role"] for m in result] == ["system", "user", "assistant", "tool"]
         assert "hook context" in result[0]["content"]
 
-    def test_declared_support_skips_the_template_probe(self):
-        assert chat_template_preserves_mid_system(
-            self.DeclaredSupportTokenizer(),
-            preceding_role="tool",
-            placement="between",
+    @pytest.mark.parametrize("declared", ["patched", 1, [], object()])
+    def test_non_bool_declaration_is_ignored(self, declared):
+        tokenizer = SimpleNamespace(_omlx_supports_mid_system_messages=declared)
+
+        assert _declared_mid_system_support(tokenizer) is None
+
+    def test_declared_support_keeps_a_trailing_system_message_in_place(self):
+        messages = [
+            {"role": "system", "content": "Leading"},
+            {"role": "user", "content": "Hello"},
+            {"role": "system", "content": "reminder"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.DeclaredSupportTokenizer()
         )
+
+        assert [m["role"] for m in result] == ["system", "user", "system"]
 
     def test_explicit_capability_overrides_marker_order_false_positive(self):
         messages = [

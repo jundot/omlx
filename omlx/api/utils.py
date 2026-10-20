@@ -468,9 +468,8 @@ def chat_template_preserves_mid_system(
     if preceding_role not in {"user", "tool"}:
         return False
 
-    explicit_capability = _declared_mid_system_support(tokenizer)
-    if explicit_capability is not None:
-        return explicit_capability
+    if _declared_mid_system_support(tokenizer) is False:
+        return False
 
     has_tools = bool(tools)
     cache_key = _mid_system_probe_cache_key(

@@ -1875,7 +1875,16 @@ class TestLaterSystemCapability:
         assert engine._tokenizer._omlx_supports_mid_system_messages is expected
 
     @pytest.mark.parametrize(
-        "chat_template", [None, {}, {"later_system": "sometimes"}, "patched"]
+        "chat_template",
+        [
+            None,
+            {},
+            {"later_system": "sometimes"},
+            {"later_system": ["native"]},
+            {"later_system": {"mode": "native"}},
+            {"later_system": 1},
+            "patched",
+        ],
     )
     async def test_unknown_status_leaves_the_capability_unset(
         self, tmp_path, chat_template
@@ -1884,7 +1893,8 @@ class TestLaterSystemCapability:
 
         await engine._refresh_status()
 
-        assert not hasattr(engine._tokenizer, "_omlx_supports_mid_system_messages")
+        assert engine._tokenizer._omlx_supports_mid_system_messages is None
+        assert engine._status is not None
 
     async def test_unknown_status_clears_an_earlier_capability(self, tmp_path):
         engine = self._engine_reporting(tmp_path, {"later_system": "sometimes"})
@@ -1892,7 +1902,26 @@ class TestLaterSystemCapability:
 
         await engine._refresh_status()
 
-        assert not hasattr(engine._tokenizer, "_omlx_supports_mid_system_messages")
+        assert engine._tokenizer._omlx_supports_mid_system_messages is None
+
+    async def test_unknown_later_system_value_is_logged_once(self, tmp_path, caplog):
+        engine = self._engine_reporting(tmp_path, {"later_system": "sometimes"})
+
+        with caplog.at_level("WARNING", logger="omlx.engine.splash"):
+            await engine._refresh_status()
+            await engine._refresh_status()
+
+        warnings = [r for r in caplog.records if "later_system" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "sometimes" in warnings[0].getMessage()
+
+    async def test_missing_later_system_is_not_logged(self, tmp_path, caplog):
+        engine = self._engine_reporting(tmp_path, {})
+
+        with caplog.at_level("WARNING", logger="omlx.engine.splash"):
+            await engine._refresh_status()
+
+        assert not [r for r in caplog.records if "later_system" in r.getMessage()]
 
     async def test_failed_status_keeps_the_last_capability(self, tmp_path):
         engine = _engine_with_transport(
