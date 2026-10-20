@@ -14,6 +14,7 @@ from .type_handlers import (
     CacheListHandler,
     CacheType,
     CacheTypeHandler,
+    ChunkedKVCacheHandler,
     DefaultCacheHandler,
     KVCacheHandler,
     MiniMaxM3BatchKVCacheHandler,
@@ -47,6 +48,7 @@ class CacheTypeRegistry:
     # Mapping from mlx-lm class names to cache types
     _class_name_map: Dict[str, CacheType] = {
         "KVCache": CacheType.KVCACHE,
+        "ChunkedKVCache": CacheType.CHUNKED_KVCACHE,
         "RotatingKVCache": CacheType.ROTATING_KVCACHE,
         # mlx-vlm MTP wraps target RotatingKVCache layers with rollback slack
         # during speculative decode. The live tensor/state representation is
@@ -70,6 +72,10 @@ class CacheTypeRegistry:
         # checks the class name first and routes to TQ-specific handling)
         "TurboQuantKVCache": CacheType.KVCACHE,
         "BatchTurboQuantKVCache": CacheType.KVCACHE,
+        "Affine4KVCache": CacheType.KVCACHE,
+        "BatchAffine4KVCache": CacheType.KVCACHE,
+        "Affine8KVCache": CacheType.KVCACHE,
+        "BatchAffine8KVCache": CacheType.KVCACHE,
         # DeepSeek V4 compressed-attention pool. Handlers live in
         # patches/deepseek_v4/cache_handlers.py and register on patch apply.
         "PoolingCache": CacheType.POOLING_CACHE,
@@ -264,6 +270,7 @@ class CacheTypeRegistry:
 def _initialize_default_handlers() -> None:
     """Initialize default handlers on module load."""
     CacheTypeRegistry.register(KVCacheHandler())
+    CacheTypeRegistry.register(ChunkedKVCacheHandler())
     CacheTypeRegistry.register(RotatingKVCacheHandler())
     CacheTypeRegistry.register(ArraysCacheHandler())
     CacheTypeRegistry.register(CacheListHandler())

@@ -30,6 +30,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "force_sampling",
     "enable_thinking",
     "preserve_thinking",
+    "cache_reasoning_output",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
     "reasoning_parser",
@@ -43,12 +44,14 @@ UNIVERSAL_PROFILE_FIELDS = (
 # Model-specific fields — eligible for per-model profiles only (never templates).
 MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_enabled",
+    "turboquant_kv_scheme",
     "turboquant_kv_bits",
     "turboquant_skip_last",
     "qwen35_ane_prefill_enabled",
     "qwen35_ane_prefill_sequence_length",
     "qwen35_ane_prefill_tail_padding_min_tokens",
     "qwen35_ane_prefill_fraction",
+    "qwen35_ane_prefill_shared_fraction",
     "qwen35_ane_prefill_fused_down",
     "qwen35_ane_prefill_max_layers",
     "qwen35_ane_prefill_dual_ane",
@@ -61,24 +64,21 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "qwen35_ane_prefill_cpu_gdn_fraction",
     "qwen35_ane_prefill_cpu_threads",
     "qwen35_ane_prefill_cpu_shared_resource",
+    "qwen35_oq_a8_enabled",
+    "qwen35_oq_a8_min_tokens",
+    "moe_expert_offload_enabled",
+    "moe_expert_offload_resident_fraction",
     "dflash_enabled",
     "dflash_draft_model",
     "dflash_draft_quant_enabled",
     "dflash_draft_quant_weight_bits",
-    "dflash_draft_quant_activation_bits",
     "dflash_draft_quant_group_size",
-    "dflash_max_ctx",
-    "dflash_in_memory_cache",
-    "dflash_in_memory_cache_max_entries",
-    "dflash_in_memory_cache_max_bytes",
-    "dflash_ssd_cache",
-    "dflash_ssd_cache_max_bytes",
     "dflash_draft_window_size",
-    "dflash_draft_sink_size",
     "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
-    "mtp_num_draft_tokens",
+    "mtp_adaptive_max_depth",
+    "mtp_fixed_depth",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
@@ -104,8 +104,18 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "ttl_seconds",
         # Hardware-specific residency choice; never propagate across models.
         "qwen4_ple_ssd_offload",
+        "deepseek_v41_engram_ssd_offload",
+        # Architecture-level prefill strategy; explicit per model.
+        "deepseek_v41_ced_prefill_enabled",
+        # Gain and memory cost depend on the checkpoint's GDN recipe.
+        "qwen4_gdn_decode_wide_proj",
+        # Which engine serves the model depends on what this Mac has installed.
+        "external_engine",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
+        # Memory residency of an embedding model's audio tower; explicit per model.
+        "embedding_audio_enabled",
+        "embedding_audio_max_seconds",
     }
 )
 
@@ -133,9 +143,24 @@ def filter_universal_fields(data: dict[str, Any]) -> dict[str, Any]:
     return _filter_and_sanitize(data, UNIVERSAL_FIELDS_SET)
 
 
+def normalize_turboquant_kv_bits(value: Any) -> Any:
+    """Return float bits; keep invalid legacy values so other settings still load."""
+    if isinstance(value, bool):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+
+
 def filter_profile_fields(data: dict[str, Any]) -> dict[str, Any]:
     """Return a new dict of UNIVERSAL + MODEL_SPECIFIC keys with real values."""
-    return _filter_and_sanitize(data, PROFILE_FIELDS_SET)
+    filtered = _filter_and_sanitize(data, PROFILE_FIELDS_SET)
+    if "turboquant_kv_bits" in filtered:
+        filtered["turboquant_kv_bits"] = normalize_turboquant_kv_bits(
+            filtered["turboquant_kv_bits"]
+        )
+    return filtered
 
 
 @dataclass

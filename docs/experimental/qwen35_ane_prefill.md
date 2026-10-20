@@ -63,16 +63,12 @@ prefill. The optimal ANE/GPU balance sits well below the classic ~50%
 optimum there, so use the Tune ANE Split utility in the model settings to
 measure the split for the specific machine before enabling. If the NAX
 metallib is missing at runtime, the suffix quietly falls back to the
-classic Metal kernels, and `OMLX_QWEN35_QMM_NAX=0` forces that fallback.
-`OMLX_QWEN35_ANE_PREFILL=0` keeps the whole feature off everywhere
-regardless of the per-model setting.
+classic Metal kernels.
 
-The ANE GDN dispatch runs through the mlx-lm prefill linear patch, so
-`OMLX_QWEN35_Q4_LM_LINEAR=0` disables ANE GDN acceleration as well as the
-standalone GPU qmm routing. GDN b/a suffix projections follow the same q8
-token threshold as that patch: below `OMLX_QWEN35_Q8_LINEAR_MIN_TOKENS`
-(default 16384, which covers every fixed ANE shape) q8 b/a use stock MLX,
-where the native q8 tile is not profitable.
+The ANE GDN dispatch runs through the mlx-lm prefill linear patch. GDN b/a
+suffix projections follow the same q8 token threshold as that patch: below
+16384 tokens, which covers every fixed ANE shape, q8 b/a use stock MLX, where
+the native q8 tile is not profitable.
 
 ## Per-model settings
 
@@ -111,8 +107,7 @@ bank fits one bank per die on M3 Ultra but cannot host both banks on a
 single-die chip such as M3 Max, where the load fails with 0x20004. When a
 bank fails to load, oMLX first retries with two near-half banks per
 instance and then with progressively smaller split banks before falling
-back to per-layer programs; `OMLX_QWEN35_ANE_BANK_MAX_BYTES`
-forces an initial per-bank cap for testing, counted on the source weights
+back to per-layer programs. The per-bank cap counts the source weights
 handed to the bank compiler (about four times the compiled INT8 program
 size). An interleaved M3 Ultra A/B measured split banks about 1% faster at
 prefill with a slightly shorter eager load, but the monolithic bank was
@@ -202,10 +197,10 @@ the full raw gate/up result and two subsequent concatenations before the q4 down
 projection. Extensions built before this fused primitive retain the compatible
 raw merge path automatically.
 
-The combined GPU suffix is retained alongside the original gate/up tensors so
-decode and every fallback remain unchanged. The dual path also owns two input
-and two output surfaces per accelerated layer. This deliberately spends memory
-to avoid per-request weight preparation and to keep both ANEs ready.
+The GPU suffix reads the remaining gate and up rows in place from the checkpoint tensors through a split-row qmm, so decode and every fallback use the same weights without a second copy. A combined copy is kept only when the M5 packed projections later replace those layers. Procedures of one bank share their fixed-shape input and output surfaces by size, because a bank evaluates one procedure at a time and each dispatch reads its output before the next one packs its input. Per-layer fallback programs still own their surfaces.
+
+The ANE driver wires the INT8 program weights while a prefill runs and releases them several seconds after it ends. This memory is outside the process footprint, so the prefill memory guard reserves it (about 7 GiB for the default 64 MLP / 48 GDN layout on a 27B). On an M3 Ultra with `Qwen3.8-27B-oQ8e-mtp` at the default settings, enabling ANE now adds about 0.2 GiB to the process footprint after load. Before the shared surfaces and in-place suffix it added 18.2 GiB: 10 GiB of per-procedure surfaces, 5.3 GiB of suffix copies, and 2.4 GiB of freed staging blocks that malloc kept resident.
+
 When CPU sharing is enabled, model admission additionally reserves the eager
 FP16 gate/up and GDN rows, the down-projection GPU suffix, and bounded
 materialization scratch. This projected size participates in the normal memory
@@ -247,8 +242,8 @@ scheduler-aligned rechecks.
 
 The 16K and 32K output hashes matched the GPU path exactly. The 4K output was
 stable across ANE rechecks but differed from GPU, which is consistent with the
-approximate INT8 ANE prefix. Peak memory increased by about 4.15 GB, and eager
-load time increased from 3.35 to about 27-29 seconds on the test system.
+approximate INT8 ANE prefix. Eager load time increased from 3.35 to about
+27-29 seconds on the test system.
 Token-generation throughput was unchanged because decode remains on the GPU.
 
 ## M3 Ultra reference result
@@ -355,7 +350,7 @@ the ANE and GPU GDN portions take about 10.1 ms and 9.95 ms respectively. The
 at 54% and 4.5370 s at 55%. Larger 60% banks were slower, and a monolithic
 60%/60% bank exceeded the compiler's model-verification or weight-blob limit.
 
-Set `OMLX_ANE_PROFILE=1` when running the benchmark to collect opt-in phase
+The `[benchmark-ane-profile]` trace above reports these opt-in phase
 timings. In the final paired run, ANE0 and ANE1 were executing requests for
 38.81% each of total body time. Request launch delay was only 29-37 us. The
 dominant downtime was dependency/input readiness: 25.1 ms before each MLP

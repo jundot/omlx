@@ -28,6 +28,7 @@ import stat
 import struct
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,7 @@ import numpy as np
 
 from omlx.utils.formatting import format_bytes
 
+from ..utils.fatal import fatal_exit
 from .interface import CacheManager
 from .pooling_delta import (
     POOLING_CACHE_DELTA_CLASS,
@@ -68,6 +70,11 @@ _PENDING_WRITES_HARD_RAM_FRACTION = 0.30
 _PENDING_WRITES_SOFT_FLOOR = 32
 _PENDING_WRITES_CEILING = 256
 _PENDING_WRITE_PUT_TIMEOUT_SECONDS = 1.0
+# A stalled writer must not wedge a bounded store; past this it queues anyway.
+_PENDING_WRITE_SLOT_TIMEOUT_SECONDS = 30.0
+# Startup keeps unreadable tmp files newer than this; another manager may
+# still be writing them.
+_STALE_TMP_CLEANUP_SECONDS = 600.0
 
 # Conservative defaults for the per-block cost estimator. The actual
 # bytes-per-block depends on the model (KV-cache layers × num_kv_heads ×
@@ -219,6 +226,39 @@ def _storage_layer_cache_types(
     ]
 
 
+_AFFINE4_CACHE_TYPES = ("Affine4KVCache", "BatchAffine4KVCache")
+_AFFINE8_CACHE_TYPES = ("Affine8KVCache", "BatchAffine8KVCache")
+_AFFINE_CACHE_TYPES = (*_AFFINE4_CACHE_TYPES, *_AFFINE8_CACHE_TYPES)
+_AFFINE_SCHEMES = {"affine4": 4.0, "affine8": 8.0}
+_PACKED_CACHE_TYPES = (
+    "TurboQuantKVCache",
+    "BatchTurboQuantKVCache",
+    *_AFFINE_CACHE_TYPES,
+)
+
+
+def _validate_affine_meta(meta: Any, scheme: str | None = None) -> tuple[str, ...]:
+    """Require an explicit affine scheme and original K/V dimensions."""
+    if (
+        not isinstance(meta, (list, tuple))
+        or len(meta) != 6
+        or not all(isinstance(value, str) for value in meta)
+        or meta[3] not in _AFFINE_SCHEMES
+        or (scheme is not None and meta[3] != scheme)
+    ):
+        raise ValueError("Invalid affine cache metadata")
+    offset, bits, seed, stored_scheme, key_dim, value_dim = meta
+    if (
+        int(offset) < 0
+        or float(bits) != _AFFINE_SCHEMES[stored_scheme]
+        or int(key_dim) <= 0
+        or int(value_dim) <= 0
+    ):
+        raise ValueError("Invalid affine cache dimensions or bit depth")
+    int(seed)
+    return tuple(meta)
+
+
 def _canonicalize_layer_cache_types(
     layer_cache_types: list[str] | tuple[str, ...] | None,
 ) -> list[str] | None:
@@ -242,6 +282,8 @@ def _canonicalize_layer_cache_types(
         # refresh_ssd_layer_signature — which always says
         # "TurboQuantKVCache" — from sweeping valid batch-form blocks.
         "BatchTurboQuantKVCache": "TurboQuantKVCache",
+        "BatchAffine4KVCache": "Affine4KVCache",
+        "BatchAffine8KVCache": "Affine8KVCache",
     }
     return [
         wrapper_to_canonical.get(cache_type, cache_type)
@@ -259,6 +301,7 @@ def _cache_compat_signature(
     cachelist_subtypes: dict[str, list[str]] | None = None,
     payload_layout: str | None = None,
     gdn_sidecar_state_dtype: str | None = None,
+    numerics: str | None = None,
 ) -> str:
     """Return a stable compatibility signature for a persisted cache block."""
     payload = {
@@ -286,7 +329,73 @@ def _cache_compat_signature(
         payload["payload_layout"] = payload_layout
     if gdn_sidecar_state_dtype is not None:
         payload["gdn_sidecar_state_dtype"] = gdn_sidecar_state_dtype
+    # Only models whose forward numerics changed carry a revision, so other
+    # signatures stay byte-identical to the previous format.
+    if numerics is not None:
+        payload["numerics"] = numerics
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+# Model modules whose forward numerics changed under a dependency update.
+# Blocks written before the change are unsafe for these models only.
+_NUMERICS_REVISIONS = {
+    # mlx-lm a63e24c scales the GDN q/k l2norm eps by inv_scale**2.
+    "mlx_lm.models.qwen3_5": "gdn-qk-norm-2",
+    "mlx_lm.models.qwen3_next": "gdn-qk-norm-2",
+    "mlx_lm.models.bailing_hybrid": "gdn-qk-norm-2",
+    # omlx.patches.qwen35_gdn_prework applies the same fix to mlx-vlm.
+    "mlx_vlm.models.qwen3_5.language": "gdn-qk-norm-2",
+}
+
+
+# mlx-lm Qwen3.5-family modules whose ``YarnRoPE`` comes from a context window
+# past the native one (see ``omlx.patches.qwen35_yarn``).
+_QWEN35_LM_MODULES = frozenset({"mlx_lm.models.qwen3_5", "mlx_lm.models.qwen3_next"})
+
+
+def _yarn_revision(modules: list[Any]) -> str | None:
+    """Tag the YaRN attention scaling of a Qwen3.5-family model, or None."""
+    qwen35_lm = any(type(m).__module__ in _QWEN35_LM_MODULES for m in modules)
+    for module in modules:
+        name = type(module).__name__
+        if name == "Qwen3_5RotaryEmbedding":
+            scale = module.attention_scaling
+        elif name == "YarnRoPE" and qwen35_lm:
+            scale = module.mscale
+        else:
+            continue
+        if scale != 1.0:
+            return f"yarn-{float(scale)!r}"
+    return None
+
+
+def numerics_revision_for_model(model: Any) -> str | None:
+    """Return the numerics revision of a loaded model, or None."""
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return None
+    modules = list(modules())
+    revisions = {
+        _NUMERICS_REVISIONS[name]
+        for module in modules
+        if (name := type(module).__module__) in _NUMERICS_REVISIONS
+    }
+    if yarn := _yarn_revision(modules):
+        revisions.add(yarn)
+    return ",".join(sorted(revisions)) or None
+
+
+def _signature_numerics(cache_signature: str) -> str | None:
+    """Extract ``numerics`` from a stored signature, or None."""
+    if not cache_signature:
+        return None
+    try:
+        payload = json.loads(cache_signature)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("numerics")
 
 
 def cache_signature_for(
@@ -353,7 +462,7 @@ def _block_turboquant_bits(
     if not layer_cache_types or not layer_meta_states:
         return None
     for i, cache_type in enumerate(layer_cache_types):
-        if cache_type not in ("TurboQuantKVCache", "BatchTurboQuantKVCache"):
+        if cache_type not in _PACKED_CACHE_TYPES:
             continue
         if i >= len(layer_meta_states):
             continue
@@ -381,6 +490,8 @@ _CACHELIST_NON_SLICEABLE_SUB_CLASSES = frozenset(
 
 _ARRAYS_SUB_CLASSES = frozenset({"ArraysCache", "SizedArraysCache"})
 _POOLING_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
+# Keep boundary eligibility separate from signature subtype classification.
+_PM_BOUNDARY_SUB_CLASSES = _ARRAYS_SUB_CLASSES | _POOLING_SUB_CLASSES
 # Sliceable KV sub-cache classes inside a CacheList (4D sequence tensors).
 # Shared with prefix_cache.cachelist_pm_member_plan (single source so the
 # class-level expectation and the shape-level store plan cannot drift).
@@ -401,18 +512,18 @@ _PM_LAYOUT_TOKEN = "@pm"
 def cachelist_pm_class_eligible(sub_class_names: list[str]) -> bool:
     """Class-level eligibility for per-member CacheList block storage.
 
-    True when every member is either a sliceable KV class or an
-    ArraysCache-style class, with at least one of each. Must stay in sync
-    with ``prefix_cache.cachelist_pm_member_plan`` (which additionally
-    checks live tensor shapes at store time).
+    True when every member is either a sliceable KV class or a boundary
+    class (ArraysCache-style or PoolingCache), with at least one of each.
+    Must stay in sync with ``prefix_cache.cachelist_pm_member_plan`` (which
+    additionally checks live tensor shapes at store time).
     """
     if not sub_class_names:
         return False
     names = [str(n) for n in sub_class_names]
     has_slice = any(n in _PM_SLICEABLE_SUB_CLASSES for n in names)
-    has_boundary = any(n in _ARRAYS_SUB_CLASSES for n in names)
+    has_boundary = any(n in _PM_BOUNDARY_SUB_CLASSES for n in names)
     all_known = all(
-        n in _PM_SLICEABLE_SUB_CLASSES or n in _ARRAYS_SUB_CLASSES for n in names
+        n in _PM_SLICEABLE_SUB_CLASSES or n in _PM_BOUNDARY_SUB_CLASSES for n in names
     )
     return has_slice and has_boundary and all_known
 
@@ -645,7 +756,7 @@ def _store_nstate_elements_flat(
             arrays[elem_key] = mx.zeros((1,))
             cache_list_meta[f"{elem_key}_none"] = "1"
         elif _has_zero_dim(elem):
-            arrays[elem_key] = mx.zeros((1,))
+            arrays[elem_key] = mx.zeros((1,), dtype=elem.dtype)
             cache_list_meta[f"{elem_key}_zero_dim"] = _encode_shape(elem.shape)
         elif (
             isinstance(elem, tuple)
@@ -732,7 +843,12 @@ def _load_nstate_flat(
                 logger.error(f"Missing {elem_key} in arrays")
                 return None
             if file_metadata and zd_marker in file_metadata:
-                elements.append(mx.zeros(_decode_shape(file_metadata[zd_marker])))
+                elements.append(
+                    mx.zeros(
+                        _decode_shape(file_metadata[zd_marker]),
+                        dtype=arrays[elem_key].dtype,
+                    )
+                )
             else:
                 elements.append(arrays[elem_key])
     else:
@@ -873,6 +989,17 @@ def _fsync_parent_dir(path: str | Path) -> None:
         os.close(dir_fd)
 
 
+def _unique_tmp_path(file_path: Path) -> Path:
+    """Build a per-writer temp path for ``file_path``.
+
+    A shared ``<stem>_tmp`` name lets two writers of one block interleave
+    their bytes in a single file.
+    """
+    return file_path.with_name(
+        f"{file_path.stem}_tmp_{uuid.uuid4().hex[:8]}.safetensors"
+    )
+
+
 def _write_safetensors_no_mx(
     path: str,
     tensors_raw: dict[str, tuple[bytes, str, list[int]]],
@@ -1003,6 +1130,9 @@ class PagedSSDBlockMetadata:
     cache_signature: str = ""
     layer_cache_types: list[str] | None = None
     layer_meta_states: list[tuple] | None = None
+    # Chain parent and tail marker; a tail is found through its parent.
+    parent_hash: bytes | None = None
+    tail_terminal: bool = False
 
     def touch(self) -> None:
         """Update last access time."""
@@ -1027,6 +1157,10 @@ class PagedSSDBlockMetadata:
         if self.layer_meta_states:
             # Convert tuples to lists for JSON serialization
             result["layer_meta_states"] = [list(m) for m in self.layer_meta_states]
+        if self.parent_hash is not None:
+            result["parent_hash"] = self.parent_hash.hex()
+        if self.tail_terminal:
+            result["tail_terminal"] = True
         return result
 
     @classmethod
@@ -1050,6 +1184,10 @@ class PagedSSDBlockMetadata:
             cache_signature=data.get("cache_signature", ""),
             layer_cache_types=data.get("layer_cache_types"),
             layer_meta_states=layer_meta_states,
+            parent_hash=(
+                bytes.fromhex(data["parent_hash"]) if data.get("parent_hash") else None
+            ),
+            tail_terminal=bool(data.get("tail_terminal", False)),
         )
 
 
@@ -1489,6 +1627,15 @@ class SharedHotCacheBudget:
                     )
         return cleared
 
+    def releasable_bytes(self, protected_hashes: set[bytes]) -> int:
+        """Bytes ``shrink_to`` can free while keeping ``protected_hashes``."""
+        with self._lock:
+            return sum(
+                entry.size_bytes
+                for entry in self._entries.values()
+                if entry.block_hash not in protected_hashes
+            )
+
     def shrink_to(
         self,
         target_bytes: int,
@@ -1600,6 +1747,7 @@ class PagedSSDCacheManager(CacheManager):
         expected_layer_cache_types: list[str] | None = None,
         gdn_ssd_split_enabled: bool = False,
         gdn_sidecar_state_dtype: str = "fp32",
+        auto_size: bool = False,
     ):
         """
         Initialize the SSD cache manager.
@@ -1607,6 +1755,7 @@ class PagedSSDCacheManager(CacheManager):
         Args:
             cache_dir: Directory for SSD cache files.
             max_size_bytes: Maximum total size of SSD cache.
+            auto_size: Use 50% of the sum of free space and existing SSD cache.
             hot_cache_max_bytes: Maximum in-memory hot cache size in bytes.
                 0 means disabled (default).
             hot_cache_only: When True, skip directory init and writer thread.
@@ -1654,6 +1803,7 @@ class PagedSSDCacheManager(CacheManager):
                 mode; split blocks use format version 5.
         """
         self._cache_dir = cache_dir
+        self._auto_size = auto_size
         self._max_size = max_size_bytes
         self._index = PagedSSDCacheIndex(max_size_bytes)
         self._incompatible_index = PagedSSDCacheIndex(max_size_bytes)
@@ -1693,6 +1843,9 @@ class PagedSSDCacheManager(CacheManager):
         # the layer signature. None disables the check (legacy managers /
         # models without mixed CacheList layers).
         self._expected_cachelist_subtypes: dict[str, list[str]] | None = None
+        # Numerics revision of the live model (see ``_NUMERICS_REVISIONS``).
+        # None accepts every block, like the TurboQuant depth.
+        self._expected_numerics: str | None = None
         # Set once we have swept stale-signature blocks for the current
         # ``_expected_layer_cache_types`` / ``_expected_turboquant_kv_bits``.
         # Re-assigning the signature (e.g., via
@@ -1704,6 +1857,7 @@ class PagedSSDCacheManager(CacheManager):
         # Disk usage cache for dynamic effective max size (30s TTL)
         self._disk_usage_cache = None  # type: shutil._ntuple_diskusage | None
         self._disk_usage_cache_time: float = 0.0
+        self._disk_cache_size_at_check: int = 0
         self._last_disk_pressure_warn: float = 0.0
         self._last_promotion_failure_warn: float = 0.0
 
@@ -1741,6 +1895,19 @@ class PagedSSDCacheManager(CacheManager):
         self._hot_cache_total_bytes: int = 0
         self._hot_cache_lock = threading.Lock()
 
+        # Track which block hashes are queued for background write
+        self._pending_write_hashes: set = set()
+        self._pending_write_hashes_lock = threading.Lock()
+        # Set by bounded_pending_writes(): save_block waits for the writer
+        # before serializing another block once this many are queued.
+        self._pending_write_limit: int | None = None
+        # Lock ordering invariant: _hot_cache_lock -> _pending_write_hashes_lock.
+        # Never acquire in reverse. Load path: _hot_cache_get (holds _hot_cache_lock,
+        # releases), then _pending_write_buffer_get (holds _pending_write_hashes_lock).
+        # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
+        # _enqueue_ssd_write (holds _pending_write_hashes_lock).
+        self._pending_write_buffers: dict[bytes, dict] = {}
+
         # Initialize directory structure and scan existing files
         # Skip in hot_cache_only mode: no SSD I/O, so no directories needed.
         if self._cache_dir and not self._hot_cache_only:
@@ -1766,15 +1933,10 @@ class PagedSSDCacheManager(CacheManager):
             kv_bytes_per_token=self._expected_kv_bytes_per_token,
         )
         self._write_queue: queue.Queue = queue.Queue(maxsize=self._max_pending_writes)
-        # Track which block hashes are queued for background write
-        self._pending_write_hashes: set = set()
-        self._pending_write_hashes_lock = threading.Lock()
-        # Lock ordering invariant: _hot_cache_lock -> _pending_write_hashes_lock.
-        # Never acquire in reverse. Load path: _hot_cache_get (holds _hot_cache_lock,
-        # releases), then _pending_write_buffer_get (holds _pending_write_hashes_lock).
-        # Eviction path: _hot_cache_put (holds _hot_cache_lock, releases), then
-        # _enqueue_ssd_write (holds _pending_write_hashes_lock).
-        self._pending_write_buffers: dict[bytes, dict] = {}
+        self._persistence_progress_lock = threading.Lock()
+        self._persistence_last_success = None
+        self._persistence_failed = False
+        self._persistence_io_threads: set[int] = set()
         self._writer_shutdown = threading.Event()
         # Writer thread is only needed when writing to SSD.
         self._writer_thread = None
@@ -1801,9 +1963,13 @@ class PagedSSDCacheManager(CacheManager):
                 )
             except OSError:
                 pass
+        initial_limit = (
+            self._get_effective_max_size() if self._auto_size else max_size_bytes
+        )
         logger.info(
             f"PagedSSDCacheManager initialized: dir={self._cache_dir}, "
-            f"max_size={format_bytes(max_size_bytes)}{hot_info}, "
+            f"max_size={format_bytes(initial_limit)}{hot_info}, "
+            f"auto_size={self._auto_size}, "
             f"existing_files={self._index.count}{disk_info}"
         )
 
@@ -1816,7 +1982,10 @@ class PagedSSDCacheManager(CacheManager):
         Entries from save_block() use 'tensors_raw' (raw bytes).
         Entries from _promote_to_hot_cache() may use 'arrays' (mx.array objects
         loaded from SSD, not from active inference — safe to retain).
+        Staging buffers for queued SSD writes are not hot cache and count as 0.
         """
+        if entry.get("staging"):
+            return 0
         if "arrays" in entry:
             return sum(arr.nbytes for arr in entry["arrays"].values())
         if "tensors_raw" in entry:
@@ -1835,6 +2004,8 @@ class PagedSSDCacheManager(CacheManager):
 
     def _handle_hot_cache_eviction(self, block_hash: bytes, entry: dict) -> None:
         self._stats["hot_cache_evictions"] += 1
+        if entry.get("staging"):
+            return  # Its SSD write is already queued.
         if not entry.get("dirty", True):
             logger.debug(
                 "Evicted clean hot cache block %s; SSD copy already exists",
@@ -1939,7 +2110,8 @@ class PagedSSDCacheManager(CacheManager):
             # Non-blocking callers (hot-cache LRU spill) also wait so a
             # transient writer backlog doesn't silently drop blocks. Blocking
             # callers (shutdown flush) use the same bounded wait.
-            self._write_queue.put(item, timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS)
+            with self._persistence_io():
+                self._write_queue.put(item, timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS)
             logger.debug(
                 f"Evicted hot cache block to SSD write queue: "
                 f"{block_hash.hex()[:16]}..."
@@ -2250,6 +2422,8 @@ class PagedSSDCacheManager(CacheManager):
         skipped_incompatible = 0
         skipped_incompatible_bytes = 0
         errors = 0
+        orphaned_tmp_cleaned = 0
+        unreadable_orphans = 0
 
         for subdir in self.SUBDIR_CHARS:
             subdir_path = self._cache_dir / subdir
@@ -2261,6 +2435,22 @@ class PagedSSDCacheManager(CacheManager):
                 try:
                     metadata = self._read_file_metadata(file_path)
                     if metadata is None:
+                        # An unreadable tmp file is a torn write. Skip recent
+                        # ones, which another manager may still be writing.
+                        stem = file_path.stem
+                        try:
+                            tmp_is_stale = (
+                                time.time() - file_path.stat().st_mtime
+                                > _STALE_TMP_CLEANUP_SECONDS
+                            )
+                        except OSError:
+                            tmp_is_stale = False
+                        if ("_tmp_" in stem or stem.endswith("_tmp")) and tmp_is_stale:
+                            with contextlib.suppress(OSError):
+                                file_path.unlink()
+                            orphaned_tmp_cleaned += 1
+                        else:
+                            unreadable_orphans += 1
                         continue
                     if not self._is_compatible_block(metadata):
                         skipped_incompatible += 1
@@ -2295,13 +2485,29 @@ class PagedSSDCacheManager(CacheManager):
             log_msg += f", skipped_gdn_sidecars={sidecars_skipped}"
         if sidecars_bytes > 0:
             log_msg += f", gdn_size={format_bytes(sidecars_bytes)}"
+        if orphaned_tmp_cleaned > 0:
+            log_msg += f", removed_torn_tmp={orphaned_tmp_cleaned}"
+        if unreadable_orphans > 0:
+            log_msg += (
+                f", unreadable_orphans={unreadable_orphans} "
+                f"(left on disk; not indexed or budgeted)"
+            )
         logger.info(log_msg)
 
         # Startup can find a cache directory that already exceeds the shared
         # SSD budget. Converge immediately before serving requests.
         tracked_size = self._tracked_ssd_size()
         if tracked_size > 0 and tracked_size > self._get_effective_max_size():
+            tracked_count = self._tracked_ssd_count()
             self._enforce_size_limit_for_new_block(0, unbounded=True)
+            logger.warning(
+                "SSD cache startup cleanup: evicted=%d, freed=%s, remaining=%s, "
+                "limit=%s",
+                tracked_count - self._tracked_ssd_count(),
+                format_bytes(tracked_size - self._tracked_ssd_size()),
+                format_bytes(self._tracked_ssd_size()),
+                format_bytes(self._get_effective_max_size()),
+            )
 
     def _scan_existing_gdn_sidecars(self) -> tuple[int, int, int]:
         """Index existing sidecars using only path and stat metadata.
@@ -2624,6 +2830,7 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 self._payload_layout == "embedded"
                 and self._signature_bits_match("")
+                and self._signature_numerics_match("")
             )
 
         try:
@@ -2687,7 +2894,16 @@ class PagedSSDCacheManager(CacheManager):
         if not self._signature_bits_match(metadata.cache_signature):
             return False
 
+        if not self._signature_numerics_match(metadata.cache_signature):
+            return False
+
         return True
+
+    def _signature_numerics_match(self, cache_signature: str) -> bool:
+        """True when a block was computed with the live model's numerics."""
+        if self._expected_numerics is None:
+            return True
+        return _signature_numerics(cache_signature) == self._expected_numerics
 
     def _signature_bits_match(self, cache_signature: str) -> bool:
         """True when a block's recorded TurboQuant depth satisfies expectations.
@@ -2723,6 +2939,22 @@ class PagedSSDCacheManager(CacheManager):
             signature_payload = {}
         if not isinstance(signature_payload, dict):
             return "invalid cache signature payload"
+        expected_types = _canonicalize_layer_cache_types(self._expected_layer_cache_types)
+        actual_types = signature_payload.get("layer_cache_types")
+        if not isinstance(actual_types, list) or not all(
+            isinstance(name, str) for name in actual_types
+        ):
+            actual_types = None
+        actual_types = _canonicalize_layer_cache_types(actual_types)
+        if (
+            expected_types is not None
+            and expected_types != actual_types
+            and (
+                any(name in _AFFINE_CACHE_TYPES for name in expected_types)
+                or any(name in _AFFINE_CACHE_TYPES for name in (actual_types or []))
+            )
+        ):
+            return f"layer cache types: expected {expected_types}, got {actual_types}"
         actual_layout = signature_payload.get("payload_layout", "embedded")
         if actual_layout != self._payload_layout:
             return (
@@ -2735,6 +2967,11 @@ class PagedSSDCacheManager(CacheManager):
             return (
                 "TurboQuant depth: expected "
                 f"{self._expected_turboquant_kv_bits}, got {actual}"
+            )
+        if not self._signature_numerics_match(cache_signature):
+            return (
+                f"numerics: expected {self._expected_numerics}, "
+                f"got {_signature_numerics(cache_signature)}"
             )
 
         expected_subtypes = self._expected_cachelist_subtypes
@@ -2802,6 +3039,7 @@ class PagedSSDCacheManager(CacheManager):
             turboquant_kv_bits=turboquant_kv_bits,
             cachelist_subtypes=cachelist_subtypes,
             payload_layout=self._payload_layout,
+            numerics=self._expected_numerics,
         )
 
     def gdn_cache_signature_for(
@@ -2958,6 +3196,7 @@ class PagedSSDCacheManager(CacheManager):
                     )
                     return None
 
+            parent_hash_hex = metadata.get("parent_hash", "")
             return PagedSSDBlockMetadata(
                 block_hash=bytes.fromhex(block_hash_hex),
                 file_path=file_path,
@@ -2971,10 +3210,32 @@ class PagedSSDCacheManager(CacheManager):
                 cache_signature=metadata.get("cache_signature", ""),
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
+                parent_hash=bytes.fromhex(parent_hash_hex) if parent_hash_hex else None,
+                tail_terminal=metadata.get("tail_terminal") == "1",
             )
         except Exception as e:
             logger.debug(f"Failed to read metadata from {file_path}: {e}")
             return None
+
+    @contextlib.contextmanager
+    def _persistence_io(self):
+        thread_id = threading.get_ident()
+        with self._persistence_progress_lock:
+            self._persistence_io_threads.add(thread_id)
+        try:
+            yield
+        finally:
+            with self._persistence_progress_lock:
+                self._persistence_io_threads.discard(thread_id)
+
+    def persistence_progress(self, thread_id: int | None = None) -> float | None:
+        """Return the last successful write only for the requested I/O waiter."""
+        with self._persistence_progress_lock:
+            if self._persistence_failed:
+                return None
+            if thread_id is not None and thread_id not in self._persistence_io_threads:
+                return None
+            return self._persistence_last_success
 
     def _write_block_file(
         self,
@@ -2986,72 +3247,114 @@ class PagedSSDCacheManager(CacheManager):
         source: str,
     ) -> bool:
         """Write one serialized block to disk from raw tensor bytes."""
-        temp_path = None
+        with self._persistence_io():
+            temp_path = None
+            try:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = _unique_tmp_path(file_path)
+                actual_size = _write_safetensors_no_mx(
+                    str(temp_path), tensors_raw, metadata
+                )
+
+                os.rename(str(temp_path), str(file_path))
+                _fsync_parent_dir(file_path)
+
+                # The block is now durable on disk; bump the persist counter
+                # before any cleanup so ``saves_persisted`` reflects rename
+                # success even if the post-rename eviction check below unlinks it.
+                self._stats["saves_persisted"] += 1
+                with self._persistence_progress_lock:
+                    self._persistence_last_success = time.monotonic()
+                    self._persistence_failed = False
+                self._index.update_file_size(block_hash, actual_size)
+
+                # Check if block was evicted while write was pending.
+                if not self._index.contains(block_hash):
+                    logger.debug(
+                        "Block %s evicted during %s write, cleaning up file",
+                        block_hash.hex()[:16],
+                        source,
+                    )
+                    with contextlib.suppress(Exception):
+                        file_path.unlink()
+                return True
+            except Exception as e:
+                if isinstance(e, OSError) and e.errno in (
+                    errno.ENOSPC,
+                    errno.EDQUOT,
+                ):
+                    # Background writes may fail after save_block already returned
+                    # True, while inline fallbacks can still report False to the
+                    # caller. In both cases, surface disk pressure at ERROR level
+                    # and force the next save to recompute available space.
+                    logger.error(
+                        "SSD cache disk full, cannot write block %s via %s: %s "
+                        "(subsequent saves will recompute disk pressure)",
+                        block_hash.hex()[:16],
+                        source,
+                        e,
+                    )
+                    # Invalidate the 30s disk-usage snapshot so the next
+                    # save sees the true (now-critical) free space and evicts
+                    # aggressively rather than trusting a stale inflated limit.
+                    # In-flight saves that already passed
+                    # _enforce_size_limit_for_new_block are still queued and may
+                    # ENOSPC again; invalidation only protects the next round of
+                    # save_block calls.
+                    with self._lock:
+                        self._disk_usage_cache = None
+                else:
+                    logger.error(
+                        "SSD cache %s write failed for %s: %s",
+                        source,
+                        block_hash.hex()[:16],
+                        e,
+                    )
+                self._stats["errors"] += 1
+                with self._persistence_progress_lock:
+                    self._persistence_failed = True
+                self._index.remove(block_hash)
+                for p in (temp_path, file_path):
+                    with contextlib.suppress(Exception):
+                        if p is not None and isinstance(p, Path) and p.exists():
+                            p.unlink()
+                return False
+
+    @contextlib.contextmanager
+    def bounded_pending_writes(self, max_pending: int):
+        """Keep at most ``max_pending`` serialized blocks queued while active.
+
+        A store under memory pressure must not buffer a whole request's KV
+        in host RAM ahead of the writer.
+        """
+        previous = self._pending_write_limit
+        self._pending_write_limit = max(1, int(max_pending))
         try:
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = file_path.with_name(file_path.stem + "_tmp.safetensors")
-            actual_size = _write_safetensors_no_mx(
-                str(temp_path), tensors_raw, metadata
-            )
+            yield
+        finally:
+            self._pending_write_limit = previous
 
-            os.rename(str(temp_path), str(file_path))
-            _fsync_parent_dir(file_path)
+    def _wait_for_pending_write_slot(self) -> None:
+        limit = self._pending_write_limit
+        if limit is None:
+            return
+        deadline = time.monotonic() + _PENDING_WRITE_SLOT_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            with self._pending_write_hashes_lock:
+                if len(self._pending_write_hashes) < limit:
+                    return
+            time.sleep(0.002)
 
-            # The block is now durable on disk; bump the persist counter
-            # before any cleanup so ``saves_persisted`` reflects rename
-            # success even if the post-rename eviction check below unlinks it.
-            self._stats["saves_persisted"] += 1
-            self._index.update_file_size(block_hash, actual_size)
-
-            # Check if block was evicted while write was pending.
-            if not self._index.contains(block_hash):
-                logger.debug(
-                    "Block %s evicted during %s write, cleaning up file",
-                    block_hash.hex()[:16],
-                    source,
-                )
-                with contextlib.suppress(Exception):
-                    file_path.unlink()
-            return True
-        except Exception as e:
-            if isinstance(e, OSError) and e.errno in (
-                errno.ENOSPC,
-                errno.EDQUOT,
-            ):
-                # Background writes may fail after save_block already returned
-                # True, while inline fallbacks can still report False to the
-                # caller. In both cases, surface disk pressure at ERROR level
-                # and force the next save to recompute available space.
-                logger.error(
-                    "SSD cache disk full, cannot write block %s via %s: %s "
-                    "(subsequent saves will recompute disk pressure)",
-                    block_hash.hex()[:16],
-                    source,
-                    e,
-                )
-                # Invalidate the 30s disk-usage snapshot so the next
-                # save sees the true (now-critical) free space and evicts
-                # aggressively rather than trusting a stale inflated limit.
-                # In-flight saves that already passed
-                # _enforce_size_limit_for_new_block are still queued and may
-                # ENOSPC again; invalidation only protects the next round of
-                # save_block calls.
-                with self._lock:
-                    self._disk_usage_cache = None
-            else:
-                logger.error(
-                    "SSD cache %s write failed for %s: %s",
-                    source,
-                    block_hash.hex()[:16],
-                    e,
-                )
-            self._stats["errors"] += 1
-            self._index.remove(block_hash)
-            for p in (temp_path, file_path):
-                with contextlib.suppress(Exception):
-                    if p is not None and isinstance(p, Path) and p.exists():
-                        p.unlink()
-            return False
+    def wait_for_pending_writes(self, timeout: float) -> bool:
+        """Wait until queued SSD writes finish. Returns False on timeout."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._pending_write_hashes_lock:
+                if not self._pending_write_hashes:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
 
     def _clear_pending_write(
         self, block_hash: bytes, *, remove_hot_cache: bool = False
@@ -3082,6 +3385,8 @@ class PagedSSDCacheManager(CacheManager):
         standard file I/O operations.
         """
         while True:
+            if self._writer_shutdown.is_set() and self._write_queue.empty():
+                break
             item = None
             try:
                 item = self._write_queue.get(timeout=1.0)
@@ -3120,6 +3425,8 @@ class PagedSSDCacheManager(CacheManager):
         layer_meta_states: list[tuple] | None = None,
         hot_cache_write_back: bool = True,
         replace_existing: bool = False,
+        parent_hash: bytes | None = None,
+        tail_terminal: bool = False,
     ) -> bool:
         """
         Save a KV cache block to SSD storage (non-blocking).
@@ -3145,6 +3452,8 @@ class PagedSSDCacheManager(CacheManager):
                 for the same content hash. This is reserved for promoting a
                 non-sliceable prefix-cache placeholder into a valid boundary
                 snapshot; normal deduplicated saves must leave it False.
+            parent_hash: Chain hash of the preceding block, if any.
+            tail_terminal: True for a short terminal block, re-indexed by parent.
 
         Returns:
             True if enqueued successfully, False otherwise.
@@ -3154,6 +3463,56 @@ class PagedSSDCacheManager(CacheManager):
             return False
 
         layer_cache_types = _storage_layer_cache_types(layer_cache_types)
+
+        for i, layer_data in enumerate(cache_data):
+            affine_class = (
+                layer_cache_types[i]
+                if layer_cache_types
+                and i < len(layer_cache_types)
+                and layer_cache_types[i] in _AFFINE_CACHE_TYPES
+                else None
+            )
+            affine_marker = (
+                layer_data[0]
+                if isinstance(layer_data, tuple)
+                and len(layer_data) == 2
+                and layer_data[0] in ("__affine4__", "__affine8__")
+                else None
+            )
+            meta = (
+                layer_meta_states[i]
+                if layer_meta_states and i < len(layer_meta_states)
+                else None
+            )
+            affine_scheme = (
+                meta[3]
+                if isinstance(meta, (list, tuple))
+                and len(meta) > 3
+                and meta[3] in _AFFINE_SCHEMES
+                else None
+            )
+            expected_marker = (
+                "__affine4__"
+                if affine_class in _AFFINE4_CACHE_TYPES
+                else "__affine8__"
+                if affine_class in _AFFINE8_CACHE_TYPES
+                else None
+            )
+            if bool(affine_class) != bool(affine_marker) or (
+                affine_marker
+                and (
+                    affine_marker != expected_marker
+                    or affine_scheme != affine_marker[2:-2]
+                )
+            ) or (affine_scheme and not affine_marker):
+                logger.warning("Affine layer %d: class/payload mismatch", i)
+                return False
+            if affine_marker:
+                try:
+                    _validate_affine_meta(meta, affine_marker[2:-2])
+                except (TypeError, ValueError, IndexError):
+                    logger.warning("Affine layer %d: invalid metadata", i)
+                    return False
 
         # First save call after a model load is the canonical source for
         # the live layer-cache signature (post-TurboQuant / post-MTP). If
@@ -3228,6 +3587,7 @@ class PagedSSDCacheManager(CacheManager):
                 return True
             return False
 
+        self._wait_for_pending_write_slot()
         file_path = self._get_file_path(block_hash)
 
         try:
@@ -3322,7 +3682,12 @@ class PagedSSDCacheManager(CacheManager):
                     isinstance(layer_data, tuple)
                     and len(layer_data) == 2
                     and isinstance(layer_data[0], str)
-                    and layer_data[0] in ("__turboquant__", "__turboquant_v2__")
+                    and layer_data[0] in (
+                        "__turboquant__",
+                        "__turboquant_v2__",
+                        "__affine4__",
+                        "__affine8__",
+                    )
                 ):
                     # TurboQuant v2: NamedTuple states (ks, vs)
                     ks, vs = layer_data[1]
@@ -3334,7 +3699,11 @@ class PagedSSDCacheManager(CacheManager):
                             if isinstance(val, mx.array):
                                 arrays[f"layer_{i}_tq_{prefix}_{field_name}"] = val
                                 tq_tensor_idx += 1
-                    cache_list_meta[f"layer_{i}_turboquant_v2"] = "1"
+                    format_tag = {
+                        "__affine4__": "affine4",
+                        "__affine8__": "affine8",
+                    }.get(layer_data[0], "turboquant_v2")
+                    cache_list_meta[f"layer_{i}_{format_tag}"] = "1"
                     cache_list_meta[f"layer_{i}_tq_key_type"] = type(ks).__name__
                     cache_list_meta[f"layer_{i}_tq_value_type"] = type(vs).__name__
                     cache_list_meta[f"layer_{i}_tq_key_fields"] = ",".join(ks._fields)
@@ -3374,6 +3743,7 @@ class PagedSSDCacheManager(CacheManager):
                     cache_data, layer_cache_types, layer_meta_states
                 ),
                 payload_layout=self._payload_layout,
+                numerics=self._expected_numerics,
             )
 
             # Prepare metadata
@@ -3394,6 +3764,10 @@ class PagedSSDCacheManager(CacheManager):
                 "payload_layout": self._payload_layout,
                 "created_at": str(time.time()),
             }
+            if parent_hash is not None:
+                metadata["parent_hash"] = parent_hash.hex()
+            if tail_terminal:
+                metadata["tail_terminal"] = "1"
 
             # Add cache type information if provided
             if layer_cache_types:
@@ -3452,6 +3826,8 @@ class PagedSSDCacheManager(CacheManager):
                 cache_signature=cache_signature,
                 layer_cache_types=layer_cache_types,
                 layer_meta_states=layer_meta_states,
+                parent_hash=parent_hash,
+                tail_terminal=tail_terminal,
             )
 
             # Store in hot cache (or temporary buffer) for immediate read-back.
@@ -3515,6 +3891,7 @@ class PagedSSDCacheManager(CacheManager):
             self._index.add(block_metadata)
 
             # Hot cache disabled: use temporary buffer + immediate SSD write
+            cache_entry["staging"] = True
             with self._hot_cache_lock:
                 self._hot_cache[block_hash] = cache_entry
 
@@ -3526,10 +3903,11 @@ class PagedSSDCacheManager(CacheManager):
             # transient bursts (faster than the writer can drain) don't
             # immediately punch holes in the cache chain.
             try:
-                self._write_queue.put(
-                    (block_hash, tensors_raw, metadata, file_path),
-                    timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
-                )
+                with self._persistence_io():
+                    self._write_queue.put(
+                        (block_hash, tensors_raw, metadata, file_path),
+                        timeout=_PENDING_WRITE_PUT_TIMEOUT_SECONDS,
+                    )
             except queue.Full:
                 self._stats["ssd_inline_write_fallbacks"] += 1
                 logger.warning(
@@ -3626,6 +4004,35 @@ class PagedSSDCacheManager(CacheManager):
                 else None
             )
 
+            affine_scheme = next(
+                (
+                    scheme
+                    for scheme in _AFFINE_SCHEMES
+                    if file_metadata and f"layer_{i}_{scheme}" in file_metadata
+                ),
+                None,
+            )
+            expected_affine_scheme = (
+                "affine4"
+                if cache_type in _AFFINE4_CACHE_TYPES
+                else "affine8"
+                if cache_type in _AFFINE8_CACHE_TYPES
+                else None
+            )
+            if expected_affine_scheme != affine_scheme or (
+                affine_scheme
+                and f"layer_{i}_turboquant_v2" in file_metadata
+            ):
+                logger.warning("Affine layer %d: class/payload mismatch", i)
+                return None
+            if affine_scheme:
+                try:
+                    metas = json.loads(file_metadata.get("layer_meta_states", "null"))
+                    _validate_affine_meta(metas[i], affine_scheme)
+                except (TypeError, ValueError, IndexError, KeyError):
+                    logger.warning("Affine layer %d: invalid metadata", i)
+                    return None
+
             if cache_type == "CacheList":
                 sub_count_key = f"layer_{i}_sub_count"
                 sub_count = 0
@@ -3667,7 +4074,9 @@ class PagedSSDCacheManager(CacheManager):
                         logger.error(f"Missing N-tuple state for layer {i}")
                         return None
                     cache_data.append(_maybe_unwrap_legacy(layer_marker))
-            elif file_metadata and f"layer_{i}_turboquant_v2" in file_metadata:
+            elif affine_scheme or (
+                file_metadata and f"layer_{i}_turboquant_v2" in file_metadata
+            ):
                 # TurboQuant v2: reconstruct NamedTuple states from flattened tensors
                 from ..turboquant_kv import (
                     TurboQuantMSEState,
@@ -3693,14 +4102,37 @@ class PagedSSDCacheManager(CacheManager):
                     "TurboQuantSplitState": TurboQuantSplitState,
                 }
                 try:
+                    if not affine_scheme:
+                        metas = json.loads(file_metadata.get("layer_meta_states", "[]"))
+                        meta = (
+                            metas[i] if isinstance(metas, list) and i < len(metas) else ()
+                        )
+                        if (
+                            isinstance(meta, (list, tuple))
+                            and len(meta) > 3
+                            and meta[3] in _AFFINE_SCHEMES
+                        ):
+                            raise TypeError("Affine metadata on a TurboQuant payload")
                     k_cls = _type_map[key_type]
                     v_cls = _type_map[value_type]
+                    if affine_scheme and (
+                        k_cls is not TurboQuantMSEState
+                        or v_cls is not TurboQuantMSEState
+                        or key_fields != list(k_cls._fields)
+                        or value_fields != list(v_cls._fields)
+                    ):
+                        raise TypeError("Invalid affine packed state fields")
                     k_tensors = [arrays[f"layer_{i}_tq_k_{f}"] for f in key_fields]
                     v_tensors = [arrays[f"layer_{i}_tq_v_{f}"] for f in value_fields]
                     ks = k_cls(*k_tensors)
                     vs = v_cls(*v_tensors)
-                    cache_data.append(("__turboquant_v2__", (ks, vs)))
-                except (KeyError, TypeError) as e:
+                    marker = (
+                        f"__{affine_scheme}__"
+                        if affine_scheme
+                        else "__turboquant_v2__"
+                    )
+                    cache_data.append((marker, (ks, vs)))
+                except (KeyError, TypeError, ValueError) as e:
                     logger.error(f"TurboQuant v2 layer {i}: reconstruction failed: {e}")
                     return None
             else:
@@ -3886,8 +4318,12 @@ class PagedSSDCacheManager(CacheManager):
             self._index.remove(block_hash)
             try:
                 file_path.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to remove corrupted SSD cache file %s: %s",
+                    file_path,
+                    e,
+                )
             return None
 
     def load_block_with_metadata(
@@ -4091,8 +4527,12 @@ class PagedSSDCacheManager(CacheManager):
             self._index.remove(block_hash)
             try:
                 file_path.unlink()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to remove corrupted SSD cache file %s: %s",
+                    file_path,
+                    e,
+                )
             return None, None
 
     def get_block_metadata(self, block_hash: bytes) -> PagedSSDBlockMetadata | None:
@@ -4105,6 +4545,12 @@ class PagedSSDCacheManager(CacheManager):
         Returns:
             PagedSSDBlockMetadata if found, None otherwise.
         """
+        with self._hot_cache_lock:
+            entry = self._hot_cache.get(block_hash)
+            if entry is not None:
+                metadata = entry.get("block_metadata")
+                if metadata is not None:
+                    return metadata
         return self._index.get(block_hash)
 
     def has_block(self, block_hash: bytes) -> bool:
@@ -4128,6 +4574,14 @@ class PagedSSDCacheManager(CacheManager):
             if block_hash in self._pending_write_buffers:
                 return True
         return False
+
+    def iter_tail_blocks(self) -> list[tuple[bytes | None, bytes, int]]:
+        """Return (parent_hash, block_hash, token_count) for indexed tail blocks."""
+        return [
+            (meta.parent_hash, meta.block_hash, meta.token_count)
+            for meta in self._index.get_all_metadata()
+            if meta.tail_terminal and meta.token_count > 0
+        ]
 
     def preload_matched_blocks(self, block_hashes: list[bytes]) -> int:
         """
@@ -4275,6 +4729,7 @@ class PagedSSDCacheManager(CacheManager):
         *,
         turboquant_kv_bits: float | None = None,
         cachelist_subtypes: dict[str, list[str]] | None = None,
+        numerics: str | None = None,
     ) -> bool:
         """Set the live layer-cache signature, replacing stale expectations.
 
@@ -4286,6 +4741,9 @@ class PagedSSDCacheManager(CacheManager):
         TurboQuant is inactive). A bit-depth change alone also triggers the
         sweep: blocks written at another depth have a different packed state
         width and would crash batch concatenation if mixed (#2045).
+
+        ``numerics`` is the live model's numerics revision; blocks computed
+        under another revision are swept.
 
         Returns True when the canonical signature changed and a stale-signature
         sweep should run. Returns False for empty input or a canonical no-op.
@@ -4306,10 +4764,12 @@ class PagedSSDCacheManager(CacheManager):
             subtypes_changed = (
                 cachelist_subtypes != self._expected_cachelist_subtypes
             )
+            numerics_changed = numerics != self._expected_numerics
             if (
                 old_canonical == new_canonical
                 and not bits_changed
                 and not subtypes_changed
+                and not numerics_changed
             ):
                 if old_signature != new_signature:
                     self._expected_layer_cache_types = new_signature
@@ -4318,16 +4778,18 @@ class PagedSSDCacheManager(CacheManager):
             self._expected_layer_cache_types = new_signature
             self._expected_turboquant_kv_bits = new_bits
             self._expected_cachelist_subtypes = cachelist_subtypes
+            self._expected_numerics = numerics
             self._signature_sweep_completed = False
 
         logger.info(
             "PagedSSDCacheManager updated layer cache signature "
             "(%d layers, %d unique types, turboquant_kv_bits=%s, "
-            "cachelist_subtypes=%s)",
+            "cachelist_subtypes=%s, numerics=%s)",
             len(new_signature),
             len(set(new_canonical or ())),
             new_bits,
             "yes" if cachelist_subtypes else "no",
+            numerics,
         )
         return True
 
@@ -4389,6 +4851,9 @@ class PagedSSDCacheManager(CacheManager):
                     stale.append(h)
                     continue
                 if not self._signature_bits_match(meta.cache_signature):
+                    stale.append(h)
+                    continue
+                if not self._signature_numerics_match(meta.cache_signature):
                     stale.append(h)
                     continue
                 if self._expected_cachelist_subtypes is not None and (
@@ -4478,14 +4943,16 @@ class PagedSSDCacheManager(CacheManager):
     def _get_effective_max_size(self) -> int:
         """Get effective max size considering actual disk free space.
 
-        Returns the minimum of configured max_size and 99% of disk space
-        available for cache (current cache size + disk free). This ensures
-        eviction triggers before the disk fills up even when other processes
-        consume disk space after the server started.
+        Auto mode uses 50% of the sum of free space and existing cache.
+        Explicit limits retain the 99% disk-space guard.
+        Sampling both sizes together keeps writes from increasing the cached budget.
 
         Uses a 30-second TTL cache for shutil.disk_usage() results.
         """
-        if self._cache_dir is None:
+        # Hot-cache-only mode never touches the SSD directory (init skips
+        # creating it), so disk headroom is irrelevant here; querying it
+        # would fail with ENOENT on every poll and spam this warning.
+        if self._cache_dir is None or self._hot_cache_only:
             return self._max_size
 
         # Take the lock so a concurrent writer-thread invalidation
@@ -4506,12 +4973,28 @@ class PagedSSDCacheManager(CacheManager):
                         f"{self._cache_dir}: {e}"
                     )
                     return self._max_size
+                self._disk_cache_size_at_check = self._tracked_ssd_size()
+                # Pending index entries reserve bytes that may not be on disk yet.
+                with self._pending_write_hashes_lock:
+                    for block_hash in self._pending_write_hashes:
+                        metadata = self._index.get(block_hash)
+                        if metadata is None:
+                            continue
+                        try:
+                            persisted_size = metadata.file_path.stat().st_size
+                        except FileNotFoundError:
+                            persisted_size = 0
+                        self._disk_cache_size_at_check += (
+                            persisted_size - metadata.file_size
+                        )
                 self._disk_usage_cache_time = now
-            disk_free = self._disk_usage_cache.free
-
-        disk_available = self._tracked_ssd_size() + disk_free
-        disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
-        return min(self._max_size, disk_limit)
+            disk_available = (
+                self._disk_cache_size_at_check + self._disk_usage_cache.free
+            )
+            if self._auto_size:
+                return disk_available // 2
+            disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
+            return min(self._max_size, disk_limit)
 
     def _evict_tracked_until_size(
         self,
@@ -4579,7 +5062,7 @@ class PagedSSDCacheManager(CacheManager):
 
         # Warn when disk pressure shrinks effective limit well below configured
         # (throttled to once per 60s to avoid log spam)
-        if effective_max < self._max_size * 0.1:
+        if not self._auto_size and effective_max < self._max_size * 0.1:
             now = time.monotonic()
             if now - self._last_disk_pressure_warn > 60.0:
                 self._last_disk_pressure_warn = now
@@ -4753,9 +5236,12 @@ class PagedSSDCacheManager(CacheManager):
             while self._hot_cache_total_bytes > target_bytes and self._hot_cache:
                 victim_hash = None
                 for block_hash in self._hot_cache:
-                    if block_hash not in protected_hashes:
-                        victim_hash = block_hash
-                        break
+                    if block_hash in protected_hashes:
+                        continue
+                    if self._hot_cache[block_hash].get("staging"):
+                        continue
+                    victim_hash = block_hash
+                    break
                 if victim_hash is None:
                     break
 
@@ -4982,7 +5468,7 @@ class PagedSSDCacheManager(CacheManager):
                 **self._stats,
             }
 
-    def close(self) -> None:
+    def close(self, *, teardown=None) -> None:
         """Close the SSD cache manager, flushing hot cache and pending writes."""
         logger.info("Shutting down PagedSSDCacheManager...")
 
@@ -5028,8 +5514,12 @@ class PagedSSDCacheManager(CacheManager):
 
             # Wait for writer to finish — longer timeout to allow flush
             timeout = 120 if self._hot_cache_enabled else 60
+            if teardown is not None:
+                timeout = teardown.remaining()
             self._writer_thread.join(timeout=timeout)
             if self._writer_thread.is_alive():
+                if teardown is not None:
+                    fatal_exit("SSD cache writer survived engine teardown")
                 logger.warning(
                     f"SSD cache writer thread did not stop within {timeout}s"
                 )

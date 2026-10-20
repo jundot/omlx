@@ -20,7 +20,7 @@ from .kernels import fast as glm_fast
 logger = logging.getLogger(__name__)
 
 PATCH_SOURCE = "mlxlm-glm optimized-final mlx-lm snapshot"
-NATIVE_KERNELS_PACKAGE = "omlx.custom_kernels.glm_moe_dsa"
+NATIVE_KERNELS_PACKAGE = "omlx.custom_kernels"
 
 _APPLIED = False
 
@@ -30,10 +30,10 @@ def _missing_fast_symbols() -> list[str]:
     required = (
         "dsa_indexer_scores",
         "dsa_topk_indices",
-        "glm_dsa_sparse_mla_attention",
-        "glm_dsa_exact_block_attention",
-        "glm_dsa_q8_vup_flat",
-        "glm_moe_weighted_sum",
+        "sparse_mla_attention",
+        "block_mask_attention",
+        "q8_head_flat_qmm",
+        "moe_weighted_sum",
     )
     return glm_fast.missing(required)
 

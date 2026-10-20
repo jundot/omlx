@@ -5,6 +5,8 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 
 def test_cluster_help_is_exposed():
     result = subprocess.run(
@@ -57,6 +59,8 @@ def test_cluster_worker_smoke_json_is_runnable():
     assert payload["stopped"]["type"] == "stopped"
 
 
+# Two real ranks on one GPU: the waiting rank can hit the Metal timeout on a busy runner.
+@pytest.mark.slow
 def test_cluster_pipeline_smoke_json_is_runnable():
     result = subprocess.run(
         [

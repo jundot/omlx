@@ -6,13 +6,25 @@ and API key verification for admin panel access.
 """
 
 import hashlib
+import ipaddress
+import logging
+import math
 import os
 import secrets
+import threading
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from starlette.requests import HTTPConnection
+
+from ..utils.network import is_loopback_bind_host
+
+logger = logging.getLogger(__name__)
 
 # Session configuration
 SESSION_COOKIE_NAME = "omlx_admin_session"
@@ -30,6 +42,9 @@ _serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 # Global settings getter (set by init_auth)
 _get_global_settings = None
+
+# Browser requests are redirected to the login page only while it is served.
+_web_ui_enabled = True
 
 
 def init_auth(secret_key: str, global_settings_getter=None) -> None:
@@ -49,6 +64,17 @@ def init_auth(secret_key: str, global_settings_getter=None) -> None:
     _serializer = URLSafeTimedSerializer(key)
     if global_settings_getter is not None:
         _get_global_settings = global_settings_getter
+
+
+def set_web_ui_enabled(enabled: bool) -> None:
+    """Record whether the server serves the browser admin pages."""
+    global _web_ui_enabled
+    _web_ui_enabled = enabled
+
+
+def web_ui_enabled() -> bool:
+    """Return whether the server serves the browser admin pages."""
+    return _web_ui_enabled
 
 
 def create_session_token(remember: bool = False) -> str:
@@ -204,6 +230,101 @@ def verify_any_api_key(api_key: str, main_key: str, sub_keys: list) -> bool:
     return False
 
 
+# Wrong API keys allowed per remote client before each lockout.
+KEY_FAILURES_PER_LOCKOUT = 8
+KEY_FIRST_LOCKOUT_SECONDS = 30
+KEY_REPEAT_LOCKOUT_SECONDS = 300
+_MAX_TRACKED_CLIENTS = 4096
+
+
+@dataclass(slots=True)
+class _KeyFailures:
+    failures: int = 0
+    locked_before: bool = False
+    locked_until: float = 0.0
+
+
+# Insertion order is least recently failed first.
+_key_failures: dict[str, _KeyFailures] = {}
+_key_failures_lock = threading.Lock()
+
+
+class KeyLockout(HTTPException):
+    """Raised while a client is locked out after repeated wrong API keys."""
+
+    def __init__(self, retry_after: int) -> None:
+        super().__init__(
+            status_code=429,
+            detail=f"Too many wrong API keys. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def _client_key(conn: HTTPConnection) -> str | None:
+    """Return the failure-budget key for a client, or None for this machine."""
+    host = getattr(getattr(conn, "client", None), "host", None)
+    if not isinstance(host, str):
+        return "unknown"
+    # A peer with the local socket address is this machine on a LAN-IP bind.
+    server = getattr(conn, "scope", {}).get("server") or (None,)
+    if is_loopback_bind_host(host) or host == server[0]:
+        return None
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    # Count an IPv4 client the same on IPv4 and dual-stack sockets.
+    return str(getattr(address, "ipv4_mapped", None) or address)
+
+
+def check_api_key(conn: HTTPConnection, verify: Callable[[], bool]) -> bool:
+    """Run one API key comparison under the client's failure budget.
+
+    Every endpoint that accepts an API key calls this, so all of them share
+    one budget per client. A locked-out client gets KeyLockout before the
+    key is compared. Clients on this machine are not limited.
+    """
+    client = _client_key(conn)
+    if client is None:
+        return verify()
+    with _key_failures_lock:
+        now = time.monotonic()
+        state = _key_failures.get(client)
+        if state is not None and state.locked_until > now:
+            raise KeyLockout(math.ceil(state.locked_until - now))
+        if verify():
+            _key_failures.pop(client, None)
+            return True
+        if state is None:
+            if len(_key_failures) >= _MAX_TRACKED_CLIENTS:
+                # Drop active lockouts only when no other entry is left.
+                oldest = next(
+                    (k for k, v in _key_failures.items() if v.locked_until <= now),
+                    next(iter(_key_failures)),
+                )
+                del _key_failures[oldest]
+            state = _key_failures[client] = _KeyFailures()
+        else:
+            _key_failures[client] = _key_failures.pop(client)
+        state.failures += 1
+        if state.failures >= KEY_FAILURES_PER_LOCKOUT:
+            seconds = (
+                KEY_REPEAT_LOCKOUT_SECONDS
+                if state.locked_before
+                else KEY_FIRST_LOCKOUT_SECONDS
+            )
+            state.failures = 0
+            state.locked_before = True
+            state.locked_until = now + seconds
+            logger.warning(
+                "Locked out %s for %ds after %d wrong API keys",
+                client,
+                seconds,
+                KEY_FAILURES_PER_LOCKOUT,
+            )
+        return False
+
+
 def validate_api_key(api_key: str) -> tuple[bool, str]:
     """Validate API key format requirements.
 
@@ -254,11 +375,20 @@ def verify_session(request: Request) -> bool:
     return verify_session_token(token)
 
 
+def _bearer_token(request: Request) -> Optional[str]:
+    """Return the Bearer token from the Authorization header, if any."""
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return token.strip()
+
+
 async def require_admin(request: Request) -> bool:
     """FastAPI dependency to require admin authentication.
 
     This dependency can be used in route definitions to protect
-    admin-only endpoints. It checks for a valid session cookie.
+    admin-only endpoints. It accepts a valid session cookie or the main
+    API key as a Bearer token.
 
     Args:
         request: The FastAPI request object (injected by FastAPI).
@@ -279,19 +409,43 @@ async def require_admin(request: Request) -> bool:
     if _get_global_settings is not None:
         gs = _get_global_settings()
         if gs is not None and gs.auth.skip_api_key_verification:
-            return True
+            from ..server import _server_state
+            from ..utils.network import is_loopback_bind
 
-    if not verify_session(request):
-        # Browser requests (Accept: text/html) get redirected to login page
-        accept = request.headers.get("accept", "")
-        if "text/html" in accept:
-            raise _RedirectToLogin()
+            active_host = gs.server.host
+            if getattr(_server_state, "global_settings", None) is gs:
+                bind_host = getattr(_server_state, "bind_host", None)
+                if isinstance(bind_host, str):
+                    active_host = bind_host
+            if is_loopback_bind(active_host):
+                return True
+
+    if verify_session(request):
+        return True
+
+    token = _bearer_token(request)
+    if token is not None:
+        gs = _get_global_settings() if _get_global_settings is not None else None
+        main_key = gs.auth.api_key if gs is not None else None
+        # Main key only: sub keys are for the inference API.
+        if main_key and check_api_key(request, lambda: verify_api_key(token, main_key)):
+            return True
+        logger.warning("Rejected admin API key (fp=%s)", fingerprint_key(token))
         raise HTTPException(
             status_code=401,
-            detail="Admin authentication required",
-            headers={"WWW-Authenticate": "Cookie"},
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    return True
+
+    # Browser requests (Accept: text/html) get redirected to login page
+    accept = request.headers.get("accept", "")
+    if "text/html" in accept and _web_ui_enabled:
+        raise _RedirectToLogin()
+    raise HTTPException(
+        status_code=401,
+        detail="Admin authentication required",
+        headers={"WWW-Authenticate": "Cookie"},
+    )
 
 
 class _RedirectToLogin(Exception):

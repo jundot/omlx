@@ -19,11 +19,14 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
 
     try:
         from omlx.patches.qwen35_q4_mlp import _is_supported_affine_linear
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
 
-        name = f"qwen35_q{bits}_affine_qmm_t"
+        name = f"affine_q{bits}_qmm_t"
         if not fast.has_symbol(name) or not _is_supported_affine_linear(linear, x):
             return None
+        # The tile indexes x as row-major packed and ignores its strides, so a
+        # last-axis view reads the wrong lanes.
+        x = mx.contiguous(x)
         return getattr(fast, name)(
             x,
             linear.weight,
@@ -83,10 +86,12 @@ def fused_quantized_matmul(
         and x.shape[-1] % 64 == 0
     ):
         try:
-            from omlx.custom_kernels.qwen35_prefill import fast
+            from omlx.custom_kernels.quant_matmul import fast
 
-            name = f"qwen35_q{bits}_affine_qmm_t"
+            name = f"affine_q{bits}_qmm_t"
             if fast.has_symbol(name) and fast.qmm_supports_group_size(group_size):
+                # The tile ignores the input's strides. See _native_qmm.
+                x = mx.contiguous(x)
                 return getattr(fast, name)(
                     x,
                     weight,

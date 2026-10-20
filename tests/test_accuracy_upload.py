@@ -45,11 +45,26 @@ class TestTrimQuestionResults:
 
     def test_external_only_fields_dropped(self):
         trimmed, _ = trim_question_results(
-            [_question(status="correct", finish_reason="stop", prompt_tokens=10)]
+            [_question(status="correct", prompt_tokens=10, error_message="x")]
         )
         assert "status" not in trimmed[0]
-        assert "finish_reason" not in trimmed[0]
         assert "prompt_tokens" not in trimmed[0]
+        assert "error_message" not in trimmed[0]
+
+    def test_stop_reason_and_completion_tokens_kept(self):
+        # Together they identify a budget-limited answer in the raw (#3772).
+        trimmed, _ = trim_question_results(
+            [_question(finish_reason="length", completion_tokens=8192)]
+        )
+        assert trimmed[0]["finish_reason"] == "length"
+        assert trimmed[0]["completion_tokens"] == 8192
+
+    def test_missing_stop_reason_adds_nothing(self):
+        trimmed, _ = trim_question_results(
+            [_question(finish_reason=None, completion_tokens=0)]
+        )
+        assert "finish_reason" not in trimmed[0]
+        assert "completion_tokens" not in trimmed[0]
 
     def test_per_question_raw_cap(self):
         trimmed, truncated = trim_question_results([_question(raw="x" * 5000)])

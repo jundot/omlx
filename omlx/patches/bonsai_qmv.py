@@ -28,18 +28,18 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from omlx.custom_kernels.bonsai.fast import (
+from omlx.custom_kernels.lowbit.fast import (
     _dequant_1bit,
-    bonsai_q1_affine_qmv,
-    bonsai_q2_affine_qmv,
-    bonsai_q1_affine_qmv_sym,
-    bonsai_q2_affine_qmv_sym,
-    bonsai_q1_affine_qmv_wide_sym,
-    bonsai_q2_affine_qmv_wide_sym,
-    bonsai_qmv_wide,
-    bonsai_t5_qmv,
-    bonsai_t5_qmv_wide,
-    bonsai_t5_qmm,
+    q1_affine_qmv,
+    q2_affine_qmv,
+    q1_affine_qmv_sym,
+    q2_affine_qmv_sym,
+    q1_affine_qmv_wide_sym,
+    q2_affine_qmv_wide_sym,
+    qmv_wide,
+    t5_qmv,
+    t5_qmv_wide,
+    t5_qmm,
     has_native,
     _use_qmv_wide,
 )
@@ -138,7 +138,7 @@ def _is_t5_format(self: nn.QuantizedLinear) -> bool:
 def _t5_dequant_matmul(self: nn.QuantizedLinear, x: mx.array) -> mx.array:
     """Prefill path for t5 weights: fused t5 MMA GEMM (Identity I-M).
 
-    Routes through bonsai_t5_qmm which decodes each t5 weight byte exactly
+    Routes through t5_qmm which decodes each t5 weight byte exactly
     once without materialising a float weight matrix.
     """
     # The qmv patch is only installed when the native extension is present
@@ -150,7 +150,7 @@ def _t5_dequant_matmul(self: nn.QuantizedLinear, x: mx.array) -> mx.array:
 
     # x may have leading batch dims; flatten to (M, K) for the kernel.
     x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
-    out_flat = bonsai_t5_qmm(x_flat, w, scales)
+    out_flat = t5_qmm(x_flat, w, scales)
     out = out_flat.reshape(x.shape[:-1] + (w.shape[0],))
     linear_bias = getattr(self, "bias", None)
     if linear_bias is not None:
@@ -176,9 +176,9 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
         w = self.weight
         scales = _get_t5_scales(self, x.dtype)
         if M >= 2:
-            out = bonsai_t5_qmv_wide(x, w, scales)
+            out = t5_qmv_wide(x, w, scales)
         else:
-            out = bonsai_t5_qmv(x, w, scales)
+            out = t5_qmv(x, w, scales)
         linear_bias = getattr(self, "bias", None)
         if linear_bias is not None:
             out = out + linear_bias
@@ -212,18 +212,18 @@ def _bonsai_quantized_linear_call(self: nn.QuantizedLinear, x: mx.array) -> mx.a
     if _use_qmv_wide(bits, M):
         # M>=3 on gen-15+: stream weights once across all M vectors (I-C)
         if bits == 1 and sym:
-            out = bonsai_q1_affine_qmv_wide_sym(x, w, scales, biases)
+            out = q1_affine_qmv_wide_sym(x, w, scales, biases)
         elif bits == 2 and sym:
-            out = bonsai_q2_affine_qmv_wide_sym(x, w, scales, biases)
+            out = q2_affine_qmv_wide_sym(x, w, scales, biases)
         else:
-            out = bonsai_qmv_wide(x, w, scales, biases, bits=bits)
+            out = qmv_wide(x, w, scales, biases, bits=bits)
     elif bits == 1:
-        out = (bonsai_q1_affine_qmv_sym if sym else bonsai_q1_affine_qmv)(
+        out = (q1_affine_qmv_sym if sym else q1_affine_qmv)(
             x, w, scales, biases
         )
     else:
         # 2-bit M=1 or M=2: qmv_fast
-        out = (bonsai_q2_affine_qmv_sym if sym else bonsai_q2_affine_qmv)(
+        out = (q2_affine_qmv_sym if sym else q2_affine_qmv)(
             x, w, scales, biases
         )
 
@@ -247,14 +247,14 @@ def apply_bonsai_qmv_patch() -> bool:
 
     if not has_native():
         logger.debug(
-            "bonsai_qmv: native extension not available, skipping patch."
+            "1/2-bit affine decode optimization skipped: native extension unavailable."
         )
         return False
 
     _original_quantized_linear_call = nn.QuantizedLinear.__call__
     nn.QuantizedLinear.__call__ = _bonsai_quantized_linear_call
     _patch_active = True
-    logger.info("bonsai_qmv: QuantizedLinear patched for 1-bit / 2-bit decode.")
+    logger.info("1/2-bit affine decode optimization enabled for QuantizedLinear.")
     return True
 
 
@@ -266,7 +266,7 @@ def remove_bonsai_qmv_patch() -> None:
     nn.QuantizedLinear.__call__ = _original_quantized_linear_call
     _original_quantized_linear_call = None
     _patch_active = False
-    logger.info("bonsai_qmv: QuantizedLinear patch removed.")
+    logger.info("1/2-bit affine decode optimization removed from QuantizedLinear.")
 
 
 def is_patch_active() -> bool:

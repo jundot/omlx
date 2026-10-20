@@ -65,6 +65,10 @@ class SamplingParams:
     # default (mlx-lm uses 20). Loop units longer than the window never
     # overlap their own penalty context.
     repetition_context_size: Optional[int] = None
+    # Ban tokens that would repeat an n-gram of this size (0 = off), looking
+    # only at the last ngram_window tokens when that is set (0 = all tokens).
+    no_repeat_ngram_size: int = 0
+    ngram_window: int = 0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     stop: Optional[List[str]] = None
@@ -83,6 +87,13 @@ class SamplingParams:
 
     # Seed for reproducible generation (best-effort, per OpenAI spec)
     seed: Optional[int] = None
+
+    # Stop strings skip the leading think block. Set by the APIs that return
+    # reasoning separately; /v1/completions returns it inline.
+    stop_skips_reasoning: bool = False
+
+    # Read-only logits processor, applied after every other processor.
+    logits_observer: Any = None
 
     def __post_init__(self):
         if self.stop is None:
@@ -127,6 +138,7 @@ class Request:
     output_token_ids: List[int] = field(default_factory=list)
     output_text: str = ""
     generation_started_at: Optional[float] = None
+    prefill_started_at: Optional[float] = None
     last_activity_at: Optional[float] = None
 
     # For BatchGenerator integration
@@ -134,12 +146,26 @@ class Request:
 
     # Prefix cache fields
     prompt_cache: Optional[List[Any]] = None  # Cached KV state from prefix cache
-    cached_tokens: int = 0  # Number of tokens retrieved from cache
+    cached_tokens: int = 0  # Prefix tokens in KV, including resumed prefill
+    prefill_resumed_tokens: int = 0  # Locally computed tokens retained after a pause
     remaining_tokens: Optional[List[int]] = None  # Tokens still needing processing
 
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
+
+    # Memory-pressure requeue. The first ``requeued_output_tokens`` outputs
+    # are folded into ``prompt_token_ids`` so re-admission prefills them;
+    # ``requeue_row_state`` carries the row's sampler, logits processors and
+    # stop matcher into the next insert.
+    memory_requeues: int = 0
+    requeued_output_tokens: int = 0
+    requeue_reported_cached_tokens: int = 0
+    requeue_row_state: Optional[Tuple[Any, List[Any], Any]] = None
+    # Token index after the last media placeholder. Embeddings are gone by
+    # then, so the resumed prefix must cover every media token.
+    requeue_media_end: int = 0
+
     # Skip the post-completion prefix/SSD cache store for this request.
     # Set by internal probes (context benchmark) whose KV must never
     # pollute the shared cache tiers or trigger the completion-time
@@ -157,6 +183,8 @@ class Request:
     benchmark_requested_steps: List[int] = field(default_factory=list)
     benchmark_boundary_enabled: bool = False
     benchmark_cache_block_size: int = 0
+    # MoE expert offload counters when the request was added.
+    moe_offload_start: Optional[Dict[str, Any]] = None
 
     # Multimodal content (images, video)
     images: Optional[List[Any]] = None
@@ -206,7 +234,10 @@ class Request:
 
     # Reasoning model support (for models with <think> tags)
     needs_think_prefix: bool = False  # True if prompt ends with <think> token
+    preserve_reasoning: bool = False  # history keeps the <think> output, so output tokens are cacheable
     think_prefix_sent: bool = False  # Track if prefix already sent
+    # Close-think token matched to the prompt's opener for multi-marker parsers
+    think_end_token_id: int | None = None
 
     # Harmony model support (gpt-oss models)
     is_harmony_model: bool = False  # True if model uses Harmony format
@@ -217,6 +248,11 @@ class Request:
     specprefill_position_offset: int = 0  # RoPE offset = M - N
     specprefill_system_end: int = 0  # Token index where system prompt ends
 
+    # Chat template suffix after the last message; the tail snapshot ends before it.
+    generation_prompt_text: Optional[str] = None
+    generation_prompt_start: int = 0  # Token index where the generation prompt starts
+    generation_prompt_persists: bool = False  # History keeps the generation prompt
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter
@@ -226,6 +262,7 @@ class Request:
     prefill_eviction_retries: int = (
         0  # Per-request prefill-headroom eviction phase counter
     )
+    packed_prefill_excluded: bool = False  # Retries alone after a failed pack
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None

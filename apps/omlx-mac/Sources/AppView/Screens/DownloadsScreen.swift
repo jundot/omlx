@@ -1,7 +1,7 @@
 // PR 8 — Downloads screen.
 //
 // Wires the HF downloader endpoints (POST /admin/api/hf/download,
-// GET /admin/api/hf/tasks at 1 Hz, cancel / retry / delete, /hf/recommended).
+// GET /admin/api/hf/tasks at 2 Hz, cancel / retry / delete, /hf/recommended).
 //
 // Phase 2 — adds a source selector (HF / ModelScope) at the top. The MS
 // branch mirrors the HF flow 1:1 against /admin/api/ms/*. Switching the
@@ -12,7 +12,7 @@
 import SwiftUI
 
 /// Active downloader source. Mirrors the HTML admin's `downloaderSource`
-/// state at `omlx/admin/static/js/dashboard.js:266`.
+/// state at `apps/omlx-web/omlx_web/static/js/dashboard.js:266`.
 enum DownloadSource: String, CaseIterable, Hashable, Sendable {
     case hf, ms
 
@@ -51,7 +51,7 @@ struct DownloadsScreen: View {
                     searchResults: vm.searchResults,
                     searchLoading: vm.searchLoading,
                     searchDismissed: vm.searchDismissed,
-                    onSubmit: { vm.startDownload(client: services.client) },
+                    onSubmit: { vm.requestDownload(client: services.client) },
                     onSaveMirror: { vm.saveMirror(client: services.client) },
                     onResetMirror: { vm.resetMirror(client: services.client) },
                     onPickResult: { vm.pickSearchResult($0) },
@@ -60,6 +60,10 @@ struct DownloadsScreen: View {
                 )
                 .onChange(of: vm.repoText) { _, newValue in
                     vm.updateSearch(query: newValue, client: services.client)
+                }
+                .onChange(of: vm.hfModelFormat) { _, _ in
+                    vm.updateSearch(query: vm.repoText, client: services.client)
+                    Task { await vm.loadRecommended(client: services.client) }
                 }
             } else {
                 AddFromMSSection(
@@ -101,19 +105,14 @@ struct DownloadsScreen: View {
             SuggestedSection(
                 models: vm.sortedRecommended,
                 sort: $vm.recommendedSort,
+                format: vm.source == .hf ? $vm.hfModelFormat : nil,
                 isLoading: vm.recommendedLoading,
-                onGet: { repo in vm.startDownload(repo: repo, client: services.client) },
+                onGet: { repo in vm.requestDownload(repo: repo, client: services.client) },
                 onRefresh: { Task { await vm.loadRecommended(client: services.client) } },
                 onShowCard: { repo in vm.showModelCard(repoId: repo) }
             )
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18)
-                    .padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
@@ -121,11 +120,11 @@ struct DownloadsScreen: View {
             ModelCardSheet(
                 target: target,
                 client: services.client,
-                onDownload: { repo in
+                onDownload: { repo, files in
                     // Sheet dismisses itself before this fires; the
                     // download lands in the Active section under
                     // whichever source the sheet was opened from.
-                    vm.startDownload(repo: repo, client: services.client)
+                    vm.startDownload(repo: repo, files: files, client: services.client)
                 }
             )
         }
@@ -134,9 +133,11 @@ struct DownloadsScreen: View {
 
 // MARK: - Source switcher
 
-/// Segmented HF / ModelScope toggle pinned at the top of Downloads. When
-/// the server's modelscope SDK isn't installed (`/admin/api/ms/status`
-/// returns `available: false`), the MS option is disabled with a tooltip
+/// HF / ModelScope tabs pinned at the top of Downloads, rendered as a
+/// centered segmented control — the macOS convention for top-of-pane tabs
+/// (System Settings › Trackpad, Finder settings). When the server's
+/// modelscope SDK isn't installed (`/admin/api/ms/status` returns
+/// `available: false`), the MS option is disabled with a note underneath
 /// rather than hidden — so a user looking for it can see why it's not
 /// usable.
 private struct SourceSwitcher: View {
@@ -144,21 +145,24 @@ private struct SourceSwitcher: View {
     let msAvailable: Bool
 
     var body: some View {
-        HStack(spacing: 8) {
+        VStack(spacing: 6) {
             Segmented(
                 selection: $source,
                 options: DownloadSource.allCases.map { ($0, $0.label) }
             )
             .disabled(!msAvailable)
+            // A fixed frame makes the picker split the width into equal
+            // tab-sized segments instead of hugging the labels.
+            .frame(width: 280)
             if !msAvailable {
                 Text(String(localized: "downloads.source.ms_unavailable",
                             defaultValue: "ModelScope SDK unavailable in this build",
-                            comment: "Inline note shown beside the source switcher when the ModelScope SDK isn't installed"))
+                            comment: "Note shown under the source switcher when the ModelScope SDK isn't installed"))
                     .font(.omlxText(10.5))
                     .foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity)
         .padding(.horizontal, 14)
         .padding(.top, 4)
         .padding(.bottom, 8)
@@ -586,7 +590,7 @@ private struct SearchDropdown: View {
             // free for the info button (rendered as a sibling outside
             // this row Button so its tap doesn't fall through to onPick).
             if !isHovered, let downloads = m.downloads, downloads > 0 {
-                Text(formatNumber(downloads))
+                Text(CountFormat.compact(downloads))
                     .font(.omlxMono(10.5))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.trailing, 12)
@@ -601,6 +605,7 @@ private struct SearchDropdown: View {
         var parts: [String] = []
         if let p = m.paramsFormatted, !p.isEmpty { parts.append(p) }
         if let s = m.sizeFormatted, !s.isEmpty { parts.append(s) }
+        if let arch = m.architecture { parts.append("GGUF · \(arch)") }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
@@ -637,17 +642,29 @@ private struct ActiveDownloadsSection: View {
                                 Image(systemName: "icloud.and.arrow.down")
                                     .font(.system(size: 12))
                                     .foregroundStyle(theme.blueDot)
-                                Text(task.repoId)
+                                Text(task.ggufFilesText.map { "\(task.repoId) · \($0)" } ?? task.repoId)
                                     .font(.omlxMono(12))
                                     .foregroundStyle(theme.text)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 Spacer(minLength: 4)
+                                if let speed = task.speedText {
+                                    Text(speed)
+                                        .font(.omlxMono(11))
+                                        .foregroundStyle(theme.blueDot)
+                                }
                                 Text(String(localized: "downloads.progress.bytes",
                                             defaultValue: "\(Int(task.progress))% · \(formatBytes(task.downloadedSize)) of \(formatBytes(task.totalSize))",
                                             comment: "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes"))
                                     .font(.omlxMono(11))
                                     .foregroundStyle(theme.textSecondary)
+                                if let eta = task.etaText {
+                                    Text(String(localized: "downloads.progress.eta",
+                                                defaultValue: "\(eta) left",
+                                                comment: "Remaining download time after the progress line. Placeholder: duration such as 2h 30m"))
+                                        .font(.omlxMono(11))
+                                        .foregroundStyle(theme.textSecondary)
+                                }
                                 Button {
                                     if task.statusEnum == .pending || task.statusEnum == .downloading {
                                         onCancel(task.taskId)
@@ -744,7 +761,7 @@ private struct CompletedTasksSection: View {
                     FreeRow(isLast: idx == tasks.count - 1) {
                         HStack(spacing: 8) {
                             StatusChip(task: task)
-                            Text(task.repoId)
+                            Text(task.ggufFilesText.map { "\(task.repoId) · \($0)" } ?? task.repoId)
                                 .font(.omlxMono(12))
                                 .foregroundStyle(theme.text)
                                 .lineLimit(1)
@@ -786,6 +803,8 @@ private struct CompletedTasksSection: View {
 private struct SuggestedSection: View {
     let models: [HFModelInfo]
     @Binding var sort: SuggestedSort
+    /// HF repo format filter; nil hides the picker (ModelScope).
+    let format: Binding<HFModelFormat>?
     let isLoading: Bool
     let onGet: (String) -> Void
     let onRefresh: () -> Void
@@ -801,9 +820,16 @@ private struct SuggestedSection: View {
                               comment: "Section heading for the recommended-models section"),
                       subtitle: hint) {
             HStack(spacing: 6) {
+                if let format {
+                    Popup(
+                        selection: format,
+                        width: .controlMedium,
+                        options: HFModelFormat.allCases.map { ($0, $0.label) }
+                    )
+                }
                 Popup(
                     selection: $sort,
-                    width: 170,
+                    width: .controlMedium,
                     options: SuggestedSort.allCases.map { ($0, $0.label) }
                 )
                 Button {
@@ -889,7 +915,8 @@ private struct SuggestedSection: View {
     }
 
     private var hint: String? {
-        models.isEmpty
+        // GGUF repos are sized by the files picked, not filtered by RAM.
+        models.isEmpty || format?.wrappedValue == .gguf
             ? nil
             : String(localized: "downloads.suggested.hint.filtered_by_ram",
                      defaultValue: "Filtered by free RAM",
@@ -899,9 +926,28 @@ private struct SuggestedSection: View {
     private func secondaryLine(for m: HFModelInfo) -> String {
         var bits: [String] = []
         if let p = m.paramsFormatted { bits.append(p) }
-        if let s = m.sizeFormatted { bits.append(s) }
-        if let dl = m.downloads { bits.append("\(formatNumber(dl)) ↓") }
+        if let s = m.sizeFormatted, !s.isEmpty { bits.append(s) }
+        if let arch = m.architecture { bits.append("GGUF · \(arch)") }
+        if let dl = m.downloads { bits.append("\(CountFormat.compact(dl)) ↓") }
         return bits.isEmpty ? "—" : bits.joined(separator: " · ")
+    }
+}
+
+// MARK: - Format
+
+extension HFModelFormat {
+    var label: String {
+        switch self {
+        case .mlx:  return String(localized: "downloads.format.mlx",
+                                  defaultValue: "MLX only",
+                                  comment: "Downloader filter option: show MLX repos only")
+        case .gguf: return String(localized: "downloads.format.gguf",
+                                  defaultValue: "GGUF only",
+                                  comment: "Downloader filter option: show GGUF repos only")
+        case .all:  return String(localized: "downloads.format.all",
+                                  defaultValue: "All formats",
+                                  comment: "Downloader filter option: show repos of every format")
+        }
     }
 }
 
@@ -923,14 +969,4 @@ enum SuggestedSort: String, Hashable, CaseIterable {
                                        comment: "Sort option: rank suggested models by on-disk size, descending")
         }
     }
-}
-
-// MARK: - Helpers
-
-func formatNumber(_ n: Int) -> String {
-    let v = Double(n)
-    if v >= 1e9 { return String(format: "%.1fB", v / 1e9) }
-    if v >= 1e6 { return String(format: "%.1fM", v / 1e6) }
-    if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
-    return String(n)
 }

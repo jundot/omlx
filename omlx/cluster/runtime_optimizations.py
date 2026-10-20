@@ -96,6 +96,27 @@ def _supports_rank_zero_logits(model: Any) -> tuple[bool, int, str]:
     )
 
 
+def _agree_across_ranks(group: Any, local: dict[str, bool]) -> dict[str, bool]:
+    """Keep a capability only if every rank supports it.
+
+    Each rank validates the optimized paths against its own pipeline stage and
+    runtime, but those paths change which collectives a rank issues. Ranks that
+    resolve them differently wait on different collectives and deadlock without
+    an error (#3521), so every rank votes and the minimum wins.
+    """
+
+    import mlx.core as mx
+
+    names = sorted(local)
+    votes = mx.array([1 if local[name] else 0 for name in names], dtype=mx.int32)
+    totals = mx.distributed.all_sum(votes, group=group)
+    mx.eval(totals)
+    world_size = int(group.size())
+    return {
+        name: int(total) == world_size for name, total in zip(names, totals.tolist())
+    }
+
+
 def _supports_pipeline_prompt(prompt_batch: Any) -> tuple[bool, str]:
     """Validate the exact MLX-LM prompt loop this module replaces.
 
@@ -191,6 +212,65 @@ def pipeline_prefill_schedule(
 
 
 @contextmanager
+def wait_for_pipeline_peers_on_host(model: Any) -> Iterator[None]:
+    """Wait for pipeline peers on the CPU during prefill and the steps after it.
+
+    A GPU op that reads a ring/JACCL transfer waits inside its Metal command
+    buffer, and Metal fails the buffer after ~5 s including that wait. A peer's
+    long prefill chunk outlasts it.
+    """
+
+    import mlx.core as mx
+
+    pipeline_model = getattr(model, "model", None)
+    if getattr(pipeline_model, "pipeline_size", 1) < 2:
+        yield
+        return
+
+    call = type(pipeline_model).__call__
+    state = threading.local()
+    transfers = {
+        name: getattr(mx.distributed, name)
+        for name in ("send", "recv", "recv_like", "all_gather")
+    }
+
+    def host_waited(name: str, transfer: Any) -> Any:
+        def wait(*args: Any, **kwargs: Any) -> Any:
+            value = transfer(*args, **kwargs)
+            mode = getattr(state, "mode", None)
+            # Prefill never evaluates the final gather.
+            if mode == "decode" or (mode == "prefill" and name != "all_gather"):
+                mx.eval(value)
+            return value
+
+        return wait
+
+    def tracked_call(instance: Any, inputs: Any, *args: Any, **kwargs: Any) -> Any:
+        steps = getattr(state, "steps", 0)
+        if getattr(inputs, "ndim", 0) > 1 and inputs.shape[1] > 1:
+            # Two decode steps, plus a one-token prompt remainder that looks
+            # like decode.
+            state.mode, state.steps = "prefill", 3
+        elif steps:
+            state.mode, state.steps = "decode", steps - 1
+            mx.eval(inputs)
+        try:
+            return call(instance, inputs, *args, **kwargs)
+        finally:
+            state.mode = None
+
+    for name, transfer in transfers.items():
+        setattr(mx.distributed, name, host_waited(name, transfer))
+    type(pipeline_model).__call__ = tracked_call
+    try:
+        yield
+    finally:
+        type(pipeline_model).__call__ = call
+        for name, transfer in transfers.items():
+            setattr(mx.distributed, name, transfer)
+
+
+@contextmanager
 def install_runtime_optimizations(
     model: Any,
     group: Any,
@@ -227,12 +307,34 @@ def install_runtime_optimizations(
         if prompt_batch_cls
         else (False, "MLX-LM has no prompt-processing batch")
     )
-    sampling_active = execution.sampling_rank_only and sampling_supported
     (
         rank_zero_logits_supported,
         output_vocab_size,
         rank_zero_logits_reason,
     ) = _supports_rank_zero_logits(model)
+    if execution.sampling_rank_only and pipeline_parallel and world_size > 1:
+        agreed = _agree_across_ranks(
+            group,
+            {
+                "prompt": prompt_supported,
+                "rank_zero_logits": rank_zero_logits_supported,
+                "sampling": sampling_supported,
+            },
+        )
+        if sampling_supported and not agreed["sampling"]:
+            sampling_supported = False
+            sampling_reason = (
+                "another rank cannot use the validated rank-zero sampling path"
+            )
+        if rank_zero_logits_supported and not agreed["rank_zero_logits"]:
+            rank_zero_logits_supported = False
+            rank_zero_logits_reason = (
+                "another rank's model adapter has no rank-zero logits contract"
+            )
+        if prompt_supported and not agreed["prompt"]:
+            prompt_supported = False
+            prompt_reason = "another rank cannot use the validated pipeline prompt loop"
+    sampling_active = execution.sampling_rank_only and sampling_supported
     rank_zero_logits_active = sampling_active and rank_zero_logits_supported
     prefill_active = (
         execution.async_overlap

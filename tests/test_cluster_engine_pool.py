@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -162,16 +162,22 @@ def test_stale_cluster_deployment_id_preserves_normal_not_found_behavior(tmp_pat
     )
 
 
-def test_cluster_model_path_rejects_non_text_model(tmp_path):
+def test_cluster_serves_vlm_checkpoint_and_rejects_non_generation_model(tmp_path):
     model_path = tmp_path / "vision"
     model_path.mkdir()
+    deployment = _deployment(str(model_path))
     pool = EnginePool()
+    pool._cluster_registry = SimpleNamespace(get_for_model=lambda model: deployment)
     entry = _entry(str(model_path))
     entry.model_type = "vlm"
     entry.engine_type = "vlm"
     pool._entries["vision"] = entry
 
-    with pytest.raises(ValueError, match="text LLM models only"):
+    assert pool.resolve_cluster_model_id(str(model_path)) == "vision"
+    assert pool._distributed_deployment_for_entry(entry) is deployment
+
+    entry.model_type = entry.engine_type = "embedding"
+    with pytest.raises(ValueError, match="text generation models only"):
         pool.resolve_cluster_model_id(str(model_path))
 
 
@@ -193,7 +199,8 @@ def test_remote_only_cluster_model_gets_a_batched_pool_entry(tmp_path):
     assert model_id == "minimax"
     assert entry is not None
     assert entry.engine_type == "batched"
-    assert entry.model_type == "llm"
+    # Discovery classifies MiniMax-M3 as vlm, so a local copy has the same type.
+    assert entry.model_type == "vlm"
     assert entry.source_type == "cluster"
     assert entry.model_context_length == 262144
     assert pool.resolve_cluster_model_id(str(model_path)) == model_id
@@ -258,3 +265,87 @@ async def test_failed_distributed_teardown_keeps_supervisor_reachable(tmp_path):
 
     assert entry.engine is engine
     assert pool.current_model_memory == 90
+
+
+def _failed_pool(tmp_path, *, peers_reachable=None):
+    """A pool holding a distributed engine whose ranks died."""
+    pool = EnginePool()
+    entry = _entry(str(tmp_path / "nemotron"))
+    engine = SimpleNamespace(runtime_failed_reason="rank 0 exited with code 1")
+    if peers_reachable is not None:
+        engine.peers_reachable = AsyncMock(return_value=peers_reachable)
+    entry.engine = engine
+    pool._entries["nemotron"] = entry
+
+    async def unload(model_id):
+        pool._entries[model_id].engine = None
+
+    pool._unload_engine = AsyncMock(side_effect=unload)
+    return pool, entry
+
+
+async def test_a_failed_distributed_engine_is_not_leased_when_reloadable(tmp_path):
+    pool, entry = _failed_pool(tmp_path)
+
+    assert pool._acquire_loaded_engine("nemotron", False, True, None, True) is None
+    # A healthy engine is not treated as failed.
+    entry.engine = SimpleNamespace(runtime_failed_reason=None)
+    assert pool._runtime_failed_engine(entry.engine) is False
+
+
+@pytest.mark.parametrize("peers_reachable", [None, True])
+async def test_get_engine_unloads_a_failed_engine_so_the_request_reloads(
+    tmp_path, peers_reachable
+):
+    pool, entry = _failed_pool(tmp_path, peers_reachable=peers_reachable)
+    sentinel = RuntimeError("reached the load path")
+
+    def stop_at_load(model_id, e):
+        raise sentinel
+
+    pool._raise_if_model_path_missing_locked = stop_at_load
+    with pytest.raises(RuntimeError) as err:
+        await pool.get_engine("nemotron")
+    assert err.value is sentinel
+    pool._unload_engine.assert_awaited_once_with("nemotron")
+    assert entry.engine is None
+
+
+async def test_failed_engine_with_an_unreachable_peer_keeps_the_fast_503(tmp_path):
+    """peer_lost: the other Mac is gone, so teardown cannot be verified.
+
+    The dead engine stays resident and its own health gate answers each request
+    with a fast 503. Nothing runs a teardown, and the pool lock stays free.
+    """
+    pool, entry = _failed_pool(tmp_path, peers_reachable=False)
+    dead = entry.engine
+
+    for _ in range(3):
+        assert await pool.get_engine("nemotron") is dead
+
+    pool._unload_engine.assert_not_awaited()
+    assert entry.engine is dead
+    assert not pool._lock.locked()
+
+
+async def test_distributed_engine_reports_unreachable_peer_with_a_cached_probe():
+    from omlx.engine.distributed import DistributedBatchedEngine
+
+    engine = DistributedBatchedEngine(_deployment("org/model"))
+    answers = [False, True]
+    seen: list[dict] = []
+
+    def fake_check_peers(hosts_by_rank, **kwargs):
+        seen.append(hosts_by_rank)
+        up = answers.pop(0)
+        return tuple(
+            SimpleNamespace(reachable=up or rank == 0) for rank in hosts_by_rank
+        )
+
+    with patch("omlx.engine.distributed.check_peers", fake_check_peers):
+        assert await engine.peers_reachable() is False
+        # Cached: a burst of requests costs one probe, not one each.
+        assert await engine.peers_reachable() is False
+        assert len(seen) == 1
+        engine._peer_reach = (engine._peer_reach[0] - 3600, False)
+        assert await engine.peers_reachable() is True

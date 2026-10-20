@@ -18,6 +18,17 @@ import pytest
 from omlx.speculative import vlm_mtp
 
 
+def test_mtp_rounds_share_the_wrapper_generation_stream():
+    """The wrapper must drain the same stream used inside both round loops."""
+    from mlx_vlm.speculative import common, mtp
+
+    stream = vlm_mtp._vlm_generation_stream
+    assert stream is common.generation_stream
+    assert stream is mtp.generation_stream
+    assert stream is vlm_mtp._mtp_rounds.__globals__["generation_stream"]
+    assert stream is vlm_mtp._mtp_rounds_batch.__globals__["generation_stream"]
+
+
 def test_qwen38_block_fp8_dequantization():
     from omlx.patches.mlx_vlm_mtp.qwen38_fp8 import dequantize_fp8_weights
 
@@ -346,29 +357,12 @@ def test_model_settings_vlm_mtp_mutex(vlm_mtp_kw, other_kw):
 
 
 # ---------------------------------------------------------------------------
-# MoE config patch tests
+# Upstream drafter config contracts
 # ---------------------------------------------------------------------------
 
 
-class TestMoeConfigPatch:
-    """Verify that the MoE compat patch in vlm_mtp.py correctly handles
-    qwen3_5_moe_text text_config dicts."""
-
-    def test_patch_is_applied_on_import(self):
-        """The patch runs at import time; Qwen3_5MTPConfig.__post_init__
-        should be the patched version."""
-        try:
-            from mlx_vlm.speculative.drafters.qwen3_5_mtp.config import (
-                Qwen3_5MTPConfig,
-            )
-        except ImportError:
-            pytest.skip("mlx-vlm qwen3_5_mtp drafter not available")
-
-        # The patched __post_init__ is a closure, not the original method.
-        # Verify it was replaced by checking it's not the unpatched version.
-        src = Qwen3_5MTPConfig.__post_init__
-        # The patched version references MoETextConfig in its closure.
-        assert src is not None
+class TestMoeDrafterConfig:
+    """The pinned upstream drafter must retain dense and MoE dispatch."""
 
     def test_moe_text_config_accepted(self):
         """Qwen3_5MTPConfig.from_dict with a MoE text_config does not raise."""
@@ -387,6 +381,7 @@ class TestMoeConfigPatch:
                 "num_hidden_layers": 2,
                 "num_attention_heads": 4,
                 "num_key_value_heads": 2,
+                "head_dim": 16,
                 "num_experts": 8,
                 "num_experts_per_tok": 2,
                 "shared_expert_intermediate_size": 128,
@@ -406,6 +401,14 @@ class TestMoeConfigPatch:
         assert cfg.text_config is not None
         assert cfg.text_config.hidden_size == 64
         assert cfg.text_config.num_experts == 8
+
+        from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp.qwen3_5_mtp import (
+            Qwen3_5MTPDraftModel,
+        )
+
+        draft = Qwen3_5MTPDraftModel(cfg)
+        assert isinstance(draft.layers[0], Qwen3_5MoeDecoderLayer)
 
     def test_dense_text_config_still_works(self):
         """Qwen3_5MTPConfig.from_dict with a dense text_config still works."""
@@ -553,12 +556,16 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
 
     logits = mx.zeros((1, 2, 16))
     hidden = mx.zeros((1, 2, 8))
+    early = mx.ones((1, 2, 8))
     gdn_states = [{"state": "mock"}]
 
     class FakeStockOutput:
-        def __init__(self):
+        def __init__(self, capture_layer_ids):
             self.logits = logits
-            self.hidden_states = [hidden]
+            # Stock capture order is ascending layer index.
+            self.hidden_states = [
+                early if layer == 0 else hidden for layer in capture_layer_ids
+            ]
             self.gdn_states = gdn_states
 
     class FakeLanguageModel:
@@ -577,7 +584,7 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
             **kwargs,
         ):
             self.forward_kwargs = kwargs
-            return FakeStockOutput()
+            return FakeStockOutput(kwargs["capture_layer_ids"])
 
     q35_lang = SimpleNamespace(LanguageModel=FakeLanguageModel)
     qwen35_vlm_runtime._patch_vlm_language_model(q35_lang)
@@ -591,7 +598,6 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
         cache=[],
         return_hidden=True,
         return_shared_kv=True,
-        capture_layer_ids=[99],
     )
 
     assert isinstance(out, LanguageModelOutput)
@@ -601,6 +607,166 @@ def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
     assert out.gdn_states is gdn_states
     assert out.shared_kv_states == {}
     assert model.forward_kwargs["capture_layer_ids"] == [1]
+
+    # A block drafter's layers ride the same forward: requested order first,
+    # the head's last-layer hidden last.
+    out = model(
+        mx.array([[1, 2]], dtype=mx.int32),
+        cache=[],
+        return_hidden=True,
+        capture_layer_ids=[0],
+    )
+    assert model.forward_kwargs["capture_layer_ids"] == [0, 1]
+    assert out.hidden_states[0] is early
+    assert out.hidden_states[-1] is hidden
+
+
+@pytest.mark.parametrize(
+    ("module_name", "cache_name"),
+    [
+        ("mlx_lm.models.cache", "BatchKVCache"),
+        ("mlx_lm.models.cache", "BatchRotatingKVCache"),
+        ("mlx_vlm.models.cache", "BatchKVCache"),
+        ("mlx_vlm.models.cache", "BatchRotatingKVCache"),
+        ("mlx_vlm.models.cache", "BatchQuantizedKVCache"),
+    ],
+)
+def test_qwen_decode_mask_follows_in_place_finalize_padding(module_name, cache_name):
+    import importlib
+
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    cache_class = getattr(importlib.import_module(module_name), cache_name)
+    kwargs = {"max_size": 32} if cache_name == "BatchRotatingKVCache" else {}
+    cache = cache_class(left_padding=[2, 0], **kwargs)
+    assert q35_lang._qwen3_5_left_padding_info(cache) == ((2, 0), 2)
+
+    cache.prepare(lengths=[6, 3], right_padding=[0, 3])
+    keys = mx.zeros((2, 1, 6, 64))
+    cache.update_and_fetch(keys, keys)
+    cache.finalize()
+
+    assert cache.left_padding.tolist() == [2, 3]
+    assert q35_lang._qwen3_5_left_padding_info(cache) == ((2, 3), 3)
+    assert q35_lang._create_qwen3_5_attention_mask(mx.zeros((2, 1, 4)), cache)
+    assert cache._qwen3_5_decode_left_padding == [2, 3]
+
+
+@pytest.mark.parametrize(
+    "left_padding,lengths,expected",
+    [
+        ([0, 0], [0, 3], [[False, False, False], [True, True, True]]),
+        ([1, 0], [2, 3], [[False, True, False], [True, True, True]]),
+        ([1, 0], [7, 7], [[False, True, True], [True, True, True]]),
+        (None, [1, 3], [[True, False, False], [True, True, True]]),
+        ([0, 0], [3, 7], None),
+        ([0, 0], None, None),
+    ],
+)
+def test_qwen_ssm_mask_preserves_padding_bounds(left_padding, lengths, expected):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language
+
+    from omlx.patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
+
+    apply_qwen35_ssm_mask_patch()
+    cache = ArraysCache(2, left_padding=left_padding)
+    if lengths is not None:
+        cache.prepare(lengths=lengths)
+    mask = language._create_qwen3_5_ssm_mask(mx.zeros((2, 3, 4)), cache)
+    assert (None if mask is None else mask.tolist()) == expected
+
+
+@pytest.mark.parametrize("chunk_size", [3, 7])
+def test_qwen_gdn_padded_prefill_matches_unpadded_state(chunk_size):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen3_5 import language
+    from mlx_vlm.models.qwen3_5.config import TextConfig
+
+    from omlx.patches.qwen35_ssm_mask import apply_qwen35_ssm_mask_patch
+
+    from test_mtp_prompt_priming import TINY_CONFIG
+
+    apply_qwen35_ssm_mask_patch()
+    mx.random.seed(173)
+    config = TextConfig.from_dict(
+        dict(TINY_CONFIG, linear_key_head_dim=128, linear_value_head_dim=128)
+    )
+    layer = language.Qwen3_5GatedDeltaNet(config)
+    layer.eval()
+    inputs = mx.random.normal((2, 7, config.hidden_size))
+    references = []
+    for row, length in enumerate([3, 7]):
+        reference = ArraysCache(2)
+        mx.eval(layer(inputs[row : row + 1, :length], cache=reference))
+        references.append(reference)
+
+    cache = ArraysCache.merge([ArraysCache(2), ArraysCache(2)])
+    cache.prepare(lengths=[3, 7])
+    for start in range(0, 7, chunk_size):
+        chunk = inputs[:, start : start + chunk_size]
+        mask = language._create_qwen3_5_ssm_mask(chunk, cache)
+        mx.eval(layer(chunk, mask=mask, cache=cache))
+
+    for row, reference in enumerate(references):
+        for state in range(2):
+            assert mx.allclose(
+                cache[state][row : row + 1], reference[state], atol=1e-6, rtol=1e-5
+            ).item()
+
+
+def test_dense_vlm_runtime_delegates_foreign_subclasses_unchanged():
+    """The dense Qwen3.5 runtime patch must not wire foreign subclasses."""
+    from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
+
+    class FakeLanguageModel:
+        def __init__(self, args, config=None):
+            self.args = args
+            self.config = config
+            self.forward_kwargs = None
+
+        def __call__(
+            self,
+            inputs,
+            inputs_embeds=None,
+            mask=None,
+            cache=None,
+            **kwargs,
+        ):
+            self.forward_kwargs = kwargs
+            return "stock-subclass-output"
+
+    q35_lang = SimpleNamespace(
+        LanguageModel=FakeLanguageModel,
+        MTPModule=lambda args: SimpleNamespace(args=args),
+    )
+    qwen35_vlm_runtime._patch_vlm_language_model(q35_lang)
+
+    class ForeignLanguageModel(FakeLanguageModel):
+        pass
+
+    model = ForeignLanguageModel(
+        SimpleNamespace(mtp_num_hidden_layers=1, tie_word_embeddings=True),
+        config=SimpleNamespace(model_type="foreign"),
+    )
+    result = model(
+        mx.array([[1, 2]], dtype=mx.int32),
+        cache=[],
+        return_hidden=True,
+        return_shared_kv=True,
+        n_confirmed=2,
+        capture_layer_ids=[],
+    )
+
+    assert result == "stock-subclass-output"
+    assert not hasattr(model, "mtp")
+    assert not hasattr(model, "_omlx_mtp_decode_enabled")
+    assert model.forward_kwargs == {
+        "return_hidden": True,
+        "return_shared_kv": True,
+        "n_confirmed": 2,
+        "capture_layer_ids": [],
+    }
 
 
 def test_moe_vlm_sanitize_unfuses_gate_up_by_midpoint(monkeypatch):
@@ -796,6 +962,41 @@ def test_moe_vlm_runtime_sanitize_stacks_per_expert_backbone():
     assert not any(f"{pfx}.experts." in k for k in result)
 
 
+def test_moe_vlm_runtime_sanitize_stacks_nvfp4_global_scales():
+    """mlx-vlm keeps ModelOpt NVFP4 global scales as separate keys; per-expert
+    ones must be stacked with the weights or strict load_weights fails."""
+    from mlx_vlm.quantization.checkpoint import transform_quantized_weights
+
+    from omlx.patches.mlx_vlm_mtp import qwen35_moe_vlm_runtime
+
+    class FakeModel:
+        pass
+
+    qwen35_moe_vlm_runtime._patch_vlm_outer_model_sanitize(
+        SimpleNamespace(Model=FakeModel)
+    )
+
+    pfx_in = "model.language_model.layers.0.mlp"
+    weights = {}
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            key = f"{pfx_in}.experts.{e}.{proj}"
+            weights[f"{key}.weight"] = mx.zeros((32, 32), dtype=mx.uint8)
+            weights[f"{key}.weight_scale"] = mx.zeros((32, 4), dtype=mx.uint8)
+            weights[f"{key}.weight_scale_2"] = mx.array(0.5, dtype=mx.float32)
+            weights[f"{key}.input_scale"] = mx.array(1.0, dtype=mx.float32)
+    weights, _ = transform_quantized_weights(
+        weights, {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}
+    )
+
+    result = FakeModel.sanitize(_per_expert_vlm_self(), weights)
+
+    pfx = "language_model.model.layers.0.mlp"
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        assert result[f"{pfx}.switch_mlp.{proj}.weight_scale_2"].shape == (2,)
+    assert not any(f"{pfx}.experts." in k for k in result)
+
+
 # ---------------------------------------------------------------------------
 # _call_backbone return format tests
 # ---------------------------------------------------------------------------
@@ -856,3 +1057,55 @@ class TestCallBackbone:
         assert result[0] is logits
         assert result[1] is hidden
         assert result[2] is gdn
+
+
+def test_qwen_external_round_clears_before_replay_and_commits_before_yield(monkeypatch):
+    from mlx_vlm.speculative.mtp import _MTPVerifyResult
+
+    events = []
+    draft = SimpleNamespace(
+        config=SimpleNamespace(model_type="qwen3_5_mtp"),
+        accept_verified_tokens=lambda: events.append("replay"),
+    )
+    monkeypatch.setattr(
+        vlm_mtp, "_sync_and_clear_cache", lambda stream: events.append("clear")
+    )
+    monkeypatch.setattr(vlm_mtp, "_buffer_mtp_target_cache", lambda *args: None)
+    with mx.stream(vlm_mtp._vlm_generation_stream):
+        expected_stream = mx.default_stream(mx.gpu)
+
+    def commit(*args):
+        assert mx.default_stream(mx.gpu) == expected_stream
+        events.append("commit")
+
+    monkeypatch.setattr(_MTPVerifyResult, "commit", commit)
+
+    def rounds(target, drafter, *args, **kwargs):
+        try:
+            drafter.accept_verified_tokens()
+            result = _MTPVerifyResult(hidden=None, shared_kv_states={})
+            result.commit(None, [], 2, 3)
+            yield 11, None
+            yield 12, None
+        finally:
+            events.append("closed")
+
+    monkeypatch.setattr(vlm_mtp, "_mtp_rounds", rounds)
+    gen = vlm_mtp.run_vlm_mtp_decode(
+        target_language_model=SimpleNamespace(),
+        drafter=vlm_mtp.VLMMTPDrafter(draft, "mtp", "/p"),
+        prompt_cache=[],
+        hidden=mx.zeros((1, 1, 8)),
+        shared_kv_states={},
+        first_bonus=7,
+        max_tokens=4,
+        sampler=lambda x: x,
+    )
+    assert next(gen) == 7
+    assert events == []
+    assert next(gen) == 11
+    assert events == ["clear", "replay", "commit"]
+    assert next(gen) == 12
+    assert events == ["clear", "replay", "commit"]
+    gen.close()
+    assert events[-1] == "closed"

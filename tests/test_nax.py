@@ -7,7 +7,8 @@ import types
 
 import pytest
 
-import omlx.custom_kernels.qwen35_prefill.fast as fast
+import omlx.custom_kernels.quant_matmul.ane as ane
+import omlx.custom_kernels.quant_matmul.fast as fast
 from omlx.custom_kernels.nax import is_nax_available
 
 
@@ -16,8 +17,6 @@ def _fresh_nax_state(monkeypatch):
     monkeypatch.setattr(fast, "_nax_available_cache", None)
     monkeypatch.setattr(fast, "_stock_nax_cache", None)
     monkeypatch.setattr(fast, "_qmm_nax_cache", None)
-    monkeypatch.delenv("OMLX_NAX", raising=False)
-    monkeypatch.delenv("OMLX_QWEN35_QMM_NAX", raising=False)
     yield
 
 
@@ -38,13 +37,6 @@ def _fresh_nax_state(monkeypatch):
 )
 def test_nax_fallback_mirrors_mlx_gate(version, arch, expected):
     assert fast._nax_available_fallback(version, arch) is expected
-
-
-def test_is_nax_available_env_override(monkeypatch):
-    monkeypatch.setenv("OMLX_NAX", "1")
-    assert fast.is_nax_available() is True
-    monkeypatch.setenv("OMLX_NAX", "0")
-    assert fast.is_nax_available() is False
 
 
 def test_is_nax_available_uses_fallback_without_ext(monkeypatch):
@@ -91,7 +83,7 @@ def test_nax_shim_reexports_fast_impl():
 
 def test_qmm_nax_kwargs_empty_for_pre_nax_ext(monkeypatch):
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", False)
-    assert fast._qmm_nax_kwargs() == {}
+    assert fast._qmm_nax_kwargs(4) == {}
 
 
 def test_qmm_nax_kwargs_on_nax_machine(monkeypatch):
@@ -101,20 +93,9 @@ def test_qmm_nax_kwargs_on_nax_machine(monkeypatch):
     )
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
-    kwargs = fast._qmm_nax_kwargs()
+    kwargs = fast._qmm_nax_kwargs(4)
     assert kwargs["use_nax"] is True
     assert kwargs["nax_variant"] == fast.QMM_NAX_VARIANT
-
-
-def test_qmm_nax_env_kill_switch(monkeypatch):
-    fake_ext = types.SimpleNamespace(
-        is_nax_available=lambda: True,
-        nax_qmm_kernels_built=lambda: True,
-    )
-    monkeypatch.setattr(fast, "_ext", fake_ext)
-    monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
-    monkeypatch.setenv("OMLX_QWEN35_QMM_NAX", "0")
-    assert fast._qmm_nax_kwargs()["use_nax"] is False
 
 
 def test_qmm_nax_disabled_without_kernels(monkeypatch):
@@ -124,15 +105,81 @@ def test_qmm_nax_disabled_without_kernels(monkeypatch):
     )
     monkeypatch.setattr(fast, "_ext", fake_ext)
     monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
-    assert fast._qmm_nax_kwargs()["use_nax"] is False
+    assert fast._qmm_nax_kwargs(4)["use_nax"] is False
+
+
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_qmm_nax_kwargs_supported_bits_use_nax(monkeypatch, bits):
+    fake_ext = types.SimpleNamespace(
+        is_nax_available=lambda: True,
+        nax_qmm_kernels_built=lambda: True,
+    )
+    monkeypatch.setattr(fast, "_ext", fake_ext)
+    monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
+    assert fast._qmm_nax_kwargs(bits)["use_nax"] is True
+
+
+def test_qmm_nax_kwargs_never_requests_nax_for_bits2(monkeypatch):
+    # affine_qmm_nax.metal only defines kernels for bits 4/5/6/8. Routing a
+    # q2 call through NAX anyway fails the kernel lookup and latches
+    # nax_qmm_runtime_ok=false process-wide, permanently demoting every
+    # q4/q5/q6/q8 layer for the rest of the process — bits==2 must never
+    # even attempt NAX, regardless of hardware/build availability.
+    fake_ext = types.SimpleNamespace(
+        is_nax_available=lambda: True,
+        nax_qmm_kernels_built=lambda: True,
+    )
+    monkeypatch.setattr(fast, "_ext", fake_ext)
+    monkeypatch.setattr(fast, "_EXT_HAS_NAX", True)
+    assert fast._qmm_nax_kwargs(2) == {}
 
 
 def test_ane_hybrid_nax_capability_reports_native_state(monkeypatch):
-    fake_ext = types.SimpleNamespace(qwen35_ane_hybrid_nax_enabled=lambda: True)
-    monkeypatch.setattr(fast, "_ext", fake_ext)
-    assert fast.qwen35_ane_hybrid_nax_enabled() is True
+    fake_ext = types.SimpleNamespace(ane_hybrid_nax_enabled=lambda: True)
+    monkeypatch.setattr(ane, "_ext", fake_ext)
+    assert ane.ane_hybrid_nax_enabled() is True
 
 
 def test_ane_hybrid_nax_capability_is_false_for_older_extension(monkeypatch):
-    monkeypatch.setattr(fast, "_ext", types.SimpleNamespace())
-    assert fast.qwen35_ane_hybrid_nax_enabled() is False
+    monkeypatch.setattr(ane, "_ext", types.SimpleNamespace())
+    assert ane.ane_hybrid_nax_enabled() is False
+
+
+def _nax_qmm_ready() -> bool:
+    return (
+        fast.is_native_available()
+        and fast.is_nax_available()
+        and fast.nax_qmm_kernels_built()
+        and fast._qmm_use_nax()
+    )
+
+
+@pytest.mark.skipif(not _nax_qmm_ready(), reason="bundled NAX qmm kernels unavailable")
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("group_size", [64, 128])
+@pytest.mark.parametrize("variant", list(fast.NAX_QMM_VARIANTS))
+def test_every_bundled_nax_qmm_tile_matches_stock(
+    monkeypatch, bits, group_size, variant
+):
+    """Each opt-in tile must reproduce stock MLX (the dropped wn=4 tile did not)."""
+    import mlx.core as mx
+
+    n, k, t = 640, 512, 320
+    keys = mx.random.split(mx.random.key(bits * 100 + variant), 2)
+    w = (mx.random.normal((n, k), key=keys[0]) * 0.05).astype(mx.bfloat16)
+    wq, scales, biases = mx.quantize(w, group_size=group_size, bits=bits)
+    x = mx.random.normal((1, t, k), key=keys[1]).astype(mx.bfloat16)
+    ref = mx.quantized_matmul(
+        x, wq, scales, biases, transpose=True, group_size=group_size, bits=bits
+    )
+    monkeypatch.setattr(fast, "QMM_NAX_VARIANT", variant)
+    native = getattr(fast, f"affine_q{bits}_qmm_t")
+    out = native(x, wq, scales, biases, 8, group_size)
+    ref32 = ref.astype(mx.float32)
+    err = mx.abs(out.astype(mx.float32) - ref32).max().item()
+    scale = mx.abs(ref32).max().item()
+    # Reduction order costs at most a bf16 ulp or two; the dropped wn=4 tile
+    # was off by whole units (err ~ scale).
+    assert err <= 0.02 * scale, (
+        f"variant {variant} q{bits}/gs{group_size}: max err {err} (scale {scale})"
+    )

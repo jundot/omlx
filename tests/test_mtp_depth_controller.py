@@ -390,6 +390,71 @@ def test_losing_speculation_builds_exit_streak():
     del picks
 
 
+def _stale_dip_at_depth_zero():
+    # Flash-Next story analog: a run of rejects dropped the acceptance EMA
+    # well below the content's true rate and the controller settled at depth
+    # 0. Depth 0 drafts nothing, so p cannot recover there on its own. The
+    # exit margin is the loop tax measured on Flash-Next (1.00-1.10).
+    c = _DepthController(3, exit_margin=1.04)
+    c._warmup = []
+    c.t = {0: 13.3, 1: 18.2, 2: 24.0, 3: 28.0}
+    c.t_age = {d: 0.0 for d in c.t}
+    c.p = [0.3, 0.3, 0.3]
+    c.cur = 0
+    return c
+
+
+def _drive(controller, cycles, p_by_depth, ms_by_depth, seed=0):
+    """Like _simulate_with_zero, but records should_exit after every cycle
+    (the real loop checks it after each emit)."""
+    rng = random.Random(seed)
+    exits = []
+    for _ in range(cycles):
+        depth = controller.cur
+        accepted = 0
+        for j in range(depth):
+            if rng.random() < p_by_depth[j]:
+                accepted += 1
+            else:
+                break
+        controller.observe(depth, accepted, ms_by_depth[depth])
+        exits.append(controller.should_exit())
+    return exits
+
+
+def test_stale_losing_verdict_at_depth_zero_is_remeasured_before_exit():
+    # The true acceptance (0.62) makes depth 1 beat the plain step by ~20%,
+    # but the stale EMA says otherwise. Handing off on that verdict is the
+    # depth-0 trap: re-measure a speculative depth first. Acceptance is
+    # random, so assert a rate over many draws (before the gate every draw
+    # parked; with it most recover).
+    ms = {0: 13.3, 1: 18.2, 2: 24.0, 3: 28.0}
+    parked = 0
+    for seed in range(50):
+        c = _stale_dip_at_depth_zero()
+        exits = _drive(c, 120, p_by_depth=[0.62, 0.6, 0.55], ms_by_depth=ms, seed=seed)
+        parked += any(exits)
+    assert parked <= 10
+
+
+def test_confirmation_probe_runs_a_speculative_depth():
+    c = _stale_dip_at_depth_zero()
+    ms = {0: 13.3, 1: 18.2, 2: 24.0, 3: 28.0}
+    _drive(c, c.EXIT_STREAK, p_by_depth=[0.62, 0.6, 0.55], ms_by_depth=ms)
+    assert c.cur >= 1
+    assert not c.should_exit()
+
+
+def test_confirmed_losing_speculation_still_exits():
+    # The re-measurement agrees that speculation loses: exit as before,
+    # only a confirmation burst later.
+    c = _stale_dip_at_depth_zero()
+    ms = {0: 13.3, 1: 18.2, 2: 24.0, 3: 28.0}
+    exits = _drive(c, 80, p_by_depth=[0.2, 0.2, 0.2], ms_by_depth=ms)
+    assert any(exits)
+    assert exits.index(True) <= c.EXIT_STREAK + c.EXIT_CONFIRM + 2
+
+
 def test_winning_speculation_never_exits():
     # code analogs: clear speculative wins keep the exit streak at zero.
     c = _DepthController(3)
@@ -415,9 +480,10 @@ def test_exit_margin_arg_overrides_prior_with_clamp():
     assert _DepthController(3, exit_margin=0.5).EXIT_MARGIN == 1.0
 
 
-def test_std_tax_probe_measures_and_smooths():
+def test_std_tax_probe_measures_and_smooths(monkeypatch):
     from types import SimpleNamespace
 
+    from omlx.patches.mlx_lm_mtp import batch_generator
     from omlx.patches.mlx_lm_mtp.batch_generator import (
         _STD_TAX_SAMPLES,
         _STD_TAX_SKIP,
@@ -425,6 +491,8 @@ def test_std_tax_probe_measures_and_smooths():
         _record_std_tax_sample,
     )
 
+    # The process-wide prefill tracker may hold another test's prefill.
+    monkeypatch.setattr(batch_generator, "_prefill_activity_recent", lambda: False)
     model = SimpleNamespace()
     gb = SimpleNamespace(model=model)
     _arm_std_tax_probe(gb, 12.0)
@@ -443,3 +511,44 @@ def test_std_tax_probe_measures_and_smooths():
     for _ in range(_STD_TAX_SAMPLES):
         _record_std_tax_sample(gb, 11.0)
     assert 1.0 < model._omlx_mtp_loop_tax < 1.2
+
+
+def test_unreached_position_borrows_previous_estimate():
+    c = _DepthController(3)
+    c._warmup = []
+    c.p = [0.9, None, None]
+    assert c._p_eff(2) == 0.9
+    # First reach of position 2 starts its EMA from position 1's estimate.
+    c.observe(2, 2, 10.0)
+    assert c.p[1] > 0.9
+    assert c.p[2] is None
+
+
+def test_seed_revalidates_costs_before_selecting_depth():
+    prev = _simulate(_DepthController(2), 20, [0.9, 0.9], {0: 8.0, 1: 10.0, 2: 12.0})
+    prev.t = {0: 1.0, 1: 40.0, 2: 3.0}
+    c = _DepthController(3, seed=prev)
+    assert c.p[:2] == prev.p and c.p[2] is None
+    assert c.t == prev.t
+    for depth, cost in [(3, 14.0), (2, 12.0), (1, 10.0), (0, 9.0), (0, 8.0), (0, 9.0)]:
+        assert c.cur == depth
+        c.observe(depth, depth, cost)
+    assert c.t == {0: 8.0, 1: 10.0, 2: 12.0, 3: 14.0}
+    assert c._warmup == []
+    assert c.cur > 0
+    assert not c.should_exit()
+    assert prev.t == {0: 1.0, 1: 40.0, 2: 3.0}
+
+
+def test_seed_revalidation_waits_for_a_valid_timing_sample():
+    prev = _DepthController(2)
+    prev.t = {0: 1.0, 1: 2.0, 2: 3.0}
+    c = _DepthController(2, seed=prev)
+    c.observe(2, 2, 100.0, time_sample=False)
+    assert c.cur == 2
+    assert c.t[2] == 3.0
+    assert math.isinf(c.t_age[2])
+    c.observe(2, 2, 15.0)
+    assert c.t[2] == 15.0
+    assert c.t_age[2] == 0.0
+    assert c.cur == 1

@@ -2,9 +2,9 @@
 //   • ServerHeroCard (the same card the Server screen mounts; defined in
 //     ServerScreen.swift)
 //   • Serving Stats — prefill/cache tiles + average speed from /admin/api/stats
+//   • Active Now — active_models slice from /api/stats
 //   • System — slice of /admin/api/global-settings + uptime from /api/stats
 //   • Updates — release check status + auto-check/auto-notify prefs
-//   • Active Now — active_models slice from /api/stats
 //
 // Polling is on-screen-only: a 5s timer ticks while the view is visible.
 
@@ -67,6 +67,8 @@ struct StatusScreen: View {
                                   comment: "Section header for the currently active models list"))
             ActiveNowList(models: vm.stats?.activeModels.models ?? [])
 
+            UsageHistoryView()
+
             SectionHeader(String(localized: "status.section.system",
                                   defaultValue: "System",
                                   comment: "Section header for system status rows"),
@@ -125,12 +127,7 @@ struct StatusScreen: View {
                                   comment: "Section header for the updates section"))
             UpdatesSection(updates: services.updates)
 
-            if let error = vm.lastError {
-                Text(error)
-                    .font(.omlxText(11))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 18).padding(.top, 8)
-            }
+            FooterBar(error: vm.lastError)
         }
         .task(id: vm.scope) {
             await vm.start(client: services.client)
@@ -318,7 +315,7 @@ private struct RuntimeCacheSection: View {
 }
 
 /// Bytes → human-readable string. Mirrors `formatByteCount` in
-/// `omlx/admin/static/js/dashboard.js` — 1024-scaled, one decimal place.
+/// `apps/omlx-web/omlx_web/static/js/dashboard.js` — 1024-scaled, one decimal place.
 private func formatByteCount(_ bytes: Int64) -> String {
     let b = Double(max(0, bytes))
     if b >= 1024 * 1024 * 1024 { return String(format: "%.1f GB", b / (1024 * 1024 * 1024)) }
@@ -338,13 +335,13 @@ private struct StatTilesRow: View {
                 label: String(localized: "status.tile.total",
                               defaultValue: "Total Prefill Tokens",
                               comment: "Stat tile label for total prefill tokens processed"),
-                value: stats.map { fmtNum($0.totalPromptTokens) } ?? "—"
+                value: stats.map { CountFormat.compact($0.totalPromptTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cached",
                               defaultValue: "Cached Tokens",
                               comment: "Stat tile label for cached tokens"),
-                value: stats.map { fmtNum($0.totalCachedTokens) } ?? "—"
+                value: stats.map { CountFormat.compact($0.totalCachedTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cache_efficiency",
@@ -492,8 +489,8 @@ private struct SystemRamTrailing: View {
         guard let used = metrics.ramUsedBytes,
               let total = metrics.ramTotalBytes
         else { return "—" }
-        let u = SystemMetricsPoller.formatBytesAsGB(used)
-        let t = SystemMetricsPoller.formatBytesAsGB(total)
+        let u = SystemMetricsPoller.formatBytesAsGiB(used)
+        let t = SystemMetricsPoller.formatBytesAsGiB(total)
         return "\(u) / \(t) GB"
     }
 }
@@ -619,7 +616,7 @@ private struct UpdatesSection: View {
                         get: { updates.channel },
                         set: { updates.channel = $0 }
                     ),
-                    width: 190,
+                    width: .controlMedium,
                     options: UpdateChannel.allCases.map { ($0, $0.displayName) }
                 )
             }
@@ -631,12 +628,10 @@ private struct UpdatesSection: View {
                                  defaultValue: "Look for updates daily in the background",
                                  comment: "Sublabel for the auto-check toggle")
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoCheck },
                     set: { updates.autoCheck = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
             Row(
                 label: String(localized: "status.updates.auto_download",
@@ -647,12 +642,10 @@ private struct UpdatesSection: View {
                                  comment: "Sublabel for the automatic update notification toggle"),
                 isLast: true
             ) {
-                Toggle("", isOn: Binding(
+                RowSwitch(isOn: Binding(
                     get: { updates.autoNotify },
                     set: { updates.autoNotify = $0 }
                 ))
-                .labelsHidden()
-                .toggleStyle(.switch)
             }
         }
     }
@@ -777,14 +770,4 @@ private struct UpdatesSection: View {
                       defaultValue: "Last checked \(formatter.string(from: date))",
                       comment: "Last-checked text when the last check was before today; placeholder is the formatted date and time")
     }
-}
-
-// MARK: - Helpers
-
-private func fmtNum(_ n: Int) -> String {
-    let v = Double(n)
-    if v >= 1e9 { return String(format: "%.2fB", v / 1e9) }
-    if v >= 1e6 { return String(format: "%.2fM", v / 1e6) }
-    if v >= 1e3 { return String(format: "%.1fK", v / 1e3) }
-    return String(n)
 }

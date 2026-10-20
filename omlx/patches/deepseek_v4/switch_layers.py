@@ -6,55 +6,72 @@
 from __future__ import annotations
 
 import math
-import os
 from functools import lru_cache
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.models.activations import swiglu
-from omlx.custom_kernels.glm_moe_dsa import fast as glm_fast
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.custom_kernels.nax import is_nax_available
+from omlx.patches.m5_gather_qmm import fused_gate_up_activation
+from omlx.patches.moe_routes import sort_routes
 
 _DEEPSEEK_MXFP4_SMALL_BLOCK_BM = 16
 _DEEPSEEK_MXFP4_SMALL_BLOCK_VARIANT = 1
 _DEEPSEEK_MXFP4_LARGE_BLOCK_BM = 32
 _DEEPSEEK_MXFP4_LARGE_BLOCK_VARIANT = 2
 _DEEPSEEK_AFFINE_LARGE_BLOCK_MIN_ROUTES = 8192
+# Affine 2/3-bit g64 crossovers measured on M1 Ultra. Other formats keep
+# their existing 64-route sorting threshold.
+_SORT_MIN_ROUTES = 32
+_AFFINE_NATIVE_MIN_ROUTES = 1024
 # Tuned on M3 Ultra. Set this to 8192 to restore the previous crossover on
 # other pre-NAX chips; M5 prefill uses the NAX fallback below.
-_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = int(
-    os.environ.get("OMLX_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES", "16384")
-)
+_DEEPSEEK_MXFP4_LARGE_BLOCK_MIN_ROUTES = 16384
 
 # On NAX GPUs (M5 family) mx.gather_qmm dispatches to the tensor-unit
 # gather_qmm_rhs_nax kernels, which beat the pre-NAX block-list kernels for
 # prefill-sized route counts (same regression shape as the Qwen qmm patch:
 # 4k pp 828 -> 400 tok/s on M5 Max). Decode-sized calls stay on the block
-# kernels pending M5 measurements. OMLX_DEEPSEEK_MOE_NAX=0 keeps the block
-# kernels everywhere, =1 routes every call to stock on NAX GPUs.
-_NAX_STOCK_MODE = os.environ.get("OMLX_DEEPSEEK_MOE_NAX", "").strip().lower()
-_NAX_STOCK_MIN_ROUTES = int(
-    os.environ.get("OMLX_DEEPSEEK_MOE_NAX_MIN_ROUTES", "1024")
-)
+# kernels pending M5 measurements.
+_NAX_STOCK_MIN_ROUTES = 1024
 
 
 def _nax_prefers_stock(num_routes: int) -> bool:
-    if _NAX_STOCK_MODE in ("0", "false", "off"):
+    return num_routes >= _NAX_STOCK_MIN_ROUTES and is_nax_available()
+
+
+def _sort_threshold(*projections) -> int:
+    if all(
+        isinstance(p, QuantizedSwitchLinear)
+        and p.mode == "affine"
+        and p.bits in (2, 3)
+        and p.group_size == 64
+        for p in projections
+    ):
+        return _SORT_MIN_ROUTES
+    return 64
+
+
+def has_native_block_kernels(projection) -> bool:
+    """Whether ``projection``'s format has native block/pair gather kernels.
+
+    MXFP4 (4-bit, group 32) and affine 2/3-bit group-64 experts can run gate
+    and up through the native pair kernels; every other format runs them as
+    stock ``gather_qmm`` calls.
+    """
+    if not isinstance(projection, QuantizedSwitchLinear):
         return False
-    if not is_nax_available():
-        return False
-    if _NAX_STOCK_MODE in ("1", "true", "on"):
-        return True
-    return num_routes >= _NAX_STOCK_MIN_ROUTES
+    mode, bits, group_size = projection.mode, projection.bits, projection.group_size
+    return (mode == "mxfp4" and bits == 4 and group_size == 32) or (
+        mode == "affine" and bits in (2, 3) and group_size == 64
+    )
 
 
 def _gather_sort(x, indices):
-    *_, M = indices.shape
-    indices = indices.flatten()
-    order = mx.argsort(indices)
-    inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // M], indices[order], inv_order
+    x, row_map, indices, inv_order = sort_routes(x, indices)
+    return x[row_map], indices, inv_order
 
 
 def _scatter_unsort(x, inv_order, shape=None):
@@ -233,7 +250,7 @@ class QuantizedSwitchLinear(nn.Module):
             and "bias" not in self
             and self["weight"].dtype == mx.uint32
             and self["scales"].dtype == mx.uint8
-            and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_blocks")
+            and quant_fast.has_symbol("mxfp4_gather_qmm_blocks")
         )
 
     def _can_use_affine_blocks(self, x, sorted_indices: bool, dtype=None) -> bool:
@@ -243,6 +260,7 @@ class QuantizedSwitchLinear(nn.Module):
             sorted_indices
             and x.ndim == 3
             and x.shape[-2] == 1
+            and int(x.shape[0]) >= _AFFINE_NATIVE_MIN_ROUTES
             and dtype in (mx.float16, mx.bfloat16)
             and self.group_size == 64
             and self.bits in (2, 3)
@@ -252,7 +270,7 @@ class QuantizedSwitchLinear(nn.Module):
             and self["weight"].dtype == mx.uint32
             and self["scales"].dtype == dtype
             and biases.dtype == dtype
-            and glm_fast.has_symbol("deepseek_affine_gather_qmm_blocks")
+            and quant_fast.has_symbol("affine_gather_qmm_blocks")
         )
 
     def _has_affine_metadata_dtype(self, dtype) -> bool:
@@ -291,7 +309,7 @@ class QuantizedSwitchLinear(nn.Module):
                     block_plan
                 )
             if native_kind == "mxfp4":
-                x = glm_fast.deepseek_mxfp4_gather_qmm_blocks(
+                x = quant_fast.mxfp4_gather_qmm_blocks(
                     x,
                     self["weight"],
                     self["scales"],
@@ -300,7 +318,7 @@ class QuantizedSwitchLinear(nn.Module):
                     block_variant,
                 )
             else:
-                x = glm_fast.deepseek_affine_gather_qmm_blocks(
+                x = quant_fast.affine_gather_qmm_blocks(
                     x,
                     self["weight"],
                     self["scales"],
@@ -312,6 +330,9 @@ class QuantizedSwitchLinear(nn.Module):
                     block_variant,
                 )
         else:
+            extra = {}
+            if "global_scale" in self:
+                extra["global_scale"] = self["global_scale"]
             x = mx.gather_qmm(
                 x,
                 self["weight"],
@@ -323,10 +344,47 @@ class QuantizedSwitchLinear(nn.Module):
                 bits=self.bits,
                 mode=self.mode,
                 sorted_indices=sorted_indices,
+                **extra,
             )
         if "bias" in self:
             x = x + mx.expand_dims(self["bias"][indices], -2)
         return x
+
+
+# ModelOpt two-level NVFP4 stores ``weight_scale_2 = amax / (6 * 448)`` per
+# expert; ``mx.gather_qmm`` takes the amax itself as ``global_scale``.
+NVFP4_GLOBAL_SCALE = 6.0 * 448.0
+_WEIGHT_SCALE_2 = ".weight_scale_2"
+
+
+def install_nvfp4_global_scales(model: nn.Module, weights: dict) -> dict:
+    """Map routed-expert ``weight_scale_2`` tensors to ``global_scale``.
+
+    ModelOpt NVFP4 experts carry one f32 tensor scale per expert next to the
+    E2M1 codes and E4M3 block scales. The projection gets a ``global_scale``
+    parameter (kept by ``to_quantized``) and the value is stored as the amax
+    ``gather_qmm`` expects. The renamed key also keeps mlx-vlm's
+    ``replace_scaled_quantized_linears`` off these projections, which it can
+    only wrap for its own switch class.
+    """
+    if not isinstance(model, nn.Module):
+        # oQ runs sanitize on a stand-in object only to map the names.
+        return weights
+    modules = None
+    out = {}
+    for key, value in weights.items():
+        if key.endswith(_WEIGHT_SCALE_2) and ".switch_mlp." in f".{key}":
+            path = key[: -len(_WEIGHT_SCALE_2)]
+            if modules is None:
+                modules = dict(model.named_modules())
+            proj = modules.get(path)
+            if isinstance(proj, (SwitchLinear, QuantizedSwitchLinear)):
+                scale = value.astype(mx.float32).reshape(-1) * NVFP4_GLOBAL_SCALE
+                proj.global_scale = mx.ones_like(scale)
+                out[f"{path}.global_scale"] = scale
+                continue
+        out[key] = value
+    return out
 
 
 class SwitchLinear(nn.Module):
@@ -383,6 +441,8 @@ class SwitchLinear(nn.Module):
             self.weight, group_size, bits, mode=mode
         )
         ql.biases = biases[0] if biases else None
+        if "global_scale" in self:
+            ql.global_scale = self.global_scale
 
         if "bias" in self:
             ql.bias = self.bias
@@ -413,21 +473,33 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
+    def projections(self) -> tuple:
+        """Expert projections in call order: gate/up (or fused), then down."""
+        if "gate_up_proj" in self:
+            return (self.gate_up_proj, self.down_proj)
+        return (self.up_proj, self.gate_proj, self.down_proj)
+
     def __call__(self, x, indices, scores=None, weighted_sum=False) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
         original_dtype = x.dtype
+        projections = self.projections()
+        fused_gate_up = len(projections) == 2
 
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= _sort_threshold(*projections)
         idx = indices
         inv_order = None
+        token_rows = None
         if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
+            # The replicated rows x_tok[row_map] stay lazy: never computed
+            # when the fused gate/up kernel reads the token rows in place.
+            x_tok, row_map, idx, inv_order = sort_routes(x, indices)
+            x = x_tok[row_map]
+            token_rows = (x_tok, row_map)
         if self.training:
             idx = mx.stop_gradient(idx)
 
         block_plan = None
         native_kinds = None
-        projections = (self.up_proj, self.gate_proj, self.down_proj)
         use_f16_moe = original_dtype == mx.bfloat16 and all(
             isinstance(p, QuantizedSwitchLinear)
             and p._has_affine_metadata_dtype(mx.float16)
@@ -454,25 +526,29 @@ class SwitchGLU(nn.Module):
                 block_bm, block_variant = _block_config(idx.size, block_kind)
                 block_meta, block_count = _build_mxfp4_blocks(
                     idx,
-                    self.up_proj.num_experts,
+                    self.down_proj.num_experts,
                     block_bm,
                 )
                 block_plan = (block_meta, block_count, block_variant)
 
         if use_f16_moe:
             x = x.astype(mx.float16)
+            if token_rows is not None:
+                token_rows = (token_rows[0].astype(mx.float16), token_rows[1])
 
         use_pair_proj = (
-            block_plan is not None
+            not fused_gate_up
+            and block_plan is not None
             and native_kinds is not None
             and native_kinds[0] == "mxfp4"
             and native_kinds[1] == "mxfp4"
-            and glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_pair_blocks")
+            and quant_fast.has_symbol("mxfp4_gather_qmm_pair_blocks")
             and self.up_proj.output_dims == self.gate_proj.output_dims
             and self.up_proj.num_experts == self.gate_proj.num_experts
         )
         use_affine_pair_proj = (
-            block_plan is not None
+            not fused_gate_up
+            and block_plan is not None
             and native_kinds is not None
             and native_kinds[0] == "affine"
             and native_kinds[1] == "affine"
@@ -480,14 +556,35 @@ class SwitchGLU(nn.Module):
             and self.up_proj.bits == self.gate_proj.bits
             and self.up_proj.output_dims == self.gate_proj.output_dims
             and self.up_proj.num_experts == self.gate_proj.num_experts
-            and glm_fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks")
+            and quant_fast.has_symbol("affine_gather_qmm_pair_concat_blocks")
         )
-        if use_pair_proj:
+        x_act = None
+        if fused_gate_up:
+            if (
+                do_sort
+                and block_plan is None
+                and not self.training
+                and isinstance(self.gate_up_proj, QuantizedSwitchLinear)
+            ):
+                # Sorted prefill on M5 (stock gather_qmm route): the
+                # activation in the [gate; up] matmul's epilogue
+                # (bit-identical; None keeps the path below).
+                x_act = fused_gate_up_activation(
+                    self.gate_up_proj, x, idx, self.activation, token_rows=token_rows
+                )
+            if x_act is None:
+                # One gather_qmm over the [gate; up] expert rows; each output
+                # column is the same K-reduction as in the separate calls.
+                x_gate_up = self.gate_up_proj(
+                    x, idx, sorted_indices=do_sort, block_plan=block_plan
+                )
+                x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+        elif use_pair_proj:
             block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
                 block_plan
             )
-            if glm_fast.has_symbol("deepseek_mxfp4_gather_qmm_pair_concat_blocks"):
-                x_pair = glm_fast.deepseek_mxfp4_gather_qmm_pair_concat_blocks(
+            if quant_fast.has_symbol("mxfp4_gather_qmm_pair_concat_blocks"):
+                x_pair = quant_fast.mxfp4_gather_qmm_pair_concat_blocks(
                     x,
                     self.up_proj["weight"],
                     self.up_proj["scales"],
@@ -501,7 +598,7 @@ class SwitchGLU(nn.Module):
                 x_up = x_pair[..., :hidden_dims]
                 x_gate = x_pair[..., hidden_dims:]
             else:
-                x_pair = glm_fast.deepseek_mxfp4_gather_qmm_pair_blocks(
+                x_pair = quant_fast.mxfp4_gather_qmm_pair_blocks(
                     x,
                     self.up_proj["weight"],
                     self.up_proj["scales"],
@@ -517,7 +614,7 @@ class SwitchGLU(nn.Module):
             block_meta, block_count, block_variant = _unpack_mxfp4_block_plan(
                 block_plan
             )
-            x_pair = glm_fast.deepseek_affine_gather_qmm_pair_concat_blocks(
+            x_pair = quant_fast.affine_gather_qmm_pair_concat_blocks(
                 x,
                 self.up_proj["weight"],
                 self.up_proj["scales"],
@@ -539,11 +636,11 @@ class SwitchGLU(nn.Module):
             x_gate = self.gate_proj(
                 x, idx, sorted_indices=do_sort, block_plan=block_plan
             )
-        x = self.activation(x_up, x_gate)
+        x = self.activation(x_up, x_gate) if x_act is None else x_act
         if (
             block_plan is not None
             and native_kinds is not None
-            and native_kinds[2] == "affine"
+            and native_kinds[-1] == "affine"
             and isinstance(self.down_proj, QuantizedSwitchLinear)
             and x.dtype != self.down_proj["scales"].dtype
             and self.down_proj["scales"].dtype in (mx.float16, mx.bfloat16)
@@ -563,9 +660,9 @@ class SwitchGLU(nn.Module):
             and scores.shape[-1] in (6, 8)
             and scores.dtype == mx.float32
             and x.dtype in (mx.float16, mx.bfloat16)
-            and glm_fast.has_symbol("glm_moe_weighted_sum")
+            and quant_fast.has_symbol("moe_weighted_sum")
         ):
-            y = glm_fast.glm_moe_weighted_sum(x, inv_order, scores)
+            y = quant_fast.moe_weighted_sum(x, inv_order, scores)
             return y.astype(original_dtype) if use_f16_moe else y
 
         if do_sort:
@@ -595,7 +692,7 @@ class SwitchMLP(nn.Module):
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= _sort_threshold(self.fc1, self.fc2)
         idx = indices
         inv_order = None
         if do_sort:

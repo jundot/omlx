@@ -67,8 +67,12 @@ def test_the_local_rank_needs_no_ssh():
 
 
 def test_an_unreachable_peer_is_reported_not_raised(tmp_path):
-    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
-                         probe=lambda t: t == "127.0.0.1")
+    health = check_peers(
+        HOSTS,
+        state_dir=str(tmp_path),
+        deployment_id="d",
+        probe=lambda t: t == "127.0.0.1",
+    )
 
     by_rank = {h.rank: h for h in health}
     assert by_rank[0].reachable is True
@@ -80,8 +84,12 @@ def test_an_unreachable_peer_is_reported_not_raised(tmp_path):
 def test_a_pulled_cable_produces_an_actionable_message(tmp_path):
     """The exact failure that needed pkill: peer gone mid-generation."""
 
-    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
-                         probe=lambda t: t == "127.0.0.1")
+    health = check_peers(
+        HOSTS,
+        state_dir=str(tmp_path),
+        deployment_id="d",
+        probe=lambda t: t == "127.0.0.1",
+    )
 
     message = describe_failure(health)
     assert "mac-studio" in message
@@ -91,15 +99,22 @@ def test_a_pulled_cable_produces_an_actionable_message(tmp_path):
         raise_if_peer_lost(health)
 
 
-def test_a_rank_that_stopped_reporting_is_distinguished_from_one_that_vanished(tmp_path):
+def test_a_rank_that_stopped_reporting_is_distinguished_from_one_that_vanished(
+    tmp_path,
+):
     """Reachable but silent means crashed or stuck — a different remedy."""
 
     _marker(tmp_path, "d", 0, age_seconds=0)
     _marker(tmp_path, "d", 1, age_seconds=300)
 
-    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
-                         probe=lambda t: True, require_heartbeat=True,
-                         remote_reader=_remote_reader(tmp_path))
+    health = check_peers(
+        HOSTS,
+        state_dir=str(tmp_path),
+        deployment_id="d",
+        probe=lambda t: True,
+        require_heartbeat=True,
+        remote_reader=_remote_reader(tmp_path),
+    )
     by_rank = {h.rank: h for h in health}
 
     assert by_rank[1].reachable is True
@@ -115,9 +130,14 @@ def test_a_busy_rank_is_not_mistaken_for_a_dead_one(tmp_path):
     _marker(tmp_path, "d", 0, age_seconds=0)
     _marker(tmp_path, "d", 1, age_seconds=20)
 
-    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
-                         probe=lambda t: True, require_heartbeat=True,
-                         remote_reader=_remote_reader(tmp_path))
+    health = check_peers(
+        HOSTS,
+        state_dir=str(tmp_path),
+        deployment_id="d",
+        probe=lambda t: True,
+        require_heartbeat=True,
+        remote_reader=_remote_reader(tmp_path),
+    )
     assert all(h.healthy for h in health)
     assert describe_failure(health) == "All ranks are responding."
     raise_if_peer_lost(health)  # must not raise
@@ -126,8 +146,9 @@ def test_a_busy_rank_is_not_mistaken_for_a_dead_one(tmp_path):
 def test_a_remote_rank_without_a_local_marker_is_not_called_stale(tmp_path):
     """Markers are local files; a peer's marker lives on the peer."""
 
-    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
-                         probe=lambda t: True)
+    health = check_peers(
+        HOSTS, state_dir=str(tmp_path), deployment_id="d", probe=lambda t: True
+    )
     remote = next(h for h in health if h.rank == 1)
     assert remote.seconds_since_heartbeat is None
     assert remote.stale is False
@@ -157,10 +178,14 @@ def test_clock_skew_between_macs_does_not_kill_a_healthy_cluster(tmp_path):
     _marker(tmp_path, "d", 0, age_seconds=0)
     _marker(tmp_path, "d", 1, age_seconds=605)
 
-    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
-                         probe=lambda t: True, require_heartbeat=True,
-                         remote_reader=_remote_reader(
-                             tmp_path, peer_clock_offset=-600.0))
+    health = check_peers(
+        HOSTS,
+        state_dir=str(tmp_path),
+        deployment_id="d",
+        probe=lambda t: True,
+        require_heartbeat=True,
+        remote_reader=_remote_reader(tmp_path, peer_clock_offset=-600.0),
+    )
 
     remote = next(h for h in health if h.rank == 1)
     assert remote.seconds_since_heartbeat == pytest.approx(5.0, abs=2.0)
@@ -174,10 +199,14 @@ def test_a_rank_that_is_stale_by_its_own_clock_is_still_caught(tmp_path):
     _marker(tmp_path, "d", 0, age_seconds=0)
     _marker(tmp_path, "d", 1, age_seconds=905)
 
-    health = check_peers(HOSTS, state_dir=str(tmp_path), deployment_id="d",
-                         probe=lambda t: True, require_heartbeat=True,
-                         remote_reader=_remote_reader(
-                             tmp_path, peer_clock_offset=-600.0))
+    health = check_peers(
+        HOSTS,
+        state_dir=str(tmp_path),
+        deployment_id="d",
+        probe=lambda t: True,
+        require_heartbeat=True,
+        remote_reader=_remote_reader(tmp_path, peer_clock_offset=-600.0),
+    )
 
     remote = next(h for h in health if h.rank == 1)
     assert remote.stale is True
@@ -203,9 +232,10 @@ def test_the_injected_marker_script_reports_the_peer_clock(tmp_path):
     payload = json.loads(result.stdout)
     assert payload["marker"]["rank"] == 0
     assert payload["process_live"] is True  # the marker carries this test's pid
-    age = payload["peer_now"] - datetime.fromisoformat(
-        payload["marker"]["updated_at"]
-    ).timestamp()
+    age = (
+        payload["peer_now"]
+        - datetime.fromisoformat(payload["marker"]["updated_at"]).timestamp()
+    )
     assert 2.0 <= age <= 8.0
 
 
@@ -215,8 +245,11 @@ def test_a_marker_response_without_the_peer_clock_is_rejected(tmp_path):
     from omlx.cluster.liveness import read_remote_marker
 
     fake = subprocess.CompletedProcess(
-        args=[], returncode=0,
-        stdout=b'{"marker":{"rank":1},"process_live":true}', stderr=b"")
+        args=[],
+        returncode=0,
+        stdout=b'{"marker":{"rank":1},"process_live":true}',
+        stderr=b"",
+    )
 
     marker, live, peer_now, error = read_remote_marker(
         "studio.local", "/tmp/x.json", runner=lambda *a, **k: fake
@@ -232,8 +265,13 @@ def test_the_watchdog_reports_once_and_stops(tmp_path):
     """It ends the wait; it does not thrash trying to repair a collective."""
 
     losses = []
-    watchdog = PeerWatchdog(HOSTS, deployment_id="d", state_dir=str(tmp_path),
-                            interval=0.0, on_lost=losses.append)
+    watchdog = PeerWatchdog(
+        HOSTS,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        on_lost=losses.append,
+    )
     watchdog.run_once = lambda: (  # type: ignore[method-assign]
         PeerHealth("test-mbp", 0, True, 0.0),
         PeerHealth("mac-studio", 1, False, None, detail="gone"),
@@ -253,8 +291,13 @@ def test_the_watchdog_reports_once_and_stops(tmp_path):
 
 def test_a_healthy_cluster_keeps_the_watchdog_quiet(tmp_path):
     losses = []
-    watchdog = PeerWatchdog(HOSTS, deployment_id="d", state_dir=str(tmp_path),
-                            interval=0.0, on_lost=losses.append)
+    watchdog = PeerWatchdog(
+        HOSTS,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        on_lost=losses.append,
+    )
     watchdog.run_once = lambda: (  # type: ignore[method-assign]
         PeerHealth("test-mbp", 0, True, 1.0),
         PeerHealth("mac-studio", 1, True, 2.0),
@@ -286,8 +329,13 @@ def test_a_watchdog_with_no_peers_never_fires(tmp_path):
     """
 
     losses = []
-    watchdog = PeerWatchdog({}, deployment_id="d", state_dir=str(tmp_path),
-                            interval=0.0, on_lost=losses.append)
+    watchdog = PeerWatchdog(
+        {},
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        on_lost=losses.append,
+    )
 
     def fake_sleep(_seconds):
         raise AssertionError("a watchdog with no peers must not even poll")
@@ -514,7 +562,12 @@ def test_a_reachable_mac_with_a_dead_worker_is_not_healthy(tmp_path):
         deployment_id="d",
         probe=lambda _target: True,
         require_heartbeat=True,
-        remote_reader=lambda _target, _path: (marker, False, datetime.now(UTC).timestamp(), ""),
+        remote_reader=lambda _target, _path: (
+            marker,
+            False,
+            datetime.now(UTC).timestamp(),
+            "",
+        ),
     )
 
     assert health[0].reachable is True
@@ -563,3 +616,114 @@ def test_status_names_each_way_a_rank_can_be_wrong(tmp_path):
     assert PeerHealth("a", 0, True, 1.0).status == "healthy"
     assert PeerHealth("a", 0, True, None, heartbeat_required=True).status == "missing"
     assert PeerHealth("a", 0, True, 1.0, process_live=False).status == "dead"
+
+
+# ---------------------------------------------------------------------------
+# Graduated response: warn/abort first, exit last.
+# ---------------------------------------------------------------------------
+
+
+def test_the_watchdog_aborts_and_recovers_without_exiting(tmp_path):
+    losses = []
+    aborts = []
+    unhealthy = (
+        PeerHealth("test-mbp", 0, True, 0.0),
+        PeerHealth("mac-studio", 1, False, None, detail="gone"),
+    )
+    healthy = (
+        PeerHealth("test-mbp", 0, True, 1.0),
+        PeerHealth("mac-studio", 1, True, 2.0),
+    )
+    state = {"aborted": False}
+
+    def on_abort(reason):
+        aborts.append(reason)
+        state["aborted"] = True
+
+    watchdog = PeerWatchdog(
+        HOSTS,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        on_lost=losses.append,
+        on_abort=on_abort,
+        abort_grace=5.0,
+    )
+    watchdog.run_once = lambda: healthy if state["aborted"] else unhealthy  # type: ignore[method-assign]
+
+    ticks = [0]
+
+    def fake_sleep(_seconds):
+        ticks[0] += 1
+        if ticks[0] > 10:
+            watchdog.stop()
+
+    watchdog.run(sleep=fake_sleep)
+
+    # The abort stage fired once at tolerance; the peer recovered during the
+    # grace window, so the exit stage never ran and the watchdog kept polling.
+    assert aborts and "mac-studio" in aborts[0]
+    assert losses == []
+    assert watchdog._consecutive_failures == {0: 0, 1: 0}
+
+
+def test_the_watchdog_exits_only_after_the_abort_grace_expires(tmp_path):
+    losses = []
+    aborts = []
+    unhealthy = (
+        PeerHealth("test-mbp", 0, True, 0.0),
+        PeerHealth("mac-studio", 1, False, None, detail="gone"),
+    )
+    watchdog = PeerWatchdog(
+        HOSTS,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        on_lost=losses.append,
+        on_abort=aborts.append,
+        abort_grace=0.2,
+    )
+    watchdog.run_once = lambda: unhealthy  # type: ignore[method-assign]
+
+    import time as _time
+
+    def fast_sleep(seconds):
+        _time.sleep(min(seconds, 0.01))
+
+    started = _time.monotonic()
+    watchdog.run(sleep=fast_sleep)
+    elapsed = _time.monotonic() - started
+
+    assert len(aborts) == 1
+    assert len(losses) == 1
+    assert "mac-studio" in losses[0]
+    # The exit was delayed by the abort grace, not instant.
+    assert elapsed >= 0.2
+
+
+def test_without_an_abort_stage_the_timing_is_unchanged(tmp_path):
+    losses = []
+    watchdog = PeerWatchdog(
+        HOSTS,
+        deployment_id="d",
+        state_dir=str(tmp_path),
+        interval=0.0,
+        on_lost=losses.append,
+    )
+    watchdog.run_once = lambda: (  # type: ignore[method-assign]
+        PeerHealth("test-mbp", 0, True, 0.0),
+        PeerHealth("mac-studio", 1, False, None, detail="gone"),
+    )
+
+    ticks = [0]
+
+    def fake_sleep(_seconds):
+        ticks[0] += 1
+        if ticks[0] > 5:
+            raise AssertionError("watchdog should have reported immediately")
+
+    watchdog.run(sleep=fake_sleep)
+
+    # Two strikes (the failure tolerance) then the exit stage, no grace.
+    assert ticks[0] == 2
+    assert len(losses) == 1

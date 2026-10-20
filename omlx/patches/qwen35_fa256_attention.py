@@ -17,14 +17,13 @@ SDPA implementation is called unchanged.
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import time
 
 import mlx.core as mx
 
+from omlx.custom_kernels.attention import fast as _attention_fast
 from omlx.custom_kernels.nax import is_nax_available
-from omlx.custom_kernels.qwen35_prefill import fast as _fa256_fast
 
 logger = logging.getLogger(__name__)
 
@@ -44,19 +43,18 @@ _MIN_ROUTE_Q_LEN = 16
 # report cliffs near 24 heads * 2048 q * 30k keys ~= 1.5e9). The kernel
 # splits the key axis into separately dispatched chunks above this budget.
 # This fixed value (~6x below that cliff) is only the fallback when
-# calibration fails; 0 disables chunking (pre-#2225 single-dispatch
-# behavior, benchmarking only).
+# calibration fails.
 _DEFAULT_DISPATCH_BUDGET = 250_000_000
 
 # The preemption threshold is wallclock-based, so a fixed work budget leaves
 # uneven margins across GPU tiers (the same work runs ~5-8x longer on an M1
-# than on an M3 Ultra). When OMLX_FA256_DISPATCH_BUDGET is unset, the patch
-# measures the kernel's own throughput once and sizes the budget so one
-# chunk dispatch targets this wallclock; the M3 Max report puts the cliff
-# above ~50ms per dispatch, so 10ms keeps a wide margin on any tier while
-# chunks stay far too coarse to cost throughput. The calibration shape is
-# small and eval overhead inflates its measured time, so the derived budget
-# errs low (real dispatches run shorter than the target) — the safe side.
+# than on an M3 Ultra). The patch measures the kernel's own throughput once
+# and sizes the budget so one chunk dispatch targets this wallclock; the M3
+# Max report puts the cliff above ~50ms per dispatch, so 10ms keeps a wide
+# margin on any tier while chunks stay far too coarse to cost throughput. The
+# calibration shape is small and eval overhead inflates its measured time, so
+# the derived budget errs low (real dispatches run shorter than the target) -
+# the safe side.
 _TARGET_DISPATCH_SECONDS = 0.010
 _CALIB_HEADS = 16
 _CALIB_KV_HEADS = 2
@@ -68,19 +66,30 @@ _CALIB_KV_LEN = 8192
 _MIN_AUTO_BUDGET = 20_000_000
 _MAX_AUTO_BUDGET = 2_000_000_000
 
+# Steel kernel tile sizes (queries x keys per block).
+_Q_BLOCK = 32
+_K_BLOCK = 8
+
 
 def _native_kernel():
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.attention import fast
     except Exception:
         return None
-    if not fast.has_symbol("qwen35_fa256_attention"):
+    if not fast.has_symbol("fa256_attention"):
         return None
-    return fast.qwen35_fa256_attention
+    return fast.fa256_attention
 
 
 def _has_quantized_cache(cache) -> bool:
     return cache is not None and hasattr(cache, "bits")
+
+
+def _bounded_sdpa_fallback(queries, keys, values, scale, mask, sinks):
+    """Keep the registered O(L) contract if the steel kernel itself fails."""
+    from .sdpa256_attention import _flash_sdpa256
+
+    return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
 
 
 def _auto_dispatch_budget(kernel, q_block: int, k_block: int) -> int:
@@ -154,7 +163,20 @@ def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
         return False
     if sinks is not None:
         return False
-    if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+    # Route only on an explicit "causal" mask, never on None. MLX's own
+    # scaled_dot_product_attention treats mask=None as "no mask at all"
+    # (unrestricted attention), but this kernel is always invoked below
+    # with causal=True -- silently causal-izing a caller that genuinely
+    # intended unrestricted attention would be a correctness bug. No
+    # currently-reachable head_dim=256 caller in this codebase actually
+    # passes mask=None at a routable q_len (audited: every mask=None call
+    # site is either single-token decode, already excluded by the q_len
+    # gate above, or a truncated-key loop where None correctly means "no
+    # mask over the already-causal-truncated keys"), so this only closes a
+    # latent hazard for future callers -- it does not change today's
+    # routing decisions.
+    # See docs/qwen35-hardening-and-optimization.md E4.
+    if not (isinstance(mask, str) and mask == "causal"):
         return False
     if keys.ndim != 4:
         return False
@@ -186,18 +208,13 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     global _PATCHED
     if _PATCHED:
         return True
-    steel_env = os.environ.get("OMLX_FA256_STEEL", "").strip()
-    if steel_env == "0":
-        return False
-    if steel_env != "1" and is_nax_available():
-        # Auto: on NAX GPUs (M5 family) stock SDPA's head_dim-256 fallback
-        # runs its matmuls on the tensor units and beats this pre-NAX steel
-        # kernel, so routing it would regress prefill (M5 Max report:
-        # 4k pp 828 -> 400 tok/s on 0.5.0). OMLX_FA256_STEEL=1 forces the
-        # kernel on for benchmarking; a NAX port of this kernel is the
-        # tracked follow-up.
+    if is_nax_available():
+        # MLX 0.32.2 selects its native split-D fused kernel for NAX
+        # head-dim-256 causal prefills with at least 1024 queries. It beats
+        # this pre-NAX steel kernel, so intercepting it would regress prefill.
         logger.info(
-            "Qwen FA-256 steel patch skipped: NAX GPU, stock SDPA is faster"
+            "Qwen FA-256 steel patch skipped: NAX GPU, MLX native fused SDPA "
+            "is faster"
         )
         return False
 
@@ -206,22 +223,17 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         logger.debug("Qwen FA-256 steel kernel unavailable; patch skipped")
         return False
 
-    min_kv_len = int(os.environ.get("OMLX_FA256_MIN_KV_LEN", min_kv_len or 2048))
-    q_block = int(os.environ.get("OMLX_FA256_Q_BLOCK", "32"))
-    k_block = int(os.environ.get("OMLX_FA256_K_BLOCK", "8"))
-    debug = os.environ.get("OMLX_FA256_DEBUG", "0") == "1"
-    budget_env = os.environ.get("OMLX_FA256_DISPATCH_BUDGET", "").strip()
-    if not _fa256_fast.fa256_supports_dispatch_budget():
-        if budget_env != "0":
-            logger.warning(
-                "Qwen FA-256 steel kernel predates chunked dispatch (issue "
-                "#2225); long-context prefill may hit the IOGPU preemption "
-                "slowdown on pre-NAX GPUs. Rebuild the native extension to "
-                "enable it."
-            )
+    min_kv_len = min_kv_len or 2048
+    q_block = _Q_BLOCK
+    k_block = _K_BLOCK
+    if not _attention_fast.fa256_supports_dispatch_budget():
+        logger.warning(
+            "Qwen FA-256 steel kernel predates chunked dispatch (issue "
+            "#2225); long-context prefill may hit the IOGPU preemption "
+            "slowdown on pre-NAX GPUs. Rebuild the native extension to "
+            "enable it."
+        )
         dispatch_budget = 0
-    elif budget_env:
-        dispatch_budget = int(budget_env)
     else:
         dispatch_budget = _auto_dispatch_budget(kernel, q_block, k_block)
 
@@ -241,16 +253,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
             mask: mx.array | None,
             sinks: mx.array | None = None,
         ) -> mx.array:
-            routed = _should_route(queries, keys, cache, mask, sinks, min_kv_len)
-            if debug:
-                logger.info(
-                    "fa256 steel lm route=%s q=%s k=%s mask=%s",
-                    routed,
-                    queries.shape,
-                    keys.shape,
-                    type(mask).__name__ if not isinstance(mask, str) else mask,
-                )
-            if routed:
+            if _should_route(queries, keys, cache, mask, sinks, min_kv_len):
                 try:
                     return kernel(
                         queries,
@@ -263,7 +266,13 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                         dispatch_budget=dispatch_budget,
                     )
                 except Exception:
-                    logger.warning("fa256 steel lm kernel failed", exc_info=True)
+                    logger.warning(
+                        "fa256 steel lm kernel failed; using bounded MLX SDPA",
+                        exc_info=True,
+                    )
+                    return _bounded_sdpa_fallback(
+                        queries, keys, values, scale, mask, sinks
+                    )
             return original_lm_sdpa(queries, keys, values, cache, scale, mask, sinks)
 
         mlx_base.scaled_dot_product_attention = patched_lm_sdpa
@@ -291,16 +300,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                 mask=None,
                 sinks=None,
             ):
-                routed = _should_route(queries, keys, cache, mask, sinks, min_kv_len)
-                if debug:
-                    logger.info(
-                        "fa256 steel vlm route=%s q=%s k=%s mask=%s",
-                        routed,
-                        queries.shape,
-                        keys.shape,
-                        type(mask).__name__ if not isinstance(mask, str) else mask,
-                    )
-                if routed:
+                if _should_route(queries, keys, cache, mask, sinks, min_kv_len):
                     try:
                         return kernel(
                             queries,
@@ -313,7 +313,13 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                             dispatch_budget=dispatch_budget,
                         )
                     except Exception:
-                        logger.warning("fa256 steel vlm kernel failed", exc_info=True)
+                        logger.warning(
+                            "fa256 steel vlm kernel failed; using bounded MLX SDPA",
+                            exc_info=True,
+                        )
+                        return _bounded_sdpa_fallback(
+                            queries, keys, values, scale, mask, sinks
+                        )
                 return original_vlm_sdpa(
                     queries, keys, values, cache, scale, mask, sinks
                 )
@@ -332,6 +338,20 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         pass
 
     if patched_any:
+        try:
+            from .. import memory_monitor
+
+            memory_monitor.register_tiled_prefill_head_dim(
+                256,
+                min_query_len=_MIN_ROUTE_Q_LEN,
+                min_kv_len=min_kv_len,
+                kv_tile=1024,
+            )
+        except Exception:
+            logger.debug(
+                "could not register Qwen FA-256 with memory_monitor",
+                exc_info=True,
+            )
         _PATCHED = True
         logger.info(
             "Qwen3.5/3.6 FA-256 steel attention patch applied "
