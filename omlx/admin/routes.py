@@ -106,10 +106,13 @@ from . import model_recommender
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
+    KeyLockout,
+    check_api_key,
     compare_keys,
     create_session_token,
     require_admin,
     validate_api_key,
+    verify_any_api_key,
     verify_api_key,
     verify_session,
     web_ui_enabled,
@@ -1848,7 +1851,7 @@ def get_system_memory_info() -> dict:
 
 
 @router.post("/api/login")
-async def login(request: LoginRequest, response: Response):
+async def login(request: LoginRequest, response: Response, http_request: Request):
     """
     Authenticate with API key and create session.
 
@@ -1858,12 +1861,14 @@ async def login(request: LoginRequest, response: Response):
     Args:
         request: LoginRequest containing the API key.
         response: FastAPI response object for setting cookies.
+        http_request: Incoming request, used for the client's key budget.
 
     Returns:
         JSON response with success status.
 
     Raises:
-        HTTPException: 400 if no API key configured, 401 if invalid.
+        HTTPException: 400 if no API key configured, 401 if invalid,
+            429 while the client is locked out.
     """
     global_settings = _get_global_settings()
     server_api_key = global_settings.auth.api_key if global_settings else None
@@ -1876,7 +1881,9 @@ async def login(request: LoginRequest, response: Response):
         )
 
     # Main key only — sub keys must not grant admin login
-    if not verify_api_key(request.api_key, server_api_key):
+    if not check_api_key(
+        http_request, lambda: verify_api_key(request.api_key, server_api_key)
+    ):
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
@@ -1996,7 +2003,9 @@ async def logout(response: Response):
 
 
 @router.get("/auto-login")
-async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
+async def auto_login(
+    http_request: Request, key: str = "", redirect: str = "/admin/dashboard"
+):
     """
     Auto-login using API key and redirect to the target admin page.
 
@@ -2004,6 +2013,7 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     authentication, bypassing the manual login form.
 
     Args:
+        http_request: Incoming request, used for the client's key budget.
         key: The API key for authentication.
         redirect: The path to redirect to after login. Must start with /admin.
 
@@ -2019,7 +2029,15 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     server_api_key = global_settings.auth.api_key if global_settings else None
 
     # Main key only — sub keys must not grant admin login
-    if not key or not server_api_key or not verify_api_key(key, server_api_key):
+    try:
+        key_ok = (
+            bool(key)
+            and bool(server_api_key)
+            and check_api_key(http_request, lambda: verify_api_key(key, server_api_key))
+        )
+    except KeyLockout:
+        key_ok = False
+    if not key_ok:
         return RedirectResponse(url="/admin", status_code=302)
 
     token = create_session_token()
@@ -2609,13 +2627,13 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer ") and gs is not None:
         token = auth_header[7:]
-        server_key = gs.auth.api_key or ""
-        sub_keys = gs.auth.sub_keys or []
-        if verify_api_key(token, server_key):
+        if check_api_key(
+            request,
+            lambda: verify_any_api_key(
+                token, gs.auth.api_key or "", gs.auth.sub_keys or []
+            ),
+        ):
             return True
-        for sk in sub_keys:
-            if verify_api_key(token, getattr(sk, "key", "")):
-                return True
 
     raise HTTPException(
         status_code=401,

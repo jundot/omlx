@@ -340,6 +340,18 @@ def _reset_decode_activity_registry():
 
 
 @pytest.fixture(autouse=True)
+def _reset_api_key_failures():
+    """Keep the process-global wrong API key budget hermetic per test."""
+    auth = sys.modules.get("omlx.admin.auth")
+    if auth is not None:
+        auth._key_failures.clear()
+    yield
+    auth = sys.modules.get("omlx.admin.auth")
+    if auth is not None:
+        auth._key_failures.clear()
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_metal_release_accounting(monkeypatch):
     """Keep the graphics footprint and its release-lag history test-local.
 

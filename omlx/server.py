@@ -359,7 +359,7 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import fingerprint_key, verify_any_api_key
+    from .admin.auth import check_api_key, fingerprint_key, verify_any_api_key
     from .utils.network import is_loopback_bind
 
     global_settings = _server_state.global_settings
@@ -401,7 +401,10 @@ async def verify_api_key(
         if global_settings is not None
         else []
     )
-    if not verify_any_api_key(api_key_value, _server_state.api_key, sub_keys):
+    if not check_api_key(
+        request,
+        lambda: verify_any_api_key(api_key_value, _server_state.api_key, sub_keys),
+    ):
         logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -985,7 +988,9 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
         )
     else:
         content = {"detail": exc.detail}
-    return JSONResponse(status_code=exc.status_code, content=content)
+    return JSONResponse(
+        status_code=exc.status_code, content=content, headers=exc.headers
+    )
 
 
 @app.exception_handler(RequestValidationError)
