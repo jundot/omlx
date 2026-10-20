@@ -122,7 +122,8 @@ _YARN_CONFIG = dataclasses.replace(
 )
 
 
-def _attention(seed: int, config=_CONFIG):
+def _attention(seed: int, config=_CONFIG, mix=None):
+    """Synthetic attention, 6-bit/64 except the ``mix`` paths' (bits, group size)."""
     mx.random.seed(seed)
     attn = language.Qwen4ExpAttention(config)
     for _, module in attn.named_modules():
@@ -133,7 +134,14 @@ def _attention(seed: int, config=_CONFIG):
             )
     for norm in (attn.q_norm, attn.k_norm, attn.indexer.q_layernorm, attn.indexer.k_layernorm):
         norm.weight = (mx.random.normal(norm.weight.shape) * 0.1).astype(mx.bfloat16)
-    nn.quantize(attn, group_size=64, bits=6, class_predicate=lambda _, m: isinstance(m, nn.Linear))
+
+    def quantization(path, module):
+        if not isinstance(module, nn.Linear):
+            return False
+        bits, group_size = (mix or {}).get(path, (6, 64))
+        return {"bits": bits, "group_size": group_size}
+
+    nn.quantize(attn, class_predicate=quantization)
     for _, module in attn.named_modules():
         if isinstance(module, nn.QuantizedLinear):
             module.scales = module.scales.astype(mx.bfloat16)
@@ -267,6 +275,37 @@ def test_masked_rows_equal_mlx_path(monkeypatch, context):
     for rows in (1, 2, 4, 8, 16):
         prologues = _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (13,))
         assert prologues == [rows]
+
+
+# Mixed-precision quants (oQ4e) mix quantizations inside one layer; the
+# grouped projection launch runs each projection on its own tile, so these
+# layers take the kernels too.
+_OQ4E_MIXES = [
+    {"v_proj": (8, 64)},  # layers 15, 27, 35
+    {
+        "indexer.index_qk_proj": (5, 64),
+        "q_proj": (4, 64),
+        "k_proj": (4, 64),
+        "v_proj": (4, 64),
+        "o_proj": (4, 64),
+    },  # layer 19
+    {"v_proj": (6, 128), "o_proj": (5, 64)},  # layer 43
+]
+
+
+@requires_kernels
+@pytest.mark.parametrize("mix", _OQ4E_MIXES)
+@pytest.mark.parametrize(
+    "context, rows",
+    [(0, 1), (700, 1), (1023, 1), (700, 4), (1500, 3), (2060, 1), (2060, 4)],
+)
+def test_mixed_quantization_rows_equal_mlx_path(monkeypatch, mix, context, rows):
+    attn = _attention(seed=9, mix=mix)
+    cache = _prefill_chunked(attn, context, seed=10)
+    prologues = _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (17, 18))
+    masked = context + rows > 2043 + 8
+    if masked or attn_fused.row_plan(context + 1, context + rows) is not None:
+        assert prologues == [rows, rows]
 
 
 @requires_kernels

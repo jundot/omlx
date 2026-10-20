@@ -44,7 +44,7 @@ from mlx_lm.models.gated_delta import normalize_qk
 from . import qwen35_gdn_verify_fused
 from .module_cache import cached_per_module
 from .qwen35_verify_qmm import is_row_exact_armed
-from .row_exact_qmv import one_row_qmv, rows_qmv
+from .row_exact_qmv import one_row_group_qmv, one_row_qmv, rows_group_qmv, rows_qmv
 
 logger = logging.getLogger(__name__)
 
@@ -1487,12 +1487,16 @@ def _build_qwen4_decode_plan(module):
         module.in_proj_a,
     )
     fused = _one_row_fused_projections(projections)
-    in_qmv = None
     if fused is not None:
         weights, scales, biases, _, group_size, bits, mode = fused
         in_qmv = one_row_qmv(
             weights, scales, biases, bits, group_size, mode, mx.bfloat16, _QWEN4_IN_QMV_RPS
         )
+    else:
+        # Projections of different quantizations (mixed-precision quants keep
+        # qkv and z/b/a apart): one launch, each projection on its own tile,
+        # returning the four outputs.
+        in_qmv = one_row_group_qmv(projections, mx.bfloat16, _QWEN4_IN_QMV_RPS)
     out = module.out_proj
     out_qmv = one_row_qmv(
         out.weight,
@@ -1617,9 +1621,10 @@ def _qwen4_verify_out_tile(rows):
 def _build_qwen4_verify_plan(module):
     """Resolved operands of the fused speculative verify, or None when ineligible.
 
-    The verify serves every canonical affine layout whose four in-projections
-    share one allocation (its projections run per row with one-row qmv_fast
-    bits, whatever the decode allow-list admits)."""
+    The verify serves every canonical affine layout (its projections run per
+    row with one-row qmv_fast bits, whatever the decode allow-list admits):
+    four in-projections sharing one allocation run concatenated, mixed
+    quantizations as one group launch with the same stacked output."""
     if not _qwen4_gdn_geometry_ok(module):
         return None
     projections = (
@@ -1636,21 +1641,24 @@ def _build_qwen4_verify_plan(module):
     ):
         return None
     fused = _one_row_fused_projections(projections)
-    if fused is None:
-        return None
-    weights, scales, biases, _, group_size, bits, mode = fused
     # 2..8-row projections use the unrolled row-exact tile for their row count.
-    in_rows = rows_qmv(
-        weights,
-        scales,
-        biases,
-        bits,
-        group_size,
-        mode,
-        mx.bfloat16,
-        _qwen4_verify_in_tile,
-        unrolled=True,
-    )
+    if fused is None:
+        in_rows = rows_group_qmv(
+            projections, mx.bfloat16, _qwen4_verify_in_tile, unrolled=True
+        )
+    else:
+        weights, scales, biases, _, group_size, bits, mode = fused
+        in_rows = rows_qmv(
+            weights,
+            scales,
+            biases,
+            bits,
+            group_size,
+            mode,
+            mx.bfloat16,
+            _qwen4_verify_in_tile,
+            unrolled=True,
+        )
     out_rows = rows_qmv(
         out.weight,
         out.scales,
@@ -1992,7 +2000,10 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             out_qmv,
         ) = plan
         if fused is None:
-            mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
+            if in_qmv is not None and _QWEN4_DECODE_QMV:
+                mixed_qkv, z, b, a = in_qmv(inputs)
+            else:
+                mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
         else:
             weights, w_scales, w_biases, split_indices, group_size, bits, mode = fused
             if in_qmv is not None and _QWEN4_DECODE_QMV:

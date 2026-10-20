@@ -1173,7 +1173,9 @@ def patched_decode(monkeypatch):
     "signatures",
     [
         ((6, 64), (6, 64), (6, 64), (6, 64)),  # one fused in-projection launch
-        ((4, 64), (5, 128), (5, 128), (5, 128)),  # four projection launches
+        ((4, 64), (5, 128), (5, 128), (5, 128)),  # one mixed-quantization group launch
+        ((5, 64), (6, 64), (6, 64), (6, 64)),
+        ((4, 64), (5, 128), (5, 128), (6, 64)),  # oQ4e layer 2's own mix
     ],
 )
 @pytest.mark.parametrize("seed", [3, 11])
@@ -1183,7 +1185,7 @@ def patched_decode(monkeypatch):
 def test_qwen4_planned_decode_is_bit_identical_to_per_call_path(
     monkeypatch, patched_decode, signatures, seed, step_fused, qmv
 ):
-    from omlx.patches.row_exact_qmv import OneRowQmv
+    from omlx.patches.row_exact_qmv import OneRowGroupQmv, OneRowQmv
 
     monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_STEP_FUSED", step_fused)
     monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_QMV", qmv)
@@ -1199,15 +1201,24 @@ def test_qwen4_planned_decode_is_bit_identical_to_per_call_path(
         launches.append("qmv")
         return projection(self, x)
 
+    group = OneRowGroupQmv.__call__
+
+    def counted_group(self, x):
+        launches.append("group")
+        return group(self, x)
+
     monkeypatch.setattr(prework_mod, "qwen4_decode_step_fused", counted_step)
     monkeypatch.setattr(OneRowQmv, "__call__", counted_projection)
+    monkeypatch.setattr(OneRowGroupQmv, "__call__", counted_group)
     module = _real_qwen4_decode_module(signatures, seed)
     _assert_planned_decode_matches_per_call_path(monkeypatch, module, 3, seed)
     # The planned steps ran the new launches: the step kernel, the out-projection
-    # and, when the four projections share one allocation, the in-projection.
-    projections = (1 + (len(set(signatures)) == 1)) if qmv else 0
+    # and the in-projection (concatenated when the four projections share one
+    # allocation, else one group launch over the four).
+    uniform = len(set(signatures)) == 1
     assert launches.count("step") == (3 if step_fused else 0)
-    assert launches.count("qmv") == 3 * projections
+    assert launches.count("qmv") == (3 * (1 + uniform) if qmv else 0)
+    assert launches.count("group") == (3 if qmv and not uniform else 0)
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -1343,9 +1354,19 @@ _PARAVIRTUAL_GPU = mx.metal.is_available() and not str(
 ).startswith("applegpu")
 
 
+# Mixed-precision allocations (oQ4e: 4-bit qkv with 5-bit/128 z/b/a; 5-bit
+# qkv with 6-bit z/b/a) run the in-projection as one group launch.
+_MIXED_SIGNATURES = [
+    ((4, 64), (5, 128), (5, 128), (5, 128)),
+    ((5, 64), (6, 64), (6, 64), (6, 64)),
+]
+
+
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.skipif(_PARAVIRTUAL_GPU, reason="per-op reference is not row-exact here")
-@pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
+@pytest.mark.parametrize(
+    "signatures", [((6, 64),) * 4, ((8, 64),) * 4, *_MIXED_SIGNATURES]
+)
 @pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9])
 @pytest.mark.parametrize("seed", [3, 11])
 @pytest.mark.parametrize("deferred", [True, False])
@@ -1403,10 +1424,11 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("signatures", [((6, 64),) * 4, *_MIXED_SIGNATURES])
 @pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8, 12, 16])
 @pytest.mark.parametrize("seed", [5, 23])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
-    monkeypatch, qwen4_verify, rows, seed
+    monkeypatch, qwen4_verify, signatures, rows, seed
 ):
     """Row t, the state after it and the conv window equal the t-th planned
     one-token decode step; a partial accept restores that step's states."""
@@ -1422,7 +1444,7 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
         return decode_step(*args)
 
     monkeypatch.setattr(prework_mod, "qwen4_decode_step_fused", counted)
-    module = _real_qwen4_decode_module(((6, 64),) * 4, seed)
+    module = _real_qwen4_decode_module(signatures, seed)
     inputs, conv_state, recurrent_state = _verify_inputs(rows, seed)
     serial = ArraysCache(size=2)
     serial[0], serial[1] = conv_state, recurrent_state
@@ -1455,9 +1477,10 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("signatures", [((6, 64),) * 4, *_MIXED_SIGNATURES])
 @pytest.mark.parametrize("rows", [2, 3])
 def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
-    monkeypatch, qwen4_verify, rows
+    monkeypatch, qwen4_verify, signatures, rows
 ):
     """Up to the per-row projection limit, every row of a batched one-token
     decode, and its next conv and recurrent states, equal that row decoded
@@ -1465,7 +1488,7 @@ def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
     from mlx_vlm.models.cache import ArraysCache
 
     assert rows <= prework_mod._QWEN4_BATCH_ROW_EXACT_ROWS
-    module = _real_qwen4_decode_module(((6, 64),) * 4, 17)
+    module = _real_qwen4_decode_module(signatures, 17)
     mx.random.seed(rows)
     inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(mx.bfloat16)
     conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)

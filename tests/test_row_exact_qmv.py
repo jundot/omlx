@@ -110,6 +110,102 @@ def test_grouped_rows_equal_one_row_quantized_matmul(k, sizes, bits, group_size,
         assert _bit_equal(output, _serial(linear, x))
 
 
+# Mixed-precision quants (oQ4e) give one layer's same-input projections
+# different quantizations; a group runs each projection on its own tile.
+MIXED_GROUPS = [
+    (
+        2560,
+        [(10240, 4, 64), (6144, 5, 128), (48, 5, 128), (48, 6, 64)],
+    ),  # DeltaNet in_proj
+    (
+        2560,
+        [(12288, 6, 64), (512, 6, 64), (512, 8, 64), (640, 6, 64)],
+    ),  # attention q/k/v/indexer
+    (2560, [(12288, 6, 64), (512, 6, 64), (512, 6, 128), (640, 6, 64)]),
+    (
+        768,
+        [(1024, 4, 64), (1024, 6, 64)],
+    ),  # qmv (4-bit) and qmv_fast (6-bit) in one group
+    (640, [(2560, 8, 128), (12, 6, 64)]),  # non-fast K with partial tiles
+]
+
+
+def _mixed_linears(k, specs):
+    return [
+        _linear(k, n, bits, group_size, seed=i + k)
+        for i, (n, bits, group_size) in enumerate(specs)
+    ]
+
+
+@pytest.mark.parametrize("k, specs", MIXED_GROUPS)
+@pytest.mark.parametrize("rows", [2, 4, 7])
+def test_mixed_grouped_rows_equal_one_row_quantized_matmul(k, specs, rows):
+    linears = _mixed_linears(k, specs)
+    x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
+    assert row_exact_qmv._group_plan(linears, x, rows) is not None
+    outputs = row_exact_qmv.quantized_linears(linears, x)
+    assert len(outputs) == len(linears)
+    for linear, output in zip(linears, outputs):
+        assert _bit_equal(output, _serial(linear, x))
+
+
+@pytest.mark.parametrize("k, specs", MIXED_GROUPS)
+@pytest.mark.parametrize(
+    "rows, tile", [(1, (1, 2, False)), (3, (1, 4, True)), (4, (2, 4, True))]
+)
+def test_mixed_grouped_tiles_equal_one_row_quantized_matmul(k, specs, rows, tile):
+    linears = _mixed_linears(k, specs)
+    x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
+    outputs = row_exact_qmv.quantized_linears_tiled(linears, x, *tile)
+    assert outputs is not None
+    for linear, output in zip(linears, outputs):
+        assert _bit_equal(output, _serial(linear, x))
+    if tile[2]:
+        assert list(row_exact_qmv._UNROLLED_VERDICTS.values()) == [True]
+
+
+@pytest.mark.parametrize("k, specs", MIXED_GROUPS[:3])
+@pytest.mark.parametrize("rps", [1, 2, 4])
+def test_one_row_group_qmv_equals_quantized_matmul(k, specs, rps):
+    linears = _mixed_linears(k, specs)
+    x = mx.random.normal((1, 1, k)).astype(mx.bfloat16)
+    launch = row_exact_qmv.one_row_group_qmv(linears, mx.bfloat16, rps)
+    assert launch is not None
+    outputs = launch(x)
+    assert len(outputs) == len(linears)
+    for linear, output in zip(linears, outputs):
+        assert _bit_equal(output, linear(x))
+
+
+@pytest.mark.parametrize("k, specs", MIXED_GROUPS[:3])
+@pytest.mark.parametrize("unrolled", [False, True])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 8])
+def test_rows_group_qmv_stacks_one_row_quantized_matmul(k, specs, unrolled, rows):
+    linears = _mixed_linears(k, specs)
+    tiles = {1: (2, 1), 2: (1, 2), 3: (2, 3), 4: (4, 2), 5: (2, 5), 8: (4, 2)}
+    launch = row_exact_qmv.rows_group_qmv(linears, mx.bfloat16, tiles.get, unrolled)
+    assert launch is not None
+    x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
+    stacked = launch(x)
+    assert stacked.shape == (1, rows, sum(n for n, _, _ in specs))
+    start = 0
+    for linear, (n, _, _) in zip(linears, specs):
+        assert _bit_equal(stacked[..., start : start + n], _serial(linear, x))
+        start += n
+    if unrolled:
+        assert all(row_exact_qmv._UNROLLED_VERDICTS.values())
+
+
+def test_one_row_group_qmv_needs_qmv_fast_layouts():
+    # K = 640 is off every qmv_fast block: stock one-row matmul runs qmv there.
+    assert (
+        row_exact_qmv.one_row_group_qmv(
+            _mixed_linears(*MIXED_GROUPS[4]), mx.bfloat16, 1
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("rows", [5, 7, 11, 13])
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("grouped", [False, True])
