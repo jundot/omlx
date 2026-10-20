@@ -224,6 +224,7 @@ from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.decision import DecisionEngine
+from .engine.image import ImageEngine
 from .engine_pool import (
     CLAUDE_DESKTOP_TIER_FAMILY,
     EnginePool,
@@ -270,6 +271,7 @@ class EngineType(Enum):
     EMBEDDING = "embedding"
     RERANKER = "reranker"
     DECISION = "decision"
+    IMAGE = "image"
 
 
 @dataclass
@@ -883,6 +885,9 @@ else:
     )
     # Before admin_router so the page routes keep their original order.
     app.include_router(_web_ui.router)
+from .api.image_routes import router as image_router
+
+app.include_router(image_router, dependencies=[Depends(verify_inference_api_key)])
 app.include_router(admin_router)
 
 _cluster_routes_registered = False
@@ -1551,6 +1556,10 @@ async def get_engine(
                 fb_engine = await pool.get_engine(
                     _server_state.default_model, **_fallback_kwargs
                 )
+                if not isinstance(fb_engine, BaseEngine):
+                    if _lease:
+                        await pool.release_engine(_server_state.default_model)
+                    raise ValueError("Default model does not support chat")
                 if _lease and _leased_out is not None:
                     _leased_out.append(_server_state.default_model)
                 return fb_engine
@@ -1601,6 +1610,12 @@ async def get_engine(
                     status_code=400,
                     detail=f"Model '{model_id}' is not a reranker model. "
                     f"Use a SequenceClassification model for reranking.",
+                )
+        elif engine_type == EngineType.IMAGE:
+            if not isinstance(engine, ImageEngine):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model {model_id!r} is not an image-generation model",
                 )
         elif engine_type == EngineType.DECISION:
             if not isinstance(engine, DecisionEngine):
@@ -1658,6 +1673,8 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
         return "Use /v1/embeddings for embedding models."
     if isinstance(engine, RerankerEngine):
         return "Use /v1/rerank for reranker models."
+    if isinstance(engine, ImageEngine):
+        return "Use /v1/images/generations for image models."
     if isinstance(engine, DecisionEngine):
         return "Use /v1/systemone for decision models."
     return "Use the model's dedicated endpoint (see /v1/models)."
@@ -2663,7 +2680,11 @@ def init_server(
         )
 
     # Set default model (from settings file, fallback to first model)
-    available_models = _server_state.engine_pool.get_model_ids()
+    available_models = [
+        mid
+        for mid in _server_state.engine_pool.get_model_ids()
+        if _server_state.engine_pool._entries[mid].model_type != "image"
+    ]
     if available_models:
         if settings_default:
             if settings_default in available_models:
@@ -3838,13 +3859,17 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
         # blocks below, and the latter runs with or without a settings manager,
         # so they are built here rather than inside the settings guard.
         physical_ids = {m["id"] for m in status["models"]}
+        image_ids = {
+            m["id"] for m in status["models"] if m.get("model_type") == "image"
+        }
         existing_ids = {m.id for m in models}
         if settings_manager:
             for profile in settings_manager.list_exposed_profile_models():
                 source_model_id = profile["source_model_id"]
                 profile_model_id = profile["model_id"]
                 if (
-                    source_model_id not in physical_ids
+                    source_model_id in image_ids
+                    or source_model_id not in physical_ids
                     or source_model_id in excluded_model_ids
                     or profile_model_id in existing_ids
                 ):
@@ -3885,7 +3910,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                         slot_id,
                     )
                     continue
-                if tier_model not in physical_ids:
+                if tier_model not in physical_ids or tier_model in image_ids:
                     logger.warning(
                         "Skipping Claude Desktop tier alias %r: tier model %r "
                         "is not an available model",
