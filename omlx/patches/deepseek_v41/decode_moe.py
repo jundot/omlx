@@ -474,61 +474,81 @@ inline void aff_mma8(W w, S s, B b, uint r0, X x, uint XS, uint lane, uint ks,
 }
 // Top-k of scores + bias with ties to the lower index (any tie order is spec-conformant).
 template <int NE, int K>
-inline void topk_select(const device float* scores, const device float* bias, threadgroup int* chosen,
-                        threadgroup float* scratch_v, threadgroup int* scratch_i, uint tid, uint tpg) {
-    for (int k = 0; k < K; ++k) {
-        float best = -INFINITY; int bi = 0x7FFFFFFF;
-        for (uint e = tid; e < uint(NE); e += tpg) {
-            bool taken = false;
-            for (int j = 0; j < k; ++j) taken |= chosen[j] == int(e);
-            const float v = taken ? -INFINITY : scores[e] + bias[e];
-            if (v > best || (v == best && int(e) < bi)) { best = v; bi = int(e); }
+inline void topk_select(const device float* scores, const device float* bias, threadgroup int* chosen, uint tid) {
+    // Simdgroup 0 keeps the biased scores in registers (lane l holds experts l + 32 i) and takes
+    // the K maxima in turn, ties to the lower index; taken experts read as -inf.
+    constexpr int PER = (NE + 31) / 32;
+    if (tid < 32) {
+        float v[PER];
+        for (int i = 0; i < PER; ++i) {
+            const uint e = tid + 32 * i;
+            v[i] = e < uint(NE) ? scores[e] + bias[e] : -INFINITY;
         }
-        for (uint off = 16; off > 0; off >>= 1) {
-            const float ov = simd_shuffle_xor(best, off); const int oi = simd_shuffle_xor(bi, off);
-            if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+        for (int k = 0; k < K; ++k) {
+            float best = -INFINITY; int bi = 0x7FFFFFFF;
+            for (int i = 0; i < PER; ++i) {
+                const int e = int(tid) + 32 * i;
+                if (e < NE && (v[i] > best || (v[i] == best && e < bi))) { best = v[i]; bi = e; }
+            }
+            for (uint off = 16; off > 0; off >>= 1) {
+                const float ov = simd_shuffle_xor(best, off); const int oi = simd_shuffle_xor(bi, off);
+                if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+            }
+            if (tid == 0) chosen[k] = bi;
+            for (int i = 0; i < PER; ++i) if (int(tid) + 32 * i == bi) v[i] = -INFINITY;
         }
-        if (tid % 32 == 0) { scratch_v[tid / 32] = best; scratch_i[tid / 32] = bi; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            float b = scratch_v[0]; int ix = scratch_i[0];
-            for (uint s = 1; s < (tpg + 31) / 32; ++s)
-                if (scratch_v[s] > b || (scratch_v[s] == b && scratch_i[s] < ix)) { b = scratch_v[s]; ix = scratch_i[s]; }
-            chosen[k] = ix;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 """
 
-# M1: gate scores (one simdgroup per expert row) + act_quant(x) shared by all experts.
+# M1: gate scores of NB tokens + act_quant(x) shared by all experts. KS simdgroups split one
+# expert row (8 consecutive dims per lane and step, one 16-byte weight load for all NB
+# tokens); the KS partial dots are added in a fixed order.
 _GATE = r"""
-    const uint lane = thread_index_in_simdgroup;
-    const uint row = threadgroup_position_in_grid.x * (TPG / 32) + simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup, sgi = simdgroup_index_in_threadgroup, part = sgi % KS;
+    const uint row = threadgroup_position_in_grid.x * (TPG / 32 / KS) + sgi / KS;
+    threadgroup float pdot[TPG / 32][NB];
     if (row < uint(NE)) {
-        float dot = 0.0f;
-        for (uint k = lane * 4; k < uint(DIM); k += 128) {
-            const float4 a = float4(float(x[k]), float(x[k + 1]), float(x[k + 2]), float(x[k + 3]));
-            const float4 b = float4(float(w[row * DIM + k]), float(w[row * DIM + k + 1]),
-                                    float(w[row * DIM + k + 2]), float(w[row * DIM + k + 3]));
-            dot += a.x * b.x; dot += a.y * b.y; dot += a.z * b.z; dot += a.w * b.w;
+        float dot[NB];
+        for (int b = 0; b < NB; ++b) dot[b] = 0.0f;
+        const device bfloat16_t* wr = w + row * DIM;
+        for (uint k = part * (DIM / KS) + lane * 8; k < (part + 1) * (DIM / KS); k += 256) {
+            const float4 w0 = float4(*(const device packed_bfloat4*)(wr + k));
+            const float4 w1 = float4(*(const device packed_bfloat4*)(wr + k + 4));
+            for (int b = 0; b < NB; ++b) {
+                const auto xb = x + b * DIM;
+                const float4 a0 = float4(*(const device packed_bfloat4*)(xb + k));
+                const float4 a1 = float4(*(const device packed_bfloat4*)(xb + k + 4));
+                dot[b] += a0.x * w0.x; dot[b] += a0.y * w0.y; dot[b] += a0.z * w0.z; dot[b] += a0.w * w0.w;
+                dot[b] += a1.x * w1.x; dot[b] += a1.y * w1.y; dot[b] += a1.z * w1.z; dot[b] += a1.w * w1.w;
+            }
         }
-        dot = simd_sum(dot);
-        if (lane == 0) {
-            const float raw = dot / temp[0];
+        for (int b = 0; b < NB; ++b) {
+            const float dp = simd_sum(dot[b]);
+            if (lane == 0) pdot[sgi][b] = dp;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row < uint(NE) && part == 0 && lane == 0) {
+        for (int b = 0; b < NB; ++b) {
+            float d = 0.0f;
+            for (uint p = 0; p < KS; ++p) d += pdot[sgi + p][b];
+            const float raw = d / temp[0];
             // torch F.softplus: x above threshold 20, else log1p(exp(x)) (accurate for tiny exp(x)).
             const float y = metal::precise::exp(raw);
             const float sp = raw > 20.0f ? raw
                 : (y < 1e-4f ? y * (1.0f - y * (0.5f - y * (1.0f / 3.0f))) : metal::precise::log(1.0f + y));
-            scores[row] = metal::precise::sqrt(sp);
+            scores[b * NE + row] = metal::precise::sqrt(sp);
         }
     }
     // act_quant(x) for the expert GEMMs: groups of 32, spread over the gate grid.
-    const uint group = threadgroup_position_in_grid.x * (TPG / 32) + simdgroup_index_in_threadgroup;
-    for (uint g = group; g < uint(DIM / 32); g += NGROUPS_STRIDE) {
-        const float v = float(x[g * 32 + lane]);
+    const uint group = threadgroup_position_in_grid.x * (TPG / 32) + sgi;
+    for (uint gb = group; gb < uint(NB * (DIM / 32)); gb += NGROUPS_STRIDE) {
+        const uint b = gb / (DIM / 32), g = gb % (DIM / 32);
+        const float v = float(x[b * DIM + g * 32 + lane]);
         const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-        xq[g * 32 + lane] = act_quant_value(v, s);
+        xq[b * DIM + g * 32 + lane] = act_quant_value(v, s);
     }
 """
 
@@ -536,11 +556,10 @@ _GATE = r"""
 # routing weight, bf16, and act_quant over each 32-row block (= one threadgroup).
 _UP = r"""
     threadgroup int chosen[8];
-    threadgroup float sv[32]; threadgroup int si[32];
     threadgroup float hblock[32];
     const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
-    topk_select<NE, TOPK>(scores, bias, chosen, sv, si, tid, 256);
+    topk_select<NE, TOPK>(scores, bias, chosen, tid);
     const uint slot = threadgroup_position_in_grid.y;           // 0..TOPK-1 routed, TOPK shared
     // routing weights (unbiased scores, normalized, scaled) -- identical in every threadgroup
     float wsum = 0.0f;
@@ -604,43 +623,6 @@ _DOWN = r"""
 
 
 # ---- batched decode MoE (NB tokens) --------------------------------------------------------
-# Gate: each simdgroup loads its expert row once and scores all NB tokens (same per-token
-# order as _GATE). act_quant(x) per token.
-_GATE_NB = r"""
-    const uint lane = thread_index_in_simdgroup;
-    const uint row = threadgroup_position_in_grid.x * (TPG / 32) + simdgroup_index_in_threadgroup;
-    if (row < uint(NE)) {
-        float dot[NB];
-        for (int b = 0; b < NB; ++b) dot[b] = 0.0f;
-        for (uint k = lane * 4; k < uint(DIM); k += 128) {
-            const float4 wv = float4(float(w[row * DIM + k]), float(w[row * DIM + k + 1]),
-                                     float(w[row * DIM + k + 2]), float(w[row * DIM + k + 3]));
-            for (int b = 0; b < NB; ++b) {
-                const auto xb = x + b * DIM;
-                const float4 a = float4(float(xb[k]), float(xb[k + 1]), float(xb[k + 2]), float(xb[k + 3]));
-                dot[b] += a.x * wv.x; dot[b] += a.y * wv.y; dot[b] += a.z * wv.z; dot[b] += a.w * wv.w;
-            }
-        }
-        for (int b = 0; b < NB; ++b) {
-            const float d = simd_sum(dot[b]);
-            if (lane == 0) {
-                const float raw = d / temp[0];
-                const float y = metal::precise::exp(raw);
-                const float sp = raw > 20.0f ? raw
-                    : (y < 1e-4f ? y * (1.0f - y * (0.5f - y * (1.0f / 3.0f))) : metal::precise::log(1.0f + y));
-                scores[b * NE + row] = metal::precise::sqrt(sp);
-            }
-        }
-    }
-    const uint group = threadgroup_position_in_grid.x * (TPG / 32) + simdgroup_index_in_threadgroup;
-    for (uint gb = group; gb < uint(NB * (DIM / 32)); gb += NGROUPS_STRIDE) {
-        const uint b = gb / (DIM / 32), g = gb % (DIM / 32);
-        const float v = float(x[b * DIM + g * 32 + lane]);
-        const float s = act_scale(max(simd_max(abs(v)), 1e-4f));
-        xq[b * DIM + g * 32 + lane] = act_quant_value(v, s);
-    }
-"""
-
 # Up: threadgroup (x, y) = (column, 32-row block). Column x < NB * TOPK is (token x / TOPK,
 # routed slot x % TOPK) and runs _UP's routed path on that token; the last column runs the
 # shared expert for all NB tokens with one weight read (fp8_rows_nb). Columns vary fastest in
@@ -649,7 +631,6 @@ _GATE_NB = r"""
 # to ~34 distinct experts; row-block-major order: B = 8 +9%, B = 4 +4%).
 _UP_NB = r"""
     threadgroup int chosen[8];
-    threadgroup float sv[32]; threadgroup int si[32];
     threadgroup float hblock[NB][32];
     const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
@@ -658,7 +639,7 @@ _UP_NB = r"""
     if (ys < uint(NB * TOPK)) {
         const uint b = ys / TOPK, slot = ys % TOPK;
         const device float* sc_b = scores + b * NE;
-        topk_select<NE, TOPK>(sc_b, bias, chosen, sv, si, tid, 256);
+        topk_select<NE, TOPK>(sc_b, bias, chosen, tid);
         float wsum = 0.0f;
         for (int j = 0; j < TOPK; ++j) wsum += sc_b[chosen[j]];
         const float rw = sc_b[chosen[slot]] / (wsum + 1e-20f) * route_scale[0];
@@ -705,7 +686,6 @@ _UP_NB = r"""
 # _UP_NB with the shared expert on simdgroup matrices (fp8_mma8); routed path unchanged.
 _UP_NB_MMA = r"""
     threadgroup int chosen[8];
-    threadgroup float sv[32]; threadgroup int si[32];
     threadgroup float hblock[NB][32];
     const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
@@ -714,7 +694,7 @@ _UP_NB_MMA = r"""
     if (ys < uint(NB * TOPK)) {
         const uint b = ys / TOPK, slot = ys % TOPK;
         const device float* sc_b = scores + b * NE;
-        topk_select<NE, TOPK>(sc_b, bias, chosen, sv, si, tid, 256);
+        topk_select<NE, TOPK>(sc_b, bias, chosen, tid);
         float wsum = 0.0f;
         for (int j = 0; j < TOPK; ++j) wsum += sc_b[chosen[j]];
         const float rw = sc_b[chosen[slot]] / (wsum + 1e-20f) * route_scale[0];
@@ -892,13 +872,32 @@ _ROLES = ("R1", "R3", "R2", "S1", "S3", "S2")
 
 
 @cache
+def _gate_kernel():
+    return mx.fast.metal_kernel(name="v41_decode_moe_gate", input_names=["x", "w", "temp"],
+                                output_names=["scores", "xq"], source=_GATE, header=_HEADER)
+
+
+def _gate(moe, x, config):
+    """Gate scores [NB * n_experts] and act_quant(x) [NB * dim] of x: [NB, dim] bf16."""
+    nb, dim, ne = x.shape[0], config.dim, config.n_routed_experts
+    tpg = 256
+    ks = next(k for k in (4, 2, 1) if dim % (256 * k) == 0)
+    rows = tpg // 32 // ks
+    n_tg = (ne + rows - 1) // rows
+    return _gate_kernel()(
+        inputs=[x, moe.gate.weight, _const((getattr(config, "gate_temp", 1.0),))],
+        template=[("NE", ne), ("DIM", dim), ("TPG", tpg), ("KS", ks), ("NGROUPS_STRIDE", n_tg * (tpg // 32)),
+                  ("NB", nb)],
+        grid=(n_tg * tpg, 1, 1), threadgroup=(tpg, 1, 1),
+        output_shapes=[(nb * ne,), (nb * dim,)], output_dtypes=[mx.float32, mx.float32])
+
+
+@cache
 def _kernels_nb(mma, formats):
     header = format_macros(zip(_ROLES, formats)) + _HEADER
     tag = format_tag(formats)
     up_inputs = ["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "b1p", "w3", "s3p", "b3p",
                  "sw1", "ss1", "sb1", "sw3", "ss3", "sb3"]
-    gate = mx.fast.metal_kernel(name="v41_decode_moe_gate_nb", input_names=["x", "w", "temp"],
-                                output_names=["scores", "xq"], source=_GATE_NB, header=_HEADER)
     up = mx.fast.metal_kernel(
         name=f"v41_decode_moe_up_nb_{tag}", input_names=up_inputs,
         output_names=["hq", "hqs", "out_idx", "out_w"], source=_UP_NB, header=header)
@@ -915,7 +914,7 @@ def _kernels_nb(mma, formats):
         down_s = mx.fast.metal_kernel(name=f"v41_decode_moe_down_shared_nb_mma_{tag}",
                                       input_names=["hqs", "partial", "sw2", "ss2", "sb2"],
                                       output_names=["out"], source=_DOWN_S_NB_MMA, header=header)
-    return gate, up, down_r, down_s
+    return up, down_r, down_s
 
 
 def fused_decode_moe_nb(moe, x, config, mma=None):
@@ -926,15 +925,9 @@ def fused_decode_moe_nb(moe, x, config, mma=None):
     nb = x.shape[0]
     formats = _formats(moe)
     mma = (use_mma(nb) if mma is None else mma) and all(f[0] in ("mxfp8", "affine") for f in formats[3:])
-    gate_k, up_k, down_r, down_s = _kernels_nb(mma, formats)
+    up_k, down_r, down_s = _kernels_nb(mma, formats)
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
-    tpg = 256
-    n_tg = (ne + tpg // 32 - 1) // (tpg // 32)
-    scores, xq = gate_k(
-        inputs=[x, moe.gate.weight, _const((getattr(config, "gate_temp", 1.0),))],
-        template=[("NE", ne), ("DIM", dim), ("TPG", tpg), ("NGROUPS_STRIDE", n_tg * (tpg // 32)), ("NB", nb)],
-        grid=(n_tg * tpg, 1, 1), threadgroup=(tpg, 1, 1),
-        output_shapes=[(nb * ne,), (nb * dim,)], output_dtypes=[mx.float32, mx.float32])
+    scores, xq = _gate(moe, x, config)
     e, s = moe.experts, moe.shared_experts
     hq, hqs, idx, w = up_k(
         inputs=[scores, moe.gate.bias, _const((config.route_scale,)), _const((config.swiglu_limit,)), xq,
@@ -969,8 +962,6 @@ def _const(values):
 def _kernels(formats):
     header = format_macros(zip(_ROLES, formats)) + _HEADER
     tag = format_tag(formats)
-    gate = mx.fast.metal_kernel(name="v41_decode_moe_gate", input_names=["x", "w", "temp"],
-                                output_names=["scores", "xq"], source=_GATE, header=_HEADER)
     up = mx.fast.metal_kernel(
         name=f"v41_decode_moe_up_{tag}",
         input_names=["scores", "bias", "route_scale", "limit", "xq", "w1", "s1p", "b1p", "w3", "s3p", "b3p",
@@ -980,7 +971,7 @@ def _kernels(formats):
         name=f"v41_decode_moe_down_{tag}",
         input_names=["hq", "idx", "w2", "s2p", "b2p", "sw2", "ss2", "sb2"],
         output_names=["out"], source=_DOWN, header=header)
-    return gate, up, down
+    return up, down
 
 
 def supported(moe, x, config):
@@ -999,16 +990,9 @@ def supported(moe, x, config):
 
 def fused_decode_moe(moe, x, config):
     """x: [1, 1, dim] bf16 (ffn_norm output). Returns ([1, 1, dim] bf16, idx, weights)."""
-    gate_k, up_k, down_k = _kernels(_formats(moe))
+    up_k, down_k = _kernels(_formats(moe))
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
-    xf = x.reshape(-1)
-    tpg = 256
-    n_tg = (ne + tpg // 32 - 1) // (tpg // 32)
-    scores, xq = gate_k(
-        inputs=[xf, moe.gate.weight, _const((getattr(config, "gate_temp", 1.0),))],
-        template=[("NE", ne), ("DIM", dim), ("TPG", tpg), ("NGROUPS_STRIDE", n_tg * (tpg // 32))],
-        grid=(n_tg * tpg, 1, 1), threadgroup=(tpg, 1, 1),
-        output_shapes=[(ne,), (dim,)], output_dtypes=[mx.float32, mx.float32])
+    scores, xq = _gate(moe, x.reshape(1, -1), config)
     e, s = moe.experts, moe.shared_experts
     hq, idx, w = up_k(
         inputs=[scores, moe.gate.bias, _const((config.route_scale,)),
