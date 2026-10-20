@@ -2447,7 +2447,7 @@ def test_forget_member_preserves_other_pairings_or_leaves_cluster(monkeypatch, n
 
     manager = SimpleNamespace(
         node_id="self",
-        list_paired=lambda: [{"node_id": node} for node in sorted(peers)],
+        paired_devices=lambda: [{"node_id": node} for node in sorted(peers)],
         unpair=lambda node: peers.remove(node),
     )
     monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
@@ -2477,7 +2477,7 @@ def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, st
     removed = []
     manager = SimpleNamespace(
         node_id="self",
-        list_paired=lambda: [{"node_id": "offline"}],
+        paired_devices=lambda: [{"node_id": "offline"}],
         unpair=removed.append,
     )
     deployment = SimpleNamespace(
@@ -2511,7 +2511,7 @@ def test_forget_member_maps_pairing_errors(monkeypatch):
         raise PairingStateError("approval is already in progress")
 
     manager = SimpleNamespace(
-        node_id="self", list_paired=lambda: [{"node_id": "busy"}], unpair=unpair
+        node_id="self", paired_devices=lambda: [{"node_id": "busy"}], unpair=unpair
     )
     monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
     monkeypatch.setattr(

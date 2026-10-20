@@ -3920,7 +3920,7 @@ async def forget_cluster(node_id: str | None = None):
     from .pairing_routes import PairingError, _manager, _pairing_http_error
 
     manager = _manager()
-    peers = await asyncio.to_thread(manager.list_paired)
+    peers = await asyncio.to_thread(manager.paired_devices)
     deployments = await asyncio.to_thread(get_cluster_registry().list)
     forget_all = node_id is None or node_id == manager.node_id
     affected = [
