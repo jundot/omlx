@@ -12,6 +12,7 @@ import enum
 import errno
 import fcntl
 import functools
+import glob
 import json
 import logging
 import os
@@ -41,6 +42,8 @@ from huggingface_hub.utils import tqdm as _hf_tqdm
 # (huggingface-hub>=1.19.0) guarantees them. Re-verify both when bumping the hub.
 from huggingface_hub.utils._xet import abort_xet_session
 
+from .. import gguf
+
 logger = logging.getLogger(__name__)
 
 # Timeout for HuggingFace API calls (seconds).
@@ -65,6 +68,12 @@ _REAP_INTERVAL = 0.5
 
 # Seconds of byte-count history the reported speed averages over.
 _SPEED_WINDOW = 1.0
+
+# Seconds of byte-count history the ETA averages over.
+_ETA_WINDOW = 60.0
+
+# Seconds of transfer before the ETA shows; the slow start reads as hours.
+_ETA_WARMUP = 10.0
 
 
 class _SlidingRate:
@@ -217,6 +226,40 @@ class _DownloadStalledError(RuntimeError):
 
 class _NonXetDownloadError(RuntimeError):
     """Raised when the isolated HTTP fallback process fails."""
+
+
+class _MissingFilesError(ValueError):
+    """Raised when selected files are not in the repository."""
+
+
+class _UnsupportedRepoError(ValueError):
+    """Raised for a repository no engine oMLX runs can load."""
+
+
+def _unsupported_repo_reason(model_info) -> str | None:
+    if getattr(model_info, "library_name", None) != "splash":
+        return None
+    card = getattr(model_info, "card_data", None)
+    base = getattr(card, "base_model", None) or []
+    base = [base] if isinstance(base, str) else list(base)
+    mlx = next((name for name in base if name.startswith("mlx-community/")), None)
+    instead = mlx or "an MLX or GGUF checkpoint of the model"
+    return (
+        "This is a Splash package, a prebuilt format Splash stopped loading in "
+        f"1.3.1. Download {instead} instead."
+    )
+
+
+def _check_selected_files(task: "DownloadTask", model_info) -> None:
+    siblings = getattr(model_info, "siblings", None)
+    if not task.files or not isinstance(siblings, (list, tuple)):
+        return
+    names = {getattr(sibling, "rfilename", None) for sibling in siblings}
+    missing = [name for name in task.files if name not in names]
+    if missing:
+        raise _MissingFilesError(
+            f"Not in repository '{task.repo_id}': {', '.join(missing)}"
+        )
 
 
 @dataclass(frozen=True)
@@ -414,6 +457,8 @@ class DownloadTask:
     downloaded_size: int = 0
     # Bytes/second over the last _SPEED_WINDOW; 0.0 when not transferring.
     speed_bps: float = 0.0
+    # Bytes/second over the last _ETA_WINDOW. Never in to_dict().
+    eta_speed_bps: float = 0.0
     error: str = ""
     # Request-supplied HF/MS token for restart resume. Never in to_dict().
     token: str = ""
@@ -423,6 +468,15 @@ class DownloadTask:
     started_at: float = 0.0
     completed_at: float = 0.0
     retry_count: int = 0
+    # Repo paths to fetch; None fetches the whole repo.
+    files: list[str] | None = None
+
+    def eta_seconds(self) -> int | None:
+        """Seconds left at the _ETA_WINDOW rate, or None when unknown."""
+        remaining = self.total_size - self.downloaded_size
+        if self.total_size <= 0 or remaining <= 0 or self.eta_speed_bps <= 0:
+            return None
+        return round(remaining / self.eta_speed_bps)
 
     def to_dict(self) -> dict:
         """Serialize task to a JSON-compatible dict."""
@@ -434,12 +488,14 @@ class DownloadTask:
             "total_size": self.total_size,
             "downloaded_size": self.downloaded_size,
             "speed_bps": round(self.speed_bps, 1),
+            "eta_seconds": self.eta_seconds(),
             "error": self.error,
             "ignore_patterns": self.ignore_patterns,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "retry_count": self.retry_count,
+            "files": self.files,
         }
 
     @classmethod
@@ -459,6 +515,7 @@ class DownloadTask:
             started_at=float(data.get("started_at", 0.0)),
             completed_at=float(data.get("completed_at", 0.0)),
             retry_count=int(data.get("retry_count", 0)),
+            files=data.get("files") or None,
         )
 
 
@@ -588,16 +645,153 @@ def _sum_safetensors_blob_bytes(siblings) -> int | None:
     return sum(sizes) if sizes else None
 
 
-def _sum_snapshot_bytes(siblings, ignore_patterns: list[str] | None) -> int | None:
-    """Sum sizes of the files snapshot_download fetches under ``ignore_patterns``.
+def _sum_snapshot_bytes(
+    siblings,
+    ignore_patterns: list[str] | None,
+    allow_patterns: list[str] | None = None,
+) -> int | None:
+    """Sum sizes of the files snapshot_download fetches under these patterns.
 
     Returns None when siblings are missing or have no sizes.
     """
     sizes = _sibling_sizes(siblings)
     if not sizes:
         return None
-    kept = filter_repo_objects(sizes, ignore_patterns=ignore_patterns)
+    kept = filter_repo_objects(
+        sizes, allow_patterns=allow_patterns, ignore_patterns=ignore_patterns
+    )
     return sum(sizes[name] for name in kept)
+
+
+def _normalize_files(files) -> list[str] | None:
+    if files is None:
+        return None
+    cleaned: set[str] = set()
+    for name in files:
+        if not isinstance(name, str):
+            raise ValueError(f"Invalid file path: {name!r}")
+        name = name.strip()
+        parts = name.split("/")
+        if not name or any(part in ("", ".", "..") for part in parts):
+            raise ValueError(f"Invalid file path: '{name}'")
+        cleaned.add(name)
+    if not cleaned:
+        raise ValueError("No files selected")
+    return sorted(cleaned)
+
+
+def _file_patterns(files: list[str]) -> list[str]:
+    """Hub matches allow_patterns with fnmatch; escape names to match literally."""
+    return [glob.escape(name) for name in files]
+
+
+MODEL_FORMATS = ("mlx", "gguf", "all")
+
+# PyTorch copies a whole-repo download skips when safetensors exist.
+_SAFETENSORS_REPO_IGNORE = ["*.bin", "original/**", "consolidated.*.pth"]
+
+# Files a safetensors checkpoint loads without: docs, media, other formats.
+_OPTIONAL_SUFFIXES = (
+    ".md", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".pdf",
+    ".gguf", ".bin", ".pth", ".pt", ".onnx", ".onnx_data", ".h5",
+    ".msgpack", ".ckpt", ".tflite",
+)
+_OPTIONAL_DIRS = frozenset({"original", "onnx", "openvino", "coreml"})
+
+
+def _repo_layout(names: list[str]) -> str:
+    """'safetensors', 'gguf' or 'other', by the weight files a repo holds."""
+    if any(name.endswith(".safetensors") for name in names):
+        return "safetensors"
+    if any(name.lower().endswith(".gguf") for name in names):
+        return "gguf"
+    return "other"
+
+
+def _optional_for_safetensors(name: str) -> bool:
+    lower = name.lower()
+    base = lower.rsplit("/", 1)[-1]
+    if base == ".gitattributes" or base.startswith(("readme", "license")):
+        return True
+    if "/" in lower and lower.split("/", 1)[0] in _OPTIONAL_DIRS:
+        return True
+    return lower.endswith(_OPTIONAL_SUFFIXES)
+
+
+def _default_mmproj(names: list[str]) -> dict[str, str]:
+    """Map each folder to the vision projector its GGUFs pair with."""
+    by_folder: dict[str, list[str]] = {}
+    for name in names:
+        if name.lower().endswith(".gguf") and gguf.file_kind(name) == "mmproj":
+            by_folder.setdefault(name.rpartition("/")[0], []).append(name)
+    return {
+        folder: min(candidates, key=gguf.projector_rank)
+        for folder, candidates in by_folder.items()
+    }
+
+
+def _is_local_copy(path: Path, size: int) -> bool:
+    try:
+        return path.is_file() and (size <= 0 or path.stat().st_size == size)
+    except OSError:
+        return False
+
+
+def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
+    """Add download hints to model-info file rows; return the repo layout.
+
+    Only root GGUFs are models (subfolders hold split copies and MTP heads).
+    """
+    names = [row["name"] for row in files]
+    layout = _repo_layout(names)
+    projectors = _default_mmproj(names)
+    # A selection starts from what downloading the whole repo would fetch.
+    preselected = (
+        set(filter_repo_objects(names, ignore_patterns=_SAFETENSORS_REPO_IGNORE))
+        if layout == "safetensors"
+        else set()
+    )
+    for row in files:
+        name = row["name"]
+        lower = name.lower()
+        row["group"] = None
+        row["mmproj"] = None
+        if lower.endswith(".gguf") and "/" not in name:
+            row["kind"] = gguf.file_kind(name)
+            if row["kind"] == "gguf":
+                split = gguf.SPLIT_RE.match(name)
+                row["group"] = split["prefix"] if split else None
+                row["mmproj"] = projectors.get(name.rpartition("/")[0])
+        elif lower.endswith(".safetensors"):
+            row["kind"] = "weights"
+        else:
+            row["kind"] = "other"
+        optional = _optional_for_safetensors(name)
+        row["required"] = layout == "safetensors" and not optional
+        row["preselected"] = name in preselected
+        row["local"] = local_dir is not None and _is_local_copy(
+            local_dir / name, row["size"]
+        )
+    return layout
+
+
+def _gguf_params(model) -> int | None:
+    gguf = getattr(model, "gguf", None)
+    if not isinstance(gguf, dict):
+        return None
+    try:
+        total = int(gguf.get("total") or 0)
+    except (TypeError, ValueError):
+        return None
+    return total if total > 0 else None
+
+
+def _gguf_architecture(model) -> str | None:
+    gguf = getattr(model, "gguf", None)
+    if not isinstance(gguf, dict):
+        return None
+    architecture = gguf.get("architecture")
+    return architecture if isinstance(architecture, str) else None
 
 
 def _fetch_safetensors_blob_bytes(api: HfApi, repo_id: str) -> int:
@@ -843,12 +1037,30 @@ def _read_tasks_file(path: Path | None) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
+def _scanned_paths(path: Path, only: list[str] | None):
+    """Every path under ``path``, or the ``only`` repo paths plus Hub staging."""
+    if only is None:
+        yield from path.rglob("*")
+        return
+    for name in only:
+        yield path / name
+    staging_dir = path / ".cache" / "huggingface" / "download"
+    if staging_dir.is_dir():
+        yield from staging_dir.rglob("*")
+
+
 class _QueuePersistenceMixin:
     """Restart-surviving task queue shared by the HF and MS downloaders."""
 
     @staticmethod
-    def _get_download_activity(path: Path) -> _DownloadActivity:
-        """Return size, allocation, and mtime signals including Hub temp files."""
+    def _get_download_activity(
+        path: Path, only: list[str] | None = None
+    ) -> _DownloadActivity:
+        """Return size, allocation, and mtime signals including Hub temp files.
+
+        ``only`` limits the scan to those repo paths and Hub's staging files,
+        so files already in the folder do not count as progress.
+        """
         if not path.exists():
             return _DownloadActivity()
         file_count = 0
@@ -857,7 +1069,7 @@ class _QueuePersistenceMixin:
         latest_mtime_ns = 0
         files: dict[str, int] = {}
         try:
-            for file_path in path.rglob("*"):
+            for file_path in _scanned_paths(path, only):
                 if not file_path.is_file():
                     continue
                 try:
@@ -911,10 +1123,16 @@ class _QueuePersistenceMixin:
                         DownloadStatus.PENDING,
                         DownloadStatus.DOWNLOADING,
                     ):
+                        # Only HF rows carry a file selection or excludes; MS
+                        # rows must reach MSDownloader.start_download bare.
+                        selection: dict = {}
+                        if entry.get("files"):
+                            selection["files"] = entry["files"]
+                        if entry.get("ignore_patterns"):
+                            selection["ignore_patterns"] = entry["ignore_patterns"]
                         task = await self.start_download(
-                            entry["repo_id"], entry.get("token", "")
+                            entry["repo_id"], entry.get("token", ""), **selection
                         )
-                        task.ignore_patterns = list(entry.get("ignore_patterns", []))
                         task.created_at = float(
                             entry.get("created_at", task.created_at)
                         )
@@ -951,18 +1169,19 @@ class HFDownloader(_QueuePersistenceMixin):
         max_memory_bytes: int,
         limit: int = 60,
         result_limit: int = 50,
-        mlx_only: bool = True,
+        model_format: str = "mlx",
     ) -> dict:
         """Fetch trending and popular models that fit in memory.
 
-        Queries HuggingFace Hub for models, optionally restricted to
-        mlx-community. Filtered by system memory capacity.
+        Queries HuggingFace Hub for models: mlx-community's for "mlx", GGUF
+        repos for "gguf", any for "all". Safetensors models are filtered by
+        system memory; a GGUF repo's size depends on the files picked.
 
         Args:
             max_memory_bytes: Maximum model size in bytes (typically system memory).
             limit: Number of models to fetch per category from HF API.
             result_limit: Maximum number of models to return per category.
-            mlx_only: If True, restrict to mlx-community author.
+            model_format: One of MODEL_FORMATS.
 
         Returns:
             Dict with 'trending' and 'popular' lists, plus 'hf_token_invalid'
@@ -975,10 +1194,18 @@ class HFDownloader(_QueuePersistenceMixin):
             kwargs = {
                 "sort": sort,
                 "limit": limit,
-                "expand": ["safetensors", "downloads", "likes", "trendingScore"],
+                "expand": [
+                    "safetensors",
+                    "gguf",
+                    "downloads",
+                    "likes",
+                    "trendingScore",
+                ],
             }
-            if mlx_only:
+            if model_format == "mlx":
                 kwargs["author"] = "mlx-community"
+            elif model_format == "gguf":
+                kwargs["filter"] = "gguf"
             # list_models returns a lazy generator; drain it inside the worker
             # thread so the paginated HTTP calls never block the event loop.
             return await asyncio.wait_for(
@@ -994,9 +1221,17 @@ class HFDownloader(_QueuePersistenceMixin):
         )
 
         def _eligible(model) -> bool:
-            if not _safetensors_parameters(getattr(model, "safetensors", None)):
+            if (model.downloads or 0) < _MIN_DOWNLOADS:
                 return False
-            return (model.downloads or 0) >= _MIN_DOWNLOADS
+            has_safetensors = bool(
+                _safetensors_parameters(getattr(model, "safetensors", None))
+            )
+            has_gguf = _gguf_params(model) is not None
+            if model_format == "mlx":
+                return has_safetensors
+            if model_format == "gguf":
+                return has_gguf
+            return has_safetensors or has_gguf
 
         need_blob: list[str] = []
         for models in (trending_models, popular_models):
@@ -1011,15 +1246,20 @@ class HFDownloader(_QueuePersistenceMixin):
                 if not _eligible(model):
                     continue
                 size = _list_disk_size(model, blob_sizes)
-                if size <= 0 or size > max_memory_bytes:
+                if size > max_memory_bytes:
                     continue
                 params = _get_param_count(
                     {"parameters": _safetensors_parameters(model.safetensors)}
                 )
+                if size <= 0:
+                    params = _gguf_params(model)
+                    if params is None:
+                        continue
                 results.append(
                     {
                         "repo_id": model.id,
                         "name": model.id.split("/")[-1],
+                        "architecture": _gguf_architecture(model),
                         "downloads": model.downloads or 0,
                         "likes": model.likes or 0,
                         "trending_score": model.trending_score or 0,
@@ -1027,9 +1267,9 @@ class HFDownloader(_QueuePersistenceMixin):
                         "size_formatted": (
                             _format_model_size(size) if size > 0 else ""
                         ),
-                        "params": params if params > 0 else None,
+                        "params": params if params else None,
                         "params_formatted": (
-                            _format_param_count(params) if params > 0 else None
+                            _format_param_count(params) if params else None
                         ),
                     }
                 )
@@ -1046,7 +1286,7 @@ class HFDownloader(_QueuePersistenceMixin):
         query: str,
         sort: str = "trending",
         limit: int = 100,
-        mlx_only: bool = True,
+        model_format: str = "mlx",
         # Filtering options
         min_params: Optional[int] = None,
         max_params: Optional[int] = None,
@@ -1058,14 +1298,14 @@ class HFDownloader(_QueuePersistenceMixin):
     ) -> dict:
         """Search HuggingFace models by query string with filtering and sorting.
 
-        When mlx_only is True, results are restricted to the MLX library
-        (same as https://huggingface.co/models?library=mlx).
+        "mlx" and "gguf" restrict results to that library, as
+        https://huggingface.co/models?library=mlx does; "all" does not.
 
         Args:
             query: Search query string.
             sort: Sort order (trending/downloads/created/updated/most_params/least_params/largest/smallest).
             limit: Maximum number of results to return.
-            mlx_only: If True, restrict to MLX library models only.
+            model_format: One of MODEL_FORMATS.
             min_params: Minimum parameter count filter.
             max_params: Maximum parameter count filter.
             min_size: Minimum model size in bytes filter.
@@ -1091,10 +1331,10 @@ class HFDownloader(_QueuePersistenceMixin):
             "search": query,
             "sort": base_sort,
             "limit": limit,
-            "expand": ["safetensors", "downloads", "likes", "trendingScore"],
+            "expand": ["safetensors", "gguf", "downloads", "likes", "trendingScore"],
         }
-        if mlx_only:
-            kwargs["filter"] = "mlx"
+        if model_format in ("mlx", "gguf"):
+            kwargs["filter"] = model_format
 
         # list_models returns a lazy generator; drain it inside the worker
         # thread so the paginated HTTP calls never block the event loop.
@@ -1109,6 +1349,8 @@ class HFDownloader(_QueuePersistenceMixin):
             st_params = _safetensors_parameters(getattr(m, "safetensors", None))
             if st_params:
                 params = _get_param_count({"parameters": st_params}) or None
+            else:
+                params = _gguf_params(m)
             if min_params is not None and (params is None or params < min_params):
                 continue
             if max_params is not None and (params is None or params > max_params):
@@ -1121,11 +1363,10 @@ class HFDownloader(_QueuePersistenceMixin):
         results = []
         for m, params, st_params in pending:
             size = 0
-            params_formatted = None
+            params_formatted = (
+                _format_param_count(params) if params and params > 0 else None
+            )
             if st_params:
-                params_formatted = (
-                    _format_param_count(params) if params and params > 0 else None
-                )
                 size = _list_disk_size(m, blob_sizes)
 
             if min_size is not None and size < min_size:
@@ -1137,6 +1378,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 {
                     "repo_id": m.id,
                     "name": m.id,
+                    "architecture": _gguf_architecture(m),
                     "downloads": m.downloads or 0,
                     "likes": m.likes or 0,
                     "trending_score": m.trending_score or 0,
@@ -1167,11 +1409,16 @@ class HFDownloader(_QueuePersistenceMixin):
         }
 
     @staticmethod
-    async def get_model_info(repo_id: str) -> dict:
+    async def get_model_info(
+        repo_id: str, local_dir: Path | None = None, token: str | None = None
+    ) -> dict:
         """Fetch detailed model information from HuggingFace.
 
         Args:
             repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
+            local_dir: The folder the repo downloads into, to mark files
+                already there.
+            token: HF token for a gated or private repo; None uses the stored one.
 
         Returns:
             Dict with model details including description, files, tags, etc.
@@ -1182,6 +1429,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 api.model_info,
                 repo_id,
                 files_metadata=True,
+                token=token,
             ),
             timeout=_HF_API_TIMEOUT,
         )
@@ -1200,6 +1448,8 @@ class HFDownloader(_QueuePersistenceMixin):
                     }
                 )
 
+        layout = await asyncio.to_thread(_describe_repo_files, files, local_dir)
+
         # Detect LoRA/adapter repos (adapter_config.json is peft standard)
         is_adapter = any(f["name"] == "adapter_config.json" for f in files)
 
@@ -1215,6 +1465,10 @@ class HFDownloader(_QueuePersistenceMixin):
             params_formatted = _format_param_count(params) if params > 0 else None
             if size == 0 and "U32" not in st_params:
                 size = _calc_safetensors_disk_size({"parameters": st_params})
+        # What "download all" fetches, by the rules of a whole-repo download.
+        download_all_size = _sum_snapshot_bytes(
+            info.siblings, _SAFETENSORS_REPO_IGNORE if st_params else None
+        )
 
         # Fetch model card (README.md) content
         model_card = ""
@@ -1225,6 +1479,7 @@ class HFDownloader(_QueuePersistenceMixin):
                     repo_id=repo_id,
                     filename="README.md",
                     endpoint=endpoint,
+                    token=token,
                 ),
                 timeout=_HF_API_TIMEOUT,
             )
@@ -1245,6 +1500,9 @@ class HFDownloader(_QueuePersistenceMixin):
             "model_card": model_card,
             "description": "",  # kept for backward compat
             "files": files,
+            "layout": layout,
+            "download_all_size": download_all_size or 0,
+            "unsupported_reason": _unsupported_repo_reason(info),
             "tags": list(info.tags) if info.tags else [],
             "pipeline_tag": info.pipeline_tag or "",
             "params": params,
@@ -1289,6 +1547,7 @@ class HFDownloader(_QueuePersistenceMixin):
         self,
         repo_id: str,
         hf_token: str = "",
+        files: list[str] | None = None,
         ignore_patterns: list[str] | None = None,
     ) -> DownloadTask:
         """Start downloading a model from HuggingFace.
@@ -1296,13 +1555,15 @@ class HFDownloader(_QueuePersistenceMixin):
         Args:
             repo_id: HuggingFace repository ID (e.g., "mlx-community/Llama-3-8B-4bit").
             hf_token: Optional HuggingFace token for gated models.
+            files: Repo paths to fetch; None fetches the whole repo.
             ignore_patterns: Optional globs to exclude from this download.
 
         Returns:
             The created DownloadTask.
 
         Raises:
-            ValueError: If repo_id format is invalid or download is already queued.
+            ValueError: If repo_id or a file path is invalid, or the repo
+                already has a download queued.
         """
         repo_id = repo_id.strip()
         parts = repo_id.split("/")
@@ -1311,10 +1572,11 @@ class HFDownloader(_QueuePersistenceMixin):
                 f"Invalid repository ID: '{repo_id}'. "
                 "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
             )
+        files = _normalize_files(files)
 
-        # Check for duplicate active downloads
+        # One download per repo folder; Hub resolves repo IDs case-insensitively.
         for task in self._tasks.values():
-            if task.repo_id == repo_id and task.status in (
+            if task.repo_id.lower() == repo_id.lower() and task.status in (
                 DownloadStatus.PENDING,
                 DownloadStatus.DOWNLOADING,
             ):
@@ -1323,7 +1585,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 )
 
         task_id = str(uuid.uuid4())
-        task = DownloadTask(task_id=task_id, repo_id=repo_id)
+        task = DownloadTask(task_id=task_id, repo_id=repo_id, files=files)
         task.token = hf_token or ""
         task.ignore_patterns = list(ignore_patterns or [])
         self._tasks[task_id] = task
@@ -1378,14 +1640,23 @@ class HFDownloader(_QueuePersistenceMixin):
         logger.info(f"Download cancelled: {task.repo_id} (task_id={task_id})")
         return True
 
-    async def cancel_download_for_dir(self, target_dir: Path) -> None:
-        """Cancel the download writing into ``target_dir`` and wait for it."""
+    async def cancel_download_for_dir(
+        self, target_dir: Path, files: list[str] | None = None
+    ) -> None:
+        """Cancel the download writing into ``target_dir`` and wait for it.
+
+        With ``files``, only a download that fetches one of them is cancelled.
+        """
         resolved = Path(target_dir).resolve()
         for task_id, active in list(self._active_tasks.items()):
             task = self._tasks.get(task_id)
-            if task and (self._model_dir / task.repo_id).resolve() == resolved:
-                await self.cancel_download(task_id)
-                await asyncio.gather(active, return_exceptions=True)
+            if task is None or (self._model_dir / task.repo_id).resolve() != resolved:
+                continue
+            if files is not None and task.files is not None:
+                if not set(task.files) & set(files):
+                    continue
+            await self.cancel_download(task_id)
+            await asyncio.gather(active, return_exceptions=True)
 
     def remove_task(self, task_id: str) -> bool:
         """Remove a completed, failed, or cancelled task from the list.
@@ -1445,7 +1716,10 @@ class HFDownloader(_QueuePersistenceMixin):
         # Start fresh download (snapshot_download resumes from existing files).
         # An empty retry token keeps the stored one.
         new_task = await self.start_download(
-            repo_id, hf_token or old_task.token, old_task.ignore_patterns
+            repo_id,
+            hf_token or old_task.token,
+            files=old_task.files,
+            ignore_patterns=old_task.ignore_patterns,
         )
         new_task.retry_count = old_retry_count + 1
         self._persist()
@@ -1534,7 +1808,8 @@ class HFDownloader(_QueuePersistenceMixin):
                 # Skip pytorch format when safetensors exist to
                 # avoid downloading redundant weight files.
                 auto_ignore_patterns: list[str] = []
-                ignore_patterns = list(task.ignore_patterns)
+                ignore_patterns: list[str] | None = None
+                allow_patterns = _file_patterns(task.files) if task.files else None
                 size_estimate = 0
                 try:
                     model_info = await asyncio.wait_for(
@@ -1549,12 +1824,12 @@ class HFDownloader(_QueuePersistenceMixin):
                     st_params = _safetensors_parameters(
                         getattr(model_info, "safetensors", None)
                     )
-                    if st_params:
-                        auto_ignore_patterns = [
-                            "*.bin",
-                            "original/**",
-                            "consolidated.*.pth",
-                        ]
+                    _check_selected_files(task, model_info)
+                    unsupported = _unsupported_repo_reason(model_info)
+                    if unsupported:
+                        raise _UnsupportedRepoError(unsupported)
+                    if st_params and allow_patterns is None:
+                        auto_ignore_patterns = _SAFETENSORS_REPO_IGNORE
                     # The user's excludes join the automatic ones before the
                     # estimate, so the progress denominator already leaves out
                     # the files the download will skip (#3477).
@@ -1563,7 +1838,9 @@ class HFDownloader(_QueuePersistenceMixin):
                     )
                     # Blob sizes of every file the snapshot fetches.
                     snapshot_bytes = _sum_snapshot_bytes(
-                        getattr(model_info, "siblings", None), ignore_patterns
+                        getattr(model_info, "siblings", None),
+                        ignore_patterns,
+                        allow_patterns,
                     )
                     if snapshot_bytes is not None:
                         size_estimate = snapshot_bytes
@@ -1572,6 +1849,8 @@ class HFDownloader(_QueuePersistenceMixin):
                         size_estimate = _calc_safetensors_disk_size(
                             {"parameters": st_params}
                         )
+                except (_MissingFilesError, _UnsupportedRepoError):
+                    raise
                 except Exception as e:
                     logger.warning(
                         f"Could not fetch repo info for {task.repo_id}: {e}"
@@ -1586,6 +1865,8 @@ class HFDownloader(_QueuePersistenceMixin):
                 }
                 if ignore_patterns:
                     dl_kwargs["ignore_patterns"] = ignore_patterns
+                if allow_patterns:
+                    dl_kwargs["allow_patterns"] = allow_patterns
 
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
@@ -1697,7 +1978,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 if size_estimated or not task.total_size:
                     # The estimate was only a progress denominator; report
                     # the measured on-disk size once the download is done.
-                    task.downloaded_size = self._get_dir_size(target_dir)
+                    task.downloaded_size = self._get_dir_size(target_dir, task.files)
                 else:
                     task.downloaded_size = task.total_size
                 task.completed_at = time.time()
@@ -1869,7 +2150,7 @@ class HFDownloader(_QueuePersistenceMixin):
         if task is None:
             return
 
-        last_activity = self._get_download_activity(target_dir)
+        last_activity = self._get_download_activity(target_dir, task.files)
         last_activity_at = time.monotonic()
         observed_activity = False
         # Prime both meters before the first sleep.
@@ -1877,6 +2158,10 @@ class HFDownloader(_QueuePersistenceMixin):
         speed_meter.add(last_activity.files, now=last_activity_at)
         wire_meter = _WireSpeedMeter()
         wire_meter.add(wire.value, now=last_activity_at)
+        # Rate of the reported bytes, so a disk flush of fetched bytes does not
+        # count twice. Fed from the first moving tick to skip startup idle time.
+        eta_meter = _WireSpeedMeter(window=_ETA_WINDOW)
+        eta_started_at: float | None = None
         last_wire = wire.value
         # A resume fetches only missing bytes, so wire bytes add to this.
         base_logical = last_activity.logical_size - _stale_bytes(
@@ -1890,7 +2175,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 if task.status != DownloadStatus.DOWNLOADING:
                     break
 
-                activity = self._get_download_activity(target_dir)
+                activity = self._get_download_activity(target_dir, task.files)
                 wire_now = wire.value
                 logical = activity.logical_size - _stale_bytes(stale, activity.files)
 
@@ -1910,6 +2195,12 @@ class HFDownloader(_QueuePersistenceMixin):
                 wire_bps = wire_meter.add(wire_now)
                 # Both meters see the same payload, so never sum them.
                 task.speed_bps = max(disk_bps, wire_bps)
+                if eta_started_at is None and task.speed_bps > 0:
+                    eta_started_at = time.monotonic()
+                if eta_started_at is not None:
+                    eta_bps = eta_meter.add(task.downloaded_size)
+                    if time.monotonic() - eta_started_at >= _ETA_WARMUP:
+                        task.eta_speed_bps = eta_bps
 
                 wire_moved = wire_now > last_wire
                 last_wire = wire_now
@@ -1960,12 +2251,16 @@ class HFDownloader(_QueuePersistenceMixin):
             pass
         finally:
             task.speed_bps = 0.0
+            task.eta_speed_bps = 0.0
 
     @staticmethod
-    def _get_dir_size(path: Path) -> int:
-        """Calculate total size of all files in a directory."""
+    def _get_dir_size(path: Path, only: list[str] | None = None) -> int:
+        """Total size of the files in a directory, or of its ``only`` paths."""
         if not path.exists():
             return 0
+        if only is not None:
+            files = (path / name for name in only)
+            return sum(f.stat().st_size for f in files if f.is_file())
         total = 0
         try:
             for f in path.rglob("*"):

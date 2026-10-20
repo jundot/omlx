@@ -277,7 +277,13 @@ def _sample_window(run: "BenchmarkRun", window_start: float) -> Optional[dict]:
 def _detect_experimental_features(model_settings: Any) -> list[str]:
     """Return benchmark-skewing model features enabled in settings."""
     return [
-        spec.legacy
+        (
+            getattr(model_settings, "turboquant_kv_scheme", "turboquant")
+            if spec.attr == "turboquant_kv_enabled"
+            and getattr(model_settings, "turboquant_kv_scheme", "turboquant")
+            in ("affine4", "affine8")
+            else spec.legacy
+        )
         for spec in _FEATURE_FLAG_SPECS
         if getattr(model_settings, spec.attr, False)
     ]
@@ -306,6 +312,12 @@ def _derive_feature_flags(model_settings: Any) -> list[dict]:
         if not getattr(model_settings, spec.attr, False):
             continue
         key, label = spec.key, spec.label
+        if spec.attr == "turboquant_kv_enabled":
+            scheme = getattr(
+                model_settings, "turboquant_kv_scheme", "turboquant"
+            )
+            if scheme in ("affine4", "affine8"):
+                key, label = f"{scheme}_kv", f"Affine{scheme[-1]} KV"
         if spec.detail_attr:
             bits = _format_bits(getattr(model_settings, spec.detail_attr, None))
             if bits:
@@ -346,6 +358,7 @@ _UPLOADED_SETTING_FIELDS = (
     "model_type_override",
     "index_cache_freq",
     "turboquant_kv_enabled",
+    "turboquant_kv_scheme",
     "turboquant_kv_bits",
     "turboquant_skip_last",
     "qwen35_oq_a8_enabled",
@@ -432,6 +445,9 @@ def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
             for spec in _FEATURE_FLAG_SPECS
             if spec.attr in filtered
         }
+        for key in ("turboquant_kv_scheme", "turboquant_kv_bits"):
+            if key in raw:
+                filtered[key] = raw[key]
     return filtered
 
 
@@ -1442,6 +1458,7 @@ def _upload_model_repo(
             getattr(entry, "model_path", None),
             list(model_dirs or []),
             source_repo_id=getattr(entry, "source_repo_id", None),
+            source_path=getattr(entry, "source_path", None),
         )
     except Exception as e:  # noqa: BLE001
         logger.debug(f"Benchmark: repo derivation failed: {e}")
@@ -2050,7 +2067,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             getattr(runtime_scheduler, "_qwen35_prefill_floor", None),
             getattr(configured_scheduler, "paged_cache_block_size", None),
             getattr(effective_scheduler, "paged_cache_block_size", None),
-            bool(getattr(runtime_scheduler, "block_aware_cache", None)),
+            getattr(runtime_scheduler, "block_aware_cache", None) is not None,
             getattr(configured_scheduler, "chunked_prefill", None),
             getattr(effective_scheduler, "chunked_prefill", None),
             getattr(effective_scheduler, "prefill_speed_priority", None),

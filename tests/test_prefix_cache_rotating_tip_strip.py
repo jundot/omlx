@@ -69,8 +69,8 @@ class MockModel:
         return a
 
 
-def _make_cache(tmp_path, budget=None):
-    """A prefix cache wired to a real hot-cache-only SSD manager."""
+def _make_cache(tmp_path, budget=None, hot_cache_only=True):
+    """A prefix cache wired to a real SSD manager with a hot cache."""
     paged_cache = PagedCacheManager(
         block_size=BLOCK_SIZE,
         max_blocks=100,
@@ -81,7 +81,7 @@ def _make_cache(tmp_path, budget=None):
         cache_dir=tmp_path / "ssd_cache",
         max_size_bytes=100 * 1024**2,
         hot_cache_max_bytes=10 * 1024**2,
-        hot_cache_only=True,
+        hot_cache_only=hot_cache_only,
         hot_cache_budget=budget,
     )
     cache = BlockAwarePrefixCache(
@@ -233,6 +233,27 @@ def test_grandparent_tip_stripped_prev_tip_kept(tmp_path):
     assert _rotating_layer_shape(ssd, tip2) == PLACEHOLDER_SHAPE
     assert _rotating_layer_shape(ssd, tip3) == REAL_ROTATING_SHAPE
     assert _rotating_layer_shape(ssd, tip4) == REAL_ROTATING_SHAPE
+
+
+def test_write_through_store_strips_without_hot_cache_entries(tmp_path):
+    """Under pressure write-through the strip rewrite also bypasses the hot cache."""
+    cache, ssd = _make_cache(tmp_path, hot_cache_only=False)
+
+    tables = []
+    for turn in range(1, 4):
+        tokens = list(range((turn + 1) * BLOCK_SIZE))
+        table = cache.store_cache(
+            f"turn-{turn}",
+            tokens,
+            _hybrid_cache_data(seq_len=len(tokens)),
+            hot_cache_write_back=False,
+        )
+        assert table is not None
+        tables.append(table)
+
+    assert ssd.get_stats().hot_cache_entries == 0
+    tip1 = _block_hash(cache, tables[0], -1)
+    assert _rotating_layer_shape(ssd, tip1) == PLACEHOLDER_SHAPE
 
 
 def test_diverged_store_does_not_track_branch_block_as_tip(tmp_path):

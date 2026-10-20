@@ -84,16 +84,27 @@ class Model(nn.Module):
         )
 
     def close(self):
+        closers = []
         offload = getattr(self, "_moe_offload_plan", None)
         if offload is not None:
-            offload.close()
+            closers.append(offload.close)
         prefetch = getattr(self.language_model, "_engram_prefetch", None)
-        try:
-            if prefetch is not None:
-                prefetch.close()
-        finally:
-            for layer in self.language_model.layers:
-                if "engram" in layer:
-                    close = getattr(layer.engram.embed, "close", None)
-                    if close is not None:
-                        close()
+        if prefetch is not None:
+            closers.append(prefetch.close)
+        for layer in self.language_model.pipeline_layers:
+            if "engram" in layer:
+                close = getattr(layer.engram.embed, "close", None)
+                if close is not None:
+                    closers.append(close)
+
+        # Drain the prefetch worker before unmapping tables, even if another
+        # cleanup fails. Attempt every closer and preserve the first error.
+        error = None
+        for close in closers:
+            try:
+                close()
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error

@@ -480,6 +480,7 @@ class TestMSDownloader:
         import omlx.admin.ms_downloader as ms_module
 
         monkeypatch.setattr(ms_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(ms_module, "_ETA_WARMUP", 0)
         target = downloader.model_dir / "owner" / "model"
         target.mkdir(parents=True, exist_ok=True)
         task = DownloadTask(
@@ -511,11 +512,14 @@ class TestMSDownloader:
             )
             await asyncio.sleep(0.05)
             observed_speed = task.speed_bps
+            observed_eta_speed = task.eta_speed_bps
             task.status = DownloadStatus.COMPLETED
             await poll
 
         assert observed_speed > 0, "a live download must report a rate"
+        assert observed_eta_speed > 0, "the ETA rate must follow the transfer"
         assert task.speed_bps == 0.0
+        assert task.eta_speed_bps == 0.0
 
 
 # =============================================================================

@@ -955,10 +955,19 @@ class PairingManager:
             "caps": _pairing_caps(self._caps_provider() if self._caps_provider else {}),
             "addrs": addresses,
             "ssh_public_key": normalize_ssh_public_key(self._ssh_key_provider() or ""),
-            "ssh_host_public_key": normalize_ssh_public_key(
-                self._ssh_host_key_provider() or ""
-            ),
+            "ssh_host_public_key": self._local_ssh_host_key(),
         }
+
+    def _local_ssh_host_key(self) -> str:
+        host_key = self._ssh_host_key_provider()
+        if not host_key:
+            # macOS creates host keys when sshd first accepts a connection.
+            raise PairingRequestError(
+                "This Mac has no SSH host key yet. Turn on Remote Login in "
+                "System Settings > General > Sharing. If it is already on, run "
+                "ssh localhost once in Terminal to create the key, then retry."
+            )
+        return normalize_ssh_public_key(host_key)
 
     def _record_audit(
         self, event: str, *, node_id: str = "", detail: dict[str, Any] | None = None
@@ -1009,9 +1018,7 @@ class PairingManager:
         validate_pairing_code(code)
         caps = self._caps_provider() if self._caps_provider else {}
         ssh_public_key = normalize_ssh_public_key(self._ssh_key_provider() or "")
-        ssh_host_public_key = normalize_ssh_public_key(
-            self._ssh_host_key_provider() or ""
-        )
+        ssh_host_public_key = self._local_ssh_host_key()
         code_salt = secrets.token_bytes(16)
         return {
             "node_id": self.node_id,

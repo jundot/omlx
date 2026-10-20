@@ -859,7 +859,8 @@ class TestSchedulerAddRequest:
 
         scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
-            block_table
+            block_table,
+            promote_to_hot_cache=True,
         )
 
     def test_add_request_hot_cache_only_ignores_pressure_bypass(
@@ -897,7 +898,8 @@ class TestSchedulerAddRequest:
 
         scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
-            block_table
+            block_table,
+            promote_to_hot_cache=True,
         )
         scheduler._current_usage_bytes.assert_not_called()
 

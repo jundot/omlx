@@ -113,6 +113,13 @@ def test_local_pool_inventory_keeps_vlms_for_cluster_compatibility():
                         "model_type": "embedding",
                         "estimated_size": 2,
                     },
+                    {
+                        "id": "Q-UD-Q4_K_M",
+                        "model_path": "/base/gguf/Q-UD-Q4_K_M-0123",
+                        "model_type": "vlm",
+                        "model_format": "gguf",
+                        "estimated_size": 17,
+                    },
                 ]
             }
 

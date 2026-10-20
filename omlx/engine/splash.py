@@ -72,6 +72,10 @@ MIN_SPLASH_VERSION = (1, 3, 0)
 MIXED_QUANTIZATION_VERSION = (1, 3, 1)
 # Splash reads a per-request thinking_token_budget from 1.3.2 on.
 THINKING_BUDGET_VERSION = (1, 3, 2)
+# Splash loads Model Optimizer and compressed-tensors NVFP4/FP8 from 1.3.2 on.
+NVIDIA_QUANTIZATION_VERSION = (1, 3, 2)
+_MODELOPT_ALGOS = frozenset({"NVFP4", "W4A16_NVFP4", "FP8"})
+_COMPRESSED_TENSORS_FORMATS = frozenset({"nvfp4-pack-quantized", "float-quantized"})
 SPLASH_MAX_CONTEXT = 262144
 SPLASH_INSTALL_HINT = (
     "Splash is not installed: brew install incoai/tap/splash (M3 or later), "
@@ -108,6 +112,11 @@ SPLASH_FAMILIES: dict[str, dict[str, Any]] = {
     },
 }
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
+# The DFlash2 draft Splash pairs with each family (its install/families.py).
+SPLASH_DRAFT_REPOS = {
+    "Qwen3.8-27B": "incoai/Qwen3.8-27B-DFlash2",
+    "Qwen3.6-35B-A3B": "incoai/Qwen3.6-35B-A3B-DFlash2",
+}
 
 # Splash quantizes the BF16 DFlash2 draft to 4 bits when it loads it.
 _DRAFT_LOAD_RATIO = 1 / 3
@@ -147,6 +156,10 @@ class SplashBinary:
     @property
     def accepts_thinking_budget(self) -> bool:
         return self.version_tuple >= THINKING_BUDGET_VERSION
+
+    @property
+    def loads_nvidia_quantization(self) -> bool:
+        return self.version_tuple >= NVIDIA_QUANTIZATION_VERSION
 
 
 def _version_tuple(version: str) -> tuple[int, int, int] | None:
@@ -307,9 +320,45 @@ def _is_affine_4bit_group64(quant: dict) -> bool:
     )
 
 
+def _is_nvfp4_or_fp8(quant_config: dict) -> bool:
+    """Whether a Model Optimizer or compressed-tensors config holds only the
+    NVFP4 and FP8 formats Splash reads; Splash checks each layer itself."""
+    method = quant_config.get("quant_method")
+    if method == "modelopt":
+        layers = quant_config.get("quantized_layers") or {}
+        algos = {quant_config.get("quant_algo")} | {
+            layer.get("quant_algo")
+            for layer in layers.values()
+            if isinstance(layer, dict)
+        }
+        algos -= {None, "MIXED_PRECISION"}
+        return bool(algos) and algos <= _MODELOPT_ALGOS
+    if method == "compressed-tensors":
+        groups = (quant_config.get("config_groups") or {}).values()
+        formats = {
+            group.get("format") or quant_config.get("format")
+            for group in groups
+            if isinstance(group, dict)
+        }
+        return bool(formats) and formats <= _COMPRESSED_TENSORS_FORMATS
+    return False
+
+
 def _quantization_problem(config: dict, binary: SplashBinary) -> str:
     quant = config.get("quantization")
     if not isinstance(quant, dict):
+        quant_config = config.get("quantization_config") or {}
+        nvidia = isinstance(quant_config, dict) and _is_nvfp4_or_fp8(quant_config)
+        if binary.loads_nvidia_quantization:
+            if nvidia:
+                return ""
+            return "Splash needs a quantized MLX, NVFP4 or FP8 checkpoint"
+        if nvidia:
+            minimum = ".".join(str(part) for part in NVIDIA_QUANTIZATION_VERSION)
+            return (
+                f"{binary.label} {binary.version} serves MLX checkpoints only; "
+                f"Splash {minimum} also serves NVFP4 and FP8 checkpoints"
+            )
         return "Splash needs a quantized MLX checkpoint"
     # Splash validates the bit widths and modules it accepts itself.
     if binary.loads_mixed_quantization or _is_affine_4bit_group64(quant):
@@ -350,6 +399,35 @@ class SplashTarget:
     draft_path: Path
 
 
+def _check_model(
+    path: Path, configured_binary: str | None
+) -> tuple[SplashBinary, str, dict] | str:
+    """(binary, family, text config) when only the draft is left to find,
+    else why Splash cannot serve ``path``."""
+    binary, reason = find_splash_binary(configured_binary)
+    if binary is None:
+        return reason
+    config = _read_config(path)
+    if config is None:
+        return "failed to read config.json"
+    family = splash_family(config)
+    if family is None:
+        return f"Splash serves {' and '.join(SPLASH_FAMILIES)} only"
+    source = _gguf_source(config)
+    if source is not None:
+        # Splash checks a GGUF's tensor types itself when it loads the file.
+        if len(source.get("parts") or []) > 1:
+            return "Splash serves single-file GGUFs only"
+    else:
+        problem = _quantization_problem(config, binary)
+        if problem:
+            return problem
+    missing = [name for name in _REQUIRED_MODEL_FILES if not (path / name).is_file()]
+    if missing:
+        return f"Splash needs {', '.join(missing)} in the model folder"
+    return binary, family, config["text_config"]
+
+
 def resolve_splash_target(
     model_path: str | Path,
     configured_binary: str | None,
@@ -364,29 +442,32 @@ def resolve_splash_target(
         (target, reason). ``target`` is None and ``reason`` says why when
         Splash cannot serve the model.
     """
-    path = Path(model_path)
-    binary, reason = find_splash_binary(configured_binary)
-    if binary is None:
-        return None, reason
-    config = _read_config(path)
-    if config is None:
-        return None, "failed to read config.json"
-    family = splash_family(config)
-    if family is None:
-        return None, f"Splash serves {' and '.join(SPLASH_FAMILIES)} only"
-    problem = _quantization_problem(config, binary)
-    if problem:
-        return None, problem
-    missing = [name for name in _REQUIRED_MODEL_FILES if not (path / name).is_file()]
-    if missing:
-        return None, f"Splash needs {', '.join(missing)} in the model folder"
-    draft = find_splash_draft(config["text_config"], draft_candidates)
+    checked = _check_model(Path(model_path), configured_binary)
+    if isinstance(checked, str):
+        return None, checked
+    binary, family, text = checked
+    draft = find_splash_draft(text, draft_candidates)
     if draft is None:
         return None, (
-            f"Splash needs the {family} DFlash2 draft in a model directory "
-            f"(z-lab/{family}-DFlash2 or incoai/{family}-DFlash2)"
+            f"Splash needs the {family} DFlash2 draft "
+            f"({SPLASH_DRAFT_REPOS[family]}) in a model directory"
         )
     return SplashTarget(binary, family, draft), ""
+
+
+def splash_draft_to_download(
+    model_path: str | Path,
+    configured_binary: str | None,
+    draft_candidates: Iterable[str],
+) -> str | None:
+    """The draft repo Splash needs for ``model_path`` when only it is missing."""
+    checked = _check_model(Path(model_path), configured_binary)
+    if isinstance(checked, str):
+        return None
+    _, family, text = checked
+    if find_splash_draft(text, draft_candidates) is not None:
+        return None
+    return SPLASH_DRAFT_REPOS[family]
 
 
 # -- memory ---------------------------------------------------------------------
@@ -394,6 +475,35 @@ def resolve_splash_target(
 
 def _safetensors_bytes(path: Path) -> int:
     return sum(f.stat().st_size for f in path.glob("*.safetensors"))
+
+
+def _gguf_source(config: dict) -> dict | None:
+    """The GGUF a generated model folder links to (omlx/gguf.py), or None."""
+    source = config.get("omlx_gguf")
+    return source if isinstance(source, dict) else None
+
+
+# Splash picks a GGUF's vision projector by precision in this order.
+_SPLASH_PROJECTOR_ORDER = ("bf16", "f32", "f16")
+
+
+def _splash_projector_rank(name: str) -> int:
+    base = name.lower()
+    for rank, tag in enumerate(_SPLASH_PROJECTOR_ORDER):
+        if re.search(rf"(^|[-_.]){tag}([-_.]|$)", base):
+            return rank
+    return len(_SPLASH_PROJECTOR_ORDER)
+
+
+def _weight_bytes(path: Path) -> int:
+    """Bytes of the weights Splash loads: the safetensors, or for a GGUF its
+    file and the projector Splash pairs it with."""
+    source = _gguf_source(_read_config(path) or {})
+    if source is None:
+        return _safetensors_bytes(path)
+    projectors = sorted(source.get("projectors") or [], key=_splash_projector_rank)
+    names = [*(source.get("parts") or []), *projectors[:1]]
+    return sum((path / name).stat().st_size for name in names)
 
 
 def _kv_bytes_per_token(text: dict, kv_format: str) -> int:
@@ -425,7 +535,7 @@ def splash_memory_estimate(
     context = min(max_context or SPLASH_MAX_CONTEXT, SPLASH_MAX_CONTEXT)
     kv = _kv_bytes_per_token(text, kv_format) * context
     draft = int(_safetensors_bytes(draft_path) * _DRAFT_LOAD_RATIO)
-    return _safetensors_bytes(path) + draft + _RUNTIME_RESERVE_BYTES + kv
+    return _weight_bytes(path) + draft + _RUNTIME_RESERVE_BYTES + kv
 
 
 # -- model staging -------------------------------------------------------------
@@ -1091,7 +1201,9 @@ class SplashEngine(BaseEngine):
             body["thinking_token_budget"] = budget
         return body
 
-    async def _stream(self, body: dict[str, Any]) -> AsyncIterator[GenerationOutput]:
+    async def _stream(
+        self, body: dict[str, Any], request_id: str | None = None
+    ) -> AsyncIterator[GenerationOutput]:
         """POST a streaming chat request to Splash and yield oMLX outputs.
 
         Timestamps use time.perf_counter(), the clock oMLX measures time to
@@ -1106,7 +1218,7 @@ class SplashEngine(BaseEngine):
             "stream_options": {"include_usage": True},
         }
         state = _StreamState()
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
         live = _LiveRequest(time.monotonic(), body.get("max_tokens"))
         self._live[request_id] = live
         self._active += 1
@@ -1221,7 +1333,7 @@ class SplashEngine(BaseEngine):
         effort = splash_effort(kwargs.get("chat_template_kwargs"))
         if effort:
             body["reasoning_effort"] = effort
-        async for output in self._stream(body):
+        async for output in self._stream(body, kwargs.get("_request_id")):
             yield output
 
     async def chat(self, messages: list[dict[str, Any]], **kwargs) -> GenerationOutput:
@@ -1367,7 +1479,12 @@ class SplashEngine(BaseEngine):
 
     def _weights_bytes(self) -> int:
         if self._weights_size is None:
-            self._weights_size = sum(f.stat().st_size for f in _model_files(self._path))
+            if _gguf_source(_read_config(self._path) or {}) is not None:
+                self._weights_size = _weight_bytes(self._path)
+            else:
+                self._weights_size = sum(
+                    f.stat().st_size for f in _model_files(self._path)
+                )
         return self._weights_size
 
     def _reported_memory(self, key: str) -> int:

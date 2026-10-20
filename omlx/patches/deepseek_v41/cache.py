@@ -8,10 +8,113 @@ from ...cache.type_handlers import ArraysCacheHandler, CacheType
 
 
 class DeepseekV41Cache(ArraysCache):
+    """Per-layer V4.1 state.
+
+    A batch (B > 1) keeps its requests as a list of single-request caches ("rows") instead
+    of padded, concatenated arrays. The model's forward runs every request on its own row
+    (Language._forward), so with rows a decode step neither slices the batch apart nor
+    re-concatenates it -- which cost B - 1 successive concatenations of every slot in every
+    layer per step, a host sync per layer and row to trim the padding, and dropped each
+    row's in-place growth buffers. Padding / lengths are mirrored on the host so masks need
+    no GPU round trip. The padded dense arrays are still produced on demand (``cache`` /
+    ``state``) for code that reads a batch as arrays.
+    """
+
     # offset, window KV, compressed KV, index K, partial KV, partial gates, history
     def __init__(self, compress_ratio=0):
+        self._rows = None
+        self._dense = None
+        self._lp = None    # host mirror of left_padding (row-backed batches)
+        self._len = None   # host mirror of lengths (row-backed batches)
         super().__init__(7)
         self.compress_ratio = compress_ratio
+
+    # -- storage: dense arrays or rows ------------------------------------------------
+    @property
+    def cache(self):
+        if self._rows is not None and self._dense is None:
+            self._dense = self._materialize()
+        return self._dense
+
+    @cache.setter
+    def cache(self, value):
+        self._rows = None
+        self._dense = value
+
+    def __setitem__(self, idx, value):
+        if self._rows is not None:
+            dense = self.cache
+            self._rows = None
+            self._dense = dense
+        self._dense[idx] = value
+
+    def _materialize(self):
+        """Padded dense arrays of a row-backed batch (same layout extend() builds)."""
+        states = []
+        for slot in range(7):
+            values = [row.cache[slot] for row in self._rows]
+            template = next((v for v in values if v is not None), None)
+            if template is None:
+                states.append(None)
+                continue
+            fill = -1 if slot == 6 else 0
+            width = max(v.shape[1] for v in values if v is not None) if template.ndim > 1 else None
+            parts = []
+            for v in values:
+                if v is None:
+                    shape = (1, *template.shape[1:]) if width is None else (1, width, *template.shape[2:])
+                    v = mx.full(shape, fill, template.dtype)
+                elif width is not None and v.shape[1] != width:
+                    v = mx.pad(v, [(0, 0), (0, width - v.shape[1])] + [(0, 0)] * (v.ndim - 2), constant_values=fill)
+                parts.append(v)
+            states.append(mx.concatenate(parts, 0))
+        return states
+
+    def _row_copy(self):
+        """A single-request cache sharing this one's arrays and growth registry."""
+        row = type(self)(self.compress_ratio)
+        if getattr(self, "_ds41_buffers", None) is None:
+            self._ds41_buffers = {}
+        row.cache = list(self.cache)
+        row._ds41_buffers = self._ds41_buffers
+        return row
+
+    def _as_rows(self):
+        if self._rows is not None:
+            return list(self._rows)
+        if self.empty() or self.batch_size == 1:
+            return [self._row_copy()]
+        return [self._dense_extract(i) for i in range(self.batch_size)]
+
+    def _set_rows(self, rows, left_padding=None):
+        self._rows, self._dense = list(rows), None
+        self._lp = None if left_padding is None else [int(v) for v in left_padding]
+        self._len = None
+        self._sync_padding()
+
+    def _sync_padding(self):
+        self.left_padding = None if self._lp is None else mx.array(self._lp, mx.int32)
+        self.lengths = None if self._len is None else mx.array(self._len, mx.int32)
+
+    def adopt_rows(self, rows):
+        """Take back the rows a forward pass ran on (the rows extract() handed out)."""
+        if self._rows is None and len(rows) == 1:
+            self.cache = list(rows[0].cache)
+            if getattr(rows[0], "_ds41_buffers", None) is not None:
+                self._ds41_buffers = rows[0]._ds41_buffers
+            return
+        self._rows, self._dense = list(rows), None
+
+    @property
+    def batch_size(self):
+        if self._rows is not None:
+            return len(self._rows)
+        return super().batch_size
+
+    def empty(self):
+        if self._rows is not None:
+            return all(row.empty() for row in self._rows)
+        return self._dense[0] is None
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -25,6 +128,8 @@ class DeepseekV41Cache(ArraysCache):
         return self.cache[0] if self.cache[0] is not None else 0
 
     def size(self):
+        if self._rows is not None:
+            return max(row.size() for row in self._rows)
         offsets = self.cache[0]
         if offsets is None:
             return 0
@@ -51,10 +156,66 @@ class DeepseekV41Cache(ArraysCache):
             raise ValueError("Unknown DeepSeek V4.1 cache format")
 
     def prepare(self, lengths=None, **kwargs):
+        if self._rows is not None:
+            self._lp, self._len = None, None if lengths is None else [int(v) for v in lengths]
+            self._sync_padding()
+            return
         self.left_padding = None
         self.lengths = mx.array(lengths) if lengths is not None else None
 
+    def finalize(self):
+        if self._rows is not None:
+            self._lp = self._len = None
+        self.left_padding = None
+        self.lengths = None
+
+    def advance(self, N):
+        if self._rows is not None:
+            self._lp = None if self._lp is None else [v - N for v in self._lp]
+            self._len = None if self._len is None else [v - N for v in self._len]
+            self._sync_padding()
+            return
+        super().advance(N)
+
+    def make_mask(self, N):
+        if self._rows is None:
+            return super().make_mask(N)
+        import numpy as np
+
+        pos, mask = np.arange(N), None
+        if self._lp is not None:
+            mask = pos >= np.asarray(self._lp)[:, None]
+        if self._len is not None:
+            within = pos < np.asarray(self._len)[:, None]
+            mask = within if mask is None else mask & within
+        return mask
+
+    def filter(self, batch_indices):
+        if self._rows is None:
+            return super().filter(batch_indices)
+        keep = batch_indices.tolist() if hasattr(batch_indices, "tolist") else list(batch_indices)
+        keep = [int(i) for i in keep]
+        self._rows = [self._rows[i] for i in keep]
+        self._dense = None
+        self._lp = None if self._lp is None else [self._lp[i] for i in keep]
+        self._len = None if self._len is None else [self._len[i] for i in keep]
+        self._sync_padding()
+
+    @property
+    def state(self):
+        return self.cache, self.left_padding, self.lengths
+
+    @state.setter
+    def state(self, v):
+        self.cache, self.left_padding, self.lengths = v
+        self._lp = self._len = None
+
     def extract(self, idx):
+        if self._rows is not None:
+            return self._rows[idx]._row_copy()
+        return self._dense_extract(idx)
+
+    def _dense_extract(self, idx):
         result = type(self)(self.compress_ratio)
         if self.batch_size == 1 and idx in (0, -1):
             # Forward passes run on extracted rows. Share the arrays and the
@@ -90,58 +251,19 @@ class DeepseekV41Cache(ArraysCache):
     @classmethod
     def merge(cls, caches):
         result = cls(caches[0].compress_ratio if caches else 0)
-        for other in caches:
-            if result.cache[0] is None and result.left_padding is None:
-                result.cache = list(other.cache)
-                result.left_padding = mx.zeros((other.batch_size,), mx.int32)
-            else:
-                result.extend(other)
+        rows = [row for other in caches for row in other._as_rows()]
+        result._set_rows(rows, left_padding=[0] * len(rows))
         return result
 
     def extend(self, other):
         if self.compress_ratio != other.compress_ratio:
             raise ValueError("Cannot batch different V4.1 compression ratios")
-        a_batch, b_batch = self.batch_size, other.batch_size
-        states = []
-        for i, (a, b) in enumerate(zip(self.cache, other.cache)):
-            if a is None and b is None:
-                states.append(None)
-                continue
-            template = a if a is not None else b
-            fill = -1 if i == 6 else 0
-            if a is None:
-                a = mx.full((a_batch, *template.shape[1:]), fill, template.dtype)
-            if b is None:
-                b = mx.full((b_batch, *template.shape[1:]), fill, template.dtype)
-            if a.ndim > 1 and a.shape[1] != b.shape[1]:
-                width = max(a.shape[1], b.shape[1])
-                a = mx.pad(
-                    a,
-                    [(0, 0), (0, width - a.shape[1])] + [(0, 0)] * (a.ndim - 2),
-                    constant_values=fill,
-                )
-                b = mx.pad(
-                    b,
-                    [(0, 0), (0, width - b.shape[1])] + [(0, 0)] * (b.ndim - 2),
-                    constant_values=fill,
-                )
-            states.append(mx.concatenate([a, b], 0))
-        self.cache = states
-        self.left_padding = mx.concatenate(
-            [
-                (
-                    self.left_padding
-                    if self.left_padding is not None
-                    else mx.zeros((a_batch,), mx.int32)
-                ),
-                (
-                    other.left_padding
-                    if other.left_padding is not None
-                    else mx.zeros((b_batch,), mx.int32)
-                ),
-            ]
-        )
-        self.lengths = None
+        a, b = self._as_rows(), other._as_rows()
+        lp_a = self._lp if self._rows is not None else (
+            None if self.left_padding is None else [int(v) for v in self.left_padding.tolist()])
+        lp_b = other._lp if other._rows is not None else (
+            None if other.left_padding is None else [int(v) for v in other.left_padding.tolist()])
+        self._set_rows(a + b, left_padding=(lp_a or [0] * len(a)) + (lp_b or [0] * len(b)))
 
 
 class DeepseekV41CacheHandler(ArraysCacheHandler):

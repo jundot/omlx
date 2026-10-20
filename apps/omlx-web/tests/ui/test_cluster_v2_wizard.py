@@ -1308,6 +1308,21 @@ def test_show_code_instead_posts_the_best_reachable_address():
     )
 
 
+def test_loopback_only_macs_explain_the_bind_instead_of_offering_pairing():
+    template = _read(TEMPLATE)
+    javascript = _read(JAVASCRIPT)
+
+    assert "device?.caps?.loopback_only" in javascript
+    # This Mac: a banner, because peers can never reach it.
+    assert 'x-show="deviceLoopbackOnly(selfDevice())"' in template
+    assert "cluster.v2.loopback.self_notice" in template
+    # Other Macs: every pairing entry point is disabled with the reason shown.
+    assert ':disabled="deviceLoopbackOnly(device)"' in template
+    assert ':disabled="join.busy || deviceLoopbackOnly(device)"' in template
+    assert ':disabled="pairing.busy || deviceLoopbackOnly(device)"' in template
+    assert template.count("cluster.v2.loopback.peer_notice") == 2
+
+
 def test_expired_join_offers_start_again_not_a_dead_end():
     template = _read(TEMPLATE)
     javascript = _read(JAVASCRIPT)

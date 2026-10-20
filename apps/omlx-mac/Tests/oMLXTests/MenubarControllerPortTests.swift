@@ -449,8 +449,10 @@ final class MenubarControllerPortTests: XCTestCase {
             sessionConfiguration: sessionConfiguration,
             apiKeyLoader: { "new-key" }
         )
+        XCTAssertFalse(poller.hasAPIKey)
 
         await poller.refreshOnce()
+        XCTAssertTrue(poller.hasAPIKey)
         XCTAssertEqual(poller.sessionStats?.totalPromptTokens, 99)
         XCTAssertEqual(MenubarStatsURLProtocol.recordedPublicStatusRequestCount(), 2)
 

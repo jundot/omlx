@@ -931,6 +931,38 @@ class TestLaunchCommandFunction:
         assert ctx.sonnet_model == "cli-sonnet"
         assert ctx.haiku_model == "cli-haiku"
 
+    def test_launch_command_requires_claude_desktop_toggle(self, capsys):
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.is_installed.return_value = True
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+        settings.claude_code.desktop_enabled = False
+        args = argparse.Namespace(
+            tool="claude_desktop",
+            host=None,
+            port=None,
+            api_key=None,
+            model=None,
+            tools_profile="coding",
+        )
+        requests_get = MagicMock()
+
+        with (
+            patch("requests.get", requests_get),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(args)
+
+        assert exc.value.code == 1
+        requests_get.assert_not_called()
+        integration.launch.assert_not_called()
+        assert "not enabled" in capsys.readouterr().out
+
 
 class TestLaunchArgvParsing:
     """Tests for top-level argv parsing of `omlx launch ...`."""

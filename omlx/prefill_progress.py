@@ -105,6 +105,19 @@ class PrefillProgressTracker:
                 return True
             return (now - self._last_activity_ts) < within_s
 
+    def active_since(self, since_ts: float) -> bool:
+        """True while any prefill is live, or when prefill activity (update,
+        completion, or abort) happened after the monotonic time ``since_ts``.
+
+        Unlike ``recently_active`` this scopes the question to a window the
+        caller owns, so a prefill that ended before it (for example the
+        request's own prompt) does not count.
+        """
+        with self._lock:
+            if self._progress:
+                return True
+            return self._last_activity_ts > float(since_ts)
+
     def get_model_progress(self, model_id: str) -> List[Dict[str, Any]]:
         """Return list of prefilling requests for a given model."""
         with self._lock:

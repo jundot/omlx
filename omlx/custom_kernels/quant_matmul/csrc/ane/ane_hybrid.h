@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "mlx/array.h"
@@ -27,6 +28,7 @@ public:
   int input_dim() const;
   int output_dim() const;
   int sequence_length() const;
+  size_t weight_bytes() const;
   MTL::Buffer *input_buffer() const;
   MTL::Buffer *output_buffer() const;
 
@@ -195,13 +197,20 @@ mlx::core::array ane_q4_swiglu_t(
     const mlx::core::array &x, const mlx::core::array &gpu_weight,
     const mlx::core::array &gpu_scales, const mlx::core::array &gpu_biases,
     const std::shared_ptr<AneLinearModel> &ane_model, int variant = 8,
-    int group_size = 128, mlx::core::StreamOrDevice s = {});
+    int group_size = 128,
+    const std::optional<mlx::core::array> &up_weight = std::nullopt,
+    const std::optional<mlx::core::array> &up_scales = std::nullopt,
+    const std::optional<mlx::core::array> &up_biases = std::nullopt,
+    mlx::core::StreamOrDevice s = {});
 
 mlx::core::array ane_affine_swiglu_t(
     const mlx::core::array &x, const mlx::core::array &gpu_weight,
     const mlx::core::array &gpu_scales, const mlx::core::array &gpu_biases,
     const std::shared_ptr<AneLinearModel> &ane_model, int bits,
     int variant = 8, int group_size = 128,
+    const std::optional<mlx::core::array> &up_weight = std::nullopt,
+    const std::optional<mlx::core::array> &up_scales = std::nullopt,
+    const std::optional<mlx::core::array> &up_biases = std::nullopt,
     mlx::core::StreamOrDevice s = {});
 
 mlx::core::array ane_cpu_fp16_swiglu_t(
@@ -210,6 +219,9 @@ mlx::core::array ane_cpu_fp16_swiglu_t(
     const mlx::core::array &gpu_biases,
     const std::shared_ptr<AneLinearModel> &ane_model, int bits, int variant = 8,
     int group_size = 128, int cpu_threads = 0, bool cpu_shared_resource = false,
+    const std::optional<mlx::core::array> &up_weight = std::nullopt,
+    const std::optional<mlx::core::array> &up_scales = std::nullopt,
+    const std::optional<mlx::core::array> &up_biases = std::nullopt,
     mlx::core::StreamOrDevice s = {});
 
 mlx::core::array ane_cpu_fp16_q4_swiglu_t(
@@ -218,6 +230,9 @@ mlx::core::array ane_cpu_fp16_q4_swiglu_t(
     const mlx::core::array &gpu_biases,
     const std::shared_ptr<AneLinearModel> &ane_model, int variant = 8,
     int group_size = 128, int cpu_threads = 0, bool cpu_shared_resource = false,
+    const std::optional<mlx::core::array> &up_weight = std::nullopt,
+    const std::optional<mlx::core::array> &up_scales = std::nullopt,
+    const std::optional<mlx::core::array> &up_biases = std::nullopt,
     mlx::core::StreamOrDevice s = {});
 
 mlx::core::array ane_dual_affine_qmm_t(
@@ -246,6 +261,9 @@ mlx::core::array ane_dual_cpu_fp16_swiglu_t(
     const std::shared_ptr<AneLinearModel> &ane_model1, int bits,
     int variant = 8, int group_size = 128, int cpu_threads = 0,
     bool cpu_shared_resource = false,
+    const std::optional<mlx::core::array> &up_weight = std::nullopt,
+    const std::optional<mlx::core::array> &up_scales = std::nullopt,
+    const std::optional<mlx::core::array> &up_biases = std::nullopt,
     mlx::core::StreamOrDevice s = {});
 
 mlx::core::array ane_dual_q4_swiglu_t(
@@ -253,7 +271,11 @@ mlx::core::array ane_dual_q4_swiglu_t(
     const mlx::core::array &gpu_scales, const mlx::core::array &gpu_biases,
     const std::shared_ptr<AneLinearModel> &ane_model0,
     const std::shared_ptr<AneLinearModel> &ane_model1, int variant = 8,
-    int group_size = 128, mlx::core::StreamOrDevice s = {});
+    int group_size = 128,
+    const std::optional<mlx::core::array> &up_weight = std::nullopt,
+    const std::optional<mlx::core::array> &up_scales = std::nullopt,
+    const std::optional<mlx::core::array> &up_biases = std::nullopt,
+    mlx::core::StreamOrDevice s = {});
 
 mlx::core::array ane_dual_affine_swiglu_t(
     const mlx::core::array &x, const mlx::core::array &gpu_weight,
@@ -261,6 +283,9 @@ mlx::core::array ane_dual_affine_swiglu_t(
     const std::shared_ptr<AneLinearModel> &ane_model0,
     const std::shared_ptr<AneLinearModel> &ane_model1, int bits,
     int variant = 8, int group_size = 128,
+    const std::optional<mlx::core::array> &up_weight = std::nullopt,
+    const std::optional<mlx::core::array> &up_scales = std::nullopt,
+    const std::optional<mlx::core::array> &up_biases = std::nullopt,
     mlx::core::StreamOrDevice s = {});
 
 mlx::core::array ane_dual_cpu_fp16_q4_swiglu_t(
@@ -271,6 +296,9 @@ mlx::core::array ane_dual_cpu_fp16_q4_swiglu_t(
     const std::shared_ptr<AneLinearModel> &ane_model1, int variant = 8,
     int group_size = 128, int cpu_threads = 0,
     bool cpu_shared_resource = false,
+    const std::optional<mlx::core::array> &up_weight = std::nullopt,
+    const std::optional<mlx::core::array> &up_scales = std::nullopt,
+    const std::optional<mlx::core::array> &up_biases = std::nullopt,
     mlx::core::StreamOrDevice s = {});
 
 mlx::core::array ane_q4_swiglu_down_t(

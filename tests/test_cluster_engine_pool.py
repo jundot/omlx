@@ -162,16 +162,22 @@ def test_stale_cluster_deployment_id_preserves_normal_not_found_behavior(tmp_pat
     )
 
 
-def test_cluster_model_path_rejects_non_text_model(tmp_path):
+def test_cluster_serves_vlm_checkpoint_and_rejects_non_generation_model(tmp_path):
     model_path = tmp_path / "vision"
     model_path.mkdir()
+    deployment = _deployment(str(model_path))
     pool = EnginePool()
+    pool._cluster_registry = SimpleNamespace(get_for_model=lambda model: deployment)
     entry = _entry(str(model_path))
     entry.model_type = "vlm"
     entry.engine_type = "vlm"
     pool._entries["vision"] = entry
 
-    with pytest.raises(ValueError, match="text LLM models only"):
+    assert pool.resolve_cluster_model_id(str(model_path)) == "vision"
+    assert pool._distributed_deployment_for_entry(entry) is deployment
+
+    entry.model_type = entry.engine_type = "embedding"
+    with pytest.raises(ValueError, match="text generation models only"):
         pool.resolve_cluster_model_id(str(model_path))
 
 
@@ -193,7 +199,8 @@ def test_remote_only_cluster_model_gets_a_batched_pool_entry(tmp_path):
     assert model_id == "minimax"
     assert entry is not None
     assert entry.engine_type == "batched"
-    assert entry.model_type == "llm"
+    # Discovery classifies MiniMax-M3 as vlm, so a local copy has the same type.
+    assert entry.model_type == "vlm"
     assert entry.source_type == "cluster"
     assert entry.model_context_length == 262144
     assert pool.resolve_cluster_model_id(str(model_path)) == model_id

@@ -17,10 +17,13 @@ from typing import Callable, Optional
 import requests
 
 from .hf_downloader import (
+    _ETA_WARMUP,
+    _ETA_WINDOW,
     DownloadStatus,
     DownloadTask,
     _QueuePersistenceMixin,
     _SpeedMeter,
+    _WireSpeedMeter,
     _format_model_size,
     _format_param_count,
 )
@@ -1035,6 +1038,10 @@ class MSDownloader(_QueuePersistenceMixin):
         speed_meter = _SpeedMeter()
         activity = self._get_download_activity(target_dir)
         speed_meter.add(activity.files)
+        # Rate of the reported bytes, fed from the first moving tick to skip
+        # startup idle time.
+        eta_meter = _WireSpeedMeter(window=_ETA_WINDOW)
+        eta_started_at: float | None = None
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -1048,6 +1055,12 @@ class MSDownloader(_QueuePersistenceMixin):
                 latest_mtime = activity.latest_mtime_ns / 1e9
                 task.downloaded_size = current_size
                 task.speed_bps = speed_meter.add(activity.files)
+                if eta_started_at is None and task.speed_bps > 0:
+                    eta_started_at = time.monotonic()
+                if eta_started_at is not None:
+                    eta_bps = eta_meter.add(task.downloaded_size)
+                    if time.monotonic() - eta_started_at >= _ETA_WARMUP:
+                        task.eta_speed_bps = eta_bps
 
                 if task.total_size > 0:
                     # Cap at 99% until snapshot_download confirms completion
@@ -1085,6 +1098,7 @@ class MSDownloader(_QueuePersistenceMixin):
             pass
         finally:
             task.speed_bps = 0.0
+            task.eta_speed_bps = 0.0
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:

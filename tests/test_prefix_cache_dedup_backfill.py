@@ -365,9 +365,9 @@ def test_backfill_inspects_each_hash_once_per_session(tmp_path):
     calls = {"n": 0}
     original = ssd.load_block_with_metadata
 
-    def counting(block_hash):
+    def counting(block_hash, **kwargs):
         calls["n"] += 1
-        return original(block_hash)
+        return original(block_hash, **kwargs)
 
     ssd.load_block_with_metadata = counting
     cache.store_cache(

@@ -19,6 +19,15 @@ def has_symbol(name: str) -> bool:
     return hasattr(_ext, name)
 
 
+def _up_suffix_kwargs(
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None,
+) -> dict[str, mx.array]:
+    if up_suffix is None:
+        return {}
+    weight, scales, biases = up_suffix
+    return {"up_weight": weight, "up_scales": scales, "up_biases": biases}
+
+
 def cpu_fp16_affine_qmm_t(
     x: mx.array,
     cpu_weight: mx.array,
@@ -63,6 +72,7 @@ def ane_dual_cpu_fp16_q4_swiglu_t(
     group_size: int = 128,
     cpu_threads: int = 0,
     cpu_shared_resource: bool = False,
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None,
 ) -> mx.array:
     if _ext is None or not hasattr(
         _ext, "ane_dual_cpu_fp16_q4_swiglu_t"
@@ -82,9 +92,9 @@ def ane_dual_cpu_fp16_q4_swiglu_t(
     )
     if hasattr(_ext, "cpu_shared_resource_available"):
         return _ext.ane_dual_cpu_fp16_q4_swiglu_t(
-            *args, cpu_shared_resource
+            *args, cpu_shared_resource, **_up_suffix_kwargs(up_suffix)
         )
-    return _ext.ane_dual_cpu_fp16_q4_swiglu_t(*args)
+    return _ext.ane_dual_cpu_fp16_q4_swiglu_t(*args, **_up_suffix_kwargs(up_suffix))
 
 
 def ane_cpu_fp16_q4_swiglu_t(
@@ -98,6 +108,7 @@ def ane_cpu_fp16_q4_swiglu_t(
     group_size: int = 128,
     cpu_threads: int = 0,
     cpu_shared_resource: bool = False,
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "ane_cpu_fp16_q4_swiglu_t"):
         raise RuntimeError("Single-ANE/CPU/GPU fp16 q4 SwiGLU is unavailable")
@@ -112,6 +123,7 @@ def ane_cpu_fp16_q4_swiglu_t(
         group_size,
         cpu_threads,
         cpu_shared_resource,
+        **_up_suffix_kwargs(up_suffix),
     )
 
 
@@ -127,6 +139,7 @@ def ane_cpu_fp16_swiglu_t(
     group_size: int = 128,
     cpu_threads: int = 0,
     cpu_shared_resource: bool = False,
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "ane_cpu_fp16_swiglu_t"):
         raise RuntimeError("Single-ANE/CPU/GPU fp16 SwiGLU is unavailable")
@@ -142,6 +155,7 @@ def ane_cpu_fp16_swiglu_t(
         group_size,
         cpu_threads,
         cpu_shared_resource,
+        **_up_suffix_kwargs(up_suffix),
     )
 
 
@@ -190,6 +204,7 @@ def ane_dual_cpu_fp16_swiglu_t(
     group_size: int = 128,
     cpu_threads: int = 0,
     cpu_shared_resource: bool = False,
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None,
 ) -> mx.array:
     if _ext is None or not hasattr(
         _ext, "ane_dual_cpu_fp16_swiglu_t"
@@ -208,6 +223,7 @@ def ane_dual_cpu_fp16_swiglu_t(
         group_size,
         cpu_threads,
         cpu_shared_resource,
+        **_up_suffix_kwargs(up_suffix),
     )
 
 
@@ -481,6 +497,7 @@ def ane_q4_swiglu_t(
     ane_model,
     variant: int = 8,
     group_size: int = 128,
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "ane_q4_swiglu_t"):
         raise RuntimeError("ANE hybrid q4 SwiGLU native kernel is unavailable")
@@ -492,6 +509,7 @@ def ane_q4_swiglu_t(
         ane_model,
         variant,
         group_size,
+        **_up_suffix_kwargs(up_suffix),
     )
 
 
@@ -504,6 +522,7 @@ def ane_affine_swiglu_t(
     bits: int,
     variant: int = 8,
     group_size: int = 128,
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "ane_affine_swiglu_t"):
         raise RuntimeError("ANE hybrid affine SwiGLU native kernel is unavailable")
@@ -516,6 +535,7 @@ def ane_affine_swiglu_t(
         bits,
         variant,
         group_size,
+        **_up_suffix_kwargs(up_suffix),
     )
 
 
@@ -556,6 +576,7 @@ def ane_dual_q4_swiglu_t(
     ane_model1,
     variant: int = 8,
     group_size: int = 128,
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "ane_dual_q4_swiglu_t"):
         raise RuntimeError("Dual ANE hybrid q4 SwiGLU native kernel is unavailable")
@@ -568,6 +589,7 @@ def ane_dual_q4_swiglu_t(
         ane_model1,
         variant,
         group_size,
+        **_up_suffix_kwargs(up_suffix),
     )
 
 
@@ -581,6 +603,7 @@ def ane_dual_affine_swiglu_t(
     bits: int,
     variant: int = 8,
     group_size: int = 128,
+    up_suffix: tuple[mx.array, mx.array, mx.array] | None = None,
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "ane_dual_affine_swiglu_t"):
         raise RuntimeError(
@@ -596,6 +619,7 @@ def ane_dual_affine_swiglu_t(
         bits,
         variant,
         group_size,
+        **_up_suffix_kwargs(up_suffix),
     )
 
 

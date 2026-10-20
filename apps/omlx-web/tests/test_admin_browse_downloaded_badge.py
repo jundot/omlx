@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DOWNLOAD_BUTTON = re.compile(
     r'<button @click="(?:downloadRecommended|downloadMsModel)\((\w+\.repo_id)\)'
 )
+# The HF detail modal's footer shows the badge in place of its download buttons.
+MODAL_FOOTER_BADGES = 1
 
 
 def _models_template() -> str:
@@ -28,7 +30,9 @@ def test_every_browse_download_button_yields_to_the_badge():
         repo = button.group(1)
         tag = html[button.start() : html.index(">", button.start())]
         assert f'x-show="!isModelDownloaded({repo})"' in tag
-    assert html.count("t('models.browse.downloaded')") == len(buttons)
+    assert html.count("t('models.browse.downloaded')") == (
+        len(buttons) + MODAL_FOOTER_BADGES
+    )
 
 
 def test_every_locale_names_the_badge():

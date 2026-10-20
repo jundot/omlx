@@ -86,13 +86,24 @@ class Omlx < Formula
     pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
-      # `metal` ships with Xcode, not the Command Line Tools.
-      unless quiet_system("/usr/bin/xcrun", "-f", "metal")
+      # Execute the compiler rather than looking for it. `xcrun -f metal` only
+      # asks whether a file named `metal` is on the search path, and since Xcode
+      # 26 that file is a shim that forwards to the separately downloaded Metal
+      # toolchain. The shim is present whether or not the toolchain behind it is
+      # usable, so the lookup succeeds and the build then fails much later with
+      # an opaque CMake error in the metallib targets. Running the compiler is
+      # the only check that agrees with whether the build will work.
+      unless quiet_system("/usr/bin/xcrun", "metal", "--version")
         odie <<~EOS
-          --with-custom-kernel requires the Metal compiler, but `xcrun -f metal` found none.
+          --with-custom-kernel requires the Metal compiler, but `xcrun metal --version` failed.
           It ships with full Xcode, and on current Xcode versions is a separate component:
 
             xcodebuild -downloadComponent MetalToolchain
+
+          If the component is already installed, a stale xcrun lookup cache causes this
+          same failure and is worth clearing first, because it costs nothing:
+
+            rm -f "${TMPDIR:-/tmp}/xcrun_db"
 
           Otherwise install omlx without the custom kernels: brew install omlx
         EOS

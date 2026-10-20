@@ -19,6 +19,8 @@ import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from tokenizers import pre_tokenizers
+from transformers import AutoTokenizer
 
 import omlx.server as srv
 from omlx.admin import routes as admin_routes
@@ -53,6 +55,7 @@ from omlx.engine.splash import (
 )
 from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.exceptions import InvalidRequestError, ModelLoadingError
+from omlx.model_discovery import discover_models
 from omlx.model_settings import ModelSettings
 from omlx.settings import GlobalSettings
 from omlx.utils.proc_memory import list_process_group_pids
@@ -247,6 +250,53 @@ class TestCompatibility:
         launchers("splash", version="1.3.1")
         assert resolve_splash_target(model, None, [str(draft)])[0] is not None
 
+    @pytest.mark.parametrize(
+        "quantization_config",
+        [
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "a": {"quant_algo": "NVFP4"},
+                    "b": {"quant_algo": "FP8"},
+                },
+            },
+            {
+                "quant_method": "compressed-tensors",
+                "format": "mixed-precision",
+                "config_groups": {
+                    "group_0": {"format": "float-quantized"},
+                    "group_1": {"format": "nvfp4-pack-quantized"},
+                },
+            },
+        ],
+    )
+    def test_nvfp4_and_fp8_checkpoints_need_splash_1_3_2(
+        self, tmp_path, launchers, quantization_config
+    ):
+        model = _write_model(tmp_path / "Qwen3.8-27B-NVFP4")
+        config = json.loads((model / "config.json").read_text())
+        del config["quantization"]
+        config["quantization_config"] = quantization_config
+        (model / "config.json").write_text(json.dumps(config))
+        draft = _write_draft(tmp_path / "draft")
+
+        launchers("splash", version="1.3.1")
+        _, reason = resolve_splash_target(model, None, [str(draft)])
+        assert "Splash 1.3.2 also serves NVFP4 and FP8" in reason
+        launchers("splash", version="1.3.2")
+        target, reason = resolve_splash_target(model, None, [str(draft)])
+        assert target is not None and reason == ""
+
+        # Other schemes of the same tools are not formats Splash reads.
+        config["quantization_config"] = {
+            "quant_method": "compressed-tensors",
+            "config_groups": {"g": {"format": "pack-quantized"}},
+        }
+        (model / "config.json").write_text(json.dumps(config))
+        _, reason = resolve_splash_target(model, None, [str(draft)])
+        assert "MLX, NVFP4 or FP8" in reason
+
     def test_missing_files_and_draft_explain_why(self, tmp_path, launchers):
         launchers("splash")
         model = _write_model(tmp_path / "m")
@@ -266,6 +316,77 @@ SPLASH_REPO_ID = re.compile(
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?/"
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
 )
+
+
+def _qwen38_gguf(vocab: list[str]) -> dict:
+    return {
+        "general.architecture": "qwen35",
+        "qwen35.block_count": 64,
+        "qwen35.context_length": 262144,
+        "qwen35.embedding_length": 5120,
+        "qwen35.attention.head_count": 24,
+        "qwen35.attention.head_count_kv": 4,
+        "qwen35.attention.key_length": 256,
+        "qwen35.full_attention_interval": 4,
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "qwen35",
+        "tokenizer.ggml.tokens": vocab,
+        "tokenizer.ggml.token_type": [3 if t.startswith("<|") else 1 for t in vocab],
+        "tokenizer.ggml.merges": [],
+        "tokenizer.ggml.eos_token_id": vocab.index("<|im_end|>"),
+        "tokenizer.chat_template": (
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}"
+            "<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        ),
+    }
+
+
+class TestGguf:
+    def test_qwen_gguf_serves_on_splash_with_a_derived_tokenizer(
+        self, tmp_path, monkeypatch, launchers, write_gguf
+    ):
+        # A small vocabulary keeps the derived tokenizer cheap to build.
+        family = splash_mod.SPLASH_FAMILIES["Qwen3.8-27B"]
+        monkeypatch.setitem(family, "vocab_size", 300)
+        alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+        specials = ["<|im_start|>", "<|im_end|>"]
+        vocab = alphabet + specials + [f"t{i}" for i in range(300 - 258)]
+        launchers("splash", version="1.3.2")
+        repo = tmp_path / "models" / "unsloth" / "Qwen3.8-27B-GGUF"
+        metadata = _qwen38_gguf(vocab)
+        write_gguf(repo / "Qwen3.8-27B-UD-Q4_K_M.gguf", metadata)
+        write_gguf(repo / "Qwen3.8-27B-BF16-00001-of-00002.gguf", metadata)
+        write_gguf(repo / "Qwen3.8-27B-BF16-00002-of-00002.gguf", {})
+        projector = {"general.architecture": "clip"}
+        write_gguf(repo / "mmproj-BF16.gguf", projector, size=512)
+        draft = _write_draft(tmp_path / "draft", {**QWEN38_TEXT, "vocab_size": 300})
+
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        folder = models["Qwen3.8-27B-UD-Q4_K_M"].model_path
+        target, reason = resolve_splash_target(folder, None, [str(draft)])
+
+        assert reason == ""
+        assert target.family == "Qwen3.8-27B"
+        gguf_bytes = (repo / "Qwen3.8-27B-UD-Q4_K_M.gguf").stat().st_size
+        assert splash_mod._weight_bytes(Path(folder)) == gguf_bytes + 512
+        split = models["Qwen3.8-27B-BF16"].model_path
+        assert resolve_splash_target(split, None, [str(draft)]) == (
+            None,
+            "Splash serves single-file GGUFs only",
+        )
+
+        # The tokenizer comes from the GGUF header, chat template included.
+        tokenizer = AutoTokenizer.from_pretrained(folder)
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        assert prompt == "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        assert tokenizer.decode(tokenizer.encode(prompt)) == prompt
+        assert tokenizer.encode("<|im_end|>") == [vocab.index("<|im_end|>")]
+        assert tokenizer.eos_token == "<|im_end|>"
 
 
 class TestStaging:
@@ -608,6 +729,7 @@ class TestStreaming:
                 live = engine.get_live_requests()
                 assert live["generating"] == []
                 row = live["prefilling"][0]
+                assert row["request_id"] == "req-1"
                 assert (row["total"], row["processed"]) == (100, 60)
                 assert row["speed"] == (60 - 20) / 0.2
                 assert row["eta"] == (100 - 60) / 200.0
@@ -620,7 +742,7 @@ class TestStreaming:
             tmp_path, lambda request: httpx.Response(200, stream=StreamingBody())
         )
         async for out in engine.stream_chat(
-            [{"role": "user", "content": "hi"}], max_tokens=128
+            [{"role": "user", "content": "hi"}], max_tokens=128, _request_id="req-1"
         ):
             if not out.finished:
                 live = engine.get_live_requests()
@@ -849,6 +971,19 @@ class TestEnginePool:
                 entry, ModelSettings(external_engine="splash"), "vlm"
             )
 
+    def test_a_gguf_runs_on_an_external_engine_without_the_setting(
+        self, tmp_path, launchers, global_settings
+    ):
+        pool, entry = _pool(tmp_path)
+        entry.model_format = "gguf"
+
+        # No in-process fallback, even with no engine to run it.
+        with pytest.raises(ModelLoadingError, match="Splash is not installed"):
+            pool._external_engine_for(entry, None, "vlm")
+        launchers("splash")
+        engine = pool._external_engine_for(entry, ModelSettings(), "vlm")
+        assert isinstance(engine, SplashEngine)
+
     def test_options_follow_omlx_settings(self, tmp_path, launchers, global_settings):
         launchers("splash")
         pool, entry = _pool(tmp_path)
@@ -921,6 +1056,40 @@ class TestEnginePool:
         pool._current_model_memory = 100 * GIB
         with pytest.raises(ModelLoadingError, match="leaves no memory"):
             pool._external_engine_for(entry, settings, "vlm")
+
+    def test_limit_the_shrunk_budget_cannot_hold_is_left_to_splash(
+        self, tmp_path, launchers, global_settings
+    ):
+        launchers("splash")
+        pool, entry = _pool(tmp_path)
+        pool._get_final_ceiling = lambda: 40 * GIB
+        settings = ModelSettings(external_engine="splash", max_context_window=262144)
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        draft = engine._target.draft_path
+        wanted = splash_memory_estimate(entry.model_path, draft, 262144, "int8")
+
+        # Room for the whole window: the limit goes to Splash.
+        assert engine._options.max_memory_bytes == wanted
+        assert engine._options.max_context == 262144
+
+        # Other models take memory, and the room left cannot hold 256K:
+        # Splash would refuse --max-context 262144, so it fits the context.
+        pool._current_model_memory = 40 * GIB - (wanted - 1)
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        assert engine._options.max_memory_bytes == wanted - 1
+        assert engine._options.max_context is None
+
+        # A smaller limit the shrunk room still holds goes to Splash.
+        small = ModelSettings(external_engine="splash", max_context_window=32768)
+        engine = pool._external_engine_for(entry, small, "vlm")
+        assert engine._options.max_context == 32768
+
+        # A configured budget too small for the limit leaves it to Splash too.
+        pool._current_model_memory = 0
+        global_settings.integrations.splash_max_memory_gb = 4
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        assert engine._options.max_memory_bytes == 4 * GIB
+        assert engine._options.max_context is None
 
     async def test_load_counts_the_planned_budget_and_unload_skips_mlx_barrier(
         self, tmp_path, launchers, global_settings
@@ -1123,9 +1292,31 @@ class TestAdminAPI:
         }
 
         assert rows[entry.model_id] == [
-            {"id": "splash", "label": "Splash", "compatible": True, "reason": ""}
+            {
+                "id": "splash",
+                "label": "Splash",
+                "compatible": True,
+                "reason": "",
+                "draft_repo": None,
+            }
         ]
         assert rows["Qwen3.8-27B-DFlash2"] == []
+
+        # Without its draft the model names the repo that provides it.
+        del pool._entries["Qwen3.8-27B-DFlash2"]
+        info = pool.get_status()["models"][0]
+        (row,) = admin_routes._external_engines_for_model(pool, info, None)
+        assert not row["compatible"]
+        assert row["draft_repo"] == "incoai/Qwen3.8-27B-DFlash2"
+
+        # A draft would not help a checkpoint Splash refuses for another reason.
+        bf16 = _write_model(tmp_path / "bf16")
+        config = json.loads((bf16 / "config.json").read_text())
+        del config["quantization"]
+        (bf16 / "config.json").write_text(json.dumps(config))
+        entry.model_path = str(bf16)
+        (row,) = admin_routes._external_engines_for_model(pool, info, None)
+        assert row["draft_repo"] is None
 
 
 # -- native response_format ---------------------------------------------------

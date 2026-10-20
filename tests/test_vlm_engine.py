@@ -3243,12 +3243,16 @@ class TestVLMEngineFrequencyPenalty:
         )
 
         await engine.generate(
-            "a prompt", preserve_reasoning=True, skip_cache_store=True
+            "a prompt",
+            preserve_reasoning=True,
+            skip_cache_store=True,
+            _request_id="req-1",
         )
 
         kwargs = engine._engine.generate.call_args.kwargs
         assert kwargs["preserve_reasoning"] is True
         assert kwargs["skip_cache_store"] is True
+        assert kwargs["request_id"] == "req-1"
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(

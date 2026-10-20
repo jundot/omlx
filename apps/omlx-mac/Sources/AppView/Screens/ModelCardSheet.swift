@@ -27,6 +27,8 @@ import MarkdownUI
 struct ModelCardTarget: Identifiable, Equatable, Sendable {
     let repoId: String
     let source: ModelCardSource
+    /// Tab the sheet opens on; a download opens on Files to pick them.
+    var startTab: ModelCardTab = .card
 
     /// `.sheet(item:)` uses this to decide when to re-present. Composing
     /// source into the id means switching HF↔MS for the same string
@@ -94,14 +96,17 @@ enum ModelCardTab: Hashable, CaseIterable {
 struct ModelCardSheet: View {
     let target: ModelCardTarget
     let client: OMLXClient
-    /// Triggered by the in-sheet Download button. The host wires this
-    /// to `vm.startDownload(repo:)` so the action plays nicely with
+    /// Triggered by the in-sheet download buttons with the repo and the
+    /// files to fetch (nil for the whole repo). The host wires this to
+    /// `vm.startDownload(repo:files:)` so the action plays nicely with
     /// the existing source-routed downloader plumbing. Sheet dismisses
     /// itself on tap so the user lands back on the row with the task
     /// already moving in the Active section.
-    let onDownload: (String) -> Void
+    let onDownload: (String, [String]?) -> Void
 
     @State private var state: LoadState = .idle
+    /// Files picked in the Files tab, beside the required ones.
+    @State private var selected: Set<String> = []
     /// Currently selected tab in the sheet. Reset to `.card` whenever
     /// the target changes (different repo opened) so we never inherit
     /// a stale Files/Tags selection from a previous model.
@@ -127,7 +132,7 @@ struct ModelCardSheet: View {
             // Reset tab selection on every (re)open so a tab the
             // previous repo had (e.g. Files on HF) doesn't stick when
             // the user opens an MS card next.
-            activeTab = .card
+            activeTab = target.startTab
             await load()
         }
     }
@@ -235,7 +240,7 @@ struct ModelCardSheet: View {
         case .card:
             cardBody(markdown: dto.modelCard)
         case .files:
-            filesBody(files: dto.files ?? [])
+            filesBody(dto: dto)
         case .tags:
             tagsBody(tags: dto.tags ?? [])
         }
@@ -362,7 +367,8 @@ struct ModelCardSheet: View {
     // MARK: Files tab (gap #5)
 
     @ViewBuilder
-    private func filesBody(files: [ModelCardFile]) -> some View {
+    private func filesBody(dto: ModelCardDTO) -> some View {
+        let files = dto.files ?? []
         if files.isEmpty {
             emptyStateView(
                 symbol: "doc.text.below.ecg",
@@ -371,33 +377,115 @@ struct ModelCardSheet: View {
                                 comment: "Empty state in the Files tab when the upstream API doesn't list any files")
             )
         } else {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(files.enumerated()), id: \.element.id) { idx, file in
-                        HStack(alignment: .firstTextBaseline, spacing: 8) {
-                            Text(file.name)
-                                .font(.omlxMono(12))
-                                .foregroundStyle(theme.text)
-                                .textSelection(.enabled)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Spacer(minLength: 8)
-                            if let s = file.sizeFormatted, !s.isEmpty {
-                                Text(s)
-                                    .font(.omlxMono(11))
-                                    .foregroundStyle(theme.textSecondary)
+            VStack(alignment: .leading, spacing: 0) {
+                if target.source == .huggingFace, dto.isAdapter != true, dto.unsupportedReason == nil,
+                   dto.layout == "safetensors" || dto.layout == "gguf" {
+                    Text(dto.layout == "safetensors" ? checkpointFilesHint : ggufFilesHint)
+                        .font(.omlxText(11))
+                        .foregroundStyle(theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, 20)
+                        .padding(.top, 8)
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(Array(files.enumerated()), id: \.element.id) { idx, file in
+                            fileRow(file, files: files)
+                            if idx < files.count - 1 {
+                                Divider().opacity(0.4)
                             }
                         }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 8)
-                        if idx < files.count - 1 {
-                            Divider().opacity(0.4)
-                        }
                     }
+                    .padding(.vertical, 4)
                 }
-                .padding(.vertical, 4)
             }
         }
+    }
+
+    private func fileRow(_ file: ModelCardFile, files: [ModelCardFile]) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if target.source == .huggingFace {
+                Toggle("", isOn: Binding(
+                    get: { file.local == true || isSelected(file) },
+                    set: { _ in toggle(file, files: files) }
+                ))
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+                .disabled(isLocked(file))
+            }
+            Text(file.name)
+                .font(.omlxMono(12))
+                .foregroundStyle(theme.text)
+                .textSelection(.enabled)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 8)
+            if file.local == true {
+                Text(String(localized: "downloads.card.files.downloaded",
+                            defaultValue: "Downloaded",
+                            comment: "Marker on a file in the model card's Files tab that is already in the model folder"))
+                    .font(.omlxText(10.5, weight: .medium))
+                    .foregroundStyle(theme.successText)
+            } else if file.required == true {
+                Text(String(localized: "downloads.card.files.required",
+                            defaultValue: "Required",
+                            comment: "Marker on a file in the model card's Files tab that the model cannot load without"))
+                    .font(.omlxText(10.5))
+                    .foregroundStyle(theme.textTertiary)
+            }
+            if let s = file.sizeFormatted, !s.isEmpty {
+                Text(s)
+                    .font(.omlxMono(11))
+                    .foregroundStyle(theme.textSecondary)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+    }
+
+    private var checkpointFilesHint: String {
+        String(localized: "downloads.card.files.hint.checkpoint",
+               defaultValue: "Files the model needs stay checked. Uncheck the extras you do not want.",
+               comment: "Hint above the Files tab of a safetensors repo")
+    }
+
+    private var ggufFilesHint: String {
+        String(localized: "downloads.card.files.hint.gguf",
+               defaultValue: "Check the GGUF files to download. A GGUF brings its vision projector with it.",
+               comment: "Hint above the Files tab of a GGUF repo")
+    }
+
+    // MARK: File selection
+
+    private func isLocked(_ file: ModelCardFile) -> Bool {
+        file.required == true || file.local == true
+    }
+
+    private func isSelected(_ file: ModelCardFile) -> Bool {
+        file.local != true && (file.required == true || selected.contains(file.name))
+    }
+
+    /// A split GGUF's parts toggle together; a GGUF brings its projector.
+    private func toggle(_ file: ModelCardFile, files: [ModelCardFile]) {
+        guard !isLocked(file) else { return }
+        let on = !selected.contains(file.name)
+        let members = file.group.map { group in files.filter { $0.group == group } } ?? [file]
+        for member in members where member.local != true {
+            if on { selected.insert(member.name) } else { selected.remove(member.name) }
+        }
+        if on, let projector = file.mmproj,
+           files.contains(where: { $0.name == projector && $0.local != true }) {
+            selected.insert(projector)
+        }
+    }
+
+    private func selectedFiles(_ dto: ModelCardDTO) -> [ModelCardFile] {
+        (dto.files ?? []).filter(isSelected)
+    }
+
+    private func fitsDisk(_ bytes: Int64, _ dto: ModelCardDTO) -> Bool {
+        guard let free = dto.diskFree, free > 0 else { return true }
+        return bytes <= free
     }
 
     // MARK: Tags tab (gap #6)
@@ -477,22 +565,88 @@ struct ModelCardSheet: View {
                 // Adapters can't be downloaded as a runnable model;
                 // hide the action entirely so the user doesn't kick
                 // off a download that won't load.
-                Button {
-                    onDownload(target.repoId)
-                    dismiss()
-                } label: {
-                    Label(String(localized: "downloads.card.download",
-                                 defaultValue: "Download",
-                                 comment: "Primary button in the model card sheet that starts downloading the displayed model"),
-                          systemImage: "icloud.and.arrow.down")
-                        .labelStyle(.titleAndIcon)
+                if let reason = dto.unsupportedReason, !reason.isEmpty {
+                    Text(reason)
+                        .font(.omlxText(11))
+                        .foregroundStyle(theme.warningText)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if target.source == .huggingFace {
+                    hfDownloadButtons(dto: dto)
+                } else {
+                    Button {
+                        onDownload(target.repoId, nil)
+                        dismiss()
+                    } label: {
+                        Label(String(localized: "downloads.card.download",
+                                     defaultValue: "Download",
+                                     comment: "Primary button in the model card sheet that starts downloading the displayed model"),
+                              systemImage: "icloud.and.arrow.down")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.omlx(.primary))
+                    .keyboardShortcut(.defaultAction)
                 }
-                .buttonStyle(.omlx(.primary))
-                .keyboardShortcut(.defaultAction)
             }
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+    }
+
+    @ViewBuilder
+    private func hfDownloadButtons(dto: ModelCardDTO) -> some View {
+        let picked = selectedFiles(dto)
+        let pickedSize = picked.reduce(Int64(0)) { $0 + $1.size }
+        // What "Download All" still fetches: its files not downloaded yet.
+        let files = dto.files ?? []
+        let allSize = files.isEmpty
+            ? (dto.downloadAllSize ?? 0)
+            : files
+                .filter { (dto.layout != "safetensors" || $0.preselected == true) && $0.local != true }
+                .reduce(Int64(0)) { $0 + $1.size }
+        if !fitsDisk(pickedSize, dto) {
+            Text(String(localized: "downloads.card.not_enough_space",
+                        defaultValue: "Not enough free space in the model folder",
+                        comment: "Warning beside the download buttons when the selection does not fit on disk"))
+                .font(.omlxText(11))
+                .foregroundStyle(theme.redDot)
+        }
+        Button(String(localized: "downloads.card.cancel",
+                      defaultValue: "Cancel",
+                      comment: "Button in the model card sheet that closes it without downloading")) {
+            dismiss()
+        }
+        .buttonStyle(.omlx(.normal))
+        Button {
+            onDownload(target.repoId, nil)
+            dismiss()
+        } label: {
+            Text(allSize > 0 ? "\(downloadAllLabel) · \(formatBytes(allSize))" : downloadAllLabel)
+        }
+        .buttonStyle(.omlx(.normal))
+        .disabled(!fitsDisk(allSize, dto))
+        Button {
+            onDownload(target.repoId, picked.map(\.name))
+            dismiss()
+        } label: {
+            Label(pickedSize > 0 ? "\(downloadSelectedLabel) · \(formatBytes(pickedSize))" : downloadSelectedLabel,
+                  systemImage: "icloud.and.arrow.down")
+                .labelStyle(.titleAndIcon)
+        }
+        .buttonStyle(.omlx(.primary))
+        .keyboardShortcut(.defaultAction)
+        .disabled(picked.isEmpty || !fitsDisk(pickedSize, dto))
+    }
+
+    private var downloadAllLabel: String {
+        String(localized: "downloads.card.download_all",
+               defaultValue: "Download All",
+               comment: "Button in the model card sheet that downloads every file of the repo")
+    }
+
+    private var downloadSelectedLabel: String {
+        String(localized: "downloads.card.download_selected",
+               defaultValue: "Download Selected",
+               comment: "Primary button in the model card sheet that downloads the files checked in the Files tab")
     }
 
     /// Source-specific label for the "View on …" link. Localized via
@@ -532,12 +686,22 @@ struct ModelCardSheet: View {
                 .foregroundStyle(theme.textSecondary)
                 .multilineTextAlignment(.center)
                 .textSelection(.enabled)
-            Button(String(localized: "downloads.card.retry",
-                          defaultValue: "Retry",
-                          comment: "Retry button shown after the model card fetch failed")) {
-                Task { await load() }
+            HStack(spacing: 8) {
+                Button(String(localized: "downloads.card.retry",
+                              defaultValue: "Retry",
+                              comment: "Retry button shown after the model card fetch failed")) {
+                    Task { await load() }
+                }
+                .buttonStyle(.omlx(.primary))
+                // A download still starts when the file list does not load.
+                if target.source == .huggingFace && target.startTab == .files {
+                    Button(downloadAllLabel) {
+                        onDownload(target.repoId, nil)
+                        dismiss()
+                    }
+                    .buttonStyle(.omlx(.normal))
+                }
             }
-            .buttonStyle(.omlx(.primary))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
@@ -555,6 +719,9 @@ struct ModelCardSheet: View {
             case .modelScope:
                 dto = try await client.getMSModelCard(modelId: target.repoId)
             }
+            selected = Set((dto.files ?? [])
+                .filter { $0.preselected == true && $0.local != true }
+                .map(\.name))
             state = .loaded(dto)
         } catch {
             state = .failed(error.omlxDescription)

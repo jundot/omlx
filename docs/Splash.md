@@ -1,6 +1,6 @@
 # Splash engine
 
-[Splash](https://github.com/incoai/splash) runs Qwen3.8-27B and Qwen3.6-35B-A3B on its own Metal engine with DFlash2 speculative decoding. oMLX can serve a model through Splash as an external engine instead of its in-process MLX engines. The model stays in oMLX's model list, API, dashboard and usage statistics like any other; Splash does the inference in its own process.
+[Splash](https://github.com/incoai/splash) runs Qwen3.8-27B and Qwen3.6-35B-A3B on its own Metal engine with DFlash2 speculative decoding. oMLX can serve a model through Splash as an external engine instead of its in-process MLX engines, including GGUF files, which only an external engine runs. The model stays in oMLX's model list, API, dashboard and usage statistics like any other; Splash does the inference in its own process.
 
 ## Setup
 
@@ -12,23 +12,30 @@
    | Splash M1 | `splash-m1` | M1 and M2 as well | `install-m1.sh` from [paperniuk/splash releases](https://github.com/paperniuk/splash/releases) |
 
 2. Open **Settings → Integrations → External engines**. oMLX looks for the launcher on `PATH`, then in `/opt/homebrew/bin`, `/usr/local/bin` and `~/.local/bin`, preferring Splash M1 on M1/M2 Macs and the official build elsewhere. When it finds one, the card shows its path and version. Otherwise, enter the launcher's path there (a source checkout's `./splash`, for example).
-3. Download the DFlash2 draft for the model's family into a model directory, for example `z-lab/Qwen3.8-27B-DFlash2` (the same weights as `incoai/Qwen3.8-27B-DFlash2`) or `incoai/Qwen3.6-35B-A3B-DFlash2`.
-4. In the model's **Model Settings → Advanced**, turn on **Use external engine** and pick Splash.
+3. Download the DFlash2 draft Splash pairs with the model's family into a model directory: `incoai/Qwen3.8-27B-DFlash2` (`z-lab/Qwen3.8-27B-DFlash2` holds the same weights) or `incoai/Qwen3.6-35B-A3B-DFlash2`. The model's **Model Settings → Advanced** offers a button that downloads it.
+4. In the model's **Model Settings → Advanced**, turn on **Use external engine** and pick Splash. A GGUF model has it on already.
 
-The toggle stays off, with the reason shown, until all of this is in place. The macOS app has the same settings under Integrations and the model's Advanced tab.
+The toggle stays off, with the reason shown, until all of this is in place. The macOS app has the same settings under Integrations and the model's Advanced tab. In the model list, a model Splash can serve carries a Splash badge.
 
 ## What runs on Splash
 
-MLX checkpoints of the two families Splash supports, quantized with affine quantization:
+Quantized checkpoints of the two families Splash supports:
 
-- Splash 1.3.0 (and Splash M1 1.3.0) serves affine 4-bit/group-64 checkpoints, for example `mlx-community/Qwen3.8-27B-4bit`.
-- Splash 1.3.1 also serves mixed-bit checkpoints, and checks the bit widths itself when it loads the model.
+- MLX checkpoints with affine quantization. Splash 1.3.0 (and Splash M1 1.3.0) serves affine 4-bit/group-64 checkpoints, for example `mlx-community/Qwen3.8-27B-4bit`. Splash 1.3.1 also serves mixed-bit checkpoints, and checks the bit widths itself when it loads the model.
+- GGUF files, for example a variant of `unsloth/Qwen3.8-27B-GGUF` (see [GGUF models](#gguf-models)). Splash checks the file's tensor types itself. A split GGUF (`-00001-of-0000N`) does not run on Splash.
+- Splash 1.3.2 also serves NVFP4 and FP8 checkpoints from NVIDIA Model Optimizer and compressed-tensors, for example `nvidia/Qwen3.8-27B-NVFP4` and `unsloth/Qwen3.8-27B-NVFP4`.
 
-Prebuilt Splash packages (`incoai/*-Splash`) are not supported; Splash 1.3.1 replaced them with the MLX checkpoints above.
+Prebuilt Splash packages (`incoai/*-Splash`) are not supported; Splash 1.3.1 replaced them with the MLX checkpoints above. The model downloader refuses them and names the MLX model that holds the same weights.
+
+## GGUF models
+
+In the model downloader, the **GGUF only** view lists GGUF repositories. Downloading one opens its file list: check the GGUF to download, and its vision projector (`mmproj-*.gguf`) is checked with it. Only the checked files are fetched, into `<model dir>/<owner>/<repo>/`.
+
+oMLX lists each GGUF in a model directory, an organization folder (`<owner>/<repo>/`, as the downloader and LM Studio lay them out) or the Hugging Face cache as its own model, named by its file, for example `Qwen3.8-27B-UD-Q4_K_M`. Vision projectors and imatrix files are not models, and subfolders of a repository are not scanned. For each GGUF oMLX generates a folder under `<base path>/gguf` with a `config.json` derived from the file's header and links to the file and its projectors; for the Qwen families the folder also holds the tokenizer the header defines. A GGUF runs only on an external engine: it never loads in oMLX's MLX engines, and `/v1/models` lists it only while an engine can serve it. Deleting a GGUF in the model manager removes its file, and the folder goes with its last GGUF.
 
 ## How it works
 
-Splash finds models by Hugging Face repository ID in a Hugging Face cache. oMLX presents the model folder to it as an entry of a private cache under `<base path>/splash/hub`: a snapshot made of symlinks to the model's files. Splash starts with `--offline` against that cache, so it never downloads the model, and the files it reads are the ones in your model directory. The draft is passed with `--draft-model`.
+Splash finds models by Hugging Face repository ID in a Hugging Face cache. oMLX presents the model folder to it as an entry of a private cache under `<base path>/splash/hub`: a snapshot made of symlinks to the model's files. For a GGUF that is the GGUF and its projectors, and Splash reads the tokenizer and configuration from the GGUF itself. Splash starts with `--offline` against that cache, so it never downloads the model, and the files it reads are the ones in your model directory. The draft is passed with `--draft-model`.
 
 On the first start Splash hashes the model files once (about one full read of the weights); later starts only check their sizes and times. A model folder that is itself a Hugging Face cache snapshot skips the hashing. Splash keeps its own selection links under `~/Library/Application Support/Splash/models/omlx/`.
 

@@ -2897,8 +2897,8 @@ class TestClaudeCodeValidation:
 class TestClaudeCodeRouteIntegration:
     """Integration tests for the settings chain: dataclass <-> dict <-> routes."""
 
-    def test_claude_code_to_dict_has_four_keys(self):
-        """to_dict must include all four keys so GlobalSettings.save() persists them."""
+    def test_claude_code_to_dict_has_five_keys(self):
+        """to_dict must include all five keys so GlobalSettings.save() persists them."""
         s = ClaudeCodeSettings(
             mode="local",
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
@@ -2911,6 +2911,7 @@ class TestClaudeCodeRouteIntegration:
             "opus_model",
             "sonnet_model",
             "haiku_model",
+            "desktop_enabled",
         }
         assert set(d.keys()) == expected_keys
 
@@ -2921,12 +2922,14 @@ class TestClaudeCodeRouteIntegration:
             opus_model="mlx-community/Qwen3-30B-A3B-4bit",
             sonnet_model="mlx-community/Qwen3-14B-4bit",
             haiku_model="mlx-community/Qwen3-4B-4bit",
+            desktop_enabled=True,
         )
         reloaded = ClaudeCodeSettings.from_dict(original.to_dict())
         assert reloaded.mode == "local"
         assert reloaded.opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
         assert reloaded.sonnet_model == "mlx-community/Qwen3-14B-4bit"
         assert reloaded.haiku_model == "mlx-community/Qwen3-4B-4bit"
+        assert reloaded.desktop_enabled is True
 
     def test_claude_code_round_trip_null_models(self):
         """Null model fields survive the round-trip."""
@@ -2968,6 +2971,65 @@ class TestClaudeCodeRouteIntegration:
         )
         assert "claude_code_opus_model" in r.model_fields_set
         assert r.claude_code_opus_model == "mlx-community/Qwen3-30B-A3B-4bit"
+
+    @pytest.mark.parametrize(
+        ("before", "after", "action"),
+        [(False, True, "configure"), (True, False, "restore"), (False, False, None)],
+    )
+    def test_desktop_toggle_writes_claude_config_on_transition(
+        self, tmp_path, monkeypatch, before, after, action
+    ):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+        from omlx.integrations import claude_desktop
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.claude_code.desktop_enabled = before
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        calls = []
+        monkeypatch.setattr(
+            claude_desktop,
+            "configure_omlx_gateway",
+            lambda port, api_key: calls.append("configure") or True,
+        )
+        monkeypatch.setattr(
+            claude_desktop, "restore", lambda: calls.append("restore") or True
+        )
+
+        request = admin_routes.GlobalSettingsRequest.model_validate(
+            {"claude_code_desktop_enabled": after}
+        )
+        result = asyncio.run(
+            admin_routes.update_global_settings(request=request, is_admin=True)
+        )
+
+        assert gs.claude_code.desktop_enabled is after
+        assert calls == ([action] if action else [])
+        assert result["claude_desktop"].get("action") == action
+
+    def test_desktop_restore_endpoint_clears_toggle(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from omlx.admin import routes as admin_routes
+        from omlx.integrations import claude_desktop
+
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.claude_code.desktop_enabled = True
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: gs)
+        monkeypatch.setattr(claude_desktop, "restore", lambda: True)
+        monkeypatch.setattr(claude_desktop, "is_configured", lambda: False)
+
+        result = asyncio.run(
+            admin_routes.claude_desktop_restore(
+                admin_routes.ClaudeDesktopRestoreRequest(), is_admin=True
+            )
+        )
+
+        assert result["configured"] is False
+        assert (
+            GlobalSettings.load(base_path=tmp_path).claude_code.desktop_enabled is False
+        )
 
 
 class TestCORSMiddleware:

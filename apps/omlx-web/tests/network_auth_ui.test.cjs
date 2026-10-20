@@ -215,3 +215,19 @@ test('the rate reaches the progress line and both queue templates', () => {
     assert.ok(template.split('x-text="formatProgress(task)"').length - 1 >= 2);
     assert.ok(template.split('formatSpeed(task)').length - 1 >= 2);
 });
+
+test('the ETA joins the progress line only while it is known', () => {
+    const {state, win} = fixture();
+    win.t = key => (key === 'models.queue.eta' ? '{time} left' : key);
+    assert.equal(state.formatEta(9000), '2h 30m left');
+    assert.equal(state.formatEta(125), '2m 5s left');
+    assert.equal(state.formatEta(42), '42s left');
+    const task = {
+        progress: 9,
+        downloaded_size: 536870912,
+        total_size: 1073741824,
+        speed_bps: 45298483.2,
+    };
+    assert.ok(state.formatProgress({...task, eta_seconds: 42}).endsWith('MB/s \u00b7 42s left'));
+    assert.ok(state.formatProgress({...task, eta_seconds: null}).endsWith('MB/s'));
+});

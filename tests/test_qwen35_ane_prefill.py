@@ -1182,10 +1182,14 @@ def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
 
     monkeypatch.setattr(fast, "ane_compile_linear_bank", compile_bank)
     per_layer = []
+    warmed = []
 
     def compile_pair(mlp, config):
         per_layer.append(mlp)
-        return SimpleNamespace(model1=object())
+        return SimpleNamespace(
+            model=SimpleNamespace(warmup=lambda: warmed.append("ane0")),
+            model1=SimpleNamespace(warmup=lambda: warmed.append("ane1")),
+        )
 
     monkeypatch.setattr(ane_patch, "_compile_pair", compile_pair)
     model = _Model(4)
@@ -1201,6 +1205,9 @@ def test_enable_falls_back_to_per_layer_when_split_banks_fail(monkeypatch):
     assert count == 4
     assert len(per_layer) == 4
     assert model._omlx_ane_dual_prefill_count == 4
+    # Per-layer programs own their I/O surfaces; warming them at load puts
+    # the surfaces in phys_footprint before admission prices a prefill.
+    assert warmed == ["ane0", "ane1"] * 4
 
 
 def test_compile_pair_builds_one_combined_ane_program(monkeypatch):
@@ -1679,6 +1686,48 @@ def test_backend_dispatches_dual_q8_swiglu_with_bits(monkeypatch):
         8,
         128,
     )
+
+
+def test_split_suffix_keeps_gate_and_up_rows_in_place(monkeypatch):
+    """A view-backed suffix passes gate and up rows as two blocks to the kernel."""
+    mlp = SimpleNamespace(
+        gate_proj=nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=8),
+        up_proj=nn.QuantizedLinear(128, 256, bias=False, group_size=64, bits=8),
+        down_proj=nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=8),
+    )
+    for linear in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    config = ane_patch._AnePrefillConfig(
+        1, 0.5, 8, dual_ane=True, gpu_suffix_views=True
+    )
+    model0, model1 = object(), object()
+    state = ane_patch._prepare_pair_runtime_state(mlp, config, model0, model1)
+
+    gpu_start = state.ane_outputs
+    assert state.gpu_outputs == 128
+    assert mx.array_equal(state.weight, mlp.gate_proj.weight[gpu_start:])
+    assert mx.array_equal(state.scales, mlp.gate_proj.scales[gpu_start:])
+    up_weight, up_scales, up_biases = state.up_suffix
+    assert mx.array_equal(up_weight, mlp.up_proj.weight[gpu_start:])
+    assert mx.array_equal(up_biases, mlp.up_proj.biases[gpu_start:])
+
+    captured = {}
+
+    def fused(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return mx.zeros((1, 1, 4), dtype=mx.bfloat16)
+
+    monkeypatch.setattr(fast, "ane_dual_affine_swiglu_t", fused, raising=False)
+    monkeypatch.setattr(ane_patch, "_post_ane_down", lambda *args: args[1])
+    mlp._omlx_ane_prefill_config = config
+    mlp._omlx_ane_prefill_state = state
+    mx.eval(ane_patch._backend(mlp, mx.zeros((1, 1, 128), dtype=mx.bfloat16)))
+
+    assert captured["kwargs"] == {"up_suffix": state.up_suffix}
+
+
 @pytest.mark.parametrize("bits", [5, 6, 8])
 def test_prepare_pair_enables_cpu_gate_share_for_q5_plus(monkeypatch, bits):
     mlp = SimpleNamespace(
@@ -2694,29 +2743,26 @@ def test_enable_warms_the_cpu_sharing_path(monkeypatch):
 # --- ANE prefill transient memory estimate (issue #2841) ---
 
 
-def test_ane_prefill_transient_bytes_reads_live_model_dims():
-    """The estimate sums (input + output) * seq * 2 over the compiled models."""
-    seq = 2048
+def test_ane_prefill_transient_bytes_sums_program_weights():
+    """The estimate sums the native program weight bytes, not the I/O surfaces."""
 
-    def _ane_model(input_dim, output_dim):
+    def _ane_model(weight_bytes):
         return SimpleNamespace(
-            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+            input_dim=5120, output_dim=4608, sequence_length=2048,
+            weight_bytes=weight_bytes,
         )
 
     mlp = SimpleNamespace(
         _omlx_ane_prefill_state=SimpleNamespace(
-            model=_ane_model(5120, 4608), model1=_ane_model(5120, 4608)
+            model=_ane_model(100), model1=_ane_model(200)
         )
     )
     gdn = SimpleNamespace(
-        _omlx_ane_gdn_state=SimpleNamespace(
-            model=_ane_model(5120, 768), model1=None
-        )
+        _omlx_ane_gdn_state=SimpleNamespace(model=_ane_model(30), model1=None)
     )
     model = SimpleNamespace(modules=lambda: [mlp, gdn, SimpleNamespace()])
 
-    expected = 2 * (5120 + 4608) * seq * 2 + (5120 + 768) * seq * 2
-    assert ane_patch.ane_prefill_transient_bytes(model) == expected
+    assert ane_patch.ane_prefill_transient_bytes(model) == 330
 
 
 def test_ane_prefill_transient_bytes_zero_without_ane():
@@ -2727,12 +2773,11 @@ def test_ane_prefill_transient_bytes_zero_without_ane():
 
 
 def test_ane_prefill_transient_bytes_prices_fused_and_down_states():
-    """Fused SwiGLU/down banks and ANE down slices hold IOSurfaces too."""
-    seq = 2048
+    """Fused and down slices count too; older extensions fall back to INT8 rows."""
 
     def _ane_model(input_dim, output_dim):
         return SimpleNamespace(
-            input_dim=input_dim, output_dim=output_dim, sequence_length=seq
+            input_dim=input_dim, output_dim=output_dim, sequence_length=2048
         )
 
     fused = SimpleNamespace(
@@ -2751,11 +2796,7 @@ def test_ane_prefill_transient_bytes_prices_fused_and_down_states():
     )
     model = SimpleNamespace(modules=lambda: [fused, down])
 
-    expected = (
-        2 * (5120 + 5120) * seq * 2
-        + (5120 + 4608) * seq * 2
-        + 2 * (4608 + 5120) * seq * 2
-    )
+    expected = 2 * 5120 * 5120 + 5120 * 4608 + 2 * 4608 * 5120
     assert ane_patch.ane_prefill_transient_bytes(model) == expected
 
 

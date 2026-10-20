@@ -23,7 +23,9 @@ def _normal_power_of_two(exponent):
 def round_fp8(x):
     """E4M3FN, round to nearest even with finite saturation."""
     a = mx.minimum(mx.abs(x.astype(mx.float32)), 448.0)
-    exponent = mx.floor(mx.log2(mx.maximum(a, 2.0**-9)))
+    # Binade from the fp32 exponent bits (exact); a transcendental log2 can misplace values
+    # just below a power of two, whereas DeepSeek casts with a true E4M3 round-to-nearest-even.
+    exponent = ((a.view(mx.uint32) >> 23) & 0xFF).astype(mx.int32) - 127
     step = _normal_power_of_two(mx.maximum(exponent - 3, -9))
     return mx.sign(x) * mx.minimum(mx.round(a / step) * step, 448.0)
 
@@ -34,13 +36,17 @@ def _quantize_activation(x, bits=8, group_size=32, e4m3_scale=False):
         raise ValueError("Activation width must divide by quantization group size")
     grouped = x.astype(mx.float32).reshape(*shape[:-1], -1, group_size)
     limit = 448.0 if bits == 8 else 6.0
-    minimum = limit * (2.0**-9 if e4m3_scale else 2.0**-126)
+    # DeepSeek-V4.1-Flash kernel.py floors: act_quant max(amax, 1e-4); fp4_act_quant
+    # 6*2^-126 (E8M0 scales) or 6*2^-9 (E4M3 scales).
+    minimum = 1e-4 if bits == 8 else limit * (2.0**-9 if e4m3_scale else 2.0**-126)
     amax = mx.maximum(mx.max(mx.abs(grouped), axis=-1, keepdims=True), minimum)
-    scale = (
-        round_fp8(amax / limit)
-        if e4m3_scale
-        else _normal_power_of_two(mx.maximum(mx.ceil(mx.log2(amax / limit)), -126))
-    )
+    if e4m3_scale:
+        scale = round_fp8(amax / limit)
+    else:
+        # fast_round_scale: 2^ceil(log2(amax * fp32(1/limit))) from the product's IEEE bits.
+        bits32 = (amax * mx.array(1.0 / limit, mx.float32)).view(mx.uint32)
+        exponent = ((bits32 >> 23) & 0xFF).astype(mx.int32) - 127 + ((bits32 & 0x7FFFFF) != 0).astype(mx.int32)
+        scale = _normal_power_of_two(exponent)
     scaled = mx.clip(grouped / scale, -limit, limit)
     if bits == 8:
         quantized = round_fp8(scaled)
@@ -81,7 +87,7 @@ def quantize_activation(x, bits=8, group_size=32, e4m3_scale=False):
 
 
 @mx.compile
-def pack_activation(x, bits=8, group_size=32, e4m3_scale=False):
+def _pack_activation_reference(x, bits=8, group_size=32, e4m3_scale=False):
     """Pack each row as value bytes followed by one scale byte per group."""
     if bits not in (4, 8) or x.shape[-1] % group_size:
         raise ValueError("Invalid packed activation geometry")
@@ -102,13 +108,15 @@ def _pack_activation(x, bits, group_size, e4m3_scale):
         *x.shape[:-1], x.shape[-1] // group_size, group_size
     )
     limit = 448.0 if bits == 8 else 6.0
-    minimum = limit * (2.0**-9 if e4m3_scale else 2.0**-126)
+    # Same floors and scale rules as _quantize_activation (DeepSeek kernel.py).
+    minimum = 1e-4 if bits == 8 else limit * (2.0**-9 if e4m3_scale else 2.0**-126)
     amax = mx.maximum(mx.max(mx.abs(grouped), -1), minimum)
     if e4m3_scale:
         scale = round_fp8(amax / limit)
         scale_bytes = mx.to_fp8(scale)
     else:
-        exponent = mx.maximum(mx.ceil(mx.log2(amax / limit)), -126)
+        bits32 = (amax * mx.array(1.0 / limit, mx.float32)).view(mx.uint32)
+        exponent = ((bits32 >> 23) & 0xFF).astype(mx.int32) - 127 + ((bits32 & 0x7FFFFF) != 0).astype(mx.int32)
         scale = _normal_power_of_two(exponent)
         scale_bytes = (exponent + 127).astype(mx.uint8)
     scaled = mx.clip(grouped / scale[..., None], -limit, limit).reshape(x.shape)
@@ -133,6 +141,21 @@ def _pack_activation(x, bits, group_size, e4m3_scale):
         code = code.astype(mx.uint8) | ((scaled < 0).astype(mx.uint8) << 3)
         values = code[..., ::2] | (code[..., 1::2] << 4)
     return mx.concatenate([values, scale_bytes], -1)
+
+
+def pack_activation(x, bits=8, group_size=32, e4m3_scale=False):
+    if (
+        mx.default_device() == mx.gpu
+        and x.size
+        and x.shape[-1] % 32 == 0
+        and (bits, group_size, e4m3_scale)
+        in ((8, 32, False), (4, 32, False), (4, 16, True))
+        and x.dtype in (mx.float32, mx.float16, mx.bfloat16)
+    ):
+        from .packed_kv import fused_pack_activation
+
+        return fused_pack_activation(x, bits, group_size, e4m3_scale)
+    return _pack_activation_reference(x, bits, group_size, e4m3_scale)
 
 
 def unpack_activation(

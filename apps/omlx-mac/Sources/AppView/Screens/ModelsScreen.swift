@@ -250,6 +250,24 @@ private struct LibrarySection: View {
                                                          defaultValue: "Found in the Hugging Face cache. Other apps that use this cache will need to download it again after you delete it.",
                                                          comment: "Tooltip on the HF cache badge in the model library"))
                                     }
+                                    ForEach((m.externalEngines ?? []).filter(\.compatible)) { engine in
+                                        StatusPill(status: .custom(
+                                            color: theme.accent,
+                                            label: engine.label,
+                                            fillBg: true))
+                                            .help(String(localized: "models.library.external_engine.help",
+                                                         defaultValue: "\(engine.label) can serve this model. Turn it on in the model's Advanced settings.",
+                                                         comment: "Tooltip on the external engine badge in the model library; placeholder is the engine name"))
+                                    }
+                                    if m.isGGUF {
+                                        StatusPill(status: .custom(
+                                            color: theme.textTertiary,
+                                            label: "GGUF",
+                                            fillBg: true))
+                                            .help(String(localized: "models.library.gguf.help",
+                                                         defaultValue: "A GGUF file, served by an external engine",
+                                                         comment: "Tooltip on the GGUF badge in the model library"))
+                                    }
                                 }
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                                     .font(.omlxMono(11))

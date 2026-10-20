@@ -958,7 +958,7 @@ private struct TopPage: View {
         return NavRow(label: page.title,
                       value: vm.summary(for: page),
                       isLast: isLast,
-                      isDimmed: enginePage && !vm.externalEngine.isEmpty,
+                      isDimmed: enginePage && !vm.effectiveExternalEngine.isEmpty,
                       action: { open(page) }) {
             Squircle(systemSymbol: symbol, gradient: gradient)
         }
@@ -975,7 +975,8 @@ private struct BasicSection: View {
                              comment: "Section header above the Basic tab fields"))
 
         // These are per-model fields (never stored in profiles), so each
-        // one saves on commit. Enable Thinking is the profile exception.
+        // one saves on commit. Context Window and Enable Thinking are the
+        // profile exceptions.
         ListGroup {
             Row(label: String(localized: "settings.basic.alias.label",
                               defaultValue: "Model Alias",
@@ -986,14 +987,27 @@ private struct BasicSection: View {
                 TextInput(text: $vm.alias, placeholder: vm.modelID, mono: true, width: .controlMedium)
                     .onSubmit { Task { await vm.save(.alias, client: client) } }
             }
-            Row(label: String(localized: "settings.basic.model_type.label",
-                              defaultValue: "Model Type",
-                              comment: "Row label for the model type override popup")) {
-                Popup(
-                    selection: vm.bind($vm.modelTypeOverride, save: { Task { await vm.save(.modelType, client: client) } }),
-                    width: .controlMedium,
-                    options: ModelSettingsScreenVM.modelTypeOptions
-                )
+            // A GGUF's type comes from its file.
+            if vm.model?.isGGUF != true {
+                Row(label: String(localized: "settings.basic.model_type.label",
+                                  defaultValue: "Model Type",
+                                  comment: "Row label for the model type override popup")) {
+                    Popup(
+                        selection: vm.bind($vm.modelTypeOverride, save: { Task { await vm.save(.modelType, client: client) } }),
+                        width: .controlMedium,
+                        options: ModelSettingsScreenVM.modelTypeOptions
+                    )
+                }
+            }
+            if vm.showsEmbeddingContextWindow {
+                Row(label: String(localized: "settings.basic.context_window.label",
+                                  defaultValue: "Context Window",
+                                  comment: "Row label for the context window field"),
+                    sublabel: String(localized: "settings.basic.embedding_context_window.sub",
+                                     defaultValue: "Longer inputs are truncated to this length when a request does not set max_length.",
+                                     comment: "Sublabel for the context window field of an embedding model")) {
+                    TextInput(text: vm.bindProfile($vm.contextLength), mono: true, suffix: "tk", width: .controlCompact)
+                }
             }
             Row(label: String(localized: "settings.basic.ttl.label",
                               defaultValue: "TTL",
@@ -1122,7 +1136,7 @@ private struct GenerationSection: View {
                                   defaultValue: "Top K",
                                   comment: "Row label for the top-k sampling field"),
                     sublabel: String(localized: "settings.basic.top_k.sub",
-                                     defaultValue: "Limit candidates to top K (positive integer).",
+                                     defaultValue: "Limit candidates to top K (0 turns it off).",
                                      comment: "Sublabel describing the top-k field")) {
                     TextInput(text: vm.bindProfile($vm.topK), mono: true, width: .controlNarrow)
                 }
@@ -1359,7 +1373,7 @@ private struct EnginePage<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            if !vm.externalEngine.isEmpty {
+            if !vm.effectiveExternalEngine.isEmpty {
                 HintLine(text: String(localized: "settings.advanced.external_engine.section_note",
                                       defaultValue: "These settings do not apply while an external engine serves this model.",
                                       comment: "Note above MLX-only settings while an external engine serves the model"),
@@ -1368,7 +1382,7 @@ private struct EnginePage<Content: View>: View {
                     .padding(.bottom, 8)
             }
             content()
-                .disabled(!vm.externalEngine.isEmpty)
+                .disabled(!vm.effectiveExternalEngine.isEmpty)
         }
         .padding(.top, 14)
     }
@@ -1430,10 +1444,17 @@ private struct MemorySavingSection: View {
                 HStack(spacing: 8) {
                     if vm.turboquantKvEnabled {
                         Popup(
-                            selection: vm.bindProfile($vm.turboquantKvBits),
-                            width: .controlCompact,
-                            options: ModelSettingsScreenVM.turboquantKvBitsOptions
+                            selection: vm.bindProfile($vm.turboquantKvScheme),
+                            width: .controlMedium,
+                            options: ModelSettingsScreenVM.turboquantKvSchemeOptions
                         )
+                        if vm.turboquantKvScheme == "turboquant" {
+                            Popup(
+                                selection: vm.bindProfile($vm.turboquantKvBits),
+                                width: .controlCompact,
+                                options: ModelSettingsScreenVM.turboquantKvBitsOptions
+                            )
+                        }
                     }
                     RowSwitch(isOn: vm.bindProfile($vm.turboquantKvEnabled))
                         .disabled(vm.vlmMtpEnabled)
@@ -1474,18 +1495,35 @@ private struct ExternalEngineRow: View {
     @Bindable var vm: ModelSettingsScreenVM
     let client: OMLXClient
     let engines: [ExternalEngineOption]
+    @State private var draftStarted = false
+    /// Why the last draft download did not start; the button retries.
+    @State private var draftError: String?
 
     private var usableEngine: String? {
         engines.first(where: { $0.compatible })?.id
     }
 
+    private var isGGUF: Bool { vm.model?.isGGUF == true }
+
+    private var draftRepo: String? {
+        let engine = engines.first(where: { $0.id == vm.effectiveExternalEngine }) ?? engines.first
+        guard let engine, !engine.compatible else { return nil }
+        return engine.draftRepo
+    }
+
     private var sublabel: String {
-        let selected = engines.first(where: { $0.id == vm.externalEngine })
+        if let draftError { return draftError }
+        let selected = engines.first(where: { $0.id == vm.effectiveExternalEngine })
         if let selected, !selected.compatible, let reason = selected.reason, !reason.isEmpty {
             return reason
         }
         if usableEngine == nil, let reason = engines.first?.reason, !reason.isEmpty {
             return reason
+        }
+        if isGGUF {
+            return String(localized: "settings.advanced.external_engine.gguf",
+                          defaultValue: "GGUF models run on an external engine only.",
+                          comment: "Sublabel for the external engine toggle of a GGUF model")
         }
         return String(localized: "settings.advanced.external_engine.sub",
                       defaultValue: "Serve this model with another inference engine in its own process instead of oMLX's MLX engines.",
@@ -1498,6 +1536,20 @@ private struct ExternalEngineRow: View {
                           comment: "Row label for serving a model with an external engine"),
             sublabel: sublabel) {
             HStack(spacing: 7) {
+                if let draftRepo {
+                    Button(draftStarted
+                           ? String(localized: "settings.advanced.external_engine.draft_started",
+                                    defaultValue: "Downloading…",
+                                    comment: "Draft download button label after the download starts")
+                           : String(localized: "settings.advanced.external_engine.get_draft",
+                                    defaultValue: "Download \(draftRepo)",
+                                    comment: "Button that downloads the draft model an external engine needs; placeholder is the Hugging Face repo")) {
+                        Task { await downloadDraft(draftRepo) }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(draftStarted)
+                    .help(draftError ?? "")
+                }
                 if !vm.externalEngine.isEmpty {
                     Popup(selection: vm.bind($vm.externalEngine, save: save),
                           width: .controlCompact,
@@ -1506,19 +1558,29 @@ private struct ExternalEngineRow: View {
                               .map { ($0.id, $0.label) })
                 }
                 RowSwitch(isOn: Binding(
-                    get: { !vm.externalEngine.isEmpty },
+                    get: { !vm.effectiveExternalEngine.isEmpty },
                     set: { on in
                         vm.externalEngine = on ? (usableEngine ?? "") : ""
                         save()
                     }
                 ))
-                .disabled(vm.externalEngine.isEmpty && usableEngine == nil)
+                .disabled(isGGUF || (vm.externalEngine.isEmpty && usableEngine == nil))
             }
         }
     }
 
     private func save() {
         Task { await vm.save(.externalEngine, client: client) }
+    }
+
+    private func downloadDraft(_ repo: String) async {
+        do {
+            _ = try await client.startHFDownload(repoId: repo)
+            draftStarted = true
+            draftError = nil
+        } catch {
+            draftError = error.omlxDescription
+        }
     }
 }
 
@@ -2535,10 +2597,13 @@ enum SamplingValidator {
                                                   defaultValue: "Top K must be an integer.",
                                                   comment: "Validation error when top-k isn't an integer")))
         }
-        guard v >= 1 else {
+        // 0 turns top-k off: that is how the server's settings, the web dashboard
+        // and mlx-lm's sampler already read it, and the global Server screen
+        // accepts it too; only this per-model check refused it (#4649).
+        guard v >= 0 else {
             return .failure(.init(message: String(localized: "settings.validator.top_k.positive",
-                                                  defaultValue: "Top K must be a positive integer.",
-                                                  comment: "Validation error when top-k isn't positive")))
+                                                  defaultValue: "Top K must be 0 or a positive integer.",
+                                                  comment: "Validation error when top-k is negative")))
         }
         return .success(v)
     }

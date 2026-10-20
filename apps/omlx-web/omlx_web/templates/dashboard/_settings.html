@@ -110,14 +110,11 @@
                                                     'theme', "setTheme('{value}')", aria_label=t('chat.theme_label')) }}
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
-                                    <label for="settings-number-scale" class="text-sm text-neutral-700">{{ t('settings.appearance.number_scale') }}</label>
-                                    <select id="settings-number-scale"
-                                            x-model="statsNumberScale"
-                                            @change="setStatsNumberScale($event.target.value)"
-                                            class="w-full sm:w-48 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                        <option value="exact">{{ t('settings.appearance.number_scale_exact') }}</option>
-                                        <option value="compact">{{ t('settings.appearance.number_scale_compact') }}</option>
-                                    </select>
+                                    <label class="text-sm text-neutral-700">{{ t('settings.appearance.number_scale') }}</label>
+                                    {{ ui.segmented([('compact', t('settings.appearance.number_scale_compact')),
+                                                     ('exact', t('settings.appearance.number_scale_exact'))],
+                                                    'statsNumberScale', "setStatsNumberScale('{value}')",
+                                                    aria_label=t('settings.appearance.number_scale')) }}
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>
@@ -1814,6 +1811,16 @@
                                             <span x-show="model.settings?.model_alias" x-cloak
                                                   class="badge bg-neutral-100 text-neutral-500 border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
+                                            <template x-for="engine in (model.external_engines || []).filter(e => e.compatible)" :key="engine.id">
+                                                <span class="badge bg-blue-50 text-blue-700 border-blue-200"
+                                                      @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.external_engine_tooltip').replace('{engine}', engine.label))"
+                                                      @mouseleave="hideTip()"
+                                                      x-text="engine.label"></span>
+                                            </template>
+                                            <span x-show="model.model_format === 'gguf'" x-cloak
+                                                  class="badge bg-neutral-100 text-neutral-500 border-neutral-200"
+                                                  @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.gguf_tooltip'))"
+                                                  @mouseleave="hideTip()">GGUF</span>
                                             <span x-show="model.is_helper" x-cloak
                                                   class="badge bg-amber-50 text-amber-600 border-amber-200"
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"

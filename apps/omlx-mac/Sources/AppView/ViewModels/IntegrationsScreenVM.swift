@@ -5,7 +5,7 @@ import SwiftUI
 @Observable
 final class IntegrationsScreenVM {
     enum Field: Sendable {
-        case claudeMode, opusModel, sonnetModel, haikuModel
+        case claudeMode, opusModel, sonnetModel, haikuModel, desktopEnabled
         case codexModel, opencodeModel, openclawModel, piModel, openclawToolsProfile
         case hermesModel, copilotModel, dshModel, vibeModel
         case mcpConfig
@@ -17,6 +17,7 @@ final class IntegrationsScreenVM {
     var opusModel: String = ""
     var sonnetModel: String = ""
     var haikuModel: String = ""
+    var desktopEnabled: Bool = false
 
     // Other integrations
     var codexModel: String = ""
@@ -78,6 +79,13 @@ final class IntegrationsScreenVM {
     /// persisted in settings, so the launcher reads them without extra flags.
     var claudeLaunchCommand: String {
         "\(cliCommandPrefix) launch claude"
+    }
+
+    /// Composed `omlx launch claude_desktop` command. Launches Claude Desktop
+    /// pointed at the oMLX gateway. Mirrors `claudeDesktopCommand` in
+    /// `omlx/admin/static/js/dashboard.js`.
+    var claudeDesktopLaunchCommand: String {
+        "\(cliCommandPrefix) launch claude_desktop"
     }
 
     /// Env-var recipe that runs the real `claude` binary directly. Mirrors
@@ -184,6 +192,7 @@ final class IntegrationsScreenVM {
                 self.opusModel       = cc.opusModel ?? ""
                 self.sonnetModel     = cc.sonnetModel ?? ""
                 self.haikuModel      = cc.haikuModel ?? ""
+                self.desktopEnabled  = cc.desktopEnabled ?? false
             }
             if let it = settings.integrations {
                 self.codexModel           = it.codexModel ?? ""
@@ -237,6 +246,7 @@ final class IntegrationsScreenVM {
         case .opusModel:            patch.claudeCodeOpusModel = opusModel
         case .sonnetModel:          patch.claudeCodeSonnetModel = sonnetModel
         case .haikuModel:           patch.claudeCodeHaikuModel = haikuModel
+        case .desktopEnabled:       patch.claudeCodeDesktopEnabled = desktopEnabled
         case .codexModel:           patch.integrationsCodexModel = codexModel
         case .opencodeModel:        patch.integrationsOpencodeModel = opencodeModel
         case .openclawModel:        patch.integrationsOpenclawModel = openclawModel

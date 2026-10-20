@@ -6,14 +6,22 @@ import os
 import subprocess
 import sys
 import textwrap
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
 
-from omlx.settings import SubKeyEntry
+from omlx import server
+from omlx.admin import auth
+from omlx.admin import routes as admin_routes
+from omlx.api.audio_routes import _verify_ws_api_key
+from omlx.settings import GlobalSettings, SubKeyEntry
 
 # Note: These tests need a mock server setup since the actual server requires models
+
+
+_LOOPBACK_CLIENT = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 
 def _mock_request(headers=None):
@@ -780,10 +788,84 @@ class TestUnauthenticatedInference:
         from omlx.api.audio_routes import _verify_ws_api_key
 
         _, settings = configured_server
-        assert _verify_ws_api_key(None) is True
+        assert _verify_ws_api_key(_LOOPBACK_CLIENT, None) is True
         settings.auth.allow_unauthenticated_inference = False
-        assert _verify_ws_api_key(None) is False
-        assert _verify_ws_api_key("management-key") is True
+        assert _verify_ws_api_key(_LOOPBACK_CLIENT, None) is False
+        assert _verify_ws_api_key(_LOOPBACK_CLIENT, "management-key") is True
+
+
+class TestApiKeyLockout:
+    """Wrong API keys share one budget per remote client on every key endpoint."""
+
+    def test_key_endpoints_share_one_budget(self, monkeypatch, tmp_path):
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.server.host = "0.0.0.0"
+        settings.auth.api_key = "management-key"
+        monkeypatch.setattr(server._server_state, "global_settings", settings)
+        monkeypatch.setattr(server._server_state, "api_key", "management-key")
+        monkeypatch.setattr(server._server_state, "bind_host", "0.0.0.0")
+        monkeypatch.setattr(auth, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(auth, "_web_ui_enabled", True)
+        client = TestClient(server.app)
+        ws_client = SimpleNamespace(client=SimpleNamespace(host="testclient"))
+        wrong = {"Authorization": "Bearer wrong-key"}
+        good = {"Authorization": "Bearer management-key"}
+
+        login = client.post("/admin/api/login", json={"api_key": "wrong-key"})
+        assert login.status_code == 401
+        auto_login = client.get(
+            "/admin/auto-login?key=wrong-key", follow_redirects=False
+        )
+        assert auto_login.status_code == 302
+        admin = client.get("/admin/api/grammar/parsers", headers=wrong)
+        assert admin.status_code == 401
+        cli = client.post("/admin/api/models/m/load", headers=wrong)
+        assert cli.status_code == 401
+        assert _verify_ws_api_key(ws_client, "wrong-key") is False
+        for _ in range(auth.KEY_FAILURES_PER_LOCKOUT - 5):
+            assert client.get("/v1/models/status", headers=wrong).status_code == 401
+
+        locked = client.get("/v1/models/status", headers=good)
+        assert locked.status_code == 429
+        assert locked.headers["retry-after"] == "30"
+        login = client.post("/admin/api/login", json={"api_key": "management-key"})
+        assert login.status_code == 429
+        with pytest.raises(auth.KeyLockout):
+            _verify_ws_api_key(ws_client, "management-key")
+
+    def test_lockout_escalates_and_resets_on_success(self, monkeypatch):
+        now = [0.0]
+        monkeypatch.setattr(auth, "time", SimpleNamespace(monotonic=lambda: now[0]))
+        remote = SimpleNamespace(client=SimpleNamespace(host="192.168.1.50"))
+
+        def fail_until_locked():
+            for _ in range(auth.KEY_FAILURES_PER_LOCKOUT):
+                assert auth.check_api_key(remote, lambda: False) is False
+
+        def retry_after():
+            with pytest.raises(auth.KeyLockout) as exc_info:
+                auth.check_api_key(remote, lambda: pytest.fail("key compared"))
+            return exc_info.value.headers["Retry-After"]
+
+        fail_until_locked()
+        assert retry_after() == "30"
+        now[0] += 30
+        fail_until_locked()
+        assert retry_after() == "300"
+        now[0] += 300
+        assert auth.check_api_key(remote, lambda: True) is True
+        fail_until_locked()
+        assert retry_after() == "30"
+
+        # The Mac app reaches a LAN-IP bind from the server's own address.
+        same_host = SimpleNamespace(
+            client=SimpleNamespace(host="192.168.1.30"),
+            scope={"server": ("192.168.1.30", 8000)},
+        )
+        for local in (_LOOPBACK_CLIENT, same_host):
+            for _ in range(3 * auth.KEY_FAILURES_PER_LOCKOUT):
+                assert auth.check_api_key(local, lambda: False) is False
 
 
 HEADLESS_PROBE = textwrap.dedent("""

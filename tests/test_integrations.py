@@ -9,9 +9,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from omlx.integrations import get_integration, list_integrations
+from omlx.integrations import (
+    claude_desktop,
+    claude_desktop_app,
+    get_integration,
+    list_integrations,
+)
 from omlx.integrations.base import IntegrationContext
 from omlx.integrations.claude import ClaudeCodeIntegration
+from omlx.integrations.claude_desktop import (
+    PROFILE_ID,
+    configure_omlx_gateway,
+    is_configured,
+    restore,
+)
+from omlx.integrations.claude_desktop_app import ClaudeDesktopAppIntegration
 from omlx.integrations.codex import (
     CodexIntegration,
     codex_config_args,
@@ -47,10 +59,11 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 10
+        assert len(integrations) == 11
         names = {i.name for i in integrations}
         assert names == {
             "claude",
+            "claude_desktop",
             "codex",
             "codex_app",
             "copilot",
@@ -64,6 +77,7 @@ class TestIntegrationRegistry:
 
     def test_get_integration(self):
         assert get_integration("claude") is not None
+        assert get_integration("claude_desktop") is not None
         assert get_integration("codex") is not None
         assert get_integration("codex_app") is not None
         assert get_integration("copilot") is not None
@@ -2016,6 +2030,108 @@ class TestClaudeCodeIntegration:
             "LSP",
             *settings_args,
         ]
+
+
+class TestClaudeDesktopIntegration:
+    def test_configure_passes_port_and_key(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            claude_desktop_app,
+            "configure_omlx_gateway",
+            lambda **kwargs: calls.append(kwargs) or True,
+        )
+        ClaudeDesktopAppIntegration().configure(ctx(port=8123, api_key="secret"))
+        assert calls == [{"port": 8123, "api_key": "secret"}]
+
+    @pytest.mark.parametrize("running", [False, True])
+    def test_launch_opens_app_unless_running(self, monkeypatch, capsys, running):
+        monkeypatch.setattr(claude_desktop_app.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            claude_desktop_app, "configure_omlx_gateway", lambda **kwargs: True
+        )
+        monkeypatch.setattr(
+            claude_desktop_app, "is_claude_desktop_running", lambda: running
+        )
+        run = MagicMock()
+        monkeypatch.setattr(claude_desktop_app.subprocess, "run", run)
+
+        ClaudeDesktopAppIntegration().launch(ctx(api_key="k"))
+
+        if running:
+            run.assert_not_called()
+            assert "restart" in capsys.readouterr().out.lower()
+        else:
+            assert run.call_args.args[0] == ["open", "-a", "Claude"]
+
+
+class TestClaudeDesktopConfigWriter:
+    @pytest.fixture(autouse=True)
+    def _macos(self, monkeypatch):
+        monkeypatch.setattr(claude_desktop, "_is_macos", lambda: True)
+
+    @staticmethod
+    def _read(path: Path) -> dict:
+        return json.loads(path.read_text())
+
+    @staticmethod
+    def _write(path: Path, data: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    def test_configure_points_profile_at_omlx(self, tmp_path):
+        paths = claude_desktop._paths(tmp_path)
+        self._write(paths["claude_config"], {"deploymentMode": "1p", "theme": "dark"})
+
+        assert configure_omlx_gateway(8000, None, home=tmp_path) is True
+        configure_omlx_gateway(8001, None, home=tmp_path)
+
+        assert self._read(paths["claude_config"]) == {
+            "deploymentMode": "3p",
+            "theme": "dark",
+        }
+        assert self._read(paths["claude3p_config"])["deploymentMode"] == "3p"
+        backup = paths["claude_config"].with_suffix(".json.bak")
+        assert self._read(backup) == {"deploymentMode": "1p", "theme": "dark"}
+        assert self._read(paths["meta"])["appliedId"] == PROFILE_ID
+        profile = self._read(paths["profile"])
+        assert profile["inferenceProvider"] == "gateway"
+        assert profile["inferenceGatewayBaseUrl"] == "http://127.0.0.1:8001"
+        assert profile["inferenceGatewayApiKey"] == "omlx"
+        assert is_configured(home=tmp_path) is True
+
+    def test_restore_hands_back_previous_gateway(self, tmp_path):
+        paths = claude_desktop._paths(tmp_path)
+        other_meta = {
+            "entries": [{"id": "other", "name": "Other"}],
+            "appliedId": "other",
+        }
+        self._write(paths["claude_config"], {"deploymentMode": "3p"})
+        self._write(paths["meta"], other_meta)
+
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        assert restore(home=tmp_path) is True
+
+        assert self._read(paths["claude_config"])["deploymentMode"] == "3p"
+        assert self._read(paths["meta"]) == other_meta
+        assert is_configured(home=tmp_path) is False
+
+    def test_restore_without_prior_setup_returns_to_first_party(self, tmp_path):
+        paths = claude_desktop._paths(tmp_path)
+
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        assert restore(home=tmp_path) is True
+
+        assert self._read(paths["claude_config"])["deploymentMode"] == "1p"
+        assert self._read(paths["claude3p_config"])["deploymentMode"] == "1p"
+        assert "appliedId" not in self._read(paths["meta"])
+        assert self._read(paths["profile"]) == {"disableDeploymentModeChooser": False}
+
+    def test_non_macos_is_noop(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(claude_desktop, "_is_macos", lambda: False)
+        assert configure_omlx_gateway(8000, "k", home=tmp_path) is False
+        assert restore(home=tmp_path) is False
+        assert not (tmp_path / "Library").exists()
 
 
 class TestCopilotIntegration:

@@ -2833,7 +2833,7 @@ class TestArraysCacheLastBlockOnly:
         for call in calls:
             saved_by_hash[call.kwargs["block_hash"]] = call.kwargs["cache_data"]
 
-        def load_block_with_metadata(block_hash):
+        def load_block_with_metadata(block_hash, **kwargs):
             block_data = saved_by_hash.get(block_hash)
             if block_data is None:
                 return None, None

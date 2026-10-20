@@ -192,7 +192,7 @@ Chattez directement avec n'importe quel modèle chargé depuis le panneau d'admi
 
 ### Téléchargement de modèles
 
-Recherchez et téléchargez des modèles MLX depuis HuggingFace directement dans le tableau de bord. Parcourez les fiches modèles, vérifiez les tailles de fichiers, et téléchargez en un clic.
+Recherchez et téléchargez des modèles depuis HuggingFace directement dans le tableau de bord, en MLX, en GGUF ou dans tous les formats. Parcourez les fiches modèles, puis choisissez les fichiers à télécharger : un checkpoint MLX garde les fichiers nécessaires, et un GGUF entraîne son projecteur de vision.
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX Model Downloader" width="720">

@@ -2965,6 +2965,70 @@ class TestLoopTaxHygiene:
         aged = _effective_loop_tax(model)
         assert _DepthController.EXIT_MARGIN <= aged < 1.2
 
+    def test_probe_armed_after_own_prefill_that_ended_before_the_run(self):
+        """The parked sequence's own prefill finished before its MTP run
+        started, so it cannot have shaped the run's t0: the probe arms, and
+        a clean sampling window latches the measured tax. Without this, an
+        interactive request (park ~1 s after its own prefill) never measures
+        the tax and keeps exiting against the 1.15 prior."""
+        import time
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        tracker = self._tracker()
+        tracker.update("own", 10, 100, "modelA")
+        tracker.update("own", 100, 100, "modelA")  # own prefill completes
+        run_started = time.monotonic()
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7, since_ts=run_started)
+        assert hasattr(gb, "_omlx_mtp_tax_probe")
+        self._drain_probe(gb, std_ms=12.0)
+        assert gb.model._omlx_mtp_loop_tax == pytest.approx(1.0)
+
+    def test_probe_not_armed_when_other_prefill_ran_during_the_run(self):
+        import time
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        run_started = time.monotonic()
+        tracker = self._tracker()
+        tracker.update("other", 10, 100, "modelB")
+        tracker.update("other", 100, 100, "modelB")  # contended the run
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7, since_ts=run_started)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+
+    def test_run_scoped_probe_discarded_when_prefill_starts_while_sampling(self):
+        import time
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SAMPLES,
+            _STD_TAX_SKIP,
+            _arm_std_tax_probe,
+            _record_std_tax_sample,
+        )
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 15.0, uid=7, since_ts=time.monotonic())
+        for _ in range(_STD_TAX_SKIP + _STD_TAX_SAMPLES - 1):
+            _record_std_tax_sample(gb, 10.0)
+        self._tracker().update("r2", 10, 100, "modelB")
+        _record_std_tax_sample(gb, 10.0)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+        assert not hasattr(gb.model, "_omlx_mtp_loop_tax")
+
+    def test_active_since(self):
+        import time
+
+        tracker = self._tracker()
+        before = time.monotonic()
+        tracker.update("r1", 10, 100, "m")
+        assert tracker.active_since(before)  # live prefill
+        tracker.update("r1", 100, 100, "m")
+        assert tracker.active_since(before)  # ended after `before`
+        after = time.monotonic()
+        assert not tracker.active_since(after)  # ended before `after`
+
     def test_recently_active_window(self):
         tracker = self._tracker()
         assert not tracker.recently_active(3.0)

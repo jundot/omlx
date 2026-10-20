@@ -170,6 +170,9 @@ NB_MODULE(_ext, m) {
       .def_prop_ro(
           "sequence_length",
           &omlx::quant_matmul::AneLinearModel::sequence_length)
+      .def_prop_ro(
+          "weight_bytes",
+          &omlx::quant_matmul::AneLinearModel::weight_bytes)
       .def(
           "warmup",
           &omlx::quant_matmul::AneLinearModel::warmup,
@@ -318,7 +321,8 @@ NB_MODULE(_ext, m) {
       "ane_model"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
-      "stream"_a = nb::none());
+      "up_weight"_a = nb::none(), "up_scales"_a = nb::none(),
+      "up_biases"_a = nb::none(), "stream"_a = nb::none());
   m.def(
       "ane_affine_swiglu_t",
       &omlx::quant_matmul::ane_affine_swiglu_t,
@@ -330,19 +334,22 @@ NB_MODULE(_ext, m) {
       "bits"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
-      "stream"_a = nb::none());
+      "up_weight"_a = nb::none(), "up_scales"_a = nb::none(),
+      "up_biases"_a = nb::none(), "stream"_a = nb::none());
   m.def("ane_cpu_fp16_swiglu_t",
         &omlx::quant_matmul::ane_cpu_fp16_swiglu_t, "x"_a,
         "cpu_weight"_a, "gpu_weight"_a, "gpu_scales"_a, "gpu_biases"_a,
         "ane_model"_a, "bits"_a, "variant"_a = 8, "group_size"_a = 128,
         "cpu_threads"_a = 0, "cpu_shared_resource"_a = false,
-        "stream"_a = nb::none());
+        "up_weight"_a = nb::none(), "up_scales"_a = nb::none(),
+      "up_biases"_a = nb::none(), "stream"_a = nb::none());
   m.def("ane_cpu_fp16_q4_swiglu_t",
         &omlx::quant_matmul::ane_cpu_fp16_q4_swiglu_t, "x"_a,
         "cpu_weight"_a, "gpu_weight"_a, "gpu_scales"_a, "gpu_biases"_a,
         "ane_model"_a, "variant"_a = 8, "group_size"_a = 128,
         "cpu_threads"_a = 0, "cpu_shared_resource"_a = false,
-        "stream"_a = nb::none());
+        "up_weight"_a = nb::none(), "up_scales"_a = nb::none(),
+      "up_biases"_a = nb::none(), "stream"_a = nb::none());
   m.def(
       "ane_dual_affine_qmm_t",
       &omlx::quant_matmul::ane_dual_affine_qmm_t,
@@ -389,7 +396,8 @@ NB_MODULE(_ext, m) {
       "group_size"_a = 128,
       "cpu_threads"_a = 0,
       "cpu_shared_resource"_a = false,
-      "stream"_a = nb::none());
+      "up_weight"_a = nb::none(), "up_scales"_a = nb::none(),
+      "up_biases"_a = nb::none(), "stream"_a = nb::none());
   m.def(
       "ane_dual_q4_swiglu_t",
       &omlx::quant_matmul::ane_dual_q4_swiglu_t,
@@ -401,7 +409,10 @@ NB_MODULE(_ext, m) {
       "ane_model1"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
-      "stream"_a = nb::none());
+      "up_weight"_a = nb::none(), "up_scales"_a = nb::none(),
+      "up_biases"_a = nb::none(), "stream"_a = nb::none());
+  // The SwiGLU entry points accept gate and up suffix rows as two slices.
+  m.attr("ane_split_gate_up_suffix") = true;
   m.def(
       "ane_dual_affine_swiglu_t",
       &omlx::quant_matmul::ane_dual_affine_swiglu_t,
@@ -414,7 +425,8 @@ NB_MODULE(_ext, m) {
       "bits"_a,
       "variant"_a = 8,
       "group_size"_a = 128,
-      "stream"_a = nb::none());
+      "up_weight"_a = nb::none(), "up_scales"_a = nb::none(),
+      "up_biases"_a = nb::none(), "stream"_a = nb::none());
   m.def(
       "ane_dual_cpu_fp16_q4_swiglu_t",
       &omlx::quant_matmul::ane_dual_cpu_fp16_q4_swiglu_t,
@@ -429,7 +441,8 @@ NB_MODULE(_ext, m) {
       "group_size"_a = 128,
       "cpu_threads"_a = 0,
       "cpu_shared_resource"_a = false,
-      "stream"_a = nb::none());
+      "up_weight"_a = nb::none(), "up_scales"_a = nb::none(),
+      "up_biases"_a = nb::none(), "stream"_a = nb::none());
   m.def(
       "ane_q4_swiglu_down_t",
       &omlx::quant_matmul::ane_q4_swiglu_down_t,

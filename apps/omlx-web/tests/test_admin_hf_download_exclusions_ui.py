@@ -17,7 +17,7 @@ def test_download_form_exposes_exclusion_patterns_input():
     assert 'x-model="hfIgnorePatterns"' in template
 
     script = (ROOT / "omlx_web/static/js/dashboard.js").read_text()
-    start = script.index("async startHFDownload()")
+    start = script.index("async submitHFDownload(files)")
     body = script[start : script.index("async loadHFTasks()", start)]
     assert "this.hfIgnorePatterns" in body
     assert "ignore_patterns: ignorePatterns," in body
