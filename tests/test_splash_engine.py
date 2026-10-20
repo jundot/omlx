@@ -613,16 +613,42 @@ class TestRequestTranslation:
 
     @pytest.mark.parametrize(
         "template_kwargs",
-        [None, {}, {"enable_thinking": True}, {"preserve_thinking": "true"}],
+        [None, {}, {"enable_thinking": True}, {"preserve_thinking": None}],
     )
     def test_request_body_leaves_preserve_thinking_to_splash(
         self, tmp_path, template_kwargs
     ):
-        # Splash rejects a preserve_thinking value that is not a bool.
         kwargs = {"chat_template_kwargs": template_kwargs}
         body = self._body_with(tmp_path, "1.3.0", kwargs)
 
         assert "preserve_thinking" not in body
+
+    @pytest.mark.parametrize("value", ["true", 1, 0, [], {}])
+    def test_request_body_drops_a_non_bool_preserve_thinking(
+        self, tmp_path, caplog, value
+    ):
+        # Splash answers HTTP 400 to a preserve_thinking that is not a bool.
+        kwargs = {"chat_template_kwargs": {"preserve_thinking": value}}
+
+        with caplog.at_level("WARNING", logger="omlx.engine.splash"):
+            body = self._body_with(tmp_path, "1.3.0", kwargs)
+
+        assert "preserve_thinking" not in body
+        assert [r for r in caplog.records if "preserve_thinking" in r.getMessage()]
+
+    def test_token_count_ignores_a_non_bool_preserve_thinking(self, tmp_path):
+        engine = _engine(tmp_path)
+        engine._tokenizer = MagicMock()
+        engine._tokenizer.apply_chat_template.return_value = [1, 2, 3]
+
+        count = engine.count_chat_tokens(
+            [{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"preserve_thinking": "true", "enable_thinking": True},
+        )
+
+        assert count == 3
+        sent = engine._tokenizer.apply_chat_template.call_args.kwargs
+        assert "preserve_thinking" not in sent and sent["enable_thinking"] is True
 
 
 # -- streaming -------------------------------------------------------------------

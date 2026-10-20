@@ -623,6 +623,22 @@ def splash_effort(chat_template_kwargs: dict | None) -> str | None:
     return effort if effort in _SPLASH_EFFORTS else None
 
 
+def splash_preserve_thinking(chat_template_kwargs: dict | None) -> bool | None:
+    """The bool Splash accepts for preserve_thinking, or None to leave it unset.
+
+    Splash answers HTTP 400 to any other type, so a stray value is dropped
+    with a warning and Splash applies its own default.
+    """
+    preserve = (chat_template_kwargs or {}).get("preserve_thinking")
+    if preserve is not None and not isinstance(preserve, bool):
+        logger.warning(
+            "Splash: ignoring preserve_thinking %r; Splash accepts a bool only",
+            preserve,
+        )
+        return None
+    return preserve
+
+
 def splash_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """OpenAI-format messages for Splash.
 
@@ -1200,9 +1216,9 @@ class SplashEngine(BaseEngine):
         if budget is not None and self._target.binary.accepts_thinking_budget:
             body["thinking_token_budget"] = budget
         # Splash renders the chat template itself and reads this one template
-        # option only as a top-level field; it rejects a value that is not a bool.
-        preserve = (kwargs.get("chat_template_kwargs") or {}).get("preserve_thinking")
-        if isinstance(preserve, bool):
+        # option only as a top-level field.
+        preserve = splash_preserve_thinking(kwargs.get("chat_template_kwargs"))
+        if preserve is not None:
             body["preserve_thinking"] = preserve
         return body
 
@@ -1348,6 +1364,9 @@ class SplashEngine(BaseEngine):
         self, messages, tools=None, chat_template_kwargs=None, is_partial=None
     ) -> int:
         template = dict(chat_template_kwargs or {})
+        if not isinstance(template.get("preserve_thinking", True), bool):
+            # Count the prompt Splash renders: it never receives this value.
+            del template["preserve_thinking"]
         attempts = (
             template,
             {k: v for k, v in template.items() if k != "reasoning_effort"},
