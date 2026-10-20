@@ -55,50 +55,40 @@ creates the sidecar without replacing an existing one or changing any weights.
 It is not a GGUF converter. Its recipe identifier is reserved for the recorded
 conditioning/sampling implementation; the inspector does not execute that recipe.
 
-## Review units and evidence (2026-10-20)
+## Series placement and validation
 
-Base: `8b7e7018` from refreshed upstream/main, including GGUF/Splash discovery.
+This is PR 2 of the image-model series, stacked on PR 1 (#4692). It provides
+structural inspection; architecture-specific required tensor names/shapes and
+cross-component compatibility checks belong with the native loader in PR 3.
+A structurally valid bundle is explicitly reported as runtime/numerically
+unvalidated, with serving disabled. No attached numerical report can change that.
 
-1. Pipeline boundary recognition and discovery guards, with independent discovery
-   regression tests. The direct-root/flat component and GGUF-precedence cases fail
-   on the base (three failures) and pass with the guard.
-2. Structural inspector, CLI and research metadata migration, with offline tests.
-   This is an experimental part of planned PR 2, not completion of every acceptance
-   case in the research plan.
+Offline fixtures cover malformed/bounded JSON, unsupported schema/recipe/layout,
+truncated tensor headers, impossible shapes/offsets, overlaps, escaping paths,
+FIFO rejection, index mismatches, hash mismatches, internal-link size accounting,
+metadata/weight mutation, cancellation, and non-overwriting migration. The CLI
+also runs under `python -S` without site packages or inference imports.
 
-Validation in the existing Python 3.12 environment:
+The restored real bundle passed inspection and explicit full-file SHA-256
+verification: 399 encoder, 265 denoiser and 238 VAE tensors, totaling
+31,287,920,248 weight bytes. The MLX files are retained; original source-weight
+copies were removed only after byte/layout parity, original tensor-digest
+comparison and native MLX load checks passed. These are artifact checks, not
+fresh-prompt generation or serving validation.
+
+Run focused checks with:
 
 ```
 python -m pytest tests/test_model_discovery.py tests/test_image_discovery.py tests/test_image_import.py -q
-# 250 passed
 python -S -m unittest discover -s tests -p test_image_import.py -q
-# 17 passed
 ```
 
-Before authorized cleanup, real-export inspection counted 399 encoder, 265 DiT
-and 238 VAE tensors and 31,287,920,248 physical weight bytes. Runtime/numerical
-status remained unvalidated. Real-export full hashes were not recomputed. The
-19 generated safetensors files were subsequently deleted; source checkpoints,
-metadata, scripts and historical validation evidence were retained in the
-original research directory. Re-export is necessary before further real-weight
-validation. This worktree does not contain those model assets.
+Integrity checking covers weight files. Config/tokenizer files are bounded and
+checked for mutation across inspection, but are not authenticated. This command
+assumes a locally managed directory, not a malicious process concurrently
+replacing parent directories. Runtime loading must independently revalidate
+inputs; inspection is neither a lease nor an immutable filesystem snapshot.
 
-## Remaining gates
-
-- Exact required tensor names/shapes and cross-component dimension/tokenizer
-  compatibility, rather than only internally consistent safetensors/indexes.
-- Structured per-component diagnostic codes beyond the current invalid-bundle
-  diagnostic and file/tensor details.
-- Deterministic mutation/race and cancellation tests; concurrent adversarial path
-  replacement is not prevented by current containment checks. Runtime loading
-  must independently revalidate inputs.
-- Full planned discovery matrix and actual GGUF fixtures beyond the existing
-  upstream suite and new precedence tests.
-- Clean environment validation against all refreshed upstream dependency pins;
-  the local existing environment was reused without installing packages.
-- Native numerics, VAE oracle, fresh-prompt generation, full peak memory,
-  lifecycle/cancellation, API and client integration remain future work.
-
-No inference dependency, API route, engine registration, UI, downloader or model
-conversion was added. Do not describe these commits as image-serving support or
-as completion of the full review acceptance matrix.
+Subsequent PRs add native conditioning/DiT, VAE and standalone generation,
+then lifecycle, serving, and web/Mac integration. This PR adds no inference
+framework, API route, engine registration, downloader or image UI.
