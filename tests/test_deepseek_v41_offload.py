@@ -749,6 +749,9 @@ def test_parallel_pages_preserve_order_short_reads_and_warm_hits(tmp_path, monke
     reader, raw = page_table(tmp_path)
     original = storage.os.pread
     calls = []
+    # This covers the page path itself, so it pins the rows onto it; the exact
+    # row path has its own test.
+    monkeypatch.setattr(storage, "ROW_READ_BYTES", 0)
 
     def short_read(fd, count, offset):
         calls.append((count, offset))
@@ -775,6 +778,8 @@ def test_decode_rows_prefetch_their_pages(tmp_path, monkeypatch):
     reader, raw = page_table(tmp_path)
     original = storage.os.pread
     calls = []
+    # Page-path coverage; the exact row path has its own test.
+    monkeypatch.setattr(storage, "ROW_READ_BYTES", 0)
 
     def counted(fd, count, offset):
         calls.append(offset)
@@ -791,11 +796,58 @@ def test_decode_rows_prefetch_their_pages(tmp_path, monkeypatch):
         reader.close()
 
 
+def test_exact_row_reads_merge_runs_and_match_the_page_path(tmp_path, monkeypatch):
+    """A row small enough to read exactly is read exactly, and bit-identically.
+
+    The page path spends a 16KiB read and a second mmap pass on a 128B Engram
+    row. A merged exact-row read measured 116-131k IOPS against 113k for the
+    16KiB page read, so the page round trip is not even the faster shape. What
+    must hold: the merged runs cover exactly the requested rows in order, the
+    bytes equal the mapping's rows, and the read is materially fewer syscalls
+    than rows.
+    """
+    reader, raw = page_table(tmp_path)
+    original = storage.os.pread
+    calls = []
+
+    def counting_read(fd, count, offset):
+        calls.append((count, offset))
+        return original(fd, count, offset)
+
+    monkeypatch.setattr(storage.os, "pread", counting_read)
+    # Deliberately scattered and repetitive, like hash-selected rows.
+    ids = np.tile(np.array([4095, 0, 255, 256, 1023, 256]), 32)
+    try:
+        assert storage.ROW_READ_BYTES >= 64, "row must take the exact path"
+        actual, dtype = reader.read("w", ids)
+        assert dtype == "U8" and calls
+        np.testing.assert_array_equal(actual, raw[ids])
+        assert len(calls) < ids.size, "rows must be merged into fewer reads"
+        # Repeated rows in one call resolve from the same merged read.
+        assert len(calls) == len(storage._row_batches(ids, reader._start, 64))
+    finally:
+        reader.close()
+    # The returned array owns its bytes: closing the mapping must not change it.
+    np.testing.assert_array_equal(actual, raw[ids])
+
+    # The page path stays byte-identical for the same rows.
+    monkeypatch.setattr(storage, "ROW_READ_BYTES", 0)
+    paged = storage.TensorFile(tmp_path / "pages.safetensors")
+    page_raw = np.arange(4096 * 64, dtype=np.uint8).reshape(4096, 64)
+    try:
+        via_pages, _ = paged.read("w", ids)
+        np.testing.assert_array_equal(via_pages, page_raw[ids])
+    finally:
+        paged.close()
+
+
 def test_page_read_failure_drains_workers_before_close(tmp_path, monkeypatch):
     reader, _ = page_table(tmp_path)
     original = storage.os.pread
     entered, release, closing = Event(), Event(), Event()
     monkeypatch.setattr(storage, "PAGE_IO_WORKERS", 2)
+    # Page-path coverage; the exact row path has its own test.
+    monkeypatch.setattr(storage, "ROW_READ_BYTES", 0)
 
     def blocked_read(fd, count, offset):
         if offset == 0:
@@ -828,6 +880,8 @@ def test_page_read_failure_drains_workers_before_close(tmp_path, monkeypatch):
 def test_slow_warm_gather_rearms_page_prefetch(tmp_path, monkeypatch):
     reader, _ = page_table(tmp_path)
     ids = np.arange(256)
+    # Page-path coverage; the exact row path has its own test.
+    monkeypatch.setattr(storage, "ROW_READ_BYTES", 0)
     try:
         reader.read("w", ids)
         assert reader._seen_pages is not None

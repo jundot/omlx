@@ -42,6 +42,75 @@ _PAGE_IO_POOL = ThreadPoolExecutor(
     max_workers=PAGE_IO_WORKERS, thread_name_prefix="v41-page-io"
 )
 
+# Rows at most this wide are read exactly instead of through the page path. An
+# Engram row is 128B, so the page path spends a 16KiB read and a second mmap
+# pass on 0.8% of the bytes it fetched, and it is not even the faster shape: a
+# merged exact-row read measured 116-131k IOPS against 113k for the 16KiB page
+# read. Tying the bound to the page size keeps it a ratio ("at most a 32nd of a
+# page") rather than a constant tuned to one checkpoint's geometry.
+ROW_READ_BYTES = PAGE_SIZE // 32
+# Rows per merged positional read, and the largest hole worth bridging. 256
+# rows of 128B is 32KiB of payload; the gap bound keeps a read from spanning an
+# unrelated region of the table.
+ROW_BATCH_ROWS = 256
+ROW_BATCH_MAX_GAP = 65536
+
+
+def _row_batches(rows, base, row_bytes):
+    """Merge row ids into positional-read runs: ``(indexes, offset, length)``."""
+    order = sorted(range(rows.size), key=lambda i: rows[i])
+    batches = []
+    current, start, previous_end = [], None, None
+    for index in order:
+        offset = base + int(rows[index]) * row_bytes
+        end = offset + row_bytes
+        if current and (
+            len(current) >= ROW_BATCH_ROWS or offset - previous_end > ROW_BATCH_MAX_GAP
+        ):
+            batches.append((current, start, previous_end - start))
+            current, start = [], None
+        if start is None:
+            start = offset
+        current.append(index)
+        previous_end = end
+    if current:
+        batches.append((current, start, previous_end - start))
+    return batches
+
+
+def _read_rows_exact(fd, rows, base, row_bytes):
+    """The rows' bytes in input order, via merged positional reads.
+
+    One thread per group of batches, each group reading its runs in order and
+    scattering them into the caller's buffer. Nothing is gathered from the
+    mapping afterwards, so there is no second pass and no page has to survive
+    in the buffer cache between the read and the gather.
+    """
+    batches = _row_batches(rows, base, row_bytes)
+    result = bytearray(rows.size * row_bytes)
+    view = memoryview(result)
+    groups = [
+        batches[i::PAGE_IO_WORKERS] for i in range(min(PAGE_IO_WORKERS, len(batches)))
+    ]
+    groups = [group for group in groups if group]
+
+    def work(group):
+        for indexes, offset, length in group:
+            raw = os.pread(fd, length, offset)
+            if len(raw) != length:
+                raise ValueError("Truncated Engram row batch")
+            for index in indexes:
+                start = int(rows[index]) * row_bytes - (offset - base)
+                view[index * row_bytes : (index + 1) * row_bytes] = raw[
+                    start : start + row_bytes
+                ]
+
+    if groups:
+        futures = [_PAGE_IO_POOL.submit(work, group) for group in groups]
+        for future in futures:
+            future.result()
+    return result
+
 
 def _resident_buffer(shape, dtype):
     """Share packed Metal storage with CPU gathers, without a host copy."""
@@ -140,6 +209,27 @@ class TensorFile:
                     raise IndexError("Engram row outside table")
                 gather_start = None
                 row_bytes = (end - start) // view.shape[0] if view.shape[0] else 0
+                if rows.size and 0 < row_bytes <= ROW_READ_BYTES:
+                    # Exact rows: merged positional reads return the bytes
+                    # already in row order, so nothing is gathered from the
+                    # mapping and no page has to survive in the buffer cache
+                    # between the read and the gather. ``bytes`` gives the
+                    # result its own storage; a bytearray-backed view would
+                    # keep the scratch buffer alive.
+                    return (
+                        np.frombuffer(
+                            bytes(
+                                _read_rows_exact(
+                                    self._file.fileno(),
+                                    rows,
+                                    self._start + start,
+                                    row_bytes,
+                                )
+                            ),
+                            dtype=dt,
+                        ).reshape((rows.size,) + view.shape[1:]),
+                        dtype,
+                    )
                 if (
                     rows.size
                     and 0 < row_bytes <= PAGE_SIZE
