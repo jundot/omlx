@@ -476,6 +476,31 @@ class TestChatCompletionRequest:
 
         assert req.max_tokens == 4096
 
+    def test_max_tokens_must_be_positive(self):
+        """max_tokens=0/-1 must fail validation, not flow into the engine."""
+        for bad in (0, -1):
+            with pytest.raises(ValidationError):
+                ChatCompletionRequest(
+                    model="gpt-4",
+                    messages=[Message(role="user", content="Hello")],
+                    max_tokens=bad,
+                )
+            with pytest.raises(ValidationError):
+                ChatCompletionRequest.model_validate(
+                    {
+                        "model": "gpt-4",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "max_completion_tokens": bad,
+                    }
+                )
+
+    def test_completion_request_max_tokens_must_be_positive(self):
+        """/v1/completions shares the same bound as /v1/chat/completions."""
+        with pytest.raises(ValidationError):
+            CompletionRequest(model="gpt-4", prompt="Hello", max_tokens=0)
+        with pytest.raises(ValidationError):
+            CompletionRequest(model="gpt-4", prompt="Hello", max_tokens=-8)
+
     def test_request_validation_requires_model(self):
         """Test that model is required."""
         with pytest.raises(ValidationError):

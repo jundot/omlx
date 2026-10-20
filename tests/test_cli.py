@@ -453,6 +453,102 @@ class TestLaunchCommandFunction:
         assert ctx.model_type == "vlm"
         assert ctx.extra_args == ()
 
+    def test_launch_command_brackets_ipv6_host_in_urls(self):
+        """`omlx launch` against an IPv6 bind host must build valid URLs.
+
+        Unbracketed, "http://::1:8000/health" makes requests raise
+        InvalidURL — previously swallowed and misreported as "server is
+        not running" even though the server was serving fine on ::1.
+        """
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "OpenCode"
+        integration.is_installed.return_value = True
+
+        health_response = MagicMock()
+        health_response.raise_for_status.return_value = None
+
+        status_response = MagicMock()
+        status_response.ok = True
+        status_response.json.return_value = {
+            "models": [
+                {
+                    "id": "qwen3.5",
+                    "model_type": "llm",
+                    "max_context_window": 32768,
+                }
+            ]
+        }
+
+        settings = MagicMock()
+        settings.server.host = "::1"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool="opencode",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model="qwen3.5",
+            tools_profile="coding",
+        )
+
+        with (
+            patch(
+                "requests.get", side_effect=[health_response, status_response]
+            ) as mock_get,
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            launch_command(args)
+
+        called_urls = [call.args[0] for call in mock_get.call_args_list]
+        assert called_urls == [
+            "http://[::1]:8000/health",
+            "http://[::1]:8000/v1/models/status",
+        ]
+        ctx = integration.launch.call_args.args[0]
+        assert ctx.host == "::1"  # raw host preserved; brackets are URL-only
+        assert ctx.base_url == "http://[::1]:8000"
+
+    def test_launch_command_invalid_url_reported_as_invalid_url(self, capsys):
+        """A malformed host must not be reported as "server is not running"."""
+        import requests as requests_mod
+
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.display_name = "OpenCode"
+
+        settings = MagicMock()
+        settings.server.host = ":::not-a-host"
+        settings.server.port = 8000
+
+        args = argparse.Namespace(
+            tool="opencode",
+            host=None,
+            port=None,
+            api_key="test-key",
+            model="qwen3.5",
+            tools_profile="coding",
+        )
+
+        with (
+            patch(
+                "requests.get",
+                side_effect=requests_mod.exceptions.InvalidURL("bad url"),
+            ),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+        ):
+            with pytest.raises(SystemExit):
+                launch_command(args)
+
+        out = capsys.readouterr().out
+        assert "invalid URL" in out
+        assert "not running" not in out
+
     def test_launch_command_passes_cross_session_flag_to_integration(self):
         from omlx.cli import launch_command
 

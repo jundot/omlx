@@ -170,6 +170,18 @@ def _is_local_address(host: str) -> bool:
     return True
 
 
+def _bracketed_url_host(host: str) -> str:
+    """Bracket a bare IPv6 literal for use in a URL authority.
+
+    ``http://::1:8000`` is invalid (requests raises InvalidURL); the RFC
+    3986 form is ``http://[::1]:8000``. Mirrors
+    ``omlx.integrations.base.bracket_host``.
+    """
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
@@ -319,7 +331,7 @@ def serve_command(args):
             print(f"Warning: skipping {h}, it is not assigned to any local interface")
             bind_hosts.remove(h)
     for h in bind_hosts:
-        print(f"Binding server at http://{h}:{settings.server.port}")
+        print(f"Binding server at http://{_bracketed_url_host(h)}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = (
         "debug" if settings.server.log_level == "trace" else settings.server.log_level
@@ -473,7 +485,10 @@ def serve_command(args):
         )
 
         for h in bind_hosts:
-            print(f"Starting server at http://{h}:{settings.server.port}")
+            print(
+                f"Starting server at "
+                f"http://{_bracketed_url_host(h)}:{settings.server.port}"
+            )
         try:
             uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)
         except KeyboardInterrupt:
@@ -526,7 +541,10 @@ def launch_command(args, extra_args: list[str] | None = None):
     connect_host = (
         first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
     )
-    base_url = f"http://{connect_host}:{port}"
+    # IPv6 literals must be bracketed in the URL authority: ::1 is a valid
+    # bind host that serves fine, but "http://::1:8000" makes requests raise
+    # InvalidURL — which used to be misreported as "server is not running".
+    base_url = f"http://{_bracketed_url_host(connect_host)}:{port}"
 
     # Claude Desktop resolves tier aliases server-side, so it needs no
     # launch-time model — but it does need the desktop switch. The toggle
@@ -545,6 +563,13 @@ def launch_command(args, extra_args: list[str] | None = None):
     try:
         resp = requests.get(f"{base_url}/health", timeout=3)
         resp.raise_for_status()
+    except requests.exceptions.InvalidURL as exc:
+        # Distinguish a malformed URL from an unreachable server: the server
+        # may be running fine while the configured host cannot form a URL.
+        print(f"Cannot check oMLX server health: invalid URL {base_url} ({exc})")
+        print("Check the configured host; IPv6 literals are bracketed automatically,")
+        print("so this usually means the host string is malformed.")
+        sys.exit(1)
     except Exception:
         print(f"oMLX server is not running at {base_url}")
         print("Start the server first: omlx start")

@@ -73,6 +73,57 @@ def _make_pool(entries: list) -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
+# TestAudioSpeechRequestBounds
+# ---------------------------------------------------------------------------
+
+
+class TestAudioSpeechRequestBounds:
+    """AudioSpeechRequest sampling params must be bounded.
+
+    Negative values (e.g. max_tokens=-1) previously flowed silently into
+    the TTS engine's sampler; mirror the chat-side Field constraints:
+    ge=0 for sampling params, gt=0 for max_tokens.
+    """
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("temperature", -0.1),
+            ("top_k", -1),
+            ("top_p", -0.5),
+            ("repetition_penalty", -0.1),
+            ("max_tokens", 0),
+            ("max_tokens", -1),
+        ],
+    )
+    def test_rejects_out_of_range(self, field, value):
+        from pydantic import ValidationError
+
+        from omlx.api.audio_models import AudioSpeechRequest
+
+        with pytest.raises(ValidationError):
+            AudioSpeechRequest(model="qwen3-tts", input="hello", **{field: value})
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("temperature", 0.0),
+            ("top_k", 0),
+            ("top_p", 0.9),
+            ("repetition_penalty", 1.0),
+            ("max_tokens", 512),
+        ],
+    )
+    def test_accepts_in_range(self, field, value):
+        from omlx.api.audio_models import AudioSpeechRequest
+
+        request = AudioSpeechRequest(
+            model="qwen3-tts", input="hello", **{field: value}
+        )
+        assert getattr(request, field) == value
+
+
+# ---------------------------------------------------------------------------
 # TestModelsListAudio
 # ---------------------------------------------------------------------------
 

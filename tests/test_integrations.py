@@ -90,6 +90,30 @@ class TestIntegrationRegistry:
         assert get_integration("nonexistent") is None
 
 
+class TestIntegrationContextBaseUrl:
+    """IPv6 literals must be bracketed in URL authorities (RFC 3986).
+
+    ``http://::1:8000`` is invalid — requests raises InvalidURL — so a
+    context built for an IPv6 bind host previously produced broken URLs.
+    """
+
+    def test_ipv6_literal_is_bracketed(self):
+        c = ctx(host="::1")
+        assert c.base_url == "http://[::1]:8000"
+        assert c.openai_base_url == "http://[::1]:8000/v1"
+
+    def test_ipv4_and_hostname_pass_through(self):
+        assert ctx(host="192.168.1.100").base_url == "http://192.168.1.100:8000"
+        assert ctx(host="localhost").base_url == "http://localhost:8000"
+
+    def test_already_bracketed_host_is_not_double_bracketed(self):
+        assert ctx(host="[::1]").base_url == "http://[::1]:8000"
+
+    def test_host_field_stores_the_unbracketed_literal(self):
+        """The raw bind host is preserved; bracketing is a URL concern."""
+        assert ctx(host="::1").host == "::1"
+
+
 class TestIntegrationCommands:
     def test_commands_quote_full_app_cli_prefix(self):
         with patch(
