@@ -36,7 +36,7 @@ def test_pre_cancelled_pipeline_rejects_before_encoding(tmp_path, monkeypatch):
         module, "inspect_bundle", lambda root: {"structural_status": "valid"}
     )
     monkeypatch.setattr(
-        module, "encode_prompt", lambda *a, **k: pytest.fail("encoding started")
+        module, "encode_prompt_steps", lambda *a, **k: pytest.fail("encoding started")
     )
     with pytest.raises(InterruptedError):
         generate_png(tmp_path, "prompt", 42, cancel=event)
@@ -55,7 +55,7 @@ def test_encoder_failure_still_drains(tmp_path, monkeypatch):
     def fail(*a, **k):
         raise ValueError("bad encoder")
 
-    monkeypatch.setattr(module, "encode_prompt", fail)
+    monkeypatch.setattr(module, "encode_prompt_steps", fail)
     with pytest.raises(ValueError, match="encoder"):
         generate_png(tmp_path, "prompt", 42)
     assert calls == ["drain"]

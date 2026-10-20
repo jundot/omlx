@@ -417,3 +417,23 @@ class Qwen21VAE(Qwen21VAECore):
         latents = latents * std + mean
         latents = VAEOperations.conv(self.post_quant_conv, latents, True)
         return self.decoder(latents, cancel=cancel)[:, :3]
+
+    def decode_steps(self, latents, *, cancel=None):
+        from .conditioning import check_cancel
+
+        check_cancel(cancel)
+        latents = self._single_frame(latents)
+        mean = mx.array(self._mean, dtype=mx.float32)[None, :, None, None]
+        std = mx.array(self._std, dtype=mx.float32)[None, :, None, None]
+        x = VAEOperations.conv(self.post_quant_conv, latents * std + mean, True)
+        x = self.decoder.mid_block(VAEOperations.conv(self.decoder.conv_in, x, True))
+        mx.eval(x)
+        yield ("vae_stage", 1, 6)
+        for i, block in enumerate(self.decoder.up_blocks):
+            check_cancel(cancel)
+            x = block(x)
+            mx.eval(x)
+            yield ("vae_stage", i + 2, 6)
+        return VAEOperations.conv(
+            self.decoder.conv_out, nn.silu(self.decoder.norm_out(x)), True
+        )[:, :3]
