@@ -1552,31 +1552,18 @@ class BlockAwarePrefixCache(CacheManager):
                         block_meta = per_block
 
                     # Save to paged SSD via PagedSSDCacheManager with cache type info
-                    if hot_cache_write_back:
-                        saved = self.paged_ssd_cache.save_block(
-                            block_hash=block.block_hash,
-                            cache_data=block_kv_data,
-                            token_count=block.token_count,
-                            model_name=self.paged_cache.model_name,
-                            layer_cache_types=layer_cache_types,
-                            layer_meta_states=block_meta,
-                            replace_existing=False,
-                            parent_hash=parent_hash,
-                            tail_terminal=is_tail_terminal,
-                        )
-                    else:
-                        saved = self.paged_ssd_cache.save_block(
-                            block_hash=block.block_hash,
-                            cache_data=block_kv_data,
-                            token_count=block.token_count,
-                            model_name=self.paged_cache.model_name,
-                            layer_cache_types=layer_cache_types,
-                            layer_meta_states=block_meta,
-                            hot_cache_write_back=False,
-                            replace_existing=False,
-                            parent_hash=parent_hash,
-                            tail_terminal=is_tail_terminal,
-                        )
+                    saved = self.paged_ssd_cache.save_block(
+                        block_hash=block.block_hash,
+                        cache_data=block_kv_data,
+                        token_count=block.token_count,
+                        model_name=self.paged_cache.model_name,
+                        layer_cache_types=layer_cache_types,
+                        layer_meta_states=block_meta,
+                        hot_cache_write_back=hot_cache_write_back,
+                        replace_existing=False,
+                        parent_hash=parent_hash,
+                        tail_terminal=is_tail_terminal,
+                    )
                     if saved:
                         if split_gdn_layout:
                             if is_exact_split_block:
@@ -3360,17 +3347,12 @@ class BlockAwarePrefixCache(CacheManager):
                     break  # Stop here, use valid prefix
 
                 # Load with metadata for type information
-                if promote_to_hot_cache:
-                    block_data, block_metadata = (
-                        self.paged_ssd_cache.load_block_with_metadata(block.block_hash)
+                block_data, block_metadata = (
+                    self.paged_ssd_cache.load_block_with_metadata(
+                        block.block_hash,
+                        promote_to_hot_cache=promote_to_hot_cache,
                     )
-                else:
-                    block_data, block_metadata = (
-                        self.paged_ssd_cache.load_block_with_metadata(
-                            block.block_hash,
-                            promote_to_hot_cache=False,
-                        )
-                    )
+                )
                 if block_data is None:
                     logger.debug(
                         f"Failed to load block {block_id} from tiered cache, "
