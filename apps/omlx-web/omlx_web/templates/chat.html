@@ -5194,7 +5194,7 @@
                 allModels.filter(m => {
                     const gatewayId = this.aliasToGateway[m.id] || m.id;
                     const t = (this.modelTypeMap[gatewayId] || '').toLowerCase();
-                    return t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker' && t !== 'decision';
+                    return t !== 'image' && t !== 'audio_tts' && t !== 'audio_sts' && t !== 'embedding' && t !== 'reranker' && t !== 'decision';
                 }).map(m => ({
                     id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
                     name: m.id, // original name (alias or directory name) for display

@@ -30,10 +30,26 @@ from .image_bundle import image_boundary
 logger = logging.getLogger(__name__)
 
 ModelType = Literal[
-    "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+    "llm",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "decision",
+    "image",
 ]
 EngineType = Literal[
-    "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+    "batched",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "decision",
+    "image",
 ]
 DecisionKind = Literal["clef", "openjev", "d3"]
 
@@ -285,7 +301,9 @@ UNSUPPORTED_RERANKER_ARCHITECTURES = {
 }
 
 # All known reranker architectures (for model type detection)
-RERANKER_ARCHITECTURES = SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER_ARCHITECTURES
+RERANKER_ARCHITECTURES = (
+    SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER_ARCHITECTURES
+)
 
 # Unsupported model types — detected and skipped during discovery.
 # Only top-level config fields are checked; nested audio_config/tts_config in
@@ -391,6 +409,7 @@ AUDIO_STS_ARCHITECTURES = {
     "SAMAudio",
     "LFM2AudioModel",
 }
+
 
 def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
     """True when an audio_stt model can serve the realtime WebSocket."""
@@ -1154,10 +1173,21 @@ _VISION_WEIGHT_PREFIXES = (
 )
 
 _SAFETENSORS_DTYPE_BYTES = {
-    "F64": 8, "I64": 8, "U64": 8,
-    "F32": 4, "I32": 4, "U32": 4,
-    "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
-    "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1,
+    "F64": 8,
+    "I64": 8,
+    "U64": 8,
+    "F32": 4,
+    "I32": 4,
+    "U32": 4,
+    "F16": 2,
+    "BF16": 2,
+    "I16": 2,
+    "U16": 2,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I8": 1,
+    "U8": 1,
+    "BOOL": 1,
 }
 
 
@@ -1523,6 +1553,7 @@ def _safetensors_has_mlx_metadata(path: Path) -> bool:
 
 
 _MLX_NAME_RE = re.compile(r"(^|[-_/])mlx($|[-_/])", re.IGNORECASE)
+
 
 # Speculative-decoding helper checkpoints (e.g. z-lab/Qwen3.6-27B-DFlash) are
 # MLX-loadable drafts even though their safetensors are saved in PyTorch ("pt")
@@ -1957,6 +1988,31 @@ def _owner_folder(path: Path, model_dirs: list[Path]) -> str | None:
     return None
 
 
+def _register_image_pipeline(models, path, model_id, **source):
+    # Structural inspection is bounded and never imports an inference runtime.
+    from .image_inspect import inspect_bundle
+
+    report = inspect_bundle(path)
+    if report["structural_status"] != "valid":
+        logger.warning(
+            "Skipping unsupported image pipeline/component %s: %s",
+            path,
+            report["errors"],
+        )
+        return
+    if model_id in models:
+        return
+    models[model_id] = DiscoveredModel(
+        model_id=model_id,
+        model_path=str(path),
+        model_type="image",
+        engine_type="image",
+        estimated_size=int(report["physical_weight_bytes"] * 1.10),
+        config_model_type="qwen_image_2_1_turbo",
+        **source,
+    )
+
+
 def discover_models(
     model_dir: Path, gguf_root: Path | None = None
 ) -> dict[str, DiscoveredModel]:
@@ -2001,7 +2057,7 @@ def discover_models(
 
     models: dict[str, DiscoveredModel] = {}
     if image_boundary(model_dir):
-        logger.warning("Skipping image pipeline/component %s: image serving is unavailable", model_dir)
+        _register_image_pipeline(models, model_dir, model_dir.name)
         return models
 
     for subdir in _iter_readable_entries(model_dir, "model directory"):
@@ -2011,7 +2067,7 @@ def discover_models(
             continue
 
         if image_boundary(subdir):
-            logger.warning("Skipping image pipeline/component %s: image serving is unavailable", subdir)
+            _register_image_pipeline(models, subdir, subdir.name)
             continue
         if _is_adapter_dir(subdir):
             logger.info(
@@ -2028,7 +2084,13 @@ def discover_models(
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
                 if image_boundary(hf_resolved.snapshot_path):
-                    logger.warning("Skipping image pipeline/component %s: image serving is unavailable", hf_resolved.snapshot_path)
+                    _register_image_pipeline(
+                        models,
+                        hf_resolved.snapshot_path,
+                        hf_resolved.model_id,
+                        source_type="hf_cache",
+                        source_repo_id=hf_resolved.source_repo_id,
+                    )
                     continue
                 if _register_gguf_folder(
                     models,
@@ -2057,13 +2119,12 @@ def discover_models(
             # Level 2: organization folder — scan children
             has_children = False
             for child in _iter_readable_entries(subdir, "model group"):
-                if (
-                    not _is_readable_dir(child, "model group entry")
-                    or child.name.startswith(".")
-                ):
+                if not _is_readable_dir(
+                    child, "model group entry"
+                ) or child.name.startswith("."):
                     continue
                 if image_boundary(child):
-                    logger.warning("Skipping image pipeline/component %s: image serving is unavailable", child)
+                    _register_image_pipeline(models, child, child.name)
                     has_children = True
                     continue
                 if _is_adapter_dir(child):
