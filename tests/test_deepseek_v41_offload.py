@@ -4,6 +4,7 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, current_thread
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -297,6 +298,69 @@ def test_model_close_unmaps_even_after_prefetch_failure(converted, monkeypatch):
         if "engram" in layer:
             assert layer.engram.embed._weights._mapping is None
     model.close()
+
+
+@pytest.mark.parametrize(
+    "failures", [("offload",), ("table0",), ("prefetch", "table0")]
+)
+def test_model_close_releases_all_resources_after_cleanup_error(
+    converted, monkeypatch, failures
+):
+    model, _ = load(converted, engram_ssd_offload=True)
+    prefetch = model.language_model._engram_prefetch
+    tables = [
+        layer.engram.embed for layer in model.language_model.layers if "engram" in layer
+    ]
+    original_prefetch_close = prefetch.close
+    original_table_closes = [table.close for table in tables]
+    errors = {name: OSError(f"{name} cleanup failed") for name in failures}
+    closed = []
+
+    def tracked_close(name, close):
+        def wrapped():
+            closed.append(name)
+            close()
+            if name in errors:
+                raise errors[name]
+
+        return wrapped
+
+    monkeypatch.setattr(
+        model,
+        "_moe_offload_plan",
+        SimpleNamespace(close=tracked_close("offload", lambda: None)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        prefetch, "close", tracked_close("prefetch", original_prefetch_close)
+    )
+    for i, (table, close) in enumerate(zip(tables, original_table_closes)):
+        monkeypatch.setattr(table, "close", tracked_close(f"table{i}", close))
+
+    try:
+        # Start the real worker and retain a completed pending read to drain.
+        prefetch.submit(tables[0], np.array([1]))
+        prefetch._pending[1].result(timeout=5)
+        with pytest.raises(OSError) as raised:
+            model.close()
+        assert raised.value is errors[failures[0]]
+        assert closed == ["offload", "prefetch", "table0", "table1"]
+        assert prefetch._closed and prefetch._pending is None
+        assert all(not thread.is_alive() for thread in prefetch._executor._threads)
+        for table in tables:
+            assert table._closed and table._prefetched is None
+            assert table._weights._mapping is None
+            assert table._weights._file.closed
+
+        # A repeated close still visits every resource, even after an error.
+        errors.clear()
+        closed.clear()
+        model.close()
+        assert closed == ["offload", "prefetch", "table0", "table1"]
+    finally:
+        original_prefetch_close()
+        for close in original_table_closes:
+            close()
 
 
 @pytest.mark.parametrize("offload", [False, True])
