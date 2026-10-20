@@ -253,5 +253,73 @@ class ImageImportTests(unittest.TestCase):
             read_json(self.root / "large.json")
 
 
+class InspectionFailureTests(unittest.TestCase):
+    setUp = ImageImportTests.setUp
+    bundle = ImageImportTests.bundle
+
+    def test_symlink_loop(self):
+        manifest = self.bundle()
+        (self.root / "loop").symlink_to("loop")
+        manifest["components"]["vae"]["path"] = "loop"
+        write_json(self.root / SIDECAR, manifest)
+        self.assertEqual(inspect_bundle(self.root)["structural_status"], "invalid")
+
+    def test_file_changes_during_inspection(self):
+        from unittest.mock import patch
+
+        from omlx.image_inspect import tensor_header as original
+
+        self.bundle()
+
+        def changing(path, verify):
+            result = original(path, verify)
+            with path.open("ab") as stream:
+                stream.write(b"changed")
+            return result
+
+        with patch("omlx.image_inspect.tensor_header", side_effect=changing):
+            self.assertEqual(inspect_bundle(self.root)["structural_status"], "invalid")
+
+    def test_metadata_changes_between_components(self):
+        from unittest.mock import patch
+
+        from omlx.image_inspect import tensor_header as original
+
+        self.bundle()
+
+        def changing(path, verify):
+            result = original(path, verify)
+            write_json(self.root / SIDECAR, {"schema_version": 999})
+            return result
+
+        with patch("omlx.image_inspect.tensor_header", side_effect=changing):
+            self.assertEqual(inspect_bundle(self.root)["structural_status"], "invalid")
+
+    def test_cancel_returns_non_success(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from omlx.image_inspect import inspect_command
+
+        with (
+            patch("omlx.image_inspect.inspect_bundle", side_effect=KeyboardInterrupt),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(
+                inspect_command(
+                    SimpleNamespace(path=self.root, verify_hashes=True, json=True)
+                ),
+                130,
+            )
+
+    def test_hashes_cannot_claim_uninspected_files(self):
+        manifest = self.bundle()
+        manifest["sha256"] = {"outside.safetensors": "0" * 64}
+        write_json(self.root / SIDECAR, manifest)
+        self.assertEqual(
+            inspect_bundle(self.root, True)["structural_status"], "invalid"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

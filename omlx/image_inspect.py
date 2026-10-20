@@ -3,8 +3,8 @@
 
 import hashlib
 import json
-import math
 import os
+import re
 import stat
 import struct
 from pathlib import Path
@@ -66,8 +66,10 @@ def tensor_header(path, verify_hashes):
                 item.get("dtype"),
                 item.get("data_offsets"),
             )
-            if not isinstance(shape, list) or not all(
-                type(x) is int and 0 <= x <= 2**63 - 1 for x in shape
+            if (
+                not isinstance(shape, list)
+                or len(shape) > 8
+                or not all(type(x) is int and 0 <= x <= 2**63 - 1 for x in shape)
             ):
                 raise ValueError(f"invalid shape: {name}")
             if dtype not in DTYPES:
@@ -79,11 +81,16 @@ def tensor_header(path, verify_hashes):
             ):
                 raise ValueError(f"invalid offsets: {name}")
             start, end = offsets
+            elements = 1
+            for dimension in shape:
+                elements *= dimension
+                if elements > before.st_size:
+                    raise ValueError(f"tensor shape exceeds file: {name}")
             if (
                 start < 0
                 or end < start
                 or end > before.st_size - 8 - length
-                or end - start != math.prod(shape) * DTYPES[dtype]
+                or end - start != elements * DTYPES[dtype]
             ):
                 raise ValueError(f"invalid tensor byte count: {name}")
             spans.append((start, end))
@@ -119,10 +126,21 @@ def inspect_bundle(path, verify_hashes=False):
         "errors": [],
         "physical_weight_bytes": 0,
         "integrity_status": "not_checked",
+        "integrity_scope": "weight_files",
     }
     try:
         root = Path(path).resolve(strict=True)
-        manifest = read_json(contained(root, SIDECAR))
+        observed = {}
+
+        def metadata(path):
+            before = signature(path.stat())
+            result = read_json(path)
+            if before != signature(path.stat()):
+                raise ValueError(f"metadata changed during inspection: {path.name}")
+            observed[path] = before
+            return result
+
+        manifest = metadata(contained(root, SIDECAR))
         if (
             type(manifest.get("schema_version")) is not int
             or manifest["schema_version"] != 1
@@ -141,7 +159,13 @@ def inspect_bundle(path, verify_hashes=False):
         hashes = manifest.get("sha256", {})
         if not isinstance(hashes, dict):
             raise ValueError("sha256 must be an object")
+        if not all(
+            isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v)
+            for v in hashes.values()
+        ):
+            raise ValueError("sha256 values must be lowercase SHA-256 digests")
         seen_files = set()
+        inspected_paths = set()
         all_hashed = True
         for name in COMPONENTS:
             component = components[name]
@@ -150,13 +174,13 @@ def inspect_bundle(path, verify_hashes=False):
             directory = contained(root, component.get("path"))
             if not directory.is_dir():
                 raise ValueError(f"not a component directory: {name}")
-            config = read_json(
+            config = metadata(
                 contained(root, str(directory.relative_to(root) / "config.json"))
             )
             index_path = directory / "model.safetensors.index.json"
             index = None
             if index_path.exists():
-                index = read_json(
+                index = metadata(
                     contained(root, str(index_path.relative_to(root)))
                 ).get("weight_map")
                 if (
@@ -178,7 +202,10 @@ def inspect_bundle(path, verify_hashes=False):
                 file = contained(root, str(directory.relative_to(root) / shard))
                 if not file.is_relative_to(directory):
                     raise ValueError("shard escapes component")
+                before = signature(file.stat())
                 values, size, digest, identity = tensor_header(file, verify_hashes)
+                observed[file] = before
+                inspected_paths.add(str(file.relative_to(root)))
                 if identity not in seen_files:
                     report["physical_weight_bytes"] += size
                     seen_files.add(identity)
@@ -208,7 +235,14 @@ def inspect_bundle(path, verify_hashes=False):
         # The tokenizer is part of the artifact even though inspection runs no code.
         processor = contained(root, manifest.get("processor"))
         for filename in ("tokenizer.json", "tokenizer_config.json"):
-            read_json(contained(root, str(processor.relative_to(root) / filename)))
+            metadata(contained(root, str(processor.relative_to(root) / filename)))
+        if set(hashes) - inspected_paths:
+            raise ValueError("sha256 references an uninspected weight file")
+        for file, before in observed.items():
+            if signature(file.stat()) != before:
+                raise ValueError(
+                    f"bundle changed during inspection: {file.relative_to(root)}"
+                )
         report["structural_status"] = "valid"
         report["compatibility_status"] = "unvalidated_tensor_semantics"
         if verify_hashes:
@@ -222,13 +256,18 @@ def inspect_bundle(path, verify_hashes=False):
         KeyError,
         OverflowError,
         RecursionError,
+        RuntimeError,
     ) as exc:
         report["errors"].append({"code": "invalid_bundle", "detail": str(exc)})
     return report
 
 
 def inspect_command(args):
-    report = inspect_bundle(args.path, args.verify_hashes)
+    try:
+        report = inspect_bundle(args.path, args.verify_hashes)
+    except KeyboardInterrupt:
+        print(json.dumps({"structural_status": "cancelled", "serving_enabled": False}))
+        return 130
     print(
         json.dumps(report, indent=2)
         if args.json
