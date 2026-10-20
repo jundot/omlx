@@ -61,6 +61,37 @@ _ONE_ROW_SOURCE = r"""
     if (simd_lid == 0) y[out_row] = static_cast<T>(result);
 """
 
+# _ONE_ROW_SOURCE for M vectors: each lane's 8-byte weight slice and its scale serve every
+# vector, and each vector keeps the one-row arithmetic, so row v equals a one-row GEMV of it.
+_ONE_ROW_EACH_SOURCE = r"""
+    const uint3 tid = threadgroup_position_in_grid;
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    constexpr int G = K / 32;
+    const int out_row = tid.y * 2 + simd_gid;
+    const device uint8_t* ws =
+        (const device uint8_t*)w + size_t(out_row) * K + simd_lid * 8;
+    const device uint8_t* sl = scales + size_t(out_row) * G + simd_lid / 4;
+    const device T* xp = x + simd_lid * 8;
+    float result[M];
+    for (int v = 0; v < M; v++) result[v] = 0;
+    for (int k = 0; k < K; k += 256) {
+        const float s = v41_e8m0(sl[0]);
+        for (int v = 0; v < M; v++) {
+            float x_thread[8];
+            for (int i = 0; i < 8; i++) x_thread[i] = xp[v * K + i];
+            result[v] += v41_qdot8(ws, x_thread, s);
+        }
+        ws += 256;
+        sl += 8;
+        xp += 256;
+    }
+    for (int v = 0; v < M; v++) {
+        const float r = simd_sum(result[v]);
+        if (simd_lid == 0) y[v * N + out_row] = static_cast<T>(r);
+    }
+"""
+
 # fp_qmv_wide (16 K lanes, one tile of M vectors) where each lane serves two
 # consecutive rows, so every activation chunk it loads feeds both rows. Group
 # order, expressions and the shuffle-down reduction are unchanged.
@@ -123,11 +154,13 @@ _ROWS_SOURCE = r"""
 
 @cache
 def _kernel(rows):
+    names = {False: "one_row", True: "rows", "each": "each_row"}
+    sources = {False: _ONE_ROW_SOURCE, True: _ROWS_SOURCE, "each": _ONE_ROW_EACH_SOURCE}
     return mx.fast.metal_kernel(
-        name="v41_mxfp8_gemv_rows" if rows else "v41_mxfp8_gemv_one_row",
+        name=f"v41_mxfp8_gemv_{names[rows]}",
         input_names=["w", "scales", "x"],
         output_names=["y"],
-        source=_ROWS_SOURCE if rows else _ONE_ROW_SOURCE,
+        source=sources[rows],
         header=_HEADER,
     )
 
@@ -171,5 +204,34 @@ def mxfp8_gemv(x, weight, scales):
         grid=(32, (n + 7) // 8 * 2, 1),
         threadgroup=(32, 2, 1),
         output_shapes=[(*x.shape[:-1], n)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+def mxfp8_gemv_each(x, weight, scales):
+    """Rows of x ([M, K], M <= 8) projected one by one with MLX's one-row arithmetic
+    (fp_qmv_fast): row r equals ``mx.quantized_matmul(x[r : r + 1], ...)`` bit for bit,
+    while the weights are read once for all rows. None when the layout does not fit."""
+    k = x.shape[-1]
+    n = weight.shape[0]
+    if (
+        x.ndim != 2
+        or not 1 <= x.shape[0] <= 8
+        or x.dtype not in (mx.bfloat16, mx.float16)
+        or weight.ndim != 2
+        or weight.dtype != mx.uint32
+        or weight.shape[1] * 4 != k
+        or scales.shape != (n, k // 32)
+        or k % 256
+        or n % 8
+        or mx.default_device() != mx.gpu
+    ):
+        return None
+    return _kernel("each")(
+        inputs=[weight, scales, x],
+        template=[("T", x.dtype), ("K", k), ("N", n), ("M", x.shape[0])],
+        grid=(32, n, 1),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(x.shape[0], n)],
         output_dtypes=[x.dtype],
     )[0]

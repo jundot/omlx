@@ -7,6 +7,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .gemv import mxfp8_gemv_each
+from .quantization import QuantizedProjection, quantize_activation
+
 
 def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
     """Map every token id onto a smaller id space where tokens that normalize alike collapse together.
@@ -134,6 +137,14 @@ class NgramHash:
 _ROWWISE_ROWS = 8
 
 
+def _project_each(p, flat):
+    """p applied to each row of flat ([count, k]) on its own, with one weight read for all
+    rows (mxfp8_gemv_each), or None if p is not an MXFP8 projection."""
+    if not (isinstance(p, QuantizedProjection) and p.mode == "mxfp8" and p.group_size == 32):
+        return None
+    return mxfp8_gemv_each(quantize_activation(flat) if p.quantize_input else flat, p.weight, p.scales)
+
+
 class Engram(nn.Module):
     def __init__(self, config, table_index):
         super().__init__()
@@ -161,8 +172,10 @@ class Engram(nn.Module):
             # decode does. A multi-row quantized_matmul runs a different MLX kernel whose
             # fp32 sums round differently (the reference leaves GEMM order free, but a
             # token's output would then depend on its batch or on speculation).
-            flat = rows.reshape(count, 1, -1)
-            kv = mx.concatenate([self.wkv(flat[r : r + 1]) for r in range(count)])
+            kv = _project_each(self.wkv, rows.reshape(count, -1))
+            if kv is None:
+                flat = rows.reshape(count, 1, -1)
+                kv = mx.concatenate([self.wkv(flat[r : r + 1]) for r in range(count)])
             kv = kv.reshape(*rows.shape[:2], -1)
         else:
             kv = self.wkv(rows)
