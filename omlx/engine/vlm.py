@@ -2538,6 +2538,15 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
+        # Qwen4-Exp vocabulary head: the one-row qmv tile at B1 and fewer
+        # weight passes for multi-row qmv_wide widths, with stock bits.
+        try:
+            from ..patches.qwen4_head_qmv import apply_qwen4_head_qmv_patch
+
+            apply_qwen4_head_qmv_patch(self._vlm_model)
+        except Exception:
+            logger.debug("Qwen4 head qmv patch not applied", exc_info=True)
+
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch for short rows (decode + MTP verify widths).
         try:
