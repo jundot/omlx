@@ -1047,6 +1047,12 @@ def _bind_request_cache_scope(caches, request, *, shared_prefix_enabled=False):
             bind_scope(scope)
 
 
+def _qwen4_qsa_shared_prefix_enabled(scheduler) -> bool:
+    """Read the optional runtime flag without widening test-double contracts."""
+    config = getattr(scheduler, "config", None)
+    return bool(getattr(config, "qwen4_qsa_shared_prefix_enabled", False))
+
+
 def _cache_layer_supports_singleton_passthrough(cache_obj: Any) -> bool:
     sub_caches = getattr(cache_obj, "caches", None)
     if isinstance(sub_caches, (list, tuple)):
@@ -7062,7 +7068,7 @@ class Scheduler:
         _bind_request_cache_scope(
             state.cache,
             request,
-            shared_prefix_enabled=self.config.qwen4_qsa_shared_prefix_enabled,
+            shared_prefix_enabled=_qwen4_qsa_shared_prefix_enabled(self),
         )
 
         per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
@@ -13391,7 +13397,7 @@ class Scheduler:
             _bind_request_cache_scope(
                 cache_to_use,
                 request,
-                shared_prefix_enabled=self.config.qwen4_qsa_shared_prefix_enabled,
+                shared_prefix_enabled=_qwen4_qsa_shared_prefix_enabled(self),
             )
 
             # Insert into BatchGenerator with pre-filled cache + last token.
