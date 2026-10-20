@@ -1109,8 +1109,8 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                 h, pre = decode_fused.decode_block_nb(
                     layer, h, pre, [rcs[r][j] for r in range(b_n)], shareds, starts, c
                 )
-                if prefetch is not None and "engram" in layer:
-                    mx.async_eval(h, pre)
+                # Submit each layer: the GPU runs it while the next one is built.
+                mx.async_eval(h, pre)
                 for r in range(b_n):
                     rc = rcs[r]
                     rc[j][0] = mx.array([starts[r] + 1], mx.int32)
@@ -1239,7 +1239,7 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # intermediates retire as the GPU progresses, and clear the pool at
             # the same points (per-layer widths vary across the ratio switch,
             # CED tail and 2047/2048 chunk widths, so size classes never
-            # reuse). Decode/verify widths stay lazy for latency.
+            # reuse). Decode/verify widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
             with prefetch.forward() if prefetch is not None else nullcontext():
                 first = self._next_engram(stage, -1)
@@ -1275,11 +1275,12 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                         image_mask,
                         ced_tail=ced_tail if ced_tail is not None and i >= ced_mid else None,
                     )
-                    if prefetch is not None and "engram" in layer:
-                        mx.async_eval(h, pre)
                     if prefill_backpressure:
                         mx.eval(h, pre)
                         mx.clear_cache()
+                    else:
+                        # The GPU runs this layer while the next one is built.
+                        mx.async_eval(h, pre)
                     rc[j][0] = mx.array([start + end - begin], mx.int32)
                     if history is not None and j == 0:
                         rc[j][6] = mx.array(history, mx.int64)
