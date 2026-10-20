@@ -1,0 +1,50 @@
+{
+  "source_repository": "mlx2",
+  "source_revision": "de836806961e561f2fd7fd848590d7b2e3a44f44",
+  "source_paths": [
+    "src/mlx2/runtime/qsa_shared_suffix.py"
+  ],
+  "transitive_source": {
+    "repository": "mlx-lm-unified",
+    "revision": "1e2bc604f71d070bee970c3e7db8b60f7855599b",
+    "path": "mlx_lm/qsa_shared_suffix.py"
+  },
+  "license": "Apache-2.0",
+  "license_basis": "mlx2 LICENSE and the explicit source-file notice",
+  "upstream_base_repository": "https://github.com/jundot/omlx",
+  "upstream_base_revision": "6f99f43044953ef55a632ec0ec0047531c1287f2",
+  "destination_paths": [
+    "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/shared_suffix.py",
+    "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/language.py",
+    "omlx/scheduler.py",
+    "omlx/cache/type_registry.py",
+    "omlx/cache/type_handlers.py",
+    "omlx/model_settings.py",
+    "omlx/engine/vlm.py"
+  ],
+  "modifications": [
+    "Adapted immutable-prefix/private-suffix storage and bounded gathering to oMLX QSA caches, pooled summaries, and rank-two/native rank-three text positions.",
+    "Made activation a default-off, reload-bound per-model setting instead of a process environment switch.",
+    "Bound restored request caches to their media-cache scope before batching and to the loaded attention/indexer and parameter-array identities before activation.",
+    "Implemented exact prefix interning, independent suffix lifecycle operations, explicit ordinary-cache fallback, exact persistence materialization, and observed-engagement counters.",
+    "Preserved ordinary full-batch projection, selection, selected-KV attention, output projection, and the ordinary QSA reference route."
+  ],
+  "validation": {
+    "current_branch": {
+      "focused_qsa": "38 passed on MLX 0.32.4",
+      "settings_engine_and_dflash_regressions": "310 passed",
+      "qwen4_cache_regressions": "263 passed and 43 optional native-kernel cases skipped",
+      "scheduler_and_settings_regressions": "591 passed",
+      "aggregate": "1202 passed and 43 skipped across the non-overlapping focused suites",
+      "dependency_boundary": "Local validation used the cached mlx-lm 0.32.0 release and mlx-vlm 0.7.3 rather than oMLX's current development pins; upstream CI remains authoritative.",
+      "compile_and_diff_checks": "passed"
+    },
+    "frozen_experiment": {
+      "evidence_repository": "https://github.com/pierre427/omlx-qsa-shared-prefix",
+      "cpu": "37 new tests passed; broader focused regression 250 passed and 12 skipped",
+      "gpu": "561 passed and 43 skipped; full-model QSA engagement observed in 12 layers",
+      "performance_boundary": "At batch 8 and prefix 4096, retained tensor capacity fell 70.6% while one-layer attention was 37.5% slower; no controlled full-model throughput claim."
+    }
+  },
+  "status": "Experimental, implemented, default off, and not selected or broadly qualified"
+}

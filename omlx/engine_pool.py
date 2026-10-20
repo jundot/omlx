@@ -1168,6 +1168,10 @@ class EnginePool:
                 "qwen4_gdn_decode_wide_proj",
                 getattr(settings, "qwen4_gdn_decode_wide_proj", False),
             )
+            add(
+                "qwen4_qsa_shared_prefix_enabled",
+                getattr(settings, "qwen4_qsa_shared_prefix_enabled", False),
+            )
             v41_offload, _, _ = self._deepseek_v41_engram_offload_status(
                 entry, settings
             )
