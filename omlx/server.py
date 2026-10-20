@@ -89,6 +89,7 @@ from .api.anthropic_utils import (
     create_message_stop_event,
     create_text_delta_event,
     create_thinking_delta_event,
+    is_auto_mode_classifier_request,
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
@@ -7484,6 +7485,80 @@ async def stream_anthropic_messages(
     yield create_message_stop_event()
 
 
+def _is_auto_mode_classifier(request) -> bool:
+    """Whether this is Claude Code's auto-mode safety classifier request.
+
+    Detection runs on every ``/v1/messages`` request, so a bug in it must not
+    fail an unrelated one. On an error this logs a warning and answers False,
+    which is the behavior before the classifier workaround existed.
+    """
+    try:
+        return is_auto_mode_classifier_request(request)
+    except Exception:
+        logger.warning(
+            "Auto-mode classifier detection failed; treating this as a normal "
+            "request",
+            exc_info=True,
+        )
+        return False
+
+
+def _apply_auto_mode_classifier_thinking(
+    request, merged_ct_kwargs: dict, forced_keys: set, is_classifier: bool
+) -> None:
+    """Disable thinking for Claude Code's auto-mode safety classifier.
+
+    The classifier sends no thinking field, so a reasoning model would fall
+    back to its own default and reason past Claude Code's deadline. A model
+    setting that forces ``enable_thinking``, or a client that sets it in
+    ``chat_template_kwargs``, still wins.
+    """
+    if not is_classifier:
+        return
+    if "enable_thinking" in forced_keys:
+        return
+    if "enable_thinking" in (request.chat_template_kwargs or {}):
+        return
+    merged_ct_kwargs["enable_thinking"] = False
+    logger.info("Auto-mode classifier detected; disabling thinking for this request")
+
+
+_steering_warned: set[str] = set()
+
+
+def _steered_classifier_model(is_classifier: bool) -> str | None:
+    """Model id that should serve a classifier request, or ``None`` to leave
+    the request on the model it asked for.
+
+    Off by default (``steer_classifier_requests``). Claude Code discards the
+    classifier's reply content, so the model that answers it does not need to
+    track the chat model.
+    """
+    claude_code = getattr(_server_state.global_settings, "claude_code", None)
+    if claude_code is None or not claude_code.steer_classifier_requests:
+        return None
+    if not is_classifier:
+        return None
+
+    tier = claude_code.classifier_model_tier
+    tier_model = {
+        "opus": claude_code.opus_model,
+        "sonnet": claude_code.sonnet_model,
+        "haiku": claude_code.haiku_model,
+    }.get(tier)
+    if not tier_model:
+        if tier not in _steering_warned:
+            _steering_warned.add(tier)
+            logger.warning(
+                "Classifier steering is on but the %r tier has no model; "
+                "classifier requests stay on the requested model. Set the "
+                "tier's model or turn steering off.",
+                tier,
+            )
+        return None
+    return tier_model
+
+
 @app.post("/v1/messages")
 async def create_anthropic_message(
     request: AnthropicMessagesRequest,
@@ -7524,14 +7599,40 @@ async def create_anthropic_message(
 
     lease = _LLMEngineLease()
     try:
-        engine = await get_engine_for_model(request.model, lease=lease)
+        # Steering must be decided before the engine is acquired, because it
+        # changes which model is loaded.
+        is_classifier = _is_auto_mode_classifier(request)
+        steered_model = _steered_classifier_model(is_classifier)
+        serving_model = request.model
+        engine = None
+        if steered_model:
+            try:
+                engine = await get_engine_for_model(steered_model, lease=lease)
+                serving_model = steered_model
+                logger.info(
+                    "Steering auto-mode classifier request from %s to %s",
+                    request.model,
+                    steered_model,
+                )
+            except HTTPException as e:
+                logger.warning(
+                    "Cannot serve the classifier with %s (%s); using %s",
+                    steered_model,
+                    e.detail,
+                    request.model,
+                )
+        if engine is None:
+            engine = await get_engine_for_model(request.model, lease=lease)
 
         # Use the exact model selected by the pool, including fallback.
-        resolved_model = _serving_model_id(lease, request.model)
+        # request.model stays what the caller asked for — the response still
+        # echoes it below, matching model_fallback's existing precedent of
+        # never surfacing a server-side substitution to the client.
+        resolved_model = _serving_model_id(lease, serving_model)
 
         # Get per-model settings
         max_tool_result_tokens = None
-        ms = get_model_settings_for_request(request.model)
+        ms = get_model_settings_for_request(serving_model)
         if ms:
             max_tool_result_tokens = ms.max_tool_result_tokens
         merged_ct_kwargs = merge_chat_template_request_kwargs(
@@ -7557,6 +7658,13 @@ async def create_anthropic_message(
                     in MINIMAX_M3_MODEL_TYPES
                 ):
                     merged_ct_kwargs.setdefault("thinking_mode", "adaptive")
+        else:
+            # Claude Code's auto-mode safety classifier sends no thinking field.
+            # A request that states its own thinking preference takes the
+            # branch above, so it is never treated as the classifier here.
+            _apply_auto_mode_classifier_thinking(
+                request, merged_ct_kwargs, forced_keys, is_classifier
+            )
 
         logger.debug(
             f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
@@ -7635,7 +7743,7 @@ async def create_anthropic_message(
         ) = get_sampling_params(
             request.temperature,
             request.top_p,
-            request.model,
+            serving_model,
             req_top_k=getattr(request, "top_k", None),
             req_repetition_penalty=getattr(request, "repetition_penalty", None),
             req_max_tokens=request.max_tokens,
@@ -7663,7 +7771,7 @@ async def create_anthropic_message(
             chat_kwargs["repetition_context_size"] = repetition_context_size
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(request, request.model)
+        thinking_budget = _resolve_thinking_budget(request, serving_model)
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
@@ -7760,7 +7868,7 @@ async def create_anthropic_message(
             ):
                 raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
             raise
-        validate_context_window(num_prompt_tokens, request.model)
+        validate_context_window(num_prompt_tokens, serving_model)
 
         if prepared_prompt is not None:
             chat_kwargs["_prepared_prompt"] = prepared_prompt

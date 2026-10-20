@@ -1530,6 +1530,116 @@ def test_anthropic_adaptive_thinking_reaches_minimax_m3_template(
     assert engine.preflight_chat.call_args.kwargs["chat_template_kwargs"] == expected
 
 
+def _post_classifier_request(
+    monkeypatch, tmp_path, get_engine, settings_lookup, steering=None
+):
+    """POST a Claude Code auto-mode classifier request and capture the engine call."""
+    engine = MagicMock()
+    engine.model_type = "qwen3_5"
+    engine.is_diffusion_model = False
+    engine.tokenizer = None
+    engine.preflight_chat = AsyncMock(
+        side_effect=HTTPException(status_code=418, detail="Kwargs captured")
+    )
+    engine.start = AsyncMock()
+    engine.count_chat_tokens.return_value = 128
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type="qwen3_5", preserve_thinking_default=None
+    )
+    monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+    monkeypatch.setattr(srv, "get_engine_for_model", get_engine(engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", settings_lookup)
+    if steering is not None:
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.claude_code.steer_classifier_requests = True
+        gs.claude_code.classifier_model_tier = "haiku"
+        gs.claude_code.haiku_model = steering
+        monkeypatch.setattr(srv._server_state, "global_settings", gs)
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "chat-model",
+                "max_tokens": 64,
+                "system": "You are a security monitor for autonomous AI coding agents.",
+                "messages": [{"role": "user", "content": "Is this safe?"}],
+            },
+        )
+    assert response.status_code == 418, response.text
+    return engine
+
+
+def test_anthropic_auto_mode_classifier_gets_thinking_disabled(monkeypatch, tmp_path):
+    engine = _post_classifier_request(
+        monkeypatch,
+        tmp_path,
+        lambda engine: AsyncMock(return_value=engine),
+        lambda name: None,
+    )
+
+    kwargs = engine.preflight_chat.call_args.kwargs["chat_template_kwargs"]
+    assert kwargs == {"enable_thinking": False}
+
+
+def test_anthropic_classifier_steering_serves_and_configures_the_tier_model(
+    monkeypatch, tmp_path
+):
+    looked_up = []
+
+    def settings_lookup(name):
+        looked_up.append(name)
+        return None
+
+    engine = _post_classifier_request(
+        monkeypatch,
+        tmp_path,
+        lambda engine: AsyncMock(return_value=engine),
+        settings_lookup,
+        steering="classifier-model",
+    )
+
+    assert set(looked_up) == {"classifier-model"}
+    assert engine.preflight_chat.call_args.kwargs["chat_template_kwargs"] == {
+        "enable_thinking": False
+    }
+
+
+def test_anthropic_classifier_steering_falls_back_when_the_tier_model_is_missing(
+    monkeypatch, tmp_path, caplog
+):
+    requested = []
+
+    def get_engine(engine):
+        async def fake(model, **kwargs):
+            requested.append(model)
+            if model == "classifier-model":
+                raise HTTPException(status_code=404, detail="model not found")
+            return engine
+
+        return fake
+
+    with caplog.at_level("WARNING", logger="omlx.server"):
+        _post_classifier_request(
+            monkeypatch,
+            tmp_path,
+            get_engine,
+            lambda name: None,
+            steering="classifier-model",
+        )
+
+    assert requested == ["classifier-model", "chat-model"]
+    assert any("Cannot serve the classifier" in r.getMessage() for r in caplog.records)
+
+
 class TestRequestBodySizeLimit:
     @pytest.fixture
     def client(self):

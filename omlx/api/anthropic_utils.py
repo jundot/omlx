@@ -711,6 +711,41 @@ def _extract_system_text(system: str | list[SystemContent]) -> str:
     return ""
 
 
+# Claude Code's auto-mode Bash safety classifier names itself in its system
+# prompt. The match is a substring test, not a prefix test, because Claude Code
+# sends the system prompt as several blocks and may reorder or prepend one.
+# The legacy ``x-anthropic-billing-header:`` marker is not usable: it also
+# appears on ordinary Agent SDK turns, so it would disable thinking everywhere.
+_CLASSIFIER_SYSTEM_MARKER = "you are a security monitor for autonomous ai coding agents"
+
+
+def is_auto_mode_classifier_request(request: MessagesRequest) -> bool:
+    """True if this is Claude Code's auto-mode Bash safety-classifier request.
+
+    Claude Code sends this request before it runs a Bash command that its
+    static allow and deny rules do not cover. The request has no ``thinking``
+    field, so a reasoning model uses its own default and reasons past Claude
+    Code's deadline of about 35-45 seconds. Claude Code then cancels the
+    request, and the user sees "model is temporarily unavailable"
+    (see jundot/omlx#2067).
+
+    Auto mode fails closed: with no verdict, Claude Code refuses the action.
+    A reply without extended reasoning is better than no reply, but it costs
+    some accuracy, so the match stays narrow. Three conditions must all hold:
+
+    1. the system prompt contains the security-monitor marker anywhere,
+    2. the request is not streaming, because the classifier never streams,
+    3. the request carries no tools, because an ordinary turn that only
+       discusses the classifier still has Claude Code's tool array attached.
+    """
+    system_text = _extract_system_text(request.system) if request.system else ""
+    if _CLASSIFIER_SYSTEM_MARKER not in system_text.lower():
+        return False
+    if request.stream is True:
+        return False
+    return not request.tools
+
+
 def _normalize_in_messages_system(
     request: MessagesRequest,
     *,

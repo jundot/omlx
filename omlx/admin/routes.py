@@ -744,6 +744,8 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_opus_model: str | None = None
     claude_code_sonnet_model: str | None = None
     claude_code_haiku_model: str | None = None
+    claude_code_steer_classifier_requests: bool | None = None
+    claude_code_classifier_model_tier: Literal["opus", "sonnet", "haiku"] | None = None
     claude_code_desktop_enabled: bool | None = None
     # Side-effect flag for the Claude Desktop toggle: writing the user's
     # Claude Desktop JSON configs is a visible side effect, so the restart
@@ -4565,6 +4567,27 @@ def _splash_status(global_settings) -> dict:
     }
 
 
+_CLAUDE_CODE_FIELDS = (
+    "mode",
+    "opus_model",
+    "sonnet_model",
+    "haiku_model",
+    "steer_classifier_requests",
+    "classifier_model_tier",
+    "desktop_enabled",
+)
+
+
+def _snapshot_claude_code(claude_code) -> dict[str, Any]:
+    """Copy the editable Claude Code fields so a rejected update can undo them."""
+    return {name: getattr(claude_code, name, None) for name in _CLAUDE_CODE_FIELDS}
+
+
+def _restore_claude_code(claude_code, snapshot: dict[str, Any]) -> None:
+    for name, value in snapshot.items():
+        setattr(claude_code, name, value)
+
+
 def _global_settings_response(global_settings):
     from ..settings import get_auto_ssd_cache_size
 
@@ -4700,6 +4723,10 @@ def _global_settings_response(global_settings):
             "opus_model": global_settings.claude_code.opus_model,
             "sonnet_model": global_settings.claude_code.sonnet_model,
             "haiku_model": global_settings.claude_code.haiku_model,
+            "steer_classifier_requests": (
+                global_settings.claude_code.steer_classifier_requests
+            ),
+            "classifier_model_tier": global_settings.claude_code.classifier_model_tier,
             "desktop_enabled": global_settings.claude_code.desktop_enabled,
         },
         "integrations": {
@@ -5536,6 +5563,7 @@ async def update_global_settings(
             logger.info(msg)
 
     # Apply Claude Code settings (Live - immediately applied)
+    previous_claude_code = _snapshot_claude_code(global_settings.claude_code)
     claude_code_changed = False
     # mode: standard is-not-None check is correct — mode must never be null
     if request.claude_code_mode is not None:
@@ -5552,6 +5580,18 @@ async def update_global_settings(
         claude_code_changed = True
     if "claude_code_haiku_model" in request.model_fields_set:
         global_settings.claude_code.haiku_model = request.claude_code_haiku_model
+        claude_code_changed = True
+    # steer_classifier_requests / classifier_model_tier: like mode, these have
+    # no null state — is-not-None is correct here, not model_fields_set.
+    if request.claude_code_steer_classifier_requests is not None:
+        global_settings.claude_code.steer_classifier_requests = (
+            request.claude_code_steer_classifier_requests
+        )
+        claude_code_changed = True
+    if request.claude_code_classifier_model_tier is not None:
+        global_settings.claude_code.classifier_model_tier = (
+            request.claude_code_classifier_model_tier
+        )
         claude_code_changed = True
     if "claude_code_desktop_enabled" in request.model_fields_set:
         desktop_previously_enabled = bool(
@@ -5572,6 +5612,10 @@ async def update_global_settings(
             f"opus={global_settings.claude_code.opus_model}, "
             f"sonnet={global_settings.claude_code.sonnet_model}, "
             f"haiku={global_settings.claude_code.haiku_model}, "
+            f"steer_classifier_requests="
+            f"{global_settings.claude_code.steer_classifier_requests}, "
+            f"classifier_model_tier="
+            f"{global_settings.claude_code.classifier_model_tier}, "
             f"desktop_enabled={global_settings.claude_code.desktop_enabled}"
         )
 
@@ -5856,6 +5900,7 @@ async def update_global_settings(
     # Validate settings
     errors = global_settings.validate()
     if errors:
+        _restore_claude_code(global_settings.claude_code, previous_claude_code)
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
@@ -5870,6 +5915,7 @@ async def update_global_settings(
     try:
         await _save_global_settings_async(global_settings)
     except Exception as e:
+        _restore_claude_code(global_settings.claude_code, previous_claude_code)
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
