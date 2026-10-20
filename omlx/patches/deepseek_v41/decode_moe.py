@@ -744,8 +744,8 @@ _UP_NB_MMA = r"""
         // shared expert, 32 rows x NB tokens: 4 row tiles x 2 K-halves on the 8 simdgroups
         threadgroup float red[4][2 * 64], tg_g[4][64], tg_u[4][64];
         const uint t = sg / 2, ks = sg % 2, r0 = rb * 32 + t * 8;
-        fp8_mma8<DIM, 2, NB>(sw1, ss1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[t]);
-        fp8_mma8<DIM, 2, NB>(sw3, ss3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[t]);
+        S1_MMA8(DIM, 2, NB, sw1, ss1, sb1, r0, xq, uint(DIM), lane, ks, red[t], tg_g[t]);
+        S3_MMA8(DIM, 2, NB, sw3, ss3, sb3, r0, xq, uint(DIM), lane, ks, red[t], tg_u[t]);
         for (uint i = tid; i < uint(32 * NB); i += 256) {
             const uint r = i % 32, b = i / 32;
             float gate = float(bfloat16_t(tg_g[r / 8][(r % 8) * 8 + b])), up = float(bfloat16_t(tg_u[r / 8][(r % 8) * 8 + b]));
@@ -797,7 +797,7 @@ _DOWN_S_NB_MMA = r"""
     threadgroup float red[2 * 64], tile[64];
     const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup, tid = thread_index_in_threadgroup;
     const uint r0 = threadgroup_position_in_grid.x * 8;
-    fp8_mma8<INTER, 2, NB>(sw2, ss2, r0, hqs, uint(INTER), lane, sg, red, tile);
+    S2_MMA8(INTER, 2, NB, sw2, ss2, sb2, r0, hqs, uint(INTER), lane, sg, red, tile);
     for (uint i = tid; i < uint(8 * NB); i += 64) {
         const uint r = i % 8, b = i / 8;
         out[b * DIM + r0 + r] = bfloat16_t(partial[b * DIM + r0 + r] + float(bfloat16_t(tile[r * 8 + b])));
@@ -922,10 +922,10 @@ def fused_decode_moe_nb(moe, x, config, mma=None):
     """NB tokens at once. x: [NB, dim] bf16 (ffn_norm outputs). Returns [NB, dim] bf16; each
     token's result equals fused_decode_moe on that token alone, bit for bit without matrix
     tiles (mma=False) and within fp32 summation rounding with them (default: use_mma(NB)).
-    Matrix tiles exist for MXFP8 shared experts only."""
+    Matrix tiles (MXFP8 or affine shared experts) give a token the same result for any NB."""
     nb = x.shape[0]
     formats = _formats(moe)
-    mma = (use_mma(nb) if mma is None else mma) and formats[3:] == (MXFP8,) * 3
+    mma = (use_mma(nb) if mma is None else mma) and all(f[0] in ("mxfp8", "affine") for f in formats[3:])
     gate_k, up_k, down_r, down_s = _kernels_nb(mma, formats)
     dim, inter, ne, topk = config.dim, config.moe_inter_dim, config.n_routed_experts, config.n_activated_experts
     tpg = 256

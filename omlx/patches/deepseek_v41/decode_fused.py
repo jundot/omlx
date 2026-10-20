@@ -182,7 +182,9 @@ def wqb_rope(att, qrq, cos, sin, c, tiles=False):
         output_shapes=[(nq,)], output_dtypes=[mx.bfloat16])[0]
 
 
-def woa(att, oq, c):
+def woa(att, oq, c, tiles=False):
+    if tiles:
+        return woa_nb(att, oq.reshape(1, -1), c, True).reshape(-1)
     wq, ws = _woa_mxfp8(att)
     rows = c.o_groups * c.o_lora_rank
     return DL.kernel("woa")(
@@ -274,7 +276,7 @@ def decode_attention(att, x, xq, cache, shared, start, c, tiles=False):
     qr, qrq, packed = attn_mid(att, qa, kv_in, cos, sin, c)
     q = wqb_rope(att, qrq, cos, sin, c, tiles)
     oq = attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c)
-    yq = woa(att, oq, c)
+    yq = woa(att, oq, c, tiles)
     return gemv_fp8(yq, att.wo_b, tiles=tiles)[0]
 
 
@@ -518,11 +520,13 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
         oq = mx.concatenate([attention_core(att, xs[r].reshape(-1), qrs[r].reshape(-1), qs[r].reshape(-1), ps[r].reshape(-1),
                                             caches[r], shareds[r], starts[r], cs[r].reshape(-1), ss[r].reshape(-1), c)[None]
                              for r in range(b_n)])
-    yq = woa_nb(att, oq, c, DM.use_mma(b_n))
+    # A model that verifies drafts runs wo_a and the shared expert on matrix tiles at any B.
+    tiles = DM.use_mma(b_n) or getattr(blk, "_omlx_verify_exact", False)
+    yq = woa_nb(att, oq, c, tiles)
     a = blk.sum_ranks(gemv_fp8_nb(yq, att.wo_b)[0])
     coef_f, x2, _, h2 = mix_nb(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
     fp, fo, fc = coef_f[:, :hc], coef_f[:, hc:2 * hc], coef_f[:, 2 * hc:]
-    f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c)[0])
+    f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c, mma=tiles)[0])
     h3 = hc_post_nb(f, h2, fo, fc, c)
     return h3.reshape(b_n, 1, hc, dim), fp.reshape(b_n, 1, hc)
 
@@ -594,11 +598,12 @@ def decode_block_verify(blk, h, pre, cache, shared, start, c):
         state["window"] = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
         if pooling:
             state["compressor"] = tuple(mx.concatenate([p[i] for p in pending], 1) for i in (0, 1))
-    yq = woa_nb(att, oq, c, False)
+    tiles = getattr(blk, "_omlx_verify_exact", False)
+    yq = woa_nb(att, oq, c, tiles)
     a = blk.sum_ranks(gemv_fp8_nb(yq, att.wo_b, mma=False)[0])
     coef_f, x2, _, h2 = mix_nb(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
     fp, fo, fc = coef_f[:, :hc], coef_f[:, hc:2 * hc], coef_f[:, 2 * hc:]
-    f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c, mma=False)[0])
+    f = blk.sum_ranks(DM.fused_decode_moe_nb(blk.ffn, x2, c, mma=tiles)[0])
     h3 = hc_post_nb(f, h2, fo, fc, c)
     return h3.reshape(1, r_n, hc, dim), fp.reshape(1, r_n, hc)
 
@@ -635,6 +640,10 @@ def decode_block(blk, h, pre, cache, shared, start, c):
     a = blk.sum_ranks(decode_attention(blk.attn, x, xq, cache, shared, start, c, tiles))
     coef_f, x2, _, h2 = mix(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)
     fp, fo, fc = coef_f[:hc], coef_f[hc:2 * hc], coef_f[2 * hc:]
-    f = blk.sum_ranks(DM.fused_decode_moe(blk.ffn, x2.reshape(1, 1, -1), c)[0].reshape(-1))
+    if tiles:
+        f = DM.fused_decode_moe_nb(blk.ffn, x2.reshape(1, -1), c, mma=True)[0].reshape(-1)
+    else:
+        f = DM.fused_decode_moe(blk.ffn, x2.reshape(1, 1, -1), c)[0].reshape(-1)
+    f = blk.sum_ranks(f)
     h3 = hc_post(f, h2, fo, fc, c)
     return h3.reshape(1, 1, hc, dim), fp.reshape(1, 1, hc)
