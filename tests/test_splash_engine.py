@@ -602,6 +602,28 @@ class TestRequestTranslation:
 
         assert "thinking_token_budget" not in body
 
+    @pytest.mark.parametrize("preserve", [True, False])
+    def test_request_body_passes_preserve_thinking(self, tmp_path, preserve):
+        # Splash renders history with its own template, so oMLX's choice
+        # reaches the prompt only as a top-level field.
+        kwargs = {"chat_template_kwargs": {"preserve_thinking": preserve}}
+        body = self._body_with(tmp_path, "1.3.0", kwargs)
+
+        assert body["preserve_thinking"] is preserve
+
+    @pytest.mark.parametrize(
+        "template_kwargs",
+        [None, {}, {"enable_thinking": True}, {"preserve_thinking": "true"}],
+    )
+    def test_request_body_leaves_preserve_thinking_to_splash(
+        self, tmp_path, template_kwargs
+    ):
+        # Splash rejects a preserve_thinking value that is not a bool.
+        kwargs = {"chat_template_kwargs": template_kwargs}
+        body = self._body_with(tmp_path, "1.3.0", kwargs)
+
+        assert "preserve_thinking" not in body
+
 
 # -- streaming -------------------------------------------------------------------
 

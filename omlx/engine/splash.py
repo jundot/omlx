@@ -1199,6 +1199,11 @@ class SplashEngine(BaseEngine):
         budget = kwargs.get("thinking_budget")
         if budget is not None and self._target.binary.accepts_thinking_budget:
             body["thinking_token_budget"] = budget
+        # Splash renders the chat template itself and reads this one template
+        # option only as a top-level field; it rejects a value that is not a bool.
+        preserve = (kwargs.get("chat_template_kwargs") or {}).get("preserve_thinking")
+        if isinstance(preserve, bool):
+            body["preserve_thinking"] = preserve
         return body
 
     async def _stream(
