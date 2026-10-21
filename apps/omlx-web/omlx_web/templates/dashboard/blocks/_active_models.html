@@ -6,7 +6,7 @@
             <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('status.active_models.section_label') }}</span>
         </div>
         <div class="flex flex-col gap-1.5 w-full min-w-0">
-            <div class="w-full h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
+            <div class="w-full h-2.5 gauge-track rounded-full overflow-hidden relative shrink-0">
                 <div class="rounded-full transition-all duration-300"
                      :style="activeModelsPressureBarStyle"></div>
                 <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"
@@ -27,7 +27,7 @@
         <div class="flex items-center gap-3">
             <!-- Memory progress bar -->
             <div class="flex items-center gap-2">
-                <div class="w-36 h-2.5 bg-neutral-200 rounded-full overflow-hidden relative shrink-0">
+                <div class="w-36 h-2.5 gauge-track rounded-full overflow-hidden relative shrink-0">
                     <div class="rounded-full transition-all duration-300"
                          :style="activeModelsPressureBarStyle"></div>
                     <div x-show="stats.active_models.memory_pressure && stats.active_models.memory_pressure.enabled && activeModelsSoftPercent > 0"

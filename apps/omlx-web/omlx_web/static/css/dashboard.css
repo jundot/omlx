@@ -1,3 +1,6 @@
+    :root { accent-color: rgb(var(--palette-neutral-900)); }
+    [data-theme="dark"] { accent-color: rgb(var(--palette-neutral-200)); }
+
     body {
         background-color: var(--bg-primary) !important;
         color: var(--text-primary) !important;
@@ -138,7 +141,7 @@
     }
 
     /* === Code/pre blocks === */
-    [data-theme="dark"] code { background-color: var(--code-bg) !important; color: var(--text-primary) !important; }
+    [data-theme="dark"] code:not([class]) { background-color: var(--code-bg) !important; color: var(--text-primary) !important; }
     [data-theme="dark"] pre:not(.bg-neutral-100) { background-color: var(--code-bg) !important; color: var(--text-primary) !important; }
 
     /* === Focus rings === */
@@ -156,6 +159,9 @@
     /* Toggle OFF state */
     [data-theme="dark"] button.bg-neutral-200 {
         background-color: var(--bg-tertiary) !important;
+    }
+    [data-theme="dark"] button[role="switch"].bg-neutral-200:not(:focus) {
+        box-shadow: inset 0 0 0 1px rgb(var(--palette-zinc-500));
     }
     /* Default radio button (ON state) */
     [data-theme="dark"] button.bg-black.border-black {

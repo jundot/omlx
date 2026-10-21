@@ -1,5 +1,6 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
+  darkMode: ['selector', '[data-theme="dark"]'],
   content: [
     "./omlx_web/templates/**/*.html",
     "./omlx_web/static/js/**/*.js",

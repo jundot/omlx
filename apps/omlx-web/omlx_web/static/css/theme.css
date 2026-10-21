@@ -274,6 +274,7 @@
     --bg-danger-hover: rgb(var(--palette-red-500) / 0.1);
     --timeline-accent: rgb(var(--palette-blue-500));
     --focus-ring-color: rgb(var(--palette-neutral-900));
+    color-scheme: light;
 }
 
 [data-theme="dark"] {
@@ -295,6 +296,7 @@
     --bg-danger-hover: rgb(var(--palette-red-500) / 0.2);
     --timeline-accent: rgb(var(--palette-blue-400));
     --focus-ring-color: rgb(var(--palette-night-50));
+    color-scheme: dark;
 }
 
 /* === Native select controls ===
