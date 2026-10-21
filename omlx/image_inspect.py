@@ -9,7 +9,7 @@ import stat
 import struct
 from pathlib import Path
 
-from .image_bundle import MAX_METADATA, PIPELINE, SIDECAR, _pairs, read_json
+from .image_bundle import MAX_METADATA, PIPELINE, _pairs, bundle_contract, read_json
 
 RECIPE = "qwen-image-2.1-turbo-euler-8-v1"
 COMPONENTS = ("text_encoder", "transformer", "vae")
@@ -140,7 +140,7 @@ def inspect_bundle(path, verify_hashes=False):
             observed[path] = before
             return result
 
-        manifest = metadata(contained(root, SIDECAR))
+        manifest = bundle_contract(root, resolve=contained, metadata=metadata)
         if (
             type(manifest.get("schema_version")) is not int
             or manifest["schema_version"] != 1
