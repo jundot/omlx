@@ -34,11 +34,35 @@ class ImageRequest(BaseModel):
 
 
 async def _wait_for_disconnect(request):
-    # Await the ASGI message instead of polling is_disconnected(), whose
-    # immediately cancelled receive can miss disconnects under middleware.
-    while True:
-        if (await request.receive())["type"] == "http.disconnect":
-            return
+    from .. import server
+
+    event = asyncio.Event()
+    signal = getattr(request, "scope", {}).get(server._DISCONNECT_SIGNAL_SCOPE_KEY)
+
+    async def notify():
+        event.set()
+
+    token = signal.register(notify) if signal is not None else None
+
+    async def receive_disconnect():
+        while True:
+            if (await request.receive())["type"] == "http.disconnect":
+                event.set()
+                return
+
+    reader = asyncio.create_task(receive_disconnect())
+    waiter = asyncio.create_task(event.wait())
+    try:
+        await asyncio.wait({reader, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if reader.done():
+            await reader
+    finally:
+        if token is not None:
+            signal.unregister(token)
+        for task in (reader, waiter):
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await _drain(task)
 
 
 @router.post("/v1/images/generations")

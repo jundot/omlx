@@ -256,3 +256,29 @@ async def test_image_unload_does_not_reclaim_its_already_released_reservation(
     engine.stop.assert_awaited_once()
     pool._metal_sync_clear_cache.assert_awaited_once_with("image")
     assert pool._current_model_memory == 0 and entry.engine is None
+
+
+@pytest.mark.asyncio
+async def test_disconnect_seen_by_another_consumer_still_aborts_image_wait():
+    from omlx.api.image_routes import _wait_for_disconnect
+
+    signal = server._ClientDisconnectSignal()
+    waiting = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def receive():
+        waiting.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    request = SimpleNamespace(
+        scope={server._DISCONNECT_SIGNAL_SCOPE_KEY: signal}, receive=receive
+    )
+    task = asyncio.create_task(_wait_for_disconnect(request))
+    await waiting.wait()
+    signal.disconnect()
+    await asyncio.wait_for(task, 1)
+    assert closed.is_set()
+    assert not signal._callbacks
