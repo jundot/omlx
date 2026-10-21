@@ -121,13 +121,13 @@ final class ThroughputBenchScreenVM {
         if !singleResults.isEmpty {
             lines.append("# Single request results")
             lines.append(
-                ["Test", "TTFT(ms)", "TPOT(ms)", "ppTPS", "tgTPS",
+                ["Test", "TTFT(ms)", "TPOT(ms)", "PP TPS", "TG TPS",
                  "E2E(s)", "Throughput", "PeakMem"]
                     .joined(separator: "\t")
             )
             for r in singleResults {
                 lines.append([
-                    "pp \(r.pp ?? 0) / tg \(r.tg ?? 0)",
+                    "PP \(r.pp ?? 0) / TG \(r.tg ?? 0)",
                     format1(r.ttftMs),
                     format1(r.tpotMs),
                     format1(r.processingTps),
@@ -142,7 +142,7 @@ final class ThroughputBenchScreenVM {
         if !batchResults.isEmpty {
             lines.append("# Batch results")
             lines.append(
-                ["Batch", "tgTPS", "ppTPS", "avgTTFT(ms)", "E2E(s)", "Speedup"]
+                ["Batch", "TG TPS", "PP TPS", "avgTTFT(ms)", "E2E(s)", "Speedup"]
                     .joined(separator: "\t")
             )
             let baselineTps = batchBaseline?.genTps ?? 0
