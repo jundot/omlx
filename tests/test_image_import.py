@@ -183,7 +183,7 @@ class ImageImportTests(unittest.TestCase):
         code = "import omlx.image_inspect, sys; assert not any(x in sys.modules for x in ('mlx','torch','mflux','mlx_audio','mlx_vlm'))"
         subprocess.run([sys.executable, "-S", "-c", code], check=True, timeout=10)
 
-    def test_migration_is_atomic_and_preserves_existing_sidecar(self):
+    def test_migration_publishes_index_and_preserves_existing_metadata(self):
         from tools.migrate_image_bundle import migrate
 
         manifest = self.bundle()
@@ -213,10 +213,11 @@ class ImageImportTests(unittest.TestCase):
         write_json(self.root / "pipeline.json", legacy)
         before = (self.root / "vae/model.safetensors").read_bytes()
         migrate(self.root)
-        saved = (self.root / SIDECAR).read_bytes()
+        saved = (self.root / "model_index.json").read_bytes()
         with self.assertRaises(FileExistsError):
             migrate(self.root)
-        self.assertEqual(saved, (self.root / SIDECAR).read_bytes())
+        self.assertEqual(saved, (self.root / "model_index.json").read_bytes())
+        self.assertFalse((self.root / SIDECAR).exists())
         self.assertEqual(before, (self.root / "vae/model.safetensors").read_bytes())
         self.assertEqual(list(self.root.glob(".pipeline-*")), [])
         self.assertEqual(inspect_bundle(self.root)["structural_status"], "valid")
