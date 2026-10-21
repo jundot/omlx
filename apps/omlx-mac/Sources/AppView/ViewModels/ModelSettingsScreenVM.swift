@@ -472,6 +472,10 @@ final class ModelSettingsScreenVM {
         return type == "llm" || type == "vlm"
     }
 
+    var isImageGeneration: Bool { model?.isImageGeneration == true }
+    var showsChatProfiles: Bool { !isImageGeneration }
+    var showsAdvancedSection: Bool { !isImageGeneration }
+    var showsModelTypeOverride: Bool { model?.isGGUF != true && !isImageGeneration }
     var showsGenerationSection: Bool { isLLMLike }
 
     /// Embedding requests without max_length truncate input to the context window.
@@ -822,6 +826,7 @@ final class ModelSettingsScreenVM {
     }
 
     func save(_ field: Field, client: OMLXClient) async {
+        if isImageGeneration && field != .alias && field != .ttl { return }
         if isDiffusionModel && isDiffusionUnsupportedField(field) {
             return
         }

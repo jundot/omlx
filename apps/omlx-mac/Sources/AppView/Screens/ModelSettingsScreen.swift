@@ -41,7 +41,9 @@ struct ModelSettingsScreen: View {
                 backButton
             }
             ToolbarItem(placement: .primaryAction) {
-                SnapshotMenu(vm: vm, client: services.client)
+                if !vm.isImageGeneration {
+                    SnapshotMenu(vm: vm, client: services.client)
+                }
             }
         }
         .task(id: modelID) { await vm.load(modelID: modelID, client: services.client) }
@@ -921,9 +923,22 @@ private struct TopPage: View {
     let open: (ModelSettingsPage) -> Void
 
     var body: some View {
-        ListGroup {
-            pageRow(.profiles, symbol: "square.stack.3d.up.fill",
-                    gradient: SquircleGradient.models, isLast: true)
+        if vm.showsChatProfiles {
+            ListGroup {
+                pageRow(.profiles, symbol: "square.stack.3d.up.fill",
+                        gradient: SquircleGradient.models, isLast: true)
+            }
+        }
+        if vm.isImageGeneration {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(String(localized: "settings.image.title", defaultValue: "Image generation"))
+                    .font(.headline)
+                Text(String(localized: "settings.image.recipe", defaultValue: "One 1024 × 1024 PNG per request. Fixed eight-step Turbo recipe; optional seed for replay."))
+                Text("POST /v1/images/generations").font(.system(.body, design: .monospaced))
+                    .textSelection(.enabled)
+                Text(String(localized: "settings.image.lifecycle", defaultValue: "Uses the inference API key. One request at a time. Disconnecting cancels after current GPU work drains. Chat profiles and sampling settings do not apply."))
+            }
+            .padding(.vertical, 14)
         }
 
         BasicSection(vm: vm, client: client)
@@ -940,9 +955,11 @@ private struct TopPage: View {
                 pageRow(.memory, symbol: "memorychip.fill",
                         gradient: SquircleGradient.downloads)
             }
-            pageRow(.advanced, symbol: "gearshape.fill",
-                    gradient: SquircleGradient.server,
-                    isLast: !vm.showsEnginePages)
+            if vm.showsAdvancedSection {
+                pageRow(.advanced, symbol: "gearshape.fill",
+                        gradient: SquircleGradient.server,
+                        isLast: !vm.showsEnginePages)
+            }
             if vm.showsEnginePages {
                 pageRow(.experimental, symbol: "flask.fill",
                         gradient: SquircleGradient.quantization, isLast: true)
@@ -988,7 +1005,7 @@ private struct BasicSection: View {
                     .onSubmit { Task { await vm.save(.alias, client: client) } }
             }
             // A GGUF's type comes from its file.
-            if vm.model?.isGGUF != true {
+            if vm.showsModelTypeOverride {
                 Row(label: String(localized: "settings.basic.model_type.label",
                                   defaultValue: "Model Type",
                                   comment: "Row label for the model type override popup")) {

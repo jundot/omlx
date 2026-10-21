@@ -1,6 +1,39 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "settings.image.lifecycle": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Uses the inference API key. One request at a time. Disconnecting cancels after current GPU work drains. Chat profiles and sampling settings do not apply."
+          }
+        }
+      }
+    },
+    "settings.image.recipe": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "One 1024 × 1024 PNG per request. Fixed eight-step Turbo recipe; optional seed for replay."
+          }
+        }
+      }
+    },
+    "settings.image.title": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Image generation"
+          }
+        }
+      }
+    },
     "settings.button.reset_defaults" : {
       "localizations" : {
         "en" : {
