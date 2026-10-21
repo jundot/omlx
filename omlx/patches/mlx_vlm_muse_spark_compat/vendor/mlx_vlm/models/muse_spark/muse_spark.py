@@ -6,7 +6,15 @@ import mlx.nn as nn
 from omlx.patches.muse_spark.muse_spark_model import (
     cast_predicate,
     install_global_scales,
+    is_modelopt_export,
     sanitize_experts,
+    use_upstream_values,
+)
+from omlx.patches.muse_spark.upstream_layout import (
+    is_upstream_layout,
+    read_upstream_text,
+    read_upstream_vision,
+    upstream_key,
 )
 
 from ..base import InputEmbeddingsFeatures
@@ -96,6 +104,7 @@ class Model(nn.Module):
         return self.language_model.make_cache()
 
     def sanitize(self, weights):
+        upstream = is_upstream_layout(weights)
         sanitized = {}
         for key, value in weights.items():
             if key.startswith("model.audio_tower."):
@@ -107,9 +116,32 @@ class Model(nn.Module):
             elif key.startswith("model."):
                 key = key[len("model.") :]
             sanitized[key] = value
-        sanitized = sanitize_experts(sanitized)
-        install_global_scales(self, sanitized)
+        if upstream:
+            text, vision = self.config.text_config, self.config.vision_config
+            sanitized = read_upstream_text(
+                sanitized,
+                "language_model.model.layers.",
+                n_heads=text.num_attention_heads,
+                n_kv_heads=text.num_key_value_heads,
+                head_dim=text.head_dim,
+            )
+            sanitized = read_upstream_vision(
+                sanitized,
+                "vision_tower.layers.",
+                vision.hidden_size // vision.num_attention_heads,
+            )
+            use_upstream_values(self)
+        else:
+            sanitized = sanitize_experts(sanitized)
+        install_global_scales(
+            self, sanitized, is_modelopt_export(self.config.quantization_config)
+        )
         return sanitized
+
+    def quantization_path_aliases(self, path):
+        # Upstream-layout checkpoints key their per-module quantization by
+        # their own module paths.
+        return (upstream_key(path),)
 
     @property
     def cast_predicate(self):

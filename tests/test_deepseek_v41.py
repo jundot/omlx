@@ -128,7 +128,9 @@ def load_reference_weights(model, seed=341, scale=0.08, vision=False):
 def test_official_prefill_decode(expected, length):
     model = LanguageModel(tiny())
     load_reference_weights(model)
-    ids = np.random.default_rng(5).integers(3, 60, (1, length + 3), dtype=np.int32)
+    # Seed 16 keeps every act_quant(o) input at least 500 ulps from an FP8 rounding
+    # boundary (see fixtures/record_deepseek_v41_expected.py).
+    ids = np.random.default_rng(16).integers(3, 60, (1, length + 3), dtype=np.int32)
     cache = model.make_cache()
     actual = np.asarray(model(mx.array(ids[:, :length]), cache=cache))[:, -1]
     np.testing.assert_allclose(
@@ -1231,3 +1233,274 @@ def test_ced_chunked_continuity_and_decode_seam():
     on(full[:, 6:], cache=cb)
     solo = np.asarray(on(mx.array([[11]]), cache=cb))[:, -1]
     np.testing.assert_array_equal(decoded, solo)
+
+
+_PIPELINE_RANK = """
+import json
+import sys
+import time
+
+import mlx.core as mx
+import numpy as np
+
+group = mx.distributed.init(backend="ring", strict=True)
+sys.path.insert(0, sys.argv[1])
+import test_deepseek_v41 as t
+from omlx.cluster.planner import PipelineAssignment, install_unequal_pipeline_plan
+
+# Engram layer 3 opens rank 0's stage, which keeps its own n-gram history.
+config = t.tiny(**t._ENGRAM)
+assert config.pipeline_stage_starts() == (1, 3)
+
+def build():
+    model = t.LanguageModel(config)
+    t.load_reference_weights(model)
+    model.set_token_map(np.arange(64))
+    return model
+
+# Two rows, so each forward makes one handoff and gather per row.
+ids = np.random.default_rng(16).integers(3, 60, (2, 14), dtype=np.int32)
+steps = [ids[:, :9], ids[:, 9:12], ids[:, 12:13], ids[:, 13:14]]
+
+def run(model):
+    cache = model.make_cache()
+    outs = []
+    for chunk in steps:
+        outs.append(model(mx.array(chunk), cache=cache))
+        mx.eval(outs[-1])
+    return outs
+
+reference = run(build())
+model = build()
+if group.rank() == 1:
+    # Rank 0 waits past the Metal watchdog (a few seconds) for this stage.
+    time.sleep(8)
+plan = (
+    PipelineAssignment("a", 0, 3, 5, 1, 0, 0, 1),
+    PipelineAssignment("b", 1, 0, 3, 1, 0, 0, 1),
+)
+with install_unequal_pipeline_plan(plan):
+    model.pipeline(group)
+assert all(mx.array_equal(r, g).item() for r, g in zip(reference, run(model)))
+print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
+"""
+
+
+def run_two_ranks(tmp_path, script, *args):
+    """Run ``script`` as ranks 0 and 1 of a loopback ring; each prints ok."""
+    import json
+    import os
+    import socket
+    import subprocess
+
+    def free_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    hostfile = tmp_path / "ring.json"
+    hostfile.write_text(
+        json.dumps([[f"127.0.0.1:{free_port()}"], [f"127.0.0.1:{free_port()}"]])
+    )
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, *map(str, args)],
+            env=dict(os.environ, MLX_RANK=str(rank), MLX_HOSTFILE=str(hostfile)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for rank in (0, 1)
+    ]
+    outputs = []
+    for proc in procs:
+        try:
+            outputs.append(proc.communicate(timeout=300)[0])
+        except subprocess.TimeoutExpired:
+            for p in procs:
+                p.kill()
+            raise
+    for rank, (proc, out) in enumerate(zip(procs, outputs)):
+        assert proc.returncode == 0, f"rank {rank} failed:\n{out[-2000:]}"
+        assert '"ok": true' in out
+
+
+def test_pipelined_forward_matches_single_process(tmp_path):
+    run_two_ranks(tmp_path, _PIPELINE_RANK, Path(__file__).parent)
+
+
+_ENGRAM = dict(
+    engram_layer_ids=(1, 3),
+    engram_num_embeddings=(72, 204),
+    engram_vocab_size=5,
+    engram_max_ngram_size=4,
+    engram_n_heads=2,
+    engram_head_dim=32,
+    engram_compressed_vocab_size=64,
+)
+
+
+def test_cluster_stage_loads_only_its_text_weights(tmp_path):
+    from mlx.utils import tree_flatten
+
+    from omlx.cluster.planner import PipelineAssignment, install_unequal_pipeline_plan
+    from omlx.patches.deepseek_v41.convert import convert
+    from omlx.patches.deepseek_v41.loading import load
+    from omlx.patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
+
+    # Converted Engram tables live in their own file under unprefixed keys.
+    source, _ = write_checkpoint(tmp_path, **_ENGRAM)
+    target = tmp_path / "converted"
+    convert(source, target)
+    full, _ = load(target)
+    reference = dict(tree_flatten(full.parameters()))
+    full.close()
+
+    assert apply_deepseek_v41_mlx_lm_patch()
+    from mlx_lm.models import deepseek_v41
+
+    plan = (
+        PipelineAssignment("a", 0, 3, 5, 1, 0, 0, 1),
+        PipelineAssignment("b", 1, 0, 3, 1, 0, 0, 1),
+    )
+    with install_unequal_pipeline_plan(plan):
+        stage = deepseek_v41.load_pipeline_stage(
+            target, SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+        )
+    loaded = dict(tree_flatten(stage.parameters()))
+
+    assert stage.model.start_idx == 3
+    assert len(stage.make_cache()) == len(stage.layers) == 2
+    assert not any(
+        key.startswith(("vision", "aligner", "image_"))
+        or key.startswith(tuple(f"language_model.layers.{i}." for i in range(3)))
+        for key in loaded
+    )
+    assert any(key.startswith("language_model.layers.4.") for key in loaded)
+    assert all(
+        mx.array_equal(value, reference[key]).item() for key, value in loaded.items()
+    )
+    stage.close()
+
+
+def test_cluster_layout_of_converted_and_source_checkpoints(tmp_path, monkeypatch):
+    from omlx.cluster.catalogue import assess_model_path
+    from omlx.cluster.planner import NodeBudget, complete_model_layout
+    from omlx.patches.deepseek_v41.convert import convert
+
+    source, _ = write_checkpoint(tmp_path, **_ENGRAM)
+    target = tmp_path / "converted"
+    convert(source, target)
+    raw = complete_model_layout(source)
+    # The catalogue may run before anything registers the rank module.
+    monkeypatch.delitem(sys.modules, "mlx_lm.models.deepseek_v41", raising=False)
+    nodes = [
+        NodeBudget(node_id=n, capacity_bytes=1024**3, rank=i)
+        for i, n in enumerate("ab")
+    ]
+    fit = assess_model_path(target, nodes)
+    layout = complete_model_layout(target)
+
+    # Ranks load their part of converted shards only.
+    assert not raw.supports_pipeline and not raw.supports_tensor_parallel
+    assert fit.supports_pipeline and fit.supports_tensor_parallel
+    # The converter keeps the tables outside the index, in a file that holds
+    # other tensors too. Stages hold the tables; tensor ranks read them from SSD.
+    tables = mx.load(str(target / "engram" / "model.safetensors"))
+    expected = [0] * 5
+    for layer in (1, 3):
+        expected[layer] = tables[f"layers.{layer}.engram.embed.weight"].nbytes
+    assert list(layout.tensor_parallel_ssd_layer_bytes) == expected
+    assert all(
+        whole > part
+        for whole, part in zip(
+            layout.layer_weight_bytes, layout.tensor_parallel_ssd_layer_bytes
+        )
+    )
+
+
+# One rank of the tensor-parallel test below: the whole model, then this rank's
+# slice of it, read from the same converted checkpoint.
+_TENSOR_RANK = """
+import json
+import sys
+
+import mlx.core as mx
+import numpy as np
+
+group = mx.distributed.init(backend="ring", strict=True)
+from omlx.patches.deepseek_v41.loading import load
+
+ids = np.random.default_rng(16).integers(3, 60, (2, 14), dtype=np.int32)
+steps = [ids[:, :9], ids[:, 9:12], ids[:, 12:13], ids[:, 13:14]]
+
+def run(model):
+    cache = model.language_model.make_cache()
+    outs = []
+    for chunk in steps:
+        outs.append(model.language_model(mx.array(chunk), cache=cache))
+        mx.eval(outs[-1])
+    return outs
+
+full, _ = load(sys.argv[1])
+reference = run(full)
+full.close()
+model, _ = load(sys.argv[1], tensor=group, engram_ssd_offload=True)
+assert model.language_model.layers[0].attn.attn_sink.shape == (1,)
+for r, g in zip(reference, run(model)):
+    assert mx.allclose(r, g, atol=1e-3, rtol=1e-3).item(), mx.abs(r - g).max()
+print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
+"""
+
+
+def test_tensor_parallel_ranks_match_single_process(tmp_path):
+    import json
+
+    from omlx.patches.deepseek_v41.convert import convert
+
+    # Two heads, output groups and 32-wide quantization groups per split width.
+    source, _ = write_checkpoint(tmp_path, moe_inter_dim=64, o_lora_rank=32, **_ENGRAM)
+    target = tmp_path / "converted"
+    convert(source, target)
+    # Pack the split projections the way released checkpoints do.
+    shard = next(target.glob("model-*.safetensors"))
+    tensors = dict(mx.load(str(shard)))
+    config = json.loads((target / "config.json").read_text())
+    index = json.loads((target / "model.safetensors.index.json").read_text())
+    modules = config["omlx_deepseek_v41"].setdefault("quantized_modules", {})
+    for key in [k for k in tensors if k.endswith(".weight")]:
+        name = key.removesuffix(".weight")
+        if not name.endswith(
+            ("attn.wq_b", "attn.wo_b", "experts.w1", "experts.w2", "experts.w3")
+        ):
+            continue
+        mode = "mxfp4" if ".ffn.experts." in key else "affine"
+        packed = mx.quantize(tensors[key], group_size=32, bits=4, mode=mode)
+        for suffix, value in zip((".weight", ".scales", ".biases"), packed):
+            tensors[name + suffix] = value
+            index["weight_map"][name + suffix] = shard.name
+        modules[name] = {"bits": 4, "mode": mode, "group_size": 32}
+    mx.eval(list(tensors.values()))
+    mx.save_safetensors(str(shard), tensors, metadata={"format": "mlx"})
+    (target / "config.json").write_text(json.dumps(config))
+    (target / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    run_two_ranks(tmp_path, _TENSOR_RANK, target)
+
+
+def test_mlx_lm_tokenizer_gets_the_v41_protocol(tmp_path):
+    from mlx_lm.utils import load_tokenizer
+
+    from omlx.patches.deepseek_v41.processing import install_tokenizer_protocol
+
+    source, model = write_checkpoint(tmp_path)
+    config = {"model_type": "deepseek_v41", "text_config": asdict(model.config)}
+    tokenizer = load_tokenizer(source)
+    install_tokenizer_protocol(tokenizer, config)
+    messages = [{"role": "user", "content": "hello"}]
+
+    assert tokenizer.has_chat_template and tokenizer.has_tool_calling
+    assert tokenizer.tool_call_start == "<｜DSML｜ calls>"
+    assert tokenizer.apply_chat_template(
+        messages, tokenize=False, enable_thinking=False
+    ) == encode_messages(messages, thinking_mode="chat")

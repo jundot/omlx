@@ -78,6 +78,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var qwen35OqA8Supported: Bool? = nil
     /// "hf_cache" for models found in the shared Hugging Face Hub cache.
     var sourceType: String? = nil
+    /// "gguf" for a GGUF file, which only an external engine serves.
+    var modelFormat: String? = nil
     /// True for builtin virtual entries (e.g. the MarkItDown document
     /// converter) that have no real load/unload lifecycle.
     let virtual: Bool?
@@ -95,6 +97,7 @@ extension ModelDTO {
     }
 
     var isInHFCache: Bool { sourceType == "hf_cache" }
+    var isGGUF: Bool { modelFormat == "gguf" }
 }
 
 /// One entry of `external_engines` in GET /admin/api/models.
@@ -103,6 +106,8 @@ struct ExternalEngineOption: Codable, Equatable, Sendable, Identifiable {
     let label: String
     let compatible: Bool
     let reason: String?
+    /// Hugging Face repo of the draft the engine lacks, when one provides it.
+    var draftRepo: String? = nil
 }
 
 struct ModelSettingsDTO: Codable, Equatable, Sendable {
@@ -149,6 +154,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     var moeExpertOffloadResidentFraction: Double? = nil
     // Experimental: TurboQuant KV cache
     let turboquantKvEnabled: Bool?
+    let turboquantKvScheme: String?
     let turboquantKvBits: Double?
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillSharedFraction: Double? = nil
@@ -233,6 +239,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var forcedCtKwargs: [String]? = nil
     // Experimental: TurboQuant KV
     var turboquantKvEnabled: Bool? = nil
+    var turboquantKvScheme: String? = nil
     var turboquantKvBits: Double? = nil
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
     var qwen35AnePrefillSharedFraction: Double? = nil

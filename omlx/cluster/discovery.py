@@ -585,9 +585,17 @@ def decode_hello(data: bytes) -> tuple[int, int] | None:
     return nonce, cluster_hash
 
 
-def encode_wassup(nonce: int, node_id: str, http_port: int) -> bytes:
+def encode_wassup(
+    nonce: int, node_id: str, http_port: int, loopback_only: bool = False
+) -> bytes:
+    # Older decoders ignore keys they do not know.
     payload = json.dumps(
-        {"nonce": nonce, "node_id": node_id, "http_port": int(http_port)},
+        {
+            "nonce": nonce,
+            "node_id": node_id,
+            "http_port": int(http_port),
+            "loopback_only": bool(loopback_only),
+        },
         separators=(",", ":"),
     ).encode("utf-8")
     return _WASSUP_MAGIC + payload
@@ -613,7 +621,12 @@ def decode_wassup(data: bytes) -> dict[str, Any] | None:
         return None
     if not isinstance(http_port, int) or not 1 <= http_port <= 65535:
         return None
-    return {"nonce": nonce, "node_id": node_id, "http_port": http_port}
+    return {
+        "nonce": nonce,
+        "node_id": node_id,
+        "http_port": http_port,
+        "loopback_only": payload.get("loopback_only") is True,
+    }
 
 
 @dataclass
@@ -623,6 +636,8 @@ class PeerCaps:
     backends: list[str] = field(default_factory=list)
     thunderbolt: bool = False
     jaccl: bool = False
+    # The HTTP server binds only loopback, so peers cannot reach it.
+    loopback_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -631,6 +646,7 @@ class PeerCaps:
             "backends": list(self.backends),
             "thunderbolt": self.thunderbolt,
             "jaccl": self.jaccl,
+            "loopback_only": self.loopback_only,
         }
 
     @classmethod
@@ -646,6 +662,7 @@ class PeerCaps:
             else [],
             thunderbolt=bool(payload.get("thunderbolt")),
             jaccl=bool(payload.get("jaccl")),
+            loopback_only=bool(payload.get("loopback_only")),
         )
 
 
@@ -1636,7 +1653,12 @@ class DiscoveryService:
         # link-local HELLO source requires the ingress interface as scope id
         # in the reply destination; without it the kernel has no route and
         # the handshake silently never completes.
-        reply = encode_wassup(nonce, self.identity.node_id, self.config.http_port)
+        reply = encode_wassup(
+            nonce,
+            self.identity.node_id,
+            self.config.http_port,
+            self.config.caps.loopback_only,
+        )
         target_sock = sock if sock is not None else self._socket
         if target_sock is not None:
             target = (
@@ -1671,6 +1693,7 @@ class DiscoveryService:
                 peer = PeerRecord(node_id=node_id)
                 self._peers[node_id] = peer
             peer.http_port = payload["http_port"]
+            peer.caps.loopback_only = payload.get("loopback_only") is True
             peer.last_seen = now
             if peer.state == "dead":
                 peer.state = "discovered"

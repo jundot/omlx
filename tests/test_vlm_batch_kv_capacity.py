@@ -11,6 +11,16 @@ from mlx_vlm.models import cache as vlm_cache
 
 import omlx.scheduler  # noqa: F401
 from omlx.cache.type_handlers import KVCacheHandler
+from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+    apply_mlx_vlm_qwen4_exp_compat_patch,
+)
+
+apply_mlx_vlm_qwen4_exp_compat_patch()
+
+# qwen4_exp carries its own BatchKVCache; importing its language module puts
+# that class on the same capacity methods.
+from mlx_vlm.models.qwen4_exp import cache as qwen4_cache  # noqa: E402
+from mlx_vlm.models.qwen4_exp import language as _qwen4_language  # noqa: E402
 
 
 def pristine(module):
@@ -21,7 +31,9 @@ def pristine(module):
     return stock
 
 
-@pytest.fixture(params=[vlm_cache, lm_cache], ids=["vlm", "lm-restored"])
+@pytest.fixture(
+    params=[vlm_cache, lm_cache, qwen4_cache], ids=["vlm", "lm-restored", "qwen4_exp"]
+)
 def backend(request):
     return pristine(request.param), request.param
 
@@ -136,7 +148,7 @@ def test_merge_reserves_append_without_changing_logical_width(backend):
         c.update_and_fetch(x, x)
         assert c.keys.shape[2] == capacity
     row = c.extract(0)
-    if patched is vlm_cache:
+    if patched is not lm_cache:
         assert row.keys.shape[2] > row.offset
     else:
         assert row.keys.shape[2] == row.offset
@@ -192,3 +204,24 @@ def test_cold_and_restored_backends_can_share_a_batch(backend):
     for c in (a, b):
         c.update_and_fetch(x, x / 4)
     equal(a, b)
+
+
+def test_qwen4_qsa_batch_decode_appends_in_place():
+    rows = []
+    for row, length in enumerate([600, 550]):
+        c = _qwen4_language.QSAKVCache()
+        x = mx.full((1, 1, length, 8), row + 1, mx.bfloat16)
+        c.update_and_fetch(x, x / 4)
+        c.update_indexer(
+            mx.ones((1, length, 4), mx.bfloat16),
+            mx.arange(length, dtype=mx.int32)[None],
+        )
+        rows.append(c)
+    batch = _qwen4_language.BatchQSAKVCache.merge(rows)
+    capacity = batch.keys.shape[2]
+    # 400 tokens cross a 256-column step, where the stock class concatenates.
+    for step in range(100):
+        x = mx.full((2, 1, 4, 8), step, mx.bfloat16)
+        keys, _ = batch.update_and_fetch(x, x / 4)
+        assert keys.shape[2] == 600 + 4 * (step + 1)
+        assert batch.keys.shape[2] == capacity

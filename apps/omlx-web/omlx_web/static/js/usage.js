@@ -74,7 +74,16 @@ function usageHistory() {
         shade(tokens) {
             return tokens ? `rgb(var(--palette-green-600) / ${0.2 + 0.8 * Math.sqrt(tokens / this.peak)})` : 'rgb(var(--palette-mid-gray) / 0.12)';
         },
-        number(value) { return new Intl.NumberFormat(usageLocale(), {notation: 'compact', maximumFractionDigits: 1}).format(value || 0); },
+        number(value) {
+            const locale = usageLocale();
+            // statsNumberScale lives in the parent dashboard() scope.
+            if (this.statsNumberScale === 'exact') {
+                return window.omlxCount.exact(value, locale);
+            }
+            const compact = window.omlxCount?.eastAsian?.(value, locale);
+            if (compact != null) return compact;
+            return new Intl.NumberFormat(locale, {notation: 'compact', maximumFractionDigits: 1}).format(value || 0);
+        },
         speed(value) { return value == null ? '—' : value.toFixed(1); },
     };
 }

@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import re
 import struct
 import subprocess
+import sys
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -16,6 +18,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
+from ..model_discovery import _VISION_WEIGHT_PREFIXES
 from .node_role import ROLES
 from .performance import ExecutionProfileName, NodePerformanceProfile
 from .staging import DEFAULT_REMOTE_PYTHON, is_local_host, run_remote_python
@@ -113,6 +116,12 @@ class ModelLayout:
     # Whether mlx-lm can split this architecture into pipeline stages. False
     # means the model runs on one node or not at all, however well it fits.
     supports_pipeline: bool = False
+    # Layers a later stage may start at, for architectures whose layers read
+    # state that an earlier layer keeps in its own cache. Empty means any.
+    pipeline_stage_starts: tuple[int, ...] = ()
+    # Per-layer bytes a tensor-parallel rank reads from SSD instead of holding
+    # (DeepSeek V4.1 Engram tables). Pipeline stages hold them. Empty means 0.
+    tensor_parallel_ssd_layer_bytes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.fixed_weight_bytes < 0:
@@ -154,6 +163,20 @@ class ModelLayout:
             )
         if any(value < 1 for value in self.tensor_parallel_divisors):
             raise ValueError("tensor_parallel_divisors must be positive")
+        starts = self.pipeline_stage_starts
+        if list(starts) != sorted(set(starts)) or any(
+            not 0 < start < len(self.layer_weight_bytes) for start in starts
+        ):
+            raise ValueError("pipeline_stage_starts must be increasing inner layers")
+        ssd = self.tensor_parallel_ssd_layer_bytes
+        if ssd and (
+            len(ssd) != len(self.layer_weight_bytes)
+            or any(
+                not 0 <= part <= whole
+                for part, whole in zip(ssd, self.layer_weight_bytes)
+            )
+        ):
+            raise ValueError("tensor_parallel_ssd_layer_bytes must fit each layer")
 
     @property
     def layer_count(self) -> int:
@@ -163,8 +186,15 @@ class ModelLayout:
     def total_weight_bytes(self) -> int:
         return self.fixed_weight_bytes + sum(self.layer_weight_bytes)
 
+    @property
+    def tensor_parallel_layer_bytes(self) -> tuple[int, ...]:
+        """Per-layer bytes a tensor-parallel group holds in memory."""
+
+        ssd = self.tensor_parallel_ssd_layer_bytes or (0,) * self.layer_count
+        return tuple(whole - part for whole, part in zip(self.layer_weight_bytes, ssd))
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "source": self.source,
             "tensor_count": self.tensor_count,
             "layer_count": self.layer_count,
@@ -180,6 +210,14 @@ class ModelLayout:
             "kv_bytes_per_token_per_layer": self.kv_bytes_per_token_per_layer,
             "kv_replicated_across_tp": self.kv_replicated_across_tp,
         }
+        # Omitted when unrestricted so existing plan hashes stay the same.
+        if self.pipeline_stage_starts:
+            payload["pipeline_stage_starts"] = list(self.pipeline_stage_starts)
+        if any(self.tensor_parallel_ssd_layer_bytes):
+            payload["tensor_parallel_ssd_layer_bytes"] = list(
+                self.tensor_parallel_ssd_layer_bytes
+            )
+        return payload
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> ModelLayout:
@@ -223,6 +261,13 @@ class ModelLayout:
                     payload.get("supports_tensor_parallel", False)
                 ),
                 supports_pipeline=bool(payload.get("supports_pipeline", False)),
+                pipeline_stage_starts=tuple(
+                    int(value) for value in payload.get("pipeline_stage_starts", ())
+                ),
+                tensor_parallel_ssd_layer_bytes=tuple(
+                    int(value)
+                    for value in payload.get("tensor_parallel_ssd_layer_bytes", ())
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise PlanningError(f"model layout is malformed: {exc}") from exc
@@ -622,15 +667,40 @@ def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     if not model_type.replace("_", "").isalnum():
         return False
     try:
-        import importlib
-
         module = importlib.import_module(f"mlx_lm.models.{model_type}")
         model_class = getattr(module, "Model", None)
         shard = getattr(model_class, "shard", None)
     except (ImportError, AttributeError):
         return False
+    # A module oMLX registers for its own checkpoint format loads the slice.
+    if callable(getattr(module, "load_tensor_shard", None)):
+        return True
     supported, _reason = native_shard_is_layer_local(shard)
     return supported
+
+
+def _mlx_lm_accepts_config(config: dict[str, Any]) -> bool:
+    """Whether the mlx-lm model a rank builds accepts this checkpoint's config.
+
+    A module can implement pipelining and still refuse the checkpoint: the
+    mlx-lm ``deepseek_v41`` raises for Engram layers, which V4.1-Flash has.
+    """
+
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str) or not model_type.replace("_", "").isalnum():
+        return False
+    try:
+        module = importlib.import_module(f"mlx_lm.models.{model_type}")
+    except ImportError:
+        return False
+    from_dict = getattr(getattr(module, "ModelArgs", None), "from_dict", None)
+    if from_dict is None:
+        return True
+    try:
+        from_dict(config)
+    except (AssertionError, KeyError, TypeError, ValueError):
+        return False
+    return True
 
 
 def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
@@ -640,6 +710,8 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     kv_heads = _config_int(config, "num_key_value_heads", heads)
     values = [heads, kv_heads]
     model_type = config.get("model_type")
+    if model_type == "deepseek_v41":
+        return _deepseek_v41_tensor_divisors(config, heads)
     if model_type in {"qwen3_next", "qwen3_next_moe", "qwen3_5", "qwen3_5_moe"}:
         values.extend(
             (
@@ -647,6 +719,14 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
                 _config_int(config, "linear_num_value_heads", 1),
             )
         )
+    if model_type == "glm5_next":
+        # KDA heads, read the way the model's TextConfig reads them.
+        linear_heads = _config_int(config, "linear_num_heads", 64)
+        text = config.get("text_config")
+        linear = text.get("linear_attn_config") if isinstance(text, dict) else None
+        if isinstance(linear, dict):
+            linear_heads = _config_int(linear, "num_heads", linear_heads)
+        values.append(linear_heads)
     if model_type == "nemotron_h":
         values.extend(
             (
@@ -698,6 +778,33 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     return tuple(dict.fromkeys(values))
 
 
+def _deepseek_v41_tensor_divisors(
+    config: dict[str, Any], heads: int
+) -> tuple[int, ...]:
+    """DeepSeek V4.1 splits heads, output groups and expert neurons.
+
+    The single KV head is shared and stays whole. The column-split projections
+    (``wo_b`` and expert ``w2``) need whole quantization groups on each rank.
+    """
+
+    groups = _config_int(config, "o_groups", 1)
+    widths = {
+        "attn.wo_b": groups * _config_int(config, "o_lora_rank", 1),
+        "experts.w2": _config_int(
+            config, "moe_intermediate_size", 1, maximum=1_000_000
+        ),
+    }
+    values = [heads, groups]
+    spec = config.get("omlx_deepseek_v41")
+    modules = spec.get("quantized_modules") if isinstance(spec, dict) else None
+    for name, entry in (modules or {}).items():
+        width = next((w for k, w in widths.items() if name.endswith(k)), 0)
+        group_size = entry.get("group_size", 32) if isinstance(entry, dict) else 0
+        if width and group_size and width % group_size == 0:
+            values.append(width // group_size)
+    return tuple(dict.fromkeys(values))
+
+
 def _model_source(model_type: str) -> str:
     """Source of the mlx-lm module for this model type, or "".
 
@@ -730,6 +837,32 @@ def _model_source(model_type: str) -> str:
         except OSError:
             continue
     return ""
+
+
+def _cluster_unloaded_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
+    """Weight prefixes an oMLX-registered rank module never loads."""
+
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str):
+        return ()
+    prefixes = getattr(
+        sys.modules.get(f"mlx_lm.models.{model_type}"),
+        "CLUSTER_UNLOADED_WEIGHT_PREFIXES",
+        (),
+    )
+    return tuple(prefixes)
+
+
+def _pipeline_stage_starts(config: dict[str, Any]) -> tuple[int, ...]:
+    """Layers a later stage may start at, when the model's module restricts them."""
+
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str):
+        return ()
+    starts = getattr(
+        sys.modules.get(f"mlx_lm.models.{model_type}"), "pipeline_stage_starts", None
+    )
+    return tuple(starts(config)) if callable(starts) else ()
 
 
 def _supports_pipeline(config: dict[str, Any]) -> bool:
@@ -992,7 +1125,21 @@ def _bounded_json_object(path: Path, *, limit: int) -> dict[str, Any]:
     return value
 
 
-def _model_weight_files(model_path: Path) -> tuple[Path, ...]:
+def _weight_file(root: Path, name: str) -> Path:
+    relative = Path(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise PlanningError(f"weight file escapes model directory: {name}")
+    candidate = root / relative
+    if not candidate.is_file():
+        raise PlanningError(f"weight file is missing: {name}")
+    return candidate
+
+
+def _model_weight_files(
+    model_path: Path, side_files: Sequence[str] = ()
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """The weight files the index lists, and those of ``side_files`` it does not."""
+
     index_path = model_path / "model.safetensors.index.json"
     names: set[str] = set()
     if index_path.is_file():
@@ -1018,18 +1165,36 @@ def _model_weight_files(model_path: Path) -> tuple[Path, ...]:
         names = {path.name for path in model_path.glob("*.safetensors")}
 
     root = model_path.resolve()
-    files: list[Path] = []
-    for name in sorted(names):
-        relative = Path(name)
-        if relative.is_absolute() or ".." in relative.parts:
-            raise PlanningError(f"weight file escapes model directory: {name}")
-        candidate = root / relative
-        if not candidate.is_file():
-            raise PlanningError(f"weight file is missing: {name}")
-        files.append(candidate)
+    files = tuple(_weight_file(root, name) for name in sorted(names))
     if not files:
         raise PlanningError(f"no safetensors weights found in {model_path}")
-    return tuple(files)
+    side = tuple(_weight_file(root, name) for name in sorted(set(side_files) - names))
+    return files, side
+
+
+def _engram_tables(config: dict[str, Any]) -> tuple[frozenset[str], tuple[str, ...]]:
+    """DeepSeek V4.1 Engram table tensors and the files that hold them.
+
+    oMLX's converter writes the tables to their own file, outside the index.
+    """
+
+    spec = config.get("omlx_deepseek_v41")
+    tables = spec.get("engram_tables") if isinstance(spec, dict) else None
+    names: set[str] = set()
+    files: set[str] = set()
+    for table in (tables or {}).values():
+        if not isinstance(table, dict):
+            continue
+        for key, into in (
+            ("weight_key", names),
+            ("scale_key", names),
+            ("bias_key", names),
+            ("weight_file", files),
+            ("scale_file", files),
+        ):
+            if isinstance(table.get(key), str):
+                into.add(table[key])
+    return frozenset(names), tuple(sorted(files))
 
 
 def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
@@ -1041,13 +1206,20 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
 
     fixed_bytes = 0
     layer_sizes: dict[int, int] = {}
+    ssd_sizes: dict[int, int] = {}
     tensor_names: set[str] = set()
     tensor_count = 0
-    for weight_file in _model_weight_files(root):
+    config = _model_config(root)
+    unloaded = _VISION_WEIGHT_PREFIXES + _cluster_unloaded_prefixes(config)
+    engram_names, engram_files = _engram_tables(config)
+    weight_files, table_files = _model_weight_files(root, engram_files)
+    for weight_file in (*weight_files, *table_files):
+        # A table file outside the index may hold other source tensors too.
+        tables_only = weight_file in table_files
         header, payload_bytes = _safetensors_header(weight_file)
         intervals: list[tuple[int, int, str]] = []
         for name, spec in header.items():
-            if name == "__metadata__":
+            if name == "__metadata__" or (tables_only and name not in engram_names):
                 continue
             if name in tensor_names:
                 raise PlanningError(f"duplicate tensor name: {name}")
@@ -1069,6 +1241,10 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                 raise PlanningError(f"invalid data offsets for tensor {name}")
             if offsets[1] > offsets[0]:
                 intervals.append((offsets[0], offsets[1], name))
+            if name.startswith(unloaded):
+                # Ranks never load these, and vision_tower.blocks.N would
+                # otherwise be charged to decoder layer N.
+                continue
             tensor_bytes = offsets[1] - offsets[0]
             layer_index = _tensor_layer_index(name)
             if layer_index is None:
@@ -1077,6 +1253,10 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
                 layer_sizes[layer_index] = (
                     layer_sizes.get(layer_index, 0) + tensor_bytes
                 )
+                if name in engram_names:
+                    ssd_sizes[layer_index] = (
+                        ssd_sizes.get(layer_index, 0) + tensor_bytes
+                    )
             tensor_count += 1
         intervals.sort()
         for previous, current in zip(intervals, intervals[1:]):
@@ -1095,7 +1275,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
     # the runtime model never instantiates them. Counting them as decoder
     # layers put a stage boundary over weights that do not exist at runtime,
     # and the last stage failed activation with end_layer beyond the model.
-    declared_depth = _config_int(_model_config(root), "num_hidden_layers", 0)
+    declared_depth = _config_int(config, "num_hidden_layers", 0)
     if declared_depth > 0 and max(layer_sizes) >= declared_depth:
         trimmed = {
             index: size for index, size in layer_sizes.items() if index < declared_depth
@@ -1112,6 +1292,7 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         raise PlanningError(
             "safetensors layer indices must be contiguous and start at zero"
         )
+    loadable = _mlx_lm_accepts_config(config)
     return ModelLayout(
         source=str(root.resolve()),
         fixed_weight_bytes=fixed_bytes,
@@ -1119,14 +1300,18 @@ def inspect_safetensors_layout(model_path: str | Path) -> ModelLayout:
         tensor_count=tensor_count,
         activation_bytes_per_token=_activation_bytes_per_token(root),
         tensor_parallel_heads=_attention_head_count(root),
-        tensor_parallel_kv_heads=_config_int(
-            _model_config(root), "num_key_value_heads", 0
+        tensor_parallel_kv_heads=_config_int(config, "num_key_value_heads", 0),
+        tensor_parallel_divisors=_tensor_parallel_divisors(config),
+        supports_tensor_parallel=(loadable and _supports_tensor_parallel(config)),
+        supports_pipeline=loadable and _supports_pipeline(config),
+        pipeline_stage_starts=_pipeline_stage_starts(config) if loadable else (),
+        kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(config),
+        kv_replicated_across_tp=_kv_cache_replicated_across_tp(config),
+        tensor_parallel_ssd_layer_bytes=(
+            tuple(ssd_sizes.get(index, 0) for index in expected_indices)
+            if ssd_sizes
+            else ()
         ),
-        tensor_parallel_divisors=_tensor_parallel_divisors(_model_config(root)),
-        supports_tensor_parallel=_supports_tensor_parallel(_model_config(root)),
-        supports_pipeline=_supports_pipeline(_model_config(root)),
-        kv_bytes_per_token_per_layer=_kv_bytes_per_token_per_layer(_model_config(root)),
-        kv_replicated_across_tp=_kv_cache_replicated_across_tp(_model_config(root)),
     )
 
 
@@ -1312,6 +1497,7 @@ def _partition_layers(
     activation_bytes_per_token: int = 0,
     workload_profile: ExecutionProfileName = "balanced",
     microbatch_size: int = 1,
+    stage_starts: Sequence[int] = (),
 ) -> tuple[tuple[int, int], ...]:
     """Minimize the bottleneck stage while retaining contiguous layers.
 
@@ -1344,6 +1530,7 @@ def _partition_layers(
         weight_prefix.append(weight_prefix[-1] + weight_size)
         resident_prefix.append(resident_prefix[-1] + resident_size)
 
+    allowed_starts = frozenset(stage_starts)
     performance_aware = all(node.performance is not None for node in pipeline_nodes)
     target_aware = any(node.target_weight_bytes > 0 for node in pipeline_nodes)
     # State value: (lexicographic score, cuts). The no-profile score is kept
@@ -1363,6 +1550,8 @@ def _partition_layers(
         for previous_end, (previous_score, cuts) in states.items():
             start = previous_end
             for end in range(max(start + 1, minimum_end), maximum_end + 1):
+                if stage_starts and end < layer_count and end not in allowed_starts:
+                    continue
                 layer_bytes = weight_prefix[end] - weight_prefix[start]
                 resident_layer_bytes = resident_prefix[end] - resident_prefix[start]
                 planned_weight_bytes = fixed_weight_bytes + layer_bytes
@@ -1532,6 +1721,7 @@ def plan_unequal_pipeline(
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
+            stage_starts=model.pipeline_stage_starts,
         )
     except PlanningError as exc:
         if kv_bytes_per_layer:
@@ -1629,6 +1819,14 @@ def plan_proportional_pipeline(
     for count in counts:
         ranges.append((start, start + count))
         start += count
+    if model.pipeline_stage_starts and any(
+        range_start not in model.pipeline_stage_starts for range_start, _ in ranges[1:]
+    ):
+        raise PlanningError(
+            "this model can start a pipeline stage only at layers "
+            f"{', '.join(map(str, model.pipeline_stage_starts))}; plan with the "
+            "balanced allocator"
+        )
     for node, (range_start, range_end) in zip(pipeline_nodes, ranges):
         layer_weight = sum(model.layer_weight_bytes[range_start:range_end])
         if model.fixed_weight_bytes + layer_weight > node.weight_ceiling_bytes:
@@ -2088,18 +2286,19 @@ def plan_hybrid(
     kv_bytes_per_layer = _kv_bytes_for_stage(model, 1, context_tokens)
     if model.kv_replicated_across_tp:
         kv_bytes_per_layer *= tensor_parallel_size
+    layer_bytes = model.tensor_parallel_layer_bytes
     try:
         ranges = _partition_layers(
-            model.layer_weight_bytes,
+            layer_bytes,
             stage_budgets,
             fixed_weight_bytes=model.fixed_weight_bytes,
             layer_resident_sizes=tuple(
-                weight_bytes + kv_bytes_per_layer
-                for weight_bytes in model.layer_weight_bytes
+                weight_bytes + kv_bytes_per_layer for weight_bytes in layer_bytes
             ),
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
+            stage_starts=model.pipeline_stage_starts,
         )
     except PlanningError as exc:
         if kv_bytes_per_layer:
@@ -2113,7 +2312,7 @@ def plan_hybrid(
     assignments: list[PipelineAssignment] = []
     for stage, group in enumerate(stage_groups):
         start, end = stage_ranges[stage]
-        stage_layer_bytes = sum(model.layer_weight_bytes[start:end])
+        stage_layer_bytes = sum(layer_bytes[start:end])
         # The stage's layer weights are split across its TP members; the first
         # `remainder` ranks carry one extra byte so the parts sum exactly.
         per_member = stage_layer_bytes // tensor_parallel_size

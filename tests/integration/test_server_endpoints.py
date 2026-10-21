@@ -992,6 +992,30 @@ class TestCompletionEndpoint:
         data = response.json()
         assert "choices" in data
 
+    @pytest.mark.parametrize(
+        "prompt", ["Only prompt", ["First prompt", "Second prompt"]]
+    )
+    def test_completion_request_id_header(self, client, mock_llm_engine, prompt):
+        """The header names the engine request; a list prompt has no single one."""
+        mock_llm_engine.generate = AsyncMock(
+            return_value=MockGenerationOutput(text="Generated response.")
+        )
+
+        response = client.post(
+            "/v1/completions", json={"model": "test-model", "prompt": prompt}
+        )
+
+        assert response.status_code == 200
+        ids = [
+            call.kwargs.get("_request_id")
+            for call in mock_llm_engine.generate.call_args_list
+        ]
+        if isinstance(prompt, list):
+            assert ids == [None, None]
+            assert "x-omlx-request-id" not in response.headers
+        else:
+            assert ids == [response.headers["x-omlx-request-id"]]
+
     def test_completion_includes_cached_tokens_on_cache_hit(
         self, client, mock_llm_engine
     ):

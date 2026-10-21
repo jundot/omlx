@@ -6175,6 +6175,30 @@
         }
       }
     },
+    "downloads.card.cancel" : {
+      "comment" : "Button in the model card sheet that closes it without downloading",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cancel"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отмена"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "取消"
+          }
+        }
+      }
+    },
     "downloads.card.close" : {
       "comment" : "Tooltip on the model card sheet's close button",
       "extractionState" : "manual",
@@ -6219,6 +6243,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "下载"
+          }
+        }
+      }
+    },
+    "downloads.card.download_all" : {
+      "comment" : "Button in the model card sheet that downloads every file of the repo",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download All"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скачать всё"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全部下载"
+          }
+        }
+      }
+    },
+    "downloads.card.download_selected" : {
+      "comment" : "Primary button in the model card sheet that downloads the files checked in the Files tab",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download Selected"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скачать выбранное"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "下载所选文件"
           }
         }
       }
@@ -6271,6 +6343,30 @@
         }
       }
     },
+    "downloads.card.files.downloaded" : {
+      "comment" : "Marker on a file in the model card's Files tab that is already in the model folder",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloaded"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скачано"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已下载"
+          }
+        }
+      }
+    },
     "downloads.card.files.empty" : {
       "comment" : "Empty state in the Files tab when the upstream API doesn't list any files",
       "extractionState" : "manual",
@@ -6291,6 +6387,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "无文件报告。"
+          }
+        }
+      }
+    },
+    "downloads.card.files.hint.checkpoint" : {
+      "comment" : "Hint above the Files tab of a safetensors repo",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Files the model needs stay checked. Uncheck the extras you do not want."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Файлы, нужные модели, остаются отмеченными. Снимите отметку с ненужных дополнительных файлов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型所需的文件始终保持勾选。取消勾选不需要的其他文件。"
+          }
+        }
+      }
+    },
+    "downloads.card.files.hint.gguf" : {
+      "comment" : "Hint above the Files tab of a GGUF repo",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Check the GGUF files to download. A GGUF brings its vision projector with it."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отметьте GGUF-файлы для скачивания. Вместе с GGUF отмечается его визуальный проектор."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "勾选要下载的 GGUF 文件。选择 GGUF 时会一并勾选其视觉投影器。"
+          }
+        }
+      }
+    },
+    "downloads.card.files.required" : {
+      "comment" : "Marker on a file in the model card's Files tab that the model cannot load without",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Required"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обязательный"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "必需"
           }
         }
       }
@@ -6339,6 +6507,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "这是一个 LoRA 适配器。它需要兼容的基座模型才能运行 — 单独下载无法在 oMLX 中加载。"
+          }
+        }
+      }
+    },
+    "downloads.card.not_enough_space" : {
+      "comment" : "Warning beside the download buttons when the selection does not fit on disk",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Not enough free space in the model folder"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Недостаточно места в папке моделей"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型文件夹可用空间不足"
           }
         }
       }
@@ -6483,6 +6675,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在 %@ 上查看"
+          }
+        }
+      }
+    },
+    "downloads.format.all" : {
+      "comment" : "Downloader filter option: show repos of every format",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "All formats"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Все форматы"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "所有格式"
+          }
+        }
+      }
+    },
+    "downloads.format.gguf" : {
+      "comment" : "Downloader filter option: show GGUF repos only",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GGUF only"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Только GGUF"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅 GGUF"
+          }
+        }
+      }
+    },
+    "downloads.format.mlx" : {
+      "comment" : "Downloader filter option: show MLX repos only",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MLX only"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Только MLX"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅 MLX"
           }
         }
       }
@@ -6699,6 +6963,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%1$lld%% · %2$@ / %3$@"
+          }
+        }
+      }
+    },
+    "downloads.progress.eta" : {
+      "comment" : "Remaining download time after the progress line. Placeholder: duration such as 2h 30m",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%@ left"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "осталось %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "剩余 %@"
           }
         }
       }
@@ -10146,25 +10434,25 @@
       }
     },
     "menubar.stats.no_api_key" : {
-      "comment" : "Disabled placeholder in the Serving Stats submenu when no API key is configured",
+      "comment" : "Disabled placeholder in the All-Time section of the Serving Stats submenu when no API key is configured",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Set OMLX_API_KEY to enable stats"
+            "value" : "Set an API key in the Security screen to enable stats"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Задайте OMLX_API_KEY, чтобы включить статистику"
+            "value" : "Задайте ключ API на экране Безопасность, чтобы включить статистику"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "设置 OMLX_API_KEY 以启用统计"
+            "value" : "在“安全”页面设置 API 密钥以启用统计"
           }
         }
       }
@@ -10645,6 +10933,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "未发现模型"
+          }
+        }
+      }
+    },
+    "models.library.external_engine.help" : {
+      "comment" : "Tooltip on the external engine badge in the model library; placeholder is the engine name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ can serve this model. Turn it on in the model's Advanced settings."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ может запускать эту модель. Включите его в расширенных настройках модели."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 可以运行此模型。请在模型的高级设置中开启。"
+          }
+        }
+      }
+    },
+    "models.library.gguf.help" : {
+      "comment" : "Tooltip on the GGUF badge in the model library",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A GGUF file, served by an external engine"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Файл GGUF, который запускает внешний движок"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "由外部引擎运行的 GGUF 文件"
           }
         }
       }
@@ -21922,6 +22258,78 @@
         }
       }
     },
+    "settings.advanced.external_engine.draft_started" : {
+      "comment" : "Draft download button label after the download starts",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloading…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在下载…"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.get_draft" : {
+      "comment" : "Button that downloads the draft model an external engine needs; placeholder is the Hugging Face repo",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Download %@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скачать %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "下载 %@"
+          }
+        }
+      }
+    },
+    "settings.advanced.external_engine.gguf" : {
+      "comment" : "Sublabel for the external engine toggle of a GGUF model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GGUF models run on an external engine only."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модели GGUF работают только на внешнем движке."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GGUF 模型只能在外部引擎上运行。"
+          }
+        }
+      }
+    },
     "settings.advanced.guided_grammar.label" : {
       "comment" : "Row label for the default guided grammar toggle",
       "extractionState" : "manual",
@@ -22552,6 +22960,48 @@
         }
       }
     },
+    "settings.basic.embedding_context_window.sub" : {
+      "comment" : "Sublabel for the context window field of an embedding model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Longer inputs are truncated to this length when a request does not set max_length."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リクエストで max_length を指定しない場合、これより長い入力はこの長さで切り詰められます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청에 max_length가 없으면 이보다 긴 입력은 이 길이로 잘립니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Если в запросе не задан max_length, более длинные входные данные обрезаются до этой длины."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请求未设置 max_length 时，超出此长度的输入将被截断。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "請求未設定 max_length 時，超過此長度的輸入會被截斷。"
+          }
+        }
+      }
+    },
     "settings.basic.max_tokens.label" : {
       "comment" : "Row label for the max generated tokens field",
       "extractionState" : "manual",
@@ -22913,19 +23363,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Limit candidates to top K (positive integer)."
+            "value" : "Limit candidates to top K (0 turns it off)."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Ограничить кандидаты top K (положительное целое)."
+            "value" : "Ограничить кандидаты до top K (0 — выключено)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "将候选限制为 Top K（正整数）。"
+            "value" : "将候选限制为 Top K（0 表示关闭）。"
           }
         }
       }
@@ -25727,25 +26177,25 @@
       }
     },
     "settings.validator.top_k.positive" : {
-      "comment" : "Validation error when top-k isn't positive",
+      "comment" : "Validation error when top-k is negative",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Top K must be a positive integer."
+            "value" : "Top K must be 0 or a positive integer."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Top K должен быть положительным целым числом."
+            "value" : "Top K должен быть 0 или положительным целым числом."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Top K 必须是正整数。"
+            "value" : "Top K 必须为 0 或正整数。"
           }
         }
       }

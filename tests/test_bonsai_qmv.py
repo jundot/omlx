@@ -4,10 +4,7 @@
 Covers:
   - _arch_gen() parsing
   - _use_qmv_wide() routing table
-  - is_nax_available() fallback + env override
-  - _verify_abi() with mock extensions
-  - bonsai_q1_affine_qmv / bonsai_qmv_wide fallback (no native ext)
-  - spec_decode_verify pure-mlx fallback correctness
+  - q1_affine_qmv / qmv_wide fallback (no native ext)
   - apply/remove bonsai_qmv_patch lifecycle
   - model_loading wiring: patch fires on bits=1/2, skipped on bits=4
 """
@@ -22,7 +19,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
-import omlx.custom_kernels.bonsai.fast as bonsai_fast
+import omlx.custom_kernels.lowbit.fast as lowbit_fast
 from omlx.patches.bonsai_qmv import (
     apply_bonsai_qmv_patch,
     is_patch_active,
@@ -40,8 +37,7 @@ from omlx.utils.model_loading import maybe_apply_pre_load_patches
 @pytest.fixture(autouse=True)
 def _reset_bonsai_caches(monkeypatch):
     """Clear all module-level caches before each test."""
-    monkeypatch.setattr(bonsai_fast, "_nax_available_cache", None)
-    monkeypatch.setattr(bonsai_fast, "_arch_gen_cache", None)
+    monkeypatch.setattr(lowbit_fast, "_arch_gen_cache", None)
     yield
 
 
@@ -72,13 +68,13 @@ def _remove_patch_after(monkeypatch):
 )
 def test_arch_gen_parsing(monkeypatch, arch, expected_gen):
     monkeypatch.setattr(mx, "device_info", lambda: {"architecture": arch})
-    gen = bonsai_fast._arch_gen()
+    gen = lowbit_fast._arch_gen()
     assert gen == expected_gen
 
 
 def test_arch_gen_device_info_exception(monkeypatch):
     monkeypatch.setattr(mx, "device_info", lambda: (_ for _ in ()).throw(RuntimeError("no GPU")))
-    assert bonsai_fast._arch_gen() == 0
+    assert lowbit_fast._arch_gen() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -106,85 +102,12 @@ def test_arch_gen_device_info_exception(monkeypatch):
     ],
 )
 def test_use_qmv_wide_routing(monkeypatch, bits, M, gen, expected):
-    monkeypatch.setattr(bonsai_fast, "_arch_gen_cache", gen)
-    assert bonsai_fast._use_qmv_wide(bits, M) is expected
+    monkeypatch.setattr(lowbit_fast, "_arch_gen_cache", gen)
+    assert lowbit_fast._use_qmv_wide(bits, M) is expected
 
 
 # ---------------------------------------------------------------------------
-# is_nax_available — fallback path
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("arch", "expected"),
-    [
-        ("applegpu_g18p", True),
-        ("applegpu_g17s", False),   # gen-17 excluded even though M5-class
-        ("applegpu_g15d", False),
-        ("", False),
-    ],
-)
-def test_is_nax_available_fallback(monkeypatch, arch, expected):
-    monkeypatch.setattr(bonsai_fast, "_ext", None)
-    monkeypatch.setattr(mx, "device_info", lambda: {"architecture": arch})
-    assert bonsai_fast.is_nax_available() is expected
-
-
-def test_is_nax_available_prefers_ext(monkeypatch):
-    fake_ext = SimpleNamespace(is_nax_available=lambda: True)
-    monkeypatch.setattr(bonsai_fast, "_ext", fake_ext)
-    monkeypatch.setattr(mx, "device_info", lambda: {"architecture": "applegpu_g15d"})
-    assert bonsai_fast.is_nax_available() is True
-
-
-# ---------------------------------------------------------------------------
-# _verify_abi
-# ---------------------------------------------------------------------------
-
-
-class _MismatchedExt:
-    def abi_probe(self, a):
-        raise TypeError("incompatible function arguments")
-
-
-class _HealthyExt:
-    def abi_probe(self, a):
-        return 1
-
-
-class _LegacyExt:
-    """Pre-probe build — assumed compatible."""
-
-
-def test_verify_abi_mismatched_disables_ext():
-    ext, err = bonsai_fast._verify_abi(_MismatchedExt(), None)
-    assert ext is None
-    assert isinstance(err, TypeError)
-
-
-def test_verify_abi_healthy_passes_through():
-    ext = _HealthyExt()
-    out, err = bonsai_fast._verify_abi(ext, None)
-    assert out is ext
-    assert err is None
-
-
-def test_verify_abi_legacy_build_passes_through():
-    ext = _LegacyExt()
-    out, err = bonsai_fast._verify_abi(ext, None)
-    assert out is ext
-    assert err is None
-
-
-def test_verify_abi_none_ext_passes_through():
-    sentinel = ImportError("no native build")
-    out, err = bonsai_fast._verify_abi(None, sentinel)
-    assert out is None
-    assert err is sentinel
-
-
-# ---------------------------------------------------------------------------
-# bonsai_q1_affine_qmv — fallback to mx.quantized_matmul
+# q1_affine_qmv — fallback to mx.quantized_matmul
 # ---------------------------------------------------------------------------
 
 
@@ -202,7 +125,7 @@ def _make_q1_tensors(N=64, K=256, group_size=128):
 
 
 def test_q1_qmv_fallback_calls_quantized_matmul(monkeypatch):
-    monkeypatch.setattr(bonsai_fast, "_ext", None)
+    monkeypatch.setattr(lowbit_fast, "_ext", None)
     called = {}
 
     def fake_qmm(x, w, *, scales, biases, transpose, group_size, bits, stream=None):
@@ -211,7 +134,7 @@ def test_q1_qmv_fallback_calls_quantized_matmul(monkeypatch):
 
     monkeypatch.setattr(mx, "quantized_matmul", fake_qmm)
     x, w, scales, biases = _make_q1_tensors()
-    bonsai_fast.bonsai_q1_affine_qmv(x, w, scales, biases)
+    lowbit_fast.q1_affine_qmv(x, w, scales, biases)
     assert called["args"] == (1, 128, True)
 
 
@@ -223,17 +146,17 @@ def test_q1_qmv_routes_to_ext_when_available(monkeypatch):
         return mx.zeros((1, 64), dtype=mx.float16)
 
     fake_ext = SimpleNamespace(
-        bonsai_q1_affine_qmv=fake_q1,
+        q1_affine_qmv=fake_q1,
         abi_probe=lambda a: 1,
     )
-    monkeypatch.setattr(bonsai_fast, "_ext", fake_ext)
+    monkeypatch.setattr(lowbit_fast, "_ext", fake_ext)
     x, w, scales, biases = _make_q1_tensors()
-    bonsai_fast.bonsai_q1_affine_qmv(x, w, scales, biases)
+    lowbit_fast.q1_affine_qmv(x, w, scales, biases)
     assert called.get("fired") is True
 
 
 # ---------------------------------------------------------------------------
-# bonsai_qmv_wide dispatch
+# qmv_wide dispatch
 # ---------------------------------------------------------------------------
 
 
@@ -247,8 +170,8 @@ def _make_q2_tensors(M=3, N=64, K=256, group_size=128):
 
 
 def test_qmv_wide_2bit_m3_gen15_routes_to_ext(monkeypatch):
-    """M=3, bits=2, gen-15 → should call bonsai_q2_affine_qmv_wide."""
-    monkeypatch.setattr(bonsai_fast, "_arch_gen_cache", 15)
+    """M=3, bits=2, gen-15 → should call q2_affine_qmv_wide."""
+    monkeypatch.setattr(lowbit_fast, "_arch_gen_cache", 15)
     called = {}
 
     def fake_wide(x, w, scales, biases, stream=None):
@@ -256,19 +179,19 @@ def test_qmv_wide_2bit_m3_gen15_routes_to_ext(monkeypatch):
         return mx.zeros((3, 64), dtype=mx.bfloat16)
 
     fake_ext = SimpleNamespace(
-        bonsai_q2_affine_qmv_wide=fake_wide,
+        q2_affine_qmv_wide=fake_wide,
         abi_probe=lambda a: 1,
     )
-    monkeypatch.setattr(bonsai_fast, "_ext", fake_ext)
+    monkeypatch.setattr(lowbit_fast, "_ext", fake_ext)
     x, w, scales, biases = _make_q2_tensors(M=3)
-    bonsai_fast.bonsai_qmv_wide(x, w, scales, biases, bits=2)
+    lowbit_fast.qmv_wide(x, w, scales, biases, bits=2)
     assert called.get("fired") is True
 
 
 def test_qmv_wide_2bit_m2_falls_back_to_stock(monkeypatch):
     """M=2, bits=2 → _use_qmv_wide returns False → stock mlx."""
-    monkeypatch.setattr(bonsai_fast, "_arch_gen_cache", 17)
-    monkeypatch.setattr(bonsai_fast, "_ext", None)
+    monkeypatch.setattr(lowbit_fast, "_arch_gen_cache", 17)
+    monkeypatch.setattr(lowbit_fast, "_ext", None)
     called = {}
 
     def fake_qmm(x, w, *, scales, biases, transpose, group_size, bits, stream=None):
@@ -277,13 +200,13 @@ def test_qmv_wide_2bit_m2_falls_back_to_stock(monkeypatch):
 
     monkeypatch.setattr(mx, "quantized_matmul", fake_qmm)
     x, w, scales, biases = _make_q2_tensors(M=2)
-    bonsai_fast.bonsai_qmv_wide(x, w, scales, biases, bits=2)
+    lowbit_fast.qmv_wide(x, w, scales, biases, bits=2)
     assert called.get("bits") == 2
 
 
 def test_qmv_wide_1bit_always_uses_qmv_fast(monkeypatch):
     """bits=1 always routes through qmv_fast (wide shows no benefit on M4 Max)."""
-    monkeypatch.setattr(bonsai_fast, "_arch_gen_cache", 18)
+    monkeypatch.setattr(lowbit_fast, "_arch_gen_cache", 18)
     called = {}
 
     def fake_q1(x, w, scales, biases, stream=None):
@@ -291,143 +214,16 @@ def test_qmv_wide_1bit_always_uses_qmv_fast(monkeypatch):
         return mx.zeros((1, 64), dtype=mx.float16)
 
     fake_ext = SimpleNamespace(
-        bonsai_q1_affine_qmv=fake_q1,
+        q1_affine_qmv=fake_q1,
         abi_probe=lambda a: 1,
     )
-    monkeypatch.setattr(bonsai_fast, "_ext", fake_ext)
+    monkeypatch.setattr(lowbit_fast, "_ext", fake_ext)
     x = mx.zeros((1, 256), dtype=mx.float16)
     w = mx.zeros((64, 256 // 32), dtype=mx.uint32)   # 1-bit: 32 values per uint32
     scales = mx.ones((64, 2), dtype=mx.float16)
     biases = mx.zeros((64, 2), dtype=mx.float16)
-    bonsai_fast.bonsai_qmv_wide(x, w, scales, biases, bits=1)
+    lowbit_fast.qmv_wide(x, w, scales, biases, bits=1)
     assert called.get("fired") is True
-
-
-# ---------------------------------------------------------------------------
-# spec_decode_verify — pure-mlx fallback correctness
-# ---------------------------------------------------------------------------
-
-
-def _logits_from_greedy(token_ids: list[int], V: int) -> mx.array:
-    """Make [1, len, V] logits where argmax = token_ids."""
-    T = len(token_ids)
-    lgt = mx.zeros((1, T, V), dtype=mx.float32)
-    # Use numpy-style trick via list-of-lists
-    rows = []
-    for tok in token_ids:
-        row = [0.0] * V
-        row[tok] = 10.0
-        rows.append(row)
-    return mx.array([[rows]], dtype=mx.float32).reshape(1, T, V)
-
-
-def test_spec_decode_verify_all_accepted(monkeypatch):
-    """Draft tokens perfectly match target greedy: all K accepted."""
-    monkeypatch.setattr(bonsai_fast, "_ext", None)
-
-    V = 8
-    draft = mx.array([[1, 2, 3]], dtype=mx.int32)          # [1, 3]
-    # target greedy: positions 0..3 → tokens [1, 2, 3, 5]
-    target_logits = _logits_from_greedy([1, 2, 3, 5], V)  # [1, 4, V]
-
-    n_acc, committed = bonsai_fast.spec_decode_verify(draft, target_logits)
-    mx.eval(n_acc, committed)
-
-    assert int(n_acc[0]) == 3                               # all 3 accepted
-    assert int(committed[0, 0]) == 1
-    assert int(committed[0, 1]) == 2
-    assert int(committed[0, 2]) == 3
-    assert int(committed[0, 3]) == 5                        # corrected token
-
-
-def test_spec_decode_verify_first_mismatch(monkeypatch):
-    """Target disagrees with first draft token: n_accepted=0."""
-    monkeypatch.setattr(bonsai_fast, "_ext", None)
-
-    V = 8
-    draft = mx.array([[1, 2]], dtype=mx.int32)
-    # target greedy at pos 0 = 7 (≠ draft[0]=1) → mismatch immediately
-    target_logits = _logits_from_greedy([7, 2, 4], V)      # [1, 3, V]
-
-    n_acc, committed = bonsai_fast.spec_decode_verify(draft, target_logits)
-    mx.eval(n_acc, committed)
-
-    assert int(n_acc[0]) == 0
-    assert int(committed[0, 0]) == 7                        # corrected at pos 0
-    assert int(committed[0, 1]) == 0                        # zeroed out
-    assert int(committed[0, 2]) == 0
-
-
-def test_spec_decode_verify_mid_mismatch(monkeypatch):
-    """Mismatch at second token: n_accepted=1."""
-    monkeypatch.setattr(bonsai_fast, "_ext", None)
-
-    V = 8
-    draft = mx.array([[3, 5]], dtype=mx.int32)
-    # target greedy: [3, 6, 2] → match at 0, mismatch at 1
-    target_logits = _logits_from_greedy([3, 6, 2], V)      # [1, 3, V]
-
-    n_acc, committed = bonsai_fast.spec_decode_verify(draft, target_logits)
-    mx.eval(n_acc, committed)
-
-    assert int(n_acc[0]) == 1
-    assert int(committed[0, 0]) == 3                        # accepted draft
-    assert int(committed[0, 1]) == 6                        # corrected token
-    assert int(committed[0, 2]) == 0
-
-
-def test_spec_decode_verify_routes_to_ext_when_available(monkeypatch):
-    called = {}
-
-    def fake_verify(draft_tokens, target, stream=None):
-        called["fired"] = True
-        called["target"] = target
-        B = draft_tokens.shape[0]
-        K = draft_tokens.shape[1]
-        return mx.zeros((B,), mx.int32), mx.zeros((B, K + 1), mx.int32)
-
-    fake_ext = SimpleNamespace(bonsai_spec_decode_verify=fake_verify)
-    monkeypatch.setattr(bonsai_fast, "_ext", fake_ext)
-
-    draft = mx.array([[1, 2]], dtype=mx.int32)
-    target_logits = mx.zeros((1, 3, 8), dtype=mx.float32)
-    bonsai_fast.spec_decode_verify(draft, target_logits)
-    assert called.get("fired") is True
-    # The native op takes argmaxed int32 token ids, not raw logits.
-    assert called["target"].dtype == mx.int32
-    assert called["target"].shape == (1, 3)
-
-
-@pytest.mark.skipif(
-    not bonsai_fast.has_symbol("bonsai_spec_decode_verify"),
-    reason="requires compiled bonsai extension",
-)
-def test_spec_decode_verify_native_matches_fallback():
-    """Native kernel and pure-mlx fallback agree on n_accepted and the
-    committed prefix (positions past n_accepted are unspecified padding)."""
-    rng = np.random.default_rng(11)
-    for _trial in range(10):
-        B = int(rng.integers(1, 5))
-        K = int(rng.integers(1, 8))
-        V = 32
-        draft = mx.array(rng.integers(0, V, (B, K)), dtype=mx.int32)
-        logits = mx.array(rng.standard_normal((B, K + 1, V)).astype(np.float32))
-
-        n_nat, c_nat = bonsai_fast.spec_decode_verify(draft, logits)
-        mx.eval(n_nat, c_nat)
-
-        orig_ext = bonsai_fast._ext
-        try:
-            bonsai_fast._ext = None
-            n_fb, c_fb = bonsai_fast.spec_decode_verify(draft, logits)
-            mx.eval(n_fb, c_fb)
-        finally:
-            bonsai_fast._ext = orig_ext
-
-        assert mx.array_equal(n_nat, n_fb).item()
-        for b in range(B):
-            n = int(n_nat[b].item())
-            assert c_nat[b, : n + 1].tolist() == c_fb[b, : n + 1].tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +282,7 @@ def test_is_symmetric_cached():
 
 def test_sym_q1_fast_py_fallback_routes_to_same_mlx(monkeypatch):
     """Symmetric q1 fast fallback calls mx.quantized_matmul with same args as affine."""
-    monkeypatch.setattr(bonsai_fast, "_ext", None)
+    monkeypatch.setattr(lowbit_fast, "_ext", None)
     calls = []
 
     def recording_qmm(x, w, *, scales, biases, transpose, group_size, bits, stream=None):
@@ -496,7 +292,7 @@ def test_sym_q1_fast_py_fallback_routes_to_same_mlx(monkeypatch):
     monkeypatch.setattr(mx, "quantized_matmul", recording_qmm)
     x, w, scales, biases = _make_q1_tensors()
     biases_sym = -scales * 0.5
-    bonsai_fast.bonsai_q1_affine_qmv_sym(x, w, scales, biases_sym)
+    lowbit_fast.q1_affine_qmv_sym(x, w, scales, biases_sym)
     # Fallback when ext is None: sym delegates to affine which calls quantized_matmul
     assert calls, "quantized_matmul should have been called"
     assert calls[0]["bits"] == 1
@@ -504,7 +300,7 @@ def test_sym_q1_fast_py_fallback_routes_to_same_mlx(monkeypatch):
 
 def test_sym_q2_fast_py_fallback_routes_to_same_mlx(monkeypatch):
     """Symmetric q2 fast fallback calls mx.quantized_matmul."""
-    monkeypatch.setattr(bonsai_fast, "_ext", None)
+    monkeypatch.setattr(lowbit_fast, "_ext", None)
     calls = []
 
     def recording_qmm(x, w, *, scales, biases, transpose, group_size, bits, stream=None):
@@ -514,7 +310,7 @@ def test_sym_q2_fast_py_fallback_routes_to_same_mlx(monkeypatch):
     monkeypatch.setattr(mx, "quantized_matmul", recording_qmm)
     x, w, scales, biases = _make_q2_tensors(M=1)
     biases_sym = -scales
-    bonsai_fast.bonsai_q2_affine_qmv_sym(x, w, scales, biases_sym)
+    lowbit_fast.q2_affine_qmv_sym(x, w, scales, biases_sym)
     assert calls, "quantized_matmul should have been called"
     assert calls[0]["bits"] == 2
 
@@ -527,12 +323,12 @@ def test_sym_routes_to_ext_when_available(monkeypatch):
         return mx.zeros((1, 64), dtype=mx.float16)
 
     fake_ext = SimpleNamespace(
-        bonsai_q1_affine_qmv_sym=fake_sym,
+        q1_affine_qmv_sym=fake_sym,
         abi_probe=lambda a: 1,
     )
-    monkeypatch.setattr(bonsai_fast, "_ext", fake_ext)
+    monkeypatch.setattr(lowbit_fast, "_ext", fake_ext)
     x, w, scales, biases = _make_q1_tensors()
-    bonsai_fast.bonsai_q1_affine_qmv_sym(x, w, scales, biases)
+    lowbit_fast.q1_affine_qmv_sym(x, w, scales, biases)
     assert called.get("fired") is True
 
 
@@ -542,7 +338,7 @@ def test_sym_routes_to_ext_when_available(monkeypatch):
 
 
 def test_patch_applies_when_native_available(monkeypatch):
-    monkeypatch.setattr(bonsai_fast, "_ext", SimpleNamespace(abi_probe=lambda a: 1))
+    monkeypatch.setattr(lowbit_fast, "_ext", SimpleNamespace(abi_probe=lambda a: 1))
     remove_bonsai_qmv_patch()
     result = apply_bonsai_qmv_patch()
     assert result is True
@@ -550,7 +346,7 @@ def test_patch_applies_when_native_available(monkeypatch):
 
 
 def test_patch_skipped_when_no_native(monkeypatch):
-    monkeypatch.setattr(bonsai_fast, "_ext", None)
+    monkeypatch.setattr(lowbit_fast, "_ext", None)
     remove_bonsai_qmv_patch()
 
     from omlx.patches import bonsai_qmv as bonsai_qmv_mod
@@ -562,7 +358,7 @@ def test_patch_skipped_when_no_native(monkeypatch):
 
 
 def test_patch_idempotent(monkeypatch):
-    monkeypatch.setattr(bonsai_fast, "_ext", SimpleNamespace(abi_probe=lambda a: 1))
+    monkeypatch.setattr(lowbit_fast, "_ext", SimpleNamespace(abi_probe=lambda a: 1))
     remove_bonsai_qmv_patch()
 
     from omlx.patches import bonsai_qmv as bonsai_qmv_mod
@@ -675,9 +471,9 @@ class TestModelLoadingBonsaiWiring:
 
 def test_bonsai_local_build_probe_is_healthy():
     """If the local build is available its abi_probe must accept mlx arrays."""
-    if not bonsai_fast.is_native_available():
+    if not lowbit_fast.is_native_available():
         pytest.skip("bonsai native build unavailable")
-    assert bonsai_fast._ext.abi_probe(mx.zeros((3,))) == 3
+    assert lowbit_fast._ext.abi_probe(mx.zeros((3,))) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -844,10 +640,10 @@ def test_vlm_one_bit_modules_keep_bonsai_paths(monkeypatch):
 
     def native(x, weight, scales, biases):
         calls.append(tuple(x.shape))
-        return x @ bonsai_fast._dequant_1bit(weight, scales, biases, x.dtype).T
+        return x @ lowbit_fast._dequant_1bit(weight, scales, biases, x.dtype).T
 
     monkeypatch.setattr(bonsai_qmv, "has_native", lambda: True)
-    monkeypatch.setattr(bonsai_qmv, "bonsai_q1_affine_qmv_sym", native)
+    monkeypatch.setattr(bonsai_qmv, "q1_affine_qmv_sym", native)
     assert restore_bonsai_quantized_modules(model) == 2
     assert type(model.linear) is nn.QuantizedLinear
     assert type(model.embedding) is nn.QuantizedEmbedding
@@ -861,7 +657,7 @@ def test_vlm_one_bit_modules_keep_bonsai_paths(monkeypatch):
         actual = model.linear(x)
         expected = (
             x
-            @ bonsai_fast._dequant_1bit(
+            @ lowbit_fast._dequant_1bit(
                 weights[0], model.linear.scales, model.linear.biases, x.dtype
             ).T
         )
@@ -869,7 +665,7 @@ def test_vlm_one_bit_modules_keep_bonsai_paths(monkeypatch):
         np.testing.assert_array_equal(np.array(actual), np.array(expected))
     assert calls == [(1, 128), (2, 128)]
     ids = mx.array([0, 7])
-    expected = bonsai_fast._dequant_1bit(
+    expected = lowbit_fast._dequant_1bit(
         model.embedding.weight,
         model.embedding.scales,
         model.embedding.biases,

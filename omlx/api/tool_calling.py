@@ -315,6 +315,13 @@ def _matches_union_type(value: Any, types: list) -> bool | None:
         return None
 
 
+def _union_admits_boolean(types: object) -> bool:
+    """Whether the declared alternatives include a boolean."""
+    return isinstance(types, list) and any(
+        isinstance(t, str) and t in _SCHEMA_BOOL_TYPES for t in types
+    )
+
+
 def _union_keyword_types(spec: dict) -> list[str] | None:
     alts = [
         alt
@@ -341,12 +348,19 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
     spec = props.get(key)
     raw_type = spec.get("type") if isinstance(spec, dict) else None
     if not isinstance(raw_type, str):
+        if not isinstance(raw_type, list) and isinstance(spec, dict):
+            raw_type = _union_keyword_types(spec)
+        # Capitalized Python literals are not JSON, so decode them against the
+        # union before the parse below rejects them (#4630).
+        stripped = val.strip()
+        if len(stripped) <= 5 and _union_admits_boolean(raw_type):
+            lowered = stripped.lower()
+            if lowered in ("true", "false"):
+                return lowered == "true"
         try:
             decoded = json.loads(val)
         except (json.JSONDecodeError, ValueError, *_DEEP_NEST_ERRORS):
             return val
-        if not isinstance(raw_type, list) and isinstance(spec, dict):
-            raw_type = _union_keyword_types(spec)
         if isinstance(raw_type, list):
             # Plain 123 remains a string for ["string", "null"].
             matches = _matches_union_type(decoded, raw_type)
@@ -485,28 +499,57 @@ _XML_FUNCTION_OPEN = "<function="
 _XML_FUNCTION_CLOSE = "</function>"
 _XML_PARAMETER_OPEN = "<parameter="
 _XML_PARAMETER_CLOSE = "</parameter>"
-# Candidate envelope ends examined before giving up. Each candidate costs a
-# balance count over the payload, so this keeps hostile output linear.
-_XML_MAX_END_CANDIDATES = 32
-# Trailing payload context the stream filter keeps so a `</function>` split
-# across chunks is still visible when the close marker arrives.
-_XML_TAIL_KEEP = 64
+# How many loose closes (the right shape at the wrong depth) a one-shot scan
+# looks past before settling for the first one. Depth needs the whole call to
+# decide, and the one-shot callers loop: each restarts just past the previous
+# answer, so an unbounded look-ahead rescans the rest of the text once per
+# call and goes quadratic on repeated calls that each leave a parameter
+# unclosed (24KB took 4.5s). A value quotes at most a couple of example calls
+# before its own close, so the cap changes nothing a model emits.
+_XML_LOOSE_CLOSE_LOOKAHEAD = 8
 
 
-class _NakedFunctionBoundary:
+class _XmlFunctionBoundary:
     """Incrementally locate a Qwen function close outside its parameter values.
 
-    A close follows either the empty function header or a parameter close.
-    Literal closing tags within a value have neither boundary. Retaining only
-    tag-sized tails keeps scanning linear across arbitrarily small chunks.
+    This is the single answer to "where does this qwen3_coder call end" for
+    the non-streaming parser, the stream filter, and wrapper-less calls.
+    Each used to apply its own rule, and the stream filter's weaker one
+    disagreed with the others whenever a value carried the terminator
+    (#2588). One scanner keeps them agreeing by construction.
+
+    A close counts only at parameter depth 0, so a ``</function>`` inside a
+    value is skipped, and only right after the empty function header or a
+    parameter close, so stray prose before the close is not mistaken for one.
+    A value holding an unbalanced literal ``</parameter>`` followed by
+    ``</function>`` is indistinguishable from a real close: the format has no
+    escaping and the model emits the same tokens either way, so no text rule
+    can do better there.
+
+    ``feed`` returns just past the first close and can be called again from
+    that index to find the next one. Retaining only tag-sized tails keeps
+    scanning linear across arbitrarily small chunks.
+
+    Depth never returns to 0 when a value holds an unclosed ``<parameter=``.
+    ``loose_end`` records the first close that passes every test but depth,
+    so one-shot callers can fall back to it (see ``_naked_function_end``),
+    the same way wrapped envelopes fall back to the first close marker.
+    With ``loose_lookahead`` set, ``feed`` gives up ``None`` after that many
+    further loose closes instead of scanning to the end of the text.
+    ``scanned`` is the index just past the last character examined.
     """
 
-    def __init__(self):
+    def __init__(self, loose_lookahead: int | None = None):
         self._tail = ""
         self._nonspace_tail = ""
         self._header = True
         self._empty = False
         self._candidate = False
+        self._depth = 0
+        self._loose_lookahead = loose_lookahead
+        self._loose_seen = 0
+        self.loose_end: int | None = None
+        self.scanned = 0
 
     def feed(self, text: str, start: int = 0) -> int | None:
         for i in range(start, len(text)):
@@ -521,14 +564,45 @@ class _NakedFunctionBoundary:
                     self._empty = True
             elif not ch.isspace():
                 self._empty = False
-            self._tail = (self._tail + ch)[-len(_XML_FUNCTION_CLOSE) :]
+            self._tail = (self._tail + ch)[-len(_XML_PARAMETER_CLOSE) :]
             if not ch.isspace():
                 self._nonspace_tail = (self._nonspace_tail + ch)[
                     -len(_XML_PARAMETER_CLOSE) :
                 ]
+            if not self._header:
+                if self._tail.endswith(_XML_PARAMETER_OPEN):
+                    self._depth += 1
+                elif self._tail.endswith(_XML_PARAMETER_CLOSE):
+                    self._depth = max(0, self._depth - 1)
+                elif self._depth == 0 and self._tail.endswith(_XML_FUNCTION_OPEN):
+                    # A second call in the same envelope. Outside every value,
+                    # so re-enter the header: its empty-header close counts.
+                    self._header = True
             if self._candidate and self._tail.endswith(_XML_FUNCTION_CLOSE):
-                return i + 1
+                if self._depth == 0:
+                    self.scanned = i + 1
+                    return i + 1
+                if self.loose_end is None:
+                    self.loose_end = i + 1
+                elif self._loose_lookahead is not None:
+                    self._loose_seen += 1
+                    if self._loose_seen >= self._loose_lookahead:
+                        self.scanned = i + 1
+                        return None
+        self.scanned = len(text)
         return None
+
+
+def _naked_function_end(text: str, start: int) -> int | None:
+    """End of a wrapper-less function call in complete text, or ``None``.
+
+    Prefers the depth-0 close; past ``_XML_LOOSE_CLOSE_LOOKAHEAD`` loose
+    closes it takes the first loose one, which keeps the looping callers
+    linear (see the constant).
+    """
+    boundary = _XmlFunctionBoundary(loose_lookahead=_XML_LOOSE_CLOSE_LOOKAHEAD)
+    end = boundary.feed(text, start)
+    return end if end is not None else boundary.loose_end
 
 
 _QWEN_OPEN_RE = re.compile(r"<tool_call>|<function=[^\s>]+>")
@@ -547,8 +621,7 @@ def _wrap_naked_function_calls(text: str) -> str | None:
             end = found[1]
             parts.append(text[pos:end])
         else:
-            boundary = _NakedFunctionBoundary()
-            end = boundary.feed(text, match.start() + len(_XML_FUNCTION_OPEN))
+            end = _naked_function_end(text, match.start() + len(_XML_FUNCTION_OPEN))
             if end is None:
                 break
             parts.extend(
@@ -591,11 +664,12 @@ def _xml_function_payload_end(
     so ``_json_value_end`` cannot bound it and a literal close marker inside a
     parameter value truncates the payload the same way (#2507).
 
-    The structural anchor is that a real envelope ends with ``</function>``
-    followed by the close marker, and that its parameter elements balance.
-    Requiring both skips copies embedded in values, including a value that
-    contains the whole ``</function>`` + close-marker sequence, while still
-    ending at the FIRST call when several are concatenated.
+    The envelope ends at the first ``</function>`` that the shared
+    ``_XmlFunctionBoundary`` accepts (outside every parameter value) and that
+    the close marker follows. That skips copies embedded in values, including
+    a value that contains the whole ``</function>`` + close-marker sequence,
+    while still ending at the FIRST call when several are concatenated. The
+    stream filter applies the same rule incrementally.
 
     Returns ``None`` when the payload is not this dialect or has no such pair,
     which leaves the caller on the historical first-match behaviour.
@@ -607,21 +681,17 @@ def _xml_function_payload_end(
         return span[1] if span else None
     if not text.startswith(_XML_FUNCTION_OPEN, idx):
         return None
-    search = idx
-    # Bounded so a value stuffed with fake terminators cannot make the balance
-    # check quadratic; past the cap we simply decline to bound the payload.
-    for _ in range(_XML_MAX_END_CANDIDATES):
-        close = text.find(_XML_FUNCTION_CLOSE, search)
-        if close < 0:
-            return None
-        after = close + len(_XML_FUNCTION_CLOSE)
+    # Same scanner as the stream filter, so both bound the envelope at the
+    # same place. One pass per envelope, but the callers walk every envelope
+    # in the text, so the pass is capped like the wrapper-less one: a value
+    # that never closes a parameter would otherwise scan to the end of the
+    # text for each envelope that follows it.
+    boundary = _XmlFunctionBoundary(loose_lookahead=_XML_LOOSE_CLOSE_LOOKAHEAD)
+    pos = idx + len(_XML_FUNCTION_OPEN)
+    while (after := boundary.feed(text, pos)) is not None:
         if text.startswith(end_marker, _skip_ws(text, after)):
-            payload = text[idx:close]
-            if payload.count(_XML_PARAMETER_OPEN) == payload.count(
-                _XML_PARAMETER_CLOSE
-            ):
-                return after
-        search = after
+            return after
+        pos = after
     return None
 
 
@@ -2276,7 +2346,7 @@ def parse_qwen_tool_calls(
         function_end = None
         if text.startswith(_XML_FUNCTION_OPEN, function_start):
             scan_end = found[0] if found else len(text)
-            relative_end = _NakedFunctionBoundary().feed(
+            relative_end = _naked_function_end(
                 text[function_start:scan_end], len(_XML_FUNCTION_OPEN)
             )
             if relative_end is not None:
@@ -2299,7 +2369,7 @@ def parse_qwen_tool_calls(
             ):
                 # A literal close tag can hide the last function's missing outer close.
                 # Do not scan through a later call to recover it.
-                relative_end = _NakedFunctionBoundary().feed(
+                relative_end = _naked_function_end(
                     text[function_start:], len(_XML_FUNCTION_OPEN)
                 )
                 if relative_end is not None:
@@ -2761,7 +2831,7 @@ class ToolCallStreamFilter:
     # non-streaming parser accepts from ``_json_value_end``.
 
     def _reset_json_scan(self) -> None:
-        self._naked_boundary = _NakedFunctionBoundary()
+        self._naked_boundary = _XmlFunctionBoundary()
         self._naked_scan_off = 0
         self._json_state = "undecided"
         self._json_depth = 0
@@ -2770,20 +2840,23 @@ class ToolCallStreamFilter:
         self._json_scan_off = 0
         self._json_complete_off = 0
         self._attr_func_in_cdata = False
-        # Tail of already-consumed payload, kept so a `</function>` straddling
-        # the pending/buffer boundary is still visible to the xml check.
-        self._xml_prev_tail = ""
+        # qwen3_coder: buffer index just past a `</function>` the boundary
+        # scanner accepted, while waiting to see whether the close marker
+        # follows it. -1 when there is none.
+        self._xml_close_off = -1
         # First payload characters, accumulated across buffer drains purely to
         # decide which dialect the payload is.
         self._payload_head = ""
 
-    def _shift_json_scan(self, dropped: int, moved: str = "") -> None:
+    def _shift_json_scan(self, dropped: int) -> None:
         """Rebase scan offsets after ``dropped`` chars leave the buffer front."""
         self._naked_scan_off = max(0, self._naked_scan_off - dropped)
         self._json_scan_off = max(0, self._json_scan_off - dropped)
         self._json_complete_off = max(0, self._json_complete_off - dropped)
-        if moved:
-            self._xml_prev_tail = (self._xml_prev_tail + moved)[-_XML_TAIL_KEEP:]
+        if self._xml_close_off >= 0:
+            # Only whitespace or a partial close marker follows the accepted
+            # close, so clamping to 0 keeps pointing at what comes after it.
+            self._xml_close_off = max(0, self._xml_close_off - dropped)
 
     def _advance_json_scan(self, buffer: str) -> None:
         """Consume buffer chars not yet seen, updating JSON-completion state."""
@@ -2937,33 +3010,18 @@ class ToolCallStreamFilter:
         if marker == "</function>":
             return self._find_attr_function_suppression_end(buffer)
 
+        # Feed the boundary scanner while the dialect is still undecided too:
+        # the buffer can drain before `<function=` settles it, and drained
+        # text must already have been scanned.
+        scan_xml = self._json_state in ("undecided", "xml")
         self._advance_json_scan(buffer)
         if self._json_state == "attr_xml":
             return self._find_attr_function_suppression_end(buffer)
 
-        if self._json_state == "xml":
-            # qwen3_coder dialect: the envelope ends with </function> right
-            # before the close marker, so a marker inside a parameter value is
-            # not preceded by one. This is a local O(1) test per candidate,
-            # unlike the non-streaming path which can also balance parameter
-            # elements because it has the whole payload at once.
-            search = 0
-            while True:
-                idx = buffer.find(marker, search)
-                if idx < 0:
-                    return -1
-                # Only the characters immediately before the marker matter, so
-                # look at a fixed window instead of slicing the whole buffer:
-                # a per-candidate full slice would be quadratic when one chunk
-                # carries many markers.
-                window_start = idx - _XML_TAIL_KEEP
-                if window_start <= 0:
-                    seen = self._xml_prev_tail + buffer[:idx]
-                else:
-                    seen = buffer[window_start:idx]
-                if seen.rstrip(" \t\r\n").endswith(_XML_FUNCTION_CLOSE):
-                    return idx
-                search = idx + len(marker)
+        if scan_xml and self._json_state in ("undecided", "xml"):
+            end = self._xml_envelope_end(buffer, marker)
+            if self._json_state == "xml":
+                return end
 
         if self._json_state == "not_json":
             # Hermes brackets, GLM arg_key/arg_value, prose: historical
@@ -2979,6 +3037,32 @@ class ToolCallStreamFilter:
         # The JSON object is closed, so its end is authoritative and markers
         # embedded inside it are ignored.
         return buffer.find(marker, self._json_complete_off)
+
+    def _xml_envelope_end(self, buffer: str, marker: str) -> int:
+        """Close-marker index for a qwen3_coder payload, or -1 to wait.
+
+        Same rule as the non-streaming ``_xml_function_payload_end``: the
+        envelope ends at the first close the shared boundary scanner accepts
+        that is followed, after whitespace, by the close marker. Every char is
+        fed to the scanner once, so this stays linear on untrusted output.
+        """
+        while True:
+            if self._xml_close_off < 0:
+                end = self._naked_boundary.feed(buffer, self._naked_scan_off)
+                if end is None:
+                    self._naked_scan_off = len(buffer)
+                    return -1
+                self._naked_scan_off = end
+                self._xml_close_off = end
+            after = _skip_ws(buffer, self._xml_close_off)
+            if buffer.startswith(marker, after):
+                return after
+            if marker.startswith(buffer[after:]):
+                # Nothing decisive after the close yet.
+                return -1
+            # Something else follows, e.g. a second function in the same
+            # envelope, so this close does not end it. Scan on.
+            self._xml_close_off = -1
 
     def _find_start_envelope(
         self,
@@ -3364,7 +3448,7 @@ class ToolCallStreamFilter:
             # two paths identical means the content shown at EOF always
             # matches what the final parse extracts.
             if marker == _XML_FUNCTION_CLOSE:
-                end = _NakedFunctionBoundary().feed(candidate, pos)
+                end = _naked_function_end(candidate, pos)
                 found = None if end is None else (end - len(marker), end)
             else:
                 found = _find_marker_span_end(candidate, pos, marker)
@@ -3381,6 +3465,16 @@ class ToolCallStreamFilter:
                     )
                 break
             pos = found[1]
+            if marker == _XML_FUNCTION_CLOSE:
+                # A complete naked call reaches EOF recovery when its value held
+                # an unclosed `<parameter=`, so the depth scan never closed it
+                # live. It is still a complete call: record it as the live path would, and
+                # swallow the orphan wrapper close it may carry, as the live
+                # path does via ``_after_naked_function``.
+                self._record_completed_envelope(candidate[env_start:pos])
+                after = _skip_ws(candidate, pos)
+                if candidate.startswith("</tool_call>", after):
+                    pos = after + len("</tool_call>")
             # Between envelopes now: emit prose until the next opening
             # envelope, swallowing self-contained ones (bracket calls,
             # orphan closes) along the way.
@@ -3471,12 +3565,12 @@ class ToolCallStreamFilter:
                         self._pending_envelope_parts.append(moved)
                         # Rebase the JSON scan: those chars left the buffer
                         # front but were already consumed by the scanner.
-                        self._shift_json_scan(len(moved), moved)
+                        self._shift_json_scan(len(moved))
                         self._buffer = self._buffer[-keep:]
                     else:
                         moved = self._buffer
                         self._pending_envelope_parts.append(moved)
-                        self._shift_json_scan(len(moved), moved)
+                        self._shift_json_scan(len(moved))
                         self._buffer = ""
                     break
                 completed = (

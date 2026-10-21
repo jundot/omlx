@@ -1653,7 +1653,7 @@ class TestMuseGlimmerOutputParserSession:
         ("model_name", "model_config"),
         [
             ("any-name", {"model_type": "muse_spark"}),
-            ("Muse-Spark-1.2-816B-A42B-NVFP4-open-hf", None),
+            ("Muse-Spark-Open-816B-A42B-NVFP4", None),
         ],
     )
     def test_muse_spark_uses_channel_parser(self, model_name, model_config):

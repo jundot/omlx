@@ -20,7 +20,7 @@ class DSparkAttention(Attention):
     def append_context(self, main_x, cache, *, start_offset=None):
         c = self._config
         start = cache.offset if start_offset is None else start_offset
-        positions = mx.arange(start, start + main_x.shape[1])
+        positions = range(start, start + main_x.shape[1])
         kv = quantize_activation(
             rope(self.kv_norm(self.wkv(main_x)), positions, c, False)
         )
@@ -29,7 +29,7 @@ class DSparkAttention(Attention):
     def __call__(self, x, cache):
         c = self._config
         batch, length, _ = x.shape
-        positions = mx.arange(cache.offset, cache.offset + length)
+        positions = range(cache.offset, cache.offset + length)
         q = rope(
             self.wq_b(self.q_norm(self.wq_a(x))).reshape(
                 batch, length, c.n_heads, c.head_dim
@@ -58,7 +58,8 @@ class DSparkAttention(Attention):
             .astype(q.dtype)
         )
         out = rope(out, positions, c, False, inverse=True)
-        grouped = out.reshape(batch, length, c.o_groups, -1)
+        # 1017 reference DSparkAttention: act_quant(o) before the wo_a einsum.
+        grouped = quantize_activation(out.reshape(batch, length, c.o_groups, -1))
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
         return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
 

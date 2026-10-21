@@ -352,7 +352,7 @@
                                    :placeholder="selectedModel?.id"
                                    class="{{ ms_field }}">
                         </label>
-                        <label class="{{ ms_row }}">
+                        <label class="{{ ms_row }}" x-show="!isGgufModel()">
                             <span class="{{ ms_row_label }}">{{ t('modal.model_settings.model_type') }}</span>
                             <select x-model="modelSettings.model_type_override" class="{{ ms_field_short }}">
                                 <option value="">{{ t('modal.model_settings.model_type_auto') }}</option>
@@ -365,6 +365,15 @@
                                 <option value="audio_sts">{{ t('modal.model_settings.model_type_audio_sts') }}</option>
                                 <option value="decision">{{ t('modal.model_settings.model_type_decision') }}</option>
                             </select>
+                        </label>
+                        <!-- Embedding context window -->
+                        <label class="{{ ms_row }}" x-show="selectedModel?.model_type === 'embedding'" x-cloak>
+                            <span class="min-w-0">
+                                <span class="block {{ ms_row_label }}">{{ t('modal.model_settings.max_context_window') }}</span>
+                                <span class="{{ ms_row_hint }}">{{ t('modal.model_settings.embedding_context_window_hint') }}</span>
+                            </span>
+                            <input type="number" x-model.number="modelSettings.max_context_window" placeholder="{{ t('modal.model_settings.placeholder_default') }}" min="1"
+                                   class="{{ ms_field_short }}">
                         </label>
                         <label class="{{ ms_row }}">
                             <span class="min-w-0">
@@ -503,8 +512,8 @@
                 <!-- Acceleration -->
                 <section id="ms-acceleration" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.acceleration_label') }}</h3>
-                    <p x-show="modelSettings.external_engine" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
-                    <div class="{{ ms_rows }}" :class="modelSettings.external_engine ? 'opacity-40 pointer-events-none' : ''">
+                    <p x-show="effectiveExternalEngine()" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
+                    <div class="{{ ms_rows }}" :class="effectiveExternalEngine() ? 'opacity-40 pointer-events-none' : ''">
                         <!-- Lightning MTP (built-in MTP head speculative decoding) -->
                         <div class="px-4 py-3.5 space-y-3">
                             <div class="flex items-start justify-between gap-3">
@@ -791,8 +800,8 @@
                 <!-- Memory Saving -->
                 <section id="ms-memory" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.memory_label') }}</h3>
-                    <p x-show="modelSettings.external_engine" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
-                    <div class="{{ ms_rows }}" :class="modelSettings.external_engine ? 'opacity-40 pointer-events-none' : ''">
+                    <p x-show="effectiveExternalEngine()" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
+                    <div class="{{ ms_rows }}" :class="effectiveExternalEngine() ? 'opacity-40 pointer-events-none' : ''">
                         <!-- SSD N-gram Offload (Qwen4 PLE or DeepSeek V4.1 Engram) -->
                         <div class="px-4 py-3.5 space-y-2"
                              x-show="ssdNgramOffloadKey()" x-cloak>
@@ -861,17 +870,17 @@
                             </div>
                         </template>
 
-                        <!-- TurboQuant KV Cache -->
+                        <!-- KV Cache Compression -->
                         <div class="px-4 py-3.5 space-y-3">
                             <div class="flex items-start justify-between gap-3">
                                 <div class="min-w-0">
-                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.turboquant_kv') }}</span>
-                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.turboquant_kv_hint') }}</p>
+                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.kv_compression') }}</span>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.kv_compression_hint') }}</p>
                                 </div>
                                 <button type="button"
                                         @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.turboquant_kv_enabled = !modelSettings.turboquant_kv_enabled"
                                         :disabled="modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled"
-                                        :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
+                                        :title="modelSettings.is_paroquant ? modelSettings.paroquant_reason : (modelSettings.vlm_mtp_enabled ? '{{ t('modal.model_settings.vlm_mtp_compression_conflict')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '')"
                                         :class="[
                                             modelSettings.turboquant_kv_enabled ? 'bg-black' : 'bg-neutral-200',
                                             (modelSettings.is_paroquant || modelSettings.vlm_mtp_enabled) ? 'opacity-40 cursor-not-allowed' : ''
@@ -883,18 +892,32 @@
                                           class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                 </button>
                             </div>
-                            <div x-show="modelSettings.turboquant_kv_enabled" x-transition class="pt-1">
-                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.turboquant_kv_bits_label') }}</label>
-                                <select x-model="modelSettings.turboquant_kv_bits"
-                                        class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                    <option value="2">{{ t('modal.model_settings.bits_2') }}</option>
-                                    <option value="2.5">{{ t('modal.model_settings.bits_2_5') }}</option>
-                                    <option value="3">{{ t('modal.model_settings.bits_3') }}</option>
-                                    <option value="3.5">{{ t('modal.model_settings.bits_3_5') }}</option>
-                                    <option value="4">{{ t('modal.model_settings.bits_4') }}</option>
-                                    <option value="6">{{ t('modal.model_settings.bits_6') }}</option>
-                                    <option value="8">{{ t('modal.model_settings.bits_8') }}</option>
-                                </select>
+                            <div x-show="modelSettings.turboquant_kv_enabled" x-transition class="pt-1 space-y-3">
+                                <div>
+                                    <label for="kv-compression-format" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.kv_compression_format') }}</label>
+                                    <select id="kv-compression-format" x-model="modelSettings.turboquant_kv_scheme"
+                                            @change="if (modelSettings.turboquant_kv_scheme === 'affine4') modelSettings.turboquant_kv_bits = 4; else if (modelSettings.turboquant_kv_scheme === 'affine8') modelSettings.turboquant_kv_bits = 8"
+                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="turboquant">{{ t('modal.model_settings.kv_compression_turboquant') }}</option>
+                                        <option value="affine4">{{ t('modal.model_settings.kv_compression_affine4') }}</option>
+                                        <option value="affine8">{{ t('modal.model_settings.kv_compression_affine8') }}</option>
+                                    </select>
+                                </div>
+                                <p x-show="modelSettings.turboquant_kv_scheme === 'affine4'" class="text-xs text-neutral-500">{{ t('modal.model_settings.kv_compression_affine4_hint') }}</p>
+                                <p x-show="modelSettings.turboquant_kv_scheme === 'affine8'" class="text-xs text-neutral-500">{{ t('modal.model_settings.kv_compression_affine8_hint') }}</p>
+                                <div x-show="modelSettings.turboquant_kv_scheme === 'turboquant'">
+                                    <label for="kv-compression-bits" class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.turboquant_kv_bits_label') }}</label>
+                                    <select id="kv-compression-bits" x-model.number="modelSettings.turboquant_kv_bits"
+                                            class="w-full px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        <option value="2">{{ t('modal.model_settings.bits_2') }}</option>
+                                        <option value="2.5">{{ t('modal.model_settings.bits_2_5') }}</option>
+                                        <option value="3">{{ t('modal.model_settings.bits_3') }}</option>
+                                        <option value="3.5">{{ t('modal.model_settings.bits_3_5') }}</option>
+                                        <option value="4">{{ t('modal.model_settings.bits_4') }}</option>
+                                        <option value="6">{{ t('modal.model_settings.bits_6') }}</option>
+                                        <option value="8">{{ t('modal.model_settings.bits_8') }}</option>
+                                    </select>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -911,20 +934,27 @@
                             <div class="flex items-start justify-between gap-3">
                                 <div class="min-w-0">
                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.external_engine') }}</span>
-                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.external_engine_hint') }}</p>
+                                    <p class="text-xs text-neutral-500 mt-0.5"
+                                       x-text="isGgufModel() ? window.t('modal.model_settings.external_engine_gguf') : window.t('modal.model_settings.external_engine_hint')"></p>
                                     <p x-show="externalEngineReason()" class="text-xs text-amber-600 mt-1 break-words" x-text="externalEngineReason()"></p>
+                                    <button type="button" x-show="externalEngineDraftRepo()" x-cloak
+                                            @click="downloadEngineDraft()"
+                                            class="mt-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-all inline-flex items-center gap-1.5">
+                                        <i data-lucide="download" class="w-3 h-3"></i>
+                                        <span x-text="window.t('modal.model_settings.external_engine_get_draft').replace('{repo_id}', externalEngineDraftRepo())"></span>
+                                    </button>
                                 </div>
                                 <button type="button"
                                         @click="modelSettings.external_engine = modelSettings.external_engine ? '' : firstUsableExternalEngine()"
-                                        :disabled="!modelSettings.external_engine && !firstUsableExternalEngine()"
+                                        :disabled="isGgufModel() || (!modelSettings.external_engine && !firstUsableExternalEngine())"
                                         :class="[
-                                            modelSettings.external_engine ? 'bg-black' : 'bg-neutral-200',
-                                            (!modelSettings.external_engine && !firstUsableExternalEngine()) ? 'opacity-40 cursor-not-allowed' : ''
+                                            effectiveExternalEngine() ? 'bg-black' : 'bg-neutral-200',
+                                            (isGgufModel() || (!modelSettings.external_engine && !firstUsableExternalEngine())) ? 'opacity-40 cursor-not-allowed' : ''
                                         ]"
                                         role="switch"
-                                        :aria-checked="modelSettings.external_engine ? 'true' : 'false'"
+                                        :aria-checked="effectiveExternalEngine() ? 'true' : 'false'"
                                         class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
-                                    <span :class="modelSettings.external_engine ? 'translate-x-5' : 'translate-x-0'"
+                                    <span :class="effectiveExternalEngine() ? 'translate-x-5' : 'translate-x-0'"
                                           class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                 </button>
                             </div>
@@ -1197,8 +1227,8 @@
                 <!-- Experimental Features -->
                 <section id="ms-experimental" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h3>
-                    <p x-show="modelSettings.external_engine" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
-                    <div class="{{ ms_rows }}" :class="modelSettings.external_engine ? 'opacity-40 pointer-events-none' : ''">
+                    <p x-show="effectiveExternalEngine()" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
+                    <div class="{{ ms_rows }}" :class="effectiveExternalEngine() ? 'opacity-40 pointer-events-none' : ''">
                         <!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->
                         <template x-if="selectedModel?.ane_prefill_backend === 'qwen'">
                             <div class="px-4 py-3.5 space-y-4">

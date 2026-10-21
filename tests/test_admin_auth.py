@@ -4,6 +4,7 @@
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -12,6 +13,9 @@ from fastapi import HTTPException
 import omlx.server  # noqa: F401 — ensure server module is imported first
 import omlx.admin.auth as admin_auth
 import omlx.admin.routes as admin_routes
+
+
+_LOOPBACK_REQUEST = SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 
 def _mock_global_settings(api_key=None):
@@ -48,7 +52,9 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin/dashboard")
+                admin_routes.auto_login(
+                    _LOOPBACK_REQUEST, key="test-key", redirect="/admin/dashboard"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin/dashboard"
@@ -64,7 +70,9 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin/chat")
+                admin_routes.auto_login(
+                    _LOOPBACK_REQUEST, key="test-key", redirect="/admin/chat"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin/chat"
@@ -77,7 +85,9 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="wrong-key", redirect="/admin/dashboard")
+                admin_routes.auto_login(
+                    _LOOPBACK_REQUEST, key="wrong-key", redirect="/admin/dashboard"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
@@ -92,7 +102,9 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="", redirect="/admin/dashboard")
+                admin_routes.auto_login(
+                    _LOOPBACK_REQUEST, key="", redirect="/admin/dashboard"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
@@ -105,7 +117,9 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="any-key", redirect="/admin/dashboard")
+                admin_routes.auto_login(
+                    _LOOPBACK_REQUEST, key="any-key", redirect="/admin/dashboard"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
@@ -120,7 +134,7 @@ class TestAutoLogin:
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
                     admin_routes.auto_login(
-                        key="test-key", redirect="https://evil.com"
+                        _LOOPBACK_REQUEST, key="test-key", redirect="https://evil.com"
                     )
                 )
             assert exc_info.value.status_code == 400
@@ -134,7 +148,9 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin")
+                admin_routes.auto_login(
+                    _LOOPBACK_REQUEST, key="test-key", redirect="/admin"
+                )
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"

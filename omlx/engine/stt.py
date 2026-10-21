@@ -436,6 +436,94 @@ class _WhisperRealtimeBackend:
         return [text] if text else []
 
 
+class _SegmentedRealtimeBackend:
+    """Push-input adapter for STT models that only decode complete audio.
+
+    Buffered audio is transcribed at each speech pause. Without a pause it
+    is cut at ``SEGMENT_SECONDS`` on a quiet point, like the segmented file
+    stream. All *_sync methods run on the MLX executor; ``feed`` is
+    thread-safe and cheap.
+    """
+
+    QUIET_RMS = 0.01
+    FRAME_SECONDS = 0.1
+    PAUSE_SECONDS = 0.7
+    MIN_VOICED_SECONDS = 0.3
+    PREROLL_SECONDS = 0.3
+    SEGMENT_SECONDS = 30.0
+
+    def __init__(self, model: Any, language: str | None = None):
+        self._model = model
+        self._language = _normalize_stt_generate_language(model, language)
+        self._pending: list[np.ndarray] = []
+        self._lock = threading.Lock()
+        self._audio = np.zeros(0, dtype=np.float32)
+        self._emitted = False
+
+    def feed(self, samples: np.ndarray) -> None:
+        with self._lock:
+            self._pending.append(samples)
+
+    def _take(self) -> None:
+        with self._lock:
+            pending, self._pending = self._pending, []
+        if pending:
+            self._audio = np.concatenate([self._audio, *pending])
+
+    def _speech_stats(self) -> tuple[float, float]:
+        """Return voiced seconds and trailing quiet seconds of the buffer."""
+        frame = int(self.FRAME_SECONDS * REALTIME_SAMPLE_RATE)
+        n = len(self._audio) // frame
+        if n == 0:
+            return 0.0, 0.0
+        frames = self._audio[: n * frame].reshape(n, frame).astype(np.float64)
+        voiced = np.sqrt(np.mean(frames**2, axis=1)) >= self.QUIET_RMS
+        if not voiced.any():
+            return 0.0, n * self.FRAME_SECONDS
+        trailing = n - 1 - int(np.flatnonzero(voiced)[-1])
+        return int(voiced.sum()) * self.FRAME_SECONDS, trailing * self.FRAME_SECONDS
+
+    def _transcribe(self, segments: list[np.ndarray]) -> list[str]:
+        kwargs = {"language": self._language} if self._language else {}
+        out: list[str] = []
+        for segment in segments:
+            result = self._model.generate(segment, **kwargs)
+            text = (getattr(result, "text", "") or "").strip()
+            if text:
+                out.append(" " + text if self._emitted else text)
+                self._emitted = True
+        return out
+
+    def poll_sync(self) -> list[str]:
+        self._take()
+        sr = REALTIME_SAMPLE_RATE
+        if len(self._audio) > self.SEGMENT_SECONDS * sr:
+            *done, self._audio = _split_audio_segments(
+                self._audio, sr, self.SEGMENT_SECONDS
+            )
+            return self._transcribe(done)
+        voiced, quiet = self._speech_stats()
+        if voiced and quiet < self.PAUSE_SECONDS:
+            return []
+        if voiced >= self.MIN_VOICED_SECONDS:
+            audio, self._audio = self._audio, self._audio[:0]
+            return self._transcribe([audio])
+        # Silence or a short click: keep a lead-in for the next onset.
+        self._audio = self._audio[-int(self.PREROLL_SECONDS * sr) :]
+        return []
+
+    def close_sync(self) -> list[str]:
+        self._take()
+        voiced, _ = self._speech_stats()
+        if voiced < self.MIN_VOICED_SECONDS:
+            return []
+        return self._transcribe(
+            _split_audio_segments(
+                self._audio, REALTIME_SAMPLE_RATE, self.SEGMENT_SECONDS
+            )
+        )
+
+
 class _VoxtralRealtimeBackend:
     """Push-input adapter over mlx-audio's VoxtralStreamingSession."""
 
@@ -1087,17 +1175,18 @@ class STTEngine(BaseNonStreamingEngine):
             )
 
     def supports_realtime_stt(self) -> bool:
-        """True when the loaded model supports push-based realtime decoding.
+        """True when the loaded model can serve a realtime session.
 
         Whisper-family models expose ``generate_streaming`` (AlignAtt
         StreamingDecoder); voxtral_realtime exposes
         ``create_streaming_session``. Other STT backends only accept a
-        complete audio input.
+        complete audio input and are transcribed per speech pause.
         """
         if self._model is None:
             return False
-        return hasattr(self._model, "create_streaming_session") or hasattr(
-            self._model, "generate_streaming"
+        return any(
+            hasattr(self._model, name)
+            for name in ("create_streaming_session", "generate_streaming", "generate")
         )
 
     async def create_realtime_session(
@@ -1127,8 +1216,10 @@ class STTEngine(BaseNonStreamingEngine):
             backend: Any = _VoxtralRealtimeBackend(model)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(get_mlx_executor(), backend.start_sync)
-        else:
+        elif hasattr(model, "generate_streaming"):
             backend = _WhisperRealtimeBackend(model, language=language)
+        else:
+            backend = _SegmentedRealtimeBackend(model, language=language)
 
         self._realtime_active = True
         activity_id = self._begin_activity(

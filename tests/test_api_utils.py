@@ -2295,6 +2295,38 @@ class TestPrepareSystemMessagesForTemplate:
         assert [m["role"] for m in result] == ["user", "system"]
         assert result[1]["content"] == "Plan mode"
 
+    def test_declared_support_keeps_later_system_messages_in_place(self):
+        tokenizer = self.ErrorTokenizer()
+        tokenizer._omlx_supports_mid_system_messages = True
+        messages = [
+            {"role": "system", "content": "Leading"},
+            {"role": "user", "content": "fix the bug"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "t1", "function": {"name": "Read", "arguments": {}}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "t1", "content": "print('hi')"},
+            {"role": "system", "content": "hook context"},
+            {"role": "assistant", "content": "Done"},
+            {"role": "system", "content": "reminder"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:,"}},
+                    {"type": "text", "text": "Next"},
+                ],
+            },
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, tokenizer, unsupported_mid_system_policy="user_note_safe"
+        )
+
+        assert result == messages
+
     def test_explicit_capability_overrides_marker_order_false_positive(self):
         messages = [
             {"role": "user", "content": "Hello"},
@@ -2708,6 +2740,95 @@ class TestPrepareSystemMessagesForTemplate:
 
         assert after_user is True
         assert after_tool is False
+
+    def test_budget_marker_system_after_tool_result_keeps_prompt_append_only(self):
+        tokenizer = self.UserOnlyMidSystemTokenizer()
+
+        def conversation(turns):
+            messages = [
+                {"role": "system", "content": "You are an agent."},
+                {"role": "user", "content": "Fix the bug."},
+            ]
+            for turn in range(turns):
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": f"c{turn}",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"c{turn}",
+                        "content": f"result {turn}",
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"<total_tokens>{150000 - 1000 * turn} tokens left"
+                            "</total_tokens>"
+                        ),
+                    }
+                )
+            return messages
+
+        prompts = [
+            tokenizer.apply_chat_template(
+                prepare_system_messages_for_template(
+                    conversation(turns),
+                    tokenizer,
+                    unsupported_mid_system_policy="user_note_safe",
+                )
+            )
+            for turns in (1, 2, 3)
+        ]
+
+        for earlier, later in zip(prompts, prompts[1:]):
+            assert later.startswith(earlier)
+
+    def test_strips_marker_appended_to_leading_system(self):
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an agent."
+                    "\n\n<total_tokens>150000 tokens left</total_tokens>"
+                ),
+            },
+            {"role": "user", "content": "Hello"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert result[0]["content"] == "You are an agent."
+
+    def test_drops_marker_only_system_even_when_template_preserves_it(self):
+        messages = [
+            {"role": "system", "content": "You are an agent."},
+            {"role": "user", "content": "Hello"},
+            {
+                "role": "system",
+                "content": "<total_tokens>42 tokens left</total_tokens>",
+            },
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert [message["role"] for message in result] == ["system", "user"]
+        assert result[0]["content"] == "You are an agent."
 
 
 class TestMergeConsecutiveRoles:

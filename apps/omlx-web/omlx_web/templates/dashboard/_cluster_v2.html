@@ -45,6 +45,12 @@
             <p x-show="confirmForgetCleanup" class="mt-2">{{ t('cluster.v2.join.forget_cleanup_warning') }}</p>
         </div>
 
+        <div x-show="deviceLoopbackOnly(selfDevice())" x-cloak
+             class="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800"
+             role="status" data-cluster-v2-self-loopback>
+            {{ t('cluster.v2.loopback.self_notice') }}
+        </div>
+
         <!-- Where you are. Five steps, derived from the live snapshot. -->
         <div class="mb-6" data-cluster-v2-steps x-show="wizardState() !== 'error'">
             <ol class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
@@ -334,13 +340,14 @@
                         <div class="mt-4 flex items-center gap-2"
                              x-show="!device.is_self && !device.paired && device.state !== 'awaiting_approval'">
                             <button type="button" @click="beginPairing(device)"
-                                    class="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800"
+                                    :disabled="deviceLoopbackOnly(device)"
+                                    class="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-neutral-900 rounded-lg hover:bg-neutral-800 disabled:opacity-50"
                                     data-cluster-v2-pair-button>
                                 <i data-lucide="link-2" class="w-3.5 h-3.5"></i>
                                 {{ t('cluster.v2.device.pair') }}
                             </button>
                             <button type="button" @click="beginJoinAsJoiner(device)"
-                                    :disabled="join.busy"
+                                    :disabled="join.busy || deviceLoopbackOnly(device)"
                                     title="{{ t('cluster.v2.device.show_code_tooltip') }}"
                                     class="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium text-neutral-600 bg-white border border-neutral-200 rounded-lg hover:bg-neutral-50 disabled:opacity-50"
                                     data-cluster-v2-show-code>
@@ -348,6 +355,11 @@
                                 {{ t('cluster.v2.device.show_code_instead') }}
                             </button>
                         </div>
+                        <p class="mt-2 text-caption text-amber-800"
+                           x-show="!device.is_self && !device.paired && deviceLoopbackOnly(device)"
+                           data-cluster-v2-peer-loopback>
+                            {{ t('cluster.v2.loopback.peer_notice') }}
+                        </p>
 
                         <div class="mt-4" x-show="!device.is_self && device.paired">
                             <button type="button" @click="forgetCluster(device)"
@@ -1226,10 +1238,11 @@
                             <div class="rounded-lg border border-neutral-200 px-3 py-2.5 flex items-center justify-between gap-3">
                                 <div>
                                     <div class="text-xs font-semibold text-neutral-900" x-text="deviceName(device)"></div>
-                                    <div class="text-caption text-neutral-600">{{ t('cluster.v2.active.found') }}</div>
+                                    <div class="text-caption text-neutral-600" x-show="!deviceLoopbackOnly(device)">{{ t('cluster.v2.active.found') }}</div>
+                                    <div class="text-caption text-amber-800" x-show="deviceLoopbackOnly(device)">{{ t('cluster.v2.loopback.peer_notice') }}</div>
                                 </div>
                                 <button type="button" @click="beginMembershipPairing(device)"
-                                        :disabled="pairing.busy"
+                                        :disabled="pairing.busy || deviceLoopbackOnly(device)"
                                         class="px-3 py-1.5 text-xs font-semibold text-neutral-900 border border-neutral-300 rounded-lg hover:bg-neutral-100 disabled:opacity-40"
                                         data-cluster-v2-membership-add-device>
                                     {{ t('cluster.v2.membership.add_device') }}

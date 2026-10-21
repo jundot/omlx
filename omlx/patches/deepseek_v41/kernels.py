@@ -215,9 +215,13 @@ _INDEX = r"""
         float dot = 0.0f;
         for (int v = 0; v < D / 32; ++v)
             dot += float(q[(query * H + h) * D + lane + v * 32]) * key[v];
-        result += max(simd_sum(dot), 0.0f) * weights[query * H + h];
+        // DeepSeek-V4.1-Flash-1017 Indexer: the einsum output and relu(s) * w are tensors of
+        // the activation dtype R (bf16 for the released checkpoints); the head sum
+        // accumulates in fp32 (order free) and is stored as R.
+        const float s = float(R(simd_sum(dot)));
+        result += float(R(max(s, 0.0f) * weights[query * H + h]));
     }
-    if (lane == 0) scores[query * M + position] = result;
+    if (lane == 0) scores[query * M + position] = float(R(result));
 """
 
 
@@ -258,8 +262,10 @@ _INDEX_MMA = r"""
             simdgroup_multiply_accumulate(acc, a, b, acc);
         }
         const float weight = h + fm < H ? weights[query * H + h + fm] : 0.0f;
-        float v0 = max(acc.thread_elements()[0], 0.0f) * weight;
-        float v1 = max(acc.thread_elements()[1], 0.0f) * weight;
+        // Reference rounding points (einsum output and relu * weight in the activation dtype
+        // R); the cross-head sum below is fp32 in any order and rounded to R when stored.
+        float v0 = float(R(max(float(R(acc.thread_elements()[0])), 0.0f) * weight));
+        float v1 = float(R(max(float(R(acc.thread_elements()[1])), 0.0f) * weight));
         // Lane bits 1, 2 and 4 span the eight head rows of each column.
         for (uint i = 0; i < 3; ++i) {
             const uint mask = i == 0 ? 2 : (i == 1 ? 4 : 16);
@@ -280,7 +286,7 @@ _INDEX_MMA = r"""
             const uint pos = block + tid;
             const int row = CANDIDATES ? candidates[query * M + pos] : int(pos);
             const bool valid = row >= 0 && row < N && row + meta[5] < (start + int(query) + 1) / ratio;
-            scores[query * M + pos] = valid ? head_totals[tid] + head_totals[tid + COLS] : -INFINITY;
+            scores[query * M + pos] = valid ? float(R(head_totals[tid] + head_totals[tid + COLS])) : -INFINITY;
         }
     } else if (fm == 0) {
         for (uint j = 0; j < 2; ++j) {
@@ -288,7 +294,7 @@ _INDEX_MMA = r"""
             if (pos >= M) continue;
             const int row = CANDIDATES ? candidates[query * M + pos] : int(pos);
             const bool valid = row >= 0 && row < N && row + meta[5] < (start + int(query) + 1) / ratio;
-            scores[query * M + pos] = valid ? (j == 0 ? total0 : total1) : -INFINITY;
+            scores[query * M + pos] = valid ? float(R(j == 0 ? total0 : total1)) : -INFINITY;
         }
     }
 """
@@ -443,6 +449,7 @@ def packed_index_scores(
             ("HEAD_SPLIT", head_split),
             ("HEADS", heads),
             ("RATIO", ratio),
+            ("R", q.dtype),
         ],
         grid=(
             ((width + cols - 1) // cols if mma else (width + 3) // 4) * 128,

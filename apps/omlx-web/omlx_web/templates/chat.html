@@ -130,8 +130,7 @@
     }
 
     .response-tab-group:hover {
-        background: color-mix(in srgb, var(--timeline-accent) 10%, var(--bg-secondary));
-        border-color: color-mix(in srgb, var(--timeline-accent) 40%, var(--border-normal));
+        background: var(--bg-tertiary);
     }
 
     .response-tab-group .response-tab {
@@ -157,7 +156,7 @@
     }
 
     .response-tab-group.response-tab-group--active:hover {
-        background: color-mix(in srgb, var(--timeline-accent) 12%, var(--bg-secondary));
+        background: var(--bg-tertiary);
     }
 
     .response-tab-group.response-tab-group--active-missing {
@@ -805,7 +804,7 @@
         border: 1px solid var(--border-normal);
         border-radius: 1rem;
         background-color: var(--bg-primary);
-        box-shadow: 0 12px 32px rgb(0 0 0 / 0.14);
+        box-shadow: 0 12px 32px rgb(var(--palette-black) / 0.14);
     }
 
     .composer-menu-item {
@@ -860,7 +859,7 @@
         width: 0.75rem;
         height: 0.75rem;
         border-radius: 9999px;
-        background-color: #fff;
+        background-color: rgb(var(--palette-white));
         transition: transform 0.15s;
     }
 
@@ -911,7 +910,7 @@
     }
 
     .reasoning-slider-dot.is-filled {
-        background-color: rgb(255 255 255 / 0.7);
+        background-color: rgb(var(--palette-white) / 0.7);
     }
 
     .reasoning-slider input[type="range"] {
@@ -944,8 +943,8 @@
         width: var(--t);
         height: var(--t);
         border-radius: 9999px;
-        background-color: #fff;
-        box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+        background-color: rgb(var(--palette-white));
+        box-shadow: 0 1px 4px rgb(var(--palette-black) / 0.3);
         transition: opacity 0.15s;
         -webkit-appearance: none;
         appearance: none;
@@ -956,12 +955,12 @@
         height: var(--t);
         border: none;
         border-radius: 9999px;
-        background-color: #fff;
-        box-shadow: 0 1px 4px rgb(0 0 0 / 0.3);
+        background-color: rgb(var(--palette-white));
+        box-shadow: 0 1px 4px rgb(var(--palette-black) / 0.3);
     }
 
     .reasoning-slider input[type="range"]:focus-visible::-webkit-slider-thumb {
-        box-shadow: 0 0 0 3px rgb(255 255 255 / 0.5), 0 0 0 5px var(--timeline-accent);
+        box-shadow: 0 0 0 3px rgb(var(--palette-white) / 0.5), 0 0 0 5px var(--timeline-accent);
     }
 
     /* Auto is the model default, not a level; keep its fill neutral. */
@@ -1067,7 +1066,7 @@
         background: rgb(var(--palette-white) / 0.1);
         border: none;
         border-radius: 50%;
-        color: white;
+        color: rgb(var(--palette-white));
         cursor: pointer;
         display: flex;
         align-items: center;
@@ -4972,17 +4971,13 @@
     },
 
     async downloadChats() {
-        const history = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
-        if (!history) {
+        // localStorage can hold an older snapshot after a quota failure.
+        const chats = this.chatHistory || [];
+        if (!chats.length) {
             alert(window.t('chat.no_chats_to_export'));
             return;
         }
         try {
-            const chats = JSON.parse(history);
-            if (!chats.length) {
-                alert(window.t('chat.no_chats_to_export'));
-                return;
-            }
             const json = JSON.stringify(chats, null, 2);
             const blob = new Blob([json], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
@@ -5693,7 +5688,9 @@
 
     saveChatHistory() {
         const key = CHAT_HISTORY_STORAGE_KEY;
-        const persist = () => localStorage.setItem(key, JSON.stringify(this.chatHistory));
+        // Trim only the stored copy; the sidebar and export keep every chat.
+        const toStore = this.chatHistory.slice();
+        const persist = () => localStorage.setItem(key, JSON.stringify(toStore));
         try {
             persist();
         } catch (e) {
@@ -5701,8 +5698,8 @@
                 console.error('Failed to save chat history:', e);
                 return;
             }
-            while (this.chatHistory.length > 1) {
-                this.chatHistory.pop();
+            while (toStore.length > 1) {
+                toStore.pop();
                 try {
                     persist();
                     console.warn('Chat history trimmed to fit localStorage quota');
@@ -7027,11 +7024,20 @@
                 }
             } else {
                 console.error('Streaming error:', error);
+                // The stream can die with tokens already on screen — a backgrounded
+                // WebKit tab kills the fetch ("TypeError: Load failed"). Keep that
+                // text, as the Stop path does, instead of replacing it with the
+                // error line alone. Appending the error keeps the failure visible.
                 const assistantId = stream.targetMessageId || this.newMessageId();
-                const errorMsg = {
+                const partialContent = (stream._toolRoundContent || '') + (stream.streamingContent || '');
+                const assistantMsg = {
                     id: assistantId,
                     role: 'assistant',
-                    content: `Error: ${error.message}`,
+                    content: partialContent
+                        ? `${partialContent}\n\nError: ${error.message}`
+                        : `Error: ${error.message}`,
+                    reasoning_content: this.hasVisibleThinking(stream.streamingThinking)
+                        ? stream.streamingThinking : null,
                     model: requestModel,
                     meta: this.captureGenerationContext(
                         requestModel,
@@ -7040,9 +7046,11 @@
                         context._generationOverride
                     ),
                     _perfVisible: false,
+                    _thinkingOpen: false,
                 };
-                this.attachProfileToAssistantMessage(errorMsg, context._profile);
-                chatSession.messages.push(errorMsg);
+                this.attachThinkingToAssistantMessage(assistantMsg, stream.streamingThinking);
+                this.attachProfileToAssistantMessage(assistantMsg, context._profile);
+                chatSession.messages.push(assistantMsg);
                 this._setActiveVariant(chatSession, assistantId, context._variantUserIndex);
                 this.saveCurrentChat(context.chatId, chatSession.messages, chatSession.model, context.systemPrompt);
                 if (this.currentChatId === context.chatId) {

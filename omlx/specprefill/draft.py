@@ -25,7 +25,9 @@ class DraftPrefixCache(Protocol):
 
     def preload_blocks(self, block_table: Any) -> int: ...
 
-    def reconstruct_cache(self, block_table: Any) -> Any: ...
+    def reconstruct_cache(
+        self, block_table: Any, promote_to_hot_cache: bool = ...
+    ) -> Any: ...
 
     def store_cache(
         self,
@@ -34,6 +36,7 @@ class DraftPrefixCache(Protocol):
         cache_data: list[Any],
         model_cache_config: Any = ...,
         boundary_snapshots: dict[int, list[Any]] | None = ...,
+        hot_cache_write_back: bool = ...,
     ) -> Any: ...
 
     block_size: int
@@ -50,6 +53,10 @@ _SLICEABLE_CACHE_TYPES = frozenset(
         "QuantizedKVCache",
         "TurboQuantKVCache",
         "BatchTurboQuantKVCache",
+        "Affine4KVCache",
+        "BatchAffine4KVCache",
+        "Affine8KVCache",
+        "BatchAffine8KVCache",
         "ChunkedKVCache",
         "MiniMaxM3KVCache",
         "QSAKVCache",
@@ -94,6 +101,7 @@ def run_specprefill_draft_scoring(
     extract_cache_states: ExtractCacheStates,
     sync_and_clear_cache: SyncAndClearCache,
     log: logging.Logger,
+    use_hot_cache: bool = True,
 ) -> None:
     """Score draft tokens, persist reusable cache state, and update ``request``."""
     tokens_to_score = plan.tokens_to_score
@@ -113,9 +121,12 @@ def run_specprefill_draft_scoring(
                     request.request_id, tokens_to_score[:-1]
                 )
                 if block_table and block_table.num_tokens > 0:
-                    draft_prefix_cache.preload_blocks(block_table)
+                    if use_hot_cache:
+                        draft_prefix_cache.preload_blocks(block_table)
                     # Avoid an alias that would retain restored KV through sync_and_clear_cache().
-                    draft_cache = draft_prefix_cache.reconstruct_cache(block_table)
+                    draft_cache = draft_prefix_cache.reconstruct_cache(
+                        block_table, promote_to_hot_cache=use_hot_cache
+                    )
                     if draft_cache:
                         draft_cached_tokens = block_table.num_tokens
             except Exception as error:
@@ -270,6 +281,7 @@ def run_specprefill_draft_scoring(
                         extracted_cache,
                         model_cache_config=model_cache_config,
                         boundary_snapshots=boundary_snapshots or None,
+                        hot_cache_write_back=use_hot_cache,
                     )
             except Exception as error:
                 log.debug(f"SpecPrefill: draft cache store failed: {error}")

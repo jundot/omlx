@@ -28,6 +28,7 @@
         'max_tool_result_tokens',
         'index_cache_freq',
         'turboquant_kv_enabled',
+        'turboquant_kv_scheme',
         'turboquant_kv_bits',
         'turboquant_skip_last',
         'qwen35_ane_prefill_enabled',
@@ -124,30 +125,6 @@
     };
     const ACC_PRESET_NAMES = ['quick', 'standard', 'full'];
 
-    // Chinese counts in ten-thousands: 万/亿/万亿 (zh) and 萬/億/兆 (zh-TW), the
-    // exact grouped figure below 10,000. Returns null for every other language.
-    function chineseCount(value) {
-        const lang = typeof document !== 'undefined' ? document.documentElement?.lang : '';
-        if (lang !== 'zh' && lang !== 'zh-TW') return null;
-        const number = Number(value);
-        if (!Number.isFinite(number)) return null;
-        const units = lang === 'zh-TW' ? ['萬', '億', '兆'] : ['万', '亿', '万亿'];
-        const scales = [1e4, 1e8, 1e12];
-        const magnitude = Math.abs(number);
-        let step = scales.length - 1;
-        while (step >= 0 && magnitude < scales[step]) step -= 1;
-        if (step < 0) return Math.round(number).toLocaleString(lang);
-        let mantissa = (magnitude / scales[step]).toFixed(1);
-        // 10,000万 is 1亿: the unit follows the printed mantissa.
-        if (Number(mantissa) >= 10000 && step < scales.length - 1) {
-            step += 1;
-            mantissa = (magnitude / scales[step]).toFixed(1);
-        }
-        const [whole, fraction] = mantissa.replace(/\.0$/, '').split('.');
-        const text = Number(whole).toLocaleString(lang) + (fraction ? '.' + fraction : '');
-        return (number < 0 ? '-' : '') + text + units[step];
-    }
-
     function dashboard() {
         // GridStack instance and helpers stay outside the reactive Alpine state.
         let dashGrid = null;
@@ -195,7 +172,7 @@
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, allow_unauthenticated_inference: false, sub_keys: [] },
-                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null, desktop_enabled: false },
                 integrations: {
                     copilot_model: null,
                     codex_model: null,
@@ -238,6 +215,8 @@
             // Splash launcher path row: manual entry when not detected or changed
             splashPath: { editing: false, draft: '', error: '', saving: false },
             splashOptionsError: '',
+            // Claude Desktop gateway profile state (macOS auto-config)
+            claudeDesktop: { configured: false, working: false, message: '' },
             // Engines selectable for the DDGS Custom provider (ddgs 9.14.1 text registry)
             ddgsBackendList: ['brave', 'duckduckgo', 'grokipedia', 'mojeek', 'wikipedia', 'yahoo', 'yandex'],
 
@@ -322,6 +301,7 @@
                 qwen35_oq_a8_min_tokens: 128,
                 external_engine: '',
                 external_engines: [],
+                model_format: null,
                 trust_remote_code: false,
                 embedding_audio_enabled: false,
                 embedding_audio_max_seconds: null,
@@ -438,6 +418,7 @@
             },
 
             statsScope: 'session',
+            statsNumberScale: window.omlxCount?.scale?.() || 'compact',
             // Dashboard block layout (see dashboard_layout.js)
             dashLayout: null,
             dashDraft: null,
@@ -511,7 +492,9 @@
             hfRecommendedLoaded: false,
             hfRecommendedLoading: false,
             hfRecommendedTab: 'trending',
-            hfMlxOnly: true,
+            // Downloader repo filter: 'mlx', 'gguf' or 'all'.
+            hfModelFormat: ['mlx', 'gguf', 'all'].includes(localStorage.getItem('hfModelFormat'))
+                ? localStorage.getItem('hfModelFormat') : 'mlx',
 
             // Pagination state
             hfPage: { trending: 1, popular: 1, search: 1 },
@@ -546,6 +529,9 @@
             // Model detail modal
             hfModelDetail: null,
             hfModelDetailLoading: false,
+            hfDetailTab: 'card',
+            // File name -> picked for download, for the detail modal's Files tab.
+            hfSelectedFiles: {},
 
             // Recommended (hardware-aware oQ picks) state
             recommendations: null,
@@ -794,6 +780,8 @@
                     this.checkForUpdate()
                 ]);
 
+                this.fetchClaudeDesktopStatus();
+
                 this.startUpdateCheckTimer();
 
                 this.onboardingStartedEmpty = !this.hasUserModels;
@@ -827,7 +815,8 @@
                     }
                 });
 
-                this.$watch('hfMlxOnly', () => {
+                this.$watch('hfModelFormat', (value) => {
+                    localStorage.setItem('hfModelFormat', value);
                     this.hfRecommended = { trending: [], popular: [] };
                     this.hfRecommendedLoaded = false;
                     this.hfSearchResults = [];
@@ -2179,8 +2168,12 @@
                     ttl_seconds: s.ttl_seconds ?? null,
                     enableIndexCache: !!(s.index_cache_freq),
                     index_cache_freq: s.index_cache_freq || null,
-                    turboquant_kv_enabled: s.turboquant_kv_enabled || false,
-                    turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    turboquant_kv_enabled: !isDiffusion && !model?.is_paroquant
+                        && (s.turboquant_kv_enabled || false),
+                    turboquant_kv_scheme: isDiffusion || model?.is_paroquant
+                        ? 'turboquant' : (s.turboquant_kv_scheme || 'turboquant'),
+                    turboquant_kv_bits: isDiffusion || model?.is_paroquant
+                        ? 4 : (s.turboquant_kv_bits || 4),
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
@@ -2233,6 +2226,7 @@
                     is_diffusion_model: isDiffusion,
                     external_engine: s.external_engine || '',
                     external_engines: model?.external_engines || [],
+                    model_format: model?.model_format || null,
                     trust_remote_code: s.trust_remote_code || false,
                     embedding_audio_enabled: s.embedding_audio_enabled || false,
                     embedding_audio_max_seconds: s.embedding_audio_max_seconds ?? null,
@@ -3122,6 +3116,232 @@
                 return null;
             },
 
+            buildModelSettingsPayload(ms) {
+                const isDiffusion = !!ms.is_diffusion_model;
+                // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
+                const chatTemplateKwargs = {};
+                const forcedCtKwargs = [];
+                for (const entry of ms.ctKwargEntries) {
+                    if (entry.type === 'enable_thinking') {
+                        if (isDiffusion) continue;
+                        chatTemplateKwargs.enable_thinking = entry.value === 'true';
+                        if (entry.force) forcedCtKwargs.push('enable_thinking');
+                    } else if (entry.type === 'reasoning_effort') {
+                        if (isDiffusion) continue;
+                        const rawEffort = entry.custom
+                            ? entry.customValue
+                            : entry.value;
+                        const effort = this.coerceKwargValue(rawEffort);
+                        if (String(effort).trim() !== '') {
+                            chatTemplateKwargs.reasoning_effort = effort;
+                            if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                        }
+                    } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
+                        const val = this.coerceKwargValue(entry.value);
+                        const key = entry.key.trim();
+                        if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
+                            continue;
+                        }
+                        chatTemplateKwargs[key] = val;
+                        if (entry.force) forcedCtKwargs.push(key);
+                    }
+                }
+                const payload = {
+                    model_alias: ms.model_alias?.trim() || null,
+                    model_type_override: ms.model_type_override || null,
+                    max_context_window: ms.max_context_window || null,
+                    max_tokens: ms.max_tokens || null,
+                    temperature: Number.isFinite(ms.temperature) ? ms.temperature : null,
+                    top_p: Number.isFinite(ms.top_p) ? ms.top_p : null,
+                    top_k: Number.isFinite(ms.top_k) ? ms.top_k : null,
+                    repetition_penalty: Number.isFinite(ms.repetition_penalty) ? ms.repetition_penalty : null,
+                    min_p: Number.isFinite(ms.min_p) ? ms.min_p : null,
+                    presence_penalty: Number.isFinite(ms.presence_penalty) ? ms.presence_penalty : null,
+                    force_sampling: ms.force_sampling,
+                    reasoning_parser: ms.reasoning_parser || null,
+                    ttl_seconds: ms.ttl_seconds || null,
+                    index_cache_freq: ms.enableIndexCache
+                        ? (ms.index_cache_freq || 4)
+                        : 0,
+                    enable_thinking: this.selectedModel?.thinking_forced ? null : ms.enable_thinking,
+                    qwen4_ple_ssd_offload:
+                        ms.qwen4_ple_ssd_offload_forced
+                            ? !!ms.qwen4_ple_ssd_offload_requested
+                            : !!ms.qwen4_ple_ssd_offload,
+                    deepseek_v41_ced_prefill_enabled:
+                        !!ms.deepseek_v41_ced_prefill_enabled,
+                    qwen4_gdn_decode_wide_proj:
+                        !!ms.qwen4_gdn_decode_wide_proj,
+                    deepseek_v41_engram_ssd_offload:
+                        ms.deepseek_v41_engram_ssd_offload_forced
+                            ? !!ms.deepseek_v41_engram_ssd_offload_requested
+                            : !!ms.deepseek_v41_engram_ssd_offload,
+                    thinking_budget_enabled: ms.enableThinkingBudget,
+                    thinking_budget_tokens: ms.enableThinkingBudget
+                        ? (ms.thinking_budget_tokens || null)
+                        : 0,
+                    guided_grammar_enabled: ms.guided_grammar_enabled,
+                    guided_grammar: ms.guided_grammar_enabled
+                        ? (ms.guided_grammar || null)
+                        : null,
+                    max_tool_result_tokens: ms.enableToolResultLimit
+                        ? (ms.max_tool_result_tokens || null)
+                        : 0,
+                    chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
+                        ? chatTemplateKwargs : null,
+                    forced_ct_kwargs: forcedCtKwargs.length > 0
+                        ? forcedCtKwargs : null,
+                    turboquant_kv_enabled: ms.turboquant_kv_enabled,
+                    turboquant_kv_scheme: ms.turboquant_kv_scheme,
+                    // Affine formats have fixed widths, also while compression is off.
+                    turboquant_kv_bits: ms.turboquant_kv_scheme === 'affine8' ? 8
+                        : ms.turboquant_kv_scheme === 'affine4' ? 4
+                        : ms.turboquant_kv_enabled ? (parseFloat(ms.turboquant_kv_bits) || 4)
+                        : 4,
+                    moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
+                    moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
+                    qwen35_oq_a8_enabled: !!ms.qwen35_oq_a8_enabled,
+                    qwen35_oq_a8_min_tokens: Number(ms.qwen35_oq_a8_min_tokens) || 128,
+                    qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
+                    // Validation only runs when the feature is enabled, so a
+                    // blank numeric input must fall back to the server default
+                    // instead of coercing to 0 and failing an unrelated save.
+                    qwen35_ane_prefill_sequence_length: Number(ms.qwen35_ane_prefill_sequence_length) || 2048,
+                    qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(ms.qwen35_ane_prefill_tail_padding_min_tokens))
+                        ? Number(ms.qwen35_ane_prefill_tail_padding_min_tokens)
+                        : 0,
+                    qwen35_ane_prefill_fraction: Number(ms.qwen35_ane_prefill_fraction),
+                    qwen35_ane_prefill_max_layers: Number(ms.qwen35_ane_prefill_max_layers) || 64,
+                    qwen35_ane_prefill_dual_ane: !!ms.qwen35_ane_prefill_dual_ane,
+                    qwen35_ane_prefill_gdn: !!ms.qwen35_ane_prefill_gdn,
+                    qwen35_ane_prefill_gdn_fraction: Number(ms.qwen35_ane_prefill_gdn_fraction) || 0.5,
+                    qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(ms.qwen35_ane_prefill_gdn_max_layers))
+                        ? Number(ms.qwen35_ane_prefill_gdn_max_layers)
+                        : 48,
+                    qwen35_ane_prefill_cpu_enabled: !!ms.qwen35_ane_prefill_cpu_enabled,
+                    qwen35_ane_prefill_cpu_fraction: Number(ms.qwen35_ane_prefill_cpu_fraction),
+                    qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_down_fraction))
+                        ? Number(ms.qwen35_ane_prefill_cpu_down_fraction)
+                        : 0,
+                    qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_gdn_fraction))
+                        ? Number(ms.qwen35_ane_prefill_cpu_gdn_fraction)
+                        : 0,
+                    qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_threads))
+                        ? Number(ms.qwen35_ane_prefill_cpu_threads)
+                        : 8,
+                    qwen35_ane_prefill_cpu_shared_resource: !!ms.qwen35_ane_prefill_cpu_shared_resource,
+                    specprefill_enabled: ms.specprefill_enabled,
+                    specprefill_draft_model: ms.specprefill_draft_model || null,
+                    specprefill_keep_pct: ms.specprefill_enabled
+                        ? parseFloat(ms.specprefill_keep_pct) || 0.2
+                        : null,
+                    specprefill_threshold: ms.specprefill_enabled
+                        ? (ms.specprefill_threshold || null)
+                        : null,
+                    dflash_enabled: ms.dflash_enabled,
+                    dflash_draft_model: ms.dflash_draft_model || null,
+                    dflash_draft_quant_enabled: ms.dflash_enabled && !!ms.dflash_draft_quant_enabled,
+                    dflash_draft_quant_weight_bits: ms.dflash_enabled && ms.dflash_draft_quant_enabled
+                        ? parseInt(ms.dflash_draft_quant_weight_bits)
+                        : null,
+                    dflash_draft_quant_group_size: ms.dflash_enabled && ms.dflash_draft_quant_enabled
+                        ? parseInt(ms.dflash_draft_quant_group_size)
+                        : null,
+                    // Long-context tuning. Empty → oMLX default.
+                    dflash_draft_window_size: ms.dflash_enabled
+                        && ms.dflash_draft_window_size
+                        ? parseInt(ms.dflash_draft_window_size)
+                        : null,
+                    dflash_block_size: ms.dflash_enabled
+                        && ms.dflash_block_size
+                        ? parseInt(ms.dflash_block_size)
+                        : null,
+                    dflash_verify_mode: ms.dflash_enabled
+                        ? (ms.dflash_verify_mode || 'adaptive')
+                        : null,
+                    mtp_enabled: !!ms.mtp_enabled,
+                    mtp_adaptive_max_depth: ms.mtp_enabled
+                        ? parseInt(ms.mtp_adaptive_max_depth || '3')
+                        : null,
+                    mtp_fixed_depth: null,
+                    qwen35_ane_prefill_shared_fraction: Number(ms.qwen35_ane_prefill_shared_fraction),
+                    vlm_mtp_enabled: !!ms.vlm_mtp_enabled,
+                    vlm_mtp_draft_model: ms.vlm_mtp_enabled
+                        ? (ms.vlm_mtp_draft_model || null)
+                        : null,
+                    vlm_mtp_draft_block_size: ms.vlm_mtp_enabled
+                        && ms.vlm_mtp_draft_block_size
+                        ? parseInt(ms.vlm_mtp_draft_block_size)
+                        : null,
+                    trust_remote_code: ms.trust_remote_code,
+                    external_engine: ms.external_engine || null,
+                };
+                if (isDiffusion) {
+                    Object.assign(payload, {
+                        top_p: null,
+                        top_k: null,
+                        repetition_penalty: null,
+                        min_p: null,
+                        presence_penalty: null,
+                        force_sampling: false,
+                        reasoning_parser: null,
+                        index_cache_freq: 0,
+                        enable_thinking: null,
+                        thinking_budget_enabled: false,
+                        thinking_budget_tokens: 0,
+                        guided_grammar_enabled: false,
+                        guided_grammar: null,
+                        max_tool_result_tokens: 0,
+                        turboquant_kv_enabled: false,
+                        turboquant_kv_scheme: 'turboquant',
+                        turboquant_kv_bits: 4,
+                        qwen35_ane_prefill_enabled: false,
+                        qwen35_ane_prefill_sequence_length: 2048,
+                        qwen35_ane_prefill_tail_padding_min_tokens: 0,
+                        qwen35_ane_prefill_fraction: 0.53,
+                        qwen35_ane_prefill_max_layers: 64,
+                        qwen35_ane_prefill_dual_ane: true,
+                        qwen35_ane_prefill_gdn: true,
+                        qwen35_ane_prefill_gdn_fraction: 0.5,
+                        qwen35_ane_prefill_gdn_max_layers: 48,
+                        qwen35_ane_prefill_cpu_enabled: false,
+                        qwen35_ane_prefill_cpu_fraction: 0.135,
+                        qwen35_ane_prefill_cpu_down_fraction: 0,
+                        qwen35_ane_prefill_cpu_gdn_fraction: 0,
+                        qwen35_ane_prefill_cpu_threads: 8,
+                        qwen35_ane_prefill_cpu_shared_resource: true,
+                        specprefill_enabled: false,
+                        specprefill_draft_model: null,
+                        specprefill_keep_pct: null,
+                        specprefill_threshold: null,
+                        external_engine: null,
+                        dflash_enabled: false,
+                        dflash_draft_model: null,
+                        dflash_draft_quant_enabled: false,
+                        dflash_draft_quant_weight_bits: null,
+                        dflash_draft_quant_group_size: null,
+                        dflash_draft_window_size: null,
+                        dflash_block_size: null,
+                        dflash_verify_mode: null,
+                        mtp_enabled: false,
+                        mtp_adaptive_max_depth: null,
+                        mtp_fixed_depth: null,
+                        vlm_mtp_enabled: false,
+                        vlm_mtp_draft_model: null,
+                        vlm_mtp_draft_block_size: null,
+                    });
+                }
+                if (this.selectedModel?.embedding_audio_supported) {
+                    const audioSeconds = Number(ms.embedding_audio_max_seconds);
+                    Object.assign(payload, {
+                        embedding_audio_enabled: !!ms.embedding_audio_enabled,
+                        // Empty keeps the 30 s processor default.
+                        embedding_audio_max_seconds: audioSeconds > 0 ? audioSeconds : null,
+                    });
+                }
+                return payload;
+            },
+
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
@@ -3139,230 +3359,24 @@
 
                 this.savingModelSettings = true;
                 try {
+                    const payload = this.buildModelSettingsPayload(this.modelSettings);
+                    if (this._modelSettingsBaseline) {
+                        // Send only edited fields so a stale form does not overwrite other changes.
+                        // Always send mtp_fixed_depth: null to clear a legacy fixed depth.
+                        const initial = this.buildModelSettingsPayload(
+                            JSON.parse(this._modelSettingsBaseline),
+                        );
+                        for (const key of Object.keys(payload)) {
+                            if (key !== 'mtp_fixed_depth'
+                                && JSON.stringify(payload[key]) === JSON.stringify(initial[key])) {
+                                delete payload[key];
+                            }
+                        }
+                    }
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify((() => {
-                            const isDiffusion = !!this.modelSettings.is_diffusion_model;
-                            // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
-                            const chatTemplateKwargs = {};
-                            const forcedCtKwargs = [];
-                            for (const entry of this.modelSettings.ctKwargEntries) {
-                                if (entry.type === 'enable_thinking') {
-                                    if (isDiffusion) continue;
-                                    chatTemplateKwargs.enable_thinking = entry.value === 'true';
-                                    if (entry.force) forcedCtKwargs.push('enable_thinking');
-                                } else if (entry.type === 'reasoning_effort') {
-                                    if (isDiffusion) continue;
-                                    const rawEffort = entry.custom
-                                        ? entry.customValue
-                                        : entry.value;
-                                    const effort = this.coerceKwargValue(rawEffort);
-                                    if (String(effort).trim() !== '') {
-                                        chatTemplateKwargs.reasoning_effort = effort;
-                                        if (entry.force) forcedCtKwargs.push('reasoning_effort');
-                                    }
-                                } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
-                                    const val = this.coerceKwargValue(entry.value);
-                                    const key = entry.key.trim();
-                                    if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
-                                        continue;
-                                    }
-                                    chatTemplateKwargs[key] = val;
-                                    if (entry.force) forcedCtKwargs.push(key);
-                                }
-                            }
-                            const payload = {
-                                model_alias: this.modelSettings.model_alias?.trim() || null,
-                                model_type_override: this.modelSettings.model_type_override || null,
-                                max_context_window: this.modelSettings.max_context_window || null,
-                                max_tokens: this.modelSettings.max_tokens || null,
-                                temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
-                                top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
-                                top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
-                                repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
-                                min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
-                                presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
-                                force_sampling: this.modelSettings.force_sampling,
-                                reasoning_parser: this.modelSettings.reasoning_parser || null,
-                                ttl_seconds: this.modelSettings.ttl_seconds || null,
-                                index_cache_freq: this.modelSettings.enableIndexCache
-                                    ? (this.modelSettings.index_cache_freq || 4)
-                                    : 0,
-                                enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
-                                qwen4_ple_ssd_offload:
-                                    this.modelSettings.qwen4_ple_ssd_offload_forced
-                                        ? !!this.modelSettings.qwen4_ple_ssd_offload_requested
-                                        : !!this.modelSettings.qwen4_ple_ssd_offload,
-                                deepseek_v41_ced_prefill_enabled:
-                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
-                                qwen4_gdn_decode_wide_proj:
-                                    !!this.modelSettings.qwen4_gdn_decode_wide_proj,
-                                deepseek_v41_engram_ssd_offload:
-                                    this.modelSettings.deepseek_v41_engram_ssd_offload_forced
-                                        ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
-                                        : !!this.modelSettings.deepseek_v41_engram_ssd_offload,
-                                thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
-                                thinking_budget_tokens: this.modelSettings.enableThinkingBudget
-                                    ? (this.modelSettings.thinking_budget_tokens || null)
-                                    : 0,
-                                guided_grammar_enabled: this.modelSettings.guided_grammar_enabled,
-                                guided_grammar: this.modelSettings.guided_grammar_enabled
-                                    ? (this.modelSettings.guided_grammar || null)
-                                    : null,
-                                max_tool_result_tokens: this.modelSettings.enableToolResultLimit
-                                    ? (this.modelSettings.max_tool_result_tokens || null)
-                                    : 0,
-                                chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
-                                    ? chatTemplateKwargs : null,
-                                forced_ct_kwargs: forcedCtKwargs.length > 0
-                                    ? forcedCtKwargs : null,
-                                turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
-                                turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
-                                    ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
-                                    : 4,
-                                moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
-                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
-                                qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
-                                qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
-                                qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
-                                // Validation only runs when the feature is enabled, so a
-                                // blank numeric input must fall back to the server default
-                                // instead of coercing to 0 and failing an unrelated save.
-                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
-                                qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
-                                    : 0,
-                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction),
-                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
-                                qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
-                                qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
-                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
-                                qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
-                                    : 48,
-                                qwen35_ane_prefill_cpu_enabled: !!this.modelSettings.qwen35_ane_prefill_cpu_enabled,
-                                qwen35_ane_prefill_cpu_fraction: Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction),
-                                qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction)
-                                    : 0,
-                                qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction)
-                                    : 0,
-                                qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_threads))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
-                                    : 8,
-                                qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
-                                specprefill_enabled: this.modelSettings.specprefill_enabled,
-                                specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
-                                specprefill_keep_pct: this.modelSettings.specprefill_enabled
-                                    ? parseFloat(this.modelSettings.specprefill_keep_pct) || 0.2
-                                    : null,
-                                specprefill_threshold: this.modelSettings.specprefill_enabled
-                                    ? (this.modelSettings.specprefill_threshold || null)
-                                    : null,
-                                dflash_enabled: this.modelSettings.dflash_enabled,
-                                dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_enabled: this.modelSettings.dflash_enabled && !!this.modelSettings.dflash_draft_quant_enabled,
-                                dflash_draft_quant_weight_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_weight_bits)
-                                    : null,
-                                dflash_draft_quant_group_size: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_group_size)
-                                    : null,
-                                // Long-context tuning. Empty → oMLX default.
-                                dflash_draft_window_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_draft_window_size
-                                    ? parseInt(this.modelSettings.dflash_draft_window_size)
-                                    : null,
-                                dflash_block_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_block_size
-                                    ? parseInt(this.modelSettings.dflash_block_size)
-                                    : null,
-                                dflash_verify_mode: this.modelSettings.dflash_enabled
-                                    ? (this.modelSettings.dflash_verify_mode || 'adaptive')
-                                    : null,
-                                mtp_enabled: !!this.modelSettings.mtp_enabled,
-                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
-                                    ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
-                                    : null,
-                                mtp_fixed_depth: null,
-                                qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
-                                vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
-                                vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
-                                    ? (this.modelSettings.vlm_mtp_draft_model || null)
-                                    : null,
-                                vlm_mtp_draft_block_size: this.modelSettings.vlm_mtp_enabled
-                                    && this.modelSettings.vlm_mtp_draft_block_size
-                                    ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
-                                    : null,
-                                trust_remote_code: this.modelSettings.trust_remote_code,
-                                external_engine: this.modelSettings.external_engine || null,
-                            };
-                            if (isDiffusion) {
-                                Object.assign(payload, {
-                                    top_p: null,
-                                    top_k: null,
-                                    repetition_penalty: null,
-                                    min_p: null,
-                                    presence_penalty: null,
-                                    force_sampling: false,
-                                    reasoning_parser: null,
-                                    index_cache_freq: 0,
-                                    enable_thinking: null,
-                                    thinking_budget_enabled: false,
-                                    thinking_budget_tokens: 0,
-                                    guided_grammar_enabled: false,
-                                    guided_grammar: null,
-                                    max_tool_result_tokens: 0,
-                                    turboquant_kv_enabled: false,
-                                    turboquant_kv_bits: 4,
-                                    qwen35_ane_prefill_enabled: false,
-                                    qwen35_ane_prefill_sequence_length: 2048,
-                                    qwen35_ane_prefill_tail_padding_min_tokens: 0,
-                                    qwen35_ane_prefill_fraction: 0.53,
-                                    qwen35_ane_prefill_max_layers: 64,
-                                    qwen35_ane_prefill_dual_ane: true,
-                                    qwen35_ane_prefill_gdn: true,
-                                    qwen35_ane_prefill_gdn_fraction: 0.5,
-                                    qwen35_ane_prefill_gdn_max_layers: 48,
-                                    qwen35_ane_prefill_cpu_enabled: false,
-                                    qwen35_ane_prefill_cpu_fraction: 0.135,
-                                    qwen35_ane_prefill_cpu_down_fraction: 0,
-                                    qwen35_ane_prefill_cpu_gdn_fraction: 0,
-                                    qwen35_ane_prefill_cpu_threads: 8,
-                                    qwen35_ane_prefill_cpu_shared_resource: true,
-                                    specprefill_enabled: false,
-                                    specprefill_draft_model: null,
-                                    specprefill_keep_pct: null,
-                                    specprefill_threshold: null,
-                                    external_engine: null,
-                                    dflash_enabled: false,
-                                    dflash_draft_model: null,
-                                    dflash_draft_quant_enabled: false,
-                                    dflash_draft_quant_weight_bits: null,
-                                    dflash_draft_quant_group_size: null,
-                                    dflash_draft_window_size: null,
-                                    dflash_block_size: null,
-                                    dflash_verify_mode: null,
-                                    mtp_enabled: false,
-                                    mtp_adaptive_max_depth: null,
-                                    mtp_fixed_depth: null,
-                                    vlm_mtp_enabled: false,
-                                    vlm_mtp_draft_model: null,
-                                    vlm_mtp_draft_block_size: null,
-                                });
-                            }
-                            if (this.selectedModel?.embedding_audio_supported) {
-                                const audioSeconds = Number(this.modelSettings.embedding_audio_max_seconds);
-                                Object.assign(payload, {
-                                    embedding_audio_enabled: !!this.modelSettings.embedding_audio_enabled,
-                                    // Empty keeps the 30 s processor default.
-                                    embedding_audio_max_seconds: audioSeconds > 0 ? audioSeconds : null,
-                                });
-                            }
-                            return payload;
-                        })()),
+                        body: JSON.stringify(payload),
                     });
 
                     if (response.ok) {
@@ -3583,6 +3597,7 @@
                         this.modelSettings.max_tool_result_tokens = 0;
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
+                        this.modelSettings.turboquant_kv_scheme = 'turboquant';
                         this.modelSettings.turboquant_kv_bits = 4;
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
@@ -3843,11 +3858,15 @@
                             claude_code_opus_model: this.globalSettings.claude_code.opus_model,
                             claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
                             claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
+                            claude_code_desktop_enabled: this.globalSettings.claude_code.desktop_enabled,
                         }),
                     });
                     if (!response.ok) {
                         console.error('Failed to save Claude Code settings');
                     }
+                    // The toggle writes/restores the Claude Desktop gateway
+                    // profile server-side; refresh the shown state.
+                    this.fetchClaudeDesktopStatus();
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
                 }
@@ -3887,7 +3906,7 @@
                     return {
                         id,
                         label: window.t(tile.label),
-                        value: tile.unit === '%' ? raw.toFixed(1) : this.formatNumber(raw),
+                        value: tile.unit === '%' ? raw.toFixed(1) : this.formatServingCount(raw),
                         unit: tile.unit || '',
                     };
                 });
@@ -4142,6 +4161,71 @@
                 }
             },
 
+            async fetchClaudeDesktopStatus() {
+                try {
+                    const response = await fetch('/admin/api/claude-desktop/status');
+                    if (!response.ok) return;
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                } catch (err) {
+                    console.error('Failed to fetch Claude Desktop status:', err);
+                }
+            },
+
+            async reapplyClaudeDesktopConfig() {
+                this.claudeDesktop.working = true;
+                this.claudeDesktop.message = '';
+                try {
+                    const enabled = !!this.globalSettings.claude_code.desktop_enabled;
+                    const endpoint = enabled
+                        ? '/admin/api/claude-desktop/configure'
+                        : '/admin/api/claude-desktop/restore';
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({}),
+                    });
+                    if (!response.ok) {
+                        console.error('Failed to apply Claude Desktop configuration');
+                        return;
+                    }
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                } catch (err) {
+                    console.error('Failed to apply Claude Desktop configuration:', err);
+                } finally {
+                    this.claudeDesktop.working = false;
+                }
+            },
+
+            async restoreClaudeDesktopConfig() {
+                if (this.claudeDesktop.working) return;
+                this.claudeDesktop.working = true;
+                this.claudeDesktop.message = '';
+                try {
+                    const response = await fetch('/admin/api/claude-desktop/restore', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({}),
+                    });
+                    if (!response.ok) {
+                        this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_error');
+                        return;
+                    }
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                    this.globalSettings.claude_code.desktop_enabled = false;
+                    await this.saveClaudeCodeSettings();
+                    this.claudeDesktop.configured = !!data.configured;
+                    this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_success');
+                } catch (err) {
+                    console.error('Failed to restore Claude Desktop configuration:', err);
+                    this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_error');
+                } finally {
+                    this.claudeDesktop.working = false;
+                }
+            },
+
             _launchCmd(tool) {
                 const raw = this.stats.cli_prefix || 'omlx';
                 const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
@@ -4150,6 +4234,10 @@
 
             get claudeCommand() {
                 return this._launchCmd('claude');
+            },
+
+            get claudeDesktopCommand() {
+                return this._launchCmd('claude_desktop');
             },
 
             get codexCommand() {
@@ -4261,9 +4349,48 @@
                 return usable ? usable.id : '';
             },
 
+            isGgufModel() {
+                return this.modelSettings.model_format === 'gguf';
+            },
+
+            // A GGUF runs on an external engine even when its settings pick none.
+            effectiveExternalEngine() {
+                if (this.modelSettings.external_engine) return this.modelSettings.external_engine;
+                if (!this.isGgufModel()) return '';
+                return this.firstUsableExternalEngine() || this.modelSettings.external_engines?.[0]?.id || '';
+            },
+
+            externalEngineDraftRepo() {
+                const engines = this.modelSettings.external_engines || [];
+                const engine = engines.find(e => e.id === this.effectiveExternalEngine()) || engines[0];
+                return engine && !engine.compatible ? engine.draft_repo || '' : '';
+            },
+
+            async downloadEngineDraft() {
+                const repoId = this.externalEngineDraftRepo();
+                if (!repoId) return;
+                try {
+                    const response = await fetch('/admin/api/hf/download', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repo_id: repoId, hf_token: this.hfToken }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        alert(data.detail || window.t('js.error.start_download_failed'));
+                        return;
+                    }
+                    alert(window.t('js.success.download_started').replace('{repo_id}', repoId));
+                    await this.loadHFTasks();
+                    this.startHFRefresh();
+                } catch (err) {
+                    alert(window.t('js.error.hf_connect_failed'));
+                }
+            },
+
             externalEngineReason() {
                 const engines = this.modelSettings.external_engines || [];
-                const selected = engines.find(e => e.id === this.modelSettings.external_engine);
+                const selected = engines.find(e => e.id === this.effectiveExternalEngine());
                 if (selected) return selected.compatible ? '' : selected.reason;
                 return engines.some(e => e.compatible) ? '' : (engines[0]?.reason || '');
             },
@@ -4477,11 +4604,23 @@
             },
 
             formatNumber(num) {
-                const chinese = chineseCount(num);
-                if (chinese !== null) return chinese;
+                const compact = window.omlxCount?.eastAsian?.(num);
+                if (compact != null) return compact;
                 if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
                 if (num >= 10000000) return (num / 1000000).toFixed(1) + 'M';
                 return num.toLocaleString();
+            },
+
+            setStatsNumberScale(value) {
+                this.statsNumberScale = value;
+                window.omlxCount?.setScale?.(value);
+            },
+
+            formatServingCount(value) {
+                if (this.statsNumberScale === 'exact') {
+                    return window.omlxCount.exact(value);
+                }
+                return this.formatNumber(value);
             },
 
             cacheObsCumulative(stats, selectedModel) {
@@ -4529,8 +4668,8 @@
             },
 
             formatTokenCount(n) {
-                const chinese = chineseCount(n);
-                if (chinese !== null) return chinese;
+                const compact = window.omlxCount?.eastAsian?.(n);
+                if (compact != null) return compact;
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                 return String(n);
@@ -6900,8 +7039,14 @@
             // HuggingFace Downloader Functions
             // =================================================================
 
-            async startHFDownload() {
+            startHFDownload() {
                 const repoId = this.hfRepoId.trim();
+                if (!repoId) return;
+                this.openModelDetail(repoId, 'files');
+            },
+
+            async submitHFDownload(files) {
+                const repoId = this.hfModelDetail?.repo_id;
                 if (!repoId) return;
 
                 this.hfError = '';
@@ -6917,13 +7062,15 @@
                         body: JSON.stringify({
                             repo_id: repoId,
                             hf_token: this.hfToken,
+                            files,
                         }),
                         signal: controller.signal,
                     });
 
                     if (response.ok) {
                         this.hfSuccess = window.t('js.success.download_started').replace('{repo_id}', repoId);
-                        this.hfRepoId = '';
+                        if (this.hfRepoId.trim().toLowerCase() === repoId.toLowerCase()) this.hfRepoId = '';
+                        this.closeModelDetail();
                         await this.loadHFTasks();
                         this.startHFRefresh();
                         setTimeout(() => { this.hfSuccess = ''; }, 5000);
@@ -7073,8 +7220,18 @@
                 const pct = Math.round(task.progress || 0);
                 const dlGB = (task.downloaded_size / (1024 ** 3)).toFixed(1);
                 const totalGB = (task.total_size / (1024 ** 3)).toFixed(1);
-                const base = `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB`;
-                return `${base} \u00b7 ${this.formatSpeed(task)}`;
+                const base = `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB \u00b7 ${this.formatSpeed(task)}`;
+                const eta = this.formatEta(task.eta_seconds);
+                return eta ? `${base} \u00b7 ${eta}` : base;
+            },
+
+            formatEta(seconds) {
+                if (seconds == null) return '';
+                const h = Math.floor(seconds / 3600);
+                const m = Math.floor((seconds % 3600) / 60);
+                const s = seconds % 60;
+                const time = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+                return window.t('models.queue.eta').replace('{time}', time);
             },
 
             formatSpeed(task) {
@@ -7514,7 +7671,7 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
-                    const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
+                    const response = await fetch(`/admin/api/hf/recommended?model_format=${this.hfModelFormat}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
                         this.hfTokenInvalid = !!data.hf_token_invalid;
@@ -7550,9 +7707,25 @@
                 }
             },
 
+            // The GGUF model files a task fetches, shown beside its repo.
+            taskGgufFiles(task) {
+                return (task.files || [])
+                    .filter(name => !name.includes('/') && name.toLowerCase().endsWith('.gguf')
+                        && !name.toLowerCase().includes('mmproj'))
+                    .join(', ');
+            },
+
+            // The model ID a finished download serves under: a GGUF's file name.
+            taskModelId(task) {
+                const name = (task.files || []).find(f => !f.includes('/')
+                    && f.toLowerCase().endsWith('.gguf') && !f.toLowerCase().includes('mmproj'));
+                if (!name) return task.repo_id.split('/').pop();
+                return name.replace(/(-\d{5}-of-\d{5})?\.gguf$/i, '');
+            },
+
+            // Every download picks its files in the detail modal first.
             downloadRecommended(repoId) {
-                this.hfRepoId = repoId;
-                this.startHFDownload();
+                this.openModelDetail(repoId, 'files');
             },
 
             isModelDownloaded(repoId) {
@@ -7827,8 +8000,8 @@
             },
 
             formatDownloads(count) {
-                const chinese = chineseCount(count);
-                if (chinese !== null) return chinese;
+                const compact = window.omlxCount?.eastAsian?.(count);
+                if (compact != null) return compact;
                 if (count >= 1000000) return (count / 1000000).toFixed(1) + 'M';
                 if (count >= 1000) return (count / 1000).toFixed(1) + 'K';
                 return count.toString();
@@ -7926,7 +8099,7 @@
                         q: this.hfSearchQuery,
                         sort: this.hfSearchSort,
                         limit: '100',
-                        mlx_only: this.hfMlxOnly,
+                        model_format: this.hfModelFormat,
                     });
                     // Add filter parameters if set. Sizes use binary GiB to match
                     // _format_model_size on the backend.
@@ -8021,30 +8194,40 @@
             },
 
             // Model detail modal
-            async openModelDetail(repoId) {
+            async openModelDetail(repoId, tab = 'card') {
                 this.hfModelDetailLoading = true;
                 this.hfModelDetail = null;
+                this.hfDetailTab = tab;
+                this.hfSelectedFiles = {};
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
+                // A download still starts when the file list does not load.
+                const unavailable = (message) => {
+                    if (tab !== 'files') {
+                        this.hfError = message;
+                        setTimeout(() => { this.hfError = ''; }, 5000);
+                        return;
+                    }
+                    this.hfModelDetail = { repo_id: repoId, files: [], tags: [], layout: 'other',
+                                           downloads: 0, likes: 0, download_all_size: 0,
+                                           unavailable: message };
+                };
                 try {
                     const params = new URLSearchParams({ repo_id: repoId });
-                    const response = await fetch(`/admin/api/hf/model-info?${params}`, { signal: controller.signal });
+                    const headers = this.hfToken ? { 'X-HF-Token': this.hfToken } : {};
+                    const response = await fetch(`/admin/api/hf/model-info?${params}`, { headers, signal: controller.signal });
                     if (response.ok) {
                         this.hfModelDetail = await response.json();
+                        this.resetHfSelection();
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || window.t('js.error.fetch_model_info_failed');
-                        setTimeout(() => { this.hfError = ''; }, 5000);
+                        unavailable(data.detail || window.t('js.error.fetch_model_info_failed'));
                     }
                 } catch (err) {
-                    if (err.name === 'AbortError') {
-                        this.hfError = window.t('js.error.hf_timeout');
-                    } else {
-                        this.hfError = window.t('js.error.hf_connect_failed');
-                    }
-                    setTimeout(() => { this.hfError = ''; }, 5000);
+                    unavailable(err.name === 'AbortError'
+                        ? window.t('js.error.hf_timeout') : window.t('js.error.hf_connect_failed'));
                     console.error('Failed to fetch model info:', err);
                 } finally {
                     clearTimeout(timeoutId);
@@ -8057,6 +8240,73 @@
                 this.hfModelDetailLoading = false;
                 this.msModelDetail = null;
                 this.msModelDetailLoading = false;
+            },
+
+            // A selection starts from what "download all" fetches; GGUF repos start empty.
+            resetHfSelection() {
+                const picked = {};
+                for (const file of this.hfModelDetail?.files || []) {
+                    if (file.preselected && !file.local) picked[file.name] = true;
+                }
+                this.hfSelectedFiles = picked;
+            },
+
+            isHfFileLocked(file) {
+                return file.required || file.local;
+            },
+
+            isHfFileSelected(file) {
+                return !file.local && (file.required || !!this.hfSelectedFiles[file.name]);
+            },
+
+            // A split GGUF's parts toggle together; a GGUF brings its vision projector.
+            toggleHfFile(file) {
+                if (this.isHfFileLocked(file)) return;
+                const files = this.hfModelDetail.files;
+                const on = !this.hfSelectedFiles[file.name];
+                const picked = { ...this.hfSelectedFiles };
+                const members = file.group ? files.filter(f => f.group === file.group) : [file];
+                for (const member of members) {
+                    if (!member.local) picked[member.name] = on;
+                }
+                const projector = on && file.mmproj && files.find(f => f.name === file.mmproj);
+                if (projector && !projector.local) picked[projector.name] = true;
+                this.hfSelectedFiles = picked;
+            },
+
+            hfSelectedNames() {
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => this.isHfFileSelected(file))
+                    .map(file => file.name);
+            },
+
+            hfSelectionSize() {
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => this.isHfFileSelected(file))
+                    .reduce((total, file) => total + (file.size || 0), 0);
+            },
+
+            // A split GGUF loads as one model: size the whole set.
+            hfFileSize(file) {
+                if (!file.group) return file.size || 0;
+                return this.hfModelDetail.files
+                    .filter(f => f.group === file.group)
+                    .reduce((total, f) => total + (f.size || 0), 0);
+            },
+
+            // What "download all" still has to fetch: its files not downloaded yet.
+            hfDownloadAllSize() {
+                const detail = this.hfModelDetail;
+                if (!detail?.files?.length) return detail?.download_all_size || 0;
+                const fetched = detail.layout === 'safetensors' ? (f => f.preselected) : (() => true);
+                return detail.files
+                    .filter(f => fetched(f) && !f.local)
+                    .reduce((total, f) => total + (f.size || 0), 0);
+            },
+
+            hfFitsDisk(bytes) {
+                const free = this.hfModelDetail?.disk_free;
+                return !free || bytes <= free;
             },
 
             formatFileSize(bytes) {

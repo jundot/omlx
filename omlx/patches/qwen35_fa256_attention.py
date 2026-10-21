@@ -22,8 +22,8 @@ import time
 
 import mlx.core as mx
 
+from omlx.custom_kernels.attention import fast as _attention_fast
 from omlx.custom_kernels.nax import is_nax_available
-from omlx.custom_kernels.qwen35_prefill import fast as _fa256_fast
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +73,12 @@ _K_BLOCK = 8
 
 def _native_kernel():
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.attention import fast
     except Exception:
         return None
-    if not fast.has_symbol("qwen35_fa256_attention"):
+    if not fast.has_symbol("fa256_attention"):
         return None
-    return fast.qwen35_fa256_attention
+    return fast.fa256_attention
 
 
 def _has_quantized_cache(cache) -> bool:
@@ -226,7 +226,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     min_kv_len = min_kv_len or 2048
     q_block = _Q_BLOCK
     k_block = _K_BLOCK
-    if not _fa256_fast.fa256_supports_dispatch_budget():
+    if not _attention_fast.fa256_supports_dispatch_budget():
         logger.warning(
             "Qwen FA-256 steel kernel predates chunked dispatch (issue "
             "#2225); long-context prefill may hit the IOGPU preemption "

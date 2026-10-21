@@ -101,11 +101,14 @@ def test_index_scores_packed_candidates_and_causal(
         )
     actual = packed_index_scores(q, keys, weights, 263, 2, candidates)
     expanded = unpack_activation(keys, 4, dtype=mx.float32)
-    expected = mx.sum(
-        mx.maximum(mx.einsum("bshd,btd->bsht", q.astype(mx.float32), expanded), 0)
-        * weights[..., None],
-        -2,
+    # DeepSeek-V4.1-Flash-1017 Indexer rounding points, in the activation dtype R:
+    # R(q.k), R(relu(.) * w), then an fp32 head sum stored as R.
+    rnd = lambda v: v.astype(dtype).astype(mx.float32)
+    terms = rnd(
+        mx.maximum(rnd(mx.einsum("bshd,btd->bsht", q.astype(mx.float32), expanded)), 0)
+        * weights[..., None]
     )
+    expected, magnitude = rnd(mx.sum(terms, -2)), mx.sum(mx.abs(terms), -2)
     valid = mx.arange(n) < ((263 + mx.arange(length) + 1) // 2)[:, None]
     expected = mx.where(valid, expected, -float("inf"))
     if candidates is not None:
@@ -113,7 +116,18 @@ def test_index_scores_packed_candidates_and_causal(
         expected = mx.where(
             (candidates >= 0) & (candidates < n), expected, -float("inf")
         )
-    np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)
+        magnitude = mx.take_along_axis(magnitude, mx.clip(candidates, 0, n - 1), -1)
+    # Free orders (the q.k dot and the head sum) can move each R rounding by one ulp.
+    eps = float(np.finfo(np.float32).eps) if dtype == mx.float32 else (
+        2.0**-10 if dtype == mx.float16 else 2.0**-7
+    )
+    actual, expected = np.asarray(actual), np.asarray(expected)
+    finite = np.isfinite(expected)
+    np.testing.assert_array_equal(np.isfinite(actual), finite)
+    np.testing.assert_array_less(
+        np.abs(actual - expected)[finite],
+        (2 * eps * np.asarray(magnitude) + 3e-5)[finite],
+    )
 
 
 def test_candidate_block_ids_preserve_latest_and_partial_blocks():

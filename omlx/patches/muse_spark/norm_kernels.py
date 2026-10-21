@@ -8,10 +8,13 @@ the same math in one launch per group:
 
 * ``scaled_rms``: ``T((x * inv) * w)`` in FP32, ``w`` or ``T(1 + w)``.
 * ``post_attention``: scaleless norm of the attention output, the residual
-  gate, then the centered pre-feedforward norm.
+  gate, then the pre-feedforward norm.
 * ``moe_tail``: the input-scaled norm of every expert row, then the FP32
   routing-weighted sum in expert order.
 * ``post_moe``: the input-scaled post-feedforward norm and the residual gate.
+
+With ``centered`` the norm weights are zero-centered and the kernels scale by
+``T(1 + w)``; without it ``w`` is that gain already.
 
 Every value is rounded to the activation dtype where the reference rounds it,
 and rows are read like MLX's RMSNorm kernels (4 values per thread, looping
@@ -118,7 +121,7 @@ _POST_ATTENTION_SOURCE = _PROLOGUE + r"""
   inv = metal::precise::rsqrt(sum / AXIS + eps_n);
   for (int i = 0; i < N_READS; i++) {
     if (col[i] < AXIS) {
-      n_out[base + col[i]] = static_cast<T>((v[i] * inv) * muse_weight(w, col[i], true));
+      n_out[base + col[i]] = static_cast<T>((v[i] * inv) * muse_weight(w, col[i], CENTERED));
     }
   }
 """
@@ -128,7 +131,7 @@ _MOE_TAIL_SOURCE = _PROLOGUE + r"""
   float wv[N_READS];
   float total[N_READS];
   for (int i = 0; i < N_READS; i++) {
-    wv[i] = col[i] < AXIS ? muse_weight(w, col[i], true) : 0.0f;
+    wv[i] = col[i] < AXIS ? muse_weight(w, col[i], CENTERED) : 0.0f;
     total[i] = 0.0f;
   }
   for (int k = 0; k < TOPK; k++) {
@@ -163,7 +166,7 @@ _POST_MOE_SOURCE = _PROLOGUE + r"""
   for (int i = 0; i < N_READS; i++) {
     v[i] = col[i] < AXIS
         ? static_cast<float>(static_cast<T>(
-              static_cast<float>(m[base + col[i]]) * muse_weight(w, col[i], true)))
+              static_cast<float>(m[base + col[i]]) * muse_weight(w, col[i], CENTERED)))
         : 0.0f;
     acc += v[i] * v[i];
   }
@@ -239,8 +242,10 @@ def scaled_rms(x, w, eps: float, centered: bool):
     return out
 
 
-def post_attention(x, attn, alpha, beta, w, attn_eps: float, norm_eps: float):
-    """Residual gate of the normed attention output, then the centered norm.
+def post_attention(
+    x, attn, alpha, beta, w, attn_eps: float, norm_eps: float, centered: bool = True
+):
+    """Residual gate of the normed attention output, then the next norm.
 
     Returns ``(x, norm(x))``.
     """
@@ -252,11 +257,11 @@ def post_attention(x, attn, alpha, beta, w, attn_eps: float, norm_eps: float):
         [x, attn, alpha, beta, w, _eps(float(attn_eps), float(norm_eps))],
         x.shape,
         x.dtype,
-        [("W", w.dtype)],
+        [("W", w.dtype), ("CENTERED", bool(centered))],
     )
 
 
-def moe_tail(y, scores, w, eps: float):
+def moe_tail(y, scores, w, eps: float, centered: bool = True):
     """Input-scaled norm of every expert row, then the weighted FP32 sum.
 
     ``y`` is ``(..., K, D)`` and ``scores`` ``(..., K)``; returns ``(..., D)``.
@@ -269,12 +274,12 @@ def moe_tail(y, scores, w, eps: float):
         [y, scores.astype(mx.float32), w, _eps(float(eps))],
         y.shape[:-2] + y.shape[-1:],
         y.dtype,
-        [("W", w.dtype), ("TOPK", int(y.shape[-2]))],
+        [("W", w.dtype), ("TOPK", int(y.shape[-2])), ("CENTERED", bool(centered))],
     )
     return out
 
 
-def post_moe(x, mlp_out, alpha, beta, w, eps: float):
+def post_moe(x, mlp_out, alpha, beta, w, eps: float, centered: bool = True):
     """Input-scaled norm of the MoE output, then the residual gate."""
     (out,) = _launch(
         "post_moe",
@@ -284,6 +289,6 @@ def post_moe(x, mlp_out, alpha, beta, w, eps: float):
         [x, mlp_out, alpha, beta, w, _eps(float(eps))],
         x.shape,
         x.dtype,
-        [("W", w.dtype)],
+        [("W", w.dtype), ("CENTERED", bool(centered))],
     )
     return out

@@ -1304,6 +1304,10 @@ function clusterV2Wizard() {
             return device?.caps?.chip || window.t('cluster.v2.device.apple_silicon');
         },
 
+        deviceLoopbackOnly(device) {
+            return !!device?.caps?.loopback_only;
+        },
+
         deviceLinkMeta(device) {
             return (
                 CLUSTER_V2_LINK_META[device?.link] ||

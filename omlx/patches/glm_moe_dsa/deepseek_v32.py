@@ -706,7 +706,7 @@ class DeepseekV32MoE(nn.Module):
         use_weighted_sum = (
             _use_glm_moe_weighted_sum(self.config)
             and inds.size >= 64
-            and hasattr(glm_fast, "glm_moe_weighted_sum")
+            and hasattr(glm_fast, "moe_weighted_sum")
         )
         y = self.switch_mlp(
             x,

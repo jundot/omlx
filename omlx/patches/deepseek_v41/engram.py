@@ -130,6 +130,10 @@ class NgramHash:
         return np.concatenate(hashes, -1) + self.offsets, joined[:, -depth:]
 
 
+# Inputs of up to this many rows (batched decode, MTP verify) are projected row by row.
+_ROWWISE_ROWS = 8
+
+
 class Engram(nn.Module):
     def __init__(self, config, table_index):
         super().__init__()
@@ -149,14 +153,28 @@ class Engram(nn.Module):
 
     def __call__(self, h, ids, image_mask=None):
         c = self._config
-        kv = self.wkv(self.embed(mx.array(ids)).flatten(-2))
+        rows = self.embed(mx.array(ids)).flatten(-2)
+        count = rows.shape[0] * rows.shape[1] if rows.ndim == 3 else 1
+        if 1 < count <= _ROWWISE_ROWS:
+            # Decode-sized inputs (one token for each of B requests, or an MTP verify block
+            # of one request): project each row on its own, exactly as a single-token
+            # decode does. A multi-row quantized_matmul runs a different MLX kernel whose
+            # fp32 sums round differently (the reference leaves GEMM order free, but a
+            # token's output would then depend on its batch or on speculation).
+            flat = rows.reshape(count, 1, -1)
+            kv = mx.concatenate([self.wkv(flat[r : r + 1]) for r in range(count)])
+            kv = kv.reshape(*rows.shape[:2], -1)
+        else:
+            kv = self.wkv(rows)
         key, value = mx.split(kv, [c.dim * c.hc_mult], axis=-1)
         key = key.astype(mx.float32).reshape(*h.shape)
         x = h.astype(mx.float32)
         inv = mx.rsqrt(mx.mean(x * x, -1) + c.norm_eps) * mx.rsqrt(
             mx.mean(key * key, -1) + c.norm_eps
         )
-        dot = mx.sum(x * self.q_weight * self.k_weight * key, -1) * inv * c.dim**-0.5
+        # Reference: weight = q_weight.float() * k_weight.float(); dot = (h * weight * key).sum(-1)
+        weight = self.q_weight.astype(mx.float32) * self.k_weight.astype(mx.float32)
+        dot = mx.sum(x * weight * key, -1) * inv * c.dim**-0.5
         gate = mx.sigmoid(mx.sign(dot) * mx.sqrt(mx.maximum(mx.abs(dot), 1e-6)))
         # copysign(+sqrt, 0) is positive in the official reference.
         gate = mx.where(dot == 0, mx.sigmoid(mx.array(0.001)), gate)

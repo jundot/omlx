@@ -707,9 +707,9 @@ def test_vector_gate_kernel_matches_reference_with_padding_mask():
 def test_native_glm_indexer_scores_match_mlx_reference_when_available():
     from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
 
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_indexer_scores"):
+    if not index_fast.has_symbol("dsa_indexer_scores"):
         pytest.skip("GLM DSA native indexer extension is not built")
 
     config = _tiny_config().text_config
@@ -732,10 +732,10 @@ def test_native_glm_indexer_scores_match_mlx_reference_when_available():
 
 
 def test_glm5_next_switch_moe_uses_opt_in_native_weighted_sum():
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
     from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 
-    if not fast.has_symbol("glm_moe_weighted_sum"):
+    if not quant_fast.has_symbol("moe_weighted_sum"):
         pytest.skip("GLM native MoE weighted-sum extension is not built")
 
     mx.random.seed(29)
@@ -761,9 +761,9 @@ def test_glm5_next_affine_prefill_uses_shared_qmm_kernel(monkeypatch):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import linear_forward
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    if not fast.has_symbol("qwen35_q4_affine_qmm_t"):
+    if not quant_fast.has_symbol("affine_q4_qmm_t"):
         pytest.skip("Qwen affine prefill QMM extension is not built")
 
     base = nn.Linear(64, 64, bias=False)
@@ -772,7 +772,7 @@ def test_glm5_next_affine_prefill_uses_shared_qmm_kernel(monkeypatch):
     x = mx.random.normal((1, 128, 64), dtype=mx.float16)
     reference = linear(x)
 
-    original = fast.qwen35_q4_affine_qmm_t
+    original = quant_fast.affine_q4_qmm_t
     calls = 0
 
     def spy(*args, **kwargs):
@@ -780,7 +780,7 @@ def test_glm5_next_affine_prefill_uses_shared_qmm_kernel(monkeypatch):
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
+    monkeypatch.setattr(quant_fast, "affine_q4_qmm_t", spy)
     actual = linear_forward(linear, x)
     mx.eval(actual, reference)
 
@@ -792,9 +792,9 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import linear_forward
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    if not fast.has_symbol("qwen35_q8_affine_qmm_t"):
+    if not quant_fast.has_symbol("affine_q8_qmm_t"):
         pytest.skip("Qwen Q8 affine prefill QMM extension is not built")
 
     mx.random.seed(37)
@@ -804,7 +804,7 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     x = mx.random.normal((1, 1024, 1536), dtype=mx.float16)
     reference = linear(x)
 
-    original = fast.qwen35_q8_affine_qmm_t
+    original = quant_fast.affine_q8_qmm_t
     calls = 0
 
     def spy(*args, **kwargs):
@@ -812,7 +812,7 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q8_affine_qmm_t", spy)
+    monkeypatch.setattr(quant_fast, "affine_q8_qmm_t", spy)
     actual = linear_forward(linear, x)
     mx.eval(actual, reference)
 
@@ -825,10 +825,10 @@ def test_glm5_next_prefill_qmm_handles_strided_input(bits, tokens):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import linear_forward
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    name = f"qwen35_q{bits}_affine_qmm_t"
-    if not fast.has_symbol(name):
+    name = f"affine_q{bits}_qmm_t"
+    if not quant_fast.has_symbol(name):
         pytest.skip(f"{name} native kernel is not built")
 
     mx.random.seed(11)
@@ -853,10 +853,10 @@ def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import fused_quantized_matmul
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    name = f"qwen35_q{bits}_affine_qmm_t"
-    if not fast.has_symbol(name):
+    name = f"affine_q{bits}_qmm_t"
+    if not quant_fast.has_symbol(name):
         pytest.skip(f"{name} native kernel is not built")
 
     mx.random.seed(11)
@@ -982,10 +982,10 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
 
 def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
     """Use fused v-up only for matching dtypes and preserve FP32 scales otherwise."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
     from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat
 
-    if not fast.is_native_available():
+    if not quant_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
 
     from mlx_lm.models.mla import QuantizedMultiLinear
@@ -1021,10 +1021,10 @@ def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
 
 def test_sparse_attention_completes_at_32k_with_fp32_scale_projection(monkeypatch):
     """Verify native sparse MLA output can feed an FP32-scale projection at 32K."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.attention import fast as attention_fast
     from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat, sparse_mla_attention
 
-    if not fast.is_native_available():
+    if not attention_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
 
     from mlx_lm.models.mla import QuantizedMultiLinear
@@ -2425,15 +2425,15 @@ def test_nax_indexer_scores_match_fp32_reference_and_mask(S, P, before):
 
 @_needs_nax_indexer
 def test_nax_indexer_scores_match_native_kernel_within_rounding():
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_indexer_scores"):
+    if not index_fast.has_symbol("dsa_indexer_scores"):
         pytest.skip("native DSA indexer kernel unavailable")
     S, P, before = 512, 1024, 3584
     q, k, w = _ixn_inputs(S, P, seed=1)
     pool_len = P
     out = indexer_nax.indexer_scores_nax(q, k, w, before, pool_len, 4)
-    native = fast.dsa_indexer_scores(
+    native = index_fast.dsa_indexer_scores(
         q[None].transpose(0, 2, 1, 3), k[None, None], w[None], causal=False
     )[0, 0]
     acc, valid = _ixn_reference(q, k, w, before, pool_len, 4)
@@ -2532,9 +2532,9 @@ def _require_native_scores():
     native kernel; without it that path falls back to MLX ops, which round
     the scores differently, so the exactness and near-tie bounds do not
     apply."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_indexer_scores"):
+    if not index_fast.has_symbol("dsa_indexer_scores"):
         pytest.skip("native DSA indexer kernel unavailable")
 
 
@@ -2620,9 +2620,9 @@ def test_topk_differences_are_threshold_near_ties():
     scores differ only by pools whose native scores sit within one bf16 ulp
     of that row's top-k threshold (fp32 summation order at a near-tie)."""
     from mlx_vlm.models.glm5_next import language
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_topk_indices"):
+    if not index_fast.has_symbol("dsa_topk_indices"):
         pytest.skip("native top-k kernel unavailable")
     S, P, before = 512, 4096, 16384 - 512
     q, k, w = _ixn_inputs(S, P, seed=11)
@@ -3760,9 +3760,9 @@ def _indexer(hidden=256, seed=0):
 
 
 def _native_indexer_available():
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    return fast.has_symbol("dsa_indexer_scores") and fast.has_symbol("dsa_topk_indices")
+    return index_fast.has_symbol("dsa_indexer_scores") and index_fast.has_symbol("dsa_topk_indices")
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
@@ -3805,7 +3805,7 @@ def test_dsa_topk_rows_matches_native_topk(pool):
     ties, -1e30 masked blocks and a NaN."""
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
     for rows in (1, 4, 8):
         for trial in range(4):
@@ -3818,7 +3818,7 @@ def test_dsa_topk_rows_matches_native_topk(pool):
             s = s.astype(mx.bfloat16)
             if trial == 3:
                 s = s.at[0, 0, 7].add(float("nan"))
-            expected = fast.dsa_topk_indices(s[:, None], 512)[:, 0]
+            expected = index_fast.dsa_topk_indices(s[:, None], 512)[:, 0]
             got = dk.dsa_topk_rows(s, 512)
             assert got is not None and got.dtype == expected.dtype
             assert mx.array_equal(got, expected).item(), (rows, trial)
@@ -3832,11 +3832,11 @@ def test_indexer_fast_selection_matches_general_path(monkeypatch, native_topk):
     if native_topk and not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     if not native_topk:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast as index_fast
 
-        has_symbol = fast.has_symbol
+        has_symbol = index_fast.has_symbol
         monkeypatch.setattr(
-            fast,
+            index_fast,
             "has_symbol",
             lambda name: name != "dsa_topk_indices" and has_symbol(name),
         )

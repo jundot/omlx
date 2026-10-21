@@ -7,7 +7,7 @@ experts, top-8) run their routed experts through this package's own
 from the stock mlx-lm module the common adapter wraps in two ways: the gate
 and up projections are fused into one ``gate_up_proj`` tensor at load, and a
 sorted call can return its routes already weighted and summed through the
-native ``glm_moe_weighted_sum`` kernel. Re-implementing that forward would
+native ``moe_weighted_sum`` kernel. Re-implementing that forward would
 fork it, so this adapter keeps the module and swaps what it computes on.
 
 Each projection's parameters are replaced, before lazy weights materialize,
@@ -340,7 +340,7 @@ class OffloadedSwitchGLU(nn.Module):
             weighted_sum
             and scores is not None
             and indices.size >= 64
-            and hasattr(glm_fast, "glm_moe_weighted_sum")
+            and hasattr(glm_fast, "moe_weighted_sum")
         ):
             y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         return y

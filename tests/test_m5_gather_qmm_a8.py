@@ -22,7 +22,7 @@ E, H, INTER, TOPK = 16, 256, 128, 10
 
 def _a8_ready() -> bool:
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
 
         return bool(fast.oq_a8_available()) and a8._get_kernel() is not None
     except Exception:
@@ -85,11 +85,11 @@ def _contract_reference(problem):
     ``Sa[m] * (Qa[m] @ dequantize(W)[e].T)`` with Stage A's own ``Qa``/``Sa``.
     Equal to ``Sa * sum_g (Sw_g * acc_g + Bw_g * Ra_g)`` up to float32 order."""
     x, wq, s, b, idx, rmap = problem
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     # Plain Stage A: the kernel's ``_v8`` variant permutes the K slots of every
     # group into the order its fragment loads expect (the sum is unchanged).
-    qa, sa, _ = fast.qwen35_oq_a8_quantize(x, 0)
+    qa, sa, _ = fast.oq_a8_quantize(x, 0)
     qa = qa.reshape(qa.shape[0], -1)  # [T, 1, K] -> [T, K]
     wd = mx.dequantize(
         wq, s.astype(mx.float32), b.astype(mx.float32), group_size=GROUP, bits=4

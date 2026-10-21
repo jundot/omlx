@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from omlx.engine.stt import (
     RealtimeTranscriptionSession,
     STTEngine,
+    _SegmentedRealtimeBackend,
     _split_audio_segments,
     _VoxtralRealtimeBackend,
     _WhisperRealtimeBackend,
@@ -34,10 +35,9 @@ class TestRealtimeSttClassification:
     def test_voxtral_realtime_is_realtime(self):
         assert is_realtime_stt_model("audio_stt", "voxtral_realtime")
 
-    def test_other_stt_families_are_not_realtime(self):
-        assert not is_realtime_stt_model("audio_stt", "qwen3_asr")
-        assert not is_realtime_stt_model("audio_stt", "parakeet")
-        assert not is_realtime_stt_model("audio_stt", "")
+    def test_whole_buffer_stt_families_are_realtime(self):
+        assert is_realtime_stt_model("audio_stt", "qwen3_asr")
+        assert is_realtime_stt_model("audio_stt", "parakeet")
 
     def test_non_stt_types_are_not_realtime(self):
         assert not is_realtime_stt_model("llm", "whisper")
@@ -60,10 +60,10 @@ class TestSupportsRealtimeStt:
         engine._model = SimpleNamespace(create_streaming_session=lambda: None)
         assert engine.supports_realtime_stt()
 
-    def test_plain_stt_model_not_supported(self):
+    def test_plain_stt_model_supported(self):
         engine = STTEngine("m")
         engine._model = SimpleNamespace(generate=lambda: None)
-        assert not engine.supports_realtime_stt()
+        assert engine.supports_realtime_stt()
 
 
 class TestRealtimeSessionLifecycle:
@@ -83,7 +83,7 @@ class TestRealtimeSessionLifecycle:
     @pytest.mark.asyncio
     async def test_unsupported_model_raises(self):
         engine = STTEngine("m")
-        engine._model = SimpleNamespace(generate=lambda: None)
+        engine._model = SimpleNamespace()
         with pytest.raises(RuntimeError, match="realtime"):
             await engine.create_realtime_session()
 
@@ -179,6 +179,62 @@ class TestVoxtralBackend:
         backend.feed(np.zeros(4, dtype=np.float32))
         assert backend.poll_sync() == []
         assert backend.close_sync() == []
+
+
+def _tone(seconds: float, amplitude: float = 0.1) -> np.ndarray:
+    t = np.arange(int(seconds * 16000)) / 16000
+    return (amplitude * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+
+
+def _silence(seconds: float) -> np.ndarray:
+    return np.zeros(int(seconds * 16000), dtype=np.float32)
+
+
+class _FakeWholeBufferModel:
+    def __init__(self):
+        self.seconds: list[float] = []
+
+    def generate(self, audio, **kwargs):
+        self.seconds.append(len(audio) / 16000)
+        return SimpleNamespace(text=f" part{len(self.seconds)} ")
+
+
+class TestSegmentedRealtimeBackend:
+    def test_pause_commits_utterance_and_joins_with_space(self):
+        model = _FakeWholeBufferModel()
+        backend = _SegmentedRealtimeBackend(model)
+
+        backend.feed(np.concatenate([_tone(1.0), _silence(1.0)]))
+        first = backend.poll_sync()
+        backend.feed(np.concatenate([_tone(1.0), _silence(1.0)]))
+        second = backend.poll_sync()
+
+        assert first == ["part1"]
+        assert second == [" part2"]
+        assert backend.close_sync() == []
+
+    def test_silence_and_clicks_dropped_open_utterance_flushed_on_close(self):
+        model = _FakeWholeBufferModel()
+        backend = _SegmentedRealtimeBackend(model)
+
+        backend.feed(np.concatenate([_silence(5.0), _tone(0.1), _silence(1.0)]))
+        assert backend.poll_sync() == []
+        assert model.seconds == []
+
+        backend.feed(_tone(1.0))
+        assert backend.poll_sync() == []
+        assert backend.close_sync() == ["part1"]
+        # Only the lead-in survives the dropped silence and click.
+        assert model.seconds == [pytest.approx(1.3)]
+
+    def test_speech_without_pause_cut_at_quiet_point(self):
+        model = _FakeWholeBufferModel()
+        backend = _SegmentedRealtimeBackend(model)
+
+        backend.feed(np.concatenate([_tone(27.0), _tone(0.1, 0.0), _tone(8.0)]))
+        assert backend.poll_sync() == ["part1"]
+        assert backend.close_sync() == [" part2"]
+        assert 26.9 < model.seconds[0] < 27.2
 
 
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from omlx.cluster.planner import (
     apply_pipeline_assignment,
     inspect_safetensors_layout,
     install_unequal_pipeline_plan,
+    plan_proportional_pipeline,
     plan_unequal_pipeline,
     synthetic_model_layout,
 )
@@ -135,6 +136,26 @@ def test_layers_past_an_undeclared_depth_are_kept(tmp_path):
     assert inspect_safetensors_layout(tmp_path).layer_count == 3
 
 
+def test_vision_tower_weights_are_not_charged_to_decoder_layers(tmp_path):
+    """Ranks load the text model only; vision_tower.blocks.N is not layer N."""
+
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("vision_tower.blocks.0.attn.qkv.weight", 700),
+            ("vision_tower.patch_embed.proj.weight", 300),
+            ("language_model.model.embed_tokens.weight", 100),
+            ("language_model.model.layers.0.self_attn.q_proj.weight", 500),
+            ("language_model.model.layers.1.self_attn.q_proj.weight", 400),
+        ],
+    )
+
+    layout = inspect_safetensors_layout(tmp_path)
+
+    assert layout.fixed_weight_bytes == 100
+    assert layout.layer_weight_bytes == (500, 400)
+
+
 def test_unequal_planner_gives_more_layers_to_larger_mac():
     model = synthetic_model_layout(
         total_weight_bytes=300 * GIB,
@@ -155,6 +176,26 @@ def test_unequal_planner_gives_more_layers_to_larger_mac():
     assert studio.end_layer == 80
     assert all(item.headroom_bytes >= 0 for item in plan.assignments)
     assert len(plan.plan_hash) == 64
+
+
+def test_stages_start_only_where_the_architecture_allows():
+    """DeepSeek V4.1 layers read KV that an earlier source layer keeps."""
+
+    layers = (10 * GIB,) * 8
+    nodes = [
+        NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
+        NodeBudget(node_id="mobile", capacity_bytes=256 * GIB, rank=1),
+    ]
+    free = ModelLayout("free", 0, layers)
+    restricted = ModelLayout("restricted", 0, layers, pipeline_stage_starts=(2, 6))
+
+    assert plan_unequal_pipeline(free, nodes).assignments[1].end_layer == 4
+    assert plan_unequal_pipeline(restricted, nodes).assignments[1].end_layer in (2, 6)
+    with pytest.raises(PlanningError, match="only at layers 2, 6"):
+        plan_proportional_pipeline(restricted, nodes)
+    # An unrestricted layout keeps its serialized form, and so its plan hash.
+    assert "pipeline_stage_starts" not in free.to_dict()
+    assert ModelLayout.from_dict(restricted.to_dict()) == restricted
 
 
 def test_unequal_planner_accounts_for_replicated_fixed_weights_and_reserve():
@@ -578,6 +619,62 @@ def test_nemotron_h_divisors_omit_quant_groups_when_unquantized():
     divisors = _tensor_parallel_divisors(config)
     assert 58 not in divisors
     assert set(divisors) == {32, 2, 64, 8}
+
+
+def test_deepseek_v41_tensor_plan_keeps_the_shared_kv_head_whole():
+    from omlx.cluster.planner import (
+        _supports_tensor_parallel,
+        _tensor_parallel_divisors,
+    )
+    from omlx.patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
+
+    assert apply_deepseek_v41_mlx_lm_patch()
+    affine = {"bits": 3, "mode": "affine", "group_size": 64}
+    config = {
+        "model_type": "deepseek_v41",
+        "text_config": {
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "o_groups": 8,
+            "o_lora_rank": 1024,
+            "moe_intermediate_size": 2304,
+        },
+        "omlx_deepseek_v41": {
+            "quantized_modules": {
+                "language_model.layers.0.attn.wo_b": affine,
+                "language_model.layers.0.ffn.experts.w2": affine,
+                "language_model.layers.1.ffn.experts.w2": {"bits": 4, "mode": "mxfp4"},
+            }
+        },
+    }
+
+    assert _supports_tensor_parallel(config)
+    # 2304 / 64 = 36 expert groups allow four ranks, not eight.
+    assert set(_tensor_parallel_divisors(config)) == {64, 8, 128, 36, 72}
+
+
+def test_tensor_plan_leaves_ssd_tables_out_of_rank_memory():
+    from omlx.cluster.planner import plan_hybrid
+
+    layout = ModelLayout(
+        source="tables",
+        fixed_weight_bytes=10,
+        layer_weight_bytes=(100, 300, 100),
+        tensor_parallel_ssd_layer_bytes=(0, 200, 0),
+        tensor_parallel_heads=2,
+        supports_tensor_parallel=True,
+        supports_pipeline=True,
+    )
+    nodes = [
+        NodeBudget(node_id=n, capacity_bytes=1000, rank=i) for i, n in enumerate("ab")
+    ]
+
+    tensor = plan_hybrid(layout, nodes, tensor_parallel_size=2)
+    pipeline = plan_hybrid(layout, nodes, tensor_parallel_size=1)
+
+    assert [item.layer_weight_bytes for item in tensor.assignments] == [150, 150]
+    assert sum(item.layer_weight_bytes for item in pipeline.assignments) == 500
+    assert ModelLayout.from_dict(layout.to_dict()) == layout
 
 
 def test_complete_model_layout_cache_invalidates_on_shard_overwrite(

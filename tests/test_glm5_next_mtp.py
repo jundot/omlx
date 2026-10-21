@@ -1454,7 +1454,7 @@ _CYCLES = [
 
 def _native_indexer_available() -> bool:
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         return bool(
             fast.has_symbol("dsa_indexer_scores")

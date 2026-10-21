@@ -17,6 +17,7 @@ import functools
 import inspect
 import logging
 import math
+import threading
 import time
 import weakref
 from collections import deque
@@ -406,23 +407,35 @@ def _raises_spec_buffer_caps() -> bool:
     return architecture.startswith("applegpu_g15")
 
 
+# The caps live on the MLX device, so engines running cycles at the same time
+# share one raise and the last one out restores MLX's values.
+_spec_caps_lock = threading.Lock()
+_spec_caps_holders = 0
+_spec_caps_previous: Optional[Tuple[int, int]] = None
+
+
 @contextlib.contextmanager
 def _spec_command_buffers(model: Any = None):
     """Raise caps for supported Qwen targets and GPUs, then restore them."""
-    if not _spec_caps_target(model):
+    global _spec_caps_holders, _spec_caps_previous
+    if not _spec_caps_target(model) or not _raises_spec_buffer_caps():
         yield
         return
 
-    from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
+    from omlx.custom_kernels.quant_matmul.fast import set_command_buffer_caps
 
-    previous = None
-    if _raises_spec_buffer_caps():
-        previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+    with _spec_caps_lock:
+        if _spec_caps_holders == 0:
+            _spec_caps_previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+        _spec_caps_holders += 1
     try:
         yield
     finally:
-        if previous is not None:
-            set_command_buffer_caps(*previous)
+        with _spec_caps_lock:
+            _spec_caps_holders -= 1
+            if _spec_caps_holders == 0 and _spec_caps_previous is not None:
+                set_command_buffer_caps(*_spec_caps_previous)
+                _spec_caps_previous = None
 
 
 def _drafter_for(model: Any) -> Optional[Any]:
@@ -1550,6 +1563,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     tokens = gen_batch.tokens[0] if getattr(gen_batch, "tokens", None) else None
     if not tokens:
         return False
+    started = time.perf_counter()
     try:
         new_cache = _rebuild_singleton_cache(gen_batch.model)
         if new_cache is None:
@@ -1593,11 +1607,14 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             from mlx_lm.models.cache import TokenBuffer
 
             gen_batch._token_context[0] = TokenBuffer(list(tokens))
-        logger.debug(
-            "MTP reconciled to standard on reshape (uid=%s tokens=%d queue=%d)",
+        logger.info(
+            "MTP reconciled to standard on reshape (uid=%s tokens=%d chunks=%d "
+            "queue=%d, %.2fs)",
             getattr(state, "uid", "?"),
             len(tokens),
+            -(-total // step),
             len(state.queue),
+            time.perf_counter() - started,
         )
         return True
     except Exception as exc:
@@ -2403,10 +2420,40 @@ def _prefill_activity_recent() -> bool:
         return False
 
 
-def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float], uid: Any = None) -> None:
+def _prefill_activity_since(since_ts: float) -> bool:
+    try:
+        return get_prefill_tracker().active_since(since_ts)
+    except Exception:
+        return False
+
+
+def _arm_std_tax_probe(
+    gen_batch: Any,
+    t0_ms: Optional[float],
+    uid: Any = None,
+    since_ts: Optional[float] = None,
+) -> None:
+    """Arm the post-park standard-step probe.
+
+    ``since_ts`` is the monotonic start of the MTP run that produced
+    ``t0_ms``. When given, only prefill activity after it counts as
+    contention: the sequence's own prefill ended before its run began and
+    cannot have shaped t0. Without it, any prefill in the last
+    ``_STD_TAX_CONTENTION_WINDOW_S`` blocks the probe, which in practice
+    skips every probe of an interactive request (it parks about a second
+    after its own prefill) and leaves the exit margin at its prior.
+    """
     if not (t0_ms and t0_ms > 0.0):
         return
-    if _prefill_activity_recent():
+    if since_ts is not None:
+        if _prefill_activity_since(since_ts):
+            logger.debug(
+                "MTP loop-tax probe skipped: prefill activity during the run, "
+                "t0=%.1fms is contention-contaminated",
+                t0_ms,
+            )
+            return
+    elif _prefill_activity_recent():
         logger.debug(
             "MTP loop-tax probe skipped: prefill activity within %.1fs, "
             "t0=%.1fms is contention-contaminated",
@@ -2419,6 +2466,8 @@ def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float], uid: Any = None) 
         "skip": _STD_TAX_SKIP,
         "samples": [],
         "uid": uid,
+        # Run-scoped probes finalize against activity after arming only.
+        "armed_ts": time.monotonic() if since_ts is not None else None,
     }
 
 
@@ -2449,7 +2498,13 @@ def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
     t_std = samples[len(samples) // 2]
     if t_std <= 0.0:
         return
-    if _prefill_activity_recent():
+    armed_ts = probe.get("armed_ts")
+    contended = (
+        _prefill_activity_since(armed_ts)
+        if armed_ts is not None
+        else _prefill_activity_recent()
+    )
+    if contended:
         logger.debug(
             "MTP loop-tax probe discarded: prefill activity during the "
             "std sampling window"
@@ -2587,6 +2642,17 @@ class _DepthController:
     # a hardcoded ratio.
     EXIT_MARGIN = 1.15
     EXIT_STREAK = 16
+    # Depth 0 drafts nothing, so acceptance does not update while the
+    # controller sits there: a losing verdict built at depth 0 rests on the
+    # estimate that sent it there. A hand-off therefore needs this many
+    # speculative cycles inside the losing streak; when they are missing,
+    # the best speculative depth is re-measured first (the depth-0 trap:
+    # one dip in a story's acceptance otherwise parks MTP for content where
+    # depth 1 beats the plain step). 16 cycles let the acceptance EMA
+    # (ALPHA 0.08) climb back from a dip; in simulation 8 cycles still
+    # parked ~40% of stale dips, 16 parks ~6%, and truly losing content
+    # exits by cycle ~37 (24 before this gate).
+    EXIT_CONFIRM = 16
 
     def __init__(
         self,
@@ -2600,6 +2666,9 @@ class _DepthController:
         if exit_margin:
             self.EXIT_MARGIN = min(_STD_TAX_MAX, max(1.0, float(exit_margin)))
         self.max_depth = max(1, int(max_depth))
+        # Start of this MTP run: a park scopes its loop-tax contention check
+        # to prefill activity after it (see _arm_std_tax_probe).
+        self.started_ts = time.monotonic()
         self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
         # A position never reached yet (None) borrows the estimate of the
         # position before it; a flat 0.6 prior kept deep drafts unexplored.
@@ -2609,6 +2678,7 @@ class _DepthController:
         self.cycles = 0
         self.probe_left = 0
         self.exit_streak = 0
+        self._streak_spec = 0  # speculative cycles in the current losing streak
         self._ms_probe = 0.0  # wall-time since any probe burst
         self._ms_explore = 0.0  # wall-time since a staleness-exploration burst
         # Measure each depth once (max..1), then the depth-0 plain step
@@ -2667,8 +2737,11 @@ class _DepthController:
 
         if self._speculation_losing():
             self.exit_streak += 1
+            if used > 0 and time_sample:
+                self._streak_spec += 1
         else:
             self.exit_streak = 0
+            self._streak_spec = 0
 
         # Warmup sweep: keep walking max..1 until every depth is measured once.
         if self._warmup:
@@ -2679,6 +2752,19 @@ class _DepthController:
                 self.cur = self._warmup[0]
                 return
             self.cur = self._best()
+            self._ms_probe = 0.0
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("MTP controller warmup done: %s", self.describe())
+            return
+
+        # Confirm a losing verdict before it can hand off (EXIT_CONFIRM).
+        if (
+            self.probe_left == 0
+            and self.exit_streak >= self.EXIT_STREAK
+            and self._streak_spec < self.EXIT_CONFIRM
+        ):
+            self.cur = max(range(1, self.max_depth + 1), key=self._score)
+            self.probe_left = self.EXIT_CONFIRM - self._streak_spec
             self._ms_probe = 0.0
             return
 
@@ -2802,8 +2888,27 @@ class _DepthController:
 
     def should_exit(self) -> bool:
         """Sustained losing speculation: hand the sequence back to the
-        standard decoder."""
-        return self.exit_streak >= self.EXIT_STREAK
+        standard decoder. The streak must include EXIT_CONFIRM speculative
+        cycles, so the verdict is not just the estimate that led to depth 0."""
+        return (
+            self.exit_streak >= self.EXIT_STREAK
+            and self._streak_spec >= self.EXIT_CONFIRM
+        )
+
+    def describe(self) -> str:
+        """Compact state for debug logs: costs, acceptance and scores."""
+        t = ", ".join(f"{d}:{v:.1f}" for d, v in sorted(self.t.items()))
+        p = ", ".join("-" if v is None else f"{v:.2f}" for v in self.p)
+        scores = ", ".join(
+            f"{d}:{self._score(d) * 1000.0:.1f}"
+            for d in range(0, self.max_depth + 1)
+            if d > 0 or 0 in self.t
+        )
+        return (
+            f"cur={self.cur} cycles={self.cycles} t_ms={{{t}}} p=[{p}] "
+            f"tok_per_s={{{scores}}} exit_margin={self.EXIT_MARGIN:.3f} "
+            f"exit_streak={self.exit_streak}"
+        )
 
     def _select_candidates(self) -> List[int]:
         # Depth 0 is only selectable once its cost has actually been
@@ -3671,7 +3776,15 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         park_state = _MtpParkState(uid=state.uid)
         gen_batch._omlx_mtp_park_state = park_state
     if state.controller is not None:
-        _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)
+        describe = getattr(state.controller, "describe", None)
+        if describe is not None and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("MTP[%s] park decision: %s", state.uid, describe())
+        _arm_std_tax_probe(
+            gen_batch,
+            state.controller.t.get(0),
+            state.uid,
+            since_ts=getattr(state.controller, "started_ts", None),
+        )
     logger.info(
         "MTP[%s] parked for %d standard tokens before re-entry probe",
         state.uid,

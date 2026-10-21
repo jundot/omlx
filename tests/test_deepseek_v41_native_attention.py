@@ -2,12 +2,12 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.custom_kernels.glm_moe_dsa import fast
+from omlx.custom_kernels.attention import fast
 from omlx.patches.deepseek_v41.kernels import packed_sparse_attention
 from omlx.patches.deepseek_v41.quantization import pack_activation
 
 pytestmark = pytest.mark.skipif(
-    not fast.has_symbol("deepseek_v41_packed_attention"),
+    not fast.has_symbol("packed_sparse_attention"),
     reason="Packed attention extension is not built",
 )
 
@@ -61,8 +61,8 @@ def test_native_packed_attention_causal_window_and_fp32_sinks(
         4,
         128,
     )
-    actual = fast.deepseek_v41_packed_attention(*args).transpose(0, 2, 1, 3)
-    repeated = fast.deepseek_v41_packed_attention(*args).transpose(0, 2, 1, 3)
+    actual = fast.packed_sparse_attention(*args).transpose(0, 2, 1, 3)
+    repeated = fast.packed_sparse_attention(*args).transpose(0, 2, 1, 3)
     np.testing.assert_allclose(
         actual.astype(mx.float32), expected.astype(mx.float32), atol=0.008, rtol=0.008
     )
@@ -77,7 +77,7 @@ def test_native_packed_attention_does_not_round_fp32_sinks():
     pooled = mx.zeros((1, 0, 288), mx.uint8)
     topk = mx.zeros((1, 1, 2, 0), mx.uint32)
     sinks = mx.linspace(-4.123456, 4.234567, 64)
-    actual = fast.deepseek_v41_packed_attention(
+    actual = fast.packed_sparse_attention(
         q, window, pooled, topk, sinks, 512**-0.5, 0, 4, 128
     )
     count = mx.array([1, 2], mx.float32)[None, :]
@@ -105,7 +105,7 @@ def test_native_packed_attention_fp8_codes_and_power_of_two_scales(scale_byte):
     values = np.ldexp(values, scale_byte - 127).astype(np.float32)
     row = np.concatenate([codes, np.full(16, scale_byte, np.uint8)])
     window = mx.array(np.tile(row, (1, 1, 2, 1)))
-    actual = fast.deepseek_v41_packed_attention(
+    actual = fast.packed_sparse_attention(
         mx.zeros((1, 64, 2, 512), mx.bfloat16),
         window,
         mx.zeros((1, 0, 288), mx.uint8),

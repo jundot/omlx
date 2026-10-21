@@ -508,6 +508,12 @@ def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) 
     )
 
     repair_tool_parser(tokenizer)
+    if model_type == "deepseek_v41":
+        from omlx.patches.deepseek_v41.processing import install_tokenizer_protocol
+
+        config = json.loads((Path(model_path) / "config.json").read_text())
+        install_tokenizer_protocol(tokenizer, config)
+        return "deepseek_v41"
     installed = install_minimax_m3_tokenizer_protocol(
         tokenizer,
         str(model_path),

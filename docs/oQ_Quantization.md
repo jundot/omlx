@@ -140,7 +140,9 @@ Measured with the refit added in [#4385](https://github.com/jundot/omlx/pull/438
 
 The refit also brings the output distribution closer to the original model's: the KL divergence from the original drops by 12% to 15% on general text for both models at both levels.
 
-Muse Spark Open NVFP4 checkpoints keep their NVFP4 routed experts unchanged at oQ4 and above, together with the per-expert tensor scales. oQ quantizes only the BF16 tensors (attention, the first and last MoE layers, embeddings, and the LM head). At oQ3 and below, oQ requantizes the routed experts and folds each expert's tensor scale into its weights, so the output is a plain affine checkpoint that mlx-lm also loads.
+Muse Spark Open output uses the checkpoint layout of mlx-lm's own Muse Spark model (mlx-lm 0.32.2 and later). That layout stores q, k, v and the attention output gate as one projection, so oQ gives the four one bit width per layer. oQ also keeps the LM head in BF16, because mlx-lm's model gives wrong logits with a quantized LM head.
+
+Muse Spark Open NVFP4 checkpoints keep their NVFP4 routed experts unchanged at oQ4 and above, together with the per-expert tensor scales. oQ quantizes only the other BF16 tensors (attention, the first and last MoE layers, and embeddings). At oQ3 and below, oQ requantizes the routed experts and folds each expert's tensor scale into its weights, so the output is a plain affine checkpoint that mlx-lm also loads.
 
 ## Acknowledgments
 

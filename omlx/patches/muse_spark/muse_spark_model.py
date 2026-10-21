@@ -17,9 +17,10 @@ The norms reproduce the reference rounding order (scale in FP32, then one cast
 to the activation dtype). ``mx.fast.rms_norm`` casts before it scales, which
 changes BF16 results.
 
-The parameter layout is the one of the mlx-lm Muse Spark model, so MLX
-checkpoints load in both. The routed experts are a ``SwitchGLU`` at
-``mlp.switch_mlp``.
+The routed experts are a ``SwitchGLU`` at ``mlp.switch_mlp``. Checkpoints in
+the layout of mlx-lm's own Muse Spark model (0.32.2 and later) load as well:
+``upstream_layout`` maps their names, and the norms and residual gates then
+read the stored gains and coefficients as they are.
 
 ModelOpt NVFP4 checkpoints keep the packed E2M1 codes and E4M3 block scales
 as-is. Like mlx-lm, a projection takes ``global_scale`` only when the
@@ -64,8 +65,15 @@ from omlx.patches.muse_spark.norm_kernels import (
     post_moe,
     scaled_rms,
 )
+from omlx.patches.muse_spark.upstream_layout import (
+    CENTERED_NORMS,
+    RESIDUAL_GATE_EPS,
+    RESIDUAL_GATES,
+    gate_coefficients,
+    is_upstream_layout,
+    read_upstream_text,
+)
 
-_RESIDUAL_GATE_EPS = 1e-3
 # Token rows that take the router gemv kernel (decode and small batches).
 _ROUTER_GEMV_MAX_ROWS = 8
 _FP32_PARAMS = ("mlp.gate.", "residual_gate.", "global_scale")
@@ -137,10 +145,14 @@ class ModelArgs(BaseModelArgs):
             self.mlp_layer_types = ["sparse"] * self.num_hidden_layers
 
 
+def is_modelopt_export(quantization_config: dict | None) -> bool:
+    return (quantization_config or {}).get("quant_method") == "modelopt"
+
+
 def modelopt_nvfp4_expert_layers(args: ModelArgs) -> list[int]:
     """Return the layers whose routed experts a ModelOpt export packed as NVFP4."""
     config = args.quantization_config or {}
-    if config.get("quant_method") != "modelopt":
+    if not is_modelopt_export(config):
         return []
     if config.get("quant_algo") != "NVFP4":
         raise ValueError(
@@ -164,14 +176,6 @@ def _input_scaled_rms_norm(x, weight, eps):
 
 
 @mx.compile
-def _gate_coefficients(gate, temperature, eps):
-    w = gate.astype(mx.float32) / temperature
-    beta = mx.sigmoid(w)
-    alpha = mx.sqrt(mx.maximum(mx.sigmoid(-w) * (1.0 + beta), eps))
-    return alpha, beta
-
-
-@mx.compile
 def _scaled_queries(queries, eps, factor):
     queries = mx.fast.rms_norm(queries, None, eps)
     # The reference multiplies in FP32; a BF16 scalar would round the factor.
@@ -188,7 +192,7 @@ def _gated_output(output, gate, eps):
 
 
 def _build_gate_coefficients(gate):
-    coefficients = _gate_coefficients(gate.gate, gate.temperature, _RESIDUAL_GATE_EPS)
+    coefficients = gate_coefficients(gate.gate, gate.temperature, RESIDUAL_GATE_EPS)
     mx.eval(coefficients)
     return coefficients
 
@@ -223,27 +227,36 @@ class ScalelessRMSNorm(nn.Module):
 
 
 class CenteredRMSNorm(nn.Module):
-    """RMSNorm with a zero-centered scale: norm(x) * (1 + weight)."""
+    """RMSNorm with a zero-centered scale: norm(x) * (1 + weight).
+
+    With ``centered`` False the weight is the gain ``T(1 + weight)`` itself.
+    """
 
     def __init__(self, dims: int, eps: float):
         super().__init__()
         self.weight = mx.zeros((dims,))
         self.eps = eps
+        self.centered = True
 
     def __call__(self, x):
-        return scaled_rms(x, self.weight, self.eps, centered=True)
+        return scaled_rms(x, self.weight, self.eps, centered=self.centered)
 
 
 class InputScaledRMSNorm(nn.Module):
-    """RMSNorm applied after the zero-centered scale: norm(x * (1 + weight))."""
+    """RMSNorm applied after the zero-centered scale: norm(x * (1 + weight)).
+
+    With ``centered`` False the weight is the gain ``T(1 + weight)`` itself.
+    """
 
     def __init__(self, dims: int, eps: float):
         super().__init__()
         self.weight = mx.zeros((dims,))
         self.eps = eps
+        self.centered = True
 
     def __call__(self, x):
-        return _input_scaled_rms_norm(x, 1.0 + self.weight, self.eps)
+        gain = 1.0 + self.weight if self.centered else self.weight
+        return _input_scaled_rms_norm(x, gain, self.eps)
 
 
 class ResidualGate(nn.Module):
@@ -256,8 +269,17 @@ class ResidualGate(nn.Module):
         alpha, beta = self.coefficients()
         return (alpha * residual + beta * hidden).astype(residual.dtype)
 
+    def use_fixed_coefficients(self):
+        """Take stored ``alpha`` and ``beta`` weights in place of the gate."""
+        dims = self.gate.shape
+        del self.gate
+        self.alpha = mx.ones(dims, dtype=mx.float32)
+        self.beta = mx.zeros(dims, dtype=mx.float32)
+
     def coefficients(self):
         """FP32 ``(alpha, beta)``; they depend on the gate weights only."""
+        if "alpha" in self:
+            return self.alpha, self.beta
         return cached_per_module(
             self, "_omlx_gate_coefficients", _build_gate_coefficients
         )
@@ -374,7 +396,15 @@ class ScaledSwitchLinear(SwitchLinear):
     NVFP4 units and still need the tensor scale.
     """
 
-    def to_quantized(self, group_size: int = 64, bits: int = 4, mode: str = "affine"):
+    def to_quantized(
+        self,
+        group_size: int = 64,
+        bits: int = 4,
+        mode: str = "affine",
+        global_scale: bool = False,
+    ):
+        # The upstream layout marks scaled experts with global_scale in the
+        # quantization map; the scale itself is already this layer's.
         ql = super().to_quantized(group_size, bits, mode)
         if "global_scale" in self:
             ql.global_scale = self.global_scale
@@ -382,10 +412,9 @@ class ScaledSwitchLinear(SwitchLinear):
 
 
 class NVFP4SwitchLinear(QuantizedSwitchLinear):
-    """NVFP4 experts that ``sanitize`` already turned into their final layer.
+    """NVFP4 experts of a ModelOpt export, already in their final layer.
 
-    oQ outputs also list these experts in their quantization map, so the
-    loader asks to quantize them again.
+    ``to_quantized`` returns the layer itself, since it is quantized already.
     """
 
     def to_quantized(self, *args, **kwargs):
@@ -471,7 +500,8 @@ class MoE(nn.Module):
             y = mx.distributed.all_sum(y, group=self.sharding_group)
         # post_expert_norm on every expert row, then the FP32 weighted sum.
         norm = self.post_expert_norm
-        return self.post_expert_proj(moe_tail(y, weights, norm.weight, norm.eps))
+        y = moe_tail(y, weights, norm.weight, norm.eps, centered=norm.centered)
+        return self.post_expert_proj(y)
 
 
 class DecoderLayer(nn.Module):
@@ -499,13 +529,28 @@ class DecoderLayer(nn.Module):
         alpha, beta = self.post_attention_residual_gate.coefficients()
         pre_norm = self.pre_feedforward_layernorm
         x, h = post_attention(
-            x, h, alpha, beta, pre_norm.weight, self.post_norm_eps, pre_norm.eps
+            x,
+            h,
+            alpha,
+            beta,
+            pre_norm.weight,
+            self.post_norm_eps,
+            pre_norm.eps,
+            centered=pre_norm.centered,
         )
 
         h = self.mlp(h)
         alpha, beta = self.post_feedforward_residual_gate.coefficients()
         post_norm = self.post_feedforward_layernorm
-        return post_moe(x, h, alpha, beta, post_norm.weight, post_norm.eps)
+        return post_moe(
+            x,
+            h,
+            alpha,
+            beta,
+            post_norm.weight,
+            post_norm.eps,
+            centered=post_norm.centered,
+        )
 
 
 class MuseSparkModel(PipelineMixin, nn.Module):
@@ -605,13 +650,13 @@ def sanitize_experts(weights: dict) -> dict:
     return out
 
 
-def install_global_scales(model: nn.Module, weights: dict):
+def install_global_scales(model: nn.Module, weights: dict, modelopt: bool):
     """Give ``global_scale`` to the switch projections that have one in ``weights``.
 
-    Packed NVFP4 experts (scales without affine biases) become nvfp4 layers
-    here: a ModelOpt export has no MLX quantization config for them. The
-    loader quantizes the other layers, and ``ScaledSwitchLinear`` keeps the
-    scale through that.
+    A ModelOpt export has no MLX quantization config for its packed NVFP4
+    experts (scales without affine biases), so with ``modelopt`` they become
+    nvfp4 layers here. Otherwise the loader quantizes every layer by config,
+    and ``ScaledSwitchLinear`` keeps the scale through that.
     """
     if not isinstance(model, nn.Module):
         # oQ runs sanitize on a stand-in object only to map the names.
@@ -625,7 +670,8 @@ def install_global_scales(model: nn.Module, weights: dict):
         path = key[: -len(".global_scale")]
         proj = modules[path]
         if (
-            isinstance(proj, SwitchLinear)
+            modelopt
+            and isinstance(proj, SwitchLinear)
             and f"{path}.scales" in weights
             and f"{path}.biases" not in weights
         ):
@@ -641,6 +687,20 @@ def install_global_scales(model: nn.Module, weights: dict):
             )
             setattr(modules[parent], name, proj)
         proj.global_scale = mx.ones((proj.num_experts,), dtype=mx.float32)
+
+
+def use_upstream_values(model: nn.Module):
+    """Make the decoder layers read upstream norm gains and gate coefficients."""
+    if not isinstance(model, nn.Module):
+        # oQ runs sanitize on a stand-in object only to map the names.
+        return
+    for module in model.modules():
+        if isinstance(module, DecoderLayer):
+            for path, norm in module.named_modules():
+                if path in CENTERED_NORMS:
+                    norm.centered = False
+            for gate in RESIDUAL_GATES:
+                getattr(module, gate).use_fixed_coefficients()
 
 
 def streamed_decoder_layer(args: ModelArgs, layer_idx: int) -> DecoderLayer:
@@ -691,6 +751,7 @@ class Model(nn.Module):
         return softcap_logits(out, self.args)
 
     def sanitize(self, weights):
+        upstream = is_upstream_layout(weights)
         out = {}
         for key, value in weights.items():
             # Drop the vision and audio towers of HF and mlx-vlm checkpoints.
@@ -710,8 +771,21 @@ class Model(nn.Module):
             out[key] = value
         if self.args.tie_word_embeddings:
             out.pop("lm_head.weight", None)
-        out = sanitize_experts(out)
-        install_global_scales(self, out)
+        if upstream:
+            args = self.args
+            out = read_upstream_text(
+                out,
+                "model.layers.",
+                n_heads=args.num_attention_heads,
+                n_kv_heads=args.num_key_value_heads,
+                head_dim=args.head_dim,
+            )
+            use_upstream_values(self)
+        else:
+            out = sanitize_experts(out)
+        install_global_scales(
+            self, out, is_modelopt_export(self.args.quantization_config)
+        )
         return out
 
     def shard(self, group: mx.distributed.Group | None = None):

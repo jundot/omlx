@@ -16,11 +16,15 @@ array-mask prefills with at least 1024 queries.
 CUDA retains the array-tiled implementation because MLX 0.32.3's CUDA fused
 kernel does not support head_dim 256.
 
+On M1/M2, FP16 decode-shaped calls above the vector kernel's thread limit run
+as two query-row halves (issue #4609).
+
 Install mechanics mirror turboquant_attention.py (patch the module attr + rebind
 already-imported model modules). The route is strictly gated (see _should_route);
 everything else passes through to the original SDPA unchanged.
 """
 
+import functools
 import logging
 import time
 
@@ -53,6 +57,12 @@ _DEFAULT_DISPATCH_BUDGET = 250_000_000
 _MIN_DISPATCH_BUDGET = 20_000_000
 _MAX_DISPATCH_BUDGET = 2_000_000_000
 _DISPATCH_BUDGET: int | None = None
+# MLX 0.32.4 sends up to 32 simdgroups (query rows x GQA factor) to its vector
+# kernel without checking the pipeline limit. On M1/M2 its FP16 head-dim-256
+# 2-pass build allows 896 threads, which is 28 simdgroups.
+_VECTOR_MAX_Q_LEN = 8
+_VECTOR_MAX_SIMDGROUPS = 32
+_VECTOR_SIMDGROUP_LIMIT = 28
 
 # Bounded-route reasons already logged. The first engagement per reason logs at
 # INFO; repeats stay silent to keep the hot path quiet.
@@ -289,6 +299,63 @@ def _flash_sdpa256(queries, keys, values, scale, mask, sinks=None):
     return _array_tiled_sdpa256(queries, keys, values, scale, mask, sinks)
 
 
+@functools.cache
+def _vector_thread_limited_gpu() -> bool:
+    try:
+        architecture = str(mx.device_info().get("architecture", ""))
+    except Exception:
+        return False
+    return architecture.startswith(("applegpu_g13", "applegpu_g14"))
+
+
+def _over_vector_thread_limit(queries, keys, mask) -> bool:
+    try:
+        q_len = queries.shape[-2]
+        if not 1 < q_len <= _VECTOR_MAX_Q_LEN or queries.dtype != mx.float16:
+            return False
+        if queries.shape[-1] != HEAD_DIM or not isinstance(keys, mx.array):
+            return False
+        # A causal call is not known to fail, and splitting it trims the keys.
+        if isinstance(mask, str):
+            return False
+        if (
+            isinstance(mask, mx.array)
+            and mask.ndim >= 2
+            and mask.shape[-2] not in (1, q_len)
+        ):
+            return False
+        n_kv = keys.shape[-3]
+        if n_kv <= 0:
+            return False
+        simdgroups = queries.shape[-3] // n_kv * q_len
+        return (
+            _VECTOR_SIMDGROUP_LIMIT < simdgroups <= _VECTOR_MAX_SIMDGROUPS
+            and _vector_thread_limited_gpu()
+        )
+    except Exception:
+        return False
+
+
+def _split_query_rows(original, queries, keys, values, cache, scale, mask, sinks):
+    # Each half keeps the key-partition plan of the full call, so every row
+    # equals the unsplit result.
+    half = (queries.shape[-2] + 1) // 2
+    per_row = isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] > 1
+    outs = [
+        original(
+            queries[..., rows, :],
+            keys,
+            values,
+            cache,
+            scale,
+            mask[..., rows, :] if per_row else mask,
+            sinks,
+        )
+        for rows in (slice(None, half), slice(half, None))
+    ]
+    return mx.concatenate(outs, axis=-2)
+
+
 def _should_route(queries, keys, cache, mask, sinks) -> bool:
     # Never raise: any unexpected input must fall through to the original SDPA,
     # never break a request. Worst case we decline to engage.
@@ -368,6 +435,10 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
         mask: mx.array | None,
         sinks: mx.array | None = None,
     ) -> mx.array:
+        if _over_vector_thread_limit(queries, keys, mask):
+            return _split_query_rows(
+                original_sdpa, queries, keys, values, cache, scale, mask, sinks
+            )
         if _should_route(queries, keys, cache, mask, sinks):
             return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
         return original_sdpa(queries, keys, values, cache, scale, mask, sinks)
@@ -413,6 +484,17 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
                 mask=None,
                 sinks=None,
             ) -> mx.array:
+                if _over_vector_thread_limit(queries, keys, mask):
+                    return _split_query_rows(
+                        original_vlm_sdpa,
+                        queries,
+                        keys,
+                        values,
+                        cache,
+                        scale,
+                        mask,
+                        sinks,
+                    )
                 if _should_route(queries, keys, cache, mask, sinks):
                     return _flash_sdpa256(queries, keys, values, scale, mask, sinks)
                 return original_vlm_sdpa(

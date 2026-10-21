@@ -679,6 +679,12 @@ def maybe_apply_pre_load_patches(
         from ..patches.deepseek_v41 import apply_patch
 
         apply_patch()
+    if not for_vlm and model_type == "deepseek_v41":
+        # Cluster ranks are mlx-lm servers; see the patch docstring.
+        from ..patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
+
+        if apply_deepseek_v41_mlx_lm_patch():
+            logger.info("DeepSeek V4.1 mlx-lm registration applied for %s", model_name)
     if (
         isinstance(model_type, str)
         and model_type.startswith("deepseek_v4")
@@ -760,6 +766,13 @@ def maybe_apply_pre_load_patches(
 
         if apply_minimax_m3_mlx_lm_patch():
             logger.info("MiniMax-M3 mlx-lm registration applied for %s", model_name)
+
+    if not for_vlm and model_type == "glm5_next":
+        # Same reason as MiniMax-M3: cluster ranks are mlx-lm servers.
+        from ..patches.glm5_next_mlx_lm import apply_glm5_next_mlx_lm_patch
+
+        if apply_glm5_next_mlx_lm_patch():
+            logger.info("GLM-5.3 mlx-lm registration applied for %s", model_name)
 
     if for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types

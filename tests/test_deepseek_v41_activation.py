@@ -193,9 +193,23 @@ def test_zero_activation_groups_remain_zero(bits, group, e4m3):
 
 
 def test_fp8_kernel_preserves_exact_power_of_two_scaled_values():
-    # Every scale whose maximum finite FP8 value fits in a normal FP32.
-    # A transcendental exp2 approximation can shift these values and FP8 ties.
-    exponents = np.arange(-126, 119, dtype=np.int32)
+    # Every scale from the reference amax floor (1e-4 <= 448 * 2^-22) up to the largest
+    # whose maximum finite FP8 value fits in a normal FP32. A transcendental exp2
+    # approximation can shift these values and FP8 ties.
+    exponents = np.arange(-22, 119, dtype=np.int32)
     rows = np.repeat(np.ldexp(np.float32(448), exponents)[:, None], 32, axis=1)
     actual = quantize_activation(mx.array(rows))
     np.testing.assert_array_equal(actual, rows)
+
+
+def test_fp8_kernel_applies_reference_amax_floor():
+    # DeepSeek-V4.1-Flash kernel.py act_quant clamps amax to 1e-4, so every group
+    # below it shares the scale fast_round_scale(1e-4 / 448) = 2^-22 and is rounded on
+    # that FP8 grid (subnormal codes, then zero).
+    ml_dtypes = pytest.importorskip("ml_dtypes")
+    exponents = np.arange(-126, -22, dtype=np.int32)
+    rows = np.repeat(np.ldexp(np.float32(448), exponents)[:, None], 32, axis=1)
+    scale = np.float32(2.0**-22)
+    expected = (rows / scale).astype(ml_dtypes.float8_e4m3fn).astype(np.float32) * scale
+    actual = quantize_activation(mx.array(rows))
+    np.testing.assert_array_equal(actual, expected)

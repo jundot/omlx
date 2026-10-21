@@ -39,6 +39,7 @@ from pydantic import (
     model_validator,
 )
 
+from .. import gguf
 from .._version import __version__ as _omlx_version
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
@@ -72,6 +73,7 @@ from ..model_settings import (
     validate_moe_expert_offload,
     MOE_OFFLOAD_MTP_MODEL_TYPES,
     merge_chat_template_kwargs,
+    validate_kv_compression_settings,
 )
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
@@ -83,6 +85,7 @@ from ..settings import (
     SubKeyEntry,
     burst_decode_env,
 )
+from ..utils.fatal import is_command_buffer_error
 from ..utils.hardware import (
     compute_owner_hash,
     get_chip_name,
@@ -104,10 +107,13 @@ from . import model_recommender
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
+    KeyLockout,
+    check_api_key,
     compare_keys,
     create_session_token,
     require_admin,
     validate_api_key,
+    verify_any_api_key,
     verify_api_key,
     verify_session,
     web_ui_enabled,
@@ -119,6 +125,7 @@ from .benchmark import (
     _sanitize_upload_error,
     _upload_model_name,
 )
+from .hf_downloader import MODEL_FORMATS
 from .recipe import (
     ALL_FIELDS,
     DEFAULTS,
@@ -243,7 +250,7 @@ def _oq_a8_kernels_available() -> bool:
     a no-op.
     """
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import fast
 
         return bool(fast.oq_a8_available())
     except Exception:
@@ -371,12 +378,12 @@ class ModelSettingsRequest(BaseModel):
     deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
-    # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
     mtp_adaptive_max_depth: int | None = None
     # Fixed Lightning MTP draft depth (None = adaptive).
     mtp_fixed_depth: int | None = None
-    # TurboQuant KV cache (mlx-vlm backend)
+    # KV cache compression
     turboquant_kv_enabled: bool | None = None
+    turboquant_kv_scheme: str | None = None
     turboquant_kv_bits: float | None = None
     turboquant_skip_last: bool | None = None
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
@@ -737,6 +744,11 @@ class GlobalSettingsRequest(BaseModel):
     claude_code_opus_model: str | None = None
     claude_code_sonnet_model: str | None = None
     claude_code_haiku_model: str | None = None
+    claude_code_desktop_enabled: bool | None = None
+    # Side-effect flag for the Claude Desktop toggle: writing the user's
+    # Claude Desktop JSON configs is a visible side effect, so the restart
+    # of the Claude app is opt-in and never automatic.
+    restart_desktop: bool = False
 
     # Other integrations settings
     integrations_copilot_model: str | None = None
@@ -798,6 +810,7 @@ class HFDownloadRequest(BaseModel):
 
     repo_id: str
     hf_token: str = ""
+    files: list[str] | None = None
 
 
 class HFRetryRequest(BaseModel):
@@ -943,12 +956,19 @@ def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list
     if model_info.get("is_helper"):
         return []
     target, reason = engine_pool.splash_target(model_info["id"], settings)
+    draft_repo = (
+        engine_pool.splash_draft_to_download(model_info["id"], settings)
+        if target is None
+        else None
+    )
     return [
         {
             "id": engine_id,
             "label": label,
             "compatible": target is not None,
             "reason": reason,
+            # The draft the engine needs that a download provides.
+            "draft_repo": draft_repo,
         }
         for engine_id, label in EXTERNAL_ENGINES.items()
     ]
@@ -998,6 +1018,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
     settings["thinking_budget_enabled"] = False
     settings["guided_grammar_enabled"] = False
     settings["turboquant_kv_enabled"] = False
+    settings["turboquant_kv_scheme"] = "turboquant"
     settings["turboquant_kv_bits"] = 4
     settings["turboquant_skip_last"] = True
     settings["moe_expert_offload_enabled"] = False
@@ -1071,6 +1092,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
 
     settings.index_cache_freq = None
     settings.turboquant_kv_enabled = False
+    settings.turboquant_kv_scheme = "turboquant"
     settings.turboquant_kv_bits = 4
     settings.turboquant_skip_last = True
     settings.moe_expert_offload_enabled = False
@@ -1844,7 +1866,7 @@ def get_system_memory_info() -> dict:
 
 
 @router.post("/api/login")
-async def login(request: LoginRequest, response: Response):
+async def login(request: LoginRequest, response: Response, http_request: Request):
     """
     Authenticate with API key and create session.
 
@@ -1854,12 +1876,14 @@ async def login(request: LoginRequest, response: Response):
     Args:
         request: LoginRequest containing the API key.
         response: FastAPI response object for setting cookies.
+        http_request: Incoming request, used for the client's key budget.
 
     Returns:
         JSON response with success status.
 
     Raises:
-        HTTPException: 400 if no API key configured, 401 if invalid.
+        HTTPException: 400 if no API key configured, 401 if invalid,
+            429 while the client is locked out.
     """
     global_settings = _get_global_settings()
     server_api_key = global_settings.auth.api_key if global_settings else None
@@ -1872,7 +1896,9 @@ async def login(request: LoginRequest, response: Response):
         )
 
     # Main key only — sub keys must not grant admin login
-    if not verify_api_key(request.api_key, server_api_key):
+    if not check_api_key(
+        http_request, lambda: verify_api_key(request.api_key, server_api_key)
+    ):
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
@@ -1992,7 +2018,9 @@ async def logout(response: Response):
 
 
 @router.get("/auto-login")
-async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
+async def auto_login(
+    http_request: Request, key: str = "", redirect: str = "/admin/dashboard"
+):
     """
     Auto-login using API key and redirect to the target admin page.
 
@@ -2000,6 +2028,7 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     authentication, bypassing the manual login form.
 
     Args:
+        http_request: Incoming request, used for the client's key budget.
         key: The API key for authentication.
         redirect: The path to redirect to after login. Must start with /admin.
 
@@ -2015,7 +2044,15 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     server_api_key = global_settings.auth.api_key if global_settings else None
 
     # Main key only — sub keys must not grant admin login
-    if not key or not server_api_key or not verify_api_key(key, server_api_key):
+    try:
+        key_ok = (
+            bool(key)
+            and bool(server_api_key)
+            and check_api_key(http_request, lambda: verify_api_key(key, server_api_key))
+        )
+    except KeyLockout:
+        key_ok = False
+    if not key_ok:
         return RedirectResponse(url="/admin", status_code=302)
 
     token = create_session_token()
@@ -2439,6 +2476,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 model_info.get("model_path", ""),
                 model_dirs,
                 source_repo_id=model_info.get("source_repo_id"),
+                source_path=model_info.get("source_path"),
             ),
             "loaded": model_info.get("loaded", False),
             "is_loading": model_info.get("is_loading", False),
@@ -2475,6 +2513,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "reasoning_efforts": model_info.get("reasoning_efforts"),
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
+            "model_format": model_info.get("model_format"),
+            "source_path": model_info.get("source_path"),
             "distributed": model_info.get("distributed", False),
             "cluster": model_info.get("cluster"),
             "last_access": model_info.get("last_access"),
@@ -2605,13 +2645,13 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer ") and gs is not None:
         token = auth_header[7:]
-        server_key = gs.auth.api_key or ""
-        sub_keys = gs.auth.sub_keys or []
-        if verify_api_key(token, server_key):
+        if check_api_key(
+            request,
+            lambda: verify_any_api_key(
+                token, gs.auth.api_key or "", gs.auth.sub_keys or []
+            ),
+        ):
             return True
-        for sk in sub_keys:
-            if verify_api_key(token, getattr(sk, "key", "")):
-                return True
 
     raise HTTPException(
         status_code=401,
@@ -2728,6 +2768,33 @@ async def update_model_settings(
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
+    kv_scheme = current_settings.turboquant_kv_scheme
+    kv_bits = current_settings.turboquant_kv_bits
+    if "turboquant_kv_scheme" in sent:
+        kv_scheme = (
+            "turboquant" if request.turboquant_kv_scheme is None
+            else request.turboquant_kv_scheme
+        )
+    if "turboquant_kv_bits" in sent:
+        kv_bits = 4 if request.turboquant_kv_bits is None else request.turboquant_kv_bits
+    try:
+        if sent & {"turboquant_kv_scheme", "turboquant_kv_bits"}:
+            validate_kv_compression_settings(kv_scheme, kv_bits)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    kv_enabled = (
+        bool(request.turboquant_kv_enabled) if "turboquant_kv_enabled" in sent
+        else current_settings.turboquant_kv_enabled
+    )
+    vlm_mtp_enabled = (
+        bool(request.vlm_mtp_enabled) if "vlm_mtp_enabled" in sent
+        else current_settings.vlm_mtp_enabled
+    )
+    if not _entry_is_diffusion_model(entry) and kv_enabled and vlm_mtp_enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="vlm_mtp_enabled and KV cache compression cannot both be enabled.",
+        )
     prev_engine_type = entry.engine_type  # Track for requires_reload check
     prev_load_signature = engine_pool._engine_runtime_signature(
         model_id, current_settings
@@ -2771,6 +2838,11 @@ async def update_model_settings(
         }
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
+        if override_value is not None and entry.model_format == "gguf":
+            raise HTTPException(
+                status_code=400,
+                detail="A GGUF model's type comes from its file",
+            )
         if override_value is not None and override_value not in valid_types:
             raise HTTPException(
                 status_code=400,
@@ -2893,11 +2965,11 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
-    # TurboQuant KV cache settings
+    # KV cache compression settings
     if "turboquant_kv_enabled" in sent:
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
-    if "turboquant_kv_bits" in sent:
-        current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    current_settings.turboquant_kv_scheme = kv_scheme
+    current_settings.turboquant_kv_bits = kv_bits
     if "turboquant_skip_last" in sent:
         # null = clear to the model default (True); bool(None) would flip it
         # to False and silently disable the skip-last corruption guard.
@@ -3059,8 +3131,8 @@ async def update_model_settings(
         current_settings.specprefill_threshold = request.specprefill_threshold or None
     if "external_engine" in sent:
         engine_id = None if is_diffusion_model else request.external_engine or None
-        # Check only a change: the web modal resends the field on every save,
-        # and a launcher or draft removed later must not block other fields.
+        # Check only a change: a client may resend the stored value, and a
+        # launcher or draft removed later must not block other fields.
         if engine_id is not None and engine_id != current_settings.external_engine:
             if engine_id not in EXTERNAL_ENGINES:
                 raise HTTPException(
@@ -3234,7 +3306,7 @@ async def update_model_settings(
                 ("dflash_enabled", "DFlash"),
                 ("specprefill_enabled", "SpecPrefill"),
                 ("mtp_enabled", "MTP"),
-                ("turboquant_kv_enabled", "TurboQuant KV"),
+                ("turboquant_kv_enabled", "KV cache compression"),
             ):
                 other_after = (
                     bool(getattr(request, other_field))
@@ -4628,6 +4700,7 @@ def _global_settings_response(global_settings):
             "opus_model": global_settings.claude_code.opus_model,
             "sonnet_model": global_settings.claude_code.sonnet_model,
             "haiku_model": global_settings.claude_code.haiku_model,
+            "desktop_enabled": global_settings.claude_code.desktop_enabled,
         },
         "integrations": {
             "codex_model": global_settings.integrations.codex_model,
@@ -5480,6 +5553,16 @@ async def update_global_settings(
     if "claude_code_haiku_model" in request.model_fields_set:
         global_settings.claude_code.haiku_model = request.claude_code_haiku_model
         claude_code_changed = True
+    if "claude_code_desktop_enabled" in request.model_fields_set:
+        desktop_previously_enabled = bool(
+            getattr(global_settings.claude_code, "desktop_enabled", False)
+        )
+        global_settings.claude_code.desktop_enabled = bool(
+            request.claude_code_desktop_enabled
+        )
+        claude_code_changed = True
+    else:
+        desktop_previously_enabled = None
 
     if claude_code_changed:
         runtime_applied.append("claude_code")
@@ -5488,7 +5571,8 @@ async def update_global_settings(
             f"mode={global_settings.claude_code.mode}, "
             f"opus={global_settings.claude_code.opus_model}, "
             f"sonnet={global_settings.claude_code.sonnet_model}, "
-            f"haiku={global_settings.claude_code.haiku_model}"
+            f"haiku={global_settings.claude_code.haiku_model}, "
+            f"desktop_enabled={global_settings.claude_code.desktop_enabled}"
         )
 
     # Apply integrations settings (Live - immediately applied)
@@ -5816,6 +5900,48 @@ async def update_global_settings(
         runtime_applied.append("embedding_batch_size")
         logger.info(f"Embedding batch size set to {pending_embedding_batch_size}")
 
+    # Claude Desktop auto-config side effect: enabling the toggle
+    # writes the user's Claude Desktop JSON configs to point at oMLX;
+    # disabling restores them. Best-effort — never fails the settings save.
+    # The route can also be invoked when only a restore is needed (toggle
+    # already off) via the dedicated /api/claude-desktop/* endpoints below.
+    claude_desktop_result: dict[str, Any] = {"applied": False}
+    if desktop_previously_enabled is not None:
+        desktop_now_enabled = bool(
+            getattr(global_settings.claude_code, "desktop_enabled", False)
+        )
+        try:
+            if desktop_now_enabled and not desktop_previously_enabled:
+                port, api_key = _resolve_claude_desktop_target(global_settings)
+                from ..integrations.claude_desktop import configure_omlx_gateway
+
+                applied = configure_omlx_gateway(port, api_key)
+                claude_desktop_result = {"applied": applied, "action": "configure"}
+                if applied:
+                    runtime_applied.append("claude_desktop")
+                    if request.restart_desktop:
+                        from ..integrations.claude_desktop import (
+                            restart_claude_desktop,
+                        )
+
+                        restart_claude_desktop()
+            elif not desktop_now_enabled and desktop_previously_enabled:
+                from ..integrations.claude_desktop import restore
+
+                applied = restore()
+                claude_desktop_result = {"applied": applied, "action": "restore"}
+                if applied:
+                    runtime_applied.append("claude_desktop")
+                    if request.restart_desktop:
+                        from ..integrations.claude_desktop import (
+                            restart_claude_desktop,
+                        )
+
+                        restart_claude_desktop()
+        except Exception as exc:
+            logger.warning("Claude Desktop auto-config failed: %s", exc)
+            claude_desktop_result = {"applied": False, "error": str(exc)}
+
     # Build response message
     message = "Settings saved successfully."
 
@@ -5823,6 +5949,124 @@ async def update_global_settings(
         "success": True,
         "message": message,
         "runtime_applied": runtime_applied,
+        "claude_desktop": claude_desktop_result,
+    }
+
+
+def _resolve_claude_desktop_target(
+    global_settings, port: int | None = None, api_key: str | None = None
+) -> tuple[int, str]:
+    """Resolve the oMLX (port, api_key) pair for the Claude Desktop gateway profile.
+
+    Explicit overrides win; otherwise the configured server port and the live
+    server API key are used. An empty key falls back to ``"omlx"`` (open server).
+    """
+    resolved_port = port or getattr(global_settings.server, "port", 8000) or 8000
+    resolved_key = (api_key or "").strip()
+    if not resolved_key:
+        try:
+            from ..server import _server_state
+
+            resolved_key = (_server_state.api_key or "").strip()
+        except Exception:
+            resolved_key = ""
+    if not resolved_key:
+        resolved_key = (getattr(global_settings.auth, "api_key", "") or "").strip()
+    return int(resolved_port), resolved_key or "omlx"
+
+
+class ClaudeDesktopConfigureRequest(BaseModel):
+    """Request model for (re-)applying the Claude Desktop gateway profile."""
+
+    restart_desktop: bool = False
+    port: int | None = None
+    api_key: str | None = None
+
+
+class ClaudeDesktopRestoreRequest(BaseModel):
+    """Request model for restoring the pre-oMLX Claude Desktop configuration."""
+
+    restart_desktop: bool = False
+
+
+@router.get("/api/claude-desktop/status")
+async def claude_desktop_status(
+    is_admin: bool = Depends(require_admin),
+):
+    """Return whether the oMLX Claude Desktop gateway profile is applied."""
+    from ..integrations.claude_desktop import PROFILE_ID, is_configured
+
+    return {
+        "configured": bool(is_configured()),
+        "profile_id": PROFILE_ID,
+    }
+
+
+@router.post("/api/claude-desktop/configure")
+async def claude_desktop_configure(
+    request: ClaudeDesktopConfigureRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """(Re-)apply the oMLX Claude Desktop gateway profile (macOS only).
+
+    Writes the user's Claude Desktop JSON configs — this side effect is
+    shown explicitly in the admin panel. Restarting the Claude app is
+    opt-in via ``restart_desktop`` and never automatic.
+    """
+    from ..integrations import claude_desktop as desktop
+
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    port, api_key = _resolve_claude_desktop_target(
+        global_settings, request.port, request.api_key
+    )
+    try:
+        applied = desktop.configure_omlx_gateway(port, api_key)
+    except Exception as exc:
+        logger.warning("Claude Desktop configure failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Configure failed: {exc}")
+    if applied and request.restart_desktop:
+        desktop.restart_claude_desktop()
+    return {
+        "success": True,
+        "configured": bool(desktop.is_configured()),
+        "applied": applied,
+        "profile_id": desktop.PROFILE_ID,
+    }
+
+
+@router.post("/api/claude-desktop/restore")
+async def claude_desktop_restore(
+    request: ClaudeDesktopRestoreRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Restore the pre-oMLX Claude Desktop configuration (macOS only)."""
+    from ..integrations import claude_desktop as desktop
+
+    if _get_global_settings() is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    try:
+        applied = desktop.restore()
+    except Exception as exc:
+        logger.warning("Claude Desktop restore failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Restore failed: {exc}")
+    if applied and request.restart_desktop:
+        desktop.restart_claude_desktop()
+    # Keep the persisted flag in sync so the dashboard toggle reflects
+    # reality after a direct restore call (not just via the settings PATCH).
+    global_settings = _get_global_settings()
+    if global_settings is not None and global_settings.claude_code.desktop_enabled:
+        global_settings.claude_code.desktop_enabled = False
+        try:
+            global_settings.save()
+        except Exception as e:
+            logger.warning("Failed to persist desktop_enabled after restore: %s", e)
+    return {
+        "success": True,
+        "configured": bool(desktop.is_configured()),
+        "applied": applied,
+        "profile_id": desktop.PROFILE_ID,
     }
 
 
@@ -7218,6 +7462,15 @@ async def clear_hot_cache(is_admin: bool = Depends(require_admin)):
             try:
                 await loop.run_in_executor(executor, _sync_and_clear_cache, stream)
             except RuntimeError as exc:
+                if is_command_buffer_error(exc):
+                    # Keep reclaiming the other engines.
+                    logger.warning(
+                        "Metal command buffer error while reclaiming MLX "
+                        "buffers for model '%s': %s",
+                        model_id,
+                        exc,
+                    )
+                    continue
                 if "cannot schedule new futures after shutdown" not in str(exc):
                     raise
                 logger.warning(
@@ -7523,7 +7776,9 @@ async def start_hf_download(
         raise HTTPException(status_code=503, detail="Downloader not initialized")
 
     try:
-        task = await _hf_downloader.start_download(request.repo_id, request.hf_token)
+        task = await _hf_downloader.start_download(
+            request.repo_id, request.hf_token, files=request.files
+        )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -7585,14 +7840,28 @@ async def remove_hf_task(
     return {"success": True}
 
 
+def _hf_model_format(model_format: str | None, mlx_only: bool) -> str:
+    """The downloader's format filter; ``mlx_only`` is the older spelling."""
+    if model_format is None:
+        return "mlx" if mlx_only else "all"
+    if model_format not in MODEL_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"model_format must be one of {', '.join(MODEL_FORMATS)}",
+        )
+    return model_format
+
+
 @router.get("/api/hf/recommended")
 async def get_recommended_models(
     mlx_only: bool = True,
+    model_format: str | None = None,
     is_admin: bool = Depends(require_admin),
 ):
     """Get recommended models filtered by system memory."""
     if _hf_downloader is None:
         raise HTTPException(status_code=503, detail="Downloader not initialized")
+    resolved_format = _hf_model_format(model_format, mlx_only)
 
     memory_info = get_system_memory_info()
     max_memory = memory_info["total_bytes"] or 16 * 1024**3
@@ -7601,7 +7870,9 @@ async def get_recommended_models(
 
     try:
         result = await HFDownloader.get_recommended_models(
-            max_memory_bytes=max_memory, result_limit=50, mlx_only=mlx_only
+            max_memory_bytes=max_memory,
+            result_limit=50,
+            model_format=resolved_format,
         )
         return result
     except TimeoutError:
@@ -7659,6 +7930,7 @@ async def search_hf_models(
     sort: str = "trending",
     limit: int = 100,
     mlx_only: bool = True,
+    model_format: str | None = None,
     # Filtering
     min_params: Optional[int] = None,
     max_params: Optional[int] = None,
@@ -7675,7 +7947,8 @@ async def search_hf_models(
         q: Search query string (required)
         sort: Sort order - trending/downloads/created/updated/most_params/least_params/largest/smallest
         limit: Maximum results (max 100)
-        mlx_only: Restrict to MLX library models
+        mlx_only: Restrict to MLX library models (older spelling of model_format)
+        model_format: mlx, gguf or all
         min_params: Minimum parameter count
         max_params: Maximum parameter count
         min_size: Minimum model size in bytes
@@ -7685,6 +7958,7 @@ async def search_hf_models(
     """
     if not q.strip():
         raise HTTPException(status_code=400, detail="Query parameter 'q' is required")
+    resolved_format = _hf_model_format(model_format, mlx_only)
 
     from .hf_downloader import HFDownloader
 
@@ -7693,7 +7967,7 @@ async def search_hf_models(
             query=q.strip(),
             sort=sort,
             limit=min(limit, 100),
-            mlx_only=mlx_only,
+            model_format=resolved_format,
             min_params=min_params,
             max_params=max_params,
             min_size=min_size,
@@ -7713,10 +7987,14 @@ async def search_hf_models(
 
 @router.get("/api/hf/model-info")
 async def get_hf_model_info(
+    request: Request,
     repo_id: str = "",
     is_admin: bool = Depends(require_admin),
 ):
-    """Get detailed model information from HuggingFace."""
+    """Get detailed model information from HuggingFace.
+
+    An ``X-HF-Token`` header carries a token for a gated or private repo.
+    """
     if not repo_id.strip():
         raise HTTPException(
             status_code=400, detail="Query parameter 'repo_id' is required"
@@ -7726,8 +8004,21 @@ async def get_hf_model_info(
 
     from .hf_downloader import HFDownloader
 
+    repo_id = repo_id.strip()
+    parts = repo_id.split("/")
+    local_dir = None
+    if _hf_downloader is not None and len(parts) == 2 and not {".", ".."} & set(parts):
+        local_dir = _hf_downloader.model_dir / repo_id
     try:
-        result = await HFDownloader.get_model_info(repo_id=repo_id.strip())
+        result = await HFDownloader.get_model_info(
+            repo_id=repo_id,
+            local_dir=local_dir,
+            token=request.headers.get("x-hf-token") or None,
+        )
+        if _hf_downloader is not None:
+            result["disk_free"] = await asyncio.to_thread(
+                _free_disk_bytes, _hf_downloader.model_dir
+            )
         return result
     except TimeoutError:
         raise HTTPException(
@@ -7735,9 +8026,7 @@ async def get_hf_model_info(
             detail="HuggingFace API request timed out. The service may be temporarily unavailable.",
         )
     except RepositoryNotFoundError:
-        raise HTTPException(
-            status_code=404, detail=f"Model '{repo_id.strip()}' not found"
-        )
+        raise HTTPException(status_code=404, detail=f"Model '{repo_id}' not found")
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
@@ -7783,6 +8072,8 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
     models = []
     seen_names: set[str] = set()
+    # (folder, row name, source type) of folders of GGUF models.
+    gguf_folders: list[tuple[Path, str, str]] = []
     for model_dir in model_dirs:
         if not model_dir.exists():
             continue
@@ -7790,14 +8081,19 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
 
-            if (subdir / "config.json").exists():
+            if gguf.is_gguf_folder(subdir):
+                gguf_folders.append((subdir, subdir.name, "local"))
+            elif (subdir / "config.json").exists():
                 # Level 1: direct model folder
                 _add_model(subdir, subdir.name)
             else:
                 # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
-                    if _is_hf_cache_mlx_compatible(
+                    if gguf.is_gguf_folder(hf_resolved.snapshot_path):
+                        folder, name = hf_resolved.snapshot_path, hf_resolved.model_id
+                        gguf_folders.append((folder, name, "hf_cache"))
+                    elif _is_hf_cache_mlx_compatible(
                         hf_resolved.snapshot_path, hf_resolved.source_repo_id
                     ):
                         _add_model(
@@ -7812,14 +8108,67 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
                         continue
-                    if (child / "config.json").exists():
+                    if gguf.is_gguf_folder(child):
+                        gguf_folders.append((child, child.name, "local"))
+                    elif (child / "config.json").exists():
                         _add_model(
                             child, child.name, repo_id=f"{subdir.name}/{child.name}"
                         )
 
+    # One row per GGUF model, as discovery found them. No repo_id: a repo
+    # holds several GGUFs, so one of them does not make the repo downloaded.
+    try:
+        engine_pool = _get_engine_pool() if _get_engine_pool else None
+    except HTTPException:  # the server has not created the pool yet
+        engine_pool = None
+    registered: set[Path] = set()
+    for info in engine_pool.get_status()["models"] if engine_pool else []:
+        if info.get("model_format") != "gguf" or info["id"] in seen_names:
+            continue
+        seen_names.add(info["id"])
+        source = Path(info.get("source_path") or "")
+        parts = (gguf.source_info(info["model_path"]) or {}).get("parts") or []
+        registered.update(source.parent / name for name in parts)
+        models.append(
+            {
+                "name": info["id"],
+                "path": info.get("source_path"),
+                "display_name": _model_display_name(
+                    info["id"],
+                    None,
+                    model_dirs,
+                    source_repo_id=info.get("source_repo_id"),
+                    source_path=info.get("source_path"),
+                ),
+                "size": info.get("estimated_size", 0),
+                "size_formatted": format_size(info.get("estimated_size", 0)),
+                "repo_id": None,
+                "source_type": info.get("source_type", "local"),
+                "model_format": "gguf",
+            }
+        )
+
+    # A folder with GGUFs no model stands for (an unfinished split, an
+    # unreadable file, subfolder copies) is listed whole so it can be deleted.
+    for folder, name, source_type in gguf_folders:
+        stranded = [
+            path
+            for path in folder.rglob("*.gguf")
+            if path not in registered
+            and not (path.parent == folder and gguf.file_kind(path.name) != "gguf")
+        ]
+        if stranded and name not in seen_names:
+            _add_model(folder, name, source_type=source_type)
+            models[-1]["model_format"] = "gguf"
+
     # Sort by the UI display name so organization prefixes group together.
     models.sort(key=lambda m: m["display_name"].lower())
     return {"models": models}
+
+
+def _is_listed_model_folder(path: Path) -> bool:
+    """A folder /api/hf/models lists whole: a checkpoint or a GGUF folder."""
+    return (path / "config.json").exists() or gguf.is_gguf_folder(path)
 
 
 @router.delete("/api/hf/models/{model_name}")
@@ -7836,6 +8185,12 @@ async def delete_hf_model(
 
     model_dirs = global_settings.get_effective_model_dirs()
 
+    entry = engine_pool.get_entry(model_name) if engine_pool is not None else None
+    if entry is not None and entry.model_format == "gguf":
+        await _delete_gguf_model(entry, model_dirs, engine_pool)
+        _refresh_pool_after_delete(model_name, engine_pool, global_settings)
+        return {"success": True, "message": f"Model '{model_name}' deleted"}
+
     # Search the discovery directories in flat, HF cache and org-folder layouts
     model_path = None
     parent_model_dir = None
@@ -7843,7 +8198,7 @@ async def delete_hf_model(
         if not model_dir.exists():
             continue
         candidate = model_dir / model_name
-        if candidate.is_dir() and (candidate / "config.json").exists():
+        if candidate.is_dir() and _is_listed_model_folder(candidate):
             model_path = candidate
             parent_model_dir = model_dir
             break
@@ -7854,15 +8209,18 @@ async def delete_hf_model(
             if hf_resolved is not None:
                 # The repo dir owns the snapshot symlinks and their blobs, so
                 # it is removed as one unit.
-                if hf_resolved.model_id == model_name and _is_hf_cache_mlx_compatible(
-                    hf_resolved.snapshot_path, hf_resolved.source_repo_id
+                if hf_resolved.model_id == model_name and (
+                    _is_hf_cache_mlx_compatible(
+                        hf_resolved.snapshot_path, hf_resolved.source_repo_id
+                    )
+                    or gguf.is_gguf_folder(hf_resolved.snapshot_path)
                 ):
                     model_path = subdir
                     parent_model_dir = model_dir
                     break
                 continue
             candidate = subdir / model_name
-            if candidate.is_dir() and (candidate / "config.json").exists():
+            if candidate.is_dir() and _is_listed_model_folder(candidate):
                 model_path = candidate
                 parent_model_dir = model_dir
                 break
@@ -7933,27 +8291,112 @@ async def delete_hf_model(
         except OSError as e:
             logger.debug(f"Could not remove empty org folder {parent}: {e}")
 
-    # Re-discover models
-    if engine_pool is not None:
-        settings_manager = _get_settings_manager()
-        pinned_models = []
-        if settings_manager:
-            pinned_models = settings_manager.get_pinned_model_ids()
-
-        engine_pool._entries.pop(model_name, None)
-        # Release the deleted model's persisted settings (including its alias)
-        # so they can be reused by another model.
-        if settings_manager:
-            settings_manager.delete_settings(model_name)
-        engine_pool.discover_models(
-            [str(d) for d in global_settings.get_effective_model_dirs()],
-            pinned_models,
-        )
-        if settings_manager:
-            engine_pool.apply_settings_overrides(settings_manager)
-        logger.info("Model pool refreshed after deletion")
-
+    _refresh_pool_after_delete(model_name, engine_pool, global_settings)
     return {"success": True, "message": f"Model '{model_name}' deleted"}
+
+
+def _refresh_pool_after_delete(model_name: str, engine_pool, global_settings) -> None:
+    """Forget a deleted model's entry and settings, then re-discover."""
+    if engine_pool is None:
+        return
+    settings_manager = _get_settings_manager()
+    pinned_models = []
+    if settings_manager:
+        pinned_models = settings_manager.get_pinned_model_ids()
+
+    engine_pool._entries.pop(model_name, None)
+    # Release the deleted model's persisted settings (including its alias)
+    # so they can be reused by another model.
+    if settings_manager:
+        settings_manager.delete_settings(model_name)
+    engine_pool.discover_models(
+        [str(d) for d in global_settings.get_effective_model_dirs()],
+        pinned_models,
+    )
+    if settings_manager:
+        engine_pool.apply_settings_overrides(settings_manager)
+    logger.info("Model pool refreshed after deletion")
+
+
+def _unlink_hf_cache_file(link: Path, repo_dir: Path) -> None:
+    """Remove a snapshot link and its blob once no other link uses it."""
+    blob = link.resolve()
+    link.unlink(missing_ok=True)
+    if not blob.is_relative_to(repo_dir / "blobs"):
+        return
+    for other in (repo_dir / "snapshots").rglob("*"):
+        if other.is_symlink() and other.resolve() == blob:
+            return
+    blob.unlink(missing_ok=True)
+
+
+async def _delete_gguf_model(entry, model_dirs: list[Path], engine_pool) -> None:
+    """Delete one GGUF model's files; its folder goes with its last GGUF.
+
+    Vision projectors stay while another GGUF in the folder pairs with them.
+    """
+    info = gguf.source_info(entry.model_path) or {}
+    folder = Path(entry.source_path).parent
+    if not any(
+        folder.resolve().is_relative_to(model_dir.resolve())
+        for model_dir in model_dirs
+    ):
+        raise HTTPException(status_code=400, detail="Invalid model name")
+    names = info.get("parts") or [Path(entry.source_path).name]
+    parts = [folder / name for name in names]
+
+    hf_cache = entry.source_type == "hf_cache"
+    # snapshots/<revision>/ inside models--Org--Name/
+    repo_dir = folder.parent.parent if hf_cache else folder
+    remaining = [
+        model
+        for model in gguf.find_models(folder)
+        if model.path not in parts and model.model_id != entry.model_id
+    ]
+    if _hf_downloader is not None and not hf_cache:
+        # The folder goes with its last GGUF, and with it every download
+        # into it; otherwise only a download of these files stops.
+        await _hf_downloader.cancel_download_for_dir(
+            folder, [part.name for part in parts] if remaining else None
+        )
+    if entry.model_id in engine_pool.get_loaded_model_ids():
+        try:
+            await engine_pool._unload_engine(entry.model_id)
+            logger.info(f"Unloaded model '{entry.model_id}' before deletion")
+        except Exception as e:
+            logger.warning(f"Failed to unload model '{entry.model_id}': {e}")
+
+    try:
+        if hf_cache and not remaining:
+            shutil.rmtree(repo_dir)
+        elif hf_cache:
+            for part in parts:
+                _unlink_hf_cache_file(part, repo_dir)
+        else:
+            for part in parts:
+                part.unlink(missing_ok=True)
+            if not remaining:
+                for projector in folder.glob("*.gguf"):
+                    if gguf.file_kind(projector.name) == "mmproj":
+                        projector.unlink(missing_ok=True)
+                is_model_dir = any(
+                    folder.resolve() == model_dir.resolve() for model_dir in model_dirs
+                )
+                if not is_model_dir and not any(folder.rglob("*.gguf")):
+                    shutil.rmtree(folder)
+                    parent = folder.parent
+                    if (
+                        all(parent.resolve() != d.resolve() for d in model_dirs)
+                        and parent.exists()
+                        and not any(parent.iterdir())
+                    ):
+                        parent.rmdir()
+        deleted = ", ".join(map(str, parts))
+        logger.info(f"Deleted GGUF model {entry.model_id}: {deleted}")
+    except OSError as e:
+        logger.error(f"Failed to delete GGUF model {entry.model_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete model: {e}")
+    shutil.rmtree(entry.model_path, ignore_errors=True)
 
 
 # =============================================================================

@@ -452,7 +452,7 @@ final class MenubarStatsPoller {
         try validateOK(response)
     }
 
-    private var hasAPIKey: Bool {
+    var hasAPIKey: Bool {
         guard let apiKey else { return false }
         return !apiKey.isEmpty
     }

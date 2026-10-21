@@ -33,6 +33,9 @@ from ..cluster.liveness import (
     read_marker,
 )
 from ..exceptions import InvalidRequestError
+from ..patches.deepseek_v41.processing import (
+    install_tokenizer_protocol as install_deepseek_v41_tokenizer_protocol,
+)
 from ..reasoning_effort import _fallback_candidate, _normalized_input
 from .base import GenerationOutput
 from .batched import BatchedEngine
@@ -47,6 +50,8 @@ _request_clock = time.monotonic
 _PEER_HEALTH_TTL = 10.0
 _MAX_TARGETED_CANCEL_REQUESTS = 256
 _MAX_TRANSPORT_REQUEST_ID_BYTES = 128
+# Content parts the API layer keeps for an engine that accepts images.
+_MEDIA_PART_TYPES = frozenset({"image_url", "input_image", "video_url", "input_audio"})
 
 
 def _valid_transport_request_id(value: Any) -> bool:
@@ -186,6 +191,7 @@ class DistributedBatchedEngine(BatchedEngine):
         request_read_timeout: float | None = None,
         abort_drain_timeout: float = 15.0,
         orphan_reap_grace: float = 5.0,
+        vision_checkpoint: bool = False,
     ) -> None:
         if request_read_timeout is None:
             raw = os.environ.get("OMLX_DISTRIBUTED_REQUEST_READ_TIMEOUT", "300.0")
@@ -235,6 +241,16 @@ class DistributedBatchedEngine(BatchedEngine):
         self._next_request_seq = 0
         self._last_cancel_epoch = 0
         self._runtime_failed_reason: str | None = None
+        self._vision_checkpoint = vision_checkpoint
+
+    @property
+    def accepts_image_input(self) -> bool:
+        """Media parts reach a vision checkpoint so preflight can refuse them.
+
+        The ranks run the text model only. Dropping the parts would answer as
+        if the user sent no image.
+        """
+        return self._vision_checkpoint
 
     @property
     def runtime_failed_reason(self) -> str | None:
@@ -451,6 +467,9 @@ raise SystemExit(2)
             {"trust_remote_code": self.deployment.trust_remote_code},
             config.get("eos_token_id"),
         )
+        if self._model_type == "deepseek_v41":
+            # The ranks encode with the same protocol (see inference_worker).
+            install_deepseek_v41_tokenizer_protocol(self._tokenizer, config)
 
         try:
             await asyncio.to_thread(self._supervisor.start)
@@ -1945,7 +1964,21 @@ raise SystemExit(2)
                     self._peer_reach = cached
         return cached[1]
 
-    async def preflight_chat(self, *args: Any, **kwargs: Any) -> None:
+    async def preflight_chat(
+        self, messages: list[dict[str, Any]], *args: Any, **kwargs: Any
+    ) -> None:
+        if any(
+            isinstance(part, dict) and part.get("type") in _MEDIA_PART_TYPES
+            for message in messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+        ):
+            raise InvalidRequestError(
+                "Image, video and audio input are not supported while this "
+                "model runs on a cluster. The cluster serves its text model "
+                "only.",
+                field="messages",
+            )
         self._validate_request_features(kwargs)
         await self._require_healthy_cluster()
         return None

@@ -197,6 +197,9 @@ def _nax_sorted_gather_qmm(x, w, args, kwargs):
 
 
 def _gather_qmm_rerouted(x, w, *args, **kwargs):
+    if kwargs.get("global_scale") is not None:
+        # The NAX kernels take no global scale; keep MLX's kernel.
+        return _original_gather_qmm(x, w, *args, **kwargs)
     if kwargs.get("sorted_indices") and _on_nax_host():
         out = _nax_sorted_gather_qmm(x, w, args, kwargs)
         if out is not None:
@@ -269,6 +272,8 @@ def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
     if not _on_nax_host():
         return None
     if "bias" in proj or not all(hasattr(proj, a) for a in ("group_size", "bits")):
+        return None
+    if "global_scale" in proj:
         return None
     w = proj.get("weight")
     scales = proj.get("scales")

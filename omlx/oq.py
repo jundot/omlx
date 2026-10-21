@@ -140,6 +140,59 @@ def _muse_spark_folded_scales(
     return frozenset(names)
 
 
+_MUSE_SPARK_QKVG_RE = re.compile(r"\.self_attn\.(?:q|k|v|gate)_proj$")
+
+
+def _shared_bits_group(path: str, config: dict) -> str | None:
+    """The fused module whose quantization ``path`` must share, if any.
+
+    Muse Spark output uses the layout of mlx-lm's Muse Spark model, which
+    stores q, k, v and the attention output gate of a layer as one
+    ``qkvg_proj``.
+    """
+    if str(config.get("model_type", "")).lower() != "muse_spark":
+        return None
+    match = _MUSE_SPARK_QKVG_RE.search(path)
+    return path[: match.start()] + ".self_attn.qkvg_proj" if match else None
+
+
+def _unify_shared_bits(
+    named_shapes: dict[str, tuple],
+    config: dict,
+    boost_map: dict[str, dict],
+    fixed_overrides: dict[str, dict],
+    base: dict,
+) -> int:
+    """Give every module of a fused group the widest format in the group.
+
+    Returns the added bits. This runs after the budget allocation and may end
+    slightly above the hard cap: a fused module needs one format to load.
+    """
+    from collections import defaultdict
+
+    added_bits = 0
+    groups = defaultdict(list)
+    for path, shape in named_shapes.items():
+        group = _shared_bits_group(path, config)
+        if group is not None and path not in fixed_overrides:
+            groups[group].append((path, shape))
+    for members in groups.values():
+        specs = [{**base, **boost_map.get(path, {})} for path, _ in members]
+        widest = max(specs, key=lambda spec: (spec["bits"], -spec["group_size"]))
+        for (path, shape), spec in zip(members, specs):
+            if spec == widest:
+                continue
+            old_cost = _tensor_quantized_bytes(
+                shape, spec["bits"], spec["group_size"], spec["mode"]
+            )
+            new_cost = _tensor_quantized_bytes(
+                shape, widest["bits"], widest["group_size"], widest["mode"]
+            )
+            boost_map[path] = dict(widest)
+            added_bits += 8 * (new_cost - old_cost)
+    return added_bits
+
+
 def _fold_nvfp4_tensor_scale(weight: mx.array, global_scale: mx.array) -> mx.array:
     """Scale each expert of a dequantized NVFP4 weight to its real magnitude."""
     from omlx.patches.muse_spark.muse_spark_model import _NVFP4_GLOBAL_SCALE
@@ -615,6 +668,11 @@ def universal_quant_predicate(
 
     if _is_moe_router(path):
         return False  # fp16 — tiny weights, some models (MoEGate) lack to_quantized()
+
+    if path.endswith("lm_head") and str(config.get("model_type", "")) == "muse_spark":
+        # mlx-lm's Muse Spark casts the lm_head input to the weight dtype, so
+        # a quantized lm_head gives wrong logits there.
+        return False
 
     if "shared_expert_gate" in path and "gate_proj" not in path:
         return {"bits": 8, "group_size": 64, "mode": "affine"}
@@ -1403,6 +1461,17 @@ def _build_quant_plan(
             target_bpw,
             hard_cap_bpw,
         )
+
+    added_bits = _unify_shared_bits(
+        named_shapes,
+        config,
+        boost_map,
+        fixed_overrides,
+        {"bits": base_bits, "group_size": base_group_size, "mode": base_mode},
+    )
+    if added_bits:
+        total_bits_f += added_bits
+        current_bpw = total_bits_f / total_params
 
     if boost_map:
         from collections import Counter
@@ -7003,6 +7072,12 @@ def quantize_oq_streaming(
     )
     pending_scales = {}
     consumed_scales = set()
+    upstream_writer = None
+    if _stream_source_model_type(config) == "muse_spark":
+        from omlx.patches.muse_spark.upstream_layout import UpstreamWriter
+
+        # The output loads in mlx-lm's own Muse Spark model as well as oMLX.
+        upstream_writer = UpstreamWriter(config)
 
     for tensor_name in tensor_names:
         if tensor_name in folded_scales:
@@ -7149,6 +7224,8 @@ def quantize_oq_streaming(
 
         current_bytes = sum(v.nbytes for v in out_shard_data.values())
         if current_bytes >= _MAX_SHARD_BYTES:
+            if upstream_writer is not None:
+                out_shard_data = upstream_writer(out_shard_data)
             shard_name = f"model-{out_shard_idx + 1:05d}-of-PLACEHOLDER.safetensors"
             shard_path = output / shard_name
             mx.save_safetensors(
@@ -7203,6 +7280,9 @@ def quantize_oq_streaming(
     mx.synchronize()
     mx.clear_cache()
 
+    if upstream_writer is not None:
+        out_shard_data = upstream_writer(out_shard_data)
+        upstream_writer.finish()
     if out_shard_data:
         total_shards = out_shard_idx + 1
         if total_shards == 1:
@@ -7294,6 +7374,8 @@ def quantize_oq_streaming(
         except Exception as e:
             logger.debug(f"Could not resolve eos_token_id: {e}")
     quant_info = dict(quantization_config)
+    if upstream_writer is not None:
+        per_layer_config = upstream_writer.quantization(per_layer_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val
     output_config["quantization"] = quant_info

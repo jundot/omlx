@@ -18,8 +18,11 @@ import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
+import omlx.engine_core as engine_core
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.engine_core import (
     AsyncEngineCore,
     EngineConfig,
@@ -702,7 +705,9 @@ class TestEngineCoreClose:
             future = MagicMock()
             future.result.side_effect = concurrent.futures.TimeoutError
             executor = MagicMock()
-            executor.submit.return_value = future
+            executor.submit.side_effect = lambda fn, *args: (
+                future if getattr(fn, "__name__", "") == "shutdown" else MagicMock()
+            )
             engine._mlx_executor = executor
 
             with (
@@ -1446,6 +1451,64 @@ class TestGlobalMLXExecutor:
         future.result.assert_called_once_with(timeout=60.0)
         executor.shutdown.assert_called_once_with(wait=False)
 
+    def test_teardown_reclaim_survives_pending_command_buffer_errors(self):
+        """A victim engine's stored GPU errors must not fail its unload."""
+        error = RuntimeError(
+            "[METAL] Command buffer execution failed: Discarded (victim of GPU "
+            "error/recovery) (00000005:kIOGPUCommandBufferCallbackErrorInnocentVictim)."
+        )
+        with (
+            patch.object(
+                engine_core, "_sync_and_clear_cache", side_effect=[error, error, None]
+            ) as sync,
+            patch.object(engine_core, "clear_thread_streams"),
+        ):
+            engine_core._final_engine_thread_reclaim("stream")
+        assert sync.call_count == 3
+
+        with (
+            patch.object(
+                engine_core,
+                "_sync_and_clear_cache",
+                side_effect=RuntimeError("[metal::malloc] out of memory"),
+            ),
+            pytest.raises(RuntimeError, match="malloc"),
+        ):
+            engine_core._final_engine_thread_reclaim("stream")
+
+    def test_close_drains_pending_gpu_error_before_scheduler_teardown(
+        self, mock_model, mock_tokenizer
+    ):
+        """Scheduler teardown must not stop on an error a GPU reset left behind."""
+        pending = [
+            RuntimeError(
+                "[METAL] Command buffer execution failed: Discarded (victim of "
+                "GPU error/recovery)"
+            )
+        ]
+        real_synchronize = mx.synchronize
+
+        def synchronize(*args):
+            if pending:
+                raise pending.pop()
+            return real_synchronize(*args)
+
+        def shutdown():
+            mx.synchronize()
+
+        with (
+            patch("omlx.engine_core.get_registry") as mock_registry,
+            patch.object(mx, "synchronize", side_effect=synchronize),
+            patch.object(engine_core, "fatal_exit", side_effect=SystemExit) as fatal,
+        ):
+            mock_registry.return_value.acquire.return_value = True
+            engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+            engine.scheduler.shutdown = shutdown
+            engine.close()
+
+        fatal.assert_not_called()
+        assert engine._closed
+
     def test_get_mlx_executor_returns_singleton(self):
         """get_mlx_executor() must always return the same executor instance."""
         from omlx.engine_core import get_mlx_executor
@@ -1467,6 +1530,64 @@ class TestGlobalMLXExecutor:
             finally:
                 engine1.close()
                 engine2.close()
+
+    @pytest.mark.skipif(
+        not quant_fast.has_symbol("share_command_queue"),
+        reason="native quant_matmul extension not built",
+    )
+    def test_engine_streams_share_one_metal_queue(self, mock_model, mock_tokenizer):
+        """Engines keep their own threads but submit on one queue (#4224).
+
+        The thread's default stream keeps its own queue: a default-stream
+        producer feeding the engine stream in one eval would deadlock on a
+        single in-order queue.
+        """
+
+        def step(stream):
+            produced = mx.arange(1 << 16, dtype=mx.float32) * 2
+            with mx.stream(stream):
+                total = (produced + 1).sum()
+            mx.eval(total)
+            return quant_fast.share_command_queue(stream), total.item()
+
+        with patch("omlx.engine_core.get_registry") as mock_registry:
+            mock_registry.return_value.acquire.return_value = True
+            engines = [
+                EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+                for _ in range(2)
+            ]
+            try:
+                results = [
+                    e._mlx_executor.submit(step, e._mlx_stream).result(timeout=30)
+                    for e in engines
+                ]
+            finally:
+                for e in engines:
+                    e.close()
+
+        assert results[0][0] == results[1][0]
+        assert [total for _, total in results] == [float(1 << 32)] * 2
+
+    def test_warns_once_when_engines_keep_own_queues(
+        self, mock_model, mock_tokenizer, caplog
+    ):
+        """Without the native extension, a second live engine logs one warning."""
+        with (
+            patch("omlx.engine_core.get_registry") as mock_registry,
+            patch.object(engine_core, "share_command_queue", return_value=None),
+            patch.object(engine_core, "_warned_own_queues", False),
+            caplog.at_level("WARNING", logger="omlx.engine_core"),
+        ):
+            mock_registry.return_value.acquire.return_value = True
+            engines = [
+                EngineCore(model=mock_model, tokenizer=mock_tokenizer)
+                for _ in range(3)
+            ]
+            for e in engines:
+                e.close()
+
+        warnings = [r for r in caplog.records if "#4224" in r.getMessage()]
+        assert len(warnings) == 1
 
     @pytest.mark.asyncio
     async def test_shared_executor_serializes_concurrent_tasks(self):

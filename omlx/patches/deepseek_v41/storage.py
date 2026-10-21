@@ -43,6 +43,67 @@ _PAGE_IO_POOL = ThreadPoolExecutor(
 )
 
 
+# Rows per positional read, and the largest hole read through instead of split.
+# On a cold SSD one read across a hole up to 64KiB is faster than two reads.
+ROW_BATCH_ROWS = 256
+ROW_BATCH_MAX_GAP = 65536
+
+
+def _read_row_runs(fd, rows, base, row_bytes):
+    """Copy rows in input order, one positional read per run of nearby rows."""
+    unique, inverse = np.unique(rows, return_inverse=True)
+    index = np.arange(unique.size)
+    first = np.ones(unique.size, dtype=bool)
+    first[1:] = (np.diff(unique) - 1) * row_bytes > ROW_BATCH_MAX_GAP
+    run = np.maximum.accumulate(np.where(first, index, 0))
+    first |= (index - run) % ROW_BATCH_ROWS == 0
+    run = np.maximum.accumulate(np.where(first, index, 0))
+    # Byte offset of each row inside the read of its run.
+    inner = ((unique - unique[run]) * row_bytes).tolist()
+    starts = np.flatnonzero(first)
+    stops = np.append(starts[1:], unique.size)
+    runs = list(
+        zip(
+            starts.tolist(),
+            stops.tolist(),
+            (base + unique[starts] * row_bytes).tolist(),
+            ((unique[stops - 1] - unique[starts] + 1) * row_bytes).tolist(),
+        )
+    )
+    packed = np.empty((unique.size, row_bytes), dtype=np.uint8)
+    target = memoryview(packed).cast("B")
+
+    def copy(group):
+        for low, high, offset, length in group:
+            data = os.pread(fd, length, offset)
+            while len(data) < length:
+                more = os.pread(fd, length - len(data), offset + len(data))
+                if not more:
+                    raise ValueError("Truncated Engram rows")
+                data += more
+            if length == (high - low) * row_bytes:
+                target[low * row_bytes : high * row_bytes] = data
+                continue
+            data = memoryview(data)
+            for row in range(low, high):
+                start = inner[row]
+                target[row * row_bytes : (row + 1) * row_bytes] = data[
+                    start : start + row_bytes
+                ]
+
+    # Bound the queue as well as the active reads. The caller holds _lock;
+    # drain every worker, including on error, before close can release fd.
+    futures = []
+    try:
+        for worker in range(min(PAGE_IO_WORKERS, len(runs))):
+            futures.append(_PAGE_IO_POOL.submit(copy, runs[worker::PAGE_IO_WORKERS]))
+    finally:
+        wait(futures)
+    for future in futures:
+        future.result()
+    return packed[inverse]
+
+
 def _resident_buffer(shape, dtype):
     """Share packed Metal storage with CPU gathers, without a host copy."""
     types = {
@@ -140,11 +201,20 @@ class TensorFile:
                     raise IndexError("Engram row outside table")
                 gather_start = None
                 row_bytes = (end - start) // view.shape[0] if view.shape[0] else 0
-                if (
-                    rows.size
-                    and 0 < row_bytes <= PAGE_SIZE
-                    and self._prefetch_pages(rows, self._start + start, row_bytes)
-                ):
+                if rows.size and 0 < row_bytes <= PAGE_SIZE:
+                    base = self._start + start
+                    fresh = self._unseen_pages(rows, base, row_bytes)
+                    if fresh.size:
+                        # Read the rows, not their pages: a page read copies
+                        # 16KiB per 128B Engram row, then the gather faults it.
+                        copied = _read_row_runs(
+                            self._file.fileno(), rows.reshape(-1), base, row_bytes
+                        )
+                        self._seen_pages[fresh] = 1
+                        return (
+                            copied.view(dt).reshape(rows.shape + view.shape[1:]),
+                            dtype,
+                        )
                     gather_start = time.perf_counter()
                 copied = view[rows]  # Advanced indexing already copies the rows.
                 if gather_start is not None:
@@ -161,8 +231,8 @@ class TensorFile:
                 return copied, dtype
             return np.array(view, copy=True), dtype
 
-    def _prefetch_pages(self, rows, base, row_bytes):
-        """Read unseen pages concurrently before gathering from the mmap."""
+    def _unseen_pages(self, rows, base, row_bytes):
+        """Pages holding the rows that no read has fetched yet."""
         if self._seen_pages is None:
             self._seen_pages = np.zeros(
                 (self._file_size + PAGE_SIZE - 1) // PAGE_SIZE, dtype=np.uint8
@@ -173,34 +243,7 @@ class TensorFile:
                 (offsets // PAGE_SIZE, (offsets + row_bytes - 1) // PAGE_SIZE)
             )
         )
-        fresh = pages[self._seen_pages[pages] == 0]
-        if not fresh.size:
-            return True
-        fd = self._file.fileno()
-
-        def touch(group):
-            for page in group:
-                offset = int(page) * PAGE_SIZE
-                remaining = min(PAGE_SIZE, self._file_size - offset)
-                while remaining:
-                    data = os.pread(fd, remaining, offset)
-                    if not data:
-                        raise ValueError("Truncated Engram page")
-                    offset += len(data)
-                    remaining -= len(data)
-
-        # Bound the queue as well as the active reads. The caller holds _lock;
-        # drain every worker, including on error, before close can release fd.
-        futures = []
-        try:
-            for group in np.array_split(fresh, min(PAGE_IO_WORKERS, fresh.size)):
-                futures.append(_PAGE_IO_POOL.submit(touch, group))
-        finally:
-            wait(futures)
-        for future in futures:
-            future.result()
-        self._seen_pages[fresh] = 1
-        return False
+        return pages[self._seen_pages[pages] == 0]
 
     def close(self):
         with self._lock:
@@ -353,7 +396,9 @@ class DiskEngramEmbedding(nn.Module):
                 self._scales.close()
 
 
-PREFETCH_BYTES = 16 * 1024 * 1024
+# Include packed rows and their IDs for wider prefill chunks. Only one read
+# remains pending per model; larger gathers still use the synchronous path.
+PREFETCH_BYTES = 64 * 1024 * 1024
 
 
 class EngramPrefetch:

@@ -17,6 +17,7 @@ from omlx.engine.distributed import (
     DistributedBatchedEngine,
     DistributedInferenceError,
 )
+from omlx.exceptions import InvalidRequestError
 
 
 def _deployment() -> ClusterDeployment:
@@ -42,8 +43,8 @@ class _Tokenizer:
         return list(text.encode())
 
 
-def _ready_engine(handler) -> DistributedBatchedEngine:
-    engine = DistributedBatchedEngine(_deployment())
+def _ready_engine(handler, **engine_kwargs) -> DistributedBatchedEngine:
+    engine = DistributedBatchedEngine(_deployment(), **engine_kwargs)
     engine._loaded = True
     engine._tokenizer = _Tokenizer()
     engine._client = httpx.AsyncClient(
@@ -1297,6 +1298,28 @@ async def test_preflight_fails_open_when_the_probe_itself_breaks(monkeypatch):
 
     monkeypatch.setattr(distributed, "check_peers", broken_check_peers)
     try:
+        await engine.preflight_chat([{"role": "user", "content": "hi"}])
+    finally:
+        await engine._client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_preflight_refuses_media_for_a_vision_checkpoint(monkeypatch):
+    engine = _ready_engine(lambda request: httpx.Response(200), vision_checkpoint=True)
+    monkeypatch.setattr(engine._supervisor, "status", _healthy_supervisor_status)
+    monkeypatch.setattr(
+        distributed,
+        "check_peers",
+        lambda hosts, **kwargs: (SimpleNamespace(healthy=True),),
+    )
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+    try:
+        # The parts must reach the engine, or the API layer drops them silently.
+        assert engine.accepts_image_input is True
+        with pytest.raises(InvalidRequestError, match="text model only"):
+            await engine.preflight_chat(
+                [{"role": "user", "content": [{"type": "text", "text": "hi"}, image]}]
+            )
         await engine.preflight_chat([{"role": "user", "content": "hi"}])
     finally:
         await engine._client.aclose()

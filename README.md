@@ -182,6 +182,8 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 - **Hot tier (RAM)**: Frequently accessed blocks stay in memory for fast access.
 - **Cold tier (SSD)**: When the hot cache fills up, blocks are offloaded to SSD in safetensors format. On the next request with a matching prefix, they're restored from disk instead of recomputed from scratch - even after a server restart.
 
+Optional [Affine4](docs/affine4.md) and [Affine8](docs/affine8.md) KV compression add signed 4-bit and 8-bit cache formats with Metal TensorOps decode attention and a portable fallback. Select either under **Model settings → Memory Saving → KV cache compression**.
+
 <p align="center">
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
 </p>
@@ -210,7 +212,7 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 - **Model alias**: set a custom API-visible name. `/v1/models` returns the alias, and requests accept both the alias and directory name.
 - **Model type override**: manually set a model as LLM or VLM regardless of auto-detection.
-- **External engine**: serve Qwen3.8-27B and Qwen3.6-35B-A3B MLX checkpoints from your model directories with [Splash](https://github.com/incoai/splash)'s Metal engine in its own process (official build on M3 or later, Splash M1 on M1/M2). See [docs/Splash.md](docs/Splash.md).
+- **External engine**: serve Qwen3.8-27B and Qwen3.6-35B-A3B MLX, NVFP4 and GGUF checkpoints from your model directories with [Splash](https://github.com/incoai/splash)'s Metal engine in its own process (official build on M3 or later, Splash M1 on M1/M2). See [docs/Splash.md](docs/Splash.md).
 - **Profiles**: save named bundles of per-model settings and switch between them from the admin panel. A profile can optionally be exposed as its own model: `/v1/models` then also lists `<model>:<profile>` (e.g. `qwen3-8b:thinking`), which serves on the same engine as the base model with the profile's settings overlaid per request — no extra memory, no reload. When the base model has an alias, the exposed ID is advertised as `<alias>:<profile>`; the directory-name form keeps working, just like for the base model.
 
 <p align="center">
@@ -228,7 +230,7 @@ Chat directly with any loaded model from the admin panel. Supports conversation 
 
 ### Model Downloader
 
-Search and download MLX models from HuggingFace directly in the admin dashboard. Browse model cards, check file sizes, and download with one click.
+Search and download models from HuggingFace directly in the admin dashboard, in MLX, GGUF or all formats. Browse model cards, then pick the files to download: an MLX checkpoint keeps the files it needs, and a GGUF brings its vision projector.
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX Model Downloader" width="720">
@@ -299,7 +301,7 @@ A bare JSON, EBNF, or regex grammar constrains the answer from the first generat
 
 ## Models
 
-Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported.
+Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported. GGUF files in these folders are listed one model per file and run on an [external engine](docs/Splash.md#gguf-models).
 
 ```
 ~/models/
@@ -466,5 +468,5 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
-- [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`; Splash itself can also serve supported models as an external engine
+- [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`, and a GGUF's tokenizer is derived from its header as Splash's Apache-2.0 `install/gguf.py` derives it; Splash itself can also serve supported models as an external engine
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating

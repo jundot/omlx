@@ -11,7 +11,7 @@ import sys
 import time
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -846,6 +846,28 @@ class TestBlockAwarePrefixCacheWithSSD:
         result = prefix_cache_with_ssd.reconstruct_cache(table)
 
         assert result is None
+
+    @pytest.mark.parametrize(
+        "message,raises",
+        [
+            ("[METAL] Command buffer execution failed: Caused GPU Hang Error", True),
+            ("unexpected block layout", False),
+        ],
+    )
+    def test_reconstruct_cache_raises_only_failed_command_buffers(
+        self, prefix_cache_with_ssd, message, raises
+    ):
+        """A GPU reset must fail the request, not turn into a cache miss."""
+        type(prefix_cache_with_ssd.paged_ssd_cache)._expected_layer_cache_types = (
+            PropertyMock(side_effect=RuntimeError(message))
+        )
+        table = BlockTable(request_id="req-001", block_ids=[1, 2])
+
+        if raises:
+            with pytest.raises(RuntimeError, match="GPU Hang"):
+                prefix_cache_with_ssd.reconstruct_cache(table)
+        else:
+            assert prefix_cache_with_ssd.reconstruct_cache(table) is None
 
     def test_reconstruct_cache_no_ssd_manager(self, paged_cache):
         """Test reconstruct_cache without SSD manager."""
@@ -2811,7 +2833,7 @@ class TestArraysCacheLastBlockOnly:
         for call in calls:
             saved_by_hash[call.kwargs["block_hash"]] = call.kwargs["cache_data"]
 
-        def load_block_with_metadata(block_hash):
+        def load_block_with_metadata(block_hash, **kwargs):
             block_data = saved_by_hash.get(block_hash)
             if block_data is None:
                 return None, None
@@ -5371,3 +5393,26 @@ def test_bounded_path_inactive(tmp_path, monkeypatch, flush_bytes, min_tokens):
     # Lazy path leaves the KV concat unevaluated, as before the change.
     assert restored[1].keys.shape[2] == total
     ssd.close()
+
+
+def test_restore_pool_flush_raises_failed_command_buffer(monkeypatch):
+    """Only a failed command buffer escapes the best-effort pool flush."""
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 1 << 40)
+    monkeypatch.setattr(
+        prefix_cache_module,
+        "_sync_and_clear_cache",
+        MagicMock(side_effect=RuntimeError("[metal] clear failed")),
+    )
+    assert BlockAwarePrefixCache._flush_restore_pool_if_over(1) is False
+
+    monkeypatch.setattr(
+        prefix_cache_module,
+        "_sync_and_clear_cache",
+        MagicMock(
+            side_effect=RuntimeError(
+                "[METAL] Command buffer execution failed: Caused GPU Hang Error"
+            )
+        ),
+    )
+    with pytest.raises(RuntimeError, match="GPU Hang"):
+        BlockAwarePrefixCache._flush_restore_pool_if_over(1)

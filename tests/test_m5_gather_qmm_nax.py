@@ -1300,11 +1300,11 @@ def _regrouped(gate_up_mod, glu):
 
 
 def _qwen_weighted_sum_kernel():
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
-    if not fast.has_symbol("qwen35_moe_weighted_sum"):
-        pytest.skip("qwen35_moe_weighted_sum native kernel unavailable")
-    return fast.qwen35_moe_weighted_sum
+    if not fast.has_symbol("moe_weighted_sum"):
+        pytest.skip("moe_weighted_sum native kernel unavailable")
+    return fast.moe_weighted_sum
 
 
 @needs_nax

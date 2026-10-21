@@ -101,7 +101,7 @@ def test_staged_extension_suffix_mismatch_fails_closed(tmp_path):
             '"version":[3,11],"extension_suffix":".cpython-311-darwin.so"}'
         ),
     )
-    extension = tmp_path / "custom_kernels/glm_moe_dsa/_ext.cpython-313-darwin.so"
+    extension = tmp_path / "custom_kernels/attention/_ext.cpython-313-darwin.so"
     extension.parent.mkdir(parents=True)
     extension.touch()
 
