@@ -33,6 +33,14 @@ class ImageRequest(BaseModel):
         return value
 
 
+async def _wait_for_disconnect(request):
+    # Await the ASGI message instead of polling is_disconnected(), whose
+    # immediately cancelled receive can miss disconnects under middleware.
+    while True:
+        if (await request.receive())["type"] == "http.disconnect":
+            return
+
+
 @router.post("/v1/images/generations")
 async def generate_image(request: ImageRequest, http_request: Request):
     from .. import server
@@ -40,6 +48,7 @@ async def generate_image(request: ImageRequest, http_request: Request):
     lease = server._LLMEngineLease()
     leased = []
     job = None
+    disconnected = None
     try:
         engine = await server.get_engine(
             request.model, server.EngineType.IMAGE, _lease=True, _leased_out=leased
@@ -48,11 +57,15 @@ async def generate_image(request: ImageRequest, http_request: Request):
             lease.model_id = leased[0]
         seed = request.seed if request.seed is not None else secrets.randbits(32)
         job = asyncio.create_task(engine.generate(request.prompt, seed))
+        disconnected = asyncio.create_task(_wait_for_disconnect(http_request))
         while not job.done():
             await server._raise_if_llm_lease_abort_requested(lease)
-            if await http_request.is_disconnected():
+            await asyncio.wait(
+                {job, disconnected}, timeout=0.1, return_when=asyncio.FIRST_COMPLETED
+            )
+            if disconnected.done():
+                await disconnected
                 raise HTTPException(status_code=499, detail="Client disconnected")
-            await asyncio.wait({job}, timeout=0.1)
         image, _metrics = await job
         return {
             "created": int(time.time()),
@@ -65,6 +78,10 @@ async def generate_image(request: ImageRequest, http_request: Request):
     except (MemoryError, RuntimeError, InterruptedError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     finally:
+        if disconnected is not None:
+            disconnected.cancel()
+            with contextlib.suppress(BaseException):
+                await _drain(disconnected)
         if job is not None:
             if not job.done():
                 job.cancel()
