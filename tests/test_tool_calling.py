@@ -4336,8 +4336,9 @@ class TestQwen3CoderMarkerInArguments:
         text = self._raw("plain") + "b</parameter></function>\n</tool_call> After"
         assert self._stream(text, chunk) == text[len(self._raw("plain")) :]
 
+    @pytest.mark.parametrize("capture_fragments", [False, True])
     def test_boundary_scan_visits_each_char_a_bounded_number_of_times(
-        self, monkeypatch
+        self, monkeypatch, capture_fragments
     ):
         """Linear-time guard, counted rather than timed.
 
@@ -4386,12 +4387,20 @@ class TestQwen3CoderMarkerInArguments:
             )
 
         def stream(text):
-            filt = ToolCallStreamFilter(self._tokenizer())
+            filt = ToolCallStreamFilter(
+                self._tokenizer(),
+                capture_ordered_segments=capture_fragments,
+                capture_envelope_fragments=capture_fragments,
+            )
             filt.feed(text)
             filt.finish()
 
         def stream_chunked(text):
-            filt = ToolCallStreamFilter(self._tokenizer())
+            filt = ToolCallStreamFilter(
+                self._tokenizer(),
+                capture_ordered_segments=capture_fragments,
+                capture_envelope_fragments=capture_fragments,
+            )
             for i in range(0, len(text), 64):
                 filt.feed(text[i : i + 64])
             filt.finish()

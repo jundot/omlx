@@ -2695,8 +2695,6 @@ def _completion_keepalive_chunk(response_id: str) -> str:
         '"model":"keepalive",'
         '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
     )
-
-
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
 
 
@@ -5066,7 +5064,9 @@ async def create_chat_completion(
 
         # Widen the repetition-penalty look-back window when the client
         # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(request, "repetition_context_size", None)
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
         chat_kwargs.update(_no_repeat_ngram_kwargs(request))
@@ -5210,9 +5210,15 @@ async def create_chat_completion(
                 f"request_max_tokens={request.max_tokens}"
             )
             first_token_at = getattr(output, "first_token_at", None)
-            ttft = (first_token_at - start_time) if first_token_at is not None else None
+            ttft = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else None
+            )
             metric_prefill = ttft if ttft is not None else 0.0
-            gen_duration = elapsed - metric_prefill if metric_prefill > 0 else elapsed
+            gen_duration = (
+                elapsed - metric_prefill if metric_prefill > 0 else elapsed
+            )
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
                 is_diffusion=is_diffusion,
@@ -6384,26 +6390,27 @@ def _chat_can_stream_qwen_tool_envelopes(engine: BaseEngine) -> bool:
     """Narrow Chat-only early-tool gate.
 
     The engine capability is authoritative and defaults false. The tokenizer
-    must independently expose mlx-lm's qwen3_coder parser; all other APIs and
-    parser families remain terminal-buffered.
+    must independently expose mlx-lm's or mlx-vlm's qwen3_coder parser. Other
+    APIs and parser families remain terminal-buffered.
     """
 
     if getattr(engine, "supports_early_tool_call_streaming", False) is not True:
         return False
     tokenizer = getattr(engine, "tokenizer", None)
     parser = getattr(tokenizer, "tool_parser", None)
-    try:
-        from mlx_lm.tool_parsers.qwen3_coder import (
-            parse_tool_call as expected_parser,
-        )
-    except ImportError:
-        return False
-    return bool(
-        parser is expected_parser
-        and getattr(parser, "__name__", None) == "parse_tool_call"
-        and getattr(parser, "__module__", None)
-        == "mlx_lm.tool_parsers.qwen3_coder"
-    )
+    import importlib
+
+    for module_name in (
+        "mlx_lm.tool_parsers.qwen3_coder",
+        "mlx_vlm.tools.parsers.qwen3_coder",
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if parser is module.parse_tool_call:
+            return True
+    return False
 
 
 def _merge_streamed_tool_call_prefix(streamed: list, terminal: list | None) -> list:
@@ -6486,21 +6493,29 @@ async def stream_chat_completion(
     tool_filter = None
     thinking_filter = None
     streamed_tool_calls = []
+    partial_tool_call_count = 0
     stream_tool_sequence_safe = True
     stream_completed_qwen_tools = False
     qwen_tool_envelope_streaming_capable = False
     registered_tool_names: set[str] = set()
     stream_content = True
+    argument_stream = None
     if has_tools:
         registered_tool_names = _registered_tool_names(kwargs.get("tools"))
         qwen_tool_envelope_streaming_capable = bool(
             registered_tool_names and _chat_can_stream_qwen_tool_envelopes(engine)
         )
         stream_completed_qwen_tools = qwen_tool_envelope_streaming_capable
+        if qwen_tool_envelope_streaming_capable:
+            from .api.qwen_argument_stream import QwenArgumentStream
+            argument_stream = QwenArgumentStream(
+                kwargs.get("tools"), native_parser=engine.tokenizer.tool_parser
+            )
         _content_filter = ToolCallStreamFilter(
             engine.tokenizer,
             tools=kwargs.get("tools"),
             capture_ordered_segments=stream_completed_qwen_tools,
+            capture_envelope_fragments=argument_stream is not None,
         )
         # The thinking channel never contains a separator-prefixed DSML
         # block; holding trailing newlines would flush them as a late
@@ -6515,6 +6530,20 @@ async def stream_chat_completion(
             thinking_filter = _thinking_filter
         else:
             stream_content = False
+    def flush_argument_events():
+        if argument_stream is not None:
+            for delta in argument_stream.flush():
+                delta["index"] += len(streamed_tool_calls)
+                chunk = ChatCompletionChunk(
+                    id=response_id, model=request.model,
+                    choices=[ChatCompletionChunkChoice(
+                        delta=ChatCompletionChunkDelta(tool_calls=[delta]),
+                        finish_reason=None,
+                    )],
+                )
+                mark_visible_delta()
+                yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+
     progress_request_id = None
     if request.return_progress:
         # The engine keys the prefill tracker by this id.
@@ -6554,6 +6583,9 @@ async def stream_chat_completion(
                 # A structured producer is authoritative. Correct engines keep
                 # the explicit capability false; this guard also prevents a
                 # same-output raw envelope from racing its structured result.
+                if argument_stream is not None and argument_stream.calls:
+                    raise ValueError("Structured producer interrupted partial tool arguments")
+                argument_stream = None
                 stream_completed_qwen_tools = False
                 stream_tool_sequence_safe = False
             if output.new_text:
@@ -6603,6 +6635,11 @@ async def stream_chat_completion(
                             # retained duplicate state.
                             tool_filter.take_completed_envelopes()
                             if tool_filter.completed_envelope_overflowed:
+                                if argument_stream is not None:
+                                    # Retain the emitted prefix for final native
+                                    # validation; queue bounds only stop early
+                                    # delivery, not an otherwise valid call.
+                                    argument_stream.enabled = False
                                 logger.warning(
                                     "Early qwen tool streaming disabled for this "
                                     "Chat turn: completed-envelope queue exceeded "
@@ -6645,10 +6682,25 @@ async def stream_chat_completion(
                             yield event
                             continue
 
+                        if segment.kind == "envelope_delta":
+                            if argument_stream is not None and stream_tool_sequence_safe:
+                                for delta in argument_stream.feed(segment.text):
+                                    delta["index"] += len(streamed_tool_calls)
+                                    chunk = ChatCompletionChunk(
+                                        id=response_id, model=request.model,
+                                        choices=[ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(tool_calls=[delta]),
+                                            finish_reason=None,
+                                        )],
+                                    )
+                                    mark_visible_delta()
+                                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                            continue
+
                         if segment.kind != "envelope":
                             stream_tool_sequence_safe = False
                             continue
-                        _, completed_calls, _ = parse_qwen_tool_calls(
+                        _, completed_calls, completed_errors = parse_qwen_tool_calls(
                             segment.text,
                             engine.tokenizer,
                             kwargs.get("tools"),
@@ -6658,13 +6710,38 @@ async def stream_chat_completion(
                         completed_keys = [
                             _tool_call_semantic_key(tc) for tc in completed_calls
                         ]
-                        if not completed_calls or any(
+                        if completed_errors or not completed_calls or any(
                             key is None for key in completed_keys
                         ):
                             stream_tool_sequence_safe = False
                             continue
                         if not stream_tool_sequence_safe:
                             continue
+                        if argument_stream is not None:
+                            remaining = argument_stream.finish(completed_calls)
+                            if remaining is not None:
+                                offset = len(streamed_tool_calls)
+                                for tc, partial in zip(completed_calls, argument_stream.calls):
+                                    tc.id = partial["id"]
+                                    streamed_tool_calls.append(tc)
+                                for delta in remaining:
+                                    delta["index"] += offset
+                                    chunk = ChatCompletionChunk(
+                                        id=response_id, model=request.model,
+                                        choices=[ChatCompletionChunkChoice(
+                                            delta=ChatCompletionChunkDelta(tool_calls=[delta]),
+                                            finish_reason=None,
+                                        )],
+                                    )
+                                    mark_visible_delta()
+                                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+                                argument_stream = QwenArgumentStream(
+                                    kwargs.get("tools"), native_parser=engine.tokenizer.tool_parser
+                                )
+                                continue
+                            argument_stream = QwenArgumentStream(
+                                kwargs.get("tools"), native_parser=engine.tokenizer.tool_parser
+                            )
                         for tc in completed_calls:
                             index = len(streamed_tool_calls)
                             streamed_tool_calls.append(tc)
@@ -6699,7 +6776,11 @@ async def stream_chat_completion(
                             mark_visible_delta()
                             yield event
     except Exception as e:
+        for event in flush_argument_events():
+            yield event
         error_data = _streaming_error_payload(e, "chat streaming")
+        if last_output and last_output.finished:
+            error_data["usage"] = _tool_generation_usage(last_output)
         yield f"data: {json.dumps(error_data)}\n\n"
         yield "data: [DONE]\n\n"
         return
@@ -6873,11 +6954,67 @@ async def stream_chat_completion(
                 mark_visible_delta()
                 yield event
 
+    # Batching must not discard already-produced bytes on length/error paths.
+    # Draining leaves partial JSON open; only native validation can close it.
+    for event in flush_argument_events():
+        yield event
+
+    # A complete function missing only its outer close may be recovered by
+    # the existing final parser. Finish its existing index, never resend the
+    # full body. Length-stopped or malformed calls retain their open JSON.
+    if argument_stream is not None and argument_stream.calls:
+        offset = len(streamed_tool_calls)
+        pending_end = offset + len(argument_stream.calls)
+        prefix_calls = tool_calls
+        prefix_errors = ()
+        if tool_failure or tool_truncated:
+            # Queue overflow may leave a complete call awaiting validation.
+            # Parse its own source prefix: a later bad sibling must neither
+            # suppress its close nor cause the whole body to be sent again.
+            _, prefix_calls, prefix_errors = parse_qwen_tool_calls(
+                regular_content, engine.tokenizer, kwargs.get("tools"),
+                last_output.finish_reason if last_output else "stop",
+                max_envelopes=pending_end,
+            )
+        pending_calls = (prefix_calls or [])[offset:pending_end]
+        pending_validated = False
+        if not prefix_errors:
+            try:
+                remaining = argument_stream.finish(pending_calls)
+            except ValueError:
+                tool_calls = list(streamed_tool_calls)
+                tool_failure = {"error": {
+                    "message": "Incremental arguments differ from final parsing",
+                    "type": "tool_stream_validation_error",
+                    "code": "invalid_tool_call",
+                }}
+            else:
+                pending_validated = True
+                for tc, partial in zip(pending_calls, argument_stream.calls):
+                    tc.id = partial["id"]
+                    streamed_tool_calls.append(tc)
+                for delta in remaining or []:
+                    delta["index"] += offset
+                    chunk = ChatCompletionChunk(
+                        id=response_id, model=request.model,
+                        choices=[ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(tool_calls=[delta]),
+                            finish_reason=None,
+                        )],
+                    )
+                    mark_visible_delta()
+                    yield f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
+        if not pending_validated:
+            # Reserve abandoned indices so later complete siblings cannot
+            # overwrite a partial call already visible to the client.
+            partial_tool_call_count = len(argument_stream.calls)
+
     # Surface an unterminated paired envelope only when final parsing could not
     # recover a structured tool call. The candidate begins at the opening marker,
     # so prose already streamed before it is never duplicated.
     recovered_thinking, recovered_content = _take_recoverable_withheld_text(
-        tool_filter, thinking_filter, tool_calls, parse_errors, streamed_tool_calls
+        tool_filter, thinking_filter, tool_calls, parse_errors,
+        streamed_tool_calls or (argument_stream.calls if argument_stream else None),
     )
     if recovered_thinking or recovered_content:
         # The marker was quoted in prose, so this is not a failed tool call.
@@ -6971,7 +7108,7 @@ async def stream_chat_completion(
                         delta=ChatCompletionChunkDelta(
                             tool_calls=[
                                 {
-                                    "index": i,
+                                    "index": i + partial_tool_call_count,
                                     "id": tc.id,
                                     "type": "function",
                                     "function": {
@@ -7037,12 +7174,18 @@ async def stream_chat_completion(
             gen_duration = max(
                 0.0,
                 end_time
-                - (first_token_time if first_token_time is not None else start_time),
+                - (
+                    first_token_time
+                    if first_token_time is not None
+                    else start_time
+                ),
             )
         metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
             last_output,
             is_diffusion=is_diffusion,
-            prefill_duration=(model_ttft if model_ttft is not None else total_duration),
+            prefill_duration=(
+                model_ttft if model_ttft is not None else total_duration
+            ),
             generation_duration=gen_duration,
         )
         speed_duration = total_duration if is_diffusion else gen_duration
@@ -7101,7 +7244,9 @@ async def stream_chat_completion(
                         else None
                     ),
                     time_to_first_visible_token=(
-                        round(visible_ttft, 2) if visible_ttft is not None else None
+                        round(visible_ttft, 2)
+                        if visible_ttft is not None
+                        else None
                     ),
                     total_time=round(total_time, 2),
                     **_usage_timing_fields(
@@ -7395,7 +7540,9 @@ async def stream_anthropic_messages(
         # held newlines here, and pure whitespace must not open a
         # phantom text block.
         if remaining and not (
-            not text_block_started and kwargs.get("tools") and not remaining.strip()
+            not text_block_started
+            and kwargs.get("tools")
+            and not remaining.strip()
         ):
             if not text_block_started:
                 if thinking_block_started:
@@ -7763,7 +7910,9 @@ async def create_anthropic_message(
 
         # Widen the repetition-penalty look-back window when the client
         # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(request, "repetition_context_size", None)
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
 
@@ -8604,7 +8753,9 @@ async def create_response(
 
         # Widen the repetition-penalty look-back window when the client
         # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(request, "repetition_context_size", None)
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
 
@@ -8864,9 +9015,7 @@ async def create_response(
                 top_p=top_p,
                 max_output_tokens=request.max_output_tokens,
                 previous_response_id=request.previous_response_id,
-                incomplete_details=(
-                    {"reason": "max_output_tokens"} if truncated else None
-                ),
+                incomplete_details={"reason": "max_output_tokens"} if truncated else None,
             )
 
             # Store response

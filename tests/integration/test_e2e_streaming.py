@@ -1838,10 +1838,11 @@ class TestStreamingHelperFunctions:
             if choice.get("finish_reason"):
                 finish_index = event_index
 
+        calls = _chat_argument_calls(payloads)
         assert len(calls) == 1
         assert call_seen_before_engine_finish
-        assert calls[0]["function"]["name"] == "get_weather"
-        assert json.loads(calls[0]["function"]["arguments"]) == {
+        assert calls[0]["name"] == "get_weather"
+        assert json.loads(calls[0]["arguments"]) == {
             "city": "Seattle"
         }
         assert call_event_indexes[0] < finish_index
@@ -1915,7 +1916,7 @@ class TestStreamingHelperFunctions:
             delta = choices[0].get("delta") or {}
             if delta.get("content"):
                 ordered.append(("content", delta["content"]))
-            if delta.get("tool_calls"):
+            if delta.get("tool_calls") and delta["tool_calls"][0]["function"].get("name"):
                 ordered.append(
                     ("tool", delta["tool_calls"][0]["function"]["name"])
                 )
@@ -2287,7 +2288,7 @@ class TestStreamingHelperFunctions:
                 seen_before_finish |= not engine.last_stream_output_finished
 
         assert seen_before_finish
-        assert [call["function"]["name"] for call in calls] == [
+        assert [call["function"]["name"] for call in calls if call["function"].get("name")] == [
             "hallucinated",
             "get_weather",
         ]
@@ -2404,8 +2405,9 @@ class TestStreamingHelperFunctions:
             scheduler._output_parser_factory = None
             assert engine.supports_early_tool_call_streaming
 
-    def test_early_tool_gate_requires_exact_qwen3_coder_parser(self):
-        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+    @pytest.mark.parametrize("module_name", ["mlx_lm.tool_parsers.qwen3_coder", "mlx_vlm.tools.parsers.qwen3_coder"])
+    def test_early_tool_gate_requires_exact_qwen3_coder_parser(self, module_name):
+        parse_tool_call = pytest.importorskip(module_name).parse_tool_call
 
         from omlx.server import _chat_can_stream_qwen_tool_envelopes
 
@@ -2421,7 +2423,7 @@ class TestStreamingHelperFunctions:
         engine.tokenizer.tool_parser = lookalike
         assert not _chat_can_stream_qwen_tool_envelopes(engine)
 
-        lookalike.__module__ = "mlx_lm.tool_parsers.qwen3_coder"
+        lookalike.__module__ = module_name
         lookalike.__name__ = "parse_tool_call"
         assert not _chat_can_stream_qwen_tool_envelopes(engine)
 
@@ -4679,7 +4681,7 @@ _RECOVERY_CALL = (
 
 async def _recovery_stream(
     raw, api="chat", chunk_size=7, finish_reason="stop", closed=None, cancel=False,
-    completion_tokens=0, include_usage=False
+    completion_tokens=0, include_usage=False, native_parser=None
 ):
     from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
 
@@ -4697,7 +4699,7 @@ async def _recovery_stream(
     engine.tokenizer.has_tool_calling = True
     engine.tokenizer.tool_call_start = "<tool_call>"
     engine.tokenizer.tool_call_end = "</tool_call>"
-    engine.tokenizer.tool_parser = parse_tool_call
+    engine.tokenizer.tool_parser = native_parser or parse_tool_call
     engine.set_stream_outputs(
         [
             MockGenerationOutput(
@@ -4749,14 +4751,29 @@ async def _recovery_stream(
     return events
 
 
+def _chat_argument_calls(events):
+    """Accumulate standard argument deltas without repairing incomplete JSON."""
+    calls = {}
+    for event in events:
+        for choice in event.get("choices", []):
+            for tc in choice.get("delta", {}).get("tool_calls", []):
+                call = calls.setdefault(tc["index"], {"id": "", "name": "", "arguments": ""})
+                call["id"] += tc.get("id", "")
+                for field in ("name", "arguments"):
+                    call[field] += tc["function"].get(field, "")
+    return list(calls.values())
+
+
 def _recovery_calls(events, api):
     if api == "chat":
-        return [
-            {"id": tc["id"], **tc["function"]}
-            for e in events
-            for c in e.get("choices", [])
-            for tc in c.get("delta", {}).get("tool_calls", [])
-        ]
+        complete = []
+        for call in _chat_argument_calls(events):
+            try:
+                json.loads(call["arguments"])
+            except json.JSONDecodeError:
+                continue
+            complete.append(call)
+        return complete
     if api == "anthropic":
         calls = {}
         for event in events:
@@ -4820,7 +4837,7 @@ async def test_qwen_recovery_delivers_calls_once(api, chunk_size, shape):
             for c in e.get("choices", [])
             for tc in c.get("delta", {}).get("tool_calls", [])
         ]
-        assert indexes == list(range(len(calls)))
+        assert list(dict.fromkeys(indexes)) == list(range(len(calls)))
         assert [
             c["finish_reason"]
             for e in events
@@ -4955,8 +4972,9 @@ def _recovery_error_codes(events, api):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
 @pytest.mark.parametrize("chunk_size", [1, 4096])
-async def test_withheld_prose_after_literal_marker_is_delivered(api, chunk_size):
-    events = await _recovery_stream(_RECOVERY_PROSE, api, chunk_size=chunk_size)
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+async def test_withheld_prose_after_literal_marker_is_delivered(api, chunk_size, finish_reason):
+    events = await _recovery_stream(_RECOVERY_PROSE, api, chunk_size=chunk_size, finish_reason=finish_reason)
 
     assert _recovery_error_codes(events, api) == []
     assert _recovery_text(events, api) == _RECOVERY_PROSE
@@ -5676,7 +5694,12 @@ async def test_tool_length_retains_complete_calls_and_usage_without_partial_argu
                                     finish_reason="length", completion_tokens=32768,
                                     include_usage=True)
     assert len(_recovery_calls(events, api)) == len(prefix) // len(_RECOVERY_CALL)
-    assert "PRIVATE_PARTIAL_BODY" not in json.dumps(events)
+    if api == "chat":
+        partial_call = _chat_argument_calls(events)[-1]
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(partial_call["arguments"])
+    else:
+        assert "PRIVATE_PARTIAL_BODY" not in json.dumps(events)
     assert not any("error" in event for event in events)
     assert len(metrics) == 1
     assert metrics[0]["completion_tokens"] == 32768
@@ -5829,3 +5852,31 @@ async def test_finished_output_tool_delta_cancellation_accounts_once(monkeypatch
             break
     assert len(metrics) == 1
     assert metrics[0]["completion_tokens"] == 123
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk_size", [1, 13, 4096])
+@pytest.mark.parametrize("paired_first", [False, True])
+@pytest.mark.parametrize("namespaced", [False, True])
+async def test_other_qwen_envelopes_preserve_literal_paired_openers(
+    chunk_size, paired_first, namespaced
+):
+    value = "<tool_call><function=write><parameter=content>" + "x" * 100
+    naked = (
+        "\n<function=write>\n<parameter=content>\n"
+        + value
+        + "\n</parameter>\n</function>\n"
+    )
+    paired = (
+        "<tool_call><function=write><parameter=content>ordinary"
+        "</parameter></function></tool_call>"
+    )
+    if namespaced:
+        naked = "<ns:tool_call>" + naked + "</ns:tool_call>"
+    raw = paired + naked if paired_first else naked + paired
+    events = await _recovery_stream(raw, chunk_size=chunk_size)
+    assert not any(event.get("error") for event in events)
+    calls = _chat_argument_calls(events)
+    expected = ["ordinary", value] if paired_first else [value, "ordinary"]
+    assert [json.loads(call["arguments"])["content"] for call in calls] == expected
+    assert len({call["id"] for call in calls}) == 2
