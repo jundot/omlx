@@ -114,10 +114,16 @@
                                                     <span class="badge bg-neutral-100 text-neutral-500 border-neutral-200 truncate max-w-[120px]"
                                                           x-text="managerModelInfo(model.name)?.settings?.model_alias"></span>
                                                 </template>
+                                                <template x-if="model.model_type === 'image'">
+                                                    <span class="badge bg-neutral-100 text-neutral-500 border-neutral-200" x-text="window.t('models.image.title')"></span>
+                                                </template>
                                                 <template x-if="model.source_type === 'hf_cache'">
                                                     <span class="badge bg-neutral-100 text-neutral-500 border-neutral-200 flex-shrink-0 whitespace-nowrap"
                                                           :title="window.t('models.manager.hf_cache_tooltip')"
                                                           x-text="window.t('models.manager.hf_cache_badge')"></span>
+                                                </template>
+                                                <template x-if="model.model_type === 'image' && model.structural_status !== 'valid'">
+                                                    <span role="status" class="text-sm text-red-600" :title="(model.import_errors || []).join('; ')" x-text="window.t('models.image.invalid') + ': ' + (model.import_errors || []).join('; ')"></span>
                                                 </template>
                                                 <template x-if="model.model_format === 'gguf'">
                                                     <span class="badge bg-neutral-100 text-neutral-500 border-neutral-200 flex-shrink-0 whitespace-nowrap"
