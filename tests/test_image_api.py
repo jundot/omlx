@@ -104,12 +104,12 @@ async def test_disconnect_drains_before_releasing(image_api):
 
     async def disconnected():
         await started.wait()
-        return True
+        return {"type": "http.disconnect"}
 
     with pytest.raises(HTTPException) as error:
         await generate_image(
             ImageRequest(model="image", prompt="boat"),
-            SimpleNamespace(is_disconnected=disconnected),
+            SimpleNamespace(receive=disconnected),
         )
     assert error.value.status_code == 499 and drained.is_set()
     pool.release_engine.assert_awaited_once_with("physical-image")
