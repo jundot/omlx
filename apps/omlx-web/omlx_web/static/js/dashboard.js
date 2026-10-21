@@ -3117,6 +3117,12 @@
             },
 
             buildModelSettingsPayload(ms) {
+                if (this.selectedModel?.model_type === 'image') {
+                    return {
+                        model_alias: ms.model_alias?.trim() || null,
+                        ttl_seconds: ms.ttl_seconds || null,
+                    };
+                }
                 const isDiffusion = !!ms.is_diffusion_model;
                 // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
                 const chatTemplateKwargs = {};

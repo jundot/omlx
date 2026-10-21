@@ -2271,5 +2271,9 @@
   "cluster.v2.join.cleanup_forgotten": "Staré úklidové pokusy na tomto Macu byly zapomenuty. Vzdálený úklid nebyl potvrzen.",
   "cluster.v2.join.forget_cleanup_error": "Tento úklid se nepodařilo zapomenout.",
   "cluster.v2.membership.waiting_request": "Čeká se, až tento Mac zobrazí kód a odešle žádost o spárování.",
-  "cluster.v2.membership.add_device": "Přidat tento Mac"
+  "cluster.v2.membership.add_device": "Přidat tento Mac",
+  "models.image.title": "Image generation",
+  "models.image.recipe": "One 1024 × 1024 PNG per request. Fixed eight-step Turbo recipe; optional seed for replay.",
+  "models.image.lifecycle": "Uses the inference API key. One request at a time. Disconnecting cancels after current GPU work drains. Chat profiles and sampling settings do not apply.",
+  "models.image.invalid": "Image bundle needs repair"
 }

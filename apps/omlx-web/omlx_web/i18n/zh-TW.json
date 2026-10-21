@@ -2271,5 +2271,9 @@
   "cluster.v2.join.cleanup_forgotten": "舊清理已在本機被忘記。遠端清理未獲確認。",
   "cluster.v2.join.forget_cleanup_error": "無法忘記此清理。",
   "cluster.v2.membership.waiting_request": "等待這台 Mac 顯示配對碼並傳送配對請求。",
-  "cluster.v2.membership.add_device": "加入這台 Mac"
+  "cluster.v2.membership.add_device": "加入這台 Mac",
+  "models.image.title": "Image generation",
+  "models.image.recipe": "One 1024 × 1024 PNG per request. Fixed eight-step Turbo recipe; optional seed for replay.",
+  "models.image.lifecycle": "Uses the inference API key. One request at a time. Disconnecting cancels after current GPU work drains. Chat profiles and sampling settings do not apply.",
+  "models.image.invalid": "Image bundle needs repair"
 }
