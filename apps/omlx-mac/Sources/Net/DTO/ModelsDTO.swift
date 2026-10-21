@@ -16,6 +16,9 @@ struct ListModelsResponse: Codable, Sendable {
 }
 
 struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
+    /// Task discriminator; unknown future types remain decodable.
+    var isImageGeneration: Bool { modelType == "image" }
+
     let id: String
     let displayName: String?
     let modelPath: String?
