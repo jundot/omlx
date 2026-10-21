@@ -13,7 +13,7 @@ import mlx.core as mx
 import numpy as np
 from tokenizers import Tokenizer
 
-from omlx.image_bundle import MAX_METADATA, PIPELINE, SIDECAR, read_json
+from omlx.image_bundle import MAX_METADATA, PIPELINE, bundle_contract, read_json
 from omlx.image_inspect import RECIPE, contained, tensor_header
 
 PREFIX = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
@@ -23,7 +23,7 @@ MAX_TOKENS = 512
 
 def native_bundle(bundle):
     root = Path(bundle).resolve(strict=True)
-    manifest = read_json(contained(root, SIDECAR))
+    manifest = bundle_contract(root, resolve=contained)
     if (
         type(manifest.get("schema_version")) is not int
         or manifest.get("schema_version") != 1
