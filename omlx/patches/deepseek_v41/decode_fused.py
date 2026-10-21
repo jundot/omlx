@@ -329,10 +329,8 @@ def _index_block(idx, x, qr, latent, cache, shared, start, ratio):
 
 def compress_index_block(att, x, qr, cache, shared, start, c):
     """compress_index for the R tokens of a verify block at once (x: [R, dim], qr:
-    [R, q_lora]; requires block_index_ok). The compressed rows, the cache updates and each
-    token's selected indices equal R calls of compress_index; projections still run one
-    row at a time. Returns per token (compressed rows of the block, its indices [1, 1, k]),
-    the same list for the layers that reuse a source layer's arrays."""
+    [R, q_lora]; requires block_index_ok), with the cache updates and per-token indices of R
+    compress_index calls. Returns per token (the block's compressed rows, its indices)."""
     from .language import rope
 
     layer = att._layer
@@ -438,9 +436,8 @@ def _aff_mma_split(tiles, groups):
 def gemv_fp8_nb(x, a, b=None, mma=None):
     """gemv_fp8 for x [B, K]: one weight read for all B vectors. MXFP8: bit for bit gemv_fp8
     per vector without matrix tiles (mma=False); default DM.use_mma(B). Affine projections
-    always run on matrix tiles, which give a vector the same result for any B (aff_mma8): on
-    rows kernels their B >= 4 throughput fell to about half (ALU bound). One-token decode
-    keeps the faster rows kernel unless the model verifies drafts (gemv_fp8 tiles)."""
+    always run on matrix tiles (rows kernels are ALU bound there), which give a vector the
+    same result for any B, as gemv_fp8(tiles=True) does."""
     b_n = x.shape[0]
     na, k = a.weight.shape[0], a.input_dims
     nb = 0 if b is None else b.weight.shape[0]
@@ -634,7 +631,6 @@ def decode_block_nb(blk, h, pre, caches, shareds, starts, c):
         oq = mx.concatenate([attention_core(att, xs[r].reshape(-1), qrs[r].reshape(-1), qs[r].reshape(-1), ps[r].reshape(-1),
                                             caches[r], shareds[r], starts[r], cs[r].reshape(-1), ss[r].reshape(-1), c)[None]
                              for r in range(b_n)])
-    # A model that verifies drafts runs wo_a and the shared expert on matrix tiles at any B.
     tiles = DM.use_mma(b_n) or getattr(blk, "_omlx_verify_exact", False)
     yq = woa_nb(att, oq, c, tiles)
     a = blk.sum_ranks(gemv_fp8_nb(yq, att.wo_b)[0])
@@ -755,7 +751,6 @@ def decode_block(blk, h, pre, cache, shared, start, c):
     hf = h.reshape(-1)
     coef_a, x, xq, _ = mix(blk, "attn", c, hf, pre.reshape(-1))
     ap, ao, ac = coef_a[:hc], coef_a[hc:2 * hc], coef_a[2 * hc:]
-    # A model that verifies MTP drafts decodes on the verify blocks' kernels (configure_mtp).
     tiles = getattr(blk, "_omlx_verify_exact", False)
     a = blk.sum_ranks(decode_attention(blk.attn, x, xq, cache, shared, start, c, tiles))
     coef_f, x2, _, h2 = mix(blk, "ffn", c, hf, ap, sub=a, post=ao, comb=ac)

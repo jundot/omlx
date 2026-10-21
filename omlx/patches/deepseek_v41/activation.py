@@ -170,12 +170,10 @@ def quantize_paired_swiglu_activation(pair, weights, dtype, limit):
     )[0]
 
 
-# RoPE on the last RD dims of each D-wide row (adjacent pairs as complex numbers, fp32,
-# result in the input dtype) in one pass; QUANT then applies act_quant to the rotated row, as
-# quantize_activation(rope(x)) would. Thread t owns 8 contiguous elements of the
-# [B, L, ROW / D, D] output (a pair never straddles two threads; an act_quant group of 32 is 4
-# adjacent lanes). HEADS_MAJOR reads x as [B, ROW / D, L, D] (the native attention output)
-# without a transposing copy.
+# RoPE on the last RD dims of each D-wide row (adjacent pairs, fp32, result in the input dtype);
+# QUANT then applies act_quant to the rotated row. Thread t owns 8 contiguous elements of the
+# [B, L, ROW / D, D] output, so an act_quant group of 32 is 4 adjacent lanes. HEADS_MAJOR reads
+# x as [B, ROW / D, L, D] (the native attention output) without a transposing copy.
 _ROPE_SOURCE = r"""
     const uint i = thread_position_in_grid.x * 8;
     if (i >= uint(N)) return;
@@ -230,9 +228,7 @@ def _rope_kernel():
 
 
 def rope_activation(x, cos, sin, inverse=False, quantize=False, heads_major=False):
-    """RoPE of x [B, L, ..., D] at the L positions of cos / sin [L, RD / 2] (fp32), optionally
-    followed by act_quant (FP8, 32-groups) of the result, in one pass. heads_major: x is
-    [B, H, L, D] and the result [B, L, H, D]."""
+    """_ROPE_SOURCE for cos / sin [L, RD / 2] (fp32); see language.rope for the arguments."""
     rd = cos.shape[-1] * 2
     length = x.shape[2] if heads_major else x.shape[1]
     shape = (x.shape[0], length, x.shape[1], x.shape[3]) if heads_major else x.shape

@@ -211,51 +211,38 @@ inline void fp4_rows(W w, S s, uint row0, X x, uint lane, thread float* acc) {
     }
     for (int r = 0; r < ROWS; ++r) acc[r] = simd_sum(acc[r]);
 }
-// Affine weights (MLX layout, as oQ exports store them), read like MLX's qdot: x is pre-scaled
-// per term so each code is multiplied masked in place (no shifts, ~35% faster at 3 bits); a code
-// that straddles a byte (3, 5, 6 bits) gives two terms. A lane covers 16 contiguous values:
-// aff_x16 gives their terms' x and their sum, aff_w16 one row's masked codes. Their dot is
-// order-fixed (explicit fma), so the one- and multi-vector helpers give a vector the same value.
+// Affine weights (MLX layout, as oQ exports store them) at 3 or 5 bits, read like MLX's qdot: x is
+// pre-scaled per term so each code is multiplied masked in place; a code that straddles a byte
+// gives two terms. A lane covers 16 contiguous values: aff_x16 gives their terms' x and their sum,
+// aff_w16 one row's masked codes. Their dot is order-fixed (explicit fma), so the one- and
+// multi-vector helpers give a vector the same value.
 template <int BITS>
-constexpr int aff_terms16() { return BITS == 3 ? 20 : (BITS == 5 || BITS == 6) ? 24 : 16; }
+constexpr int aff_terms16() {
+    static_assert(BITS == 3 || BITS == 5, "other widths are read with shifts (aff8_rows)");
+    return BITS == 3 ? 20 : 24;
+}
 template <int BITS, typename X>
 inline float aff_x16(X x, thread float* t) {
     float xv[16], sum = 0.0f;
     for (int i = 0; i < 16; ++i) { xv[i] = float(x[i]); sum += xv[i]; }
-    if (BITS == 2) {
-        for (int i = 0; i < 16; i += 4) { t[i] = xv[i]; t[i + 1] = xv[i + 1] / 4.0f; t[i + 2] = xv[i + 2] / 16.0f; t[i + 3] = xv[i + 3] / 64.0f; }
-    } else if (BITS == 3) {
+    if (BITS == 3) {
         for (int i = 0, o = 0; i < 16; i += 8, o += 10) {
             t[o] = xv[i]; t[o + 1] = xv[i + 1] / 8.0f; t[o + 2] = xv[i + 2] / 64.0f; t[o + 3] = xv[i + 2] * 4.0f;
             t[o + 4] = xv[i + 3] / 2.0f; t[o + 5] = xv[i + 4] / 16.0f; t[o + 6] = xv[i + 5] / 128.0f; t[o + 7] = xv[i + 5] * 2.0f;
             t[o + 8] = xv[i + 6] / 4.0f; t[o + 9] = xv[i + 7] / 32.0f;
         }
-    } else if (BITS == 4) {
-        for (int i = 0; i < 16; i += 4) { t[i] = xv[i]; t[i + 1] = xv[i + 1] / 16.0f; t[i + 2] = xv[i + 2] / 256.0f; t[i + 3] = xv[i + 3] / 4096.0f; }
-    } else if (BITS == 5) {
+    } else {
         for (int i = 0, o = 0; i < 16; i += 8, o += 12) {
             t[o] = xv[i]; t[o + 1] = xv[i + 1] / 32.0f; t[o + 2] = xv[i + 1] * 8.0f; t[o + 3] = xv[i + 2] / 4.0f;
             t[o + 4] = xv[i + 3] / 128.0f; t[o + 5] = xv[i + 3] * 2.0f; t[o + 6] = xv[i + 4] / 16.0f; t[o + 7] = xv[i + 4] * 16.0f;
             t[o + 8] = xv[i + 5] / 2.0f; t[o + 9] = xv[i + 6] / 64.0f; t[o + 10] = xv[i + 6] * 4.0f; t[o + 11] = xv[i + 7] / 8.0f;
         }
-    } else if (BITS == 6) {
-        for (int i = 0, o = 0; i < 16; i += 4, o += 6) {
-            t[o] = xv[i]; t[o + 1] = xv[i + 1] / 64.0f; t[o + 2] = xv[i + 1] * 4.0f;
-            t[o + 3] = xv[i + 2] / 16.0f; t[o + 4] = xv[i + 2] * 16.0f; t[o + 5] = xv[i + 3] / 4.0f;
-        }
-    } else {
-        for (int i = 0; i < 16; ++i) t[i] = xv[i];
     }
     return sum;
 }
 template <int BITS>
 inline void aff_w16(const device uchar* p, thread float* m) {
-    if (BITS == 2) {
-        for (int i = 0; i < 4; ++i) {
-            const uint b = p[i];
-            m[4 * i] = float(b & 0x03u); m[4 * i + 1] = float(b & 0x0cu); m[4 * i + 2] = float(b & 0x30u); m[4 * i + 3] = float(b & 0xc0u);
-        }
-    } else if (BITS == 3) {
+    if (BITS == 3) {
         for (int i = 0; i < 2; ++i) {
             const uint b0 = p[3 * i], b1 = p[3 * i + 1], b2 = p[3 * i + 2];
             thread float* o = m + 10 * i;
@@ -263,13 +250,7 @@ inline void aff_w16(const device uchar* p, thread float* m) {
             o[4] = float(b1 & 0x0eu); o[5] = float(b1 & 0x70u); o[6] = float(b1 & 0x80u); o[7] = float(b2 & 0x03u);
             o[8] = float(b2 & 0x1cu); o[9] = float(b2 & 0xe0u);
         }
-    } else if (BITS == 4) {
-        const device ushort* h = reinterpret_cast<const device ushort*>(p);
-        for (int i = 0; i < 4; ++i) {
-            const uint w = h[i];
-            m[4 * i] = float(w & 0x000fu); m[4 * i + 1] = float(w & 0x00f0u); m[4 * i + 2] = float(w & 0x0f00u); m[4 * i + 3] = float(w & 0xf000u);
-        }
-    } else if (BITS == 5) {
+    } else {
         for (int i = 0; i < 2; ++i) {
             const device uchar* q = p + 5 * i;
             thread float* o = m + 12 * i;
@@ -277,15 +258,6 @@ inline void aff_w16(const device uchar* p, thread float* m) {
             o[4] = float(q[1] & 0x80u); o[5] = float(q[2] & 0x0fu); o[6] = float(q[2] & 0xf0u); o[7] = float(q[3] & 0x01u);
             o[8] = float(q[3] & 0x3eu); o[9] = float(q[3] & 0xc0u); o[10] = float(q[4] & 0x07u); o[11] = float(q[4] & 0xf8u);
         }
-    } else if (BITS == 6) {
-        for (int i = 0; i < 4; ++i) {
-            const uint b0 = p[3 * i], b1 = p[3 * i + 1], b2 = p[3 * i + 2];
-            thread float* o = m + 6 * i;
-            o[0] = float(b0 & 0x3fu); o[1] = float(b0 & 0xc0u); o[2] = float(b1 & 0x0fu);
-            o[3] = float(b1 & 0xf0u); o[4] = float(b2 & 0x03u); o[5] = float(b2 & 0xfcu);
-        }
-    } else {
-        for (int i = 0; i < 16; ++i) m[i] = float(p[i]);
     }
 }
 // ROWS rows of an affine matrix (MLX layout: K * BITS / 32 uint32 words per row, a scale and
@@ -335,9 +307,8 @@ inline void aff16_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thr
     }
     for (int i = 0; i < ROWS * NB; ++i) acc[i] = simd_sum(acc[i]);
 }
-// Affine weights read with shifts, 8 contiguous values per lane per step (MLX layout as above).
-// Faster than the masked-term helpers at 2, 4, 6 and 8 bits, and the multi-vector form keeps the
-// codes of 4 rows in registers cheaply. q[j] = code of value j of the 8 values starting at byte p.
+// Affine weights read with shifts, 8 contiguous values per lane per step (rows at 2, 4, 6 or 8
+// bits, matrix tiles at every width). q[j] = code of value j of the 8 values starting at byte p.
 template <int BITS>
 inline void affine_codes8(const device uchar* p, thread float* q) {
     constexpr uint MASK = (1u << BITS) - 1u;
@@ -416,9 +387,8 @@ inline void aff8_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thre
 }
 // fp8_mma8 for affine weights: rows r0..r0+7 against NB <= 8 vectors on simdgroup matrices, with
 // fp8_mma8's k mapping (column c of a 32-value sub-block is k = base + 4c + j for MMA j), so a lane
-// decodes 8 contiguous codes of its row. Per GS-group: scale * sum(q x) (MMA) + bias * sum(x),
-// sum(x) reduced over the lanes of the 8 k-rows. A vector's result does not depend on NB (padded
-// columns never mix into another column), so one-token decode and verify blocks agree bitwise.
+// decodes 8 contiguous codes of its row. Per GS-group: scale * sum(q x) (MMA) + bias * sum(x). A
+// vector's result does not depend on NB, so one-token decode and verify blocks agree bitwise.
 template <int K, int KS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff_mma8(W w, S s, B b, uint r0, X x, uint XS, uint lane, uint ks,
                      threadgroup float* red, threadgroup float* tile) {

@@ -21,9 +21,7 @@ from .gemv import mxfp8_gemv
 @cache
 def _affine_blocks_beat_stock():
     """Whether the native affine block-list kernels beat mx.gather_qmm for sorted prefill
-    routes. They do from ~1024 routes on M1 Ultra (#3409). From the M3 GPU (applegpu_g15) on,
-    mx.gather_qmm is 1-7% faster at every prefill size (V4.1 oQ3e 3-bit experts, 256-4096
-    tokens, M3 Ultra)."""
+    routes: from ~1024 routes on M1 Ultra (#3409), never from the M3 GPU (g15) on."""
     match = re.match(r"applegpu_g(\d+)", mx.device_info().get("architecture", ""))
     return match is None or int(match.group(1)) < 15
 

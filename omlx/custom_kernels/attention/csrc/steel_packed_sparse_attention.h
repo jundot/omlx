@@ -62,9 +62,7 @@ METAL_FUNC float deepseek_v41_packed_value(
 }
 
 // 8 BF16 values (16 bytes) of key slot k_pos (window rows, then pooled rows; < 0 masked) from
-// the BF16 row copies deepseek_v41_prefill_unpack_kv writes. Loading K / V tiles this way
-// instead of one value per thread made the prefill kernel 1.5x faster (17.0 -> 11.4 ms at
-// 2048 queries), with the same values in the tiles.
+// the BF16 row copies deepseek_v41_prefill_unpack_kv writes.
 template <typename T>
 METAL_FUNC uint4 deepseek_v41_bf16_row_slice(
     int k_pos,
@@ -409,4 +407,3 @@ template <
       size_t(tm + sm) * params->O_strides[1] + sn;
   Otile.template store<T, 1, 1>(out, params->O_strides[1]);
 }
-
