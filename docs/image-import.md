@@ -109,3 +109,7 @@ inputs; inspection is neither a lease nor an immutable filesystem snapshot.
 Subsequent PRs add native conditioning/DiT, VAE and standalone generation,
 then lifecycle, serving, and web/Mac integration. This PR adds no inference
 framework, API route, engine registration, downloader or image UI.
+
+The native loader introduced in PR3 normalizes the same model-index contract as
+this inspector before checking architecture-specific tensor names, shapes and
+precisions. Legacy sidecar loading remains a compatibility path only.
