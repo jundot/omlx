@@ -685,7 +685,7 @@ private struct TextExportSection: View {
                 ListGroup {
                     FreeRow(isLast: true) {
                         ScrollView(.horizontal, showsIndicators: true) {
-                            Text(text)
+                            Text(columns)
                                 .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.text)
                                 .fixedSize(horizontal: true, vertical: true)
@@ -702,6 +702,25 @@ private struct TextExportSection: View {
     private func copyToPasteboard() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// The tab-separated text with each table padded into columns for display;
+    /// Copy keeps the tabs.
+    private var columns: String {
+        text.components(separatedBy: "\n\n").map { block in
+            let rows = block.components(separatedBy: "\n").map { $0.components(separatedBy: "\t") }
+            var widths: [Int] = []
+            for row in rows where row.count > 1 {
+                for (i, cell) in row.enumerated() {
+                    if i < widths.count { widths[i] = max(widths[i], cell.count) } else { widths.append(cell.count) }
+                }
+            }
+            return rows.map { row in
+                row.enumerated().map { i, cell in
+                    i == row.count - 1 ? cell : cell.padding(toLength: widths[i] + 2, withPad: " ", startingAt: 0)
+                }.joined()
+            }.joined(separator: "\n")
+        }.joined(separator: "\n\n")
     }
 }
 
