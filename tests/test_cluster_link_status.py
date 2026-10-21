@@ -502,6 +502,39 @@ def test_rdma_detection_does_not_invent_a_three_mac_full_mesh(monkeypatch):
     assert ("a.local", "c.local") not in rdma_edges
 
 
+@pytest.mark.parametrize("probe_fails, kinds", [(True, set()), (False, {"ethernet"})])
+def test_a_failed_probe_reports_no_link_instead_of_ethernet(
+    monkeypatch, probe_fails, kinds
+):
+    class FakeConfig:
+        class Host:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        @staticmethod
+        def extract_connectivity(hosts, verbose=False):
+            if probe_fails:
+                raise ValueError("ssh returned no output")
+            return hosts, {}
+
+        @staticmethod
+        def make_connectivity_matrix(hosts, reverse):
+            return []
+
+    monkeypatch.setattr(
+        "omlx.cluster.transport._import_mlx_config",
+        lambda: FakeConfig,
+    )
+    monkeypatch.setattr(
+        "omlx.cluster.transport._rdma_available",
+        lambda hosts, ssh_prefix="": False,
+    )
+
+    transports = detect_transports(["a.local", "b.local"])
+
+    assert {item.kind for item in transports} == kinds
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

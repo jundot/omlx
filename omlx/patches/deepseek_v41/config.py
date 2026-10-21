@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """DeepSeek V4.1 configuration; field defaults follow the official reference."""
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Literal
 
 
@@ -214,6 +214,52 @@ class ModelConfig:
             raise ValueError("Engram layer/table counts differ")
         if self.ced_prefill and not self.ced_layout_supported():
             raise ValueError("CED prefill is not supported by this layer layout")
+
+    def pipeline_stage_starts(self) -> tuple[int, ...]:
+        """Layers a later pipeline stage may start at.
+
+        A compressed-attention layer reads the KV, index and candidate state
+        of earlier source layers from the forward's shared state, so a stage
+        may not start between a source and a layer that reads it.
+        """
+
+        def sources(layer):
+            if not self.compress_ratios[layer]:
+                return ()
+            kv = max(i for i in self.kv_source_layers if i <= layer)
+            index = max(i for i in self.index_source_layers if i <= layer)
+            if 0 <= self.candidate_source_layer < index:
+                return (kv, index, self.candidate_source_layer)
+            return (kv, index)
+
+        return tuple(
+            start
+            for start in range(1, self.n_layers)
+            if all(
+                source >= start
+                for layer in range(start, self.n_layers)
+                for source in sources(layer)
+            )
+        )
+
+    def tensor_shard(self, size: int) -> "ModelConfig":
+        """The shapes one of ``size`` tensor-parallel ranks holds.
+
+        A rank keeps whole attention heads, output groups and expert neurons.
+        """
+
+        for name in ("n_heads", "o_groups", "moe_inter_dim"):
+            if getattr(self, name) % size:
+                raise ValueError(
+                    f"DeepSeek V4.1 {name} ({getattr(self, name)}) is not "
+                    f"divisible by {size} ranks"
+                )
+        return replace(
+            self,
+            n_heads=self.n_heads // size,
+            o_groups=self.o_groups // size,
+            moe_inter_dim=self.moe_inter_dim // size,
+        )
 
     def ced_layout_supported(self) -> bool:
         # CED requires an even split whose midpoint CSA2 layer owns the whole

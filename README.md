@@ -10,10 +10,6 @@
 <p align="center"><b>LLM inference, optimized for your Mac</b><br>Continuous batching and tiered KV caching, managed directly from your menu bar.</p>
 
 <p align="center">
-<a href="https://www.buymeacoffee.com/jundot"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-</p>
-
-<p align="center">
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.11--3.13-green" alt="Python 3.11-3.13">
   <img src="https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple" alt="Apple Silicon">
@@ -60,7 +56,8 @@ Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), dr
 
 ```bash
 brew tap jundot/omlx https://github.com/jundot/omlx
-brew install jundot/omlx/omlx
+brew install jundot/omlx/omlx --with-custom-kernel   # With native custom kernels (needs full Xcode)
+# No full Xcode? brew install jundot/omlx/omlx installs without the kernels
 
 # Upgrade to the latest version
 brew update && brew upgrade omlx
@@ -68,14 +65,9 @@ brew update && brew upgrade omlx
 # Run as a background service (auto-restarts on crash)
 omlx start
 
-# Optional: MCP (Model Context Protocol) support
+# Optional: MCP (Model Context Protocol) support, then restart to load it
 /opt/homebrew/opt/omlx/libexec/bin/pip install mcp
-```
-
-Optional GLM-5.2 / MiniMax M3 native custom kernels currently require a HEAD build:
-
-```bash
-brew install jundot/omlx/omlx --HEAD --with-custom-kernel
+omlx restart
 ```
 
 ### From Source
@@ -83,26 +75,25 @@ brew install jundot/omlx/omlx --HEAD --with-custom-kernel
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e .          # Core only
-pip install -e ".[mcp]"   # With MCP (Model Context Protocol) support
-
-# GLM-5.2 / MiniMax M3 / Qwen3.5 native custom kernels (strongly recommended
-# if you serve those families -- see note below)
-OMLX_WITH_CUSTOM_KERNEL=1 pip install -e .
+make install                # Editable install with the web UI and native custom kernels
+# No full Xcode? make install-no-kernels installs without the kernels
+make mcp                    # Optional: MCP support, restart `omlx serve` to load it
 ```
 
 Requires macOS 15.0+ (Sequoia), Python 3.11–3.13, and Apple Silicon (M1/M2/M3/M4/M5).
 
-> **Note on native custom kernels:** a plain `pip install -e .` does NOT build
-> them, and the affected model families then silently fall back to much slower
-> generic paths -- for GLM-5.2 the fused DSA prefill is roughly 30x faster with
-> the kernels (measured 845 vs ~29 tok/s on an M3 Ultra), and the fallback also
-> uses more memory (#2137). Building them requires the Metal toolchain, which
-> Command Line Tools alone do not provide (`xcrun: error: unable to find utility
-> "metal"`): install full Xcode, or use the official DMG which ships the kernels
-> precompiled. Homebrew can build them with `brew install jundot/omlx/omlx --HEAD
-> --with-custom-kernel`, but that build also needs full Xcode. To verify your
-> install:
+> **Note on native custom kernels:** GLM-5.2, MiniMax M3, and Qwen3.5 need them.
+> Without them those families silently fall back to much slower generic paths --
+> for GLM-5.2 the fused DSA prefill is roughly 30x faster with the kernels
+> (measured 845 vs ~29 tok/s on an M3 Ultra), and the fallback also uses more
+> memory (#2137). `make install` builds them and checks that each one loads. That
+> needs full Xcode with the Metal toolchain (`xcodebuild -downloadComponent
+> MetalToolchain`); Command Line Tools alone do not provide it (`xcrun: error:
+> unable to find utility "metal"`). Without Xcode, use the official DMG, which
+> ships the kernels precompiled, or `make install-no-kernels`. A plain
+> `pip install -e .` also skips them. `make kernels` rebuilds only the kernels
+> from scratch. Homebrew builds them with `--with-custom-kernel`, which also needs
+> full Xcode. To verify any install:
 >
 > ```bash
 > python -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
@@ -176,7 +167,7 @@ headroom-aware execution tuning, activation, and a live shard/performance map
 on both Macs. Interactive, balanced, and throughput profiles expose coalesced
 batching, prompt-cache affinity, rotating-KV limits, Ring connection tuning,
 and a capability-gated experimental token-only output path. See
-[Distributed inference across Macs](docs/distributed-cluster.md) for setup,
+[Distributed inference across Macs](docs/experimental/distributed-cluster.md) for setup,
 security boundaries, current limitations, and the physical-hardware validation
 checklist.
 
@@ -190,6 +181,8 @@ Block-based KV cache management inspired by vLLM, with prefix sharing and Copy-o
 
 - **Hot tier (RAM)**: Frequently accessed blocks stay in memory for fast access.
 - **Cold tier (SSD)**: When the hot cache fills up, blocks are offloaded to SSD in safetensors format. On the next request with a matching prefix, they're restored from disk instead of recomputed from scratch - even after a server restart.
+
+Optional [Affine4](docs/affine4.md) and [Affine8](docs/affine8.md) KV compression add signed 4-bit and 8-bit cache formats with Metal TensorOps decode attention and a portable fallback. Select either under **Model settings → Memory Saving → KV cache compression**.
 
 <p align="center">
   <img src="docs/images/omlx_hot_cold_cache.png" alt="oMLX Hot & Cold Cache" width="720">
@@ -219,6 +212,7 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 - **Model alias**: set a custom API-visible name. `/v1/models` returns the alias, and requests accept both the alias and directory name.
 - **Model type override**: manually set a model as LLM or VLM regardless of auto-detection.
+- **External engine**: serve Qwen3.8-27B and Qwen3.6-35B-A3B MLX, NVFP4 and GGUF checkpoints from your model directories with [Splash](https://github.com/incoai/splash)'s Metal engine in its own process (official build on M3 or later, Splash M1 on M1/M2). See [docs/Splash.md](docs/Splash.md).
 - **Profiles**: save named bundles of per-model settings and switch between them from the admin panel. A profile can optionally be exposed as its own model: `/v1/models` then also lists `<model>:<profile>` (e.g. `qwen3-8b:thinking`), which serves on the same engine as the base model with the profile's settings overlaid per request — no extra memory, no reload. When the base model has an alias, the exposed ID is advertised as `<alias>:<profile>`; the directory-name form keeps working, just like for the base model.
 
 <p align="center">
@@ -238,7 +232,7 @@ Document attachments support PDF, DOCX, PPTX, TXT, and MD. If a client reports o
 
 ### Model Downloader
 
-Search and download MLX models from HuggingFace directly in the admin dashboard. Browse model cards, check file sizes, and download with one click.
+Search and download models from HuggingFace directly in the admin dashboard, in MLX, GGUF or all formats. Browse model cards, then pick the files to download: an MLX checkpoint keeps the files it needs, and a GGUF brings its vision projector.
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX Model Downloader" width="720">
@@ -246,11 +240,13 @@ Search and download MLX models from HuggingFace directly in the admin dashboard.
 
 ### Integrations
 
-Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, and DeepSeek Harness directly from the admin dashboard with a single click. No manual config editing required.
+Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, Mistral Vibe, and DeepSeek Harness directly from the admin dashboard with a single click. No manual config editing required.
 
 <p align="center">
   <img src="docs/images/omlx_integrations.png" alt="oMLX Integrations" width="720">
 </p>
+
+Install [Mistral Vibe](https://github.com/mistralai/mistral-vibe) 2.26.0 or newer with `uv tool install mistral-vibe`, then run `omlx launch vibe` to select a local model, or `omlx launch vibe --model <model-id>`. Vibe's provider, model, API-key reference and context window are configured for that process through its `VIBE_*` environment overrides. Existing `config.toml`, `VIBE_HOME`, tool permissions and cloud configuration are preserved. Pass Vibe arguments after `--`, for example `omlx launch vibe --model <model-id> -- --resume`.
 
 ### Performance Benchmark
 
@@ -279,9 +275,11 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | Text embeddings |
 | `POST /v1/rerank` | Document reranking |
-| `POST /v1/systemone` | Typed decisions with decision models (TypeSafe System One) |
+| `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
 | `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
+
+The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
 
 ### Tool Calling & Structured Output
 
@@ -305,7 +303,7 @@ A bare JSON, EBNF, or regex grammar constrains the answer from the first generat
 
 ## Models
 
-Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported.
+Point `--model-dir` at a directory containing MLX-format model subdirectories. Two-level organization folders (e.g., `mlx-community/model-name/`) are also supported. GGUF files in these folders are listed one model per file and run on an [external engine](docs/Splash.md#gguf-models).
 
 ```
 ~/models/
@@ -325,7 +323,7 @@ Models are auto-detected by type. You can also download models directly from the
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
-| Decision | Clef, Clef-Flash, OpenJev |
+| Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
 
 ## CLI Configuration
 
@@ -365,15 +363,18 @@ omlx serve --model-dir ~/models --api-key your-secret-key
 
 # Network access requires authentication
 OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
+
+# Inference and admin APIs only, without the web UI (not saved to settings)
+omlx serve --model-dir ~/models --headless
 ```
 
 The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and existing SSD cache files, including GDN sidecars. The budget is refreshed during use and does not shrink simply because the cache grows or the server restarts. Other disk usage can change the budget. Set `--paged-ssd-cache-max-size 20GB` for a fixed limit.
 
 
 Most settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
-Set the main API key before changing the server host to a LAN address or `0.0.0.0`, or save both settings together. oMLX refuses to start on any non-loopback address without a main API key. The existing `skip_api_key_verification` option remains restricted to loopback-only binds.
+Set the main API key before changing the server host to a LAN address or `0.0.0.0`, or save both settings together. oMLX refuses to start on any non-loopback address without a main API key. "Disable all authentication" (`skip_api_key_verification`) turns off both inference and admin authentication, so it stays restricted to loopback-only binds.
 
-For keyless inference, stop oMLX, manually set `auth.allow_unauthenticated_inference` to `true` in `settings.json`, and restart. It defaults to `false` and has no UI toggle. This allows anyone who can reach the server to use inference (including stored Responses and audio), MCP tools, and web search. On network binds, keep a main API key configured and `skip_api_key_verification` set to `false`; management endpoints still require authentication.
+For keyless inference on a network bind, turn on "Allow inference without API key" in the web admin settings or the Security screen of the macOS app. It sets `auth.allow_unauthenticated_inference`, defaults to `false`, and applies without a restart. This allows anyone who can reach the server to use inference (including stored Responses and audio), MCP tools, and web search. Management endpoints still require the main API key or an admin login.
 
 <details>
 <summary>Architecture</summary>
@@ -403,31 +404,46 @@ FastAPI Server (OpenAI / Anthropic API)
 
 ## Development
 
+### Build commands
+
+| Command | What it does |
+|---|---|
+| `make install` | Editable install of the server and the web UI, then the native custom kernels |
+| `make install-no-kernels` | The same without the kernels, for machines without full Xcode |
+| `make mcp` | Add MCP (Model Context Protocol) support |
+| `make dev` | Same as `make install`, with dev tools (`make dev-no-kernels` skips the kernels) |
+| `make kernels` | Delete any built native custom kernels, compile them again in place, and check that each one loads |
+| `make web` | Rebuild the web UI CSS and normalize the translation files |
+| `make app` | Stage a runnable `oMLX.app` with freshly compiled native custom kernels |
+
+The native custom kernels need full Xcode with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`).
+
 ### CLI Server
 
 ```bash
 git clone https://github.com/jundot/omlx.git
 cd omlx
-pip install -e ".[dev]"
+make dev
 pytest
 ```
 
+### Web UI
+
+The web admin UI lives in `apps/omlx-web/` and ships in the same package, so `make dev` installs it too. After editing its templates, JavaScript, or translations, run `make web` to rebuild the CSS and normalize the translation files.
+
 ### macOS App
 
-The native SwiftUI app lives at `apps/omlx-mac/`. Requires Xcode 26.5+ and Python 3.11+. venvstacks is declared as a dev dependency so `pip install -e ".[dev]"` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
+The native SwiftUI app lives at `apps/omlx-mac/`. Requires Xcode 26.5+ and Python 3.11+. venvstacks is declared as a dev dependency so `make dev` (or `uv sync --dev`) brings the pinned version in. The build script also falls back to `uvx venvstacks` or `pipx run venvstacks` if you prefer a host-global tool runner.
 
 ```bash
-# Stage a runnable oMLX.app (xcodebuild + venvstacks Python layers + ad-hoc sign)
-apps/omlx-mac/Scripts/build.sh release
+# Stage a runnable oMLX.app (xcodebuild + venvstacks Python layers + native kernels + ad-hoc sign)
+make app
 
 # Result lands at apps/omlx-mac/build/Stage/oMLX.app
 open apps/omlx-mac/build/Stage/oMLX.app
 
 # Force a fresh venvstacks rebuild (otherwise it's cached by fingerprint)
 apps/omlx-mac/Scripts/build.sh release --rebuild-donor
-
-# Stage with optional GLM-5.2 / MiniMax M3 native custom kernels
-apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
 ```
 
 First cold build takes 10–20 minutes (venvstacks Python layer assembly). Subsequent builds reuse the cached `packaging/_export/` and finish in about 4 minutes. See [packaging/README.md](packaging/README.md) for the layer configuration and [apps/omlx-mac/](apps/omlx-mac/) for the Swift sources.
@@ -454,5 +470,5 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) - Block diffusion speculative decoding on Apple Silicon
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP's verify-shape Metal kernels are powered by MTPLX by Youssof Altoukhi, which also inspired the depth-k pipeline
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - The fused GDN verify prework kernel is adapted from mlx-serve's port of the mlxfast-challenge qwen35_packed_gdn_prework kernel, and Qwen4's fused GDN decode and prefill kernels are adapted from mlx-serve's MIT-licensed `transformer.zig`; Qwen4 QSA's 128-bit K/V staging is adapted from mlx-serve's MIT-licensed `msv_attn_p256` kernel
-- [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`
+- [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`, and a GGUF's tokenizer is derived from its header as Splash's Apache-2.0 `install/gguf.py` derives it; Splash itself can also serve supported models as an external engine
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating

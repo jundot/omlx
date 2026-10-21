@@ -1386,17 +1386,17 @@ class TestDeepseekV4SwitchGLU:
         from omlx.patches.deepseek_v4 import switch_layers
 
         monkeypatch.setattr(
-            switch_layers.glm_fast,
+            switch_layers.quant_fast,
             "has_symbol",
-            lambda name: name == "glm_moe_weighted_sum",
+            lambda name: name == "moe_weighted_sum",
         )
 
         def fail_weighted_sum(*args, **kwargs):
             raise AssertionError("DeepSeek V4 must not use fused weighted sum")
 
         monkeypatch.setattr(
-            switch_layers.glm_fast,
-            "glm_moe_weighted_sum",
+            switch_layers.quant_fast,
+            "moe_weighted_sum",
             fail_weighted_sum,
             raising=False,
         )
@@ -1467,7 +1467,7 @@ class TestDeepseekV4CompressedNativeAttention:
     ):
         import mlx.core as mx
 
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         layer = dsv4.CompressedAttention(self._attention_config(dsv4), 0)
@@ -1604,7 +1604,7 @@ class TestDeepseekV4CompressedNativeAttention:
     ):
         import mlx.core as mx
 
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
         mx.random.seed(41)
@@ -1631,8 +1631,8 @@ class TestDeepseekV4CompressedNativeAttention:
         )
         pooled_mask = pooled_positions <= offset + query_rows
         scale = 512**-0.5
-        if not fast.has_symbol("deepseek_v4_sparse_attention"):
-            pytest.skip("deepseek_v4_sparse_attention native kernel is unavailable")
+        if not fast.has_symbol("compressed_sparse_attention"):
+            pytest.skip("compressed_sparse_attention native kernel is unavailable")
 
         previous = dsv4._DEEPSEEK_V4_SPARSE_ATTENTION_NATIVE_DISABLED
         try:
@@ -2164,7 +2164,6 @@ class TestNaxMoEStockRouting:
         # Pin detection off so the block-kernel tests behave identically on
         # M5-family machines; each test overrides what it needs.
         monkeypatch.setattr(sl, "is_nax_available", lambda: False)
-        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "")
         yield
 
     def test_prefers_stock_for_prefill_route_counts_only(self, monkeypatch):
@@ -2180,20 +2179,6 @@ class TestNaxMoEStockRouting:
         from omlx.patches.deepseek_v4 import switch_layers as sl
 
         assert not sl._nax_prefers_stock(1 << 20)
-
-    def test_env_kill_switch_keeps_block_kernels(self, monkeypatch):
-        from omlx.patches.deepseek_v4 import switch_layers as sl
-
-        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
-        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "0")
-        assert not sl._nax_prefers_stock(1 << 20)
-
-    def test_env_force_routes_everything(self, monkeypatch):
-        from omlx.patches.deepseek_v4 import switch_layers as sl
-
-        monkeypatch.setattr(sl, "is_nax_available", lambda: True)
-        monkeypatch.setattr(sl, "_NAX_STOCK_MODE", "1")
-        assert sl._nax_prefers_stock(1)
 
     def test_native_block_kind_short_circuits_on_nax_prefill(self, monkeypatch):
         import mlx.core as mx
@@ -2455,7 +2440,7 @@ class TestAffineBlockRouteThreshold:
 
         from omlx.patches.deepseek_v4 import switch_layers as sl
 
-        monkeypatch.setattr(sl.glm_fast, "has_symbol", lambda name: True)
+        monkeypatch.setattr(sl.quant_fast, "has_symbol", lambda name: True)
         linear = self._linear()
         below = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES - 1, 1, 64), dtype=mx.bfloat16)
         at = mx.zeros((sl._AFFINE_NATIVE_MIN_ROUTES, 1, 64), dtype=mx.bfloat16)

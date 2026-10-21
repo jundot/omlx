@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """SDPA256 bounded routing, numerical fallback, and memory registration tests."""
 
-import logging
 import math
 import sys
 import types
@@ -17,22 +16,15 @@ def _sdpa256_reset():
     from omlx.patches import sdpa256_attention as sdpa256
 
     saved_routes = dict(mm._SDPA_TILED_PREFILL_HEAD_DIMS)
-    saved_force = sdpa256._FORCE_TILED
     saved_logged = set(sdpa256._TILED_ROUTE_LOGGED)
     sdpa256._TILED_ROUTE_LOGGED.clear()
-    sdpa256._FORCE_TILED = None
     try:
         yield sdpa256
     finally:
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.clear()
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.update(saved_routes)
-        sdpa256._FORCE_TILED = saved_force
         sdpa256._TILED_ROUTE_LOGGED.clear()
         sdpa256._TILED_ROUTE_LOGGED.update(saved_logged)
-
-
-def _tiled_log_records(caplog):
-    return [r for r in caplog.records if "memory-bounded path" in r.getMessage()]
 
 
 SCALE_256 = 1.0 / math.sqrt(256)
@@ -456,6 +448,68 @@ def test_patch_routes_256_and_passes_through_others(monkeypatch):
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
 
 
+def test_m1_m2_fp16_verify_rows_stay_under_vector_thread_limit(monkeypatch):
+    """Batched MTP verify at 24/4 heads and 5 rows asks MLX for 960 threads,
+    above the 896 its FP16 head-dim-256 vector kernel allows on M1/M2 (#4609)."""
+    from mlx_lm.models import base as mlx_base
+
+    import omlx.patches.sdpa256_attention as sdpa256
+
+    monkeypatch.setattr(sdpa256, "_PATCHED", False, raising=False)
+    monkeypatch.setattr(
+        sdpa256, "_SDPA256_MIN_KV_LEN", sdpa256._SDPA256_MIN_KV_LEN, raising=False
+    )
+    original = mlx_base.scaled_dot_product_attention
+    rows = []
+
+    def recording_original(q, k, v, cache, scale, mask, sinks=None):
+        rows.append(q.shape[-2])
+        return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+    monkeypatch.setattr(mlx_base, "scaled_dot_product_attention", recording_original)
+    assert sdpa256.apply_sdpa256_attention_patch() is True
+    patched = mlx_base.scaled_dot_product_attention
+    try:
+        mx.random.seed(0)
+        q = mx.random.normal((2, 24, 5, 256)).astype(mx.float16)
+        k = mx.random.normal((2, 4, 2048, 256)).astype(mx.float16)
+        v = mx.random.normal((2, 4, 2048, 256)).astype(mx.float16)
+        pads = mx.array([0, 9])[:, None, None, None]
+        mask = mx.broadcast_to(mx.arange(2048) >= pads, (2, 1, 5, 2048))
+
+        monkeypatch.setattr(sdpa256, "_vector_thread_limited_gpu", lambda: True)
+        out = patched(q, k, v, None, SCALE_256, mask)
+        assert rows == [3, 2]
+        # One-row calls share the key-partition plan, so rows match bit for bit.
+        reference = mx.concatenate(
+            [
+                mx.fast.scaled_dot_product_attention(
+                    q[..., i : i + 1, :],
+                    k,
+                    v,
+                    scale=SCALE_256,
+                    mask=mask[..., i : i + 1, :],
+                )
+                for i in range(5)
+            ],
+            axis=-2,
+        )
+        assert mx.array_equal(out, reference).item()
+
+        # Not evaluated: the unsplit FP16 call fails on M1/M2 hosts.
+        rows.clear()
+        q16, k16, v16 = (x.astype(mx.bfloat16) for x in (q, k, v))
+        patched(q16, k16, v16, None, SCALE_256, mask)
+        monkeypatch.setattr(sdpa256, "_vector_thread_limited_gpu", lambda: False)
+        patched(q, k, v, None, SCALE_256, mask)
+        assert rows == [5, 5]
+    finally:
+        monkeypatch.setattr(mlx_base, "scaled_dot_product_attention", original)
+        from omlx import memory_monitor as mm
+
+        mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
+
+
 # --- estimator lockstep --------------------------------------------------
 
 
@@ -531,31 +585,14 @@ def test_unfused_call_bytes_shared_with_guard_estimator():
     )
 
 
-# --- bounded routing overrides -------------------------------------------
+# --- bounded memory route registration -----------------------------------
 
 
-def test_parse_force_tiled_env(monkeypatch):
-    from omlx.patches import sdpa256_attention as sdpa256
-
-    monkeypatch.delenv("OMLX_SDPA256_TILED", raising=False)
-    assert sdpa256._parse_force_tiled_env() is None
-    monkeypatch.setenv("OMLX_SDPA256_TILED", "1")
-    assert sdpa256._parse_force_tiled_env() is True
-    monkeypatch.setenv("OMLX_SDPA256_TILED", "0")
-    assert sdpa256._parse_force_tiled_env() is False
-
-
-def test_force_off_does_not_publish_a_bounded_memory_route(monkeypatch):
-    """The O(L^2) benchmark override must keep conservative admission math."""
+def test_bounded_route_publishes_array_mask_support():
     from omlx import memory_monitor as mm
     from omlx.patches import sdpa256_attention as sdpa256
 
     mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", False)
-    assert sdpa256._register_bounded_route(8192) is False
-    assert 256 not in mm._SDPA_TILED_PREFILL_HEAD_DIMS
-
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", None)
     assert sdpa256._register_bounded_route(8192) is True
     try:
         routes = mm._SDPA_TILED_PREFILL_HEAD_DIMS[256]
@@ -563,20 +600,6 @@ def test_force_off_does_not_publish_a_bounded_memory_route(monkeypatch):
         assert routes[0].supports_array_mask is True
     finally:
         mm._SDPA_TILED_PREFILL_HEAD_DIMS.pop(256, None)
-
-
-# --- bounded-route engagement logging (issue #2283) ------------------------
-
-
-def test_tiled_route_logs_forced_env(_sdpa256_reset, caplog, monkeypatch):
-    sdpa256 = _sdpa256_reset
-    monkeypatch.setattr(sdpa256, "_FORCE_TILED", True, raising=False)
-    q, k, _ = _qkv(2048, 16384)
-    with caplog.at_level(logging.INFO, logger=sdpa256.__name__):
-        assert sdpa256._should_route(q, k, None, "causal", None) is True
-    records = _tiled_log_records(caplog)
-    assert len(records) == 1
-    assert "OMLX_SDPA256_TILED=1" in records[0].getMessage()
 
 
 # --- mlx-vlm coverage (issue: VLM engine head-256 prefill unprotected) ----
@@ -690,7 +713,6 @@ def test_production_install_order_covers_vlm_language(
     monkeypatch.setattr(fa256, "_PATCHED", False, raising=False)
     monkeypatch.setattr(fa256, "is_nax_available", lambda: False)
     monkeypatch.setattr(fa256, "_auto_dispatch_budget", lambda *a, **k: 0)
-    monkeypatch.delenv("OMLX_FA256_STEEL", raising=False)
 
     steel_calls = {"n": 0}
 

@@ -159,8 +159,18 @@ final class OMLXClient: ObservableObject {
         try await put(AdminAPI.modelSettings(id), body: patch)
     }
 
+    /// Settings write with explicit JSON nulls, for clearing fields.
+    @discardableResult
+    func updateModelSettings(id: String, settings: [String: AnyCodable]) async throws -> SimpleStatusResponse {
+        try await put(AdminAPI.modelSettings(id), body: settings)
+    }
+
     func resetModelSettings(id: String) async throws -> SettingsApplyResultDTO {
         try await postEmpty(AdminAPI.modelSettingsReset(id))
+    }
+
+    func getGenerationConfig(id: String) async throws -> GenerationConfigDTO {
+        try await get(AdminAPI.modelGenerationConfig(id))
     }
 
     /// Server-side lookup of the best omlx.ai benchmarks for this device
@@ -175,6 +185,14 @@ final class OMLXClient: ObservableObject {
 
     func applyRecipe(id: String, recipe: String) async throws -> SettingsApplyResultDTO {
         try await post(AdminAPI.modelSettingsRecipe(id), body: ApplyRecipeRequest(recipe: recipe))
+    }
+
+    /// Normalize an MTPLX MTP sidecar into the model checkpoint so native
+    /// MTP can load it. The server validates the runtime contract before
+    /// changing the local model files.
+    @discardableResult
+    func importMtplxSidecar(id: String) async throws -> SimpleStatusResponse {
+        try await postEmpty(AdminAPI.importMtplx(id))
     }
 
     func listModelProfiles(id: String) async throws -> ProfileListResponse {
@@ -231,9 +249,13 @@ final class OMLXClient: ObservableObject {
         try await get(AdminAPI.hfTasks)
     }
 
-    func startHFDownload(repoId: String, hfToken: String = "") async throws -> StartHFDownloadResponse {
+    func startHFDownload(
+        repoId: String,
+        hfToken: String = "",
+        files: [String]? = nil
+    ) async throws -> StartHFDownloadResponse {
         try await post(AdminAPI.hfDownload, body: StartHFDownloadRequest(
-            repoId: repoId, hfToken: hfToken
+            repoId: repoId, hfToken: hfToken, files: files
         ))
     }
 
@@ -252,9 +274,9 @@ final class OMLXClient: ObservableObject {
         try await delete(AdminAPI.hfTask(taskId))
     }
 
-    func getHFRecommended(mlxOnly: Bool = true) async throws -> HFRecommendedResponse {
+    func getHFRecommended(modelFormat: HFModelFormat = .mlx) async throws -> HFRecommendedResponse {
         try await get(AdminAPI.hfRecommended, query: [
-            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+            URLQueryItem(name: "model_format", value: modelFormat.rawValue),
         ])
     }
 
@@ -266,13 +288,13 @@ final class OMLXClient: ObservableObject {
         query: String,
         sort: String = "trending",
         limit: Int = 20,
-        mlxOnly: Bool = true
+        modelFormat: HFModelFormat = .mlx
     ) async throws -> HFSearchResponse {
         try await get(AdminAPI.hfSearch, query: [
             URLQueryItem(name: "q", value: query),
             URLQueryItem(name: "sort", value: sort),
             URLQueryItem(name: "limit", value: String(limit)),
-            URLQueryItem(name: "mlx_only", value: mlxOnly ? "true" : "false"),
+            URLQueryItem(name: "model_format", value: modelFormat.rawValue),
         ])
     }
 

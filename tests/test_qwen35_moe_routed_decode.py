@@ -74,6 +74,7 @@ def _block(
         shared_expert_intermediate_size=inter,
         num_experts=experts,
         num_experts_per_tok=top_k,
+        norm_topk_prob=True,
     )
     block = Qwen3_5MoeSparseMoeBlock(args)
     block.set_dtype(dtype)
@@ -180,7 +181,7 @@ def test_fp32_kernels_match_mlx_mat_vecs(bits):
     gate_row = quantized((1, hidden), 64, 8)
     fmt = routed._Format
     gate_up_kernel = routed._gate_up_kernel(
-        fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, False)
+        fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, True)
     )
     down_kernel = routed._down_kernel(fmt(bits, gs, False), fmt(8, 128, False))
     for step in range(3):
@@ -438,6 +439,7 @@ def test_block_without_gate_up_fusion_is_not_routed():
         shared_expert_intermediate_size=320,
         num_experts=EXPERTS,
         num_experts_per_tok=10,
+        norm_topk_prob=True,
     )
     block = Qwen3_5MoeSparseMoeBlock(args)
     block.set_dtype(mx.bfloat16)

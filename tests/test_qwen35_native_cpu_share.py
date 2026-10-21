@@ -6,13 +6,13 @@ import pytest
 @pytest.mark.skipif(sys.platform != "darwin", reason="Darwin-only native API")
 def test_native_shared_cluster_cpu_matmul():
     mx = pytest.importorskip("mlx.core")
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     if not mx.metal.is_available():
         pytest.skip("Metal is unavailable")
-    if not fast.has_symbol("qwen35_cpu_fp16_affine_qmm_t"):
+    if not fast.has_symbol("cpu_fp16_affine_qmm_t"):
         pytest.skip("Qwen3.5 native custom kernel is unavailable")
-    if not fast.qwen35_cpu_shared_resource_available():
+    if not fast.cpu_shared_resource_available():
         pytest.skip("shared-cluster dispatch_apply is unavailable")
 
     rows, input_dim = 2048, 128
@@ -27,7 +27,7 @@ def test_native_shared_cluster_cpu_matmul():
     )
     gpu_biases = mx.zeros_like(gpu_scales)
 
-    result = fast.qwen35_cpu_fp16_affine_qmm_t(
+    result = fast.cpu_fp16_affine_qmm_t(
         x,
         cpu_weight,
         gpu_weight,

@@ -707,9 +707,9 @@ def test_vector_gate_kernel_matches_reference_with_padding_mask():
 def test_native_glm_indexer_scores_match_mlx_reference_when_available():
     from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
 
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_indexer_scores"):
+    if not index_fast.has_symbol("dsa_indexer_scores"):
         pytest.skip("GLM DSA native indexer extension is not built")
 
     config = _tiny_config().text_config
@@ -732,10 +732,10 @@ def test_native_glm_indexer_scores_match_mlx_reference_when_available():
 
 
 def test_glm5_next_switch_moe_uses_opt_in_native_weighted_sum():
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
     from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
 
-    if not fast.has_symbol("glm_moe_weighted_sum"):
+    if not quant_fast.has_symbol("moe_weighted_sum"):
         pytest.skip("GLM native MoE weighted-sum extension is not built")
 
     mx.random.seed(29)
@@ -761,9 +761,9 @@ def test_glm5_next_affine_prefill_uses_shared_qmm_kernel(monkeypatch):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import linear_forward
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    if not fast.has_symbol("qwen35_q4_affine_qmm_t"):
+    if not quant_fast.has_symbol("affine_q4_qmm_t"):
         pytest.skip("Qwen affine prefill QMM extension is not built")
 
     base = nn.Linear(64, 64, bias=False)
@@ -772,7 +772,7 @@ def test_glm5_next_affine_prefill_uses_shared_qmm_kernel(monkeypatch):
     x = mx.random.normal((1, 128, 64), dtype=mx.float16)
     reference = linear(x)
 
-    original = fast.qwen35_q4_affine_qmm_t
+    original = quant_fast.affine_q4_qmm_t
     calls = 0
 
     def spy(*args, **kwargs):
@@ -780,7 +780,7 @@ def test_glm5_next_affine_prefill_uses_shared_qmm_kernel(monkeypatch):
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q4_affine_qmm_t", spy)
+    monkeypatch.setattr(quant_fast, "affine_q4_qmm_t", spy)
     actual = linear_forward(linear, x)
     mx.eval(actual, reference)
 
@@ -792,9 +792,9 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import linear_forward
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    if not fast.has_symbol("qwen35_q8_affine_qmm_t"):
+    if not quant_fast.has_symbol("affine_q8_qmm_t"):
         pytest.skip("Qwen Q8 affine prefill QMM extension is not built")
 
     mx.random.seed(37)
@@ -804,7 +804,7 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     x = mx.random.normal((1, 1024, 1536), dtype=mx.float16)
     reference = linear(x)
 
-    original = fast.qwen35_q8_affine_qmm_t
+    original = quant_fast.affine_q8_qmm_t
     calls = 0
 
     def spy(*args, **kwargs):
@@ -812,7 +812,7 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(fast, "qwen35_q8_affine_qmm_t", spy)
+    monkeypatch.setattr(quant_fast, "affine_q8_qmm_t", spy)
     actual = linear_forward(linear, x)
     mx.eval(actual, reference)
 
@@ -825,10 +825,10 @@ def test_glm5_next_prefill_qmm_handles_strided_input(bits, tokens):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import linear_forward
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    name = f"qwen35_q{bits}_affine_qmm_t"
-    if not fast.has_symbol(name):
+    name = f"affine_q{bits}_qmm_t"
+    if not quant_fast.has_symbol(name):
         pytest.skip(f"{name} native kernel is not built")
 
     mx.random.seed(11)
@@ -853,10 +853,10 @@ def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
     import mlx.nn as nn
     from mlx_vlm.models.glm5_next.linear import fused_quantized_matmul
 
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-    name = f"qwen35_q{bits}_affine_qmm_t"
-    if not fast.has_symbol(name):
+    name = f"affine_q{bits}_qmm_t"
+    if not quant_fast.has_symbol(name):
         pytest.skip(f"{name} native kernel is not built")
 
     mx.random.seed(11)
@@ -982,10 +982,10 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
 
 def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
     """Use fused v-up only for matching dtypes and preserve FP32 scales otherwise."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.quant_matmul import fast as quant_fast
     from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat
 
-    if not fast.is_native_available():
+    if not quant_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
 
     from mlx_lm.models.mla import QuantizedMultiLinear
@@ -1021,10 +1021,10 @@ def test_q8_vup_flat_gates_dtype_mismatch_and_preserves_projection_contract():
 
 def test_sparse_attention_completes_at_32k_with_fp32_scale_projection(monkeypatch):
     """Verify native sparse MLA output can feed an FP32-scale projection at 32K."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.attention import fast as attention_fast
     from omlx.patches.glm_moe_dsa.sparse_mla import q8_vup_flat, sparse_mla_attention
 
-    if not fast.is_native_available():
+    if not attention_fast.is_native_available():
         pytest.skip("GLM MoE DSA native extension is unavailable")
 
     from mlx_lm.models.mla import QuantizedMultiLinear
@@ -1419,14 +1419,15 @@ def test_kda_fused_prefill_matches_stock(monkeypatch):
     model = _kda_model(77)[0]
     prompt = mx.arange(70, dtype=mx.int32)[None] + 1
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", False)
+    eligible = kda.glm53_kda_prefill_eligible
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", lambda *args: False)
     reference_cache = model.make_cache()
     reference = model(prompt, cache=reference_cache).logits
     mx.eval(reference)
     ref_conv = [cache[0] for cache in reference_cache]
     ref_state = [cache[1] for cache in reference_cache]
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", True)
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", eligible)
     engaged = []
     original = kda.glm53_kda_prefill
 
@@ -1500,18 +1501,13 @@ def test_kda_prefill_eligibility_gating(monkeypatch):
     padded.lengths = mx.array([70])
     assert not glm53_kda_prefill_eligible(layer, inputs, None, padded)
 
-    monkeypatch.setattr(
-        "omlx.patches.glm53_kda_prework._GLM53_KDA_PREFILL_ENABLED", False
-    )
-    assert not glm53_kda_prefill_eligible(layer, inputs, None, cache)
-    monkeypatch.undo()
-
     # The fused driver runs end to end and matches the module's own route.
     fused_cache = model.make_cache()[0]
     out_fused = glm53_kda_prefill(layer, inputs, fused_cache)
     stock_cache = model.make_cache()[0]
     monkeypatch.setattr(
-        "omlx.patches.glm53_kda_prework._GLM53_KDA_PREFILL_ENABLED", False
+        "omlx.patches.glm53_kda_prework.glm53_kda_prefill_eligible",
+        lambda *args: False,
     )
     out_stock = layer(inputs, None, stock_cache)
     mx.eval(out_fused, out_stock)
@@ -1536,11 +1532,12 @@ def test_kda_fused_prefill_survives_mtp_runtime_patch(monkeypatch):
     model = _kda_model(80)[0]
     prompt = mx.arange(70, dtype=mx.int32)[None] + 1
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", False)
+    eligible = kda.glm53_kda_prefill_eligible
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", lambda *args: False)
     reference_cache = model.make_cache()
     reference = model(prompt, cache=reference_cache).logits
 
-    monkeypatch.setattr(kda, "_GLM53_KDA_PREFILL_ENABLED", True)
+    monkeypatch.setattr(kda, "glm53_kda_prefill_eligible", eligible)
     engaged = []
     original = kda.glm53_kda_prefill
 
@@ -2195,8 +2192,9 @@ def _kda_run(attn, x, conv0, state0, fused, chunks=None):
 
     from omlx.patches import glm53_kda_prework as kda
 
-    enabled = kda._GLM53_KDA_PREFILL_ENABLED
-    kda._GLM53_KDA_PREFILL_ENABLED = fused
+    eligible = kda.glm53_kda_prefill_eligible
+    if not fused:
+        kda.glm53_kda_prefill_eligible = lambda *args: False
     try:
         cache = ArraysCache(size=2)
         cache[0] = conv0
@@ -2209,7 +2207,7 @@ def _kda_run(attn, x, conv0, state0, fused, chunks=None):
         mx.eval(out, cache[0], cache[1])
         return out, cache[0], cache[1]
     finally:
-        kda._GLM53_KDA_PREFILL_ENABLED = enabled
+        kda.glm53_kda_prefill_eligible = eligible
 
 
 def test_fused_prefill_runs_blocked_recurrence(monkeypatch):
@@ -2427,15 +2425,15 @@ def test_nax_indexer_scores_match_fp32_reference_and_mask(S, P, before):
 
 @_needs_nax_indexer
 def test_nax_indexer_scores_match_native_kernel_within_rounding():
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_indexer_scores"):
+    if not index_fast.has_symbol("dsa_indexer_scores"):
         pytest.skip("native DSA indexer kernel unavailable")
     S, P, before = 512, 1024, 3584
     q, k, w = _ixn_inputs(S, P, seed=1)
     pool_len = P
     out = indexer_nax.indexer_scores_nax(q, k, w, before, pool_len, 4)
-    native = fast.dsa_indexer_scores(
+    native = index_fast.dsa_indexer_scores(
         q[None].transpose(0, 2, 1, 3), k[None, None], w[None], causal=False
     )[0, 0]
     acc, valid = _ixn_reference(q, k, w, before, pool_len, 4)
@@ -2534,9 +2532,9 @@ def _require_native_scores():
     native kernel; without it that path falls back to MLX ops, which round
     the scores differently, so the exactness and near-tie bounds do not
     apply."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_indexer_scores"):
+    if not index_fast.has_symbol("dsa_indexer_scores"):
         pytest.skip("native DSA indexer kernel unavailable")
 
 
@@ -2622,9 +2620,9 @@ def test_topk_differences_are_threshold_near_ties():
     scores differ only by pools whose native scores sit within one bf16 ulp
     of that row's top-k threshold (fp32 summation order at a near-tie)."""
     from mlx_vlm.models.glm5_next import language
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    if not fast.has_symbol("dsa_topk_indices"):
+    if not index_fast.has_symbol("dsa_topk_indices"):
         pytest.skip("native top-k kernel unavailable")
     S, P, before = 512, 4096, 16384 - 512
     q, k, w = _ixn_inputs(S, P, seed=11)
@@ -2748,6 +2746,9 @@ def _smla_native(q, kv, idx, scale):
 @pytest.mark.parametrize(
     "L,K,topk,q_scale",
     [
+        (2, 2602, 2051, 1.0),
+        (4, 4100, 2051, 1.0),
+        (8, 8192, 2051, 3.0),
         (64, 256, 128, 1.0),
         (37, 700, 200, 1.0),
         (128, 4096, 2051, 1.0),
@@ -2807,17 +2808,6 @@ def test_nax_sparse_mla_unsupported_shapes_return_none():
 
 
 @_needs_nax_sparse_mla
-def test_nax_sparse_mla_disabled_by_env(monkeypatch):
-    monkeypatch.setattr(sparse_mla_nax, "_ENABLED", False)
-    sparse_mla_nax.nax_sparse_mla_available.cache_clear()
-    try:
-        q, kv, idx = _smla_inputs(16, 64, 32)
-        assert sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, 1.0) is None
-    finally:
-        sparse_mla_nax.nax_sparse_mla_available.cache_clear()
-
-
-@_needs_nax_sparse_mla
 def test_nax_sparse_mla_deterministic_across_runs():
     # Large enough to keep many threadgroups in flight; every run must be
     # bit-identical (guards against threadgroup-memory races).
@@ -2861,7 +2851,7 @@ def test_nax_sparse_mla_probabilities_keep_fp32_precision():
     assert mx.all(err <= 0.5 * ulp + 0.02).item()
 
 
-def _make_sparse_attention():
+def _make_sparse_attention(*, head_dim=16):
     from mlx.utils import tree_map
     from mlx_vlm.models import glm5_next
     from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
@@ -2881,8 +2871,8 @@ def _make_sparse_attention():
         kv_lora_rank=512,
         q_lora_rank=32,
         qk_rope_head_dim=0,
-        v_head_dim=16,
-        qk_nope_head_dim=16,
+        v_head_dim=head_dim,
+        qk_nope_head_dim=head_dim,
         num_experts_per_tok=2,
         first_k_dense_replace=99,
         max_position_embeddings=8192,
@@ -2932,13 +2922,9 @@ def test_nax_sparse_mla_call_site_matches_fallback_paths(monkeypatch):
     products, so bf16 intermediate rounding differs)."""
     attn = _make_sparse_attention()
     chunks = [2600, 1600]  # sparse at 2600 keys, then at 4200 keys
-    monkeypatch.setattr(sparse_mla_nax, "_ENABLED", False)
-    sparse_mla_nax.nax_sparse_mla_available.cache_clear()
-    try:
+    with monkeypatch.context() as off:
+        off.setattr(sparse_mla_nax, "nax_sparse_mla_available", lambda: False)
         expected = _run_attention(attn, chunks)
-    finally:
-        monkeypatch.setattr(sparse_mla_nax, "_ENABLED", True)
-        sparse_mla_nax.nax_sparse_mla_available.cache_clear()
     calls = []
     orig = sparse_mla_nax.sparse_mla_attention_nax
 
@@ -2957,6 +2943,78 @@ def test_nax_sparse_mla_call_site_matches_fallback_paths(monkeypatch):
         e32, g32 = e.astype(mx.float32), g.astype(mx.float32)
         scale = mx.abs(e32).max().item()
         assert mx.abs(e32 - g32).max().item() <= tol * scale
+
+
+@_needs_nax_sparse_mla
+@pytest.mark.parametrize("length", [2, 4, 8])
+@pytest.mark.parametrize("bits", [None, 4])
+def test_nax_sparse_mla_short_verify_avoids_gather(monkeypatch, length, bits):
+    from mlx_lm.models.cache import KVCache, PoolingCache
+    from mlx_vlm.models.glm5_next import language
+
+    # This checks the existing NAX attention route independently of small scoring.
+    monkeypatch.setattr(language, "_SMALL_QUERY_INDEXER", False)
+    attn = _make_sparse_attention(head_dim=32)
+    if bits is not None:
+        nn.quantize(attn, group_size=32, bits=bits)
+    cache = [KVCache(), PoolingCache(4)]
+    mx.eval(attn(mx.random.normal((1, 2603, 64)).astype(mx.bfloat16), None, cache))
+    reference_cache = copy.deepcopy(cache)
+    x = mx.random.normal((1, length, 64)).astype(mx.bfloat16)
+    with monkeypatch.context() as fallback:
+        fallback.setattr(language, "sparse_mla_attention_nax", lambda *args: None)
+        expected = attn(x, None, reference_cache)
+        mx.eval(expected)
+
+    calls = []
+    original = sparse_mla_nax.sparse_mla_attention_nax
+
+    def nax(q, kv, indices, scale):
+        output = original(q, kv, indices, scale)
+        assert output is not None
+        calls.append(q.shape[2])
+        return output
+
+    def no_gather(*args, **kwargs):
+        pytest.fail("eligible short verification used gathered SDPA")
+
+    monkeypatch.setattr(language, "sparse_mla_attention_nax", nax)
+    monkeypatch.setattr(language, "scaled_dot_product_attention", no_gather)
+    got = attn(x, None, cache)
+    mx.eval(got)
+    assert calls == [length]
+    assert got.shape == expected.shape and got.dtype == expected.dtype
+    e32, g32 = expected.astype(mx.float32), got.astype(mx.float32)
+    assert mx.abs(e32 - g32).max().item() <= 1e-2 * mx.abs(e32).max().item()
+
+
+@pytest.mark.parametrize("batch,dtype", [(1, mx.float32), (2, mx.bfloat16)])
+def test_short_sparse_attention_preserves_unsupported_input_fallback(
+    monkeypatch, batch, dtype
+):
+    from mlx_vlm.models.glm5_next import language
+
+    q, kv, indices = _smla_inputs(4, 64, 32, dtype=dtype)
+    q, kv, indices = (mx.repeat(a, batch, axis=0) for a in (q, kv, indices))
+    attn = _make_sparse_attention()
+    attn.embed_q = attn.unembed_out = nn.Identity()
+    with monkeypatch.context() as fallback:
+        fallback.setattr(language, "sparse_mla_attention_nax", lambda *args: None)
+        expected = attn._gathered_attention(q, kv, indices)
+
+    calls = []
+    original = sparse_mla_nax.sparse_mla_attention_nax
+
+    def nax(*args):
+        output = original(*args)
+        assert output is None
+        calls.append(args[0].dtype)
+        return output
+
+    monkeypatch.setattr(language, "sparse_mla_attention_nax", nax)
+    got = attn._gathered_attention(q, kv, indices)
+    assert calls == [dtype]
+    assert got.dtype == dtype and mx.array_equal(got, expected).item()
 
 
 def _smla_realistic_inputs(L, K, H=64, dtype=mx.bfloat16, seed=0, topk_blocks=512):
@@ -3027,6 +3085,77 @@ def test_nax_sparse_mla_deterministic_many_threadgroups():
         out = sparse_mla_nax.sparse_mla_attention_nax(q, kv, idx, scale)
         mx.eval(out)
         assert mx.array_equal(out, first).item()
+
+
+def _split_k_tokens(windows, before, n_pool):
+    """Tokens of the valid top-k windows, then the incomplete-window tail."""
+    w = np.array(windows)
+    n = w.shape[1] * 4
+    out = np.full((w.shape[0], n + 3), -1, np.int32)
+    for s, row in enumerate(w):
+        qpos = before + s
+        ok = (row >= 0) & (row < n_pool) & ((row + 1) * 4 - 1 <= qpos)
+        tokens = (row[:, None] * 4 + np.arange(4)).reshape(-1)
+        out[s, :n] = np.where(np.repeat(ok, 4), tokens, -1)
+        count = (qpos + 1) % 4
+        out[s, n : n + count] = qpos + 1 - count + np.arange(count)
+    return mx.array(out)[None, None]
+
+
+@_needs_nax_sparse_mla
+@pytest.mark.parametrize("width", [1, 3, 8])
+def test_split_k_decode_matches_fp32_reference(width):
+    from mlx_vlm.models.glm5_next import sparse_mla_decode as split_k
+
+    K, scale = 2603, 256**-0.5
+    before, n_pool = K - width, K // 4
+    q, kv, _ = _smla_inputs(width, K, 1, seed=width)
+    # Distinct windows, including negative, past-the-pool and incomplete ids.
+    order = mx.argsort(mx.random.uniform(shape=(width, n_pool + 8)), axis=-1)
+    windows = (order[:, :512] - 4).astype(mx.int32)
+    out = split_k.sparse_mla_decode(q, kv, windows, before, n_pool, scale)
+    ref = _smla_reference(q, kv, _split_k_tokens(windows, before, n_pool), scale)
+    err = mx.abs(out.astype(mx.float32) - ref)
+    assert mx.all(err <= mx.abs(ref) * 2.0**-8 + 1e-3).item()
+
+    # The same row twice in a batch buffer: unpadded and left-padded.
+    pad = mx.zeros((1, 1, 5, 512), kv.dtype)
+    kv_rows = mx.concatenate(
+        [mx.concatenate([kv, pad, pad], 2), mx.concatenate([pad, kv, pad], 2)]
+    )
+    rows = mx.array([[n_pool, before, 0], [n_pool, before, 5]], mx.int32)
+    q_rows, windows_rows = mx.concatenate([q, q]), mx.stack([windows, windows])
+    batched = split_k.sparse_mla_decode_batched(
+        q_rows, kv_rows, K + 5, windows_rows, rows, scale
+    )
+    assert mx.array_equal(batched[:1], out).item()
+    assert mx.array_equal(batched[1:], out).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="needs a Metal GPU")
+@pytest.mark.parametrize("width", [1, 8])
+def test_small_query_scores_match_fp32_reference(width):
+    from mlx_vlm.models.glm5_next import small_indexer
+
+    mx.random.seed(width)
+    before, plen = [140, 118], [37, 29]
+    q = mx.random.normal((2, width, 32, 128)).astype(mx.bfloat16)
+    keys = mx.random.normal((2, 37, 128)).astype(mx.bfloat16)
+    weights = (mx.random.normal((2, width, 32)) * 0.1).astype(mx.bfloat16)
+    batched = small_indexer.small_scores_batched(q, keys, weights, before, plen, 4)
+    for b, n in enumerate(plen):
+        got = small_indexer.small_scores(
+            q[b : b + 1], keys[b : b + 1, :n], weights[b : b + 1], before[b], 4
+        )
+        assert mx.array_equal(batched[b : b + 1, :, :n], got).item()
+        assert (batched[b, :, n:] <= -1e29).all().item()
+        ref = q[b].astype(mx.float32) @ keys[b, :n].astype(mx.float32).T
+        ref = (mx.maximum(ref, 0) * weights[b].astype(mx.float32)[..., None]).sum(1)
+        ref = ref.astype(mx.bfloat16).astype(mx.float32)
+        valid = (mx.arange(n) + 1) * 4 - 1 <= before[b] + mx.arange(width)[:, None]
+        assert mx.array_equal(got[0] <= -1e29, ~valid).item()
+        got = mx.where(valid, got[0].astype(mx.float32), 0)
+        assert mx.allclose(got, mx.where(valid, ref, 0), atol=0.02, rtol=0.01).item()
 
 
 # ---------------------------------------------------------------------------
@@ -3631,9 +3760,9 @@ def _indexer(hidden=256, seed=0):
 
 
 def _native_indexer_available():
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
-    return fast.has_symbol("dsa_indexer_scores") and fast.has_symbol("dsa_topk_indices")
+    return index_fast.has_symbol("dsa_indexer_scores") and index_fast.has_symbol("dsa_topk_indices")
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
@@ -3676,7 +3805,7 @@ def test_dsa_topk_rows_matches_native_topk(pool):
     ties, -1e30 masked blocks and a NaN."""
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast as index_fast
 
     for rows in (1, 4, 8):
         for trial in range(4):
@@ -3689,7 +3818,7 @@ def test_dsa_topk_rows_matches_native_topk(pool):
             s = s.astype(mx.bfloat16)
             if trial == 3:
                 s = s.at[0, 0, 7].add(float("nan"))
-            expected = fast.dsa_topk_indices(s[:, None], 512)[:, 0]
+            expected = index_fast.dsa_topk_indices(s[:, None], 512)[:, 0]
             got = dk.dsa_topk_rows(s, 512)
             assert got is not None and got.dtype == expected.dtype
             assert mx.array_equal(got, expected).item(), (rows, trial)
@@ -3703,11 +3832,11 @@ def test_indexer_fast_selection_matches_general_path(monkeypatch, native_topk):
     if native_topk and not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     if not native_topk:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast as index_fast
 
-        has_symbol = fast.has_symbol
+        has_symbol = index_fast.has_symbol
         monkeypatch.setattr(
-            fast,
+            index_fast,
             "has_symbol",
             lambda name: name != "dsa_topk_indices" and has_symbol(name),
         )
@@ -3862,7 +3991,7 @@ def _check_small_model(seed=41, prompt_len=2101, heads=16, quantize_mla=False):
     before = dict(_stats())
     saved = language._DECODE_FUSION
     try:
-        for step, width in enumerate([1, 1, 4, 1, 7, 2, 1, 8, 3]):
+        for step, width in enumerate([1, 1, 4, 1, 7, 2, 1, 8, 3, 4, 8]):
             block = mx.concatenate(
                 [next_ids, (next_ids + mx.arange(1, width)[None]) % 256], axis=1
             )[:, :width]
@@ -3884,9 +4013,11 @@ _CORE_FUSED = {"hc_mix", "kda", "moe_gate_up", "moe_down"}
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
-def test_small_model_decode_and_verify_logits_are_bitwise_reference():
+def test_small_model_decode_and_verify_logits_are_bitwise_reference(monkeypatch):
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
+    # Retain bitwise assertions for the original scorer and attention kernels.
+    monkeypatch.setattr(_language(), "_SMALL_QUERY_INDEXER", False)
     used = _check_small_model()
     assert _CORE_FUSED | {"dsa_gather"} <= used, used
 
@@ -4435,8 +4566,6 @@ def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch
     except ImportError:
         pytest.skip("this build has no glm53 fused KDA prefill")
     _language()
-    if not getattr(prework, "_GLM53_KDA_PREFILL_ENABLED", False):
-        pytest.skip("glm53 fused KDA prefill disabled")
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
 
@@ -4448,8 +4577,9 @@ def test_upstream_kda_prefill_then_fused_decode_is_bitwise_reference(monkeypatch
 
 @pytest.mark.usefixtures("glm5_fused_decode")
 @pytest.mark.parametrize("every", [1, 3])
-def test_decode_early_eval_only_schedules(every, monkeypatch):
-    """One-token decode forwards evaluate every few layers while the graph is
+@pytest.mark.parametrize("width", [1, 2, 4, 8])
+def test_decode_early_eval_only_schedules(every, width, monkeypatch):
+    """Decode/verify forwards evaluate every few layers while the graph is
     still being built; the logits and caches are those of the lazy forward."""
     language = _language()
     model = _fused_shape_model(seed=45)
@@ -4466,7 +4596,7 @@ def test_decode_early_eval_only_schedules(every, monkeypatch):
         calls.append(len(args))
         return real_async_eval(*args)
 
-    token = mx.array([[17]], dtype=mx.int32)
+    token = mx.arange(17, 17 + width, dtype=mx.int32)[None]
     for step in range(3):
         monkeypatch.setattr(language, "_DECODE_EVAL_EVERY", 0)
         lazy = model(token, cache=caches[0]).logits
@@ -4477,7 +4607,7 @@ def test_decode_early_eval_only_schedules(every, monkeypatch):
         monkeypatch.setattr(mx, "async_eval", real_async_eval)
         mx.eval(early)
         assert _mismatches(early, lazy) == 0, f"step {step}"
-        token = mx.argmax(lazy[:, -1:], axis=-1).astype(mx.int32)
+        token = mx.argmax(lazy, axis=-1).astype(mx.int32)
     # 4 layers: evaluations after layers `every`, 2 * every, ... (not the last).
     assert len(calls) == 3 * len(range(every, 4, every))
     for a, b in zip(caches[0], caches[1]):

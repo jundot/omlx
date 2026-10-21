@@ -828,11 +828,12 @@ def _is_muse_glimmer_model(
     model_name: str,
     model_config: dict[str, Any] | None = None,
 ) -> bool:
+    # Muse Spark speaks the same channel protocol as Muse Glimmer.
     model_type = model_config.get("model_type") if model_config else None
-    if model_type == "muse_glimmer":
+    if model_type in ("muse_glimmer", "muse_spark"):
         return True
     lowered = model_name.lower()
-    return "muse" in lowered and "glimmer" in lowered
+    return "muse" in lowered and ("glimmer" in lowered or "spark" in lowered)
 
 
 def _append_missing_json_object_closers(payload: str) -> str | None:
@@ -1414,6 +1415,7 @@ def detect_output_parser(
                 model_path=session_model_path,
             ),
             stop_token_ids=temp_parser.get_stop_token_ids(),
+            thinking_start_text="<|channel|>analysis<|message|>",
             thinking_end_text="<|end|>",
             thinking_end_trailing_text="<|start|>assistant<|channel|>final<|message|>",
         )

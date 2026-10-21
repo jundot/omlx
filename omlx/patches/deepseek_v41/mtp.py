@@ -3,6 +3,8 @@
 
 import mlx.core as mx
 
+from . import growth
+
 
 class AcceptanceDepthController:
     """Choose verification shapes from token acceptance, never wall-clock time.
@@ -50,6 +52,10 @@ class DSparkMixin:
         self._omlx_mtp_rowwise_unsupported = True
         self._omlx_mtp_independent_verify = True
         self._omlx_mtp_depth = max(1, min(depth, self._config.dspark_block_size))
+        # One-token decode then runs the kernels of verify blocks (decode_fused), so a
+        # verified draft gets the logits that decoding it alone gives.
+        for layer in getattr(self, "layers", ()):
+            object.__setattr__(layer, "_omlx_verify_exact", bool(enabled))
 
     def make_mtp_depth_controller(self, depth):
         return AcceptanceDepthController(depth)
@@ -117,8 +123,8 @@ class DSparkMixin:
             ]
             ratio = item.compress_ratio
             if ratio:
-                item[2] = item[2][:, : end // ratio]
-                item[3] = item[3][:, : end // ratio]
+                growth.truncate(item, 2, end // ratio)
+                growth.truncate(item, 3, end // ratio)
                 if ratio > 1:
                     kv, gate = state["compressor"]
                     projected_end = before % ratio + count

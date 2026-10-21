@@ -27,6 +27,7 @@ hot-cache-only PagedSSDCacheManager.
 
 from __future__ import annotations
 
+from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -37,6 +38,7 @@ from omlx.cache.paged_cache import BlockTable, PagedCacheManager
 from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
 from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.cache.type_registry import CacheTypeRegistry
+from omlx.patches.arrays_cache_metadata import apply_arrays_cache_metadata_patch
 
 try:
     import mlx.core as mx
@@ -619,6 +621,27 @@ def test_arrays_cache_extract_none_guard(cache_module):
     assert type(row[0][0]) is caches.ArraysCache
     assert mx.array_equal(row[0][0][0], ac[0][1:2]).item()
     assert all(slot is None for slot in row[0][1].cache)
+
+
+@pytest.mark.parametrize(
+    "cache_module", ["mlx_lm.models.cache", "mlx_vlm.models.cache"]
+)
+def test_arrays_cache_metadata_pins_no_buffers(cache_module):
+    """Decode-step advances must not keep one Metal buffer alive per step."""
+    caches = import_module(cache_module)
+    assert apply_arrays_cache_metadata_patch() is True
+
+    ac = caches.ArraysCache(size=2, left_padding=[2, 0])
+    # Past the Metal resource limit if each advance pinned a buffer.
+    steps = int(mx.device_info()["resource_limit"]) + 1
+    for _ in range(steps):
+        ac.advance(1)
+    assert ac.left_padding.tolist() == [2 - steps, -steps]
+
+    ac.extend(caches.ArraysCache(size=2, left_padding=[1]))
+    ac.filter([0, 2])
+    ac.advance(1)
+    assert ac.left_padding.tolist() == [1 - steps, 0]
 
 
 def test_none_conv_slots_roundtrip(tmp_path):

@@ -3,12 +3,14 @@
 
 import asyncio
 import base64
+import io
 import json
 import math
 import numpy as np
 import struct
 import threading
 import time
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -38,6 +40,22 @@ from omlx.engine.embedding import EmbeddingEngine
 from omlx.exceptions import InvalidRequestError
 from omlx.model_discovery import detect_model_type
 from omlx.models.embedding import EmbeddingOutput, MLXEmbeddingModel
+
+
+def _wav_data_uri(seconds: float = 0.25, sample_rate: int = 16000) -> str:
+    """Base64 data URI of a mono 16-bit sine WAV."""
+    t = np.arange(int(seconds * sample_rate)) / sample_rate
+    pcm = (0.3 * np.sin(2 * np.pi * 440 * t) * 32767).astype("<i2").tobytes()
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+    return "data:audio/wav;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+AUDIO_DATA_URI = _wav_data_uri()
 
 IMAGE_DATA_URI = (
     "data:image/png;base64,"
@@ -112,8 +130,14 @@ class TestEmbeddingModels:
 
     def test_embedding_input_item_requires_text_or_image(self):
         """Test EmbeddingInputItem rejects empty payloads."""
-        with pytest.raises(ValueError, match="text or image"):
+        with pytest.raises(ValueError, match="text, image, or audio"):
             EmbeddingInputItem()
+
+    def test_embedding_input_item_accepts_audio_only(self):
+        """Test EmbeddingInputItem accepts an audio-only payload."""
+        item = EmbeddingInputItem(audio=AUDIO_DATA_URI)
+        assert item.audio == AUDIO_DATA_URI
+        assert item.text is None and item.image is None
 
     def test_embedding_input_item_allows_empty_string_text(self):
         """Test EmbeddingInputItem preserves empty-string text items."""
@@ -244,6 +268,89 @@ class TestEmbeddingUtils:
         result = normalize_input(["Hello", "World"])
         assert result == ["Hello", "World"]
 
+    def test_normalize_input_image_content_parts(self):
+        """OpenAI image_url content parts fold into one structured item."""
+        parts = [
+            {"type": "text", "text": "a diagram"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        assert normalize_input(parts) == [{"text": "a diagram", "image": IMAGE_DATA_URI}]
+
+    def test_normalize_input_image_only_content_parts(self):
+        """Image-only parts produce an item without a text key."""
+        parts = [{"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}}]
+        assert normalize_input(parts) == [{"image": IMAGE_DATA_URI}]
+
+    def test_normalize_input_multiple_text_parts_join(self):
+        """Several text parts join with newlines, like extract_text_from_content."""
+        parts = [
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        assert normalize_input(parts) == [
+            {"text": "one\ntwo", "image": IMAGE_DATA_URI}
+        ]
+
+    def test_normalize_input_audio_content_part(self):
+        """input_audio parts fold into the data-URI form items take."""
+        parts = [
+            {"type": "text", "text": "speech"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        ]
+        assert normalize_input(parts) == [
+            {"text": "speech", "audio": "data:audio/wav;base64,AAAA"}
+        ]
+
+    def test_normalize_input_rejects_two_images(self):
+        parts = [
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        with pytest.raises(InvalidRequestError, match="at most one image"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_unknown_part_type(self):
+        parts = [{"type": "file", "file": {"filename": "x.pdf"}}]
+        with pytest.raises(InvalidRequestError, match="Unsupported embedding content part"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_image_part_without_url(self):
+        parts = [{"type": "image_url", "image_url": {}}]
+        with pytest.raises(InvalidRequestError, match="requires a non-empty url"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_empty_parts(self):
+        with pytest.raises(InvalidRequestError, match="no text, image, or audio"):
+            normalize_input([{"type": "text", "text": ""}])
+
+    def test_normalize_input_rejects_strings_mixed_with_parts(self):
+        """A string batch must not silently fuse into one vector."""
+        parts = [
+            "doc one",
+            "doc two",
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        with pytest.raises(InvalidRequestError, match="cannot mix plain strings"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_null_text_part(self):
+        parts = [
+            {"type": "text", "text": None},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        with pytest.raises(InvalidRequestError, match="'text' requires a string"):
+            normalize_input(parts)
+
+    def test_embedding_request_accepts_content_parts(self):
+        """EmbeddingRequest keeps OpenAI content-part input verbatim."""
+        parts = [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        request = EmbeddingRequest(input=parts, model="test-model")
+        assert request.input == parts
+
     def test_normalize_embedding_items(self):
         """Test structured embedding items normalization."""
         result = normalize_embedding_items(
@@ -254,8 +361,11 @@ class TestEmbeddingUtils:
                     text="hello",
                     image=IMAGE_DATA_URI,
                 ),
+                EmbeddingInputItem(text="rain", audio=AUDIO_DATA_URI),
             ]
         )
+        assert result[-1] == {"text": "rain", "audio": AUDIO_DATA_URI}
+        result = result[:-1]
         assert result == [
             {"text": "hello"},
             {"image": IMAGE_DATA_URI},
@@ -488,6 +598,31 @@ class TestEmbeddingCompileFallback:
             model.embed(["test"])
 
         assert generate.call_args.kwargs["max_length"] == 40960
+
+    def test_eager_usage_counts_tokens_left_after_truncation(self):
+        """generate() returns no mask, so usage is counted from the text."""
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = MagicMock()
+        model.processor = MagicMock(spec=["encode"])
+        model.processor.encode.side_effect = lambda text, add_special_tokens: (
+            text.split()
+        )
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6], [0.1, 0.2]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        texts = [" ".join(["w"] * 100), "a b c"]
+        with patch("mlx_embeddings.generate", return_value=mock_outputs):
+            truncated = model.embed(texts, max_length=8)
+            full = model.embed(texts, max_length=8, truncation=False)
+
+        assert truncated.total_tokens == 8 + 3
+        assert full.total_tokens == 100 + 3
 
     def test_default_max_length_uses_tokenizer_config_fallback(self):
         """Tokenizer model_max_length is used when model config lacks a limit."""
@@ -783,21 +918,6 @@ class TestEmbeddingCompileFallback:
         with pytest.raises(ValueError, match="does not support image inputs"):
             model.embed([{"image": IMAGE_DATA_URI}])
 
-    def test_try_compile_respects_disable_env(self, monkeypatch):
-        """OMLX_EMBEDDING_COMPILE=0 should skip mx.compile for root-cause probes."""
-        from omlx.models.embedding import MLXEmbeddingModel
-
-        monkeypatch.setenv("OMLX_EMBEDDING_COMPILE", "0")
-        model = MLXEmbeddingModel("test-model")
-        model.model = MagicMock()
-
-        with patch("omlx.models.embedding.mx") as mock_mx:
-            result = model._try_compile()
-
-        assert result is False
-        assert model._compiled_embed is None
-        mock_mx.compile.assert_not_called()
-
     def test_close_releases_compiled_model_and_processor_resources(self):
         """close() should drop wrapper references before clearing MLX caches."""
         from omlx.models.embedding import MLXEmbeddingModel
@@ -848,7 +968,12 @@ class TestEmbeddingEngine:
 
             asyncio.run(engine.start())
 
-            MockModel.assert_called_once_with("test-model", trust_remote_code=False)
+            MockModel.assert_called_once_with(
+                "test-model",
+                trust_remote_code=False,
+                audio_enabled=False,
+                audio_max_seconds=None,
+            )
             mock_model.load.assert_called_once()
 
             asyncio.run(engine.stop())
@@ -2100,8 +2225,8 @@ class TestDeclaredPoolingMode:
         """compile off + right-padded batch: the tokenizer path must pool real tokens.
 
         ``mlx_embeddings.generate`` drops the mask it builds, so this path
-        pooled a pad token for every mixed-length batch whenever
-        ``OMLX_EMBEDDING_COMPILE=0`` or a compile failure sent it here.
+        pooled a pad token for every mixed-length batch whenever a compile
+        failure sent it here.
         """
         import mlx.core as mx
 
@@ -2262,11 +2387,16 @@ class TestMlxVlmEmbeddingGemma2:
         save_file(weights, str(tmp_path / "model.safetensors"))
         return tmp_path
 
-    def _load(self, model_dir):
+    def _load(self, model_dir, audio_enabled=False, audio_max_seconds=None):
         tokenizer = self.MockTokenizer()
         processor = MagicMock()
         processor.tokenizer = tokenizer
-        model = MLXEmbeddingModel(str(model_dir))
+        processor.feature_extractor.sampling_rate = 16000
+        model = MLXEmbeddingModel(
+            str(model_dir),
+            audio_enabled=audio_enabled,
+            audio_max_seconds=audio_max_seconds,
+        )
         with patch(
             "omlx.models.embedding.load_processor", return_value=processor
         ) as load_processor:
@@ -2317,3 +2447,172 @@ class TestMlxVlmEmbeddingGemma2:
         np.testing.assert_allclose(
             np.array(output.embeddings), np.array(expected), atol=1e-6
         )
+
+    def test_audio_item_reaches_processor_as_waveform(self, model_dir):
+        model, _, processor = self._load(model_dir, audio_enabled=True)
+        assert model.model.audio_tower is not None
+        prepared = {
+            "input_ids": mx.array([[2, 5, 6, 1]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+        }
+        processor.apply_chat_template.return_value = prepared
+        model._compiled_embed = MagicMock()
+
+        output = model.embed([{"text": "a beep", "audio": AUDIO_DATA_URI}])
+
+        (conversation,) = processor.apply_chat_template.call_args.args[0]
+        content = conversation[0]["content"]
+        assert content[0] == {"type": "text", "text": "a beep"}
+        assert content[1]["type"] == "audio"
+        waveform = content[1]["audio"]
+        assert isinstance(waveform, np.ndarray) and waveform.dtype == np.float32
+        assert waveform.shape == (4000,)  # 0.25 s at 16 kHz
+        model._compiled_embed.assert_not_called()
+        expected = model.model(**prepared).text_embeds
+        np.testing.assert_allclose(
+            np.array(output.embeddings), np.array(expected), atol=1e-6
+        )
+
+    def test_audio_rejected_until_setting_enables_tower(self, model_dir):
+        model, _, processor = self._load(model_dir)
+
+        with pytest.raises(ValueError, match="enable embedding_audio_enabled"):
+            model.embed([{"audio": AUDIO_DATA_URI}])
+        processor.apply_chat_template.assert_not_called()
+
+    def test_engine_passes_audio_setting_to_model(self, model_dir):
+        from omlx.engine.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine(
+            str(model_dir), audio_enabled=True, audio_max_seconds=90
+        )
+        with patch(
+            "omlx.models.embedding.load_processor", return_value=MagicMock()
+        ):
+            asyncio.run(engine.start())
+        assert engine._model.audio_enabled is True
+        assert engine._model.audio_max_seconds == 90
+        assert engine._model.model.audio_tower is not None
+
+    def test_malformed_audio_is_request_error(self, model_dir):
+        model, _, processor = self._load(model_dir, audio_enabled=True)
+
+        with pytest.raises(InvalidRequestError):
+            model.embed([{"audio": "data:audio/wav;base64,not-base64!"}])
+        processor.apply_chat_template.assert_not_called()
+
+    def _prepared(self, processor):
+        processor.apply_chat_template.return_value = {
+            "input_ids": mx.array([[2, 5, 6, 1]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+        }
+
+    def test_audio_length_setting_reaches_feature_extractor(self, model_dir):
+        model, _, processor = self._load(
+            model_dir, audio_enabled=True, audio_max_seconds=120
+        )
+        self._prepared(processor)
+
+        model.embed([{"audio": AUDIO_DATA_URI}])
+
+        kwargs = processor.apply_chat_template.call_args.kwargs
+        assert kwargs["audio_kwargs"] == {"max_length": 120 * 16000}
+
+    def test_audio_length_default_keeps_processor_default(self, model_dir):
+        model, _, processor = self._load(model_dir, audio_enabled=True)
+        self._prepared(processor)
+
+        model.embed([{"audio": AUDIO_DATA_URI}])
+
+        assert "audio_kwargs" not in processor.apply_chat_template.call_args.kwargs
+
+    def test_audio_length_not_sent_for_image_batches(self, model_dir):
+        model, _, processor = self._load(
+            model_dir, audio_enabled=True, audio_max_seconds=120
+        )
+        self._prepared(processor)
+
+        model.embed([{"text": "a cat", "image": IMAGE_DATA_URI}])
+
+        assert "audio_kwargs" not in processor.apply_chat_template.call_args.kwargs
+
+
+class TestEmbeddingGemma2ImageLayout:
+    """PIL channel-layout guard for mlx-vlm EmbeddingGemma 2 (#2346)."""
+
+    @pytest.fixture(scope="class")
+    def processor(self):
+        pytest.importorskip(
+            "mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2"
+        )
+        from omlx.patches.embedding_gemma2_image_layout import (
+            apply_embedding_gemma2_image_layout_patch,
+        )
+
+        apply_embedding_gemma2_image_layout_patch()
+        from mlx_vlm.models.embedding_gemma2.image_processing_embedding_gemma2 import (
+            EmbeddingGemma2ImageProcessor,
+        )
+
+        return EmbeddingGemma2ImageProcessor()
+
+    def test_one_pixel_tall_image_embeds_at_full_patch_width(self, processor):
+        """1-px-tall RGB must not collapse to 256-wide single-channel patches."""
+        from PIL import Image
+
+        out = processor.preprocess([Image.new("RGB", (900, 1), (5, 5, 5))])
+        assert out["pixel_values"].shape[-1] == 768
+
+    def test_nested_pil_batch_is_forced_to_hwc(self, processor):
+        """The HF processor chain hands preprocess a nested [[PIL]] list."""
+        from PIL import Image
+
+        out = processor.preprocess([[Image.new("RGB", (900, 1), (5, 5, 5))]])
+        assert out["pixel_values"].shape[-1] == 768
+
+    def test_landscape_orientation_keeps_width_on_x_axis(self, processor):
+        from PIL import Image
+
+        image = Image.new("RGB", (900, 3))
+        pixels = image.load()
+        for x in range(900):
+            for y in range(3):
+                pixels[x, y] = (x // 4, y * 70, 0)
+        positions = processor.preprocess([image])["image_position_ids"]
+        # Patch grid: 13440/16 wide, 3 stays under one 16-px patch row.
+        assert positions[..., 0].max() > positions[..., 1].max()
+
+    def test_portrait_and_landscape_are_not_interchangeable(self, processor):
+        from PIL import Image
+
+        wide = processor.preprocess([Image.new("RGB", (900, 3))])[
+            "image_position_ids"
+        ]
+        tall = processor.preprocess([Image.new("RGB", (3, 900))])[
+            "image_position_ids"
+        ]
+        assert wide[..., 0].max() == tall[..., 1].max()
+        assert wide[..., 1].max() == tall[..., 0].max()
+
+    def test_explicit_input_format_is_not_overridden(self, processor):
+        """Callers passing input_data_format keep control (e.g. numpy FIRST)."""
+        import numpy as np
+        from PIL import Image
+
+        image = Image.new("RGB", (8, 8), (1, 2, 3))
+        with_channel = processor.preprocess(
+            [image], input_data_format="channels_last"
+        )
+        default = processor.preprocess([image])
+        np.testing.assert_array_equal(
+            np.asarray(with_channel["pixel_values"]),
+            np.asarray(default["pixel_values"]),
+        )
+
+    def test_non_pil_input_still_uses_layout_inference(self, processor):
+        """numpy arrays keep the old behaviour — only PIL gets forced HWC."""
+        import numpy as np
+
+        array_hwc = np.full((8, 8, 3), 7, dtype=np.uint8)
+        out = processor.preprocess([array_hwc])
+        assert out["pixel_values"].shape[-1] == 768

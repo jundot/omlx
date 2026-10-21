@@ -241,8 +241,9 @@ def detect_transports(
     """Detect available transports for a set of cluster hosts.
 
     Uses MLX's ``extract_connectivity`` and ``check_rdma`` to discover
-    Thunderbolt topology and RDMA availability. Degrades gracefully to
-    Ethernet when Thunderbolt is not available.
+    Thunderbolt topology and RDMA availability. Reports Ethernet only when
+    both probes ran and found no fast link. A failed probe returns an empty
+    tuple, which callers read as an unknown link.
 
     Args:
         hosts: List of SSH hostnames for the cluster nodes.
@@ -267,6 +268,7 @@ def detect_transports(
 
     transports: list[TransportInfo] = []
     physical_edges: set[tuple[int, int]] = set()
+    probe_failed = False
 
     # Try Thunderbolt connectivity
     try:
@@ -300,8 +302,7 @@ def detect_transports(
                             )
                         )
     except Exception:
-        # Thunderbolt detection failed — degrade to Ethernet
-        pass
+        probe_failed = True
 
     # Check RDMA
     try:
@@ -335,11 +336,9 @@ def detect_transports(
                     )
                 )
     except Exception:
-        # RDMA detection failed — skip
-        pass
+        probe_failed = True
 
-    # If no transports detected, assume Ethernet
-    if not transports:
+    if not transports and not probe_failed:
         for i, _host in enumerate(hosts):
             for j, peer_host in enumerate(hosts):
                 if i == j:

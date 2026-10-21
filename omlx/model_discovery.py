@@ -12,7 +12,7 @@ Supports:
 - Reranker models: Use RerankerEngine for document reranking
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
-- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev)
+- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, Decision 3.0)
 """
 
 import contextlib
@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from . import gguf
+
 logger = logging.getLogger(__name__)
 
 ModelType = Literal[
@@ -32,7 +34,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev"]
+DecisionKind = Literal["clef", "openjev", "d3"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -69,12 +71,14 @@ VLM_MODEL_TYPES = {
     "glm_ocr",
     "minimax_m3_vl",
     "minicpmv",
+    "minicpmv4_7",
     "phi4_siglip",
     "phi4mm",
     "youtu_vl",
     "inkling",
     "inkling_mm_model",  # config model_type of Inkling Small checkpoints
     "muse_glimmer",
+    "muse_spark",
     "glm5_next",
 }
 
@@ -106,6 +110,18 @@ _MIMO_OMNIMODAL_CONFIG = Path("omnimodal/config.json")
 CLEF_HEAD_WEIGHTS = "joint_head.safetensors"
 CLEF_HEAD_CONFIG = "joint_head_config.json"
 _OPENJEV_HELPER = Path("helper/shim.py")
+# Decision 3.0 (vllm-sr d3) scores answer codes with an FP32 readout stored
+# next to the backbone shards, described by its decision config.
+D3_READOUT_WEIGHTS = "readout.safetensors"
+D3_DECISION_CONFIG = "decision_config.json"
+D3_FORMAT_ID = "d3-code-readout-v1"
+# Files of a decision head, not of the backbone. Quantizers copy them as is.
+DECISION_SIDECAR_WEIGHTS = (CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS)
+DECISION_SIDECAR_FILES = (
+    *DECISION_SIDECAR_WEIGHTS,
+    CLEF_HEAD_CONFIG,
+    D3_DECISION_CONFIG,
+)
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
 # are never meant to be served as standalone chat models. Some declare a
@@ -114,8 +130,7 @@ _OPENJEV_HELPER = Path("helper/shim.py")
 # a plain model_type (e.g. ``qwen3``) and are only distinguishable by their
 # architecture name (``DFlashDraftModel``) or a drafter-only config block
 # (``dflash_config``). Keep these in sync with the drafter resolution in
-# engine_pool.py (~1498) and the dflash gate in engine/dflash.py when new
-# drafter families are added.
+# engine_pool.py when new drafter families are added.
 HELPER_CONFIG_MODEL_TYPE_SUFFIXES = ("_assistant", "_mtp")
 _HELPER_ARCH_TOKENS = ("draft", "assistant", "mtp")
 _HELPER_CONFIG_KEYS = ("dflash_config",)
@@ -183,6 +198,7 @@ VLM_ARCHITECTURES = {
     "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
+    "MuseSparkForConditionalGeneration",  # meta-models/Muse-Spark-Open-816B-A42B
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
     "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
     "Moondream",  # vikhyatk/moondream2 (2024 revisions)
@@ -375,18 +391,9 @@ AUDIO_STS_ARCHITECTURES = {
     "LFM2AudioModel",
 }
 
-# STT families whose mlx-audio implementations accept incremental audio
-# input (push-based realtime decoding): whisper via the AlignAtt
-# StreamingDecoder, voxtral_realtime via VoxtralStreamingSession. Gates
-# the realtime transcription WebSocket and the admin chat mic button.
-REALTIME_STT_MODEL_TYPES = {"whisper", "voxtral_realtime"}
-
-
 def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
-    """True when an audio_stt model supports push-based realtime decoding."""
-    if model_type != "audio_stt":
-        return False
-    return (config_model_type or "").lower() in REALTIME_STT_MODEL_TYPES
+    """True when an audio_stt model can serve the realtime WebSocket."""
+    return model_type == "audio_stt"
 
 
 @dataclass
@@ -402,10 +409,13 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    reasoning_efforts: list[str] | None = None  # Template effort levels (None = no effort)
     model_context_length: int | None = None  # Declared context length from config.json (None if unknown)
     source_type: str = "local"  # "local" or "hf_cache"
     source_repo_id: str | None = None  # HuggingFace repo id for cache-backed models
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+    model_format: str | None = None  # "gguf": served by an external engine only
+    source_path: str | None = None  # The GGUF file a generated folder links to
 
 
 @dataclass(frozen=True)
@@ -463,17 +473,30 @@ def _model_name_hint(model_path: Path) -> str:
     return model_path.name.lower()
 
 
+def _is_d3_decision_config(path: Path) -> bool:
+    try:
+        with open(path) as f:
+            return json.load(f).get("format_id") == D3_FORMAT_ID
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
     """Return the decision-model family of a checkpoint, or None.
 
-    Clef is identified by its joint head files. OpenJev is a plain Qwen3.5
-    checkpoint, so it is identified by its helper directory or, for MLX
-    conversions without the helper, by the directory name.
+    Clef is identified by its joint head files and Decision 3.0 by its
+    readout and decision config. OpenJev is a plain Qwen3.5 checkpoint, so it
+    is identified by its helper directory or, for MLX conversions without the
+    helper, by the directory name.
     """
     if (model_path / CLEF_HEAD_WEIGHTS).is_file() and (
         model_path / CLEF_HEAD_CONFIG
     ).is_file():
         return "clef"
+    if (model_path / D3_READOUT_WEIGHTS).is_file() and _is_d3_decision_config(
+        model_path / D3_DECISION_CONFIG
+    ):
+        return "d3"
     if config is None:
         try:
             with open(model_path / "config.json") as f:
@@ -861,7 +884,28 @@ def detect_model_type(model_path: Path) -> ModelType:
     return "llm"
 
 
-def detect_thinking_default(model_path: Path) -> bool | None:
+def _read_chat_template_text(model_path: Path) -> str | None:
+    """Return the chat template from chat_template.jinja or tokenizer_config.json."""
+    jinja_path = model_path / "chat_template.jinja"
+    if jinja_path.exists():
+        with contextlib.suppress(OSError):
+            return jinja_path.read_text(encoding="utf-8")
+
+    tc_path = model_path / "tokenizer_config.json"
+    if tc_path.exists():
+        try:
+            with open(tc_path) as f:
+                template = json.load(f).get("chat_template")
+        except Exception:
+            return None
+        if isinstance(template, str):
+            return template
+    return None
+
+
+def detect_thinking_default(
+    model_path: Path, template_text: str | None = None
+) -> bool | None:
     """Detect a model's effective thinking default from local metadata.
 
     Inspects the Jinja chat template for ``enable_thinking`` references and
@@ -877,22 +921,8 @@ def detect_thinking_default(model_path: Path) -> bool | None:
     * **None** — template does not reference ``enable_thinking`` (model has
       no thinking toggle).
     """
-    # Try standalone Jinja file first, then tokenizer_config.json
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
     if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
+        template_text = _read_chat_template_text(model_path)
 
     if not template_text or "enable_thinking" not in template_text:
         return None
@@ -1002,7 +1032,9 @@ def _read_model_context_length(model_path: Path) -> int | None:
     return None
 
 
-def detect_preserve_thinking(model_path: Path) -> bool | None:
+def detect_preserve_thinking(
+    model_path: Path, template_text: str | None = None
+) -> bool | None:
     """Detect whether a model's chat template supports ``preserve_thinking``.
 
     Qwen 3.6+ templates strip ``<think>`` blocks from historical assistant
@@ -1014,26 +1046,53 @@ def detect_preserve_thinking(model_path: Path) -> bool | None:
         True if the template references ``preserve_thinking`` (should be
         enabled), None otherwise (template has no such flag).
     """
-    template_text = None
-    jinja_path = model_path / "chat_template.jinja"
-    if jinja_path.exists():
-        with contextlib.suppress(OSError):
-            template_text = jinja_path.read_text(encoding="utf-8")
-
     if template_text is None:
-        tc_path = model_path / "tokenizer_config.json"
-        if tc_path.exists():
-            try:
-                with open(tc_path) as f:
-                    tc = json.load(f)
-                template_text = tc.get("chat_template")
-            except Exception:
-                pass
+        template_text = _read_chat_template_text(model_path)
 
     if not template_text or "preserve_thinking" not in template_text:
         return None
 
     return True
+
+
+REASONING_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# `reasoning_effort == 'low'` or `reasoning_effort (not) in ['low', 'high']`.
+_EFFORT_CHECK = re.compile(
+    r"reasoning_effort\s*(?:==|(?:not\s+)?in)\s*"
+    r"([\[(][^\])]*[\])]|'[^']*'|\"[^\"]*\")"
+)
+_QUOTED = re.compile(r"['\"]([^'\"]+)['\"]")
+# `reasoning_effort in levels` where the template sets `levels` to a literal.
+_EFFORT_NAME_CHECK = re.compile(r"reasoning_effort\s+(?:not\s+)?in\s+([A-Za-z_]\w*)")
+_DICT_KEY = re.compile(r"['\"]([^'\"]+)['\"]\s*:")
+
+
+def detect_reasoning_effort(
+    model_path: Path, template_text: str | None = None
+) -> list[str] | None:
+    """Return the effort levels the chat template accepts.
+
+    None means the template does not read ``reasoning_effort``. An empty list
+    means it reads the value but names none of the standard levels.
+    """
+    if template_text is None:
+        template_text = _read_chat_template_text(model_path)
+    if not template_text or "reasoning_effort" not in template_text:
+        return None
+    named = set()
+    for match in _EFFORT_CHECK.finditer(template_text):
+        named.update(_QUOTED.findall(match.group(1)))
+    for match in _EFFORT_NAME_CHECK.finditer(template_text):
+        literal = re.search(
+            rf"set\s+{match.group(1)}\s*=\s*(\{{[^}}]*\}}|\[[^\]]*\]|\([^)]*\))",
+            template_text,
+        )
+        if literal is not None:
+            text = literal.group(1)
+            # A dict literal names the accepted levels as its keys.
+            pattern = _DICT_KEY if text.startswith("{") else _QUOTED
+            named.update(pattern.findall(text))
+    return [level for level in REASONING_EFFORT_LEVELS if level in named]
 
 
 def estimate_model_size(model_path: Path) -> int:
@@ -1694,8 +1753,10 @@ def _register_model(
                 model_id,
             )
 
-        thinking_default = detect_thinking_default(model_dir)
-        preserve_thinking_default = detect_preserve_thinking(model_dir)
+        template_text = _read_chat_template_text(model_dir)
+        thinking_default = detect_thinking_default(model_dir, template_text)
+        preserve_thinking_default = detect_preserve_thinking(model_dir, template_text)
+        reasoning_efforts = detect_reasoning_effort(model_dir, template_text)
         model_context_length = _read_model_context_length(model_dir)
 
         models[model_id] = DiscoveredModel(
@@ -1708,6 +1769,7 @@ def _register_model(
             config_model_type=config_model_type,
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
+            reasoning_efforts=reasoning_efforts,
             model_context_length=model_context_length,
             source_type=source_type,
             source_repo_id=source_repo_id,
@@ -1729,12 +1791,109 @@ def _register_model(
         logger.error(f"Failed to discover model {model_id}: {e}")
 
 
+# Prebuilt Splash packages, by their manifest's format, and the MLX model
+# that holds the same weights. Splash stopped loading packages in 1.3.1.
+_SPLASH_PACKAGE_REPLACEMENTS = {
+    "splash-packed-q4": "mlx-community/Qwen3.8-27B-4bit",
+    "splash-packed-q4-moe": "mlx-community/Qwen3.6-35B-A3B-4bit",
+}
+
+
+def _skip_splash_package(folder: Path) -> bool:
+    """Log and skip a Splash package, which nothing loads any more."""
+    try:
+        manifest = json.loads((folder / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return False
+    package_format = manifest.get("format") if isinstance(manifest, dict) else None
+    name = package_format.get("name") if isinstance(package_format, dict) else None
+    replacement = _SPLASH_PACKAGE_REPLACEMENTS.get(name)
+    if replacement is None:
+        return False
+    logger.warning(
+        f"Skipping {folder}: a Splash package, a prebuilt format Splash stopped "
+        f"loading in 1.3.1; {replacement} holds the same weights"
+    )
+    return True
+
+
+def _register_gguf_model(
+    models: dict[str, DiscoveredModel],
+    model: gguf.GgufModel,
+    gguf_root: Path,
+    *,
+    source_type: str,
+    source_repo_id: str | None,
+) -> None:
+    if model.model_id in models:
+        logger.warning(
+            f"Duplicate model_id '{model.model_id}' found at {model.path}, "
+            f"keeping version from {models[model.model_id].model_path}"
+        )
+        return
+    try:
+        folder = gguf.prepare_model_folder(model, gguf_root)
+        config = json.loads((folder / gguf.CONFIG_FILE).read_text())
+        model_type: ModelType = "vlm" if "vision_config" in config else "llm"
+        template_text = _read_chat_template_text(folder)
+        models[model.model_id] = DiscoveredModel(
+            model_id=model.model_id,
+            model_path=str(folder),
+            model_type=model_type,
+            engine_type="vlm" if model_type == "vlm" else "batched",
+            estimated_size=gguf.model_size(model),
+            config_model_type=config.get("model_type", ""),
+            thinking_default=detect_thinking_default(folder, template_text),
+            preserve_thinking_default=detect_preserve_thinking(folder, template_text),
+            reasoning_efforts=detect_reasoning_effort(folder, template_text),
+            model_context_length=_read_model_context_length(folder),
+            source_type=source_type,
+            source_repo_id=source_repo_id,
+            model_format="gguf",
+            source_path=str(model.path),
+        )
+        logger.info(
+            f"Discovered GGUF model: {model.model_id} "
+            f"({config.get('model_type')}, {model.path})"
+        )
+    except Exception as e:
+        logger.warning(f"Skipping GGUF model {model.model_id} at {model.path}: {e}")
+
+
+def _register_gguf_folder(
+    models: dict[str, DiscoveredModel],
+    folder: Path,
+    gguf_root: Path | None,
+    *,
+    source_type: str = "local",
+    source_repo_id: str | None = None,
+) -> bool:
+    """Register each GGUF model in ``folder``; False if it is no GGUF folder.
+
+    Without ``gguf_root`` the folder is claimed but nothing is registered, so
+    the config.json a GGUF repo ships never registers it as a checkpoint.
+    """
+    if not gguf.is_gguf_folder(folder):
+        return False
+    if gguf_root is not None:
+        for model in gguf.find_models(folder):
+            _register_gguf_model(
+                models,
+                model,
+                gguf_root,
+                source_type=source_type,
+                source_repo_id=source_repo_id,
+            )
+    return True
+
+
 def model_display_name(
     model_id: str,
     model_path: str | Path | None,
     model_dirs: list[Path],
     *,
     source_repo_id: str | None = None,
+    source_path: str | Path | None = None,
 ) -> str:
     """Return the org-qualified display name for a discovered model.
 
@@ -1745,6 +1904,11 @@ def model_display_name(
     same leaf directory name stay distinguishable.
     """
     repo_id = (source_repo_id or "").strip()
+    if source_path:
+        # A GGUF is <owner>/<file>: a repo holds several of them.
+        owner = repo_id.split("/", 1)[0] if "/" in repo_id else None
+        owner = owner or _owner_folder(Path(source_path), model_dirs)
+        return f"{owner}/{model_id}" if owner else model_id
     if "/" in repo_id:
         return repo_id
 
@@ -1774,7 +1938,25 @@ def model_display_name(
     return model_id
 
 
-def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
+def _owner_folder(path: Path, model_dirs: list[Path]) -> str | None:
+    """The owner folder of ``<model dir>/<owner>/<repo>/<file>``, or None."""
+    try:
+        # The file itself may link elsewhere; its folder places it.
+        folder = path.expanduser().parent.resolve()
+    except (OSError, RuntimeError):
+        return None
+    for model_dir in model_dirs:
+        try:
+            parts = folder.relative_to(Path(model_dir).expanduser().resolve()).parts
+        except (OSError, RuntimeError, ValueError):
+            continue
+        return parts[0] if len(parts) >= 2 else None
+    return None
+
+
+def discover_models(
+    model_dir: Path, gguf_root: Path | None = None
+) -> dict[str, DiscoveredModel]:
     """
     Scan model directory with two-level discovery.
 
@@ -1797,9 +1979,12 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
 
     If a first-level subdirectory has config.json, it's treated as a model.
     Otherwise, its children are scanned for models (organization folder).
+    A folder of GGUF files registers one model per GGUF, each backed by a
+    folder generated under ``gguf_root`` (see omlx/gguf.py).
 
     Args:
         model_dir: Path to directory containing model subdirectories
+        gguf_root: Where GGUF model folders are generated; None skips GGUFs
 
     Returns:
         Dictionary mapping model_id to DiscoveredModel
@@ -1816,12 +2001,16 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     for subdir in _iter_readable_entries(model_dir, "model directory"):
         if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
             continue
+        if gguf_root is not None and subdir.resolve() == gguf_root.resolve():
+            continue
 
         if _is_adapter_dir(subdir):
             logger.info(
                 f"Skipping LoRA adapter: {subdir.name} "
                 "(oMLX does not support LoRA/PEFT adapters)"
             )
+        elif _register_gguf_folder(models, subdir, gguf_root):
+            pass
         elif _is_model_dir(subdir):
             # Level 1: direct model folder
             _register_model(models, subdir, subdir.name)
@@ -1829,7 +2018,15 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
-                if _is_hf_cache_mlx_compatible(
+                if _register_gguf_folder(
+                    models,
+                    hf_resolved.snapshot_path,
+                    gguf_root,
+                    source_type="hf_cache",
+                    source_repo_id=hf_resolved.source_repo_id,
+                ) or _skip_splash_package(hf_resolved.snapshot_path):
+                    pass
+                elif _is_hf_cache_mlx_compatible(
                     hf_resolved.snapshot_path,
                     hf_resolved.source_repo_id,
                 ):
@@ -1840,6 +2037,9 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                         source_type="hf_cache",
                         source_repo_id=hf_resolved.source_repo_id,
                     )
+                continue
+
+            if _skip_splash_package(subdir):
                 continue
 
             # Level 2: organization folder — scan children
@@ -1855,6 +2055,10 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                         f"Skipping LoRA adapter: {child.name} "
                         "(oMLX does not support LoRA/PEFT adapters)"
                     )
+                elif _register_gguf_folder(models, child, gguf_root):
+                    has_children = True
+                elif _skip_splash_package(child):
+                    has_children = True
                 elif _is_model_dir(child):
                     has_children = True
                     _register_model(models, child, child.name)
@@ -1868,14 +2072,16 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     # Fallback: if no models found and the directory itself is a model, register it.
     # This supports pointing directly at a single model folder, e.g.:
     #   /Models/Qwen3.5-9B-MLX-4bit/  (contains config.json and weight files)
-    if not models and _is_model_dir(model_dir):
+    if _register_gguf_folder(models, model_dir, gguf_root):
+        pass
+    elif not models and _is_model_dir(model_dir):
         _register_model(models, model_dir, model_dir.name)
 
     return models
 
 
 def discover_models_from_dirs(
-    model_dirs: list[Path],
+    model_dirs: list[Path], gguf_root: Path | None = None
 ) -> dict[str, DiscoveredModel]:
     """
     Scan multiple model directories and merge results.
@@ -1898,7 +2104,7 @@ def discover_models_from_dirs(
             continue
 
         try:
-            discovered = discover_models(model_dir)
+            discovered = discover_models(model_dir, gguf_root)
         except ValueError as e:
             logger.warning(f"Skipping directory {model_dir}: {e}")
             continue

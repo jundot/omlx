@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 from collections.abc import Callable
 
 import mlx.core as mx
@@ -31,39 +30,15 @@ _NATIVE_QSA_MAIN_PROVEN = False
 _NAX_QSA_MAIN_DISABLED = False
 _NAX_QSA_MAIN_PROVEN = False
 
-
-def _min_rows(env: str, default: int) -> int:
-    raw = os.environ.get(env, "").strip()
-    if raw:
-        try:
-            return max(0, int(raw))
-        except ValueError:
-            pass
-    return default
-
-
-# Measured on M5 (NAX) and M3 Ultra alike. On M3 Ultra Flash-Next at 64k the
-# thresholds took Lightning MTP from 48 to 63-65 tok/s and decode from 50.8 to
-# 52.3 tok/s.
-@functools.lru_cache(maxsize=None)
-def _native_score_min_rows() -> int:
-    """Query rows from which the native indexer-score kernel engages; below it the
-    MLX ops are faster (NAX: 0.27 vs 0.36-0.77 ms per layer at 1-16 rows)."""
-    return _min_rows("OMLX_QWEN4_QSA_NATIVE_SCORE_MIN_ROWS", 32)
-
-
-@functools.lru_cache(maxsize=None)
-def _native_topk_min_rows() -> int:
-    """Query rows from which the native top-k engages; argpartition ties or wins
-    below it (NAX: 0.26-0.31 vs 0.26 ms per layer at one row)."""
-    return _min_rows("OMLX_QWEN4_QSA_NATIVE_TOPK_MIN_ROWS", 8)
-
-
-@functools.lru_cache(maxsize=None)
-def _native_main_min_rows() -> int:
-    """Query rows from which the native sparse GQA kernel engages; the gathered SDPA
-    is faster below it (NAX: 0.7 vs 1.6 ms per layer at verify width)."""
-    return _min_rows("OMLX_QWEN4_QSA_NATIVE_MAIN_MIN_ROWS", 24)
+# Query rows from which each native kernel engages. Measured on M5 (NAX) and
+# M3 Ultra alike; on M3 Ultra Flash-Next at 64k they took Lightning MTP from 48
+# to 63-65 tok/s and decode from 50.8 to 52.3 tok/s.
+# Indexer scores: MLX ops are faster below (NAX: 0.27 vs 0.36-0.77 ms, 1-16 rows).
+_NATIVE_SCORE_MIN_ROWS = 32
+# Top-k: argpartition ties or wins below (NAX: 0.26-0.31 vs 0.26 ms, one row).
+_NATIVE_TOPK_MIN_ROWS = 8
+# Sparse GQA: gathered SDPA is faster below (NAX: 0.7 vs 1.6 ms, verify width).
+_NATIVE_MAIN_MIN_ROWS = 24
 
 
 def contiguous_causal_query_chunk(key_tokens: int) -> int:
@@ -95,10 +70,8 @@ def _native_causal_query_chunk(key_tokens: int) -> int:
 # operations in the same order, selects exactly the same set (argpartition's
 # [-k:] is the last k of MLX's stable ascending merge sort: NaN above +inf,
 # -0 == +0, ties by index) and writes the mask or token list in one launch.
-# OMLX_QWEN4_QSA_DECODE_SELECT=0 keeps the MLX ops.
-_DECODE_SELECT_DISABLED = os.environ.get(
-    "OMLX_QWEN4_QSA_DECODE_SELECT", "1"
-).strip().lower() in {"0", "false", "no", "off"}
+# Tests set _DECODE_SELECT_DISABLED to compare against the MLX ops.
+_DECODE_SELECT_DISABLED = False
 _DECODE_SELECT_THREADS = 1024
 # Keys held per thread; larger block banks keep the MLX ops.
 _DECODE_SELECT_MAX_PER_THREAD = 32
@@ -434,10 +407,7 @@ def decode_block_selection_tokens(
 # same partitions, same visiting order, same float operations, same bits.
 # The partition count is MLX's rule for the GPU class; only the 'd' class is
 # transcribed (and verified), other GPUs keep MLX.
-# OMLX_QWEN4_QSA_DECODE_SDPA=0 keeps mx.fast.scaled_dot_product_attention.
-_DECODE_SDPA_DISABLED = os.environ.get(
-    "OMLX_QWEN4_QSA_DECODE_SDPA", "1"
-).strip().lower() in {"0", "false", "no", "off"}
+_DECODE_SDPA_DISABLED = False
 _DECODE_SDPA_KERNELS: list = []
 _DECODE_SDPA_VALIDATED: set[tuple] = set()
 _DECODE_SDPA_SCALES: dict[float, mx.array] = {}
@@ -836,21 +806,21 @@ def _native_indexer_scores(
         or mask_q_offset < 0
     ):
         return None
-    if queries.shape[1] < _native_score_min_rows():
+    if queries.shape[1] < _NATIVE_SCORE_MIN_ROWS:
         return None
 
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         if not fast.is_native_available() or not fast.has_symbol(
-            "qwen4_qsa_indexer_scores"
+            "qsa_indexer_scores"
         ):
             _NATIVE_QSA_SCORE_DISABLED = True
             return None
         # The caller's [B,M,H,D] view transposes back to the GEMM-friendly
         # [B,H,M,D] ABI. The native wrapper only copies when the resulting
         # view is not row-contiguous (for example an offset query chunk).
-        scores = fast.qwen4_qsa_indexer_scores(
+        scores = fast.qsa_indexer_scores(
             queries.transpose(0, 2, 1, 3),
             pooled_keys[:, None],
             mask_ratio=compress_ratio,
@@ -886,17 +856,17 @@ def _native_topk_indices(scores: mx.array, topk: int) -> mx.array | None:
         or topk != 512
     ):
         return None
-    if scores.shape[1] < _native_topk_min_rows():
+    if scores.shape[1] < _NATIVE_TOPK_MIN_ROWS:
         return None
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         if not fast.is_native_available() or not fast.has_symbol(
-            "qwen4_qsa_topk_indices"
+            "qsa_topk_indices"
         ):
             _NATIVE_QSA_TOPK_DISABLED = True
             return None
-        indices = fast.qwen4_qsa_topk_indices(scores, topk=topk).astype(mx.int32)
+        indices = fast.qsa_topk_indices(scores, topk=topk).astype(mx.int32)
         if not _NATIVE_QSA_TOPK_PROVEN:
             mx.eval(indices)
             _NATIVE_QSA_TOPK_PROVEN = True
@@ -938,18 +908,18 @@ def _native_sparse_gqa_attention(
         or q_offset + queries.shape[2] > keys.shape[2]
     ):
         return None
-    if queries.shape[2] < _native_main_min_rows():
+    if queries.shape[2] < _NATIVE_MAIN_MIN_ROWS:
         return None
     try:
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         if not fast.is_native_available() or not fast.has_symbol(
-            "qwen4_qsa_sparse_gqa_attention"
+            "sparse_gqa_attention"
         ):
             _NATIVE_QSA_MAIN_DISABLED = True
             return None
         native_blocks = mx.contiguous(selected_blocks.astype(mx.uint32)[:, None])
-        output = fast.qwen4_qsa_sparse_gqa_attention(
+        output = fast.sparse_gqa_attention(
             queries,
             keys,
             values,
@@ -988,8 +958,7 @@ def _nax_sparse_gqa_attention(
     if _NAX_QSA_MAIN_DISABLED:
         return None
     if (
-        not qsa_nax.enabled()
-        or queries.ndim != 4
+        queries.ndim != 4
         or queries.shape[0] != 1
         or queries.shape[1] != 24
         or queries.shape[-1] != 256
@@ -1007,7 +976,7 @@ def _nax_sparse_gqa_attention(
         or q_offset + queries.shape[2] > keys.shape[2]
     ):
         return None
-    if queries.shape[2] < _native_main_min_rows() or not qsa_nax.nax_available():
+    if queries.shape[2] < _NATIVE_MAIN_MIN_ROWS or not qsa_nax.nax_available():
         return None
     try:
         output = qsa_nax.sparse_gqa_attention(
@@ -1045,7 +1014,7 @@ def _decode_qsa_sdpa(
     """
 
     try:
-        from omlx.custom_kernels.decode_fast import fast
+        from omlx.custom_kernels.attention import fast
 
         extension = getattr(fast, "_ext", None)
         supported = getattr(extension, "sdpa_decode_supported", None)
@@ -1145,7 +1114,7 @@ def contiguous_causal_gathered_qsa_decode(
             pooled_index_keys,
             indexer_head_dim,
         )
-        if index_queries.shape[1] < _native_topk_min_rows():
+        if index_queries.shape[1] < _NATIVE_TOPK_MIN_ROWS:
             # The argpartition path below, in one launch (same sorted tokens).
             selected_tokens = decode_block_selection_tokens(
                 head_scores,
@@ -1268,10 +1237,10 @@ def contiguous_causal_gathered_qsa(
             and not _NATIVE_QSA_MAIN_DISABLED
         ):
             try:
-                from omlx.custom_kernels.glm_moe_dsa import fast
+                from omlx.custom_kernels.attention import fast
 
                 if fast.is_native_available() and fast.has_symbol(
-                    "qwen4_qsa_sparse_gqa_attention"
+                    "sparse_gqa_attention"
                 ):
                     query_chunk = max(
                         query_chunk, _native_causal_query_chunk(key_tokens)
@@ -1459,7 +1428,63 @@ def contiguous_causal_gathered_qsa(
     return mx.concatenate(outputs, axis=1)
 
 
+def batched_causal_block_selection(
+    index_queries: mx.array,
+    pooled_index_keys: mx.array,
+    visible: mx.array,
+    *,
+    compress_ratio: int,
+    block_topk: int,
+    indexer_head_dim: int,
+) -> tuple[mx.array, mx.array]:
+    """QSA key selection of every query of a batch of contiguous rows.
+
+    ``index_queries`` ``[B, heads, L, D]`` are normalized and rotated;
+    ``pooled_index_keys`` ``[B, blocks, D]`` holds each row's completed blocks
+    left-aligned from its first token (zero past the row's own count);
+    ``visible`` ``[B, L]`` is how many of its row's tokens each query sees.
+    Returns row-relative token indices ``[B, L, block_topk * ratio + ratio - 1]``
+    (int32, chronological) and their validity: the query's top ``block_topk``
+    causal blocks by the FP32 score the indexer uses -- every causal block
+    below the crossover -- then its incomplete tail. Invalid slots index 0.
+    ``blocks`` must exceed ``block_topk``.
+    """
+
+    ratio = compress_ratio
+    batch, _, length, _ = index_queries.shape
+    blocks = pooled_index_keys.shape[1]
+    complete = visible // ratio
+    scores = index_queries.astype(mx.float32) @ pooled_index_keys[:, None].astype(
+        mx.float32
+    ).swapaxes(-1, -2)
+    scores = mx.sum(mx.maximum(scores, 0), axis=1) / math.sqrt(indexer_head_dim)
+    scores = mx.where(
+        mx.arange(blocks)[None, None] < complete[..., None], scores, -mx.inf
+    )
+    # argpartition's top-k set is unordered; restore key order as the dense
+    # path's SDPA reads keys.
+    chosen = mx.sort(
+        mx.argpartition(scores, kth=-block_topk, axis=-1)[..., -block_topk:].astype(
+            mx.int32
+        ),
+        axis=-1,
+    )
+    tokens = (chosen[..., None] * ratio + mx.arange(ratio, dtype=mx.int32)).reshape(
+        batch, length, block_topk * ratio
+    )
+    tail = complete[..., None] * ratio + mx.arange(ratio - 1, dtype=mx.int32)
+    valid = mx.concatenate(
+        [
+            mx.repeat(chosen < complete[..., None], ratio, axis=-1),
+            tail < visible[..., None],
+        ],
+        axis=-1,
+    )
+    return mx.where(valid, mx.concatenate([tokens, tail], axis=-1), 0), valid
+
+
 __all__ = [
+    "batched_causal_block_selection",
     "contiguous_causal_gathered_qsa",
     "contiguous_causal_gathered_qsa_decode",
     "contiguous_causal_query_chunk",

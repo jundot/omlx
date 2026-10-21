@@ -6,6 +6,8 @@ full-attention layer. Only the full-attention layers grow a KV cache, so neither
 the planner's reservation nor the per-rank prefill guard may charge every layer.
 """
 
+import pytest
+
 from omlx.cluster.planner import _kv_bytes_per_token_per_layer
 
 HYBRID_TEXT_CONFIG = {
@@ -26,6 +28,51 @@ def test_hybrid_kv_reservation_counts_only_full_attention_layers():
     assert _kv_bytes_per_token_per_layer(config) == per_layer // 4
     # => 64 KiB per token over the whole model, not 256 KiB.
     assert _kv_bytes_per_token_per_layer(config) * 64 == 64 * 1024
+
+
+MLA = {"kv_lora_rank": 512, "qk_rope_head_dim": 64}
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        # #4547: Qwen3-Next has full_attention_interval, not layer_types.
+        (
+            {
+                "num_hidden_layers": 48,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "full_attention_interval": 4,
+            },
+            512,
+        ),
+        # Kimi K3: 24 MLA layers among 93.
+        (
+            {
+                "text_config": {
+                    "num_hidden_layers": 93,
+                    "linear_attn_config": {
+                        "kda_layers": [n for n in range(1, 94) if n % 4 and n != 93]
+                    },
+                    **MLA,
+                }
+            },
+            298,
+        ),
+        # Ring/Ling 2.5: 10 MLA layers among 80.
+        (
+            {
+                "model_type": "bailing_hybrid",
+                "num_hidden_layers": 80,
+                "layer_group_size": 8,
+                **MLA,
+            },
+            144,
+        ),
+    ],
+)
+def test_hybrid_kv_reservation_without_layer_types(config, expected):
+    assert _kv_bytes_per_token_per_layer(config) == expected
 
 
 def test_non_hybrid_kv_reservation_is_unchanged():

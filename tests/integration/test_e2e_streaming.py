@@ -5507,10 +5507,7 @@ def test_responses_namespace_tool_continuation(
     client.close()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("with_tools", [False, True])
-@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
-async def test_stream_thinking_length_channels(api, with_tools):
+async def _stream_thinking_channels(api, engine, tools=None):
     from omlx.api.anthropic_models import MessagesRequest as AnthropicMessagesRequest
     from omlx.api.openai_models import ChatCompletionRequest
     from omlx.api.responses_models import ResponsesRequest
@@ -5520,28 +5517,8 @@ async def test_stream_thinking_length_channels(api, with_tools):
         stream_responses_api,
     )
 
-    text = "<think>unfinished</thi"
-    engine = MockBaseEngine()
-    engine.set_stream_outputs(
-        [
-            MockGenerationOutput(
-                text=text,
-                new_text=text,
-                finish_reason="length",
-                completion_tokens=64,
-                finished=True,
-            )
-        ]
-    )
     messages = [{"role": "user", "content": "Reply OK"}]
-    kwargs = {}
-    if with_tools:
-        kwargs["tools"] = [
-            {
-                "type": "function",
-                "function": {"name": "lookup", "parameters": {"type": "object"}},
-            }
-        ]
+    kwargs = {"tools": tools} if tools else {}
     if api == "chat":
         request = ChatCompletionRequest(model="test-model", messages=messages)
         stream = stream_chat_completion(engine, messages, request, **kwargs)
@@ -5561,10 +5538,18 @@ async def test_stream_thinking_length_channels(api, with_tools):
         deltas = [c["delta"] for e in events for c in e.get("choices", [])]
         content = "".join(d.get("content") or "" for d in deltas)
         reasoning = "".join(d.get("reasoning_content") or "" for d in deltas)
+        calls = [
+            t["function"]["name"] for d in deltas for t in d.get("tool_calls") or []
+        ]
     elif api == "anthropic":
         deltas = [e.get("delta", {}) for e in events]
         content = "".join(d.get("text") or "" for d in deltas)
         reasoning = "".join(d.get("thinking") or "" for d in deltas)
+        calls = [
+            e["content_block"]["name"]
+            for e in events
+            if e.get("content_block", {}).get("type") == "tool_use"
+        ]
     else:
         content = "".join(
             e["delta"] for e in events if e["type"] == "response.output_text.delta"
@@ -5574,6 +5559,44 @@ async def test_stream_thinking_length_channels(api, with_tools):
             for e in events
             if e["type"] == "response.reasoning_summary_text.delta"
         )
+        calls = [
+            e["item"]["name"]
+            for e in events
+            if e["type"] == "response.output_item.done"
+            and e["item"]["type"] == "function_call"
+        ]
+    return events, content, reasoning, calls
+
+
+_LOOKUP_TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": "lookup", "parameters": {"type": "object"}},
+    }
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_stream_thinking_length_channels(api, with_tools):
+    text = "<think>unfinished</thi"
+    engine = MockBaseEngine()
+    engine.set_stream_outputs(
+        [
+            MockGenerationOutput(
+                text=text,
+                new_text=text,
+                finish_reason="length",
+                completion_tokens=64,
+                finished=True,
+            )
+        ]
+    )
+    events, content, reasoning, _ = await _stream_thinking_channels(
+        api, engine, _LOOKUP_TOOLS if with_tools else None
+    )
+    if api == "responses":
         final = next(
             e["response"] for e in events if e["type"] == "response.incomplete"
         )
@@ -5586,6 +5609,31 @@ async def test_stream_thinking_length_channels(api, with_tools):
         )
     assert content == ""
     assert reasoning == "unfinished</thi"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api", ["chat", "anthropic", "responses"])
+async def test_stream_unclosed_thinking_tool_turn_keeps_reasoning(api):
+    text = "<think>Need the lookup tool."
+    engine = MockBaseEngine()
+    engine.set_stream_outputs(
+        [
+            MockGenerationOutput(
+                text=text,
+                new_text=text,
+                finish_reason="tool_calls",
+                completion_tokens=8,
+                finished=True,
+                tool_calls=[{"name": "lookup", "arguments": "{}"}],
+            )
+        ]
+    )
+    _, content, reasoning, calls = await _stream_thinking_channels(
+        api, engine, _LOOKUP_TOOLS
+    )
+    assert calls == ["lookup"]
+    assert content == ""
+    assert reasoning == "Need the lookup tool."
 
 
 async def test_responses_stream_reports_resolved_sampling():

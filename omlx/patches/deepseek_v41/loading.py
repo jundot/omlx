@@ -42,6 +42,27 @@ def _load_shard(path):
     return values
 
 
+# A tensor-parallel rank splits these projections: rows hold whole heads,
+# output groups or expert neurons, and columns their partial sums. Everything
+# else, Engram included, is replicated.
+_TENSOR_ROWS = ("attn.wq_b", "attn.wo_a", "experts.w1", "experts.w3")
+_TENSOR_COLUMNS = ("attn.wo_b", "experts.w2")
+
+
+def tensor_slice(key, value, rank, size):
+    """This rank's part of checkpoint tensor ``key``."""
+    module = key.rpartition(".")[0]
+    if key.endswith("attn.attn_sink"):
+        axis = 0
+    elif module.endswith(_TENSOR_ROWS):
+        axis = -2
+    elif module.endswith(_TENSOR_COLUMNS):
+        axis = -1
+    else:
+        return value
+    return mx.contiguous(mx.split(value, size, axis=axis)[rank])
+
+
 def set_module(model, path, module):
     parent = model
     parts = path.split(".")
@@ -62,7 +83,16 @@ def load(
     preserve_mtp=None,
     moe_expert_offload_resident_fraction=None,
     ced_prefill=False,
+    stage=None,
+    tensor=None,
 ):
+    """Load a converted or source checkpoint.
+
+    ``stage`` makes a cluster rank: it is called with the language model to
+    keep one pipeline stage, and only that stage's text weights are read.
+    ``tensor`` (a distributed group) makes a tensor-parallel rank that reads
+    only its slice of the split projections.
+    """
     path = Path(path)
     if (path / "conversion.inprogress.json").exists():
         raise ValueError("DeepSeek V4.1 checkpoint conversion is still in progress")
@@ -79,6 +109,16 @@ def load(
             raise ValueError("Expected a DeepSeek V4.1 checkpoint")
         format_spec = {"engram_tables": source_engram_tables(mapping, raw)}
     config = ModelConfig.from_dict(raw)
+    if stage is not None or tensor is not None:
+        if source_checkpoint:
+            raise ValueError(
+                "DeepSeek V4.1 cluster ranks load converted checkpoints only"
+            )
+        # Cluster ranks serve the text model without draft heads.
+        config.preserve_mtp = False
+        config.vision_n_layers = 0
+    if tensor is not None:
+        config = config.tensor_shard(tensor.size())
     if source_checkpoint and preserve_mtp is None:
         from ..mlx_lm_mtp import is_mtp_active
 
@@ -104,6 +144,24 @@ def load(
                 "unsupported; falling back to full decoder prefill"
             )
     model = Model(config)
+    held = None
+    if stage is not None:
+        stage(model.language_model)
+    if stage is not None or tensor is not None:
+        held = {name for name, _ in tree_flatten(model.parameters())}
+    if tensor is not None:
+        for block in model.language_model.layers:
+            block._tensor_group = tensor
+
+    def in_scope(key):
+        module, _, name = key.rpartition(".")
+        # A packed projection stores scales and biases beside its weight.
+        return (
+            held is None
+            or key in held
+            or (name in ("scales", "biases") and f"{module}.weight" in held)
+        )
+
     if config.engram_layer_ids:
         logger.info(
             "DeepSeek V4.1 Engram mode: %s",
@@ -118,6 +176,9 @@ def load(
             memory_scope.enter_context(wired_limit(model))
         engram_keys = set()
         for module, spec in format_spec.get("engram_tables", {}).items():
+            # Converted tables may live in their own file under another key.
+            if not in_scope(f"{module}.weight"):
+                continue
             for key_field, file_field in (
                 ("weight_key", "weight_file"),
                 ("scale_key", "scale_file"),
@@ -195,12 +256,17 @@ def load(
             else:
                 for filename in dict.fromkeys(mapping.values()):
                     keys = {key for key, file in mapping.items() if file == filename}
-                    normal_keys = keys - engram_keys - offload_keys
+                    normal_keys = {
+                        key
+                        for key in keys - engram_keys - offload_keys
+                        if in_scope(key)
+                    }
                     if not normal_keys:
                         continue
-                    if keys.intersection(engram_keys | offload_keys):
+                    if keys - normal_keys:
                         # Shared shards must not pull SSD-offloaded tables onto
-                        # the GPU when loading their ordinary projections.
+                        # the GPU when loading their ordinary projections, nor
+                        # another stage's layers onto this rank.
                         reader = TensorFile(path / filename)
                         try:
                             values = {
@@ -211,6 +277,11 @@ def load(
                             reader.close()
                     else:
                         values = _load_shard(path / filename)
+                    if tensor is not None:
+                        values = {
+                            key: tensor_slice(key, value, tensor.rank(), tensor.size())
+                            for key, value in values.items()
+                        }
                     for key in values:
                         if mapping.get(key) != filename:
                             raise ValueError(f"Unexpected or misplaced weight: {key}")
@@ -275,6 +346,9 @@ def load(
                         raise ValueError(f"Unexpected target tensor shape: {key}")
                 model.load_weights(list(values.items()), strict=False)
                 mx.eval(values)
+                if tensor is not None:
+                    # Release the whole tensors this rank sliced its part from.
+                    mx.clear_cache()
                 seen.update(values)
                 loaded_bytes += sum(value.nbytes for value in values.values())
                 if number % 25 == 0:
@@ -286,18 +360,20 @@ def load(
                         mx.get_cache_memory() / 1024**3,
                     )
         expected = {name for name, _ in tree_flatten(model.parameters())}
+        scope_keys = {key for key in mapping if in_scope(key)}
         if (
             seen != expected
             or replaced != set(all_quantized)
             or (
                 not source_checkpoint
                 and (
-                    seen != set(mapping) - engram_keys - offload_keys
+                    seen != scope_keys - engram_keys - offload_keys
                     or replaced
                     != {
                         name
                         for name in format_spec.get("quantized_modules", {})
                         if name + ".weight" not in offload_keys
+                        and in_scope(name + ".weight")
                     }
                 )
             )
@@ -317,7 +393,7 @@ def load(
             model.language_model.set_tokenizer(tokenizer)
         # Load the backbone before reserving RAM for large Engram tables.
         if not engram_ssd_offload:
-            for layer in model.language_model.layers:
+            for layer in model.language_model.pipeline_layers:
                 if "engram" in layer and isinstance(
                     layer.engram.embed, DiskEngramEmbedding
                 ):

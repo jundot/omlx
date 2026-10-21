@@ -116,6 +116,7 @@ from .runtime import read_runtime_markers
 from .staging import (
     DEFAULT_REMOTE_PYTHON,
     InsufficientDiskError,
+    fabric_transfer_address,
     home_relative_model_path,
     index_shards,
     model_staging_inventory,
@@ -1186,7 +1187,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         str(fabric["backend"]) if fabric is not None else choose_backend(transports)[0]
     )
     strategy_transports = transports
-    if provisional_backend == "ring" and transports:
+    # A resolved ring fabric is slow even when the transport probe failed.
+    if provisional_backend == "ring" and (transports or fabric is not None):
         strategy_transports = (SimpleNamespace(kind="ethernet"),)
 
     measurements = {}
@@ -1671,6 +1673,9 @@ def _run_staging_job(
         # disk-space check). Resolve each peer's copy in its OWN home from the
         # portable ~-form.
         portable_model_path = home_relative_model_path(deployment.model)
+        source_entry = next(
+            (item for item in deployment.hosts if item.ssh == source_host), None
+        )
         failed_nodes: list[str] = []
         for host, assignment in zip(deployment.hosts, assignments):
             # Cluster v2: files land at the node's path_map entry when one
@@ -1750,6 +1755,16 @@ def _run_staging_job(
                 name: (shard_sizes | sidecar_sizes)[name]
                 for name in needed
             }
+            # When this Mac is one end, the data takes the address the
+            # collectives verified (Thunderbolt first) if SSH answers there.
+            source_address = destination_address = None
+            if needed and _local_ssh_target(source_host) != _local_ssh_target(host.ssh):
+                if not _local_ssh_target(host.ssh):
+                    destination_address = fabric_transfer_address(host.ssh, host.ips)
+                elif source_entry is not None:
+                    source_address = fabric_transfer_address(
+                        source_host, source_entry.ips
+                    )
             result = stage_files_from_source(
                 plan,
                 model_path=model_path,
@@ -1759,7 +1774,18 @@ def _run_staging_job(
                 destination_dir=destination_dir,
                 parallel=parallel,
                 progress=progress,
+                source_address=source_address,
+                destination_address=destination_address,
             )
+            if result.bytes_copied:
+                logger.info(
+                    "Staged %.1f GiB to %s over %s in %.0f s (%.2f GB/s)",
+                    result.bytes_copied / 1024**3,
+                    assignment.node_id,
+                    destination_address or source_address or "the paired address",
+                    result.seconds,
+                    result.gigabytes_per_second,
+                )
 
             def finish(
                 job: dict[str, Any],

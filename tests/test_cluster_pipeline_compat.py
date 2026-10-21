@@ -2,11 +2,14 @@
 
 import json
 
+import pytest
+
 from omlx.cluster.pipeline_compat import (
     install_pipeline_compatibility,
     pipeline_assignment_is_honored,
 )
 from omlx.cluster.planner import PipelineAssignment
+from tests.test_deepseek_v41 import run_two_ranks
 
 
 def _assignment():
@@ -69,3 +72,181 @@ def test_minimax_declares_its_wrapped_assigned_stage_contract(tmp_path):
     maybe_apply_pre_load_patches(str(model))
 
     assert pipeline_assignment_is_honored(model)
+
+
+@pytest.mark.parametrize("model_type", ["glm5_next", "deepseek_v41"])
+def test_cluster_adapters_inherit_the_pipeline_contract(tmp_path, model_type):
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    model = _model_config(tmp_path, model_type)
+    maybe_apply_pre_load_patches(str(model))
+
+    assert not pipeline_assignment_is_honored(model)
+    with install_pipeline_compatibility(_assignment()):
+        assert pipeline_assignment_is_honored(model)
+
+
+_GLM5_NEXT_TEXT = dict(
+    model_type="glm5_next_text",
+    hidden_size=256,
+    intermediate_size=256,
+    moe_intermediate_size=128,
+    num_hidden_layers=5,
+    num_attention_heads=4,
+    num_key_value_heads=4,
+    vocab_size=1024,
+    layer_types=["linear_attention"] * 3
+    + ["deepseek_sparse_attention", "linear_attention"],
+    mlp_layer_types=["dense"] * 3 + ["sparse", "sparse"],
+    indexer_types=["full"] * 5,
+    first_k_dense_replace=3,
+    n_routed_experts=8,
+    n_shared_experts=1,
+    num_experts_per_tok=4,
+    kv_lora_rank=64,
+    q_lora_rank=128,
+    qk_head_dim=256,
+    qk_nope_head_dim=64,
+    qk_rope_head_dim=0,
+    v_head_dim=64,
+    index_head_dim=64,
+    index_n_heads=4,
+    index_topk=64,
+    index_kpool=4,
+    linear_num_heads=4,
+    linear_head_dim=64,
+    linear_conv_kernel_dim=4,
+    hc_mult=4,
+    num_nextn_predict_layers=0,
+    routed_scaling_factor=2.5,
+    max_position_embeddings=4096,
+    rms_norm_eps=1e-5,
+    linear_attn_config=dict(
+        gate_lower_bound=-5.0, head_dim=64, num_heads=4, short_conv_kernel_size=4
+    ),
+)
+
+
+def test_glm5_next_sanitize_maps_hf_and_mlx_names_to_the_text_model():
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.glm5_next_mlx_lm import apply_glm5_next_mlx_lm_patch
+
+    assert apply_glm5_next_mlx_lm_patch()
+    from mlx_lm.models import glm5_next
+
+    model = glm5_next.Model(
+        glm5_next.ModelArgs.from_dict(
+            {"model_type": "glm5_next", "text_config": _GLM5_NEXT_TEXT}
+        )
+    )
+    norm, head, vision = mx.ones((256,)), mx.ones((1024, 256)), mx.ones((4,))
+    hf = model.sanitize(
+        {
+            "model.language_model.norm.weight": norm,
+            "lm_head.weight": head,
+            "model.visual.patch_embed.proj.weight": vision,
+        }
+    )
+    converted = model.sanitize(
+        {
+            "language_model.model.norm.weight": norm,
+            "language_model.lm_head.weight": head,
+            "vision_model.patch_embed.proj.weight": vision,
+        }
+    )
+
+    # The rank loads with strict=False, so a wrong name would stay random.
+    expected = {"language_model.model.norm.weight", "language_model.lm_head.weight"}
+    assert set(hf) == set(converted) == expected
+    assert expected <= {name for name, _ in tree_flatten(model.parameters())}
+
+
+# One rank of the GLM-5.3 test below: a tiny random model against the vendored
+# single-node forward, as two pipeline stages and as two tensor-parallel ranks.
+_GLM5_NEXT_RANK = """
+import json
+import sys
+import mlx.core as mx
+import mlx.nn as nn
+group = mx.distributed.init(backend="ring", strict=True)
+from omlx.cluster.planner import PipelineAssignment, install_unequal_pipeline_plan
+from omlx.cluster.tensor_strategies import apply_tensor_strategy
+from omlx.patches.glm5_next_mlx_lm import apply_glm5_next_mlx_lm_patch
+assert apply_glm5_next_mlx_lm_patch()
+from mlx_lm.models import glm5_next
+from mlx_vlm.models.glm5_next import language
+
+text = json.loads(sys.argv[1])
+args = glm5_next.ModelArgs.from_dict({"model_type": "glm5_next", "text_config": text})
+mx.random.seed(7)
+prompt = mx.random.randint(0, 1024, (1, 265))
+# LayerPipeline prefill, a short block, then two deferred one-token decodes.
+steps = [prompt[:, :260], prompt[:, 260:263], prompt[:, 263:264], prompt[:, 264:]]
+
+def build(embed_dtype=mx.float32, bits=None):
+    mx.random.seed(11)
+    model = glm5_next.Model(args)
+    embed = model.language_model.model.embed_tokens
+    embed.weight = embed.weight.astype(embed_dtype)
+    if bits:
+        nn.quantize(
+            model,
+            64,
+            bits,
+            class_predicate=lambda path, module: hasattr(module, "to_quantized")
+            and module.weight.shape[-1] % 64 == 0,
+        )
+    mx.eval(model.parameters())
+    return model
+
+def run(forward, make_cache):
+    # One evaluation per step, as in serving, keeps collectives in order.
+    cache = make_cache()
+    outs = []
+    for chunk in steps:
+        outs.append(forward(chunk, cache))
+        mx.eval(outs[-1])
+    return outs
+
+def vendored(model):
+    lm = model.language_model
+    lm.model.__class__ = language.Glm5NextModel
+    outs = run(lambda x, c: lm(x, cache=c).logits, lm.make_cache)
+    lm.model.__class__ = glm5_next.PipelinedTextModel
+    return outs
+
+# Rank 1 [0, 3) -> rank 0 [3, 5). The layers return fp32 while recv_like
+# takes the embedding dtype, so a bf16 embedding is checked too.
+plan = (
+    PipelineAssignment("a", 0, 3, 5, 1, 0, 0, 1),
+    PipelineAssignment("b", 1, 0, 3, 1, 0, 0, 1),
+)
+for embed_dtype in (mx.float32, mx.bfloat16):
+    model = build(embed_dtype)
+    reference = vendored(model)
+    with install_unequal_pipeline_plan(plan):
+        model.model.pipeline(group)
+    got = run(lambda x, c: model(x, cache=c), model.make_cache)
+    if embed_dtype == mx.float32:
+        assert all(mx.array_equal(r, g).item() for r, g in zip(reference, got))
+    assert all(mx.isfinite(g).all().item() for g in got)
+    assert all(
+        mx.array_equal(mx.argmax(r[:, -1], -1), mx.argmax(g[:, -1], -1)).item()
+        for r, g in zip(reference, got)
+    )
+
+for bits in (None, 4):
+    reference = vendored(build(bits=bits))
+    model = build(bits=bits)
+    apply_tensor_strategy(model, group, mx_module=mx)
+    got = run(lambda x, c: model(x, cache=c), model.make_cache)
+    for r, g in zip(reference, got):
+        assert mx.allclose(r, g, atol=1e-4, rtol=1e-4).item(), mx.abs(r - g).max()
+print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
+"""
+
+
+def test_glm5_next_cluster_forwards_match_single_process(tmp_path):
+    run_two_ranks(tmp_path, _GLM5_NEXT_RANK, json.dumps(_GLM5_NEXT_TEXT))

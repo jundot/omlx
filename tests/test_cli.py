@@ -931,6 +931,38 @@ class TestLaunchCommandFunction:
         assert ctx.sonnet_model == "cli-sonnet"
         assert ctx.haiku_model == "cli-haiku"
 
+    def test_launch_command_requires_claude_desktop_toggle(self, capsys):
+        from omlx.cli import launch_command
+
+        integration = MagicMock()
+        integration.is_installed.return_value = True
+        settings = MagicMock()
+        settings.server.host = "127.0.0.1"
+        settings.server.port = 8000
+        settings.claude_code.desktop_enabled = False
+        args = argparse.Namespace(
+            tool="claude_desktop",
+            host=None,
+            port=None,
+            api_key=None,
+            model=None,
+            tools_profile="coding",
+        )
+        requests_get = MagicMock()
+
+        with (
+            patch("requests.get", requests_get),
+            patch("omlx.integrations.get_integration", return_value=integration),
+            patch("omlx.settings.GlobalSettings.load", return_value=settings),
+            pytest.raises(SystemExit) as exc,
+        ):
+            launch_command(args)
+
+        assert exc.value.code == 1
+        requests_get.assert_not_called()
+        integration.launch.assert_not_called()
+        assert "not enabled" in capsys.readouterr().out
+
 
 class TestLaunchArgvParsing:
     """Tests for top-level argv parsing of `omlx launch ...`."""
@@ -1232,8 +1264,13 @@ class TestServeCommandFunctions:
         assert _is_local_address("127.0.0.1")
         assert not _is_local_address("192.0.2.1")
 
-    def test_serve_hands_prebound_socket_to_uvicorn(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("headless", [False, True])
+    def test_serve_hands_prebound_socket_to_uvicorn(
+        self, tmp_path, monkeypatch, headless
+    ):
         """Successful serve startup should pass the pre-bound socket into uvicorn."""
+        import os
+
         import omlx
         import uvicorn
 
@@ -1241,8 +1278,9 @@ class TestServeCommandFunctions:
 
         host, port = "127.0.0.1", 0
         settings = self._make_settings(tmp_path, host=host, port=port)
-        args = self._make_serve_args(tmp_path, host=host, port=port)
+        args = self._make_serve_args(tmp_path, host=host, port=port, headless=headless)
         events = []
+        monkeypatch.delenv("OMLX_HEADLESS", raising=False)
 
         fake_server = ModuleType("omlx.server")
 
@@ -1251,6 +1289,8 @@ class TestServeCommandFunctions:
 
         def fake_init_server(**kwargs):
             events.append("init")
+            # omlx.server reads this when it is first imported.
+            events.append(os.environ.get("OMLX_HEADLESS"))
 
         fake_server.app = app
         fake_server.init_server = MagicMock(side_effect=fake_init_server)
@@ -1291,7 +1331,7 @@ class TestServeCommandFunctions:
         serve_command(args)
 
         fake_server.init_server.assert_called_once()
-        assert events == ["bind", "init", "run"]
+        assert events == ["bind", "init", "1" if headless else None, "run"]
         assert captured["socket_count"] == 1
         assert captured["socket_name"][0] == host
         assert captured["socket_name"][1] > 0

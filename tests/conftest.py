@@ -1,5 +1,6 @@
 import fnmatch
 import os
+import struct
 import subprocess
 import sys
 import zlib
@@ -35,7 +36,6 @@ _install_torch_stub()
 from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
 apply_m5_gather_qmm_workaround()
 
-from omlx.custom_kernels.nax import is_nax_available
 from omlx.request import Request, SamplingParams
 
 # Model and kernel numerics tests keep the GPU busy. Under --dist loadgroup
@@ -51,6 +51,7 @@ _GPU_SERIAL_TEST_FILES = (
     "test_qwen35_*",
     "test_qwen4_*",
     "test_row_exact_qmv.py",
+    "test_scheduler_chunked_prefill.py",
     "test_sdpa*",
 )
 
@@ -71,9 +72,7 @@ def pytest_collection_modifyitems(config, items):
 @pytest.fixture
 def glm5_fused_decode():
     """GLM-5.3's fused decode/verify kernels, which run (and replay the
-    reference bit for bit) only on NAX GPUs."""
-    if not is_nax_available():
-        pytest.skip("the fused GLM-5.3 decode kernels run on M5 (NAX) GPUs")
+    reference bit for bit) on M3 and newer GPUs."""
     from omlx.patches.mlx_vlm_glm5_next_compat import (
         apply_mlx_vlm_glm5_next_compat_patch,
     )
@@ -81,8 +80,45 @@ def glm5_fused_decode():
     apply_mlx_vlm_glm5_next_compat_patch()
     from mlx_vlm.models.glm5_next import language
 
-    assert language._DECODE_FUSION
+    if not language._DECODE_FUSION:
+        pytest.skip("the fused GLM-5.3 decode kernels run on M3 and newer GPUs")
     return language
+
+
+@pytest.fixture
+def apply_drafter_target(monkeypatch):
+    """``drafter_target.apply`` that restores the patched classes afterwards.
+
+    The patch rewrites shared mlx-lm/mlx-vlm model and layer classes, which
+    other tests in the session build too.
+    """
+    from omlx.patches.mlx_lm_mtp import drafter_target
+
+    model_names = (
+        "__call__",
+        "mtp_partial_rollback",
+        "rollback_speculative_cache",
+        "_omlx_drafter_single_row",
+        "_omlx_drafter_target",
+    )
+    layer_names = ("__call__", "_omlx_drafter_capture_wrapped")
+
+    def apply(model):
+        targets = [(type(model), model_names)]
+        targets += [
+            (cls, layer_names) for cls in {type(layer) for layer in model.model.layers}
+        ]
+        for cls, names in targets:
+            for name in names:
+                if name in cls.__dict__:
+                    monkeypatch.setattr(cls, name, cls.__dict__[name])
+                else:
+                    # Records the name as absent so teardown deletes it.
+                    monkeypatch.setattr(cls, name, None, raising=False)
+                    delattr(cls, name)
+        return drafter_target.apply(model)
+
+    return apply
 
 
 @pytest.fixture(autouse=True)
@@ -233,6 +269,38 @@ def mock_model_config() -> MockModelConfig:
     return MockModelConfig()
 
 
+def _gguf_value(value) -> bytes:
+    if isinstance(value, int):
+        return struct.pack("<II", 4, value)
+    if isinstance(value, float):
+        return struct.pack("<If", 6, value)
+    if isinstance(value, str):
+        data = value.encode()
+        return struct.pack("<IQ", 8, len(data)) + data
+    if all(isinstance(item, str) for item in value):
+        items = b"".join(
+            struct.pack("<Q", len(item.encode())) + item.encode() for item in value
+        )
+        return struct.pack("<IIQ", 9, 8, len(value)) + items
+    items = b"".join(struct.pack("<i", item) for item in value)
+    return struct.pack("<IIQ", 9, 5, len(value)) + items
+
+
+@pytest.fixture
+def write_gguf():
+    """Write a GGUF file of a header with ``metadata`` and ``size`` bytes in all."""
+
+    def write(path: Path, metadata: dict, size: int = 0) -> Path:
+        header = b"GGUF" + struct.pack("<IQQ", 3, 0, len(metadata))
+        for key, value in metadata.items():
+            header += struct.pack("<Q", len(key)) + key.encode() + _gguf_value(value)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(header + b"\0" * max(0, size - len(header)))
+        return path
+
+    return write
+
+
 @pytest.fixture
 def tmp_cache_dir(tmp_path: Path) -> Path:
     """Provide a temporary cache directory for tests."""
@@ -302,6 +370,18 @@ def _reset_decode_activity_registry():
     get_decode_activity().clear()
     yield
     get_decode_activity().clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_api_key_failures():
+    """Keep the process-global wrong API key budget hermetic per test."""
+    auth = sys.modules.get("omlx.admin.auth")
+    if auth is not None:
+        auth._key_failures.clear()
+    yield
+    auth = sys.modules.get("omlx.admin.auth")
+    if auth is not None:
+        auth._key_failures.clear()
 
 
 @pytest.fixture(autouse=True)

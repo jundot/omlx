@@ -16,7 +16,7 @@ Patch 2 – mx.quantized_matmul
   mlx_vlm (Qwen3.5 and similar) calls mx.quantized_matmul DIRECTLY, bypassing
   QuantizedLinear.__call__ and our bonsai_qmv inference patch.  This wrapper
   intercepts all calls: for uint8 t5 weights it routes all M through the fast
-  bonsai_t5_qmv (M=1) / bonsai_t5_qmv_wide (M≥2) Metal kernels.  The wide
+  t5_qmv (M=1) / t5_qmv_wide (M≥2) Metal kernels.  The wide
   kernel tiles M into groups of ≤5 in one dispatch — no float weight
   materialisation at any batch size.  Non-t5 calls (uint32) pass through
   unchanged.  A dequant+matmul fallback fires only when the native extension
@@ -38,17 +38,17 @@ import mlx.nn as nn
 import mlx_lm.utils as mlx_lm_utils
 from mlx.utils import tree_flatten, tree_unflatten
 
-from omlx.custom_kernels.bonsai.fast import (
+from omlx.custom_kernels.lowbit.fast import (
     _dequant_1bit,
-    bonsai_q1_affine_qmv,
-    bonsai_qmv_wide,
-    bonsai_t5_qmv,
-    bonsai_t5_qmv_wide,
-    bonsai_t5_qmm,
+    q1_affine_qmv,
+    qmv_wide,
+    t5_qmv,
+    t5_qmv_wide,
+    t5_qmm,
     has_native,
 )
 
-# M threshold below which qmv kernels are used; above this bonsai_t5_qmm is used.
+# M threshold below which qmv kernels are used; above this t5_qmm is used.
 # Must match _T5_PREFILL_THRESHOLD in bonsai_qmv.py.
 _T5_PREFILL_THRESHOLD = 16
 
@@ -191,11 +191,11 @@ def _t5_quantized_matmul(
     if bits == 1 and mode == "affine" and w.dtype == mx.uint32 and transpose:
         M = x.shape[-2] if x.ndim >= 2 else 1
         if has_native() and M == 1:
-            return bonsai_q1_affine_qmv(
+            return q1_affine_qmv(
                 x, w, scales.astype(x.dtype), biases.astype(x.dtype)
             )
         if has_native() and 2 <= M <= 5:
-            return bonsai_qmv_wide(x, w, scales, biases, bits=1)
+            return qmv_wide(x, w, scales, biases, bits=1)
         # Prefill / no native ext: dequantize to x.dtype and matmul.
         w_fp = _dequant_1bit(
             w, scales, biases, x.dtype, 64 if group_size is None else group_size
@@ -226,12 +226,12 @@ def _t5_quantized_matmul(
     if has_native() and M <= _T5_PREFILL_THRESHOLD:
         # scales dtype coercion is handled by the C++ ensure_dtype layer.
         if M >= 2:
-            return bonsai_t5_qmv_wide(x, w, scales)
-        return bonsai_t5_qmv(x, w, scales)
+            return t5_qmv_wide(x, w, scales)
+        return t5_qmv(x, w, scales)
 
     if has_native():
         x_flat = x.reshape(-1, x.shape[-1]) if x.ndim > 2 else x
-        out_flat = bonsai_t5_qmm(x_flat, w, scales)
+        out_flat = t5_qmm(x_flat, w, scales)
         out = out_flat.reshape(x.shape[:-1] + (w.shape[0],))
         if not transpose:
             return out.mT

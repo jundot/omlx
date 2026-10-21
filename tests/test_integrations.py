@@ -1,6 +1,7 @@
 """Tests for the integrations module."""
 
 import json
+import os
 import plistlib
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,9 +9,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from omlx.integrations import get_integration, list_integrations
+from omlx.integrations import (
+    claude_desktop,
+    claude_desktop_app,
+    get_integration,
+    list_integrations,
+)
 from omlx.integrations.base import IntegrationContext
 from omlx.integrations.claude import ClaudeCodeIntegration
+from omlx.integrations.claude_desktop import (
+    PROFILE_ID,
+    configure_omlx_gateway,
+    is_configured,
+    restore,
+)
+from omlx.integrations.claude_desktop_app import ClaudeDesktopAppIntegration
 from omlx.integrations.codex import (
     CodexIntegration,
     codex_config_args,
@@ -29,6 +42,7 @@ from omlx.integrations.hermes import HermesIntegration
 from omlx.integrations.openclaw import OpenClawIntegration
 from omlx.integrations.opencode import OpenCodeIntegration
 from omlx.integrations.pi import PiIntegration, _get_agent_dir
+from omlx.integrations.vibe import VibeIntegration
 
 
 def ctx(**overrides) -> IntegrationContext:
@@ -45,10 +59,11 @@ def ctx(**overrides) -> IntegrationContext:
 class TestIntegrationRegistry:
     def test_list_integrations(self):
         integrations = list_integrations()
-        assert len(integrations) == 9
+        assert len(integrations) == 11
         names = {i.name for i in integrations}
         assert names == {
             "claude",
+            "claude_desktop",
             "codex",
             "codex_app",
             "copilot",
@@ -56,11 +71,13 @@ class TestIntegrationRegistry:
             "openclaw",
             "hermes",
             "pi",
+            "vibe",
             "dsh",
         }
 
     def test_get_integration(self):
         assert get_integration("claude") is not None
+        assert get_integration("claude_desktop") is not None
         assert get_integration("codex") is not None
         assert get_integration("codex_app") is not None
         assert get_integration("copilot") is not None
@@ -68,6 +85,7 @@ class TestIntegrationRegistry:
         assert get_integration("openclaw") is not None
         assert get_integration("hermes") is not None
         assert get_integration("pi") is not None
+        assert get_integration("vibe") is not None
         assert get_integration("dsh") is not None
         assert get_integration("nonexistent") is None
 
@@ -1327,6 +1345,68 @@ class TestPiIntegration:
         assert pi.display_name == "Pi"
 
 
+class TestVibeIntegration:
+    @staticmethod
+    def _launch(context: IntegrationContext) -> tuple[list[str], dict[str, str]]:
+        with patch("omlx.integrations.vibe.os.execvpe") as execute:
+            VibeIntegration().launch(context)
+        _, argv, env = execute.call_args.args
+        return argv, env
+
+    def test_get_command_quotes_model(self):
+        cmd = VibeIntegration().get_command(ctx(model="local model"))
+        assert cmd.endswith("launch vibe --model 'local model'")
+
+    def test_launch_scopes_config_to_process(self, tmp_path, monkeypatch):
+        config = tmp_path / "config.toml"
+        original = 'active_model = "cloud"\n'
+        config.write_text(original)
+        monkeypatch.setenv("VIBE_HOME", str(tmp_path))
+        monkeypatch.setenv("VIBE_ACTIVE_MODEL", "cloud")
+        monkeypatch.setenv("PYTHONHOME", "/bundle/python")
+
+        argv, env = self._launch(
+            ctx(
+                api_key="local-secret",
+                model="qwen3.5",
+                context_window=32768,
+                model_type="vlm",
+                extra_args=("--resume", "session-id"),
+            )
+        )
+
+        assert argv == ["vibe", "--resume", "session-id"]
+        assert env["OMLX_API_KEY"] == "local-secret"
+        assert "PYTHONHOME" not in env
+        provider = json.loads(env["VIBE_PROVIDERS"])[0]
+        assert provider["api_base"] == "http://127.0.0.1:8000/v1"
+        assert provider["api_key_env_var"] == "OMLX_API_KEY"
+        model = json.loads(env["VIBE_MODELS"])[0]
+        assert model["alias"] == env["VIBE_ACTIVE_MODEL"]
+        assert model["name"] == "qwen3.5"
+        assert model["provider"] == provider["name"]
+        assert model["max_context_length"] == 32768
+        assert model["supports_images"] is True
+        assert config.read_text() == original
+        assert os.environ["VIBE_ACTIVE_MODEL"] == "cloud"
+
+    def test_launch_without_key_or_context_window(self):
+        _, env = self._launch(ctx(model="qwen3.5"))
+        assert env["OMLX_API_KEY"] == "omlx"
+        model = json.loads(env["VIBE_MODELS"])[0]
+        assert "max_context_length" not in model
+        assert model["supports_images"] is False
+
+    def test_alias_is_stable_per_server_and_model(self):
+        aliases = [
+            self._launch(ctx(port=port, model=model))[1]["VIBE_ACTIVE_MODEL"]
+            for port, model in ((8000, "a"), (8000, "a"), (8000, "b"), (8001, "a"))
+        ]
+        # Saved Vibe sessions resume by alias.
+        assert aliases[0] == aliases[1]
+        assert len(set(aliases)) == 3
+
+
 class TestClaudeCodeIntegration:
     def test_get_command(self):
         cc = ClaudeCodeIntegration()
@@ -1952,6 +2032,108 @@ class TestClaudeCodeIntegration:
         ]
 
 
+class TestClaudeDesktopIntegration:
+    def test_configure_passes_port_and_key(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            claude_desktop_app,
+            "configure_omlx_gateway",
+            lambda **kwargs: calls.append(kwargs) or True,
+        )
+        ClaudeDesktopAppIntegration().configure(ctx(port=8123, api_key="secret"))
+        assert calls == [{"port": 8123, "api_key": "secret"}]
+
+    @pytest.mark.parametrize("running", [False, True])
+    def test_launch_opens_app_unless_running(self, monkeypatch, capsys, running):
+        monkeypatch.setattr(claude_desktop_app.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            claude_desktop_app, "configure_omlx_gateway", lambda **kwargs: True
+        )
+        monkeypatch.setattr(
+            claude_desktop_app, "is_claude_desktop_running", lambda: running
+        )
+        run = MagicMock()
+        monkeypatch.setattr(claude_desktop_app.subprocess, "run", run)
+
+        ClaudeDesktopAppIntegration().launch(ctx(api_key="k"))
+
+        if running:
+            run.assert_not_called()
+            assert "restart" in capsys.readouterr().out.lower()
+        else:
+            assert run.call_args.args[0] == ["open", "-a", "Claude"]
+
+
+class TestClaudeDesktopConfigWriter:
+    @pytest.fixture(autouse=True)
+    def _macos(self, monkeypatch):
+        monkeypatch.setattr(claude_desktop, "_is_macos", lambda: True)
+
+    @staticmethod
+    def _read(path: Path) -> dict:
+        return json.loads(path.read_text())
+
+    @staticmethod
+    def _write(path: Path, data: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    def test_configure_points_profile_at_omlx(self, tmp_path):
+        paths = claude_desktop._paths(tmp_path)
+        self._write(paths["claude_config"], {"deploymentMode": "1p", "theme": "dark"})
+
+        assert configure_omlx_gateway(8000, None, home=tmp_path) is True
+        configure_omlx_gateway(8001, None, home=tmp_path)
+
+        assert self._read(paths["claude_config"]) == {
+            "deploymentMode": "3p",
+            "theme": "dark",
+        }
+        assert self._read(paths["claude3p_config"])["deploymentMode"] == "3p"
+        backup = paths["claude_config"].with_suffix(".json.bak")
+        assert self._read(backup) == {"deploymentMode": "1p", "theme": "dark"}
+        assert self._read(paths["meta"])["appliedId"] == PROFILE_ID
+        profile = self._read(paths["profile"])
+        assert profile["inferenceProvider"] == "gateway"
+        assert profile["inferenceGatewayBaseUrl"] == "http://127.0.0.1:8001"
+        assert profile["inferenceGatewayApiKey"] == "omlx"
+        assert is_configured(home=tmp_path) is True
+
+    def test_restore_hands_back_previous_gateway(self, tmp_path):
+        paths = claude_desktop._paths(tmp_path)
+        other_meta = {
+            "entries": [{"id": "other", "name": "Other"}],
+            "appliedId": "other",
+        }
+        self._write(paths["claude_config"], {"deploymentMode": "3p"})
+        self._write(paths["meta"], other_meta)
+
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        assert restore(home=tmp_path) is True
+
+        assert self._read(paths["claude_config"])["deploymentMode"] == "3p"
+        assert self._read(paths["meta"]) == other_meta
+        assert is_configured(home=tmp_path) is False
+
+    def test_restore_without_prior_setup_returns_to_first_party(self, tmp_path):
+        paths = claude_desktop._paths(tmp_path)
+
+        configure_omlx_gateway(8000, "k", home=tmp_path)
+        assert restore(home=tmp_path) is True
+
+        assert self._read(paths["claude_config"])["deploymentMode"] == "1p"
+        assert self._read(paths["claude3p_config"])["deploymentMode"] == "1p"
+        assert "appliedId" not in self._read(paths["meta"])
+        assert self._read(paths["profile"]) == {"disableDeploymentModeChooser": False}
+
+    def test_non_macos_is_noop(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(claude_desktop, "_is_macos", lambda: False)
+        assert configure_omlx_gateway(8000, "k", home=tmp_path) is False
+        assert restore(home=tmp_path) is False
+        assert not (tmp_path / "Library").exists()
+
+
 class TestCopilotIntegration:
     def test_get_command(self):
         copilot = CopilotIntegration()
@@ -2062,19 +2244,23 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model is None
         assert settings.pi_model is None
+        assert settings.vibe_model is None
         assert settings.dsh_model is None
         assert settings.openclaw_tools_profile == "coding"
 
     def test_to_dict(self):
         from omlx.settings import IntegrationSettings
 
-        settings = IntegrationSettings(codex_model="qwen3.5", dsh_model="Qwen3.8")
+        settings = IntegrationSettings(
+            codex_model="qwen3.5", vibe_model="local", dsh_model="Qwen3.8"
+        )
         d = settings.to_dict()
         assert d["copilot_model"] is None
         assert d["codex_model"] == "qwen3.5"
         assert d["opencode_model"] is None
         assert d["hermes_model"] is None
         assert d["pi_model"] is None
+        assert d["vibe_model"] == "local"
         assert d["dsh_model"] == "Qwen3.8"
         assert d["openclaw_tools_profile"] == "coding"
 
@@ -2087,6 +2273,7 @@ class TestIntegrationSettings:
                 "codex_model": "llama",
                 "opencode_model": "qwen",
                 "hermes_model": "hermes-qwen",
+                "vibe_model": "local",
                 "dsh_model": "Qwen3.8",
             }
         )
@@ -2096,6 +2283,7 @@ class TestIntegrationSettings:
         assert settings.openclaw_model is None
         assert settings.hermes_model == "hermes-qwen"
         assert settings.pi_model is None
+        assert settings.vibe_model == "local"
         assert settings.dsh_model == "Qwen3.8"
 
     def test_from_dict_empty(self):

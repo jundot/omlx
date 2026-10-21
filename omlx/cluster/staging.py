@@ -14,6 +14,7 @@ copy to each Mac" and "clustering needs the shards you don't already have".
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -23,9 +24,11 @@ import struct
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
+from ..model_discovery import _VISION_WEIGHT_PREFIXES
 from .ssh_policy import cluster_ssh_options
 from .worker_shim import CLUSTER_PYTHON_SHIM
 
@@ -102,6 +105,26 @@ def _safetensors_tensor_names(path: Path) -> list[str]:
     return [name for name in header if name != "__metadata__"]
 
 
+def _shard_coverage(names: Sequence[str]) -> tuple[frozenset[int], bool]:
+    """Decoder layers a file holds, and whether it holds shared text tensors.
+
+    Vision tensors are ignored: ranks load the text model only, and
+    ``vision_tower.blocks.N`` is not decoder layer N.
+    """
+
+    layers: set[int] = set()
+    shared = False
+    for name in names:
+        if name.startswith(_VISION_WEIGHT_PREFIXES):
+            continue
+        match = _LAYER.search(name)
+        if match:
+            layers.add(int(match.group(1)))
+        else:
+            shared = True
+    return frozenset(layers), shared
+
+
 def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
     """Describe every weight file in a model directory.
 
@@ -130,19 +153,12 @@ def index_shards(model_path: str | Path) -> tuple[ShardInfo, ...]:
         names = names_by_file.get(path.name)
         if names is None:
             names = _safetensors_tensor_names(path)
-        layers = set()
-        shared = False
-        for name in names:
-            match = _LAYER.search(name)
-            if match:
-                layers.add(int(match.group(1)))
-            else:
-                shared = True
+        layers, shared = _shard_coverage(names)
         shards.append(
             ShardInfo(
                 name=path.name,
                 size_bytes=path.stat().st_size,
-                layers=frozenset(layers),
+                layers=layers,
                 has_shared_tensors=shared,
             )
         )
@@ -238,19 +254,12 @@ def _indexed_shards(model_path: str | Path) -> tuple[ShardInfo, ...] | None:
     shards: list[ShardInfo] = []
     for filename, names in sorted(names_by_file.items()):
         path = root / filename
-        layers: set[int] = set()
-        shared = False
-        for name in names:
-            match = _LAYER.search(name)
-            if match:
-                layers.add(int(match.group(1)))
-            else:
-                shared = True
+        layers, shared = _shard_coverage(names)
         shards.append(
             ShardInfo(
                 name=filename,
                 size_bytes=path.stat().st_size if path.is_file() else 0,
-                layers=frozenset(layers),
+                layers=layers,
                 has_shared_tensors=shared,
             )
         )
@@ -709,6 +718,62 @@ class StagingResult:
         }
 
 
+def _fabric_route(ssh_target: str, address: str | None) -> tuple[str, list[str]]:
+    """The scp host and leading options that reach ``ssh_target``.
+
+    A fabric address keeps the paired user and accepts only the host key
+    recorded for the paired name. OpenSSH keeps the first value of an option,
+    so these go before ``cluster_ssh_options``.
+    """
+
+    if address is None:
+        return ssh_target, []
+    user, _, host = ssh_target.rpartition("@")
+    return (f"{user}@{address}" if user else address), [
+        "-o",
+        f"HostKeyAlias={host}",
+        "-o",
+        "StrictHostKeyChecking=yes",
+    ]
+
+
+def fabric_transfer_address(ssh_target: str, addresses: Sequence[str]) -> str | None:
+    """The cluster fabric address to copy model files over, or None.
+
+    ``addresses`` are the ones the collectives verified, Thunderbolt and RDMA
+    first. One is used only when SSH answers there with the paired host key.
+    """
+
+    for address in addresses:
+        try:
+            if ipaddress.ip_address(address).version != 4:
+                continue
+        except ValueError:
+            continue
+        if address == ssh_target.rpartition("@")[2]:
+            continue
+        target, route_options = _fabric_route(ssh_target, address)
+        try:
+            probe = subprocess.run(
+                [
+                    "ssh",
+                    *route_options,
+                    *cluster_ssh_options(connect_timeout=3),
+                    target,
+                    "true",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return address
+    return None
+
+
 def scp_push(
     *,
     destination_host: str,
@@ -717,8 +782,12 @@ def scp_push(
     filename: str,
     cipher: str = _FAST_CIPHER,
     timeout: float = 3600.0,
+    transfer_address: str | None = None,
 ) -> None:
-    """Push one local model file to the Mac that needs it."""
+    """Push one local model file to the Mac that needs it.
+
+    ``transfer_address`` carries the file data; commands use the paired name.
+    """
 
     if Path(filename).name != filename:
         raise ValueError(f"staging filename must be a basename: {filename!r}")
@@ -749,17 +818,19 @@ def scp_push(
     )
     final_path = f"{str(Path(destination_dir).expanduser()).rstrip('/')}/{filename}"
     installed = False
+    scp_host, route_options = _fabric_route(destination_host, transfer_address)
     try:
         result = subprocess.run(
             [
                 "scp",
                 "-s",
                 "-q",
+                *route_options,
                 *cluster_ssh_options(connect_timeout=10),
                 "-c",
                 cipher,
                 str(source),
-                f"{destination_host}:{temporary_path}",
+                f"{scp_host}:{temporary_path}",
             ],
             capture_output=True,
             text=True,
@@ -799,8 +870,14 @@ def scp_copy(
     filename: str,
     cipher: str = _FAST_CIPHER,
     timeout: float = 3600.0,
+    source_address: str | None = None,
+    destination_address: str | None = None,
 ) -> None:
-    """Copy one model file between any two enrolled cluster nodes."""
+    """Copy one model file between any two enrolled cluster nodes.
+
+    A fabric address carries the data when one side is this Mac. A
+    peer-to-peer copy keeps the paired names: its options apply to both ends.
+    """
 
     if Path(filename).name != filename:
         raise ValueError(f"staging filename must be a basename: {filename!r}")
@@ -822,6 +899,7 @@ def scp_copy(
             filename=filename,
             cipher=cipher,
             timeout=timeout,
+            transfer_address=destination_address,
         )
         return
 
@@ -836,16 +914,18 @@ def scp_copy(
         destination = Path(destination_dir).expanduser()
         destination.mkdir(parents=True, exist_ok=True)
         temporary = destination / _staging_partial_name()
+        scp_host, route_options = _fabric_route(source_host, source_address)
         try:
             result = subprocess.run(
                 [
                     "scp",
                     "-s",
                     "-q",
+                    *route_options,
                     *cluster_ssh_options(connect_timeout=10),
                     "-c",
                     cipher,
-                    f"{source_host}:{remote_source}",
+                    f"{scp_host}:{remote_source}",
                     str(temporary),
                 ],
                 capture_output=True,
@@ -929,8 +1009,13 @@ def stage_files_from_source(
     transfer: Any = scp_copy,
     progress: Callable[[str, str, int], None] | None = None,
     clock: Any = None,
+    source_address: str | None = None,
+    destination_address: str | None = None,
 ) -> StagingResult:
     """Stage one rank from a local or peer model holder and verify every file.
+
+    ``source_address`` and ``destination_address`` are fabric addresses from
+    ``fabric_transfer_address`` for the file data.
 
     ``destination_dir`` is where files land on the destination Mac; it defaults
     to the coordinator's own absolute source path, correct only when every Mac
@@ -972,6 +1057,7 @@ def stage_files_from_source(
             destination_dir=destination_dir,
             sidecars=common,
             parallel=parallel,
+            transfer=partial(scp_push, transfer_address=destination_address),
             progress=progress,
             clock=clock,
         )
@@ -1003,6 +1089,14 @@ def stage_files_from_source(
     started = clock()
     transferred: list[str] = []
     failed: list[str] = []
+    routes = {
+        key: value
+        for key, value in (
+            ("source_address", source_address),
+            ("destination_address", destination_address),
+        )
+        if value is not None
+    }
 
     def copy(name: str) -> tuple[str, str | None]:
         if progress is not None:
@@ -1014,6 +1108,7 @@ def stage_files_from_source(
                 source_dir=source_dir,
                 destination_dir=destination_dir,
                 filename=name,
+                **routes,
             )
             return name, None
         except Exception as exc:  # noqa: BLE001 - reported per file

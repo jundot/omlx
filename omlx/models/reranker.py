@@ -283,13 +283,14 @@ class MLXRerankerModel:
         query: "str | dict[str, Any]",
         documents: "list[str] | list[dict[str, Any]]",
         max_length: int,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """Rerank using mlx-embeddings' multimodal model.process() API."""
         query_item = self._build_vl_item(query)
         doc_items = [self._build_vl_item(d) for d in documents]
 
         inputs = {
-            "instruction": self._CAUSAL_LM_DEFAULT_INSTRUCTION,
+            "instruction": instruction or self._CAUSAL_LM_DEFAULT_INSTRUCTION,
             "query": query_item,
             "documents": doc_items,
         }
@@ -965,6 +966,7 @@ class MLXRerankerModel:
         query: "str | dict",
         documents: "list[str] | list[dict]",
         max_length: int | None = None,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank documents by relevance to the query.
@@ -978,6 +980,8 @@ class MLXRerankerModel:
                 If None, uses model-appropriate default (the tokenizer limit
                 for encoders, 8192 for CausalLM). Encoder values are capped
                 at the tokenizer limit.
+            instruction: Task instruction for the Qwen3 reranker `<Instruct>:`
+                slot. None or empty uses the default. Other rerankers ignore it.
 
         Returns:
             RerankOutput with scores, sorted indices, and token count
@@ -994,7 +998,9 @@ class MLXRerankerModel:
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
-            return self._rerank_vl(query, documents, effective_max_length)
+            return self._rerank_vl(
+                query, documents, effective_max_length, instruction=instruction
+            )
 
         # Text-only paths: coerce dict inputs down to text so existing
         # _rerank_* methods keep their str-only contract.
@@ -1014,7 +1020,9 @@ class MLXRerankerModel:
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
-            return self._rerank_causal_lm(query_str, docs_str, effective_max_length)
+            return self._rerank_causal_lm(
+                query_str, docs_str, effective_max_length, instruction=instruction
+            )
         else:
             # Absolute position tables read out of range without an error, so
             # never exceed the tokenizer's declared limit.
@@ -1031,6 +1039,7 @@ class MLXRerankerModel:
         query: str,
         documents: list[str],
         max_length: int = 8192,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank using CausalLM yes/no logit scoring (e.g., Qwen3-Reranker).
@@ -1039,9 +1048,11 @@ class MLXRerankerModel:
         extracts relevance scores from the logits of yes/no tokens at the last
         position. Each document is processed individually since mlx-lm models
         generate their own causal mask internally and don't accept an external
-        padding mask.
+        padding mask. The prompt run the documents share (the instruction and
+        query) is forwarded once and reused through the KV cache.
         """
         import mlx.core as mx
+        from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 
         tokenizer = self.processor
         prefix_tokens = self._prefix_tokens
@@ -1053,6 +1064,8 @@ class MLXRerankerModel:
         if not callable(self.model):
             raise ValueError("CausalLM reranker model is not initialized.")
 
+        effective_instruction = instruction or self._CAUSAL_LM_DEFAULT_INSTRUCTION
+
         # Compute max tokens available for the instruction content
         max_content_tokens = max_length - len(prefix_tokens) - len(suffix_tokens)
 
@@ -1060,7 +1073,7 @@ class MLXRerankerModel:
         pairs_text = []
         for doc in documents:
             content = (
-                f"<Instruct>: {self._CAUSAL_LM_DEFAULT_INSTRUCTION}\n"
+                f"<Instruct>: {effective_instruction}\n"
                 f"<Query>: {query}\n"
                 f"<Document>: {doc}"
             )
@@ -1082,15 +1095,28 @@ class MLXRerankerModel:
             full_ids = prefix_tokens + content_ids + suffix_tokens
             all_input_ids.append(full_ids)
 
+        # Every document shares the prompt run up to "<Document>: ", so count
+        # how many leading tokens are identical across all of them: that run
+        # only has to be forwarded once per request.
+        shared_len = len(prefix_tokens)
+        for position in zip(*content_encodings["input_ids"]):
+            if len(set(position)) != 1:
+                break
+            shared_len += 1
+
         # Per-document forward pass and score extraction.
         # mlx-lm models generate their own causal attention mask internally
         # and don't support external padding masks, so we process each
         # document individually to ensure correct attention computation.
         scores = []
         total_tokens = 0
-        for ids in all_input_ids:
-            input_ids = mx.array([ids])  # (1, seq_len)
-            logits = self.model(input_ids)
+        cache = make_prompt_cache(self.model)
+        for index, ids in enumerate(all_input_ids):
+            # The first document's pass prefills the shared run; every pass
+            # leaves just that run in the cache for the next document.
+            tail = ids if index == 0 else ids[shared_len:]
+            logits = self.model(mx.array([tail]), cache=cache)
+            trim_prompt_cache(cache, len(ids) - shared_len)
             # Extract yes/no logits at the last position
             last_logits = logits[0, -1, :]
             true_logit = last_logits[self._token_true_id]
@@ -1419,50 +1445,11 @@ class MLXRerankerModel:
         indexed_scores.sort(key=lambda x: x[1], reverse=True)
         sorted_indices = [idx for idx, _ in indexed_scores]
 
-        # Count tokens
-        total_tokens = self._count_tokens(query, documents)
-
         return RerankOutput(
             scores=scores,
             indices=sorted_indices,
-            total_tokens=total_tokens,
+            total_tokens=sum(len(ids) for ids in input_ids),
         )
-
-    def _count_tokens(self, query: str, documents: list[str]) -> int:
-        """Count total tokens in query-document pairs."""
-        total = 0
-
-        processor = self.processor
-        processor_class = type(processor).__name__
-        if processor_class == "TokenizerWrapper" and hasattr(processor, "_tokenizer"):
-            processor = processor._tokenizer
-
-        def get_token_count(text: str, add_special: bool = True) -> int:
-            """Get token count for text, handling different tokenizer types."""
-            if hasattr(processor, "encode"):
-                tokens = processor.encode(text, add_special_tokens=add_special)
-                # Handle different return types
-                if isinstance(tokens, list):
-                    return len(tokens)
-                elif hasattr(tokens, "ids"):
-                    # tokenizers.Encoding object
-                    return len(tokens.ids)
-                else:
-                    return len(tokens)
-            else:
-                # Fallback to word count estimate
-                return len(text.split()) + (2 if add_special else 0)
-
-        # Count query tokens once
-        query_len = get_token_count(query, add_special=True)
-
-        # Count document tokens
-        for doc in documents:
-            doc_len = get_token_count(doc, add_special=False)
-            # Each pair includes query + doc + special tokens
-            total += query_len + doc_len + 3  # [CLS], [SEP], [SEP]
-
-        return total
 
     @property
     def num_labels(self) -> int | None:

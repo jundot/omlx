@@ -1,0 +1,119 @@
+// Run with: node --test apps/omlx-web/tests/usage_history_ui.test.cjs
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const countSource = fs.readFileSync(path.join(__dirname, '..', 'omlx_web/static/js/count_format.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '..', 'omlx_web/static/js/usage.js'), 'utf8');
+
+function component(fetch, lang = 'en') {
+    const context = vm.createContext({fetch, AbortController, URLSearchParams, Intl,
+        window: {t: key => key}, document: {hidden: false, documentElement: {lang}}, setInterval, clearInterval});
+    vm.runInContext(countSource, context);
+    vm.runInContext(source, context);
+    return context.usageHistory();
+}
+const data = {available: true, dropped_requests: 0, models: [{model_id: 'canonical model'}],
+    totals: {requests: 1}, heatmap: [{date: '2026-09-08', tokens: [0, 120]}]};
+
+test('range and exact model are encoded; unloaded models and intensity remain usable', async () => {
+    const urls = [];
+    const view = component(async url => { urls.push(url); return {ok: true, json: async () => data}; });
+    await view.load();
+    assert.equal(view.modelIds[0], 'canonical model');
+    view.range = 'month'; view.model = 'canonical model';
+    await view.load();
+    assert.equal(urls[1], '/admin/api/usage?range=month&model=canonical+model');
+    assert.equal(view.peak, 120);
+    assert.equal(view.shade(0), 'rgb(var(--palette-mid-gray) / 0.12)');
+    assert.equal(view.speed(null), '—');
+});
+
+test('storage failure removes stale values and displays unavailable state', async () => {
+    const view = component(async () => ({ok: false}));
+    view.data = data;
+    await view.load();
+    assert.equal(view.data, null);
+    assert.equal(view.error, 'usage.unavailable');
+    assert.equal(view.loading, false);
+});
+
+test('slower previous selection cannot overwrite newer range', async () => {
+    const pending = [];
+    const view = component(() => new Promise(resolve => pending.push(resolve)));
+    const first = view.load();
+    view.range = '7d';
+    const second = view.load();
+    const newer = {...data, totals: {requests: 7}};
+    pending[1]({ok: true, json: async () => newer});
+    await second;
+    pending[0]({ok: true, json: async () => data});
+    await first;
+    assert.equal(view.data.totals.requests, 7);
+    assert.equal(view.loading, false);
+});
+
+test('retry/overflow state stays visible alongside committed history', async () => {
+    const view = component(async () => ({ok: true, json: async () => ({...data, dropped_requests: 1})}));
+    await view.load();
+    assert.equal(view.error, 'usage.delayed');
+    assert.equal(view.data.totals.requests, 1);
+});
+
+test('recording switched off shows the settings pointer, not the unavailable warning', async () => {
+    let payload = {...data, enabled: false, models: [], totals: {requests: 0}, heatmap: []};
+    const view = component(async () => ({ok: true, json: async () => payload}));
+    view.data = data; view.modelIds = ['canonical model']; view.error = 'usage.delayed';
+    await view.load();
+    assert.equal(view.disabled, true);
+    assert.equal(view.data, null);
+    assert.equal(view.error, '');
+    assert.equal(view.modelIds.length, 0);
+    assert.equal(view.loading, false);
+    payload = {...data, enabled: true};
+    await view.load();
+    assert.equal(view.disabled, false);
+    assert.equal(view.data.totals.requests, 1);
+    assert.equal(view.modelIds[0], 'canonical model');
+});
+
+test('compact numbers follow the UI language, not the runtime locale', () => {
+    assert.equal(component(null, 'en').number(33320000), '33.3M');
+    assert.equal(component(null, 'ja').number(33320000), '3,332.0万');
+    assert.equal(component(null, 'ko').number(33320000), '3,332.0만');
+    assert.equal(component(null, 'en_US').number(33320000), '33.3M');
+    assert.equal(component(null, 'zh').number(97116000), '9,711.6万');
+    assert.equal(component(null, 'zh').number(99999999), '1.0亿');
+    assert.equal(component(null, 'zh').number(160000000), '1.6亿');
+    assert.equal(component(null, 'ja').number(160000000), '1.6億');
+    assert.equal(component(null, 'ko').number(160000000), '1.6억');
+});
+
+test('exact scale applies to usage history counts', () => {
+    const view = component(null, 'zh');
+    view.statsNumberScale = 'exact';  // Stands in for the parent dashboard() scope.
+    assert.equal(view.number(160000000), '160,000,000');
+    assert.equal(view.number(97116000), '97,116,000');
+});
+
+test('number scale survives a page reload', () => {
+    const store = new Map();
+    const make = () => {
+        const context = vm.createContext({
+            window: {},
+            document: {documentElement: {lang: 'en'}},
+            localStorage: {
+                getItem: key => store.has(key) ? store.get(key) : null,
+                setItem: (key, value) => store.set(key, value),
+            },
+        });
+        vm.runInContext(countSource, context);
+        return context.window.omlxCount;
+    };
+    const first = make();
+    assert.equal(first.scale(), 'compact');
+    first.setScale('exact');
+    assert.equal(store.get('omlx-number-scale'), 'exact');
+    assert.equal(make().scale(), 'exact');
+});

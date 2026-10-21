@@ -4,7 +4,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.custom_kernels.glm_moe_dsa import fast
+from omlx.custom_kernels.attention import fast
 from omlx.patches.deepseek_v41.kernels import packed_sparse_attention
 from omlx.patches.deepseek_v41.quantization import pack_activation, unpack_activation
 
@@ -82,8 +82,8 @@ def test_packed_attention_preserves_online_bf16_probability_rounding(
 
     assert rms(actual) < rms(unrounded) * 0.2
     assert mx.array_equal(actual, packed_sparse_attention(*args)).item()
-    if length > 1 and fast.has_symbol("deepseek_v41_packed_attention"):
-        native = fast.deepseek_v41_packed_attention(
+    if length > 1 and fast.has_symbol("packed_sparse_attention"):
+        native = fast.packed_sparse_attention(
             q.transpose(0, 2, 1, 3),
             window[:, None],
             pooled,

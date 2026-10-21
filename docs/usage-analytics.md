@@ -98,8 +98,9 @@ Time statistics are unaffected.
 
 ## Admin API
 
-`GET /admin/api/usage?range=7d&model=<canonical-model-id>` uses the existing admin
-session-cookie authentication (and the existing explicit auth-bypass setting).
+`GET /admin/api/usage?range=7d&model=<canonical-model-id>` uses the same
+authentication as the rest of the [admin API](admin-api.md): the main API key as a
+Bearer token or the admin session cookie (and the existing explicit auth-bypass setting).
 `range` accepts `today` (default), `yesterday`, `7d`, `30d`, `90d`, or `month`.
 Multi-day ranges include today; Yesterday is the preceding calendar day. Omit
 `model` for all models. Filtering uses the exact canonical ID, even after unload
@@ -114,10 +115,9 @@ Mac panels use the compact default response. Aggregate metrics are
 `cache_efficiency`, `generation_tps`, `prefill_tps`, and `average_request_seconds`.
 Unsupported ranges return 422; inaccessible history returns a generic 503.
 
-For example, with an admin session cookie file obtained through the existing
-login flow:
+For example:
 
 ```sh
-curl -b /path/to/admin-cookies.txt \
+curl -H "Authorization: Bearer $OMLX_API_KEY" \
   'http://127.0.0.1:8000/admin/api/usage?range=month&model=your-model-id'
 ```
