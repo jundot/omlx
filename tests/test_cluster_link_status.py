@@ -9,6 +9,7 @@ be told to click. These tests pin the distinctions.
 import ipaddress
 import shlex
 import subprocess
+from dataclasses import replace
 
 import pytest
 
@@ -23,9 +24,12 @@ from omlx.cluster.transport import (
     classify_link,
     configure_link,
     detect_transports,
+    link_warnings,
     parse_interface_addresses,
     parse_linux_ip_addresses,
+    parse_self_assigned_interfaces,
     parse_thunderbolt_interfaces,
+    parse_wifi_interfaces,
     resolve_link_addresses,
     select_backend,
     shared_link_addresses,
@@ -625,6 +629,45 @@ def _studio():
         rdma={"en5"},
         thunderbolt={"en5"},
     )
+
+
+def test_a_thunderbolt_cable_on_its_self_assigned_address_is_named_with_the_fix():
+    """A Thunderbolt Bridge left on DHCP gets 169.254, which nothing routes."""
+
+    ports = _LAPTOP_PORTS + "\nHardware Port: Thunderbolt Bridge\nDevice: bridge0\n"
+    ifconfig = (
+        _LAPTOP_IFCONFIG
+        + "bridge0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST>\n"
+        + "    inet 169.254.10.1 netmask 0xffff0000 broadcast 169.254.255.255\n"
+    )
+    laptop = HostInterfaces(
+        host="127.0.0.1",
+        addresses=parse_interface_addresses(ifconfig),
+        thunderbolt_interfaces=parse_thunderbolt_interfaces(ports),
+        wifi_interfaces=parse_wifi_interfaces(ports),
+        self_assigned_interfaces=parse_self_assigned_interfaces(ifconfig),
+    )
+    assert laptop.self_assigned_interfaces == {"en5", "bridge0"}
+    assert laptop.wifi_interfaces == {"en0"}
+    studio = HostInterfaces(
+        host="Studio.local",
+        addresses=(InterfaceAddress("en0", "192.168.4.22", 24),),
+        thunderbolt_interfaces=frozenset({"bridge0"}),
+        wifi_interfaces=frozenset({"en0"}),
+        self_assigned_interfaces=frozenset({"bridge0"}),
+    )
+
+    (warning,) = link_warnings(laptop, studio, shared_link_addresses(laptop, studio))
+    assert "127.0.0.1 (bridge0) and Studio.local (bridge0)" in warning
+    assert "self-assigned 169.254" in warning
+    assert "uses Wi-Fi instead" in warning
+    assert "manual IPv4 address on both Macs" in warning
+    # Wi-Fi alone is still worth saying; a Thunderbolt link needs nothing.
+    plain = replace(studio, self_assigned_interfaces=frozenset())
+    (warning,) = link_warnings(laptop, plain, shared_link_addresses(laptop, plain))
+    assert warning.startswith("127.0.0.1 and Studio.local reach each other over Wi-Fi")
+    thunderbolt = shared_link_addresses(_laptop(), _studio())
+    assert link_warnings(_laptop(), _studio(), thunderbolt) == ()
 
 
 def test_an_address_on_a_down_interface_is_not_offered():

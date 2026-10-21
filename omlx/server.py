@@ -859,7 +859,7 @@ def _register_cluster_routes() -> None:
     from .cluster.routes import router as cluster_router
     from .cluster.routes import set_cluster_getters
 
-    set_cluster_getters(get_engine_pool)
+    set_cluster_getters(get_engine_pool, lambda: _server_state.settings_manager)
     app.include_router(
         cluster_router,
         dependencies=[

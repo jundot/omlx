@@ -480,7 +480,7 @@ async def create_transcription(
     response_format: str = Form("json"),
     temperature: float = Form(0.0),
     stream: bool = Form(False),
-    max_tokens: Optional[int] = Form(None),
+    max_tokens: Optional[int] = Form(None, gt=0),
     word_timestamps: bool = Form(False),
 ):
     """OpenAI-compatible audio transcription endpoint (Speech-to-Text).

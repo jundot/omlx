@@ -109,6 +109,7 @@ def _approval_for(payload: dict) -> str:
             execution_profile=payload.get("execution_profile", "balanced"),
             tensor_parallel_size=payload.get("tensor_parallel_size", 1),
             target_context_tokens=payload.get("target_context_tokens", 8192),
+            mtp=payload.get("mtp", False),
         )
     )
     return routes._placement_signature(plan.to_dict())
@@ -689,6 +690,36 @@ def test_cluster_plan_route_uses_downloaded_model_headers(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["model"]["source"] == "/models/example"
+
+
+def test_new_cluster_plans_follow_the_saved_lightning_mtp_setting(monkeypatch):
+    from omlx.cluster.planner import ModelLayout, PlanningError
+
+    head = ModelLayout("/models/draft", 0, (1,), mtp_weight_bytes=1)
+    plain = ModelLayout("/models/plain", 0, (1,))
+    saved = {}
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "draft", "model_path": "/models/draft", "model_type": "llm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: SimpleNamespace(mtp_enabled=saved[model_id]),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+
+    # Like a single Mac, a checkpoint with a head starts with MTP on.
+    assert routes._cluster_mtp(None, head, "/models/draft") is True
+    saved["draft"] = False
+    assert routes._cluster_mtp(None, head, "/models/draft") is False
+    assert routes._cluster_mtp(True, head, "/models/draft") is True
+    assert routes._cluster_mtp(None, plain, "/models/plain") is False
+    with pytest.raises(PlanningError, match="no Lightning MTP head"):
+        routes._cluster_mtp(True, plain, None)
 
 
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
@@ -1751,6 +1782,54 @@ def test_macs_that_share_no_subnet_get_no_address_and_a_reason(monkeypatch):
     assert "share no subnet" in body["backend_reason"]
 
 
+def test_a_thunderbolt_cable_the_cluster_cannot_use_is_named_before_activation(
+    monkeypatch,
+):
+    from dataclasses import replace
+
+    def mac(name, address):
+        return replace(
+            _interfaces(name, [("en1", address, 24)], thunderbolt={"bridge0"}),
+            wifi_interfaces=frozenset({"en1"}),
+            self_assigned_interfaces=frozenset({"bridge0"}),
+        )
+
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": mac("127.0.0.1", "192.168.4.21"),
+            "studio.local": mac("studio.local", "192.168.4.22"),
+        },
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+
+    proposal = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_size_bytes": 40 * 1024**3,
+                "layer_count": 32,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * 1024**3}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["10.0.0.1"]},
+                    {"node_id": "node-1", "ssh": "studio.local", "ips": ["10.0.0.2"]},
+                ],
+            },
+        )
+        .json()
+    )
+
+    # The cluster still runs, over Wi-Fi, and says what to fix first.
+    assert proposal["backend"] == "ring"
+    (warning,) = [w for w in proposal["warnings"] if "169.254" in w]
+    assert "self-assigned 169.254" in warning and "Wi-Fi" in warning
+
+
 def test_one_host_is_not_a_fabric():
     response = _client().get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1"})
 
@@ -1858,6 +1937,60 @@ def test_autoconfigure_activates_on_discovered_addresses_not_supplied_ones(
         [None, "rdma_en4"],
         ["rdma_en5", None],
     ]
+
+
+def test_autoconfigure_lightning_mtp_plan_is_the_one_activation_recomputes(
+    monkeypatch,
+):
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=path,
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(2 * gib,) * 8,
+            supports_pipeline=True,
+            mtp_weight_bytes=gib,
+        ),
+    )
+    _readings(
+        monkeypatch,
+        {
+            "127.0.0.1": _interfaces("127.0.0.1", [("en4", "10.0.1.1", 30)]),
+            "studio.local": _interfaces("studio.local", [("en5", "10.0.1.2", 30)]),
+        },
+    )
+    monkeypatch.setattr(routes, "detect_cluster_transports", lambda hosts: _no_links())
+    monkeypatch.setattr(routes, "probe_remote_host", lambda ssh, **_: None)
+
+    body = (
+        _client()
+        .post(
+            "/admin/api/cluster/autoconfigure",
+            json={
+                "model_path": "/models/draft",
+                "strategy": "pipeline",
+                "mtp": True,
+                "nodes": [
+                    {"node_id": f"node-{index}", "capacity_bytes": 64 * gib}
+                    for index in range(2)
+                ],
+                "hosts": [
+                    {"node_id": "node-0", "ssh": "127.0.0.1", "ips": ["10.0.1.1"]},
+                    {"node_id": "node-1", "ssh": "studio.local", "ips": ["10.0.1.2"]},
+                ],
+            },
+        )
+        .json()
+    )
+
+    activation = body["activation"]
+    assert activation["mtp"] is True
+    # Placing ranks rebuilds the plan; it must still carry the head.
+    assert activation["approved_placement"] == _approval_for(activation)
 
 
 def test_autoconfigure_uses_verified_ethernet_when_rdma_is_unreachable(
@@ -2447,7 +2580,7 @@ def test_forget_member_preserves_other_pairings_or_leaves_cluster(monkeypatch, n
 
     manager = SimpleNamespace(
         node_id="self",
-        list_paired=lambda: [{"node_id": node} for node in sorted(peers)],
+        paired_devices=lambda: [{"node_id": node} for node in sorted(peers)],
         unpair=lambda node: peers.remove(node),
     )
     monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
@@ -2477,7 +2610,7 @@ def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, st
     removed = []
     manager = SimpleNamespace(
         node_id="self",
-        list_paired=lambda: [{"node_id": "offline"}],
+        paired_devices=lambda: [{"node_id": "offline"}],
         unpair=removed.append,
     )
     deployment = SimpleNamespace(
@@ -2511,7 +2644,7 @@ def test_forget_member_maps_pairing_errors(monkeypatch):
         raise PairingStateError("approval is already in progress")
 
     manager = SimpleNamespace(
-        node_id="self", list_paired=lambda: [{"node_id": "busy"}], unpair=unpair
+        node_id="self", paired_devices=lambda: [{"node_id": "busy"}], unpair=unpair
     )
     monkeypatch.setattr(pairing_routes, "_manager", lambda: manager)
     monkeypatch.setattr(

@@ -5,6 +5,7 @@ import fcntl
 import json
 import logging
 from contextlib import ExitStack, closing
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -12,8 +13,10 @@ from mlx.utils import tree_flatten
 from mlx_lm.generate import wired_limit
 from transformers import PreTrainedTokenizerFast
 
+from ..mlx_lm_mtp import get_mtp_depth
 from .config import ModelConfig
 from .convert import iter_source_weights, source_engram_tables
+from .dspark import make_stages
 from .model import Model
 from .processing import Processor
 from .quantization import QuantizedProjection
@@ -85,13 +88,16 @@ def load(
     ced_prefill=False,
     stage=None,
     tensor=None,
+    mtp_head=False,
 ):
     """Load a converted or source checkpoint.
 
     ``stage`` makes a cluster rank: it is called with the language model to
     keep one pipeline stage, and only that stage's text weights are read.
     ``tensor`` (a distributed group) makes a tensor-parallel rank that reads
-    only its slice of the split projections.
+    only its slice of the split projections. ``mtp_head`` keeps the DSpark
+    stages on the cluster rank that drafts; a tensor-parallel rank holds them
+    whole, since drafting runs there alone.
     """
     path = Path(path)
     if (path / "conversion.inprogress.json").exists():
@@ -109,13 +115,18 @@ def load(
             raise ValueError("Expected a DeepSeek V4.1 checkpoint")
         format_spec = {"engram_tables": source_engram_tables(mapping, raw)}
     config = ModelConfig.from_dict(raw)
+    whole_config = None
     if stage is not None or tensor is not None:
         if source_checkpoint:
             raise ValueError(
                 "DeepSeek V4.1 cluster ranks load converted checkpoints only"
             )
-        # Cluster ranks serve the text model without draft heads.
-        config.preserve_mtp = False
+        if mtp_head and not config.preserve_mtp:
+            raise ValueError("This DeepSeek V4.1 checkpoint has no DSpark stages")
+        if mtp_head and tensor is not None:
+            whole_config = replace(config, vision_n_layers=0)
+        # Only the drafting rank keeps the draft heads.
+        config.preserve_mtp = bool(mtp_head and stage is not None)
         config.vision_n_layers = 0
     if tensor is not None:
         config = config.tensor_shard(tensor.size())
@@ -144,6 +155,12 @@ def load(
                 "unsupported; falling back to full decoder prefill"
             )
     model = Model(config)
+    if whole_config is not None:
+        # Draft stages built from the unsharded shapes; Block._tensor_group
+        # stays None on them, so they never all-reduce.
+        model.language_model.mtp = make_stages(whole_config)
+        config.preserve_mtp = True
+        model.language_model.configure_mtp(True, get_mtp_depth())
     held = None
     if stage is not None:
         stage(model.language_model)
@@ -279,7 +296,13 @@ def load(
                         values = _load_shard(path / filename)
                     if tensor is not None:
                         values = {
-                            key: tensor_slice(key, value, tensor.rank(), tensor.size())
+                            key: (
+                                value
+                                if key.startswith("language_model.mtp.")
+                                else tensor_slice(
+                                    key, value, tensor.rank(), tensor.size()
+                                )
+                            )
                             for key, value in values.items()
                         }
                     for key in values:

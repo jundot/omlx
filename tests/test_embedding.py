@@ -107,6 +107,14 @@ class TestEmbeddingModels:
         with pytest.raises(ValueError, match="greater than 0"):
             EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", max_length=0)
 
+    def test_embedding_request_rejects_non_positive_dimensions(self):
+        """dimensions=0 returned the full-length vector and -1 silently
+        truncated from the end; both must fail validation like max_length."""
+        with pytest.raises(ValueError, match="greater than 0"):
+            EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", dimensions=0)
+        with pytest.raises(ValueError, match="greater than 0"):
+            EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", dimensions=-1)
+
     def test_embedding_request_items_input(self):
         """Test EmbeddingRequest with structured items."""
         request = EmbeddingRequest(

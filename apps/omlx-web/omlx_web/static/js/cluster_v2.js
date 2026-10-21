@@ -2677,6 +2677,13 @@ function clusterV2Wizard() {
             return Array.isArray(assignments) ? assignments : [];
         },
 
+        // Server-written, already redacted. They name what to fix before
+        // activating, like a Thunderbolt cable the cluster cannot use.
+        planWarnings() {
+            const warnings = this.planProposal?.warnings;
+            return Array.isArray(warnings) ? warnings : [];
+        },
+
         planTotalLayers() {
             return this.planAssignments().reduce(
                 (sum, assignment) => sum + (assignment.layer_count || 0),

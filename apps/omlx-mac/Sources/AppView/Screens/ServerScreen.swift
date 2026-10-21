@@ -248,7 +248,7 @@ private struct ModelDirectoriesEditor: View {
                     Text(String(localized: "server.row.models_directories",
                                 defaultValue: "Model Directories",
                                 comment: "Row label for the model directories editor"))
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     Text(String(localized: "server.row.models_directories.sub",
                                 defaultValue: "The first path is the download target. All paths are scanned for local models.",
@@ -283,7 +283,7 @@ private struct ModelDirectoriesEditor: View {
                           defaultValue: "Primary",
                           comment: "Badge for the first model directory")
                  : String(format: "#%d", index + 1))
-                .font(.omlxMono(10, weight: .semibold))
+                .font(.omlxMono(DesignTokens.FontSize.caption, weight: .semibold))
                 .foregroundStyle(index == 0 ? theme.accent : theme.textSecondary)
                 .frame(width: 52, alignment: .leading)
 
@@ -714,7 +714,7 @@ private struct ServerAdvancedSection: View {
                     Text(String(localized: "server.section.advanced",
                                 defaultValue: "Advanced",
                                 comment: "Disclosure header for the advanced server settings"))
-                        .font(.omlxText(11, weight: .semibold))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .semibold))
                         .foregroundStyle(theme.textSecondary)
                         .textCase(.uppercase)
                         .kerning(0.6)

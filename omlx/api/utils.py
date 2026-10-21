@@ -725,8 +725,10 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
     """Move unsupported non-leading system runs into adjacent safe user text.
 
     This keeps the native chat template/tool rendering path intact while making
-    volatile tail notes cache-friendly. It deliberately refuses tool-call
-    boundaries and multimodal user content, where changing roles is too risky.
+    volatile tail notes cache-friendly. A note after a tool result becomes its
+    own user turn, the same shape as text sent next to an Anthropic
+    tool_result. It deliberately refuses positions between a tool call and its
+    results and multimodal user content, where changing roles is too risky.
     """
     rewritten: list[dict] = []
     seen_non_system = False
@@ -757,12 +759,12 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
             continue
 
         note = _format_system_note(parts)
+        prev_msg = rewritten[-1] if rewritten else None
         next_msg = messages[i] if i < len(messages) else None
         next_role = next_msg.get("role") if next_msg is not None else None
+        before_assistant_turn = next_msg is None or next_role == "assistant"
 
-        if _is_safe_user_note_target(rewritten[-1] if rewritten else None) and (
-            next_msg is None or next_role == "assistant"
-        ):
+        if _is_safe_user_note_target(prev_msg) and before_assistant_turn:
             rewritten[-1] = _rewrite_user_content_with_note(
                 rewritten[-1],
                 note,
@@ -771,7 +773,7 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
             continue
 
         if _is_safe_user_note_target(next_msg):
-            if _message_has_tool_calls(rewritten[-1] if rewritten else None):
+            if _message_has_tool_calls(prev_msg):
                 return None
             rewritten.append(
                 _rewrite_user_content_with_note(
@@ -782,6 +784,10 @@ def _downgrade_mid_system_to_user_notes(messages: list[dict]) -> list[dict] | No
             )
             seen_non_system = True
             i += 1
+            continue
+
+        if prev_msg and prev_msg.get("role") == "tool" and before_assistant_turn:
+            rewritten.append({"role": "user", "content": note})
             continue
 
         return None

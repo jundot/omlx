@@ -30,7 +30,7 @@ struct Row<Trailing: View>: View {
             if let label {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(label)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     if let sublabel, !sublabel.isEmpty {
                         Text(sublabel)
@@ -174,10 +174,10 @@ struct LinkRow<Icon: View>: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(label)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     Text(sublabel)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(2)
                 }
@@ -242,13 +242,13 @@ struct NavRow<Icon: View>: View {
             HStack(spacing: 10) {
                 icon
                 Text(label)
-                    .font(.omlxText(13, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                 Spacer(minLength: 12)
                 if let value, !value.isEmpty {
                     Text(value)
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(1)
                         .truncationMode(.tail)

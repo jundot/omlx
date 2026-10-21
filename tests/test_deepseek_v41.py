@@ -1383,6 +1383,61 @@ def test_cluster_stage_loads_only_its_text_weights(tmp_path):
     stage.close()
 
 
+def test_cluster_lightning_mtp_head_loads_on_rank_zero_only(tmp_path):
+    from mlx.utils import tree_flatten
+
+    from omlx.cluster.planner import PipelineAssignment, install_unequal_pipeline_plan
+    from omlx.patches import mlx_lm_mtp
+    from omlx.patches.deepseek_v41.convert import convert
+    from omlx.patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
+
+    source, _ = write_checkpoint(
+        tmp_path,
+        preserve_mtp=True,
+        n_mtp_layers=3,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_n_routed_experts=2,
+        dspark_n_activated_experts=1,
+        dspark_markov_rank=32,
+        compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+    )
+    target = tmp_path / "converted"
+    convert(source, target, preserve_mtp=True)
+    assert apply_deepseek_v41_mlx_lm_patch()
+    from mlx_lm.models import deepseek_v41
+
+    def stage(rank, split):
+        plan = (
+            PipelineAssignment("a", 0, split, 5, 1, 0, 0, 1),
+            PipelineAssignment("b", 1, 0, split, 1, 0, 0, 1),
+        )
+        group = SimpleNamespace(rank=lambda: rank, size=lambda: 2)
+        with install_unequal_pipeline_plan(plan):
+            return deepseek_v41.load_pipeline_stage(target, group)
+
+    def holds_head(model):
+        return any(".mtp." in key for key, _ in tree_flatten(model.parameters()))
+
+    was_active = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    try:
+        drafter, follower, short = stage(0, 2), stage(1, 2), stage(0, 3)
+    finally:
+        mlx_lm_mtp.set_mtp_active(was_active)
+    try:
+        assert holds_head(drafter) and drafter.language_model._omlx_mtp_decode_enabled
+        assert not holds_head(follower)
+        assert follower.language_model._omlx_mtp_verify_only
+        # Rank zero without target layer 2 cannot draft, so MTP stays off.
+        assert not short.language_model._omlx_mtp_decode_enabled
+        assert not short.language_model._omlx_dspark_decode_enabled
+    finally:
+        for model in (drafter, follower, short):
+            model.close()
+
+
 def test_cluster_layout_of_converted_and_source_checkpoints(tmp_path, monkeypatch):
     from omlx.cluster.catalogue import assess_model_path
     from omlx.cluster.planner import NodeBudget, complete_model_layout
@@ -1453,16 +1508,10 @@ print(json.dumps({"rank": group.rank(), "ok": True}), flush=True)
 """
 
 
-def test_tensor_parallel_ranks_match_single_process(tmp_path):
+def pack_split_projections(target):
+    """Pack the projections tensor ranks split, as released checkpoints do."""
     import json
 
-    from omlx.patches.deepseek_v41.convert import convert
-
-    # Two heads, output groups and 32-wide quantization groups per split width.
-    source, _ = write_checkpoint(tmp_path, moe_inter_dim=64, o_lora_rank=32, **_ENGRAM)
-    target = tmp_path / "converted"
-    convert(source, target)
-    # Pack the split projections the way released checkpoints do.
     shard = next(target.glob("model-*.safetensors"))
     tensors = dict(mx.load(str(shard)))
     config = json.loads((target / "config.json").read_text())
@@ -1485,6 +1534,16 @@ def test_tensor_parallel_ranks_match_single_process(tmp_path):
     (target / "config.json").write_text(json.dumps(config))
     (target / "model.safetensors.index.json").write_text(json.dumps(index))
 
+
+def test_tensor_parallel_ranks_match_single_process(tmp_path):
+    from omlx.patches.deepseek_v41.convert import convert
+
+    # Two heads, output groups and 32-wide quantization groups per split width.
+    source, _ = write_checkpoint(tmp_path, moe_inter_dim=64, o_lora_rank=32, **_ENGRAM)
+    target = tmp_path / "converted"
+    convert(source, target)
+    pack_split_projections(target)
+
     run_two_ranks(tmp_path, _TENSOR_RANK, target)
 
 
@@ -1504,3 +1563,151 @@ def test_mlx_lm_tokenizer_gets_the_v41_protocol(tmp_path):
     assert tokenizer.apply_chat_template(
         messages, tokenize=False, enable_thinking=False
     ) == encode_messages(messages, thinking_mode="chat")
+
+
+# One rank of a two-stage V4.1 deployment decoding with Lightning MTP: rank zero
+# drafts with its DSpark head and decides, rank one replays its decisions. The
+# oracle mode drafts the expected tokens with every third block corrupted, so
+# full and partial accepts both occur. Greedy output must equal plain decoding
+# of the whole model on both ranks.
+_MTP_RANK = """
+import json
+import sys
+
+import mlx.core as mx
+
+group = mx.distributed.init(backend="ring", strict=True)
+from mlx_lm.generate import BatchGenerator
+from omlx.cluster.control_plane import RankControlPlane
+from omlx.cluster.mtp_sync import ClusterMtpSync
+from omlx.cluster.performance import execution_profile
+from omlx.cluster.planner import PipelineAssignment, install_unequal_pipeline_plan
+from omlx.cluster.runtime_optimizations import (
+    install_runtime_optimizations,
+    wait_for_pipeline_peers_on_host,
+)
+from omlx.patches import mlx_lm_mtp
+from omlx.patches.deepseek_v41.loading import load
+from omlx.patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
+from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+assert apply_deepseek_v41_mlx_lm_patch() and mlx_lm_mtp.apply_mlx_lm_mtp_patch()
+from mlx_lm.models import deepseek_v41
+
+target, port, oracle = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "oracle"
+pipeline = sys.argv[4] == "pipeline"
+rank, depth, limit = group.rank(), 3, 20
+prompt = [5, 9, 13, 2, 40, 7, 33, 21, 8, 17, 44, 3]
+
+full, _ = load(target)
+cache = full.language_model.make_cache()
+logits = full.language_model(mx.array([prompt]), cache=cache)
+reference = []
+for _ in range(limit):
+    token = mx.argmax(logits[:, -1], -1)
+    reference.append(int(token.item()))
+    logits = full.language_model(token[None], cache=cache)
+full.close()
+
+mlx_lm_mtp.set_mtp_active(True)
+mlx_lm_mtp.set_mtp_depth(depth)
+plan = (
+    PipelineAssignment("a", 0, 1, 5, 1, 0, 0, 1),
+    PipelineAssignment("b", 1, 0, 1, 1, 0, 0, 1),
+)
+if pipeline:
+    with install_unequal_pipeline_plan(plan):
+        model = deepseek_v41.load_pipeline_stage(target, group)
+else:
+    model = deepseek_v41.load_tensor_shard(target, group)
+
+cycles, accepted = [], []
+original = bg._run_verify_cycle_chain
+def counted(*a, **k):
+    cycles.append(1)
+    return original(*a, **k)
+bg._run_verify_cycle_chain = counted
+share_result = ClusterMtpSync.share_cycle_result
+def recorded(self, *a):
+    result = share_result(self, *a)
+    accepted.append(result[0])
+    return result
+ClusterMtpSync.share_cycle_result = recorded
+
+def oracle_drafts(gen_batch, state, *_args, **_kwargs):
+    done = len(gen_batch.tokens[0]) - len(prompt) + len(state.queue)
+    count = state.controller.cur if state.controller is not None else depth
+    ids = (reference[done : done + count] + [0] * count)[:count]
+    if done % 3 == 0:
+        ids[-1] = (ids[-1] + 1) % 64
+    state.drafts = mx.array(ids, dtype=mx.uint32)
+    state.draft_lps, state.draft_accept_lps = [], []
+if oracle and rank == 0:
+    bg._chain_next_drafts = oracle_drafts
+
+with (
+    RankControlPlane(
+        rank=rank, world_size=2, host="127.0.0.1", port=port, token="v41-mtp-test"
+    ) as plane,
+    install_runtime_optimizations(
+        model,
+        group,
+        execution_profile("balanced"),
+        batchable=True,
+        pipeline_parallel=pipeline,
+    ),
+    wait_for_pipeline_peers_on_host(model),
+):
+    model._omlx_cluster_mtp = ClusterMtpSync(rank=rank, control_plane=plane)
+    gen = BatchGenerator(model, sampler=lambda lp: mx.argmax(lp, -1), max_tokens=limit)
+    tokens = []
+    try:
+        gen.insert([prompt], max_tokens=[limit])
+        for _ in range(4 * limit):
+            _, responses = gen.next()
+            tokens.extend(response.token for response in responses)
+            if any(response.finish_reason for response in responses):
+                break
+    finally:
+        gen.close()
+model.close()
+assert cycles, "Lightning MTP never ran a verify cycle"
+assert tokens == reference, (tokens, reference)
+assert len(accepted) == len(cycles)
+if oracle:
+    assert max(accepted) > 0 and min(accepted) < max(accepted), accepted
+print(json.dumps({"rank": rank, "ok": True, "cycles": len(cycles)}), flush=True)
+"""
+
+
+@pytest.mark.parametrize(
+    ("drafts", "split"),
+    [("head", "pipeline"), ("oracle", "pipeline"), ("oracle", "tensor")],
+)
+def test_cluster_lightning_mtp_matches_greedy_decoding(tmp_path, drafts, split):
+    import socket
+
+    from omlx.patches.deepseek_v41.convert import convert
+
+    tensor = {"moe_inter_dim": 64, "o_lora_rank": 32} if split == "tensor" else {}
+    source, _ = write_checkpoint(
+        tmp_path,
+        **tensor,
+        preserve_mtp=True,
+        n_mtp_layers=3,
+        dspark_block_size=3,
+        dspark_noise_token_id=2,
+        dspark_target_layer_ids=(2, 3, 4),
+        dspark_n_routed_experts=2,
+        dspark_n_activated_experts=1,
+        dspark_markov_rank=32,
+        compress_ratios=(0, 2, 2, 1, 1, 0, 0, 0),
+    )
+    target = tmp_path / "converted"
+    convert(source, target, preserve_mtp=True)
+    if tensor:
+        pack_split_projections(target)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    run_two_ranks(tmp_path, _MTP_RANK, target, port, drafts, split)

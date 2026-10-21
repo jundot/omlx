@@ -903,3 +903,28 @@ async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
             assert exc.value.status_code == 422
 
     manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_type,accepted", [("qwen3_5", True), ("gemma4", False)])
+async def test_paroquant_dflash_allows_only_qwen_targets(
+    tmp_path, model_type, accepted
+):
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = model_type
+    entry.engine_type = "vlm"
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization_config": {"quant_method": "paroquant"}})
+    )
+    settings = ModelSettings()
+    request = admin_routes.ModelSettingsRequest(dflash_enabled=True)
+
+    if accepted:
+        await _update_settings(pool, settings, request)
+        assert settings.dflash_enabled is True
+    else:
+        with pytest.raises(HTTPException) as exc:
+            await _update_settings(pool, settings, request)
+        assert exc.value.status_code == 400
+        assert exc.value.detail == admin_routes._PAROQUANT_REASON

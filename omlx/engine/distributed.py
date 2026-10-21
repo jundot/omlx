@@ -13,6 +13,7 @@ import subprocess
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -137,6 +138,39 @@ def _reasoning_effort_retry_payloads(
     return variants
 
 
+def _with_model_mtp(
+    deployment: ClusterDeployment, model_settings: Any | None
+) -> ClusterDeployment:
+    """The deployment with the model's Lightning MTP setting applied.
+
+    The plan decides whether rank zero has room for the draft head; the model
+    settings decide whether to use it and at which depth.
+    """
+
+    execution = deployment.execution
+    wanted = bool(getattr(model_settings, "mtp_enabled", False))
+    if wanted and not execution.mtp:
+        logger.warning(
+            "Lightning MTP is enabled for %s, but its cluster plan has no room "
+            "for the draft head; activate the cluster again to use it",
+            deployment.model,
+        )
+    if not (wanted and execution.mtp):
+        if not execution.mtp:
+            return deployment
+        return replace(deployment, execution=replace(execution, mtp=False))
+    fixed = getattr(model_settings, "mtp_fixed_depth", None)
+    depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
+    return replace(
+        deployment,
+        execution=replace(
+            execution,
+            mtp_depth=int(depth or 0),
+            mtp_fixed_depth=bool(fixed),
+        ),
+    )
+
+
 class DistributedInferenceError(RuntimeError):
     """A bounded error surfaced when the private rank-zero backend fails."""
 
@@ -209,6 +243,7 @@ class DistributedBatchedEngine(BatchedEngine):
             )
         if abort_drain_timeout < 0 or orphan_reap_grace < 0:
             raise ValueError("distributed abort timeouts must be non-negative")
+        deployment = _with_model_mtp(deployment, model_settings)
         super().__init__(
             model_name=deployment.model,
             trust_remote_code=deployment.trust_remote_code,
@@ -500,7 +535,6 @@ raise SystemExit(2)
             for name in (
                 "dflash_enabled",
                 "specprefill_enabled",
-                "mtp_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
                 "qwen35_ane_prefill_enabled",

@@ -1637,6 +1637,36 @@ class TestSchedulerAbortRequest:
         scheduled, _ = scheduler._schedule_waiting()
         assert scheduled == [request]
 
+    def test_specprefill_deferred_while_plain_request_decoding(
+        self, mock_model, mock_tokenizer
+    ):
+        """The model-wide offset RoPE must not reach live decode rows."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        plain = Request(
+            request_id="plain",
+            prompt="Hi",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+        )
+        scheduler.running["plain"] = plain
+        scheduler.requests["plain"] = plain
+
+        spec = Request(
+            request_id="sp",
+            prompt="Long prompt",
+            sampling_params=SamplingParams(),
+        )
+        spec.specprefill_indices = [0, 1, 2]
+        scheduler.requests["sp"] = spec
+        scheduler.waiting.append(spec)
+
+        scheduled, _ = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert list(scheduler.waiting) == [spec]
+
     def test_abort_nonexistent_request(self, mock_model, mock_tokenizer):
         """Test aborting a non-existent request is silently ignored."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)

@@ -256,16 +256,16 @@ private struct AddFromHFSection: View {
             Text(String(localized: "downloads.mirror.label",
                         defaultValue: "Mirror:",
                         comment: "Inline label preceding the mirror host on the Downloads screen"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textTertiary)
             Text(mirrorHost)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
             if mirrorIsCustom {
                 Text(String(localized: "downloads.mirror.custom",
                             defaultValue: "custom",
                             comment: "Badge shown next to the mirror host when the user has configured a custom endpoint"))
-                    .font(.omlxText(10, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.caption, weight: .medium))
                     .foregroundStyle(theme.blueDot)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
@@ -412,16 +412,16 @@ private struct AddFromMSSection: View {
             Text(String(localized: "downloads.mirror.label",
                         defaultValue: "Mirror:",
                         comment: "Inline label preceding the mirror host on the Downloads screen"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textTertiary)
             Text(mirrorHost)
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
             if mirrorIsCustom {
                 Text(String(localized: "downloads.mirror.custom",
                             defaultValue: "custom",
                             comment: "Badge shown next to the mirror host when the user has configured a custom endpoint"))
-                    .font(.omlxText(10, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.caption, weight: .medium))
                     .foregroundStyle(theme.blueDot)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
@@ -508,7 +508,7 @@ private struct SearchDropdown: View {
                     Text(String(localized: "downloads.search.loading",
                                 defaultValue: "Searching…",
                                 comment: "Placeholder shown inside the autocomplete dropdown while a search is in flight"))
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textTertiary)
                     Spacer()
                 }
@@ -574,7 +574,7 @@ private struct SearchDropdown: View {
                 .foregroundStyle(theme.textTertiary)
             VStack(alignment: .leading, spacing: 1) {
                 Text(m.repoId)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.text)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -643,26 +643,26 @@ private struct ActiveDownloadsSection: View {
                                     .font(.system(size: 12))
                                     .foregroundStyle(theme.blueDot)
                                 Text(task.ggufFilesText.map { "\(task.repoId) · \($0)" } ?? task.repoId)
-                                    .font(.omlxMono(12))
+                                    .font(.omlxMono(DesignTokens.FontSize.callout))
                                     .foregroundStyle(theme.text)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                                 Spacer(minLength: 4)
                                 if let speed = task.speedText {
                                     Text(speed)
-                                        .font(.omlxMono(11))
+                                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                         .foregroundStyle(theme.blueDot)
                                 }
                                 Text(String(localized: "downloads.progress.bytes",
                                             defaultValue: "\(Int(task.progress))% · \(formatBytes(task.downloadedSize)) of \(formatBytes(task.totalSize))",
                                             comment: "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes"))
-                                    .font(.omlxMono(11))
+                                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                     .foregroundStyle(theme.textSecondary)
                                 if let eta = task.etaText {
                                     Text(String(localized: "downloads.progress.eta",
                                                 defaultValue: "\(eta) left",
                                                 comment: "Remaining download time after the progress line. Placeholder: duration such as 2h 30m"))
-                                        .font(.omlxMono(11))
+                                        .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                         .foregroundStyle(theme.textSecondary)
                                 }
                                 Button {
@@ -762,7 +762,7 @@ private struct CompletedTasksSection: View {
                         HStack(spacing: 8) {
                             StatusChip(task: task)
                             Text(task.ggufFilesText.map { "\(task.repoId) · \($0)" } ?? task.repoId)
-                                .font(.omlxMono(12))
+                                .font(.omlxMono(DesignTokens.FontSize.callout))
                                 .foregroundStyle(theme.text)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
@@ -850,7 +850,7 @@ private struct SuggestedSection: View {
                         Text(String(localized: "downloads.suggested.loading",
                                     defaultValue: "Loading recommendations…",
                                     comment: "Placeholder shown while the recommended-models list is fetching"))
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.callout))
                             .foregroundStyle(theme.textSecondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -861,7 +861,7 @@ private struct SuggestedSection: View {
                     Text(String(localized: "downloads.suggested.empty",
                                 defaultValue: "No suggestions available right now.",
                                 comment: "Empty-state message for the Suggested Models section"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 14)
@@ -876,12 +876,12 @@ private struct SuggestedSection: View {
                                      gradient: SquircleGradient.models)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(m.repoId)
-                                    .font(.omlxText(13, weight: .medium))
+                                    .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                                     .foregroundStyle(theme.text)
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                                 Text(secondaryLine(for: m))
-                                    .font(.omlxMono(11))
+                                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                     .foregroundStyle(theme.textSecondary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)

@@ -352,7 +352,7 @@
                                 <div class="flex items-center justify-between">
                                     <div class="flex items-center gap-3">
                                         <div class="w-10 h-10 rounded-xl flex items-center justify-center"
-                                             :class="r.accuracy >= 0.7 ? 'bg-green-50 text-green-600' : r.accuracy >= 0.4 ? 'bg-amber-50 text-amber-600' : 'bg-red-50 text-red-600'">
+                                             :class="r.accuracy >= 0.7 ? 'bg-green-50 text-green-700' : r.accuracy >= 0.4 ? 'bg-amber-50 text-amber-700' : 'bg-red-50 text-red-600'">
                                             <i data-lucide="target" class="w-5 h-5"></i>
                                         </div>
                                         <div>
@@ -372,7 +372,7 @@
                                     <div class="text-right">
                                         <div x-show="r.external" class="text-caption uppercase tracking-wide text-neutral-400 mb-0.5">{{ t('acc_bench.results.total_accuracy') }}</div>
                                         <span class="text-2xl font-bold tabular-nums"
-                                              :class="r.accuracy >= 0.7 ? 'text-green-600' : r.accuracy >= 0.4 ? 'text-amber-600' : 'text-red-600'"
+                                              :class="r.accuracy >= 0.7 ? 'text-green-700' : r.accuracy >= 0.4 ? 'text-amber-700' : 'text-red-600'"
                                               x-text="(r.accuracy * 100).toFixed(1) + '%'"></span>
                                     </div>
                                 </div>
@@ -381,9 +381,9 @@
                                 <div x-show="r.upload" x-cloak class="mt-3 flex items-center gap-1.5 text-xs flex-wrap">
                                     <template x-if="r.upload && r.upload.url && !r.upload.error">
                                         <span class="inline-flex items-center gap-1.5 flex-wrap">
-                                            <i data-lucide="check-circle" class="w-3.5 h-3.5" :class="r.upload.duplicate ? 'text-amber-500' : 'text-green-600'"></i>
+                                            <i data-lucide="check-circle" class="w-3.5 h-3.5" :class="r.upload.duplicate ? 'text-amber-500' : 'text-green-700'"></i>
                                             <span x-show="!r.upload.duplicate" class="font-medium text-green-700">{{ t('acc_bench.upload.success') }}</span>
-                                            <span x-show="r.upload.duplicate" class="font-medium text-amber-600">{{ t('acc_bench.upload.duplicate') }}</span>
+                                            <span x-show="r.upload.duplicate" class="font-medium text-amber-700">{{ t('acc_bench.upload.duplicate') }}</span>
                                             <a :href="r.upload.url" target="_blank" rel="noopener"
                                                class="text-neutral-400 hover:text-neutral-700 underline break-all" x-text="r.upload.url"></a>
                                         </span>
@@ -514,7 +514,7 @@
                                                     <tr class="border-b border-neutral-50">
                                                         <td class="py-1 px-2 text-neutral-600" x-text="cat.replace(/_/g, ' ')"></td>
                                                         <td class="py-1 px-2 text-right font-medium tabular-nums"
-                                                            :class="score >= 0.7 ? 'text-green-600' : score >= 0.4 ? 'text-amber-600' : 'text-red-500'"
+                                                            :class="score >= 0.7 ? 'text-green-700' : score >= 0.4 ? 'text-amber-700' : 'text-red-500'"
                                                             x-text="(score * 100).toFixed(1) + '%'"></td>
                                                     </tr>
                                                 </template>

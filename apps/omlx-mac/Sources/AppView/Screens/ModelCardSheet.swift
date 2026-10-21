@@ -143,13 +143,13 @@ struct ModelCardSheet: View {
         HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(target.repoId)
-                    .font(.omlxText(15, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.title3, weight: .semibold))
                     .foregroundStyle(theme.text)
                     .textSelection(.enabled)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(target.source.displayName)
-                    .font(.omlxText(11, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
                     .textCase(.uppercase)
                     .kerning(0.6)
@@ -304,7 +304,7 @@ struct ModelCardSheet: View {
             Image(systemName: symbol)
                 .font(.system(size: 10, weight: .medium))
             Text(CountFormat.compact(value))
-                .font(.omlxMono(11))
+                .font(.omlxMono(DesignTokens.FontSize.subheadline))
         }
         .foregroundStyle(theme.textSecondary)
     }
@@ -319,7 +319,7 @@ struct ModelCardSheet: View {
             Text(String(localized: "downloads.card.lora_warning",
                         defaultValue: "This is a LoRA adapter. It needs a compatible base model to run — downloading on its own won't load in oMLX.",
                         comment: "Warning banner shown in the model card sheet when the repo is an adapter rather than a full model"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.text)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
@@ -348,7 +348,7 @@ struct ModelCardSheet: View {
                 Text(String(localized: "downloads.card.empty",
                             defaultValue: "This model doesn't ship a README.",
                             comment: "Empty state shown when the upstream repo has no model card"))
-                    .font(.omlxText(13))
+                    .font(.omlxText(DesignTokens.FontSize.body))
                     .foregroundStyle(theme.textSecondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -381,7 +381,7 @@ struct ModelCardSheet: View {
                 if target.source == .huggingFace, dto.isAdapter != true, dto.unsupportedReason == nil,
                    dto.layout == "safetensors" || dto.layout == "gguf" {
                     Text(dto.layout == "safetensors" ? checkpointFilesHint : ggufFilesHint)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.horizontal, 20)
@@ -414,7 +414,7 @@ struct ModelCardSheet: View {
                 .disabled(isLocked(file))
             }
             Text(file.name)
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.text)
                 .textSelection(.enabled)
                 .lineLimit(1)
@@ -435,7 +435,7 @@ struct ModelCardSheet: View {
             }
             if let s = file.sizeFormatted, !s.isEmpty {
                 Text(s)
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textSecondary)
             }
         }
@@ -513,7 +513,7 @@ struct ModelCardSheet: View {
 
     private func tagPill(_ tag: String) -> some View {
         Text(tag)
-            .font(.omlxMono(11))
+            .font(.omlxMono(DesignTokens.FontSize.subheadline))
             .foregroundStyle(theme.textSecondary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
@@ -532,7 +532,7 @@ struct ModelCardSheet: View {
                 .font(.system(size: 28, weight: .light))
                 .foregroundStyle(theme.textTertiary)
             Text(message)
-                .font(.omlxText(13))
+                .font(.omlxText(DesignTokens.FontSize.body))
                 .foregroundStyle(theme.textSecondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -567,7 +567,7 @@ struct ModelCardSheet: View {
                 // off a download that won't load.
                 if let reason = dto.unsupportedReason, !reason.isEmpty {
                     Text(reason)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.warningText)
                         .fixedSize(horizontal: false, vertical: true)
                 } else if target.source == .huggingFace {
@@ -607,7 +607,7 @@ struct ModelCardSheet: View {
             Text(String(localized: "downloads.card.not_enough_space",
                         defaultValue: "Not enough free space in the model folder",
                         comment: "Warning beside the download buttons when the selection does not fit on disk"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.redDot)
         }
         Button(String(localized: "downloads.card.cancel",
@@ -665,7 +665,7 @@ struct ModelCardSheet: View {
             Text(String(localized: "downloads.card.loading",
                         defaultValue: "Loading model card…",
                         comment: "Status text shown while the model README is being fetched"))
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -679,10 +679,10 @@ struct ModelCardSheet: View {
             Text(String(localized: "downloads.card.error",
                         defaultValue: "Couldn't load model card",
                         comment: "Title shown in the model card sheet when the fetch failed"))
-                .font(.omlxText(13, weight: .semibold))
+                .font(.omlxText(DesignTokens.FontSize.body, weight: .semibold))
                 .foregroundStyle(theme.text)
             Text(message)
-                .font(.omlxText(11))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
                 .multilineTextAlignment(.center)
                 .textSelection(.enabled)

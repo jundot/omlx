@@ -1305,6 +1305,10 @@ def build_mlx_launch_argv(
         argv.append("--sampling-rank-only")
     if deployment.execution.async_overlap:
         argv.append("--async-overlap")
+    if deployment.execution.mtp:
+        argv.extend(["--mtp", "--mtp-depth", str(deployment.execution.mtp_depth)])
+        if deployment.execution.mtp_fixed_depth:
+            argv.append("--mtp-fixed-depth")
     if deployment.trust_remote_code:
         argv.append("--trust-remote-code")
     return argv

@@ -96,6 +96,23 @@ def _write_draft(path: Path, text=None) -> Path:
     return path
 
 
+def _add_optiq_vision(model: Path) -> dict:
+    """OptiQ's layout: the vision tower in optiq/, listed by the index, and no
+    processor file. Returns the index's weight map."""
+    config = json.loads((model / "config.json").read_text())
+    vision = {"patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2}
+    (model / "config.json").write_text(json.dumps({**config, "vision_config": vision}))
+    (model / "optiq").mkdir()
+    (model / "optiq" / "optiq_vision.safetensors").write_bytes(b"0" * 512)
+    weight_map = {
+        "lm_head.weight": "model.safetensors",
+        "vision_tower.blocks.0.attn.qkv.weight": "optiq/optiq_vision.safetensors",
+    }
+    index = model / "model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": weight_map}))
+    return weight_map
+
+
 def _fake_launcher(path: Path, version: str = "1.3.1", body: str = "exit 0\n") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -451,6 +468,32 @@ class TestStaging:
         staged = stage_model(snapshot, "omlx/m", tmp_path / "hub")
 
         assert (staged / "config.json").resolve().parent == blobs.resolve()
+
+    def test_optiq_layout_stages_as_splash_reads_it(self, tmp_path):
+        # Splash refuses index shards outside the snapshot root and a vision
+        # checkpoint without a processor file.
+        model = _write_model(tmp_path / "m")
+        weight_map = _add_optiq_vision(model)
+
+        snapshot = stage_model(model, "omlx/m", tmp_path / "hub")
+
+        index = snapshot / "model.safetensors.index.json"
+        assert not index.is_symlink()
+        assert set(json.loads(index.read_text())["weight_map"].values()) == {
+            "model.safetensors",
+            "optiq-optiq_vision.safetensors",
+        }
+        sidecar = (model / "optiq" / "optiq_vision.safetensors").resolve()
+        assert (snapshot / "optiq-optiq_vision.safetensors").resolve() == sidecar
+        assert json.loads((snapshot / "preprocessor_config.json").read_text()) == {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+        }
+        model_index = json.loads((model / "model.safetensors.index.json").read_text())
+        assert model_index["weight_map"] == weight_map
 
 
 # -- request translation -----------------------------------------------------------
@@ -1513,6 +1556,15 @@ class TestMemoryEstimate:
         # Splash caps context at 256K, and no limit means the whole window.
         assert splash_memory_estimate(model, draft, None, "int8") == int8
         assert splash_memory_estimate(model, draft, 10**6, "int8") == int8
+
+    def test_counts_a_vision_tower_in_a_subdirectory(self, tmp_path):
+        model = _write_model(tmp_path / "m")
+        draft = _write_draft(tmp_path / "draft")
+        before = splash_memory_estimate(model, draft, 1024, "int8")
+
+        _add_optiq_vision(model)
+
+        assert splash_memory_estimate(model, draft, 1024, "int8") == before + 512
 
 
 class TestProcessMemory:

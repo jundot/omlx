@@ -15,9 +15,11 @@ from omlx.cluster.planner import (
     apply_pipeline_assignment,
     inspect_safetensors_layout,
     install_unequal_pipeline_plan,
+    plan_hybrid,
     plan_proportional_pipeline,
     plan_unequal_pipeline,
     synthetic_model_layout,
+    with_mtp_head,
 )
 
 GIB = 1024**3
@@ -154,6 +156,62 @@ def test_vision_tower_weights_are_not_charged_to_decoder_layers(tmp_path):
 
     assert layout.fixed_weight_bytes == 100
     assert layout.layer_weight_bytes == (500, 400)
+
+
+def test_lightning_mtp_head_is_measured_apart_and_charged_to_rank_zero(
+    tmp_path, monkeypatch
+):
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.draft_test",
+        types.SimpleNamespace(
+            CLUSTER_UNLOADED_WEIGHT_PREFIXES=("mtp.",),
+            CLUSTER_MTP_WEIGHT_PREFIXES=("mtp.",),
+        ),
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "draft_test", "num_hidden_layers": 2})
+    )
+    _write_safetensors(
+        tmp_path / "model.safetensors",
+        [
+            ("model.layers.0.weight", 500),
+            ("model.layers.1.weight", 400),
+            ("mtp.fc.weight", 300),
+        ],
+    )
+    layout = inspect_safetensors_layout(tmp_path)
+    assert layout.layer_weight_bytes == (500, 400)
+    assert layout.mtp_weight_bytes == 300
+    assert ModelLayout.from_dict(layout.to_dict()) == layout
+    # Plans without the head keep their serialized form, and so their hash.
+    assert "mtp_weight_bytes" not in ModelLayout("plain", 0, (1,)).to_dict()
+
+    model = ModelLayout(
+        "draft",
+        0,
+        (10 * GIB,) * 8,
+        tensor_parallel_heads=8,
+        mtp_weight_bytes=5 * GIB,
+    )
+    nodes = [
+        NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
+        NodeBudget(node_id="mobile", capacity_bytes=256 * GIB, rank=1),
+    ]
+    # Rank zero holds the last layers, so the head rides on the last one.
+    studio, mobile = plan_unequal_pipeline(with_mtp_head(model), nodes).assignments
+    assert studio.layer_weight_bytes - 5 * GIB == 10 * GIB * studio.layer_count
+    assert mobile.layer_weight_bytes == 10 * GIB * mobile.layer_count
+    # Tensor parallelism replicates the head on rank zero only.
+    tp = plan_hybrid(
+        model, nodes, tensor_parallel_size=2, head_rank_extra_bytes=5 * GIB
+    )
+    assert [item.fixed_weight_bytes for item in tp.assignments] == [5 * GIB, 0]
+    with pytest.raises(PlanningError, match="no Lightning MTP head"):
+        with_mtp_head(ModelLayout("plain", 0, (1,)))
 
 
 def test_unequal_planner_gives_more_layers_to_larger_mac():

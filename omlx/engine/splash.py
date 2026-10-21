@@ -116,6 +116,11 @@ SPLASH_FAMILIES: dict[str, dict[str, Any]] = {
     },
 }
 _REQUIRED_MODEL_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json")
+_SHARD_INDEX = "model.safetensors.index.json"
+# Splash serves vision only with one of these from the target repository.
+_PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
+# The one image normalization Splash runs ([-1, 1]), which both families use.
+_SPLASH_IMAGE_NORM = [0.5, 0.5, 0.5]
 # The DFlash2 draft Splash pairs with each family (its install/families.py).
 SPLASH_DRAFT_REPOS = {
     "Qwen3.8-27B": "incoai/Qwen3.8-27B-DFlash2",
@@ -289,13 +294,16 @@ def _read_json_cached(path: str, _mtime_ns: int) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _read_config(model_path: Path) -> dict | None:
-    path = model_path / "config.json"
+def _read_json(path: Path) -> dict | None:
     try:
         mtime = path.stat().st_mtime_ns
     except OSError:
         return None
     return _read_json_cached(str(path), mtime)
+
+
+def _read_config(model_path: Path) -> dict | None:
+    return _read_json(model_path / "config.json")
 
 
 def splash_family(config: dict) -> str | None:
@@ -481,6 +489,24 @@ def _safetensors_bytes(path: Path) -> int:
     return sum(f.stat().st_size for f in path.glob("*.safetensors"))
 
 
+def _nested_shards(model_path: Path) -> list[str]:
+    """Shards the index keeps in a subdirectory, as OptiQ does its vision
+    tower (``optiq/optiq_vision.safetensors``), that are on disk."""
+    weight_map = (_read_json(model_path / _SHARD_INDEX) or {}).get("weight_map")
+    if not isinstance(weight_map, dict):
+        return []
+    names = {name for name in weight_map.values() if isinstance(name, str)}
+    # Plain relative paths only: Splash refuses the others by name.
+    return sorted(
+        name
+        for name in names
+        if "/" in name
+        and not name.startswith("/")
+        and ".." not in name.split("/")
+        and (model_path / name).is_file()
+    )
+
+
 def _gguf_source(config: dict) -> dict | None:
     """The GGUF a generated model folder links to (omlx/gguf.py), or None."""
     source = config.get("omlx_gguf")
@@ -504,7 +530,8 @@ def _weight_bytes(path: Path) -> int:
     file and the projector Splash pairs it with."""
     source = _gguf_source(_read_config(path) or {})
     if source is None:
-        return _safetensors_bytes(path)
+        nested = sum((path / name).stat().st_size for name in _nested_shards(path))
+        return _safetensors_bytes(path) + nested
     projectors = sorted(source.get("projectors") or [], key=_splash_projector_rank)
     names = [*(source.get("parts") or []), *projectors[:1]]
     return sum((path / name).stat().st_size for name in names)
@@ -569,13 +596,56 @@ def _model_files(model_path: Path) -> list[Path]:
     return sorted(files)
 
 
-def _snapshot_revision(model_path: Path, files: list[Path]) -> str:
-    """A 40-hex revision that changes whenever the model files change."""
+def _snapshot_additions(model_path: Path) -> dict[str, Path | bytes]:
+    """Snapshot entries Splash needs beyond the model files, by name: a file
+    to link, or the bytes to write.
+
+    - Splash takes index shards at the snapshot root only. A shard the index
+      keeps in a subdirectory gets a root link, and the index names the link.
+    - A vision checkpoint without a processor file gets one with the
+      preprocessing Splash runs. Patch and merge sizes come from the vision
+      config, so Splash still refuses a tower it cannot prepare images for.
+    """
+    additions: dict[str, Path | bytes] = {}
+    nested = _nested_shards(model_path)
+    if nested:
+        index = _read_json(model_path / _SHARD_INDEX)
+        flat = {name: name.replace("/", "-") for name in nested}
+        additions.update({flat[name]: model_path / name for name in nested})
+        weight_map = {
+            key: flat.get(name, name) for key, name in index["weight_map"].items()
+        }
+        index = {**index, "weight_map": weight_map}
+        additions[_SHARD_INDEX] = json.dumps(index, indent=2).encode()
+    config = _read_config(model_path) or {}
+    if splash_has_vision(config) and not any(
+        (model_path / name).is_file() for name in _PROCESSOR_FILES
+    ):
+        vision = config["vision_config"]
+        processor = {
+            "patch_size": vision.get("patch_size"),
+            "temporal_patch_size": vision.get("temporal_patch_size"),
+            "merge_size": vision.get("spatial_merge_size"),
+            "image_mean": _SPLASH_IMAGE_NORM,
+            "image_std": _SPLASH_IMAGE_NORM,
+        }
+        additions["preprocessor_config.json"] = json.dumps(processor).encode()
+    return additions
+
+
+def _snapshot_revision(
+    model_path: Path, files: list[Path], additions: dict[str, Path | bytes]
+) -> str:
+    """A 40-hex revision that changes whenever the model files or the
+    snapshot additions change."""
     digest = hashlib.sha1(str(model_path.resolve()).encode())
     for path in files:
         stat = path.stat()
         relative = path.relative_to(model_path)
         digest.update(f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
+    for name, source in sorted(additions.items()):
+        data = source if isinstance(source, bytes) else str(source).encode()
+        digest.update(name.encode() + b"\0" + data + b"\n")
     return digest.hexdigest()
 
 
@@ -583,15 +653,17 @@ def stage_model(model_path: Path, repo_id: str, hub_dir: Path) -> Path:
     """Present ``model_path`` to Splash as a cached snapshot of ``repo_id``.
 
     Builds ``<hub_dir>/models--<owner>--<repo>/snapshots/<rev>`` from
-    symlinks to the model files and points ``refs/main`` at it, which is
-    what an offline Splash resolves. A link that resolves into a Hub cache
-    ``blobs/`` file spares Splash hashing that file.
+    symlinks to the model files and the additions Splash needs
+    (_snapshot_additions), and points ``refs/main`` at it, which is what an
+    offline Splash resolves. A link that resolves into a Hub cache ``blobs/``
+    file spares Splash hashing that file.
 
     Returns:
         The snapshot directory.
     """
     files = _model_files(model_path)
-    revision = _snapshot_revision(model_path, files)
+    additions = _snapshot_additions(model_path)
+    revision = _snapshot_revision(model_path, files, additions)
     repo_dir = hub_dir / ("models--" + repo_id.replace("/", "--"))
     snapshots = repo_dir / "snapshots"
     snapshot = snapshots / revision
@@ -602,6 +674,14 @@ def stage_model(model_path: Path, repo_id: str, hub_dir: Path) -> Path:
             link = partial / path.relative_to(model_path)
             link.parent.mkdir(parents=True, exist_ok=True)
             link.symlink_to(path.resolve())
+        for name, source in additions.items():
+            entry = partial / name
+            if isinstance(source, bytes):
+                # Replace the link: writing through it changes the model file.
+                entry.unlink(missing_ok=True)
+                entry.write_bytes(source)
+            else:
+                entry.symlink_to(source.resolve())
         partial.rename(snapshot)
     for stale in snapshots.iterdir():
         if stale.name != revision:

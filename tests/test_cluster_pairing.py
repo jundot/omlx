@@ -436,6 +436,28 @@ def test_unpair_revokes_everything(tmp_path):
     assert joiner.paired_devices() == []
 
 
+def test_forget_route_unpairs_through_the_real_manager(tmp_path, monkeypatch):
+    from omlx.cluster import routes
+
+    coordinator, joiner, _, _, _ = _loopback_pair(tmp_path)
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator.approve("join-node", code)
+    joiner.complete_join(joiner.poll_join("coordinator.local:8080"))
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: coordinator)
+    monkeypatch.setattr(
+        routes, "get_cluster_registry", lambda: SimpleNamespace(list=lambda: [])
+    )
+    app = FastAPI()
+    app.include_router(routes.router)
+
+    response = TestClient(app).delete("/admin/api/cluster/forget?node_id=join-node")
+
+    assert response.status_code == 200
+    assert response.json()["forgotten_node_ids"] == ["join-node"]
+    assert coordinator.paired_devices() == []
+
+
 def test_unpair_unknown_device_fails_closed(tmp_path):
     coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator")
     with pytest.raises(PairingStateError, match="unknown device"):

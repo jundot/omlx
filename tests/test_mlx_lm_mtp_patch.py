@@ -221,6 +221,102 @@ class TestMtpBoundaryCommit:
         assert state.copy_drafts is False
 
 
+class _RecordedControlPlane:
+    """Rank zero's broadcasts, replayed in order to a rank run after it."""
+
+    def __init__(self, messages, *, leader):
+        self.messages = messages
+        self.leader = leader
+
+    def broadcast_object(self, obj):
+        if self.leader:
+            self.messages.append(obj)
+            return obj
+        return self.messages.pop(0)
+
+
+class TestClusterMtpReplay:
+    def test_follower_replays_rank_zero_inputs_acceptance_and_seed(self, monkeypatch):
+        from omlx.cluster.mtp_sync import ClusterMtpSync
+
+        messages = []
+        leader = SimpleNamespace(
+            _omlx_cluster_mtp=ClusterMtpSync(
+                rank=0, control_plane=_RecordedControlPlane(messages, leader=True)
+            )
+        )
+        follower = SimpleNamespace(
+            _omlx_cluster_mtp=ClusterMtpSync(
+                rank=1, control_plane=_RecordedControlPlane(messages, leader=False)
+            )
+        )
+        # Rank zero rejects its second draft; the follower's own logits would
+        # accept all three, but only rank zero's verdict may count.
+        targets = {id(leader): [1, 9, 7, 20], id(follower): [1, 2, 3, 20]}
+        seen_inputs, rollbacks, drafted, seeds = {}, {}, [], []
+
+        def fake_backbone(model, inputs, _cache, **_kwargs):
+            seen_inputs[id(model)] = inputs.tolist()
+            rows = []
+            for target in targets[id(model)]:
+                row = [-100.0] * 32
+                row[target] = 0.0
+                rows.append(row)
+            return mx.array([rows]), mx.zeros((1, 4, 8)), None
+
+        def fake_rollback(model, _cache, accepted, num_drafts, _gdn_states):
+            rollbacks[id(model)] = (accepted, num_drafts)
+            return True
+
+        monkeypatch.setattr(bg, "_call_backbone", fake_backbone)
+        monkeypatch.setattr(bg, "_chain_rollback", fake_rollback)
+        monkeypatch.setattr(
+            bg, "_chain_next_drafts", lambda batch, *a, **k: drafted.append(batch)
+        )
+        monkeypatch.setattr(mx.random, "seed", seeds.append)
+
+        def run(model, state):
+            batch = SimpleNamespace(
+                model=model,
+                prompt_cache=[SimpleNamespace()],
+                tokens=[[4, 5]],
+                samplers=[None],
+                fallback_sampler=lambda lp: mx.argmax(lp, axis=-1),
+                logits_processors=[],
+                _token_context=[],
+                max_tokens=[1000],
+                _num_tokens=[0],
+                _matchers=[SimpleNamespace(advance=lambda token: False)],
+            )
+            bg._run_verify_cycle_chain(batch, state)
+            return batch
+
+        lead_state = bg._MtpState(
+            uid=1,
+            chain=True,
+            depth=3,
+            mtp_cache=[],
+            next_main=mx.array([15], dtype=mx.uint32),
+            drafts=mx.array([1, 2, 3], dtype=mx.uint32),
+            draft_lps=[mx.zeros((32,))] * 3,
+        )
+        lead_batch = run(leader, lead_state)
+        follow_state = bg._MtpState(
+            uid=1, chain=True, depth=3, next_main=mx.array([15], dtype=mx.uint32)
+        )
+        run(follower, follow_state)
+
+        assert messages == []
+        assert seen_inputs[id(follower)] == seen_inputs[id(leader)] == [[15, 1, 2, 3]]
+        assert [item[0] for item in follow_state.queue] == [1, 9]
+        assert [item[0] for item in lead_state.queue] == [1, 9]
+        assert rollbacks[id(follower)] == rollbacks[id(leader)] == (1, 3)
+        assert follow_state.next_main.tolist() == [9]
+        assert follow_state.drafts is None
+        assert drafted == [lead_batch]
+        assert len(seeds) == 2 and seeds[0] == seeds[1]
+
+
 class TestQwen35Model:
     @pytest.fixture(autouse=True)
     def _apply(self):

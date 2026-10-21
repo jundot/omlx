@@ -63,10 +63,12 @@ class EmbeddingRequest(BaseModel):
     - "base64": Returns a base64-encoded string of little-endian floats
     """
 
-    dimensions: Optional[int] = None
+    dimensions: Optional[int] = Field(default=None, gt=0)
     """
     The number of dimensions the output embeddings should have.
     Only supported by some models. If not supported, returns full dimensions.
+    Must be positive: 0 inconsistently returned the full vector and negative
+    values truncated from the end instead of being rejected.
     """
 
     max_length: Optional[int] = Field(default=None, gt=0)

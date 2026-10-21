@@ -764,6 +764,7 @@ async def _run_single_test(
             max_tokens=max_tokens,
             temperature=0.0,
             top_p=1.0,
+            ignore_eos=True,
             skip_cache_store=True,
             benchmark_trace=True,
             benchmark_ane_sequence_length=int(
@@ -1095,6 +1096,7 @@ async def _run_batch_test(
         max_tokens=max_tokens,
         temperature=0.0,
         top_p=1.0,
+        ignore_eos=True,
     )
 
     async def _single_request(prompt: list[int]) -> dict:

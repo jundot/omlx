@@ -42,9 +42,16 @@ class DSparkMixin:
     def args(self):
         return self._config
 
-    def configure_mtp(self, enabled, depth=5):
-        if enabled and not self._config.preserve_mtp:
+    def configure_mtp(self, enabled, depth=5, *, verify_only=False):
+        """Arm DSpark decoding.
+
+        ``verify_only`` is a cluster rank without the draft head: it runs the
+        verify forwards and rollbacks rank zero chose, but never captures
+        target taps or drafts.
+        """
+        if enabled and not verify_only and not self._config.preserve_mtp:
             raise ValueError("DSpark decoding requires preserved MTP weights")
+        self._omlx_mtp_verify_only = bool(enabled and verify_only)
         self._omlx_mtp_decode_enabled = bool(enabled)
         self._omlx_dspark_decode_enabled = bool(enabled)
         self._omlx_mtp_chain = True
@@ -55,7 +62,9 @@ class DSparkMixin:
         # One-token decode then runs the kernels of verify blocks (decode_fused), so a
         # verified draft gets the logits that decoding it alone gives.
         for layer in getattr(self, "layers", ()):
-            object.__setattr__(layer, "_omlx_verify_exact", bool(enabled))
+            # A pipeline stage holds None in place of other ranks' layers.
+            if layer is not None:
+                object.__setattr__(layer, "_omlx_verify_exact", bool(enabled))
 
     def make_mtp_depth_controller(self, depth):
         return AcceptanceDepthController(depth)
@@ -149,9 +158,11 @@ class DSparkMixin:
         target_verify = kwargs.pop("target_verify", False)
         n_confirmed = kwargs.pop("n_confirmed", 0)
         verify = bool(target_verify or n_confirmed)
-        active = getattr(self, "_omlx_dspark_decode_enabled", False)
+        verify_only = getattr(self, "_omlx_mtp_verify_only", False)
+        active = getattr(self, "_omlx_dspark_decode_enabled", False) and not verify_only
         capture_dspark = kwargs.pop("return_dspark_hidden", False)
-        capture = return_hidden or bool(capture_dspark)
+        # A verify-only rank may not hold the target layers the taps come from.
+        capture = (return_hidden or bool(capture_dspark)) and not verify_only
         if kwargs.get("_ced_prefill", False) and self._config.ced_prefill:
             if input_ids.shape[0] != 1:
                 raise ValueError("CED scheduler prefill requires one request row")
@@ -182,4 +193,6 @@ class DSparkMixin:
             # using the existing absolute-position prompt-capture contract.
             capture_prompt(self, input_ids[:, -hidden.shape[1] :], hidden, cache)
             return logits
+        if verify_only and return_hidden:
+            return result, None
         return result

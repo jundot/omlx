@@ -90,6 +90,13 @@ class TestIntegrationRegistry:
         assert get_integration("nonexistent") is None
 
 
+class TestIntegrationContextBaseUrl:
+    def test_base_url_brackets_bare_ipv6_literal(self):
+        assert ctx(host="::1").base_url == "http://[::1]:8000"
+        assert ctx(host="[::1]").base_url == "http://[::1]:8000"
+        assert ctx(host="192.168.1.100").base_url == "http://192.168.1.100:8000"
+
+
 class TestIntegrationCommands:
     def test_commands_quote_full_app_cli_prefix(self):
         with patch(

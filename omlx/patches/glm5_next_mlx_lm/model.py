@@ -19,8 +19,14 @@ from mlx_lm.models.pipeline import PipelineMixin
 from omlx.cluster.pipeline_compat import _cache_dependency
 from omlx.model_discovery import _VISION_WEIGHT_PREFIXES
 from omlx.patches.deepseek_v4.switch_layers import install_nvfp4_global_scales
+from omlx.patches.mlx_lm_mtp import is_mtp_active
 from omlx.patches.mlx_vlm_glm5_next_compat import (
     apply_mlx_vlm_glm5_next_compat_patch,
+)
+from omlx.patches.mlx_vlm_mtp import (
+    glm5_next_vlm_runtime,
+    is_mtp_attach_enabled,
+    set_mtp_attach_enabled,
 )
 from omlx.utils.layer_pipeline import LayerPipeline
 
@@ -34,6 +40,10 @@ from mlx_vlm.models.glm5_next.config import ModelConfig, TextConfig  # noqa: E40
 # config. The inherited PipelineMixin.pipeline is the one the worker replaces
 # with the planner's split, so the assignment contract is found there.
 SUPPORTS_PIPELINE = True
+# The Lightning MTP head. Only rank zero, which drafts, loads it, and only when
+# the plan enables MTP; the planner charges it there.
+CLUSTER_UNLOADED_WEIGHT_PREFIXES = ("language_model.mtp.",)
+CLUSTER_MTP_WEIGHT_PREFIXES = ("language_model.mtp.",)
 
 
 class ModelArgs(ModelConfig):
@@ -67,13 +77,26 @@ class PipelinedTextModel(_language.Glm5NextModel, PipelineMixin):
     pipeline_size = 1
     start_idx = 0
     end_idx = None
+    # Set with Lightning MTP: rank zero primes its head from the output of a
+    # prefill chunk that the caller discards. Every rank then evaluates the
+    # collectives behind that output (the final gather, a tensor-parallel
+    # layer's last all_sum) with its cache, or rank zero waits on them alone.
+    _omlx_output_in_cache = False
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Any = None,
         inputs_embeds: mx.array | None = None,
+        gdn_sink: list | None = None,
+        hidden_sink: list | None = None,
+        capture_layer_ids: list[int] | None = None,
+        capture_sink: list | None = None,
     ) -> mx.array:
+        # The sinks are the Lightning MTP verify contract of the vendored
+        # runtime patch; block drafters do not run on cluster ranks.
+        if capture_layer_ids:
+            raise NotImplementedError("cluster ranks do not capture drafter layers")
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
@@ -119,10 +142,13 @@ class PipelinedTextModel(_language.Glm5NextModel, PipelineMixin):
             else 0
         )
         n_layers = len(layers)
-        defer = h.shape[:2] == (1, 1)
+        defer = gdn_sink is None and h.shape[:2] == (1, 1)
         for i, (layer, c) in enumerate(zip(layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
-            if defer:
+            if gdn_sink is not None:
+                # KDA layers record their verify inputs for the rollback.
+                h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
+            elif defer:
                 # The last layer of a stage returns an array, not a deferral.
                 h = layer(h, mask=mask, cache=c, defer=i + 1 < n_layers)
             else:
@@ -146,7 +172,38 @@ class PipelinedTextModel(_language.Glm5NextModel, PipelineMixin):
         h = h.mean(axis=2)
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h.astype(boundary_dtype))[: h.shape[0]]
-        return self.norm(h)
+        if hidden_sink is not None:
+            hidden_sink.append(h)
+        out = self.norm(h)
+        if cache and self._omlx_output_in_cache:
+            _keep_send_in_graph(cache[-1], out)
+        return out
+
+
+def _language_model(args: ModelArgs) -> Any:
+    """The vendored language model, with the MTP head on rank zero only.
+
+    Lightning MTP uses the vendored runtime patch, which adds the head and
+    threads verify state through the layers. Every other rank replays rank
+    zero's verify forwards and rollbacks without the head.
+    """
+
+    mtp = is_mtp_active()
+    if mtp:
+        glm5_next_vlm_runtime.apply()
+    drafts = mtp and mx.distributed.init().rank() == 0
+    attach = is_mtp_attach_enabled()
+    set_mtp_attach_enabled(drafts)
+    try:
+        language_model = _language.LanguageModel(args.text_config, args)
+    finally:
+        set_mtp_attach_enabled(attach)
+    if mtp and not drafts:
+        language_model._omlx_mtp_decode_enabled = True
+        language_model._omlx_mtp_verify_only = True
+        language_model._omlx_mtp_chain = True
+    language_model.model._omlx_output_in_cache = mtp
+    return language_model
 
 
 class Model(nn.Module):
@@ -159,7 +216,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.language_model = _language.LanguageModel(args.text_config, args)
+        self.language_model = _language_model(args)
         # Same instance and parameters, with the pipeline contract added.
         self.language_model.model.__class__ = PipelinedTextModel
 
@@ -168,10 +225,27 @@ class Model(nn.Module):
         inputs: mx.array,
         cache: Any = None,
         skip_logits: bool = False,
-    ) -> mx.array:
+        **kwargs: Any,
+    ) -> Any:
         if skip_logits:
             return self.language_model.model(inputs, cache=cache)
+        if kwargs:
+            # A Lightning MTP forward (return_hidden, n_confirmed) returns the
+            # vendored output with its hidden and rollback states.
+            return self.language_model(inputs, cache=cache, **kwargs)
         return self.language_model(inputs, cache=cache).logits
+
+    def mtp_forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self.language_model.mtp_forward(*args, **kwargs)
+
+    def make_mtp_cache(self) -> Any:
+        return self.language_model.make_mtp_cache()
+
+    def mtp_clamp_accept(self, cache: Any, accepted: int, num_drafts: int) -> int:
+        return self.language_model.mtp_clamp_accept(cache, accepted, num_drafts)
+
+    def rollback_speculative_cache(self, *args: Any) -> Any:
+        return self.language_model.rollback_speculative_cache(*args)
 
     @property
     def model(self) -> PipelinedTextModel:

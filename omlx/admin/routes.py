@@ -939,14 +939,17 @@ def _paroquant_compat_for_model(model_info: dict) -> tuple[bool, str]:
     return False, ""
 
 
+# ParoQuant targets whose rotated layers are checked on the DFlash verify path.
+_PAROQUANT_DFLASH_MODEL_TYPES = {"qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_moe"}
+
+
 def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     """Resolve dflash compatibility for an engine_pool model dict."""
+    model_type = model_info.get("config_model_type")
     is_paro, paro_reason = _paroquant_compat_for_model(model_info)
-    if is_paro:
+    if is_paro and model_type not in _PAROQUANT_DFLASH_MODEL_TYPES:
         return False, paro_reason
-    return dflash_compatibility(
-        model_info.get("config_model_type"), model_info.get("engine_type")
-    )
+    return dflash_compatibility(model_type, model_info.get("engine_type"))
 
 
 def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list[dict]:
@@ -3150,8 +3153,12 @@ async def update_model_settings(
             False if is_diffusion_model else bool(request.dflash_enabled)
         )
         if new_dflash_enabled:
-            compat_ok, compat_reason = dflash_compatibility(
-                entry.config_model_type, entry.engine_type
+            compat_ok, compat_reason = _dflash_compat_for_model(
+                {
+                    "model_path": entry.model_path,
+                    "config_model_type": entry.config_model_type,
+                    "engine_type": entry.engine_type,
+                }
             )
             if not compat_ok:
                 raise HTTPException(status_code=400, detail=compat_reason)

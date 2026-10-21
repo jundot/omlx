@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from functools import partial, wraps
@@ -36,6 +36,7 @@ from .memory_guard import (
     guard_rank_load,
     watch_rank_load,
 )
+from .mtp_sync import ClusterMtpSync
 from .performance import ExecutionSettings
 from .pipeline_compat import (
     install_pipeline_compatibility,
@@ -54,6 +55,9 @@ from .telemetry import install_server_telemetry
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
 # Bound for the Metal release in the SIGTERM/SIGINT handler before hard exit.
 _SIGNAL_CLEAR_TIMEOUT_SECONDS = 10
+# Same period and idle window as the engine pool's keep-warm ticker.
+_GPU_KEEP_WARM_INTERVAL_SECONDS = 0.5
+_GPU_KEEP_WARM_IDLE_WINDOW_SECONDS = 300.0
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +147,96 @@ def _bind_generation_thread_stream(
         yield
     finally:
         response_generator_type._generate = original_generate
+
+
+@contextmanager
+def _keep_rank_gpu_warm(
+    mx: Any,
+    telemetry: Any,
+    *,
+    interval: float = _GPU_KEEP_WARM_INTERVAL_SECONDS,
+    idle_window: float = _GPU_KEEP_WARM_IDLE_WINDOW_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+):
+    """Keep this rank's GPU out of its idle power state while it serves.
+
+    An idle GPU parks after about a second and then stalls the next command
+    buffer for seconds. A pipeline stage idles while its peers compute, so the
+    stalls chain across stages and decode drops to seconds per token.
+    """
+
+    stop = threading.Event()
+
+    def tick() -> None:
+        stream = mx.new_stream(mx.gpu)
+        last_active = clock()
+        while not stop.wait(interval):
+            now = clock()
+            if telemetry.active_request_count():
+                last_active = now
+            elif now - last_active > idle_window:
+                continue
+            with mx.stream(stream):
+                mx.eval(mx.zeros((1,), dtype=mx.float32) + 1)
+
+    thread = threading.Thread(
+        target=tick,
+        name="omlx-cluster-gpu-keep-warm",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
+
+
+def _mtp_load_settings(args: argparse.Namespace) -> SimpleNamespace | None:
+    """The model settings that make the pre-load patches arm Lightning MTP."""
+
+    if not getattr(args, "mtp", False):
+        return None
+    depth = int(getattr(args, "mtp_depth", 0) or 0) or None
+    fixed = bool(getattr(args, "mtp_fixed_depth", False))
+    return SimpleNamespace(
+        mtp_enabled=True,
+        mtp_fixed_depth=depth if fixed else None,
+        mtp_adaptive_max_depth=None if fixed else depth,
+    )
+
+
+def _arm_cluster_mtp(model: Any, group: Any, rank: int, mx: Any) -> Any:
+    """Give the loaded rank its Lightning MTP decision channel, or none at all.
+
+    Rank zero must hold the draft head and every other rank must replay its
+    verify forwards. One rank short of its role would leave the others running
+    a different forward, so the ranks vote and all serve without MTP instead.
+    """
+
+    host = getattr(model, "language_model", model)
+    if rank == 0:
+        ready = bool(getattr(host, "_omlx_mtp_decode_enabled", False)) and (
+            getattr(host, "mtp", None) is not None
+        )
+    else:
+        ready = bool(getattr(host, "_omlx_mtp_verify_only", False))
+    votes = mx.distributed.all_sum(mx.array(int(ready)), group=group, stream=mx.cpu)
+    if int(votes.item()) != group.size():
+        # configure_mtp also stops rank zero capturing prompts for the head.
+        configure = getattr(host, "configure_mtp", None)
+        if callable(configure):
+            configure(False)
+        host._omlx_mtp_decode_enabled = False
+        logger.warning(
+            "Lightning MTP disabled for this deployment: rank %d %s its role",
+            rank,
+            "holds" if ready else "cannot take",
+        )
+        return None
+    sync = ClusterMtpSync(rank=rank)
+    model._omlx_cluster_mtp = sync
+    return sync
 
 
 def _encode_thinking_marker(tokenizer: Any, text: str) -> list[int] | None:
@@ -270,6 +364,23 @@ def _thinking_budget_token_to_piece(
             return None
     except Exception:
         return None
+
+
+@contextmanager
+def _sample_with_stated_parameters(mlx_server: Any):
+    """Build request samplers that state their temperature and filters.
+
+    Lightning MTP reads them off the sampler to accept drafts. MLX-LM's samplers
+    carry none and read as greedy; oMLX's draw the same way and carry them.
+    """
+    from omlx.utils.sampling import make_sampler
+
+    original = mlx_server.make_sampler
+    mlx_server.make_sampler = make_sampler
+    try:
+        yield
+    finally:
+        mlx_server.make_sampler = original
 
 
 @contextmanager
@@ -542,6 +653,9 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         async_overlap=args.async_overlap,
         ring_connections_per_ip=args.ring_connections_per_ip,
         tuning_reason=args.tuning_reason,
+        mtp=getattr(args, "mtp", False),
+        mtp_depth=getattr(args, "mtp_depth", 0),
+        mtp_fixed_depth=getattr(args, "mtp_fixed_depth", False),
     )
 
 
@@ -1335,7 +1449,7 @@ def run_worker(args: argparse.Namespace) -> int:
             assignments=[_runtime_assignment(item) for item in assignments],
         )
 
-        maybe_apply_pre_load_patches(args.model)
+        maybe_apply_pre_load_patches(args.model, _mtp_load_settings(args))
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
         # moments later. Architectures oMLX patches in (glm_moe_dsa's
@@ -1423,6 +1537,11 @@ def run_worker(args: argparse.Namespace) -> int:
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
+            mtp_sync = (
+                _arm_cluster_mtp(provider.model, group, rank, mx)
+                if execution.mtp
+                else None
+            )
             # Installed first so the runtime optimizations wrap the RDMA-aware send.
             with (
                 install_stage_links(
@@ -1441,6 +1560,20 @@ def run_worker(args: argparse.Namespace) -> int:
                 # Last: the optimizations validate the stock forward's source.
                 wait_for_pipeline_peers_on_host(provider.model),
             ):
+                if mtp_sync is not None:
+                    mtp_reason = (
+                        "rank zero drafts and decides; the other ranks replay "
+                        "its verify cycles"
+                    )
+                elif execution.mtp:
+                    mtp_reason = "a rank could not take its Lightning MTP role"
+                else:
+                    mtp_reason = "the plan or the model settings leave it off"
+                optimizations["lightning_mtp"] = {
+                    "enabled": execution.mtp,
+                    "active": mtp_sync is not None,
+                    "reason": mtp_reason,
+                }
                 marker.update(
                     "ready",
                     load_stage="ready",
@@ -1537,7 +1670,8 @@ def run_worker(args: argparse.Namespace) -> int:
                         on_generation_failed=partial(
                             _exit_on_generation_failure, marker, rank
                         ),
-                    ),
+                    ) as telemetry,
+                    _keep_rank_gpu_warm(mx, telemetry),
                     _bind_generation_thread_stream(
                         ResponseGenerator,
                         mx,
@@ -1547,7 +1681,18 @@ def run_worker(args: argparse.Namespace) -> int:
                         mlx_server,
                         provider.tokenizer,
                     ),
+                    (
+                        _sample_with_stated_parameters(mlx_server)
+                        if mtp_sync is not None
+                        else nullcontext()
+                    ),
                 ):
+                    if mtp_sync is not None:
+                        if control_plane is None:
+                            raise RuntimeError(
+                                "cluster Lightning MTP needs the rank-control channel"
+                            )
+                        mtp_sync.control_plane = control_plane
                     # install_server_telemetry also runs the idle heartbeat for
                     # the length of this block, so "stale" means stalled rather
                     # than "nobody has asked anything for 45 seconds".
@@ -1647,6 +1792,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--tuning-reason",
         default="balanced profile defaults",
     )
+    parser.add_argument("--mtp", action="store_true")
+    parser.add_argument("--mtp-depth", type=int, default=0)
+    parser.add_argument("--mtp-fixed-depth", action="store_true")
     return parser
 
 

@@ -440,6 +440,32 @@ def test_qwen35_ane_prefill_rejected_by_distributed_engine():
         engine._validate_model_settings()
 
 
+def test_model_lightning_mtp_runs_only_when_the_plan_holds_the_head():
+    planned = replace(
+        _deployment(), execution=replace(execution_profile("balanced"), mtp=True)
+    )
+    settings = SimpleNamespace(
+        mtp_enabled=True, mtp_fixed_depth=None, mtp_adaptive_max_depth=4
+    )
+
+    engine = DistributedBatchedEngine(planned, model_settings=settings)
+    engine._validate_model_settings()
+    execution = engine._supervisor.deployment.execution
+    assert (execution.mtp, execution.mtp_depth, execution.mtp_fixed_depth) == (
+        True,
+        4,
+        False,
+    )
+    # Turned off in the model settings, the planned head stays unused.
+    off = DistributedBatchedEngine(
+        planned, model_settings=SimpleNamespace(mtp_enabled=False)
+    )
+    assert not off._supervisor.deployment.execution.mtp
+    # A plan without room for the head cannot run it.
+    unplanned = DistributedBatchedEngine(_deployment(), model_settings=settings)
+    assert not unplanned._supervisor.deployment.execution.mtp
+
+
 @pytest.mark.asyncio
 async def test_distributed_generate_translates_backend_completion():
     def handler(request):

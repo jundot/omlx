@@ -344,6 +344,7 @@ class ChatCompletionRequest(BaseModel):
     ngram_window: int | None = Field(default=None, ge=0)
     max_tokens: Optional[int] = Field(
         default=None,
+        gt=0,
         validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
     )
     stream: bool = False
@@ -497,7 +498,7 @@ class CompletionRequest(BaseModel):
     repetition_context_size: Optional[int] = Field(default=None, gt=0)
     no_repeat_ngram_size: int | None = Field(default=None, ge=0)
     ngram_window: int | None = Field(default=None, ge=0)
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(default=None, gt=0)
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
     # llama.cpp extension: stream prompt_progress chunks during prefill.
