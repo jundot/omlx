@@ -19,12 +19,34 @@ module.exports = {
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
       },
-      // neutral-400 is too light for text (2.52:1 on white); text takes the
-      // 500 step so it meets WCAG AA. Borders and backgrounds keep 400.
-      // Dark mode maps the class to --text-muted in dashboard.css.
+      // Neutral utilities resolve through theme.css, so light and dark share
+      // one definition; dashboard.css supplies the dark channels and the one
+      // dark hover override (hover:text-neutral-700).
+      // Values match the palette steps the classes used before (text-400 took
+      // the 500 step for AA; see #4727).
       textColor: {
         neutral: {
-          400: 'rgb(var(--palette-neutral-500) / <alpha-value>)',
+          300: 'rgb(var(--text-scale-300) / <alpha-value>)',
+          400: 'rgb(var(--text-scale-400) / <alpha-value>)',
+          500: 'rgb(var(--text-scale-500) / <alpha-value>)',
+          600: 'rgb(var(--text-scale-600) / <alpha-value>)',
+          700: 'rgb(var(--text-scale-700) / <alpha-value>)',
+          800: 'rgb(var(--text-scale-800) / <alpha-value>)',
+          900: 'rgb(var(--text-scale-900) / <alpha-value>)',
+        },
+      },
+      backgroundColor: {
+        neutral: {
+          50: 'rgb(var(--surface-scale-50) / <alpha-value>)',
+          100: 'rgb(var(--surface-scale-100) / <alpha-value>)',
+          200: 'rgb(var(--surface-scale-200) / <alpha-value>)',
+        },
+      },
+      borderColor: {
+        neutral: {
+          100: 'rgb(var(--border-scale-100) / <alpha-value>)',
+          200: 'rgb(var(--border-scale-200) / <alpha-value>)',
+          300: 'rgb(var(--border-scale-300) / <alpha-value>)',
         },
       },
       // Tailwind's palette resolves through the tokens in static/css/theme.css.
