@@ -355,7 +355,7 @@ def bench_client(monkeypatch):
     from omlx.admin import routes as admin_routes
 
     _benchmark_runs.clear()
-    admin_routes._get_engine_pool = lambda: _FakePool()
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: _FakePool())
 
     async def _fake_require_admin():
         return True

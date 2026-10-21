@@ -91,10 +91,10 @@ def client(tmp_path, monkeypatch):
     state = _FakeServerState()
 
     # Patch the module-level getters
-    admin_routes._get_settings_manager = lambda: mgr
-    admin_routes._get_engine_pool = lambda: pool
-    admin_routes._get_server_state = lambda: state
-    admin_routes._get_global_settings = lambda: None
+    monkeypatch.setattr(admin_routes, "_get_settings_manager", lambda: mgr)
+    monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(admin_routes, "_get_server_state", lambda: state)
+    monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: None)
 
     # Bypass auth
     async def _fake_require_admin():
