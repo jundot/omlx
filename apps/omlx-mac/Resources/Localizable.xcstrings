@@ -1174,6 +1174,54 @@
         }
       }
     },
+    "appearance.row.number_scale" : {
+      "comment" : "Appearance row label for the number scale picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Number Scale"
+          }
+        }
+      }
+    },
+    "appearance.row.number_scale.sub" : {
+      "comment" : "Appearance row sublabel explaining where the number scale applies",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Applies to counts in the window; the menu bar stays compact."
+          }
+        }
+      }
+    },
+    "appearance.number_scale.compact" : {
+      "comment" : "Number scale option that shows large counts in 万 or M and similar units",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Higher Units"
+          }
+        }
+      }
+    },
+    "appearance.number_scale.exact" : {
+      "comment" : "Number scale option that shows every digit of a count",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Exact Digits"
+          }
+        }
+      }
+    },
     "appearance.row.refresh_interval" : {
       "comment" : "Appearance row label for the menubar refresh cadence picker",
       "extractionState" : "manual",
