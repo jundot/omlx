@@ -791,6 +791,107 @@ def test_decode_rows_prefetch_their_pages(tmp_path, monkeypatch):
         reader.close()
 
 
+@pytest.mark.parametrize("row_bytes", [16, 128])
+def test_sparse_row_runs_preserve_bytes_and_shape(tmp_path, monkeypatch, row_bytes):
+    path = tmp_path / "sparse.safetensors"
+    rng = np.random.default_rng(7)
+    raw = rng.integers(0, 256, (4096, row_bytes), dtype=np.uint8)
+    raw_safetensors(path, {"w": (raw, "U8")})
+    # Span several full runs and a partial run, with holes, duplicates and an
+    # input order different from the sorted rows read by the workers.
+    rows = np.concatenate((np.arange(0, 4096, 3), [3, 0, 4095, 3]))
+    rng.shuffle(rows)
+    rows = rows.reshape(2, -1)
+    original = storage.os.pread
+    calls = []
+
+    def short_read(fd, count, offset):
+        calls.append((offset, count))
+        return original(fd, min(count, 997), offset)
+
+    monkeypatch.setattr(storage.os, "pread", short_read)
+    reader = storage.TensorFile(path)
+    try:
+        actual, dtype = reader.read("w", rows)
+        assert dtype == "U8" and calls
+        np.testing.assert_array_equal(actual, raw[rows])
+        count = len(calls)
+        warm, _ = reader.read("w", rows)
+        assert len(calls) == count
+        np.testing.assert_array_equal(warm, actual)
+    finally:
+        reader.close()
+    np.testing.assert_array_equal(actual, raw[rows])
+
+
+@pytest.mark.parametrize("row_bytes", [16, 128, 519])
+def test_mixed_warm_rows_are_not_read_again(tmp_path, monkeypatch, row_bytes):
+    path = tmp_path / "mixed.safetensors"
+    rng = np.random.default_rng(17)
+    raw = rng.integers(0, 256, (4096, row_bytes), dtype=np.uint8)
+    raw_safetensors(path, {"w": (raw, "U8")})
+    reader = storage.TensorFile(path)
+    original = storage.os.pread
+    calls = []
+
+    def counted(fd, count, offset):
+        calls.append((offset, count))
+        return original(fd, count, offset)
+
+    try:
+        reader.read("w", np.arange(24))
+        monkeypatch.setattr(storage.os, "pread", counted)
+        rows = np.array([[4095, 2, 15], [0, 4095, 2]])
+        actual, _ = reader.read("w", rows)
+        np.testing.assert_array_equal(actual, raw[rows])
+        assert calls == [(reader._start + 4095 * row_bytes, row_bytes)]
+    finally:
+        reader.close()
+    np.testing.assert_array_equal(actual, raw[rows])
+
+
+def test_row_crossing_from_a_warm_page_is_read_exactly(tmp_path, monkeypatch):
+    path = tmp_path / "crossing.safetensors"
+    row_bytes = 519
+    raw = np.random.default_rng(19).integers(0, 256, (4096, row_bytes), dtype=np.uint8)
+    raw_safetensors(path, {"w": (raw, "U8")})
+    reader = storage.TensorFile(path)
+    original = storage.os.pread
+    calls = []
+
+    def counted(fd, count, offset):
+        calls.append((offset, count))
+        return original(fd, count, offset)
+
+    try:
+        reader.read("w", np.array([0]))
+        crossing = (storage.PAGE_SIZE - reader._start) // row_bytes
+        offset = reader._start + crossing * row_bytes
+        assert offset < storage.PAGE_SIZE < offset + row_bytes
+        monkeypatch.setattr(storage.os, "pread", counted)
+        rows = np.array([0, crossing, 0])
+        actual, _ = reader.read("w", rows)
+        np.testing.assert_array_equal(actual, raw[rows])
+        assert calls == [(offset, row_bytes)]
+    finally:
+        reader.close()
+
+
+def test_slow_mixed_warm_gather_rearms_reads(tmp_path, monkeypatch):
+    reader, raw = page_table(tmp_path)
+    try:
+        reader.read("w", np.arange(24))
+        ticks = iter([0.0, 1.0])
+        monkeypatch.setattr(storage.time, "perf_counter", lambda: next(ticks))
+        monkeypatch.setattr(storage.time, "monotonic", lambda: 100.0)
+        rows = np.array([0, 4095, 2])
+        actual, _ = reader.read("w", rows)
+        np.testing.assert_array_equal(actual, raw[rows])
+        assert reader._seen_pages is None
+    finally:
+        reader.close()
+
+
 def test_page_read_failure_drains_workers_before_close(tmp_path, monkeypatch):
     reader, _ = page_table(tmp_path)
     original = storage.os.pread
