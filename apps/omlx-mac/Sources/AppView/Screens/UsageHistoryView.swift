@@ -167,6 +167,7 @@ struct UsageHistoryView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label).font(.omlxText(DesignTokens.FontSize.subheadline)).foregroundStyle(.secondary)
             Text(CountFormat.count(value)).font(.omlxMono(20))
+                .lineLimit(1).minimumScaleFactor(0.6)
         }
         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
         .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
