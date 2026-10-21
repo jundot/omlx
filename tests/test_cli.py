@@ -120,6 +120,84 @@ class TestLifecycleCommand:
         assert capsys.readouterr().out.strip() == "oMLX stopped"
         cli._open_macos_app.assert_not_called()
 
+    def test_app_bundle_stop_reports_failure_when_server_keeps_running(
+        self, monkeypatch, capsys
+    ):
+        """An ok reply must not hide a server the app says is still running.
+
+        ServerProcess.stop() returns early when the app never tracked the
+        process, and AppDelegate still answers ok while echoing the live
+        state. Reporting "stopped" there is how #3431 leaves a listener and
+        its Metal memory behind.
+        """
+        from omlx import cli
+        import omlx.utils.install as install
+
+        monkeypatch.setattr(install, "is_app_bundle", lambda: True)
+        monkeypatch.setattr(install, "is_homebrew", lambda: False)
+        send = MagicMock(
+            return_value={
+                "ok": True,
+                "status": "stopped",
+                "state": "running",
+                "port": 8000,
+            }
+        )
+        wait = MagicMock(return_value={"ok": True, "state": "running"})
+        monkeypatch.setattr(cli, "_send_app_control", send)
+        monkeypatch.setattr(cli, "_wait_app_control_state", wait)
+
+        assert cli.lifecycle_command(self._args("stop")) == 1
+        wait.assert_called_once_with({"stopped"}, 1.0)
+        assert "running" in capsys.readouterr().out
+
+    def test_app_bundle_stop_waits_for_the_stopped_state(self, monkeypatch, capsys):
+        """A still-stopping reply is polled until the app reports stopped."""
+        from omlx import cli
+        import omlx.utils.install as install
+
+        monkeypatch.setattr(install, "is_app_bundle", lambda: True)
+        monkeypatch.setattr(install, "is_homebrew", lambda: False)
+        send = MagicMock(
+            return_value={
+                "ok": True,
+                "status": "stopped",
+                "state": "stopping",
+                "port": 8000,
+            }
+        )
+        wait = MagicMock(return_value={"ok": True, "state": "stopped"})
+        monkeypatch.setattr(cli, "_send_app_control", send)
+        monkeypatch.setattr(cli, "_wait_app_control_state", wait)
+
+        assert cli.lifecycle_command(self._args("stop")) == 0
+        wait.assert_called_once_with({"stopped"}, 1.0)
+        assert capsys.readouterr().out.strip() == "oMLX stopped"
+
+    def test_app_bundle_stop_treats_a_vanished_control_socket_as_stopped(
+        self, monkeypatch, capsys
+    ):
+        """The app quitting mid-wait is a completed stop, not an error."""
+        from omlx import cli
+        import omlx.utils.install as install
+
+        monkeypatch.setattr(install, "is_app_bundle", lambda: True)
+        monkeypatch.setattr(install, "is_homebrew", lambda: False)
+        send = MagicMock(
+            return_value={
+                "ok": True,
+                "status": "stopped",
+                "state": "stopping",
+                "port": 8000,
+            }
+        )
+        wait = MagicMock(side_effect=OSError)
+        monkeypatch.setattr(cli, "_send_app_control", send)
+        monkeypatch.setattr(cli, "_wait_app_control_state", wait)
+
+        assert cli.lifecycle_command(self._args("stop")) == 0
+        assert capsys.readouterr().out.strip() == "oMLX stopped"
+
     def test_app_bundle_start_sends_command_and_waits(self, monkeypatch):
         """`omlx start` asks the app to start and waits for a running state."""
         from omlx import cli

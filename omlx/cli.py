@@ -827,6 +827,27 @@ def lifecycle_command(args) -> int:
                 print(response.get("message") or f"oMLX {command} failed")
                 return 1
 
+            if command == "stop" and not no_wait:
+                # The app replies ok even when it never tracked the process
+                # (ServerProcess.stop returns early), and that reply carries
+                # the state it is actually in. Trust the state, not "ok", or
+                # a server that keeps listening is reported as stopped.
+                state = response.get("state")
+                if state != "stopped":
+                    try:
+                        state = _wait_app_control_state({"stopped"}, timeout).get(
+                            "state"
+                        )
+                    except OSError:
+                        # The app quit and took its control socket with it.
+                        state = "stopped"
+                    if state != "stopped":
+                        print(
+                            f"oMLX server is {state or 'unknown'} "
+                            f"after {int(timeout)}s."
+                        )
+                        return 1
+
             if command in {"start", "restart"} and not no_wait:
                 response = _wait_app_control_state({"running", "unresponsive"}, timeout)
                 if response.get("state") not in {"running", "unresponsive"}:
