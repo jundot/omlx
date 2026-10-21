@@ -3756,6 +3756,11 @@ class EnginePool:
             if entry.runtime_settle_size is not None
             else resident_size
         )
+        if isinstance(entry.engine, ImageEngine):
+            # Image weights are request-scoped. stop() drains and closes the
+            # pipeline before returning; the admission reservation is not a
+            # resident allocation that can be measured as an unload delta.
+            settle_size = 0
         pre_unload_active = 0 if external else mx.get_active_memory()
         pre_unload_footprint = 0 if external else get_phys_footprint()
 
