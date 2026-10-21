@@ -1121,6 +1121,9 @@
     .usage-model-table td { white-space: nowrap; }
 
     /* === Dashboard layout grid (GridStack) === */
+    /* GridStack insets every block by its 12px margin; pull the grid out by the
+       same amount so Status lines up with the other tabs. */
+    .dash-grid { margin-inline: -12px; }
     .dash-grid > .dash-block-parked { display: none; }
     /* Item content is absolutely positioned by GridStack; let shadows, tooltips
        and select popovers escape in view mode. */

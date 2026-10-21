@@ -12,7 +12,7 @@
                 <div class="animate-fade-in-up">
                     <!-- First-run guide: only when the first model list was empty. -->
                     <template x-if="onboardingState === 'first'">
-                        <div class="mx-3 mb-4 rounded-2xl border border-neutral-200 bg-neutral-50 px-5 py-4 flex flex-wrap items-center justify-between gap-4">
+                        <div class="mb-4 rounded-2xl border border-neutral-200 bg-neutral-50 px-5 py-4 flex flex-wrap items-center justify-between gap-4">
                             <div class="flex items-center gap-3 min-w-0">
                                 <span class="w-9 h-9 shrink-0 rounded-xl bg-white border border-neutral-200 text-neutral-500 grid place-items-center">
                                     <i data-lucide="download" class="w-5 h-5"></i>
@@ -35,7 +35,7 @@
                         </div>
                     </template>
                     <template x-if="onboardingState === 'downloading'">
-                        <div class="mx-3 mb-4 rounded-2xl border border-neutral-200 bg-neutral-50 px-5 py-4 flex flex-wrap items-center justify-between gap-4">
+                        <div class="mb-4 rounded-2xl border border-neutral-200 bg-neutral-50 px-5 py-4 flex flex-wrap items-center justify-between gap-4">
                             <div class="flex-1 min-w-[16rem]">
                                 <div class="text-sm font-semibold text-neutral-900"
                                      x-text="window.t('status.onboarding.downloading.title').replace('{name}', onboardingTask.repo_id.split('/').pop()).replace('{percent}', Math.round(onboardingTask.progress || 0))"></div>
@@ -51,7 +51,7 @@
                         </div>
                     </template>
                     <template x-if="onboardingState === 'ready'">
-                        <div class="mx-3 mb-4 rounded-2xl border border-green-200 bg-green-50 px-5 py-4 flex flex-wrap items-center justify-between gap-4">
+                        <div class="mb-4 rounded-2xl border border-green-200 bg-green-50 px-5 py-4 flex flex-wrap items-center justify-between gap-4">
                             <div class="flex items-center gap-3 min-w-0">
                                 <span class="w-9 h-9 shrink-0 rounded-xl bg-white border border-green-200 text-green-700 grid place-items-center">
                                     <i data-lucide="check" class="w-5 h-5"></i>
@@ -75,9 +75,8 @@
                         </div>
                     </template>
 
-                    <!-- Server status header: identity, uptime and the two lifecycle actions.
-                         mx-3 matches the 12px GridStack item margin of the blocks below. -->
-                    <div class="bg-white rounded-2xl border border-neutral-200 mb-6 mx-3">
+                    <!-- Server status header: identity, uptime and the two lifecycle actions. -->
+                    <div class="bg-white rounded-2xl border border-neutral-200 mb-6">
                         <div class="flex flex-wrap items-center justify-between gap-4 px-6 py-5">
                             <div class="flex items-center gap-3 min-w-0">
                                 <img x-show="activeTheme !== 'dark'" src="/admin/static/navbar-logo-light.svg" alt="" aria-hidden="true" class="w-9 h-9">
