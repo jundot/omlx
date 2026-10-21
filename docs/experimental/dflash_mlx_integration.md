@@ -17,6 +17,7 @@ oMLX runs DFlash inside its standard engines. `BatchedEngine` (mlx-lm text model
 | GLM-5.3 (`glm5_next`) | VLM | concurrent rows, block of at most 8 |
 | Gemma 4 (`gemma4`, `gemma4_unified`) | VLM | single row |
 | Muse Glimmer (`muse_glimmer`) | VLM | single row |
+| MiniCPM-V 4.7 (`minicpmv4_7`) | VLM | concurrent rows |
 
 "Single row" means a request speculates while it decodes alone; a batch of two or more decodes normally, since rows that accept different counts would need a ragged rollback of sliding-window caches. MiMo V2 checkpoints with the omnimodal vision sidecar load on the VLM engine and run without DFlash; other model types also load without DFlash and log a warning. The gate lives in `omlx/utils/model_loading.py` (`dflash_batched_supported`, `dflash_compatibility`).
 
