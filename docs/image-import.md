@@ -20,23 +20,37 @@ Exit 0 means structural validity (and matched manifest hashes when requested).
 Missing hash references give a nonzero integrity-check exit. Manifest hashes
 establish consistency, not trusted provenance. No report enables serving.
 
-Version 1 sidecar example:
+The primary release contract uses the community component directory layout:
 
-```json
-{
-  "schema_version": 1,
-  "pipeline": "qwen_image_2_1_turbo_text_to_image",
-  "layout": "native-bf16-f32-v1",
-  "recipe": "qwen-image-2.1-turbo-euler-8-v1",
-  "processor": "processor",
-  "components": {
-    "text_encoder": {"path": "text_encoder"},
-    "transformer": {"path": "transformer"},
-    "vae": {"path": "vae", "auxiliary": ["temporal_auxiliary.safetensors"]}
-  },
-  "sha256": {}
-}
+```text
+model_index.json
+generation_config.json
+PROVENANCE.json
+checksums.json                 # Optional reference hashes for weight files
+text_encoder/{config.json, model*.safetensors, model.safetensors.index.json}
+transformer/{config.json, model*.safetensors, model.safetensors.index.json}
+vae/{config.json, model.safetensors, temporal_auxiliary.safetensors}
+processor/{tokenizer.json, tokenizer_config.json, ...}
+scheduler/scheduler_config.json
 ```
+
+`model_index.json` declares `QwenImage21Pipeline`, descriptive component class
+pairs, `mlx_format: true` and `mlx_layout: native-bf16-f32-v1`. Class names are
+never dynamically imported. The layout discriminator is essential: a community
+MLX repository may use different tensor names or packed quantization. Ordinary
+Diffusers loading is not implied by these labels.
+
+`generation_config.json` records recipe `qwen-image-2.1-turbo-euler-8-v1`,
+`num_inference_steps: 8`, `guidance_scale: 1.0`, `height: 1024`, `width: 1024`,
+and `sigmas: [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534,
+0.414568, 0.0]`. `checksums.json` is a map of weight paths to SHA-256 digests.
+Provenance is independent of loader configuration; it does not enable serving.
+
+`omlx-pipeline.json` is accepted only for backward compatibility with the
+research export, and is not required or generated for new releases. If a model
+index exists, malformed or unsupported metadata never falls back to that legacy
+sidecar. Low-bit quantization remains unsupported; 4-bit/8-bit names alone cannot
+make a bundle compatible. Future quantization must declare per-component settings.
 
 Paths must resolve inside the selected bundle. Internal links are allowed;
 physical weight bytes count each inode once. Direct HF-cache symlinks to external
@@ -50,8 +64,11 @@ For the existing research export, from the checkout:
 python -m tools.migrate_image_bundle /path/to/bundle
 ```
 
-Migration checks the legacy pipeline and fixed eight-step recipe, then atomically
-creates the sidecar without replacing an existing one or changing any weights.
+Migration checks the legacy pipeline, canonical component paths and fixed eight-step
+recipe, then exclusively creates provenance, generation config and model index
+(in that order). It publishes the index last and rolls back its new metadata on
+failure, without replacing existing files or changing weights. It does not compute
+reference hashes; explicit hash verification needs a separately prepared checksums.json.
 It is not a GGUF converter. Its recipe identifier is reserved for the recorded
 conditioning/sampling implementation; the inspector does not execute that recipe.
 
@@ -79,7 +96,7 @@ fresh-prompt generation or serving validation.
 Run focused checks with:
 
 ```
-python -m pytest tests/test_model_discovery.py tests/test_image_discovery.py tests/test_image_import.py -q
+python -m pytest tests/test_model_discovery.py tests/test_image_discovery.py tests/test_image_import.py tests/test_image_model_index.py -q
 python -S -m unittest discover -s tests -p test_image_import.py -q
 ```
 
@@ -92,3 +109,7 @@ inputs; inspection is neither a lease nor an immutable filesystem snapshot.
 Subsequent PRs add native conditioning/DiT, VAE and standalone generation,
 then lifecycle, serving, and web/Mac integration. This PR adds no inference
 framework, API route, engine registration, downloader or image UI.
+
+The native loader introduced in PR3 normalizes the same model-index contract as
+this inspector before checking architecture-specific tensor names, shapes and
+precisions. Legacy sidecar loading remains a compatibility path only.
