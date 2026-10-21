@@ -109,3 +109,43 @@ def test_generation_metadata_cannot_escape_bundle(bundle, tmp_path):
     (bundle / "generation_config.json").unlink()
     (bundle / "generation_config.json").symlink_to(external)
     assert inspect_bundle(bundle)["structural_status"] == "invalid"
+
+
+def test_migration_rolls_back_metadata_when_publication_fails(bundle, monkeypatch):
+    from tools import migrate_image_bundle as migration
+
+    recipe = read_json(bundle / "generation_config.json")
+    write_json(
+        bundle / "pipeline.json",
+        {
+            "pipeline": "qwen_image_2_1_turbo_text_to_image",
+            "format": "mlx",
+            "components": {
+                n: {"path": n} for n in ("text_encoder", "transformer", "vae")
+            },
+            "sampling": {
+                "steps": 8,
+                "guidance": 1.0,
+                "sampler": "euler",
+                "resolution": [1024, 1024],
+                "sigmas": recipe["sigmas"],
+            },
+        },
+    )
+    (bundle / "model_index.json").unlink()
+    (bundle / "generation_config.json").unlink()
+    original_link = migration.os.link
+
+    def fail_second(source, target):
+        if target.name == "generation_config.json":
+            raise OSError("simulated publication failure")
+        return original_link(source, target)
+
+    monkeypatch.setattr(migration.os, "link", fail_second)
+    before = (bundle / "vae/model.safetensors").read_bytes()
+    with pytest.raises(OSError, match="simulated"):
+        migration.migrate(bundle)
+    for name in ("PROVENANCE.json", "generation_config.json", "model_index.json"):
+        assert not (bundle / name).exists()
+    assert not list(bundle.glob(".pipeline-*"))
+    assert (bundle / "vae/model.safetensors").read_bytes() == before
