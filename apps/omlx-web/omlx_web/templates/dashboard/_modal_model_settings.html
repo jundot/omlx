@@ -118,7 +118,7 @@
                                 <button type="button" @click="applyPresetToForm(p)"
                                         @mouseenter="showTip($event.currentTarget, p.description)"
                                         @mouseleave="hideTip()"
-                                        class="px-2.5 py-1 text-xs rounded-lg border border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100 transition-all"
+                                        class="px-2.5 py-1 text-xs rounded-lg border border-neutral-200 bg-neutral-50 text-neutral-700 hover:bg-neutral-100 transition-all"
                                         x-text="p.display_name || p.name"></button>
                             </template>
                             <span x-show="presets.length === 0" x-cloak class="text-xs text-neutral-400 italic">{{ t('modal.model_settings.profiles.no_presets') }}</span>
@@ -133,7 +133,7 @@
                             <template x-for="tmpl in templates" :key="tmpl.name">
                                 <div class="inline-flex items-center gap-1">
                                     <button type="button" @click="applyTemplateToForm(tmpl)"
-                                            :class="activeTemplateName === tmpl.name ? 'bg-blue-500 text-white border-blue-500' : 'border-blue-200 bg-blue-50 text-blue-700 hover:bg-blue-100'"
+                                            :class="activeTemplateName === tmpl.name ? 'bg-neutral-900 text-white border-neutral-900' : 'border-neutral-200 bg-neutral-50 text-neutral-700 hover:bg-neutral-100'"
                                             class="px-2.5 py-1 text-xs rounded-lg border transition-all"
                                             x-text="tmpl.display_name || tmpl.name"></button>
                                     <button type="button" @click="editingTemplate = tmpl.name"
@@ -411,7 +411,7 @@
                             <p x-show="modelSettings.enable_thinking == null && modelSettings.thinking_default != null"
                                class="text-xs text-neutral-400" x-text="'{{ t('modal.model_settings.enable_thinking_default')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></p>
                             <p x-show="modelSettings.enable_thinking != null && modelSettings.thinking_default != null && modelSettings.enable_thinking !== modelSettings.thinking_default"
-                               class="text-xs text-amber-500 cursor-pointer hover:text-amber-600"
+                               class="text-xs text-amber-500 cursor-pointer hover:text-amber-700"
                                @click="modelSettings.enable_thinking = null"
                                x-text="'{{ t('modal.model_settings.enable_thinking_reset')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></p>
                         </div>
@@ -485,7 +485,7 @@
                                        class="{{ ms_field_short }}">
                             </label>
                             <p x-show="!modelSettings.is_diffusion_model && modelSettings.vlm_mtp_enabled"
-                               class="px-4 py-3 text-xs text-amber-600">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
+                               class="px-4 py-3 text-xs text-amber-700">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
 
                             <!-- Force Sampling -->
                             <div class="px-4 py-3.5"
@@ -512,7 +512,7 @@
                 <!-- Acceleration -->
                 <section id="ms-acceleration" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.acceleration_label') }}</h3>
-                    <p x-show="effectiveExternalEngine()" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
+                    <p x-show="effectiveExternalEngine()" x-cloak class="text-xs text-amber-700 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
                     <div class="{{ ms_rows }}" :class="effectiveExternalEngine() ? 'opacity-40 pointer-events-none' : ''">
                         <!-- Lightning MTP (built-in MTP head speculative decoding) -->
                         <div class="px-4 py-3.5 space-y-3">
@@ -521,7 +521,7 @@
                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.lightning_mtp') }}</span>
                                     <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.lightning_mtp_hint') }}</p>
                                     <p x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason"
-                                       class="text-xs text-amber-600 mt-1"
+                                       class="text-xs text-amber-700 mt-1"
                                        x-text="modelSettings.mtp_compatibility_reason"></p>
                                     <button type="button"
                                             x-show="!modelSettings.mtp_compatible && modelSettings.mtp_compatibility_reason?.includes('MTPLX side-car')"
@@ -531,7 +531,7 @@
                                             class="mt-2 px-3 py-1.5 text-xs font-medium rounded-full bg-neutral-900 text-white hover:bg-neutral-700 transition-colors"
                                             x-text="importingMtplx ? '{{ t('modal.model_settings.mtplx_importing')|replace('\\', '\\\\')|replace("'", "\\'") }}' : '{{ t('modal.model_settings.mtplx_import')|replace('\\', '\\\\')|replace("'", "\\'") }}'"></button>
                                     <p x-show="modelSettings.mtp_compatible && modelSettings.dflash_enabled"
-                                       class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
+                                       class="text-xs text-amber-700 mt-1">{{ t('modal.model_settings.mtp_conflict_dflash') }}</p>
                                 </div>
                                 <button type="button"
                                         @click="if ((!modelSettings.moe_expert_offload_enabled || modelSettings.moe_offload_allows_mtp) && ((modelSettings.mtp_compatible || modelSettings.mtp_enabled) && !modelSettings.dflash_enabled && !modelSettings.vlm_mtp_enabled)) modelSettings.mtp_enabled = !modelSettings.mtp_enabled"
@@ -577,7 +577,7 @@
                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.dflash') }}</span>
                                     <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.dflash_hint') }}</p>
                                     <p x-show="!modelSettings.dflash_compatible && modelSettings.dflash_compatibility_reason"
-                                       class="text-xs text-amber-600 mt-1"
+                                       class="text-xs text-amber-700 mt-1"
                                        x-text="modelSettings.dflash_compatibility_reason"></p>
                                 </div>
                                 <button type="button"
@@ -684,9 +684,9 @@
                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.vlm_mtp') }}</span>
                                     <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.vlm_mtp_hint') | safe }}</p>
                                     <p x-show="modelSettings.dflash_enabled || modelSettings.specprefill_enabled || modelSettings.mtp_enabled || modelSettings.turboquant_kv_enabled"
-                                       class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_conflict') }}</p>
+                                       class="text-xs text-amber-700 mt-1">{{ t('modal.model_settings.vlm_mtp_conflict') }}</p>
                                     <p x-show="vlmMtpProcessorConflict()"
-                                       class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_conflict') }}</p>
+                                       class="text-xs text-amber-700 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_conflict') }}</p>
                                 </div>
                                 <button type="button"
                                         @click="if (!modelSettings.moe_expert_offload_enabled && (!modelSettings.is_paroquant && !modelSettings.dflash_enabled && !modelSettings.specprefill_enabled && !modelSettings.mtp_enabled && !modelSettings.turboquant_kv_enabled && !vlmMtpProcessorConflict())) modelSettings.vlm_mtp_enabled = !modelSettings.vlm_mtp_enabled"
@@ -800,7 +800,7 @@
                 <!-- Memory Saving -->
                 <section id="ms-memory" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.memory_label') }}</h3>
-                    <p x-show="effectiveExternalEngine()" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
+                    <p x-show="effectiveExternalEngine()" x-cloak class="text-xs text-amber-700 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
                     <div class="{{ ms_rows }}" :class="effectiveExternalEngine() ? 'opacity-40 pointer-events-none' : ''">
                         <!-- SSD N-gram Offload (Qwen4 PLE or DeepSeek V4.1 Engram) -->
                         <div class="px-4 py-3.5 space-y-2"
@@ -825,7 +825,7 @@
                                 </button>
                             </div>
                             <p x-show="modelSettings[ssdNgramOffloadKey() + '_forced']"
-                               class="text-xs text-amber-600">{{ t('modal.model_settings.ssd_ngram_offload_forced') }}</p>
+                               class="text-xs text-amber-700">{{ t('modal.model_settings.ssd_ngram_offload_forced') }}</p>
                         </div>
 
                         <!-- MoE Expert Offload -->
@@ -936,7 +936,7 @@
                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.external_engine') }}</span>
                                     <p class="text-xs text-neutral-500 mt-0.5"
                                        x-text="isGgufModel() ? window.t('modal.model_settings.external_engine_gguf') : window.t('modal.model_settings.external_engine_hint')"></p>
-                                    <p x-show="externalEngineReason()" class="text-xs text-amber-600 mt-1 break-words" x-text="externalEngineReason()"></p>
+                                    <p x-show="externalEngineReason()" class="text-xs text-amber-700 mt-1 break-words" x-text="externalEngineReason()"></p>
                                     <button type="button" x-show="externalEngineDraftRepo()" x-cloak
                                             @click="downloadEngineDraft()"
                                             class="mt-2 px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-lg transition-all inline-flex items-center gap-1.5">
@@ -1045,7 +1045,7 @@
                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.guided_grammar') }}</span>
                                     <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.guided_grammar_hint') }}</p>
                                     <p x-show="modelSettings.vlm_mtp_enabled"
-                                       class="text-xs text-amber-600 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
+                                       class="text-xs text-amber-700 mt-1">{{ t('modal.model_settings.vlm_mtp_processor_locked') }}</p>
                                 </div>
                                 <button type="button" @click="if (!modelSettings.vlm_mtp_enabled) { modelSettings.guided_grammar_enabled = !modelSettings.guided_grammar_enabled; if (!modelSettings.guided_grammar_enabled) modelSettings.guided_grammar = ''; }"
                                         :disabled="modelSettings.vlm_mtp_enabled"
@@ -1227,7 +1227,7 @@
                 <!-- Experimental Features -->
                 <section id="ms-experimental" class="model-settings-section mt-8" x-show="{{ ms_llm_non_diffusion }}" x-cloak>
                     <h3 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h3>
-                    <p x-show="effectiveExternalEngine()" x-cloak class="text-xs text-amber-600 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
+                    <p x-show="effectiveExternalEngine()" x-cloak class="text-xs text-amber-700 mb-3">{{ t('modal.model_settings.external_engine_section_note') }}</p>
                     <div class="{{ ms_rows }}" :class="effectiveExternalEngine() ? 'opacity-40 pointer-events-none' : ''">
                         <!-- Qwen 3.5/3.6/3.8 private ANE/GPU prompt processing -->
                         <template x-if="selectedModel?.ane_prefill_backend === 'qwen'">
@@ -1492,7 +1492,7 @@
                                     </div>
                                     <p x-show="aneTuningForSelectedModel() && !aneTuning.running && aneTuning.status?.termination_reason"
                                        x-cloak
-                                       :class="aneTuning.status?.status === 'error' ? 'text-red-600' : 'text-amber-600'"
+                                       :class="aneTuning.status?.status === 'error' ? 'text-red-600' : 'text-amber-700'"
                                        class="text-xs"
                                        x-text="aneTuning.status?.termination_reason"></p>
 
@@ -1540,7 +1540,7 @@
                                 <div class="flex items-start justify-between gap-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.index_cache') }}</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.index_cache_hint') }} (<a href="https://github.com/THUDM/IndexCache" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.github') }}</a>)</p>
+                                        <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.index_cache_hint') }} (<a href="https://github.com/THUDM/IndexCache" target="_blank" rel="noopener" class="text-neutral-700 hover:text-neutral-900 underline">{{ t('modal.model_settings.github') }}</a>)</p>
                                     </div>
                                     <button type="button"
                                             @click="if (!modelSettings.is_paroquant) { modelSettings.enableIndexCache = !modelSettings.enableIndexCache; if (!modelSettings.enableIndexCache) modelSettings.index_cache_freq = null; }"
@@ -1570,7 +1570,7 @@
                             <div class="flex items-start justify-between gap-3">
                                 <div class="min-w-0">
                                     <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.specprefill') }}</span>
-                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.specprefill_hint') }} (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.specprefill_paper') }}</a>) (<a href="https://huggingface.co/spaces/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-blue-500 hover:text-blue-700 underline">{{ t('modal.model_settings.huggingface') }}</a>)</p>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.specprefill_hint') }} (<a href="https://arxiv.org/abs/2502.02789" target="_blank" rel="noopener" class="text-neutral-700 hover:text-neutral-900 underline">{{ t('modal.model_settings.specprefill_paper') }}</a>) (<a href="https://huggingface.co/spaces/Thump604/specprefill-paper" target="_blank" rel="noopener" class="text-neutral-700 hover:text-neutral-900 underline">{{ t('modal.model_settings.huggingface') }}</a>)</p>
                                 </div>
                                 <button type="button"
                                         @click="if (!modelSettings.is_paroquant && !modelSettings.vlm_mtp_enabled) modelSettings.specprefill_enabled = !modelSettings.specprefill_enabled"

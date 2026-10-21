@@ -22,6 +22,7 @@
     --palette-zinc-200: 228 228 231;
     --palette-zinc-300: 212 212 216;
     --palette-zinc-400: 161 161 170;
+    --palette-zinc-450: 148 148 154;
     --palette-zinc-500: 113 113 122;
     --palette-zinc-600: 82 82 91;
     --palette-zinc-700: 63 63 70;
@@ -281,8 +282,8 @@
     --bg-tertiary: rgb(var(--palette-night-700));
     --text-primary: rgb(var(--palette-night-50));
     --text-secondary: rgb(var(--palette-zinc-400));
-    --text-tertiary: rgb(var(--palette-zinc-500));
-    --text-muted: rgb(var(--palette-zinc-600));
+    --text-tertiary: rgb(var(--palette-zinc-450));
+    --text-muted: rgb(var(--palette-zinc-450));
     --border-faint: rgb(var(--palette-zinc-700));
     --border-normal: rgb(var(--palette-zinc-600));
     --code-bg: rgb(var(--palette-zinc-800));

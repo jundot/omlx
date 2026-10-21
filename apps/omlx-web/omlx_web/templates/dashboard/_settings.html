@@ -14,7 +14,7 @@
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('settings.global.section_label') }}</h2>
                             <h3 class="text-2xl font-bold tracking-tight text-neutral-900">{{ t('settings.global.heading') }}</h3>
                             <p class="text-sm text-neutral-500 mt-2">
-                                {{ t('settings.global.restart_notice') }} <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
+                                {{ t('settings.global.restart_notice') }} <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('settings.global.restart_badge') }}</span> {{ t('settings.global.restart_suffix') }}
                             </p>
                         </div>
                         <button type="button" @click="resetGlobalSettingsDefaults()"
@@ -323,7 +323,7 @@
                                      }">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.host') }}</label>
-                                        <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
+                                        <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
                                     <div class="flex flex-col items-end gap-1">
                                         <div class="flex items-center gap-2">
@@ -345,7 +345,7 @@
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div class="flex items-center gap-2">
                                         <label class="text-sm text-neutral-700">{{ t('settings.server.port') }}</label>
-                                        <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
+                                        <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('settings.global.restart_badge') }}</span>
                                     </div>
                                     <input type="number" x-model.number="globalSettings.server.port"
                                            class="w-full sm:w-48 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
@@ -473,7 +473,7 @@
                                         <i x-show="settingsCopiedAnchor === 'settings-resource'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
                                     </button>
                                 </div>
-                                <span class="badge bg-green-50 text-green-600 border-green-200">
+                                <span class="badge bg-green-50 text-green-700 border-green-200">
                                     {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
@@ -483,7 +483,7 @@
                                     <div>
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.resource.prefill_memory_guard') }}</label>
-                                            <span class="badge bg-amber-50 text-amber-600 border-amber-200">{{ t('settings.resource.restart_badge') }}</span>
+                                            <span class="badge bg-amber-50 text-amber-700 border-amber-200">{{ t('settings.resource.restart_badge') }}</span>
                                         </div>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.prefill_memory_guard_description') }}</p>
                                         <p class="text-xs text-neutral-500 mt-1"
@@ -623,7 +623,7 @@
                                             <label class="text-sm text-neutral-700">{{ t('settings.resource.max_concurrent_requests') }}</label>
                                             <!-- Applied live, except to distributed (cluster) engines -->
                                             <span x-show="globalSettings.server.distributed_inference_active" x-cloak
-                                                  class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                                  class="badge bg-amber-50 text-amber-700 border-amber-200">
                                                 {{ t('settings.resource.restart_badge') }}
                                             </span>
                                         </div>
@@ -752,7 +752,7 @@
                                     <div>
                                         <div class="flex items-center gap-2">
                                             <label class="text-sm text-neutral-700">{{ t('settings.cache.hot_cache_only') }}</label>
-                                            <span class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                            <span class="badge bg-amber-50 text-amber-700 border-amber-200">
                                                 {{ t('settings.global.restart_badge') }}
                                             </span>
                                         </div>
@@ -877,7 +877,7 @@
                                         <i x-show="settingsCopiedAnchor === 'settings-mcp'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
                                     </button>
                                 </div>
-                                <span class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                <span class="badge bg-amber-50 text-amber-700 border-amber-200">
                                     {{ t('settings.mcp.restart_badge') }}
                                 </span>
                             </div>
@@ -919,7 +919,7 @@
                                         <i x-show="settingsCopiedAnchor === 'settings-usage'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
                                     </button>
                                 </div>
-                                <span class="badge bg-green-50 text-green-600 border-green-200">
+                                <span class="badge bg-green-50 text-green-700 border-green-200">
                                     {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
@@ -956,7 +956,7 @@
                                         <i x-show="settingsCopiedAnchor === 'settings-network'" x-cloak data-lucide="check" class="w-3.5 h-3.5"></i>
                                     </button>
                                 </div>
-                                <span class="badge bg-green-50 text-green-600 border-green-200">
+                                <span class="badge bg-green-50 text-green-700 border-green-200">
                                     {{ t('settings.resource.live_badge') }}
                                 </span>
                             </div>
@@ -1007,7 +1007,7 @@
                                     <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('settings.advanced.section_label') }}</span>
                                 </div>
                                 <div class="flex items-center gap-2">
-                                    <span class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                    <span class="badge bg-amber-50 text-amber-700 border-amber-200">
                                         {{ t('settings.advanced.restart_badge') }}
                                     </span>
                                     <i data-lucide="chevron-down" class="w-4 h-4 text-neutral-400 transition-transform duration-200"
@@ -1254,7 +1254,7 @@
                             <div x-show="restartServer.message" x-cloak
                                  class="flex items-start gap-2 text-sm min-w-0"
                                  :class="restartServer.status === 'error' ? 'text-red-600'
-                                       : restartServer.status === 'unsupported' ? 'text-amber-600'
+                                       : restartServer.status === 'unsupported' ? 'text-amber-700'
                                        : 'text-neutral-700'"
                                  :title="restartServer.message">
                                 <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
@@ -1345,7 +1345,7 @@
                                             <div>
                                                 <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.splash.binary_hint') }}</p>
                                                 <p x-show="!globalSettings.external_engines.splash.available && globalSettings.external_engines.splash.reason"
-                                                   class="text-xs text-amber-600 mt-1 break-words"
+                                                   class="text-xs text-amber-700 mt-1 break-words"
                                                    x-text="globalSettings.external_engines.splash.reason"></p>
                                             </div>
                                         </template>
@@ -1353,7 +1353,7 @@
                                     </div>
                                     <template x-if="globalSettings.external_engines.splash.available && !splashPath.editing">
                                         <div class="flex items-center gap-2 flex-shrink-0">
-                                            <span class="badge bg-green-50 text-green-600 border-green-200"
+                                            <span class="badge bg-green-50 text-green-700 border-green-200"
                                                   x-text="globalSettings.external_engines.splash.label + ' ' + globalSettings.external_engines.splash.version"></span>
                                             <button type="button" @click="editSplashPath()"
                                                     class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-full hover:bg-neutral-50 transition-colors shrink-0">{{ t('settings.integrations.splash.change') }}</button>
@@ -1520,11 +1520,11 @@
                                         <label class="text-sm text-neutral-700">{{ t('settings.integrations.markitdown.pdf_processing_engine') }}</label>
                                         <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.markitdown.pdf_processing_engine_hint') }}</p>
                                         <p x-show="markitdownOcrModelMissing"
-                                           class="text-xs text-amber-600 mt-1">
+                                           class="text-xs text-amber-700 mt-1">
                                             {{ t('settings.integrations.markitdown.pdf_processing_missing_model') }}
                                         </p>
                                         <p x-show="globalSettings.integrations.markitdown_pdf_processing_engine === 'markitdown' || markitdownOcrModelMissing"
-                                           class="text-xs text-amber-600 mt-1">
+                                           class="text-xs text-amber-700 mt-1">
                                             {{ t('settings.integrations.markitdown.pdf_processing_markitdown_warning') }}
                                         </p>
                                     </div>
@@ -1812,7 +1812,7 @@
                                                   class="badge bg-neutral-100 text-neutral-500 border-neutral-200 truncate max-w-[120px]"
                                                   x-text="model.settings?.model_alias"></span>
                                             <template x-for="engine in (model.external_engines || []).filter(e => e.compatible)" :key="engine.id">
-                                                <span class="badge bg-blue-50 text-blue-700 border-blue-200"
+                                                <span class="badge bg-neutral-100 text-neutral-600 border-neutral-200"
                                                       @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.external_engine_tooltip').replace('{engine}', engine.label))"
                                                       @mouseleave="hideTip()"
                                                       x-text="engine.label"></span>
@@ -1822,7 +1822,7 @@
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.gguf_tooltip'))"
                                                   @mouseleave="hideTip()">GGUF</span>
                                             <span x-show="model.is_helper" x-cloak
-                                                  class="badge bg-amber-50 text-amber-600 border-amber-200"
+                                                  class="badge bg-amber-50 text-amber-700 border-amber-200"
                                                   @mouseenter="showTip($event.currentTarget, window.t('settings.models.table.helper_tooltip'))"
                                                   @mouseleave="hideTip()"
                                                   x-text="window.t('settings.models.table.helper_badge')"></span>
@@ -2013,7 +2013,7 @@
                                                 </span>
                                             </template>
                                             <template x-if="model.settings?.max_tokens">
-                                                <span class="badge bg-blue-50 text-blue-700 border-blue-200">
+                                                <span class="badge bg-neutral-100 text-neutral-600 border-neutral-200">
                                                     max_tokens: <span class="ml-1" x-text="model.settings.max_tokens"></span>
                                                 </span>
                                             </template>

@@ -133,7 +133,7 @@
                                                 </button>
                                                 <span x-show="managerModelStatus(model.name)" x-cloak
                                                       class="badge flex-shrink-0 whitespace-nowrap"
-                                                      :class="{loading: 'bg-amber-50 text-amber-600 border-amber-200', loaded: 'bg-green-50 text-green-600 border-green-200', unloaded: 'bg-neutral-100 text-neutral-500 border-neutral-200'}[managerModelStatus(model.name)]"
+                                                      :class="{loading: 'bg-amber-50 text-amber-700 border-amber-200', loaded: 'bg-green-50 text-green-700 border-green-200', unloaded: 'bg-neutral-100 text-neutral-500 border-neutral-200'}[managerModelStatus(model.name)]"
                                                       x-text="window.t('models.status.' + managerModelStatus(model.name))"></span>
                                             </div>
                                             <!-- Type -->
@@ -560,12 +560,12 @@
                                                                 <span class="text-xs text-neutral-400 tabular-nums" x-text="'#' + model.rank"></span>
                                                                 <button @click="openModelDetail(model.repo_id)"
                                                                         :title="model.name"
-                                                                        class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer flex-1 min-w-0" x-text="model.name"></button>
+                                                                        class="text-sm font-medium text-neutral-900 hover:underline truncate block transition-colors text-left cursor-pointer flex-1 min-w-0" x-text="model.name"></button>
                                                             </div>
                                                             <!-- Desktop: name -->
                                                             <button @click="openModelDetail(model.repo_id)"
                                                                     :title="model.name"
-                                                                    class="max-md:hidden block text-sm font-medium text-neutral-900 hover:text-blue-600 truncate transition-colors text-left cursor-pointer max-w-[280px] lg:max-w-[480px] xl:max-w-[600px]" x-text="model.name"></button>
+                                                                    class="max-md:hidden block text-sm font-medium text-neutral-900 hover:underline truncate transition-colors text-left cursor-pointer max-w-[280px] lg:max-w-[480px] xl:max-w-[600px]" x-text="model.name"></button>
                                                             <!-- Desktop: only params shown below name -->
                                                             <span x-show="model.params" x-cloak class="max-md:hidden text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                             <span x-show="model.architecture" x-cloak class="max-md:hidden ml-1 badge bg-neutral-100 text-neutral-500 border-neutral-200" x-text="'GGUF · ' + model.architecture"></span>
@@ -579,7 +579,7 @@
                                                             <!-- Mobile: badge + download button on their own row -->
                                                             <div class="md:hidden flex items-center gap-2 mt-2">
                                                                 <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
-                                                                      class="badge bg-amber-50 text-amber-600 border-amber-200 shrink-0">
+                                                                      class="badge bg-amber-50 text-amber-700 border-amber-200 shrink-0">
                                                                     {{ t('models.browse.tight_fit') }}
                                                                 </span>
                                                                 <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
@@ -587,7 +587,7 @@
                                                                     {{ t('models.browse.high_oom_risk') }}
                                                                 </span>
                                                                 <span x-show="isModelDownloaded(model.repo_id)" x-cloak
-                                                                      class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                      class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                                                     <i data-lucide="check" class="w-3 h-3"></i>
                                                                     {{ t('models.browse.downloaded') }}
                                                                 </span>
@@ -606,7 +606,7 @@
                                                         <td class="max-md:hidden px-4 py-3">
                                                             <div class="flex justify-end items-center gap-2">
                                                                 <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
-                                                                      class="badge bg-amber-50 text-amber-600 border-amber-200 shrink-0">
+                                                                      class="badge bg-amber-50 text-amber-700 border-amber-200 shrink-0">
                                                                     {{ t('models.browse.tight_fit') }}
                                                                 </span>
                                                                 <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
@@ -614,7 +614,7 @@
                                                                     {{ t('models.browse.high_oom_risk') }}
                                                                 </span>
                                                                 <span x-show="isModelDownloaded(model.repo_id)" x-cloak
-                                                                      class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                      class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                                                     <i data-lucide="check" class="w-3 h-3"></i>
                                                                     {{ t('models.browse.downloaded') }}
                                                                 </span>
@@ -715,7 +715,7 @@
                                                             <td class="px-4 py-3">
                                                                 <button @click="openModelDetail(model.repo_id)"
                                                                         :title="model.repo_id"
-                                                                        class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs max-w-[280px] lg:max-w-[480px] xl:max-w-[600px]" x-text="model.repo_id"></button>
+                                                                        class="text-sm font-medium text-neutral-900 hover:underline truncate block transition-colors text-left cursor-pointer font-mono text-xs max-w-[280px] lg:max-w-[480px] xl:max-w-[600px]" x-text="model.repo_id"></button>
                                                                 <!-- Desktop: only params shown below name -->
                                                                 <span x-show="model.params" x-cloak class="max-md:hidden text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
                                                                 <span x-show="model.architecture" x-cloak class="max-md:hidden ml-1 badge bg-neutral-100 text-neutral-500 border-neutral-200" x-text="'GGUF · ' + model.architecture"></span>
@@ -729,7 +729,7 @@
                                                                 <!-- Mobile: badge + download button on their own row -->
                                                                 <div class="md:hidden flex items-center gap-2 mt-2">
                                                                     <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
-                                                                          class="badge bg-amber-50 text-amber-600 border-amber-200 shrink-0">
+                                                                          class="badge bg-amber-50 text-amber-700 border-amber-200 shrink-0">
                                                                         {{ t('models.browse.tight_fit') }}
                                                                     </span>
                                                                     <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
@@ -737,7 +737,7 @@
                                                                         {{ t('models.browse.high_oom_risk') }}
                                                                     </span>
                                                                     <span x-show="isModelDownloaded(model.repo_id)" x-cloak
-                                                                          class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                          class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                                                         <i data-lucide="check" class="w-3 h-3"></i>
                                                                         {{ t('models.browse.downloaded') }}
                                                                     </span>
@@ -756,7 +756,7 @@
                                                             <td class="max-md:hidden px-4 py-3">
                                                                 <div class="flex justify-end items-center gap-2">
                                                                     <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
-                                                                          class="badge bg-amber-50 text-amber-600 border-amber-200 shrink-0">
+                                                                          class="badge bg-amber-50 text-amber-700 border-amber-200 shrink-0">
                                                                         {{ t('models.browse.tight_fit') }}
                                                                     </span>
                                                                     <span x-show="getMemoryFitStatus(model.size) === 'danger'" x-cloak
@@ -764,7 +764,7 @@
                                                                         {{ t('models.browse.high_oom_risk') }}
                                                                     </span>
                                                                     <span x-show="isModelDownloaded(model.repo_id)" x-cloak
-                                                                          class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                          class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                                                         <i data-lucide="check" class="w-3 h-3"></i>
                                                                         {{ t('models.browse.downloaded') }}
                                                                     </span>
@@ -867,7 +867,7 @@
                                                     </button>
                                                     <button x-show="task.status === 'failed' || task.status === 'cancelled'" x-cloak
                                                             @click="retryHFDownload(task.task_id)"
-                                                            class="p-1.5 text-neutral-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
+                                                            class="p-1.5 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
                                                             :title="window.t('models.queue.retry_tooltip') || 'Retry download'">
                                                         <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                                     </button>
@@ -1082,7 +1082,7 @@
                                                         <div class="px-6 py-3.5 flex items-center justify-between hover:bg-neutral-50 transition-colors">
                                                             <div class="min-w-0 flex-1">
                                                                 <button @click="openMsModelDetail(model.repo_id)"
-                                                                   class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer" x-text="model.name || model.repo_id"></button>
+                                                                   class="text-sm font-medium text-neutral-900 hover:underline truncate block transition-colors text-left cursor-pointer" x-text="model.name || model.repo_id"></button>
                                                                 <div class="flex items-center gap-3 mt-0.5">
                                                                     <span x-show="model.size_formatted" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
                                                                     <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
@@ -1092,11 +1092,11 @@
                                                             </div>
                                                             <div class="flex items-center gap-2 shrink-0 ml-4">
                                                                 <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
-                                                                      class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                                                      class="badge bg-amber-50 text-amber-700 border-amber-200">
                                                                     {{ t('models.browse.tight_fit') }}
                                                                 </span>
                                                                 <span x-show="isModelDownloaded(model.repo_id)" x-cloak
-                                                                      class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                      class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                                                     <i data-lucide="check" class="w-3 h-3"></i>
                                                                     {{ t('models.browse.downloaded') }}
                                                                 </span>
@@ -1142,7 +1142,7 @@
                                                         <div class="px-6 py-3.5 flex items-center justify-between hover:bg-neutral-50 transition-colors">
                                                             <div class="min-w-0 flex-1">
                                                                 <button @click="openMsModelDetail(model.repo_id)"
-                                                                   class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer" x-text="model.name || model.repo_id"></button>
+                                                                   class="text-sm font-medium text-neutral-900 hover:underline truncate block transition-colors text-left cursor-pointer" x-text="model.name || model.repo_id"></button>
                                                                 <div class="flex items-center gap-3 mt-0.5">
                                                                     <span x-show="model.size_formatted" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
                                                                     <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
@@ -1152,11 +1152,11 @@
                                                             </div>
                                                             <div class="flex items-center gap-2 shrink-0 ml-4">
                                                                 <span x-show="getMemoryFitStatus(model.size) === 'warning'" x-cloak
-                                                                      class="badge bg-amber-50 text-amber-600 border-amber-200">
+                                                                      class="badge bg-amber-50 text-amber-700 border-amber-200">
                                                                     {{ t('models.browse.tight_fit') }}
                                                                 </span>
                                                                 <span x-show="isModelDownloaded(model.repo_id)" x-cloak
-                                                                      class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                      class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                                                     <i data-lucide="check" class="w-3 h-3"></i>
                                                                     {{ t('models.browse.downloaded') }}
                                                                 </span>
@@ -1211,7 +1211,7 @@
                                                             <div class="px-6 py-3.5 flex items-center justify-between hover:bg-neutral-50 transition-colors">
                                                                 <div class="min-w-0 flex-1">
                                                                     <button @click="openMsModelDetail(model.repo_id)"
-                                                                       class="text-sm font-medium text-neutral-900 hover:text-blue-600 truncate block transition-colors text-left cursor-pointer font-mono text-xs" x-text="model.repo_id"></button>
+                                                                       class="text-sm font-medium text-neutral-900 hover:underline truncate block transition-colors text-left cursor-pointer font-mono text-xs" x-text="model.repo_id"></button>
                                                                     <div class="flex items-center gap-3 mt-0.5 flex-wrap">
                                                                         <span x-show="model.size_formatted" x-cloak class="text-xs text-neutral-400" x-text="model.size_formatted"></span>
                                                                         <span x-show="model.params" x-cloak class="text-xs text-neutral-400" x-text="model.params_formatted + ' ' + window.t('models.browse.params_suffix')"></span>
@@ -1221,7 +1221,7 @@
                                                                 </div>
                                                                 <div class="flex items-center gap-2 shrink-0 ml-4">
                                                                     <span x-show="isModelDownloaded(model.repo_id)" x-cloak
-                                                                          class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                                                          class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                                                         <i data-lucide="check" class="w-3 h-3"></i>
                                                                         {{ t('models.browse.downloaded') }}
                                                                     </span>
@@ -1321,7 +1321,7 @@
                                                                 </button>
                                                                 <button x-show="task.status === 'failed' || task.status === 'cancelled'" x-cloak
                                                                         @click="retryMSDownload(task.task_id)"
-                                                                        class="p-1.5 text-neutral-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
+                                                                        class="p-1.5 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100 rounded-lg transition-all"
                                                                         title="{{ t('models.queue.retry_tooltip') }}">
                                                                     <i data-lucide="refresh-cw" class="w-4 h-4"></i>
                                                                 </button>
@@ -1501,7 +1501,7 @@
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>
-                                        <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-600 leading-relaxed">{{ t('models.oq.text_only_hint') }}</p>
+                                        <p x-show="oqTextOnly && oqSelectedModelIsVLM()" x-cloak class="text-xs text-amber-700 leading-relaxed">{{ t('models.oq.text_only_hint') }}</p>
                                         <!-- Preserve MTP weights -->
                                         <div class="flex items-center justify-between">
                                             <div class="flex-1 min-w-0 pr-3">
@@ -1509,7 +1509,7 @@
                                                 <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.preserve_mtp_help') }}</p>
                                                 <p x-show="!oqSelectedModelHasMtp()"
                                                    x-cloak
-                                                   class="text-xs text-amber-600 mt-1 leading-relaxed">{{ t('models.oq.preserve_mtp_unavailable') }}</p>
+                                                   class="text-xs text-amber-700 mt-1 leading-relaxed">{{ t('models.oq.preserve_mtp_unavailable') }}</p>
                                             </div>
                                             <button type="button"
                                                     role="switch"
@@ -1911,9 +1911,9 @@
                                                 <!-- Status badge -->
                                                 <span class="badge uppercase tracking-wider"
                                                       :class="{
-                                                          'bg-amber-50 text-amber-600': task.status === 'pending',
-                                                          'bg-blue-50 text-blue-600': task.status === 'uploading',
-                                                          'bg-green-50 text-green-600': task.status === 'completed',
+                                                          'bg-amber-50 text-amber-700': task.status === 'pending',
+                                                          'bg-blue-50 text-blue-700': task.status === 'uploading',
+                                                          'bg-green-50 text-green-700': task.status === 'completed',
                                                           'bg-red-50 text-red-600': task.status === 'failed',
                                                           'bg-neutral-100 text-neutral-500': task.status === 'cancelled',
                                                       }"
@@ -1951,7 +1951,7 @@
                                         <!-- Completed: HF repo link -->
                                         <div x-show="task.status === 'completed' && task.repo_url" x-cloak class="mt-2">
                                             <a :href="task.repo_url" target="_blank" rel="noopener noreferrer"
-                                               class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1 transition-colors">
+                                               class="text-xs text-neutral-700 underline hover:text-neutral-900 flex items-center gap-1 transition-colors">
                                                 <i data-lucide="external-link" class="w-3 h-3"></i>
                                                 <span x-text="task.repo_url"></span>
                                             </a>
@@ -2146,11 +2146,11 @@
                                                                    @change="toggleHfFile(file)">
                                                             <span class="font-mono text-neutral-700 truncate flex-1 min-w-0" x-text="file.name"></span>
                                                             <span x-show="file.local" x-cloak
-                                                                  class="badge bg-green-50 text-green-600 border-green-200 shrink-0">{{ t('models.detail.file_downloaded') }}</span>
+                                                                  class="badge bg-green-50 text-green-700 border-green-200 shrink-0">{{ t('models.detail.file_downloaded') }}</span>
                                                             <span x-show="!file.local && file.required" x-cloak
                                                                   class="text-neutral-400 shrink-0">{{ t('models.detail.required_file') }}</span>
                                                             <span x-show="file.kind === 'gguf' && getMemoryFitStatus(hfFileSize(file)) === 'warning'" x-cloak
-                                                                  class="badge bg-amber-50 text-amber-600 border-amber-200 shrink-0">{{ t('models.browse.tight_fit') }}</span>
+                                                                  class="badge bg-amber-50 text-amber-700 border-amber-200 shrink-0">{{ t('models.browse.tight_fit') }}</span>
                                                             <span x-show="file.kind === 'gguf' && getMemoryFitStatus(hfFileSize(file)) === 'danger'" x-cloak
                                                                   class="badge bg-red-50 text-red-700 border-red-200 shrink-0">{{ t('models.browse.high_oom_risk') }}</span>
                                                             <span class="text-neutral-400 shrink-0 ml-1" x-text="formatFileSize(file.size)"></span>
@@ -2183,7 +2183,7 @@
                                 <!-- Footer -->
                                 <div class="px-6 py-4 border-t border-neutral-200 flex items-center justify-between shrink-0 bg-neutral-50">
                                     <a :href="'https://huggingface.co/' + hfModelDetail.repo_id" target="_blank" rel="noopener noreferrer"
-                                       class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1.5 transition-colors">
+                                       class="text-xs text-neutral-700 underline hover:text-neutral-900 flex items-center gap-1.5 transition-colors">
                                         <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
                                         {{ t('models.detail.view_on_hf') }}
                                     </a>
@@ -2201,7 +2201,7 @@
                                             </span>
                                         </template>
                                         <span x-show="!hfModelDetail.is_adapter && hfModelDetail.layout !== 'gguf' && isModelDownloaded(hfModelDetail.repo_id)" x-cloak
-                                              class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                              class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                             <i data-lucide="check" class="w-3 h-3"></i>
                                             {{ t('models.browse.downloaded') }}
                                         </span>
@@ -2295,7 +2295,7 @@
                                 <!-- Footer -->
                                 <div class="px-6 py-4 border-t border-neutral-200 flex items-center justify-between shrink-0 bg-neutral-50">
                                     <a :href="'https://modelscope.cn/models/' + msModelDetail.repo_id" target="_blank" rel="noopener noreferrer"
-                                       class="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1.5 transition-colors">
+                                       class="text-xs text-neutral-700 underline hover:text-neutral-900 flex items-center gap-1.5 transition-colors">
                                         <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
                                         <span x-text="window.t('models.detail.view_on_ms')"></span>
                                     </a>
@@ -2305,7 +2305,7 @@
                                             {{ t('models.detail.close') }}
                                         </button>
                                         <span x-show="isModelDownloaded(msModelDetail.repo_id)" x-cloak
-                                              class="badge bg-green-50 text-green-600 border-green-200 shrink-0 gap-1">
+                                              class="badge bg-green-50 text-green-700 border-green-200 shrink-0 gap-1">
                                             <i data-lucide="check" class="w-3 h-3"></i>
                                             {{ t('models.browse.downloaded') }}
                                         </span>

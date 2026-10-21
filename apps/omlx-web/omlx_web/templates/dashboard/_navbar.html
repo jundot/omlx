@@ -85,7 +85,7 @@
                     <!-- Download count badge -->
                     <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
                           x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="absolute -top-1 -right-1 w-4 h-4 bg-blue-500 text-white text-caption font-bold rounded-full flex items-center justify-center pointer-events-none"
+                          class="absolute -top-1 -right-1 w-4 h-4 bg-neutral-900 text-white text-caption font-bold rounded-full flex items-center justify-center pointer-events-none"
                           x-cloak></span>
                     <!-- Dropdown menu -->
                     <div
@@ -423,7 +423,7 @@
                     {{ t('navbar.tab.models') }}
                     <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
                           x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="w-4 h-4 bg-blue-500 text-white text-caption font-bold rounded-full flex items-center justify-center"
+                          class="w-4 h-4 bg-neutral-900 text-white text-caption font-bold rounded-full flex items-center justify-center"
                           x-cloak></span>
                 </button>
                 <button @click="setMainTab('settings'); mobileMenuOpen = false"

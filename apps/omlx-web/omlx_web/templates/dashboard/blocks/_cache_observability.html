@@ -222,13 +222,13 @@
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right">
                                     <span x-show="!m.has_sub_block_cache" x-text="formatNumber(m.indexed_blocks || 0) + ' blocks'"></span>
-                                    <span x-show="m.has_sub_block_cache" class="font-medium text-amber-600" x-text="m.indexed_blocks_display + ' tks'"></span>
+                                    <span x-show="m.has_sub_block_cache" class="font-medium text-amber-700" x-text="m.indexed_blocks_display + ' tks'"></span>
                                 </td>
                             </template>
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
                                 <td class="px-3 py-2 text-right">
                                     <span x-show="m.has_sub_block_cache"
-                                          class="text-amber-600"
+                                          class="text-amber-700"
                                           x-text="window.t('status.active_models.cached_tokens').replace('{count}', (m.last_partial_tokens_skipped || m.indexed_blocks_display || ('<' + (m.block_size || '?'))))">
                                     </span>
                                     <span x-show="!m.has_sub_block_cache" class="text-neutral-400">-</span>

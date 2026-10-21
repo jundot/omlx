@@ -69,24 +69,24 @@
                             <span class="badge bg-violet-50 text-violet-600 border-violet-200"
                                   x-text="clusterBadgeLabel(m.cluster)"></span>
                             <span x-show="m.cluster?.live?.stale"
-                                  class="badge bg-amber-50 text-amber-600 border-amber-200"
+                                  class="badge bg-amber-50 text-amber-700 border-amber-200"
                                   x-text="window.t('cluster.badge.stale')"></span>
                         </div>
                         <div class="mt-1.5 space-y-1 min-w-0">
                             <template x-if="m.is_loading">
-                                <div class="flex items-center gap-1.5 min-w-0 text-xs text-blue-500 font-medium">
-                                    <svg class="w-3 h-3 shrink-0 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
+                                <div class="flex items-center gap-1.5 min-w-0 text-xs text-blue-700 font-medium">
+                                    <svg class="w-3 h-3 shrink-0 animate-spin text-blue-700" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
                                     <span class="min-w-0" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
                                 </div>
                             </template>
                             <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
-                                <div class="flex items-center gap-1.5 text-xs text-blue-600 font-medium">
+                                <div class="flex items-center gap-1.5 text-xs text-blue-700 font-medium">
                                     <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse shrink-0"></span>
                                     <span x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
                                 </div>
                             </template>
                             <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests > 0">
-                                <div class="flex items-center gap-1.5 text-xs text-green-600 font-medium">
+                                <div class="flex items-center gap-1.5 text-xs text-green-700 font-medium">
                                     <span class="w-2 h-2 rounded-full bg-green-500 shrink-0"></span>
                                     <span x-text="m.active_requests + ' ' + window.t('status.active_models.req')"></span>
                                 </div>
@@ -132,7 +132,7 @@
                                 <span class="badge bg-violet-50 text-violet-600 border-violet-200 whitespace-nowrap"
                                       x-text="clusterBadgeLabel(m.cluster)"></span>
                                 <span x-show="m.cluster?.live?.stale" x-cloak
-                                      class="badge bg-amber-50 text-amber-600 border-amber-200 whitespace-nowrap"
+                                      class="badge bg-amber-50 text-amber-700 border-amber-200 whitespace-nowrap"
                                       x-text="window.t('cluster.badge.stale')"></span>
                             </span>
                         </template>
@@ -143,22 +143,22 @@
                             <!-- Loading spinner -->
                             <template x-if="m.is_loading">
                                 <div class="flex items-center gap-1.5">
-                                    <svg class="w-3 h-3 animate-spin text-blue-500" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
-                                    <span class="text-xs text-blue-500 font-medium" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
+                                    <svg class="w-3 h-3 animate-spin text-blue-700" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"/><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"/></svg>
+                                    <span class="text-xs text-blue-700 font-medium" x-text="'Loading' + (m.loading_elapsed_seconds != null ? ' · ' + formatDurationShort(m.loading_elapsed_seconds) : '') + (m.loading_remaining_seconds_estimate != null ? ' · ~' + formatDurationShort(m.loading_remaining_seconds_estimate) + ' left' : '')"></span>
                                 </div>
                             </template>
                             <!-- Prefilling -->
                             <template x-if="!m.is_loading && m.prefilling && m.prefilling.length > 0">
                                 <div class="flex items-center gap-1.5">
                                     <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
-                                    <span class="text-xs text-blue-600 font-medium" x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
+                                    <span class="text-xs text-blue-700 font-medium" x-text="m.prefilling.length + ' PP' + (m.active_requests > 0 ? ' · ' + m.active_requests + ' ' + window.t('status.active_models.req') : '')"></span>
                                 </div>
                             </template>
                             <!-- Active (generation only) -->
                             <template x-if="!m.is_loading && (!m.prefilling || m.prefilling.length === 0) && m.active_requests > 0">
                                 <div class="flex items-center gap-1.5">
                                     <span class="w-2 h-2 rounded-full bg-green-500"></span>
-                                    <span class="text-xs text-green-600 font-medium" x-text="m.active_requests + ' ' + window.t('status.active_models.req')"></span>
+                                    <span class="text-xs text-green-700 font-medium" x-text="m.active_requests + ' ' + window.t('status.active_models.req')"></span>
                                 </div>
                             </template>
                             <!-- Idle -->
@@ -201,8 +201,8 @@
                                     <div class="h-full bg-blue-400 rounded-full transition-all duration-300"
                                          :style="'width: ' + (pp.total > 0 ? Math.min(100, pp.processed / pp.total * 100) : 0) + '%'"></div>
                                 </div>
-                                <span class="text-caption text-blue-500 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
-                                <span class="text-caption text-blue-600 font-medium" x-show="pp.detail" x-text="pp.detail"></span>
+                                <span class="text-caption text-blue-700 font-medium w-8 text-right" x-text="(pp.total > 0 ? Math.round(pp.processed / pp.total * 100) : 0) + '%'"></span>
+                                <span class="text-caption text-blue-700 font-medium" x-show="pp.detail" x-text="pp.detail"></span>
                                 <span class="text-caption text-neutral-400" x-text="formatTokenCount(pp.processed) + ' / ' + formatTokenCount(pp.total) + ' tok'"></span>
                                 <span x-show="pp.scored_tokens || pp.selected_tokens" class="text-caption text-neutral-400" x-text="'(' + (pp.scored_tokens ? 'draft scored ' + formatTokenCount(pp.scored_tokens) : '') + (pp.scored_tokens && pp.selected_tokens ? ' · ' : '') + (pp.selected_tokens ? 'selected ' + formatTokenCount(pp.selected_tokens) + (pp.keep_percent != null ? ' (' + pp.keep_percent + '%)' : '') : '') + ')'"></span>
                                 <span x-show="pp.elapsed != null" class="text-caption text-neutral-400" x-text="formatDurationShort(pp.elapsed)"></span>
@@ -220,7 +220,7 @@
                                 <span class="text-caption font-mono text-neutral-400 w-16 truncate" x-text="gen.request_id.substring(0, 8)"></span>
                                 <span class="inline-flex items-center gap-2 min-w-[104px] whitespace-nowrap">
                                     <span class="w-2 h-2 rounded-full flex-shrink-0 bg-green-400 animate-pulse"></span>
-                                    <span class="text-caption text-green-600 font-medium" x-text="window.t('status.active_models.generating')"></span>
+                                    <span class="text-caption text-green-700 font-medium" x-text="window.t('status.active_models.generating')"></span>
                                 </span>
                                 <span class="text-caption text-neutral-400 w-16 whitespace-nowrap ml-2" x-text="formatTokenCount(gen.generated_tokens || 0) + ' tok'"></span>
                                 <span x-show="gen.tokens_per_second > 0" class="text-caption text-neutral-400 w-20 whitespace-nowrap"
@@ -240,7 +240,7 @@
                                 <span class="text-caption font-mono text-neutral-400 w-16 truncate" x-text="activity.request_id.substring(0, 8)"></span>
                                 <span class="inline-flex items-center gap-2 min-w-[120px] whitespace-nowrap">
                                     <span class="w-2 h-2 rounded-full flex-shrink-0" :class="activityDotClass(activity.last_activity_age_seconds)"></span>
-                                    <span class="text-caption text-green-600 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
+                                    <span class="text-caption text-green-700 font-medium" x-text="activity.detail || activity.kind || window.t('status.active_models.active')"></span>
                                 </span>
                                 <span x-show="formatActivityMetadata(activity)" class="text-caption text-neutral-400 whitespace-nowrap ml-2" x-text="formatActivityMetadata(activity)"></span>
                                 <span x-show="activity.elapsed_seconds != null" class="text-caption text-neutral-400 whitespace-nowrap ml-1" x-text="formatDurationShort(activity.elapsed_seconds)"></span>
@@ -255,7 +255,7 @@
                             <div class="flex items-center gap-2">
                                 <span class="text-caption font-mono text-neutral-400 w-16 truncate" x-text="wait.request_id.substring(0, 8)"></span>
                                 <span class="w-2 h-2 rounded-full bg-amber-300"></span>
-                                <span class="text-caption text-amber-600 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
+                                <span class="text-caption text-amber-700 font-medium" x-text="window.t('status.active_models.waiting') + ' #' + wait.queue_position"></span>
                                 <span class="text-caption text-neutral-400" x-text="formatDurationShort(wait.elapsed_seconds)"></span>
                                 <span x-show="wait.prompt_tokens > 0" class="text-caption text-neutral-400" x-text="window.t('status.active_models.waiting_prompt_tokens').replace('{count}', formatTokenCount(wait.prompt_tokens))"></span>
                             </div>

@@ -201,7 +201,7 @@
     [data-theme="dark"] .bg-red-50 { background-color: rgb(var(--palette-red-500) / 0.15) !important; }
     [data-theme="dark"] .border-red-200 { border-color: rgb(var(--palette-red-500) / 0.3) !important; }
     [data-theme="dark"] .text-red-500 { color: rgb(var(--palette-red-400)) !important; }
-    [data-theme="dark"] .text-red-600 { color: rgb(var(--palette-red-500)) !important; }
+    [data-theme="dark"] .text-red-600 { color: rgb(var(--palette-red-400)) !important; }
     [data-theme="dark"] .text-red-700 { color: rgb(var(--palette-red-300)) !important; }
     [data-theme="dark"] .bg-emerald-50 { background-color: rgb(var(--palette-emerald-500) / 0.15) !important; }
     [data-theme="dark"] .hover\:bg-emerald-100:hover { background-color: rgb(var(--palette-emerald-500) / 0.25) !important; }

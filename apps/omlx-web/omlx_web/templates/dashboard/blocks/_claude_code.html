@@ -63,7 +63,7 @@
                     </select>
                     <div x-show="globalSettings.claude_code.opus_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.opus_model)"
                          x-cloak
-                         class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                         class="mt-1 flex items-center gap-1.5 text-xs text-amber-700">
                         <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
                         <span>{{ t('status.claude_code.model_unavailable') }}</span>
                     </div>
@@ -81,7 +81,7 @@
                     </select>
                     <div x-show="globalSettings.claude_code.sonnet_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.sonnet_model)"
                          x-cloak
-                         class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                         class="mt-1 flex items-center gap-1.5 text-xs text-amber-700">
                         <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
                         <span>{{ t('status.claude_code.model_unavailable') }}</span>
                     </div>
@@ -99,7 +99,7 @@
                     </select>
                     <div x-show="globalSettings.claude_code.haiku_model && llmModels.length > 0 && !llmModels.find(m => m.id === globalSettings.claude_code.haiku_model)"
                          x-cloak
-                         class="mt-1 flex items-center gap-1.5 text-xs text-amber-600">
+                         class="mt-1 flex items-center gap-1.5 text-xs text-amber-700">
                         <i data-lucide="alert-triangle" class="w-3 h-3 flex-shrink-0"></i>
                         <span>{{ t('status.claude_code.model_unavailable') }}</span>
                     </div>
