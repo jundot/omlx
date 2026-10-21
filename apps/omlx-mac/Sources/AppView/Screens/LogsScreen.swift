@@ -227,7 +227,7 @@ private struct LogTable: View {
             if vm.rows.isEmpty {
                 if !vm.isLoading {
                     Text(vm.emptyMessage)
-                        .font(.omlxText(13))
+                        .font(.omlxText(DesignTokens.FontSize.body))
                         .foregroundStyle(theme.textTertiary)
                         .padding(.vertical, 36)
                 }
@@ -310,7 +310,7 @@ private struct LogColumnHeader: View {
                         comment: "Logs table column header: the log message"))
             Spacer(minLength: 0)
         }
-        .font(.omlxText(12, weight: .semibold))
+        .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
         .foregroundStyle(theme.textTertiary)
         .lineLimit(1)
         .padding(.horizontal, 12)
@@ -330,7 +330,7 @@ private struct LogRowView: View {
     var body: some View {
         HStack(spacing: 8) {
             Text(Self.clockTime(record.time))
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.textTertiary)
                 .frame(width: LogColumn.time, alignment: .leading)
                 .help(record.level == nil
@@ -341,7 +341,7 @@ private struct LogRowView: View {
             LevelBadge(level: record.level)
                 .frame(width: LogColumn.level, alignment: .leading)
             Text(record.module)
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.textSecondary)
                 .truncationMode(.middle)
                 .frame(width: LogColumn.module, alignment: .leading)
@@ -385,7 +385,7 @@ private struct LogRowView: View {
 
     private var message: some View {
         Text(record.firstLine)
-            .font(.omlxText(13))
+            .font(.omlxText(DesignTokens.FontSize.body))
             .foregroundStyle(theme.text)
             .truncationMode(.tail)
     }
@@ -415,7 +415,7 @@ private struct LevelBadge: View {
     var body: some View {
         let color = tint
         Text(level?.rawValue ?? "-")
-            .font(.omlxMono(12, weight: .semibold))
+            .font(.omlxMono(DesignTokens.FontSize.callout, weight: .semibold))
             .foregroundStyle(color)
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
@@ -443,7 +443,7 @@ private struct CountBadge: View {
 
     var body: some View {
         Text(text)
-            .font(.omlxText(12, weight: .semibold))
+            .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
             .foregroundStyle(tint ?? theme.textTertiary)
             .padding(.horizontal, 4)
             .background((tint?.opacity(0.16) ?? theme.controlBg),
@@ -468,7 +468,7 @@ private struct LogMemoryChips: View {
                 .background(theme.controlBg, in: RoundedRectangle(cornerRadius: 5, style: .continuous))
             }
         }
-        .font(.omlxText(12))
+        .font(.omlxText(DesignTokens.FontSize.callout))
         .fixedSize()
     }
 }
@@ -507,14 +507,14 @@ private struct LogDetailCard: View {
                 Text(String(localized: "logs.detail.title",
                             defaultValue: "Entry",
                             comment: "Title of the card that shows one log record in full"))
-                    .font(.omlxText(12, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
                     .foregroundStyle(theme.textSecondary)
                 Text(row.record.time)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textSecondary)
                 LevelBadge(level: row.record.level)
                 Text(row.record.module)
-                    .font(.omlxMono(12))
+                    .font(.omlxMono(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textTertiary)
                     .lineLimit(1)
                 Spacer(minLength: 8)
@@ -547,7 +547,7 @@ private struct LogDetailCard: View {
                         onOpen(.server)
                     }
                 }
-                .font(.omlxText(12))
+                .font(.omlxText(DesignTokens.FontSize.callout))
                 .buttonStyle(.link)
             }
 
@@ -555,7 +555,7 @@ private struct LogDetailCard: View {
                 Text(String(localized: "logs.detail.occurrences",
                             defaultValue: "Occurrences (\(row.times.count))",
                             comment: "Heading above the list of times a repeated log line appeared; the placeholder is how many times"))
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                     .foregroundStyle(theme.textSecondary)
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 3) {
@@ -567,13 +567,13 @@ private struct LogDetailCard: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .frame(maxHeight: 96)
-                .font(.omlxMono(12))
+                .font(.omlxMono(DesignTokens.FontSize.callout))
                 .foregroundStyle(theme.textTertiary)
                 if row.times.count > LogParser.occurrenceLimit {
                     Text(String(localized: "logs.detail.occurrences_more",
                                 defaultValue: "…and \(row.times.count - LogParser.occurrenceLimit) more",
                                 comment: "Line under the occurrence list when the list is capped; the placeholder is how many occurrences are not listed"))
-                        .font(.omlxMono(12))
+                        .font(.omlxMono(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textTertiary)
                 }
             }
@@ -601,7 +601,7 @@ private struct LogRawPane: View {
                         fgColor: NSColor(theme.text), bgColor: NSColor(theme.codeBg))
             if vm.rawText.isEmpty && !vm.isLoading {
                 Text(vm.emptyMessage)
-                    .font(.omlxText(13))
+                    .font(.omlxText(DesignTokens.FontSize.body))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.vertical, 36)
             }

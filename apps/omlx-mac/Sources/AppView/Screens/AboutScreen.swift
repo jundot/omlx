@@ -53,17 +53,17 @@ private struct HeroCard: View {
                 Text(String(localized: "common.app_name",
                             defaultValue: "oMLX",
                             comment: "Product name shown as the About screen title"))
-                    .font(.omlxText(22, weight: .semibold))
+                    .font(.omlxText(DesignTokens.FontSize.title1, weight: .semibold))
                     .foregroundStyle(theme.text)
                 Text(String(localized: "about.hero.tagline",
                             defaultValue: "Local AI, no more waiting on your Mac.",
                             comment: "Tagline shown under the oMLX product name on the About screen hero card"))
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textSecondary)
                 Text(String(localized: "about.hero.version",
                             defaultValue: "Version \(version) · build \(build)",
                             comment: "Version + build line on the About screen hero card; placeholders are the bundle short version string and bundle version"))
-                    .font(.omlxMono(11))
+                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                     .foregroundStyle(theme.textTertiary)
             }
             Spacer(minLength: 8)
@@ -155,7 +155,7 @@ private struct LicenseSection: View {
                         Text(String(localized: "about.license.name",
                                     defaultValue: "Apache License 2.0",
                                     comment: "Name of the open-source license shown on the About screen"))
-                            .font(.omlxText(13, weight: .medium))
+                            .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                             .foregroundStyle(theme.text)
                     }
                     Text(String(localized: "about.license.notice",

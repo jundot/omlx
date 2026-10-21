@@ -99,7 +99,7 @@ private struct ActiveModelsSection: View {
                     Text(String(localized: "models.active.empty",
                                 defaultValue: "No models loaded",
                                 comment: "Empty-state message shown when no models are currently loaded"))
-                        .font(.omlxText(12))
+                        .font(.omlxText(DesignTokens.FontSize.callout))
                         .foregroundStyle(theme.textTertiary)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 14)
@@ -114,14 +114,14 @@ private struct ActiveModelsSection: View {
                                     .foregroundStyle(theme.textSecondary)
                             }
                             Text(m.displayTitle)
-                                .font(.omlxText(13, weight: .medium))
+                                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                                 .foregroundStyle(theme.text)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                             Spacer(minLength: 8)
                             ActiveBadge(model: m)
                             Text(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))
-                                .font(.omlxMono(11))
+                                .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.textSecondary)
                                 .frame(minWidth: 60, alignment: .trailing)
                             Button {
@@ -198,12 +198,12 @@ private struct LibrarySection: View {
                         Text(String(localized: "models.library.empty.title",
                                     defaultValue: "No models discovered",
                                     comment: "Empty-state title shown when no models have been discovered on disk"))
-                            .font(.omlxText(12))
+                            .font(.omlxText(DesignTokens.FontSize.callout))
                             .foregroundStyle(theme.textTertiary)
                         Text(String(localized: "models.library.empty.sub",
                                     defaultValue: "Use the Downloads screen to fetch a model from Hugging Face.",
                                     comment: "Empty-state subtitle directing the user to the Downloads screen"))
-                            .font(.omlxText(11))
+                            .font(.omlxText(DesignTokens.FontSize.subheadline))
                             .foregroundStyle(theme.textTertiary)
                     }
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -234,7 +234,7 @@ private struct LibrarySection: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 HStack(spacing: 4) {
                                     Text(m.displayTitle)
-                                        .font(.omlxText(13, weight: .medium))
+                                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                                         .foregroundStyle(theme.text)
                                         .lineLimit(1)
                                         .truncationMode(.tail)
@@ -270,7 +270,7 @@ private struct LibrarySection: View {
                                     }
                                 }
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
-                                    .font(.omlxMono(11))
+                                    .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                     .foregroundStyle(theme.textSecondary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)

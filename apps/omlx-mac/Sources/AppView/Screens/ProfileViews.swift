@@ -125,7 +125,7 @@ struct ProfileGroup: View {
                                  comment: "Button in profile chip-group header that saves the working profile as a new named profile"),
                           systemImage: "plus")
                         .labelStyle(.titleAndIcon)
-                        .font(.omlxText(11, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline, weight: .medium))
                 }
                 .buttonStyle(.omlx(.plain, size: .small))
                 .overlay(
@@ -193,7 +193,7 @@ struct ProfileGroup: View {
             if isEditing {
                 TextField("", text: $renameText)
                     .textFieldStyle(.plain)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                     .foregroundStyle(isActive ? .white : theme.text)
                     .fixedSize(horizontal: true, vertical: false)
                     .focused($renameFieldFocused)
@@ -214,7 +214,7 @@ struct ProfileGroup: View {
                     }
             } else {
                 Text(displayNames[name] ?? name)
-                    .font(.omlxText(12, weight: .medium))
+                    .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                     .foregroundStyle(isActive ? .white : theme.text)
             }
         }
@@ -447,7 +447,7 @@ struct SaveAsPopover: View {
             Text(String(localized: "profile.save_as.title",
                         defaultValue: "Save current profile as",
                         comment: "Lead label inside the Save-as popover for naming a new profile"))
-                .font(.omlxText(12, weight: .medium))
+                .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
                 .foregroundStyle(theme.textSecondary)
             Segmented(
                 selection: $scope,
@@ -596,7 +596,7 @@ struct ProfileDetailCard: View {
                         .fill(isWorking ? theme.amberDot : scopeColor)
                         .frame(width: 6, height: 6)
                     Text(subtitleText)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                 }
             }
@@ -721,7 +721,7 @@ struct ProfileDetailCard: View {
                 Text(String(localized: "profile.detail.empty",
                             defaultValue: "This profile doesn't override any settings.",
                             comment: "Placeholder text in the profile detail card when no settings are set"))
-                    .font(.omlxText(12))
+                    .font(.omlxText(DesignTokens.FontSize.callout))
                     .foregroundStyle(theme.textTertiary)
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 10)
@@ -1068,7 +1068,7 @@ struct ProfileDetailCard: View {
                     .controlSize(.small)
                     if exposeAsModel, let exposedModelId {
                         Text(exposedModelId)
-                            .font(.omlxMono(11))
+                            .font(.omlxMono(DesignTokens.FontSize.subheadline))
                             .foregroundStyle(theme.textTertiary)
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -1093,7 +1093,7 @@ struct ProfileDetailCard: View {
     @ViewBuilder
     private func sectionTitle(_ s: String) -> some View {
         Text(s)
-            .font(.omlxText(10, weight: .heavy))
+            .font(.omlxText(DesignTokens.FontSize.caption, weight: .heavy))
             .kerning(0.9)
             .textCase(.uppercase)
             .foregroundStyle(theme.textTertiary)
