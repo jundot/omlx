@@ -350,47 +350,21 @@ extension Font {
 
 // MARK: - Type ramp
 
-/// The app's type ramp, in points: the macOS built-in text styles, plus the
-/// Welcome hero.
-///
-/// Every `.omlxText` / `.omlxMono` / `.omlxDisplay` call names one of these
-/// rather than typing a size, so a screen states which step of the scale it
-/// wants and a number cannot drift back into a view. Each value is the point
-/// size AppKit gives its built-in text style, so a step and the style it stands
-/// for cannot disagree. Weight is a call-site argument, not part of a step.
-///
-/// | step          | value | macOS style |
-/// |---------------|-------|-------------|
-/// | `caption`     | 10    | footnote, caption 1, caption 2 |
-/// | `subheadline` | 11    | subheadline |
-/// | `callout`     | 12    | callout |
-/// | `body`        | 13    | body, headline |
-/// | `title3`      | 15    | title 3 |
-/// | `title2`      | 17    | title 2 |
-/// | `title1`      | 22    | title 1 |
-/// | `largeTitle`  | 26    | large title |
-/// | `hero`        | 48    | no built-in style: the Welcome hero |
+/// Font sizes for `.omlxText`, `.omlxMono` and `.omlxDisplay`.
+/// Each step is the point size of the macOS text style it is named after.
 enum DesignTokens {
-    /// The type levels, named after the macOS text style each one is.
     enum FontSize {
-        /// Footnote and captions: timestamps, badges, table secondary cells.
+        /// Footnote, caption 1 and caption 2.
         static let caption: CGFloat = 10
-        /// Subheadline: dense table headers, secondary labels.
         static let subheadline: CGFloat = 11
-        /// Callout: captions that lead a group, secondary body copy.
         static let callout: CGFloat = 12
-        /// Body and headline: body copy, form labels, table primary cells.
+        /// Body and headline.
         static let body: CGFloat = 13
-        /// Title 3: group and card titles.
         static let title3: CGFloat = 15
-        /// Title 2: section headings.
         static let title2: CGFloat = 17
-        /// Title 1: drawer and sheet titles.
         static let title1: CGFloat = 22
-        /// Large title: page titles.
         static let largeTitle: CGFloat = 26
-        /// The Welcome hero: larger than any built-in style, and the one step
-        /// that is not a macOS text style.
+        /// Welcome hero. No macOS text style is this large.
         static let hero: CGFloat = 48
     }
 }
