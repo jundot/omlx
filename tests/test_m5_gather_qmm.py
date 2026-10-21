@@ -17,12 +17,8 @@ def _fresh_state(monkeypatch):
 
     Restoration pins everything to the raw builtin captured at setup —
     monkeypatched stand-ins (e.g. call spies on ``_original_gather_qmm``)
-    must never leak into ``mx.gather_qmm`` for later test files. The
-    reinstall bypasses ``apply`` so a kill-switch env var set by the
-    test cannot leave the session unwrapped.
+    must never leak into ``mx.gather_qmm`` for later test files.
     """
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_FIX", raising=False)
-    monkeypatch.delenv("OMLX_M5_GATHER_QMM_NAX", raising=False)
     was_installed = getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
     raw = patch_mod._original_gather_qmm if was_installed else mx.gather_qmm
     saved_defective = patch_mod._defective
@@ -40,12 +36,6 @@ def test_apply_idempotent():
     assert apply_m5_gather_qmm_workaround()
     assert getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
     assert not apply_m5_gather_qmm_workaround()
-
-
-def test_env_kill_switch(monkeypatch):
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_FIX", "0")
-    assert not apply_m5_gather_qmm_workaround()
-    assert not getattr(mx.gather_qmm, "_omlx_m5_reroute", False)
 
 
 def _call(x_shape, **kwargs):
@@ -129,7 +119,8 @@ def test_reroute_restores_correct_output_on_defective_hardware(
     reroute (flag dropped for K % 64 != 0). ``poisoned`` puts NaN right after
     the last expert: mlx 0.32.3's kernel reads it for K % 64 != 0.
     """
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", nax_route)
+    if nax_route == "0":
+        monkeypatch.setattr(patch_mod._nax, "supports", lambda *a, **k: False)
     assert apply_m5_gather_qmm_workaround()
 
     n, e, out_dim, k = 80, 8, 64, 96
@@ -165,7 +156,8 @@ def test_reroute_restores_correct_output_on_defective_hardware(
 def test_sorted_call_past_32768_rows_matches_reference(monkeypatch, nax_route):
     """>32768 sorted rows run as one call and match fp32: the NAX route, or
     (route off) mlx's own kernel, whose row offsets no longer overflow."""
-    monkeypatch.setenv("OMLX_M5_GATHER_QMM_NAX", nax_route)
+    if nax_route == "0":
+        monkeypatch.setattr(patch_mod._nax, "supports", lambda *a, **k: False)
     assert apply_m5_gather_qmm_workaround()
 
     n, e, out_dim, k = 32768 + 4096, 8, 64, 64

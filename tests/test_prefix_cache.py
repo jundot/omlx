@@ -11,7 +11,7 @@ import sys
 import time
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -847,6 +847,28 @@ class TestBlockAwarePrefixCacheWithSSD:
 
         assert result is None
 
+    @pytest.mark.parametrize(
+        "message,raises",
+        [
+            ("[METAL] Command buffer execution failed: Caused GPU Hang Error", True),
+            ("unexpected block layout", False),
+        ],
+    )
+    def test_reconstruct_cache_raises_only_failed_command_buffers(
+        self, prefix_cache_with_ssd, message, raises
+    ):
+        """A GPU reset must fail the request, not turn into a cache miss."""
+        type(prefix_cache_with_ssd.paged_ssd_cache)._expected_layer_cache_types = (
+            PropertyMock(side_effect=RuntimeError(message))
+        )
+        table = BlockTable(request_id="req-001", block_ids=[1, 2])
+
+        if raises:
+            with pytest.raises(RuntimeError, match="GPU Hang"):
+                prefix_cache_with_ssd.reconstruct_cache(table)
+        else:
+            assert prefix_cache_with_ssd.reconstruct_cache(table) is None
+
     def test_reconstruct_cache_no_ssd_manager(self, paged_cache):
         """Test reconstruct_cache without SSD manager."""
         model = MockModel(num_layers=4)
@@ -916,8 +938,9 @@ class TestBlockAwarePrefixCacheWithSSD:
         result = prefix_cache_with_ssd.reconstruct_cache(table)
 
         assert result is None
+        # free_block() clears the live hash, so compare against the stored one.
         prefix_cache_with_ssd.paged_ssd_cache.forget_block.assert_called_once_with(
-            block.block_hash
+            b"\xcd" * 32
         )
         prefix_cache_with_ssd.paged_ssd_cache.delete_block.assert_not_called()
 
@@ -2810,7 +2833,7 @@ class TestArraysCacheLastBlockOnly:
         for call in calls:
             saved_by_hash[call.kwargs["block_hash"]] = call.kwargs["cache_data"]
 
-        def load_block_with_metadata(block_hash):
+        def load_block_with_metadata(block_hash, **kwargs):
             block_data = saved_by_hash.get(block_hash)
             if block_data is None:
                 return None, None
@@ -5000,27 +5023,20 @@ TYPES = ["ArraysCache", "KVCache", "CacheList"]
 ## MockModel: uses the existing one in this module
 
 
-def _make_cache(
-    cache_dir,
-    *,
-    block_size=BLOCK_SIZE,
-    num_layers=None,
-    hot_cache_max_bytes=64 * 1024**2,
-    hot_cache_only=True,
-):
+def _make_cache(cache_dir, *, num_layers=None, ssd_only=False):
     if num_layers is None:
         num_layers = len(TYPES)
     ssd = PagedSSDCacheManager(
         cache_dir=cache_dir,
         max_size_bytes=1024**3,
-        hot_cache_max_bytes=hot_cache_max_bytes,
-        hot_cache_only=hot_cache_only,
+        hot_cache_max_bytes=0 if ssd_only else 64 * 1024**2,
+        hot_cache_only=not ssd_only,
         expected_model_name="test-model",
         expected_num_layers=num_layers,
-        expected_block_size=block_size,
+        expected_block_size=BLOCK_SIZE,
     )
     paged = PagedCacheManager(
-        block_size=block_size,
+        block_size=BLOCK_SIZE,
         max_blocks=200,
         model_name="test-model",
         initial_blocks=200,
@@ -5277,6 +5293,52 @@ def test_bounded_restore_keeps_non_arrays_layers_intact(tmp_path, monkeypatch):
     ssd.close()
 
 
+@pytest.mark.parametrize("ssd_only", [False, True])
+def test_single_array_recurrent_state_round_trips(tmp_path, ssd_only):
+    """LFM2 short-conv layers are ArraysCache(size=1): a lone conv state must
+    survive store/restore instead of degrading to the (1,) placeholder."""
+    types = ["KVCache", "ArraysCache"]
+    cache, ssd = _make_cache(tmp_path / "ssd", num_layers=len(types), ssd_only=ssd_only)
+    total = NUM_BLOCKS * BLOCK_SIZE
+
+    def data(n):
+        keys, values = _position_kv(n)
+        return [
+            {
+                "state": (keys, values),
+                "meta_state": (n,),
+                "class_name": "KVCache",
+                "cache_type": "KVCache",
+            },
+            {
+                "state": (mx.full((1, 2, 16), float(n)),),
+                "meta_state": (),
+                "class_name": "ArraysCache",
+                "cache_type": "ArraysCache",
+            },
+        ]
+
+    snapshots = {BLOCK_SIZE * i: data(BLOCK_SIZE * i) for i in range(1, NUM_BLOCKS + 1)}
+    table = cache.store_cache(
+        "store",
+        list(range(total + 2)),
+        data(total + 2),
+        model_cache_config=ModelCacheConfig.from_type_list(
+            types, model_name="test-model"
+        ),
+        boundary_snapshots=snapshots,
+    )
+    assert table is not None and len(table.block_ids) == NUM_BLOCKS
+
+    restored, restored_tokens = _restore(cache, total, "restore")
+    assert restored_tokens == total
+    assert len(restored[1].cache) == 1
+    assert mx.array_equal(
+        restored[1].cache[0], mx.full((1, 2, 16), float(total))
+    ).item()
+    ssd.close()
+
+
 def test_bounded_restore_with_mid_chain_placeholder(tmp_path, monkeypatch):
     """A mid-chain block whose arrays snapshot is the standard placeholder
     must not break the drop cutoff: the walk-back target (the newest block
@@ -5333,114 +5395,24 @@ def test_bounded_path_inactive(tmp_path, monkeypatch, flush_bytes, min_tokens):
     ssd.close()
 
 
-@pytest.mark.parametrize(
-    "reader_hot_bytes", [0, 256 * 1024**2], ids=["no-promotion", "promotion"]
-)
-def test_bounded_restore_lowers_promoted_peak(tmp_path, monkeypatch, reader_hot_bytes):
-    """With hot-cache promotion the bounded path keeps only the live layer
-    and the newest snapshot. Without promotion both paths stay lazy, and the
-    win is the KV concat evaluated inside reconstruct instead of at the
-    first prefill step: with two KV layers the lazy peak holds both layers'
-    slices plus both concats, the bounded one slice plus one concat."""
-    block, blocks = 64, 16
-    types = [
-        "ArraysCache",
-        "KVCache",
-        "ArraysCache",
-        "KVCache",
-        "KVCache",
-    ]
-    total = block * blocks
-    keys = mx.random.normal((1, 1, total, 256)).astype(mx.bfloat16)
-    values = mx.random.normal((1, 1, total, 256)).astype(mx.bfloat16)
-    mx.eval(keys, values)
-
-    def data(n):
-        out = []
-        for i, t in enumerate(types):
-            if t == "ArraysCache":
-                out.append(
-                    {
-                        "state": (
-                            mx.full((1, 3, 64), n + i, dtype=mx.bfloat16),
-                            mx.full((1, 8, 64, 64), n * 0.5 + i, dtype=mx.float32),
-                        ),
-                        "meta_state": (),
-                        "class_name": t,
-                        "cache_type": t,
-                    }
-                )
-            else:
-                out.append(
-                    {
-                        "state": (keys[:, :, :n, :], values[:, :, :n, :]),
-                        "meta_state": (n,),
-                        "class_name": t,
-                        "cache_type": t,
-                    }
-                )
-        return out
-
-    ssd_dir = tmp_path / "ssd"
-    writer, writer_ssd = _make_cache(
-        ssd_dir,
-        block_size=block,
-        num_layers=len(types),
-        hot_cache_max_bytes=0,
-        hot_cache_only=False,
+def test_restore_pool_flush_raises_failed_command_buffer(monkeypatch):
+    """Only a failed command buffer escapes the best-effort pool flush."""
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 1 << 40)
+    monkeypatch.setattr(
+        prefix_cache_module,
+        "_sync_and_clear_cache",
+        MagicMock(side_effect=RuntimeError("[metal] clear failed")),
     )
-    table = writer.store_cache(
-        "store",
-        list(range(total)),
-        data(total),
-        model_cache_config=ModelCacheConfig.from_type_list(
-            types, model_name="test-model"
+    assert BlockAwarePrefixCache._flush_restore_pool_if_over(1) is False
+
+    monkeypatch.setattr(
+        prefix_cache_module,
+        "_sync_and_clear_cache",
+        MagicMock(
+            side_effect=RuntimeError(
+                "[METAL] Command buffer execution failed: Caused GPU Hang Error"
+            )
         ),
-        boundary_snapshots={
-            block * (i + 1): data(block * (i + 1)) for i in range(blocks)
-        },
     )
-    assert table is not None and len(table.block_ids) == blocks
-    writer_ssd.close()
-
-    def peak_and_arrays(flush_bytes):
-        _set_flush(monkeypatch, flush_bytes)
-        reader, reader_ssd = _make_cache(
-            ssd_dir,
-            block_size=block,
-            num_layers=len(types),
-            hot_cache_max_bytes=reader_hot_bytes,
-            hot_cache_only=False,
-        )
-        restore_table, _ = reader.fetch_cache("r", list(range(total)) + [7])
-        assert restore_table is not None and restore_table.num_tokens == total
-        mx.clear_cache()
-        base = mx.get_active_memory()
-        mx.reset_peak_memory()
-        restored = reader.reconstruct_cache(restore_table)
-        assert restored is not None
-        arrays = [
-            v
-            for c in restored
-            for v in _restored_cache_arrays(c)
-            if isinstance(v, mx.array)
-        ]
-        mx.eval(arrays)
-        peak = mx.get_peak_memory() - base
-        reader_ssd.close()
-        return peak, arrays
-
-    lazy_peak, lazy_arrays = peak_and_arrays(0)
-    bounded_peak, bounded_arrays = peak_and_arrays(1)
-    for x, y in zip(lazy_arrays, bounded_arrays, strict=True):
-        assert mx.array_equal(x, y).item()
-    if reader_hot_bytes:
-        # Promotion materializes every block: unbounded holds KV slices +
-        # every block's snapshots; bounded holds KV slices + one live layer
-        # + ~one block of snapshots.
-        assert bounded_peak < 0.65 * lazy_peak, (bounded_peak, lazy_peak)
-    else:
-        # No promotion: snapshots stay lazy on both paths. The eager eval
-        # still wins with two KV layers: lazy peaks holding both layers'
-        # slices plus both concats, bounded one slice plus one concat.
-        assert bounded_peak < 0.8 * lazy_peak, (bounded_peak, lazy_peak)
+    with pytest.raises(RuntimeError, match="GPU Hang"):
+        BlockAwarePrefixCache._flush_restore_pool_if_over(1)

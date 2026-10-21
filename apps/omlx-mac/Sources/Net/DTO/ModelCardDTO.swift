@@ -50,6 +50,18 @@ struct ModelCardDTO: Decodable, Equatable, Sendable {
     /// Free-form tag strings from the upstream API. Drives the Tags tab
     /// for both sources.
     let tags: [String]?
+
+    /// HF-only: "safetensors", "gguf" or "other", by the repo's weights.
+    let layout: String?
+
+    /// HF-only: bytes "Download All" fetches.
+    let downloadAllSize: Int64?
+
+    /// HF-only: free bytes in the model folder.
+    let diskFree: Int64?
+
+    /// HF-only: why no engine oMLX runs loads the repo (a Splash package).
+    let unsupportedReason: String?
 }
 
 /// One entry in `ModelCardDTO.files`. `sizeFormatted` is already
@@ -58,6 +70,18 @@ struct ModelCardFile: Decodable, Equatable, Sendable, Identifiable {
     let name: String
     let size: Int64
     let sizeFormatted: String?
+    /// HF-only download hints. `kind` is "gguf", "mmproj", "imatrix",
+    /// "weights" or "other"; `group` names the split GGUF a part belongs
+    /// to; `mmproj` is the projector a GGUF pairs with.
+    let kind: String?
+    let group: String?
+    let mmproj: String?
+    /// A file the checkpoint cannot load without; always downloaded.
+    let required: Bool?
+    /// A file a selection starts with.
+    let preselected: Bool?
+    /// Already in the model folder.
+    let local: Bool?
 
     var id: String { name }
 }

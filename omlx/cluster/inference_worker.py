@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager, nullcontext, suppress
 from datetime import UTC, datetime
 from functools import partial, wraps
@@ -36,6 +36,7 @@ from .memory_guard import (
     guard_rank_load,
     watch_rank_load,
 )
+from .mtp_sync import ClusterMtpSync
 from .performance import ExecutionSettings
 from .pipeline_compat import (
     install_pipeline_compatibility,
@@ -45,10 +46,18 @@ from .planner import PipelineAssignment
 from .prefill_guard import build_guard
 from .progressive_loading import install_progressive_loader
 from .rdma.stage_transport import install_stage_links
-from .runtime_optimizations import install_runtime_optimizations
+from .runtime_optimizations import (
+    install_runtime_optimizations,
+    wait_for_pipeline_peers_on_host,
+)
 from .telemetry import install_server_telemetry
 
 _EVENT_PREFIX = "OMLX_CLUSTER_EVENT:"
+# Bound for the Metal release in the SIGTERM/SIGINT handler before hard exit.
+_SIGNAL_CLEAR_TIMEOUT_SECONDS = 10
+# Same period and idle window as the engine pool's keep-warm ticker.
+_GPU_KEEP_WARM_INTERVAL_SECONDS = 0.5
+_GPU_KEEP_WARM_IDLE_WINDOW_SECONDS = 300.0
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +149,96 @@ def _bind_generation_thread_stream(
         response_generator_type._generate = original_generate
 
 
+@contextmanager
+def _keep_rank_gpu_warm(
+    mx: Any,
+    telemetry: Any,
+    *,
+    interval: float = _GPU_KEEP_WARM_INTERVAL_SECONDS,
+    idle_window: float = _GPU_KEEP_WARM_IDLE_WINDOW_SECONDS,
+    clock: Callable[[], float] = time.monotonic,
+):
+    """Keep this rank's GPU out of its idle power state while it serves.
+
+    An idle GPU parks after about a second and then stalls the next command
+    buffer for seconds. A pipeline stage idles while its peers compute, so the
+    stalls chain across stages and decode drops to seconds per token.
+    """
+
+    stop = threading.Event()
+
+    def tick() -> None:
+        stream = mx.new_stream(mx.gpu)
+        last_active = clock()
+        while not stop.wait(interval):
+            now = clock()
+            if telemetry.active_request_count():
+                last_active = now
+            elif now - last_active > idle_window:
+                continue
+            with mx.stream(stream):
+                mx.eval(mx.zeros((1,), dtype=mx.float32) + 1)
+
+    thread = threading.Thread(
+        target=tick,
+        name="omlx-cluster-gpu-keep-warm",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
+
+
+def _mtp_load_settings(args: argparse.Namespace) -> SimpleNamespace | None:
+    """The model settings that make the pre-load patches arm Lightning MTP."""
+
+    if not getattr(args, "mtp", False):
+        return None
+    depth = int(getattr(args, "mtp_depth", 0) or 0) or None
+    fixed = bool(getattr(args, "mtp_fixed_depth", False))
+    return SimpleNamespace(
+        mtp_enabled=True,
+        mtp_fixed_depth=depth if fixed else None,
+        mtp_adaptive_max_depth=None if fixed else depth,
+    )
+
+
+def _arm_cluster_mtp(model: Any, group: Any, rank: int, mx: Any) -> Any:
+    """Give the loaded rank its Lightning MTP decision channel, or none at all.
+
+    Rank zero must hold the draft head and every other rank must replay its
+    verify forwards. One rank short of its role would leave the others running
+    a different forward, so the ranks vote and all serve without MTP instead.
+    """
+
+    host = getattr(model, "language_model", model)
+    if rank == 0:
+        ready = bool(getattr(host, "_omlx_mtp_decode_enabled", False)) and (
+            getattr(host, "mtp", None) is not None
+        )
+    else:
+        ready = bool(getattr(host, "_omlx_mtp_verify_only", False))
+    votes = mx.distributed.all_sum(mx.array(int(ready)), group=group, stream=mx.cpu)
+    if int(votes.item()) != group.size():
+        # configure_mtp also stops rank zero capturing prompts for the head.
+        configure = getattr(host, "configure_mtp", None)
+        if callable(configure):
+            configure(False)
+        host._omlx_mtp_decode_enabled = False
+        logger.warning(
+            "Lightning MTP disabled for this deployment: rank %d %s its role",
+            rank,
+            "holds" if ready else "cannot take",
+        )
+        return None
+    sync = ClusterMtpSync(rank=rank)
+    model._omlx_cluster_mtp = sync
+    return sync
+
+
 def _encode_thinking_marker(tokenizer: Any, text: str) -> list[int] | None:
     try:
         ids = tokenizer.encode(text, add_special_tokens=False)
@@ -211,13 +310,18 @@ def _thinking_close_pattern(
     if not template:
         return None, None
     template = template if isinstance(template, str) else str(template)
-    match = re.search(
-        r"(\\n|\\r|[\n\r])*" + re.escape(think_end_text) + r"((?:\\n|\\r|[\n\r])*)",
-        template,
+    matches = list(
+        re.finditer(
+            r"(\\n|\\r|[\n\r])*" + re.escape(think_end_text) + r"((?:\\n|\\r|[\n\r])*)",
+            template,
+        )
     )
-    if match is None:
+    if not matches:
         return None, None
-    matched = match.group(0)
+    matched = next(
+        (m.group(0) for m in matches if m.group(0) != think_end_text),
+        matches[0].group(0),
+    )
     leading, trailing = matched.split(think_end_text, 1)
     leading = leading.replace("\\n", "\n").replace("\\r", "\r")
     trailing = trailing.replace("\\n", "\n").replace("\\r", "\r")
@@ -260,6 +364,23 @@ def _thinking_budget_token_to_piece(
             return None
     except Exception:
         return None
+
+
+@contextmanager
+def _sample_with_stated_parameters(mlx_server: Any):
+    """Build request samplers that state their temperature and filters.
+
+    Lightning MTP reads them off the sampler to accept drafts. MLX-LM's samplers
+    carry none and read as greedy; oMLX's draw the same way and carry them.
+    """
+    from omlx.utils.sampling import make_sampler
+
+    original = mlx_server.make_sampler
+    mlx_server.make_sampler = make_sampler
+    try:
+        yield
+    finally:
+        mlx_server.make_sampler = original
 
 
 @contextmanager
@@ -498,6 +619,12 @@ def _install_distributed_model_protocol(tokenizer: Any, model_path: str | Path) 
     )
 
     repair_tool_parser(tokenizer)
+    if model_type == "deepseek_v41":
+        from omlx.patches.deepseek_v41.processing import install_tokenizer_protocol
+
+        config = json.loads((Path(model_path) / "config.json").read_text())
+        install_tokenizer_protocol(tokenizer, config)
+        return "deepseek_v41"
     installed = install_minimax_m3_tokenizer_protocol(
         tokenizer,
         str(model_path),
@@ -526,6 +653,9 @@ def _execution_settings(args: argparse.Namespace) -> ExecutionSettings:
         async_overlap=args.async_overlap,
         ring_connections_per_ip=args.ring_connections_per_ip,
         tuning_reason=args.tuning_reason,
+        mtp=getattr(args, "mtp", False),
+        mtp_depth=getattr(args, "mtp_depth", 0),
+        mtp_fixed_depth=getattr(args, "mtp_fixed_depth", False),
     )
 
 
@@ -593,9 +723,7 @@ def _install_signal_handlers() -> None:
         # KeyboardInterrupt path is unchanged for a rank that answers promptly.
         try:
             signal.signal(signal.SIGALRM, hard_exit)
-            signal.alarm(
-                int(os.environ.get("OMLX_CLUSTER_SIGNAL_CLEAR_TIMEOUT", "10") or "10")
-            )
+            signal.alarm(_SIGNAL_CLEAR_TIMEOUT_SECONDS)
         except Exception:
             pass
         _release_metal_memory(f"rank received {name}")
@@ -661,8 +789,6 @@ def _watch_launcher_parent(
     marker: RuntimeMarker,
     *,
     poll_interval: float = 0.2,
-    watched_marker_path: Any = None,
-    marker_stale_after: float = 45.0,
     get_parent_pid: Any = os.getppid,
     wait: Any = time.sleep,
     exit_process: Any = os._exit,
@@ -677,42 +803,22 @@ def _watch_launcher_parent(
     of every rank, so a reparented worker cannot make useful collective
     progress and must not remain resident on a node.
 
-    Two conditions are watched: the parent pid changing (the original check),
-    and — when ``watched_marker_path`` is configured — a launcher- or
-    coordinator-maintained lease file going stale for ``marker_stale_after``
-    seconds, which catches a launcher that is alive but wedged (its ranks
-    would otherwise wait in a collective forever). ``os._exit`` stays the
-    last resort: ``on_abort`` fires first so in-flight requests can be
-    cancelled at a step boundary, and ``release_memory`` unwires the rank's
-    Metal allocations before the process disappears — ``os._exit`` skips
-    every finally/atexit handler, and a skipped release strands wired memory
-    until the Mac is rebooted.
+    ``os._exit`` stays the last resort: ``on_abort`` fires first so in-flight
+    requests can be cancelled at a step boundary, and ``release_memory``
+    unwires the rank's Metal allocations before the process disappears -
+    ``os._exit`` skips every finally/atexit handler, and a skipped release
+    strands wired memory until the Mac is rebooted.
     """
 
-    watched = Path(watched_marker_path) if watched_marker_path else None
     while True:
         wait(poll_interval)
-        reason = None
-        if get_parent_pid() != parent_pid:
-            current_parent = get_parent_pid()
-            reason = (
-                f"rank launcher parent changed from {parent_pid} to "
-                f"{current_parent}; the rank cannot safely continue"
-            )
-        elif watched is not None and marker_stale_after > 0:
-            try:
-                age = time.time() - watched.stat().st_mtime
-            except OSError:
-                age = None
-            # A lease that never appeared yet is not stale; the launcher may
-            # still be starting. Once it exists, it must stay fresh.
-            if age is not None and age > marker_stale_after:
-                reason = (
-                    f"launcher lease {watched} is stale ({age:.1f}s > "
-                    f"{marker_stale_after:.1f}s); the launcher is wedged"
-                )
-        if reason is None:
+        if get_parent_pid() == parent_pid:
             continue
+        current_parent = get_parent_pid()
+        reason = (
+            f"rank launcher parent changed from {parent_pid} to "
+            f"{current_parent}; the rank cannot safely continue"
+        )
         # Keep the marker as bounded crash evidence. The next activation
         # overwrites the deterministic path, and liveness already ignores a
         # marker whose owner is dead. Removing it here reduced this exact
@@ -842,14 +948,12 @@ def _start_peer_watchdog(
             plan_hash=marker.payload.get("plan_hash"),
         )
 
-    abort_grace = float(os.environ.get("OMLX_CLUSTER_PEER_ABORT_GRACE", "5.0") or 0.0)
     watchdog = PeerWatchdog(
         hosts_by_rank,
         deployment_id=deployment_id,
         state_dir=state_dir,
         on_lost=on_lost,
         on_abort=on_abort,
-        abort_grace=abort_grace,
     )
     thread = threading.Thread(
         target=watchdog.run, name="omlx-cluster-peer-watchdog", daemon=True
@@ -864,11 +968,6 @@ def _start_launcher_watchdog(
     *,
     state_dir: str | None = None,
 ) -> None:
-    # Optional coordinator/launcher lease file: when configured (and once
-    # it exists), the watchdog also fires if it goes stale — covering a
-    # launcher that is alive but wedged, which the parent-pid check alone
-    # cannot see. Off by default, preserving the original PPID-only watch.
-    lease = os.environ.get("OMLX_CLUSTER_LAUNCHER_LEASE", "").strip()
     deployment_id = str(marker.payload.get("deployment_id") or "")
 
     def on_abort(reason: str) -> None:
@@ -883,10 +982,7 @@ def _start_launcher_watchdog(
     thread = threading.Thread(
         target=_watch_launcher_parent,
         args=(parent_pid, marker),
-        kwargs={
-            "watched_marker_path": lease or None,
-            "on_abort": on_abort,
-        },
+        kwargs={"on_abort": on_abort},
         name="omlx-cluster-launcher-watchdog",
         daemon=True,
     )
@@ -1353,7 +1449,7 @@ def run_worker(args: argparse.Namespace) -> int:
             assignments=[_runtime_assignment(item) for item in assignments],
         )
 
-        maybe_apply_pre_load_patches(args.model)
+        maybe_apply_pre_load_patches(args.model, _mtp_load_settings(args))
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
         # moments later. Architectures oMLX patches in (glm_moe_dsa's
@@ -1441,6 +1537,11 @@ def run_worker(args: argparse.Namespace) -> int:
             # Doing it here as well would shard every projection twice.
             measured_weight_bytes = _measured_weight_bytes(provider.model)
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
+            mtp_sync = (
+                _arm_cluster_mtp(provider.model, group, rank, mx)
+                if execution.mtp
+                else None
+            )
             # Installed first so the runtime optimizations wrap the RDMA-aware send.
             with (
                 install_stage_links(
@@ -1456,7 +1557,23 @@ def run_worker(args: argparse.Namespace) -> int:
                     batchable=provider.is_batchable,
                     pipeline_parallel=tensor_parallel_size == 1,
                 ) as optimizations,
+                # Last: the optimizations validate the stock forward's source.
+                wait_for_pipeline_peers_on_host(provider.model),
             ):
+                if mtp_sync is not None:
+                    mtp_reason = (
+                        "rank zero drafts and decides; the other ranks replay "
+                        "its verify cycles"
+                    )
+                elif execution.mtp:
+                    mtp_reason = "a rank could not take its Lightning MTP role"
+                else:
+                    mtp_reason = "the plan or the model settings leave it off"
+                optimizations["lightning_mtp"] = {
+                    "enabled": execution.mtp,
+                    "active": mtp_sync is not None,
+                    "reason": mtp_reason,
+                }
                 marker.update(
                     "ready",
                     load_stage="ready",
@@ -1553,7 +1670,8 @@ def run_worker(args: argparse.Namespace) -> int:
                         on_generation_failed=partial(
                             _exit_on_generation_failure, marker, rank
                         ),
-                    ),
+                    ) as telemetry,
+                    _keep_rank_gpu_warm(mx, telemetry),
                     _bind_generation_thread_stream(
                         ResponseGenerator,
                         mx,
@@ -1563,7 +1681,18 @@ def run_worker(args: argparse.Namespace) -> int:
                         mlx_server,
                         provider.tokenizer,
                     ),
+                    (
+                        _sample_with_stated_parameters(mlx_server)
+                        if mtp_sync is not None
+                        else nullcontext()
+                    ),
                 ):
+                    if mtp_sync is not None:
+                        if control_plane is None:
+                            raise RuntimeError(
+                                "cluster Lightning MTP needs the rank-control channel"
+                            )
+                        mtp_sync.control_plane = control_plane
                     # install_server_telemetry also runs the idle heartbeat for
                     # the length of this block, so "stale" means stalled rather
                     # than "nobody has asked anything for 45 seconds".
@@ -1663,6 +1792,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--tuning-reason",
         default="balanced profile defaults",
     )
+    parser.add_argument("--mtp", action="store_true")
+    parser.add_argument("--mtp-depth", type=int, default=0)
+    parser.add_argument("--mtp-fixed-depth", action="store_true")
     return parser
 
 

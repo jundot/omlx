@@ -513,7 +513,7 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
     )
     # The tuner reaches into the engine for the raw model and compares prompt
     # throughput across slots, so it must stage the plain LM engine: a DFlash
-    # engine exposes no _model and would skew every measurement (issue #2914).
+    # drafter would skew every measurement (issue #2914).
     if hasattr(settings, "dflash_enabled"):
         settings.dflash_enabled = False
     # SpecPrefill compresses the measurement prompt to a sparse subset before
@@ -565,6 +565,16 @@ def _ane_execution_observed(
         int(values.get("operations", 0) or 0) > 0
         for values in categories.values()
     )
+
+
+def _observed_operations(traces: list[dict[str, Any] | None]) -> dict[str, int]:
+    totals = {"mlp": 0, "gdn": 0}
+    for trace in traces:
+        categories = (trace or {}).get("categories") or {}
+        for category in totals:
+            values = categories.get(category) or {}
+            totals[category] += int(values.get("operations", 0) or 0)
+    return totals
 
 
 def _ane_is_active(engine: Any) -> bool:
@@ -631,12 +641,12 @@ async def _measure_candidate(
     fast = None
     if candidate.enabled:
         try:
-            from ..custom_kernels.qwen35_prefill import fast as profile_fast
+            from ..custom_kernels.quant_matmul import ane as profile_fast
 
             fast = profile_fast
-            profile_enabled = fast.qwen35_ane_profile_set_enabled(True)
+            profile_enabled = fast.ane_profile_set_enabled(True)
             if profile_enabled:
-                fast.qwen35_ane_profile_reset()
+                fast.ane_profile_reset()
         except Exception:
             logger.debug("ANE tuner profiling is unavailable", exc_info=True)
 
@@ -687,10 +697,10 @@ async def _measure_candidate(
             if candidate.enabled:
                 traces.append(metrics.get("ane_trace"))
         if profile_enabled and fast is not None:
-            profile = fast.qwen35_ane_profile_snapshot()
+            profile = fast.ane_profile_snapshot()
     finally:
         if profile_enabled and fast is not None:
-            fast.qwen35_ane_profile_set_enabled(False)
+            fast.ane_profile_set_enabled(False)
 
     if candidate.backend == "k2" and candidate.enabled:
         if (
@@ -710,24 +720,40 @@ async def _measure_candidate(
     # Reject only a positive observation that compiled programs remained idle.
     # If profiling was unavailable, the result is unknown and stays eligible.
     if candidate.enabled and any(o is False for o in observations) and not any(observations):
+        operations = _observed_operations(traces)
         step = _prefill_step_size(engine)
-        hint = (
-            f"the scheduler is configured for {step}-token prefill chunks, "
-            f"so set sequence_length={step} or smaller (wider chunks tile "
-            "onto the compiled shape, narrower ones cannot)"
-            if step
-            else "sequence_length must not exceed the scheduler's prefill "
-            "chunk width"
-        )
+        if any(operations.values()):
+            # Another branch ran on the same chunks, so the width matched.
+            cause = (
+                "The other ANE branch ran on the same chunks, so the idle "
+                "branch was dropped at load or dispatch; check the serve log "
+                "for ANE compile, program budget, warmup, or runtime failure "
+                "warnings."
+            )
+        elif step is None:
+            cause = (
+                "sequence_length must not exceed the scheduler's prefill "
+                "chunk width."
+            )
+        elif run.request.sequence_length > step:
+            cause = (
+                f"The scheduler is configured for {step}-token prefill chunks, "
+                f"so set sequence_length={step} or smaller (wider chunks tile "
+                "onto the compiled shape, narrower ones cannot)."
+            )
+        else:
+            cause = (
+                f"The configured {step}-token prefill step fits this shape; "
+                "check chunk_tokens in the serve log, since delivered chunks "
+                "can shrink below the step, and check for ANE warmup or "
+                "runtime failure warnings."
+            )
         raise RuntimeError(
-            "The ANE compiled but never executed for "
-            f"sequence_length={run.request.sequence_length}: no ANE operation "
-            "was observed during measurement, so this candidate would report "
-            "GPU-only throughput as an ANE result. The most common cause is a "
-            f"prefill chunk size mismatch ({hint}; confirm against "
-            "chunk_tokens in the serve log, since delivered chunks can shrink "
-            "below the configured step). A runtime dispatch failure can also "
-            "disable the path; check the serve log for 'Disabling ANE' warnings."
+            "A required ANE branch never executed for "
+            f"sequence_length={run.request.sequence_length} (observed ANE "
+            f"operations: mlp={operations['mlp']}, gdn={operations['gdn']}), "
+            "so this candidate would report GPU-only throughput as an ANE "
+            f"result. {cause}"
         )
 
     result = {
@@ -1066,7 +1092,7 @@ def _calibrate_fused_components_sync(
         run.request.allow_cpu
         and run.request.allow_cpu_gate
         and mlp.gate_proj.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_ane_dual_cpu_fp16_q4_swiglu_down_t")
+        and fast.has_symbol("ane_dual_cpu_fp16_q4_swiglu_down_t")
     )
     gdn_cpu_supported = bool(
         run.request.allow_cpu
@@ -1080,7 +1106,7 @@ def _calibrate_fused_components_sync(
         (cpu_supported or gdn_cpu_supported)
         and run.request.allow_cpu_shared_resource
         and getattr(base_settings, "qwen35_ane_prefill_cpu_shared_resource", True)
-        and fast.qwen35_cpu_shared_resource_available()
+        and fast.cpu_shared_resource_available()
     )
     calibration_threads = _CALIBRATION_CPU_THREADS
     fractions = _fused_fraction_grid()
@@ -1113,14 +1139,14 @@ def _calibrate_fused_components_sync(
     if not prepared:
         raise RuntimeError("No valid fused MLP calibration widths could be prepared")
     mx.eval(*(value for _, weights in prepared for value in weights))
-    models0 = fast.qwen35_ane_compile_swiglu_down_bank(
+    models0 = fast.ane_compile_swiglu_down_bank(
         [weights[0] for _, weights in prepared],
         [weights[1] for _, weights in prepared],
         [weights[2] for _, weights in prepared],
         run.request.sequence_length,
         1,
     )
-    models1 = fast.qwen35_ane_compile_swiglu_down_bank(
+    models1 = fast.ane_compile_swiglu_down_bank(
         [weights[3] for _, weights in prepared],
         [weights[4] for _, weights in prepared],
         [weights[5] for _, weights in prepared],
@@ -1706,7 +1732,7 @@ def _calibrate_components_sync(
 ) -> _CalibrationChoice:
     import mlx.core as mx
 
-    from ..custom_kernels.qwen35_prefill import fast
+    from ..custom_kernels.quant_matmul import ane as fast
     from ..patches import qwen35_ane_prefill as patch
 
     dual_ane = bool(getattr(base_settings, "qwen35_ane_prefill_dual_ane", True))
@@ -1730,7 +1756,7 @@ def _calibrate_components_sync(
     down = mlp.down_proj
     fused_supported = bool(
         dual_ane
-        and fast.qwen35_ane_swiglu_down_available()
+        and fast.ane_swiglu_down_available()
         and all(
             int(getattr(linear, "bits", 0)) == 4
             and int(getattr(linear, "group_size", 0)) == 128
@@ -1761,7 +1787,7 @@ def _calibrate_components_sync(
         run.request.allow_cpu
         and gate.scales.dtype == mx.float16
         and down.scales.dtype == mx.float16
-        and fast.has_symbol("qwen35_cpu_fp16_affine_qmm_t")
+        and fast.has_symbol("cpu_fp16_affine_qmm_t")
     )
     gdn_cpu_supported = bool(
         run.request.allow_cpu
@@ -1776,7 +1802,7 @@ def _calibrate_components_sync(
         (cpu_gate_supported or cpu_down_supported or gdn_cpu_supported)
         and run.request.allow_cpu_shared_resource
         and getattr(base_settings, "qwen35_ane_prefill_cpu_shared_resource", True)
-        and fast.qwen35_cpu_shared_resource_available()
+        and fast.cpu_shared_resource_available()
     )
     cpu_threads = _CALIBRATION_CPU_THREADS
     fractions = run.fractions
@@ -2084,10 +2110,10 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
     # unloaded, and return a completed GPU-only verdict: on such a machine
     # that IS the tuning answer, not an error.
     try:
-        from ..custom_kernels.qwen35_prefill import fast
+        from ..custom_kernels.quant_matmul import ane as fast
 
-        runtime_available = fast.qwen35_ane_available()
-        bank_available = fast.qwen35_ane_bank_compiler_available()
+        runtime_available = fast.ane_available()
+        bank_available = fast.ane_bank_compiler_available()
     except Exception:
         # Never let the guard itself break tuning; fail open and let the
         # ladder report whatever is actually wrong.
@@ -2243,9 +2269,23 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
             )
         if refinement_changed:
             active_slot = _REFINE_SLOT
-            await _measure_result_slot(
-                run, _REFINE_SLOT, engine_pool, base_settings, refined
-            )
+            try:
+                await _measure_result_slot(
+                    run, _REFINE_SLOT, engine_pool, base_settings, refined
+                )
+            except Exception as exc:
+                # The verified prediction stays a valid answer; only this
+                # follow-up candidate is dropped.
+                logger.warning(
+                    "ANE tuning skipped %s for %s",
+                    refined.label,
+                    run.request.model_id,
+                    exc_info=True,
+                )
+                run.termination_reason = (
+                    f"Skipped {refined.label} after it failed: "
+                    f"{_exception_reason(exc)}"
+                )
         else:
             _complete_phase(
                 run,
@@ -2454,9 +2494,9 @@ async def _run_k2_tuning(run: ANETuningRun, engine_pool: Any) -> None:
     run.deadline = time.monotonic() + 180
     previous = _pin_speed_priority(engine_pool)
     try:
-        from ..custom_kernels.qwen35_prefill import fast
+        from ..custom_kernels.quant_matmul import ane as fast
 
-        if not fast.qwen35_ane_available() or not hasattr(
+        if not fast.ane_available() or not hasattr(
             fast._ext, "ane_compile_program"
         ):
             raise RuntimeError("K2 tuning requires the native ANE extension")

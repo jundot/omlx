@@ -4,7 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, WebSocket
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
@@ -98,6 +98,18 @@ def configured_server(tmp_path):
         metrics.record_request_complete(1, 1, 0, 0.1, 0.1, "model-a", 0.2)
         return {"client": current_client()}
 
+    @app.websocket("/ws")
+    async def websocket_route(websocket: WebSocket):
+        from omlx.api.audio_routes import _verify_ws_api_key
+
+        if not _verify_ws_api_key(websocket, websocket.query_params.get("key")):
+            await websocket.close(code=1008)
+            return
+        await websocket.accept()
+        metrics.record_request_complete(3, 1, 0, 0.1, 0.1, "model-a", 0.2)
+        await websocket.send_json({"client": current_client()})
+        await websocket.close()
+
     try:
         yield TestClient(app, client=("192.168.1.20", 5000)), history
     finally:
@@ -134,3 +146,38 @@ def test_requests_record_key_and_peer(configured_server):
     assert [(r["client_ip"], r["requests"]) for r in result["clients_by_ip"]] == [
         (peer, 4)
     ]
+
+
+def test_websocket_records_matching_key_and_peer(configured_server):
+    from starlette.websockets import WebSocketDisconnect
+
+    client, history = configured_server
+    with client.websocket_connect("/ws?key=editor-key") as websocket:
+        assert websocket.receive_json()["client"] == [
+            "sub_key",
+            "Editor",
+            "192.168.1.20",
+        ]
+    with pytest.raises(WebSocketDisconnect) as rejected:
+        with client.websocket_connect("/ws?key=wrong"):
+            pytest.fail("invalid key accepted")
+    assert rejected.value.code == 1008
+    history.flush()
+    rows = history.query("today")["clients_by_key"]
+    assert [(row["key_id"], row["requests"]) for row in rows] == [("Editor", 1)]
+
+
+def test_locked_client_is_rejected_before_key_attribution(
+    configured_server, monkeypatch
+):
+    from omlx.admin import auth
+
+    client, history = configured_server
+    monkeypatch.setattr(
+        auth,
+        "_key_failures",
+        {"192.168.1.20": auth._KeyFailures(locked_until=auth.time.monotonic() + 300)},
+    )
+    response = client.get("/plain", headers={"x-api-key": "editor-key"})
+    assert response.status_code == 429
+    assert history.query("today")["clients"] == []

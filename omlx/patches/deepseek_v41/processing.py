@@ -7,6 +7,9 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image, ImageOps
 
+from .config import ModelConfig
+from .tool_parser import parse_tool_call, tool_call_end, tool_call_start
+
 
 def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
     return n_llm_h * (n_llm_w + 1) + 2
@@ -112,6 +115,24 @@ def image_patches(image, config):
     return mx.array(patches).astype(mx.bfloat16), height // p, width // p, types
 
 
+def install_tokenizer_protocol(tokenizer, raw_config):
+    """Serve V4.1 through an mlx-lm tokenizer: its encoder and DSML tool calls.
+
+    Cluster ranks and the coordinator load the tokenizer with mlx-lm, whose
+    wrapper reads these private fields and has no template of its own here.
+    """
+    Processor(tokenizer, ModelConfig.from_dict(raw_config))
+    tokenizer.has_chat_template = True
+    tokenizer._tool_parser = parse_tool_call
+    for name, marker in (("start", tool_call_start), ("end", tool_call_end)):
+        setattr(tokenizer, f"_tool_call_{name}", marker)
+        setattr(
+            tokenizer,
+            f"_tool_call_{name}_tokens",
+            tuple(tokenizer.encode(marker, add_special_tokens=False)),
+        )
+
+
 class Processor:
     def __init__(self, tokenizer, config):
         self.tokenizer, self.config = tokenizer, config
@@ -140,6 +161,8 @@ class Processor:
             if not messages or messages[0]["role"] != "system":
                 messages.insert(0, {"role": "system", "content": ""})
             messages[0]["tools"] = tools
+        if continue_final_message and messages and messages[-1]["role"] == "assistant":
+            messages[-1]["wo_eos"] = True
         mode = thinking_mode or ("thinking" if enable_thinking else "chat")
         prompt = encode_messages(
             messages, thinking_mode=mode, reasoning_effort=reasoning_effort
@@ -147,10 +170,6 @@ class Processor:
         header = "<｜Assistant｜>" + ("<think>" if mode == "thinking" else "</think>")
         if not add_generation_prompt and prompt.endswith(header):
             prompt = prompt[: -len(header)]
-        if continue_final_message:
-            raise ValueError(
-                "DeepSeek V4.1 partial assistant continuation is not yet supported"
-            )
         return (
             self.tokenizer.encode(prompt, add_special_tokens=False)
             if tokenize

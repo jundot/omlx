@@ -127,6 +127,23 @@ class TestParseMsModelEntry:
         result = _parse_ms_model_entry(entry)
         assert result["name"] == "my-model"
 
+    @pytest.mark.parametrize(
+        "entry,expected_repo_id",
+        [
+            (
+                {"Owner": "mlx-community", "Name": "Qwen3.8-27B-4bit"},
+                "mlx-community/Qwen3.8-27B-4bit",
+            ),
+            (
+                {"Path": "qwen", "Owner": "other", "Name": "Qwen2.5-7B"},
+                "qwen/Qwen2.5-7B",
+            ),
+        ],
+    )
+    def test_repo_id_from_path_or_owner_key(self, entry, expected_repo_id):
+        result = _parse_ms_model_entry(entry)
+        assert result["repo_id"] == expected_repo_id
+
 
 # =============================================================================
 # MSDownloader Tests
@@ -178,10 +195,11 @@ class TestMSDownloader:
                 await downloader.start_download("no-slash")
 
     @pytest.mark.asyncio
-    async def test_start_download_invalid_model_id_too_many_parts(self, downloader):
+    @pytest.mark.parametrize("model_id", ["a/b/c", "../..", "a/..", "/etc"])
+    async def test_start_download_invalid_model_id_parts(self, downloader, model_id):
         with patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True):
             with pytest.raises(ValueError, match="Invalid model ID"):
-                await downloader.start_download("a/b/c")
+                await downloader.start_download(model_id)
 
     @pytest.mark.asyncio
     async def test_start_download_strips_whitespace(self, downloader):
@@ -462,6 +480,7 @@ class TestMSDownloader:
         import omlx.admin.ms_downloader as ms_module
 
         monkeypatch.setattr(ms_module, "_PROGRESS_POLL_INTERVAL", 0.01)
+        monkeypatch.setattr(ms_module, "_ETA_WARMUP", 0)
         target = downloader.model_dir / "owner" / "model"
         target.mkdir(parents=True, exist_ok=True)
         task = DownloadTask(
@@ -493,11 +512,14 @@ class TestMSDownloader:
             )
             await asyncio.sleep(0.05)
             observed_speed = task.speed_bps
+            observed_eta_speed = task.eta_speed_bps
             task.status = DownloadStatus.COMPLETED
             await poll
 
         assert observed_speed > 0, "a live download must report a rate"
+        assert observed_eta_speed > 0, "the ETA rate must follow the transfer"
         assert task.speed_bps == 0.0
+        assert task.eta_speed_bps == 0.0
 
 
 # =============================================================================
@@ -908,17 +930,17 @@ class TestFetchModelConfig:
 
 class TestFetchModelDetailSize:
     @pytest.mark.asyncio
-    async def test_prefers_safetensor_model_size(self):
+    async def test_ignores_safetensor_element_count(self):
         resp = MagicMock()
         resp.status_code = 200
         resp.json.return_value = {
             "Data": {
-                "ModelInfos": {"safetensor": {"model_size": 193153024}},
-                "StorageSize": 712593982,
+                "ModelInfos": {"safetensor": {"model_size": 4665462000}},
+                "StorageSize": 16081491610,
             }
         }
         with patch("omlx.admin.ms_downloader.requests.get", return_value=resp):
-            assert await _fetch_model_detail_size("owner/m") == 193153024
+            assert await _fetch_model_detail_size("owner/m") == 16081491610
 
     @pytest.mark.asyncio
     async def test_falls_back_to_storage_size(self):

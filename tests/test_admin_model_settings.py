@@ -95,6 +95,61 @@ async def test_load_time_setting_change_clears_cached_failure():
 
 
 @pytest.mark.asyncio
+async def test_embedding_audio_setting_is_load_time():
+    pool, entry = _failed_pool()
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(embedding_audio_enabled=True),
+    )
+
+    assert settings.embedding_audio_enabled is True
+    assert entry.load_failed is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio_enabled", [True, False])
+async def test_embedding_audio_length_is_load_time_only_with_audio(audio_enabled):
+    pool, entry = _failed_pool()
+    settings = ModelSettings(embedding_audio_enabled=audio_enabled)
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(embedding_audio_max_seconds=120),
+    )
+
+    assert settings.embedding_audio_max_seconds == 120
+    assert entry.load_failed is not audio_enabled
+
+
+@pytest.mark.asyncio
+async def test_resent_embedding_audio_settings_keep_loaded_engine():
+    pool, entry = _failed_pool()
+    entry.engine = _idle_engine()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(embedding_audio_enabled=True, embedding_audio_max_seconds=120.0),
+        admin_routes.ModelSettingsRequest(
+            embedding_audio_enabled=True, embedding_audio_max_seconds=120.0
+        ),
+    )
+
+    assert result["requires_reload"] is False
+    pool._unload_engine.assert_not_awaited()
+
+
+def test_embedding_audio_length_must_be_positive():
+    with pytest.raises(ValueError):
+        admin_routes.ModelSettingsRequest(embedding_audio_max_seconds=0)
+
+
+@pytest.mark.asyncio
 async def test_unchanged_load_time_setting_keeps_cached_failure():
     pool, entry = _failed_pool()
     settings = ModelSettings(trust_remote_code=False)
@@ -125,6 +180,54 @@ async def test_sampling_setting_change_keeps_cached_failure():
     assert entry.load_failed is True
     assert entry.load_failure_message == "trust_remote_code=True required"
     assert entry.load_failure_at == 123.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_kv_format_change_reloads_only_when_compression_is_enabled(enabled):
+    pool, entry = _failed_pool()
+    entry.engine = _idle_engine()
+    entry.load_failed = False
+    pool._unload_engine = AsyncMock()
+
+    result = await _update_settings(
+        pool,
+        ModelSettings(turboquant_kv_enabled=enabled),
+        admin_routes.ModelSettingsRequest(turboquant_kv_scheme="affine4"),
+    )
+
+    assert result["settings"]["turboquant_kv_scheme"] == "affine4"
+    assert result["requires_reload"] is enabled
+    assert result["auto_unloaded"] is enabled
+    assert result["reload_deferred"] is False
+    assert pool._unload_engine.await_count == int(enabled)
+
+
+@pytest.mark.asyncio
+async def test_legacy_turboquant_bits_only_block_kv_changes():
+    pool, _ = _failed_pool()
+    legacy = ModelSettings(turboquant_kv_bits=5)
+
+    result = await _update_settings(
+        pool, legacy, admin_routes.ModelSettingsRequest(temperature=0.5)
+    )
+    assert result["settings"]["temperature"] == 0.5
+
+    manager = MagicMock()
+    manager.get_settings.return_value = ModelSettings(turboquant_kv_bits=5)
+    with (
+        patch("omlx.admin.routes._get_engine_pool", return_value=pool),
+        patch("omlx.admin.routes._get_settings_manager", return_value=manager),
+        patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
+        pytest.raises(HTTPException) as exc,
+    ):
+        await admin_routes.update_model_settings(
+            "ling",
+            admin_routes.ModelSettingsRequest(turboquant_kv_scheme="affine8"),
+            is_admin=True,
+        )
+    assert exc.value.status_code == 400
+    manager.set_settings.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -288,6 +391,105 @@ async def test_oq_a8_alone_is_persisted():
 
 
 @pytest.mark.asyncio
+async def test_oq_a8_is_accepted_for_qwen4_exp_and_keeps_min_tokens():
+    """Qwen3.8-Flash-Next shares the existing A8 setting (routed experts)."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(
+                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=512
+            ),
+        )
+
+    assert settings.qwen35_oq_a8_enabled is True
+    assert settings.qwen35_oq_a8_min_tokens == 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config_type", ["qwen4", "qwen4_exp_x", "qwen3", "qwen2", "llama", "gemma4", ""]
+)
+async def test_oq_a8_is_refused_outside_validated_families(config_type):
+    """Only the exact ``qwen4_exp`` family is added, not every ``qwen4*``."""
+    pool, entry = _failed_pool()
+    entry.config_model_type = config_type
+    settings = ModelSettings()
+
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True):
+        with pytest.raises(admin_routes.HTTPException) as excinfo:
+            await _update_settings(
+                pool,
+                settings,
+                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+            )
+
+    assert excinfo.value.status_code == 400
+    assert "Flash-Next" in excinfo.value.detail
+    assert settings.qwen35_oq_a8_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
+    from omlx.model_settings import ModelSettingsManager
+
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen4_exp"
+    manager = ModelSettingsManager(tmp_path)
+    manager.set_settings("ling", ModelSettings())
+    before = manager.get_settings("ling").to_dict()
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+        patch.object(admin_routes, "_get_server_state", return_value=MagicMock()),
+        patch.object(admin_routes, "_oq_a8_kernels_available", return_value=True),
+        pytest.raises(admin_routes.HTTPException) as excinfo,
+    ):
+        await admin_routes.update_model_settings(
+            "ling",
+            admin_routes.ModelSettingsRequest(
+                qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True
+            ),
+            is_admin=True,
+        )
+    assert excinfo.value.status_code == 400
+    assert manager.get_settings("ling").to_dict() == before
+
+
+@pytest.mark.parametrize(
+    "config_type, expected",
+    [
+        ("qwen3_5", True),
+        ("qwen3_5_moe", True),
+        ("Qwen3-6", True),
+        ("qwen3_8", True),
+        ("qwen4_exp", True),
+        ("Qwen4-Exp", True),
+        ("qwen4", False),
+        ("qwen4_exp_x", False),
+        ("llama", False),
+        (None, False),
+    ],
+)
+def test_oq_a8_model_supported(config_type, expected):
+    assert admin_routes._oq_a8_model_supported(config_type) is expected
+
+
+@pytest.mark.parametrize(
+    "config_type,kernels,expected",
+    [("qwen3_5", True, True), ("qwen3_5", False, False), ("llama", True, False)],
+)
+def test_model_options_report_oq_a8_support(config_type, kernels, expected):
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=kernels):
+        options = admin_routes._model_options({"config_model_type": config_type}, None)
+    assert options["qwen35_oq_a8_supported"] is expected
+
+
+@pytest.mark.asyncio
 async def test_oq_a8_needs_native_int8_kernels():
     """Nothing on this hardware would run faster, so the setting is refused
     rather than accepted and silently ignored at load."""
@@ -335,6 +537,24 @@ async def test_qwen4_ple_ssd_offload_is_ignored_for_other_models():
     )
 
     assert settings.qwen4_ple_ssd_offload is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_type", "expected"), [("qwen4_exp", True), ("qwen3_5_moe", False)]
+)
+async def test_qwen4_wide_decode_is_persisted_for_qwen4_only(model_type, expected):
+    pool, entry = _failed_pool()
+    entry.config_model_type = model_type
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen4_gdn_decode_wide_proj=True),
+    )
+
+    assert settings.qwen4_gdn_decode_wide_proj is expected
 
 
 @pytest.mark.asyncio
@@ -610,6 +830,33 @@ def test_runtime_signature_gates_mtp_depth_on_lightning_mtp():
     ) == pool._engine_runtime_signature("m", depth_8_off)
 
 
+def test_runtime_signature_reloads_qwen35_family_for_a_yarn_window():
+    pool = EnginePool()
+    pool._entries["q"] = EngineEntry(
+        model_id="q",
+        model_path="/tmp/q",
+        model_type="vlm",
+        engine_type="vlm",
+        estimated_size=1,
+        config_model_type="qwen4_exp",
+        model_context_length=262144,
+    )
+
+    def signature(window):
+        return dict(
+            pool._engine_runtime_signature(
+                "q", ModelSettings(max_context_window=window)
+            )
+        )
+
+    assert "yarn_factor" not in signature(None)
+    assert "yarn_factor" not in signature(262144)
+    assert signature(524288)["yarn_factor"] != signature(1048576)["yarn_factor"]
+
+    pool._entries["q"].config_model_type = "llama"
+    assert "yarn_factor" not in signature(1048576)
+
+
 @pytest.mark.asyncio
 async def test_parked_dflash_draft_path_does_not_block_saves(tmp_path):
     pool, _ = _failed_pool()
@@ -644,7 +891,7 @@ async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
         patch("omlx.admin.routes._get_engine_pool", return_value=pool),
         patch("omlx.admin.routes._get_settings_manager", return_value=manager),
         patch("omlx.admin.routes._get_server_state", return_value=MagicMock()),
-        patch("omlx.engine.dflash.is_dflash_compatible", return_value=(True, "")),
+        patch.object(admin_routes, "dflash_compatibility", return_value=(True, "")),
     ):
         for payload in (
             {"dflash_enabled": True},
@@ -656,3 +903,28 @@ async def test_enabling_dflash_over_a_deleted_draft_path_is_rejected(tmp_path):
             assert exc.value.status_code == 422
 
     manager.set_settings.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_type,accepted", [("qwen3_5", True), ("gemma4", False)])
+async def test_paroquant_dflash_allows_only_qwen_targets(
+    tmp_path, model_type, accepted
+):
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = model_type
+    entry.engine_type = "vlm"
+    (tmp_path / "config.json").write_text(
+        json.dumps({"quantization_config": {"quant_method": "paroquant"}})
+    )
+    settings = ModelSettings()
+    request = admin_routes.ModelSettingsRequest(dflash_enabled=True)
+
+    if accepted:
+        await _update_settings(pool, settings, request)
+        assert settings.dflash_enabled is True
+    else:
+        with pytest.raises(HTTPException) as exc:
+            await _update_settings(pool, settings, request)
+        assert exc.value.status_code == 400
+        assert exc.value.detail == admin_routes._PAROQUANT_REASON

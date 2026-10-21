@@ -142,7 +142,9 @@ def prompt_opens_thinking(
     return True, think_tag
 
 
-def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
+def extract_thinking(
+    text: str, *, truncated: bool = False, start_in_thinking: bool = False
+) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
     Handles:
@@ -157,9 +159,10 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
       fallback the entire body would be classified as thinking and the
       visible answer would be empty.
 
-    With ``truncated=True``, unfinished thinking stays in the thinking channel.
+    With ``truncated=True``, unfinished thinking stays in the thinking channel,
+    including a block the prompt opened (``start_in_thinking``).
 
-    Tag-free text is always classified as content. Mirrors
+    Other tag-free text is always classified as content. Mirrors
     ``ThinkingParser.finish()`` recovery semantics (`_content_emitted`
     fallback): when the model emits no thinking markers, surface the body
     as the answer so the response is never empty.
@@ -167,6 +170,7 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
     Args:
         text: Complete model output text.
         truncated: Keep unfinished thinking in its channel on length termination.
+        start_in_thinking: The prompt opened a think block before ``text``.
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -180,6 +184,14 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
         .replace(_HY3_OPEN_TAG, _OPEN_TAG)
         .replace(_HY3_CLOSE_TAG, _CLOSE_TAG)
     )
+
+    if (
+        truncated
+        and start_in_thinking
+        and _OPEN_TAG not in text
+        and _CLOSE_TAG not in text
+    ):
+        return (text.strip(), "")
 
     thinking_parts = []
     remaining = text
@@ -331,12 +343,14 @@ class ThinkingParser:
             self._content_emitted = True
         return (thinking_delta, content_delta)
 
-    def finish(self, *, truncated: bool = False) -> Tuple[str, str]:
+    def finish(
+        self, *, truncated: bool = False, has_tool_calls: bool = False
+    ) -> Tuple[str, str]:
         """Flush any remaining buffered content.
 
         Should be called when the stream is complete to emit any
         buffered characters that were waiting for potential tag completion.
-        Unless truncated, recover an unclosed thinking block as content when no answer was emitted.
+        Unless truncated or ended by tool calls, recover an unclosed thinking block as content when no answer was emitted.
 
         Returns:
             Tuple of (thinking_text, content_text) from remaining buffer
@@ -352,8 +366,10 @@ class ThinkingParser:
         # already streamed live cannot be retracted, so the client sees
         # the same text twice — once in the thinking panel, once as the
         # answer. UX trade-off documented in the chat template plan.
+        # A tool-call turn is not empty, so its reasoning stays in thinking.
         if (
             not truncated
+            and not has_tool_calls
             and self._in_thinking
             and not self._close_seen
             and not self._content_emitted
@@ -453,6 +469,7 @@ class ThinkingBudgetProcessor:
         # In new mlx-lm API, tokens is the full history list.
         # Accept each genuinely generated token exactly once (see grammar.py).
         n = len(tokens)
+        is_new_position = n > getattr(self, "_accepted_up_to", -1)
         if not hasattr(self, "_accepted_up_to"):
             self._accepted_up_to = n  # skip prompt tokens
         elif n > self._accepted_up_to:
@@ -470,7 +487,8 @@ class ThinkingBudgetProcessor:
         if self._waiting_utf8:
             return logits
 
-        if self._in_thinking:
+        # Resuming a dropped decode step repeats the same sampling position.
+        if self._in_thinking and is_new_position:
             self._thinking_tokens += 1
             if self._thinking_tokens >= self._budget:
                 if self._last_token_utf8_complete:

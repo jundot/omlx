@@ -654,14 +654,15 @@ class TestUsesNativeReasoningContent:
             preserve_thinking_default=True,
         )
 
-    def test_detects_muse_glimmer(self):
+    @pytest.mark.parametrize("model_type", ["muse_glimmer", "muse_spark"])
+    def test_detects_muse_family(self, model_type):
         assert uses_native_reasoning_content(
             "any-name",
-            config_model_type="muse_glimmer",
+            config_model_type=model_type,
         )
         assert uses_native_reasoning_content(
             "any-name",
-            engine_model_type="muse_glimmer",
+            engine_model_type=model_type,
         )
 
     def test_plain_model_is_not_native(self):
@@ -2257,6 +2258,15 @@ class TestPrepareSystemMessagesForTemplate:
                     raise ValueError("tool result must match a tool call")
             return super().apply_chat_template(messages, **kwargs)
 
+    class LeadingSystemOnlyTokenizer(PreserveTokenizer):
+        chat_template = "leading-system-only"
+
+        def apply_chat_template(self, messages, **kwargs):
+            for index, message in enumerate(messages):
+                if message["role"] == "system" and index > 0:
+                    raise ValueError("System message must be at the beginning.")
+            return super().apply_chat_template(messages, **kwargs)
+
     class UserOnlyMidSystemTokenizer(PreserveTokenizer):
         chat_template = "user-only-mid-system"
 
@@ -2293,6 +2303,38 @@ class TestPrepareSystemMessagesForTemplate:
 
         assert [m["role"] for m in result] == ["user", "system"]
         assert result[1]["content"] == "Plan mode"
+
+    def test_declared_support_keeps_later_system_messages_in_place(self):
+        tokenizer = self.ErrorTokenizer()
+        tokenizer._omlx_supports_mid_system_messages = True
+        messages = [
+            {"role": "system", "content": "Leading"},
+            {"role": "user", "content": "fix the bug"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "t1", "function": {"name": "Read", "arguments": {}}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "t1", "content": "print('hi')"},
+            {"role": "system", "content": "hook context"},
+            {"role": "assistant", "content": "Done"},
+            {"role": "system", "content": "reminder"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "data:,"}},
+                    {"type": "text", "text": "Next"},
+                ],
+            },
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, tokenizer, unsupported_mid_system_policy="user_note_safe"
+        )
+
+        assert result == messages
 
     def test_explicit_capability_overrides_marker_order_false_positive(self):
         messages = [
@@ -2430,12 +2472,13 @@ class TestPrepareSystemMessagesForTemplate:
         )
 
         assert [message["role"] for message in result] == [
-            "system",
             "user",
             "assistant",
             "tool",
+            "user",
             "assistant",
         ]
+        assert result[3]["content"] == "[System note]\nRuntime tip\n[/System note]"
         tokenizer.apply_chat_template(result)
 
     def test_merges_consecutive_tail_systems_in_place_when_preserved(self):
@@ -2582,6 +2625,203 @@ class TestPrepareSystemMessagesForTemplate:
 
         assert [m["role"] for m in result] == ["system", "user", "assistant", "tool"]
 
+    @staticmethod
+    def _tool_turn(call_id: str, result: str) -> list[dict]:
+        return [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "Read", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": call_id, "content": result},
+        ]
+
+    def test_user_note_policy_adds_user_note_after_tail_tool_result(self):
+        messages = [
+            {"role": "system", "content": "You are an agent."},
+            {"role": "user", "content": "Fix the bug."},
+            *self._tool_turn("c0", "print('hi')"),
+            {"role": "system", "content": "PostToolUse hook: lint passed"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.LeadingSystemOnlyTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "user",
+        ]
+        assert result[0]["content"] == "You are an agent."
+        assert result[3]["content"] == "print('hi')"
+        assert result[4]["content"] == (
+            "[System note]\nPostToolUse hook: lint passed\n[/System note]"
+        )
+
+    def test_user_note_policy_adds_user_note_between_tool_result_and_assistant(
+        self,
+    ):
+        messages = [
+            {"role": "system", "content": "You are an agent."},
+            {"role": "user", "content": "Fix the bug."},
+            *self._tool_turn("c0", "print('hi')"),
+            {"role": "system", "content": "PostToolUse hook: lint passed"},
+            {"role": "assistant", "content": "Done."},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.LeadingSystemOnlyTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "user",
+            "assistant",
+        ]
+        assert result[0]["content"] == "You are an agent."
+        assert result[4]["content"] == (
+            "[System note]\nPostToolUse hook: lint passed\n[/System note]"
+        )
+
+    def test_user_note_policy_refuses_system_between_tool_results(self):
+        messages = [
+            {"role": "user", "content": "Read both files."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c0", "function": {"name": "Read", "arguments": {}}},
+                    {"id": "c1", "function": {"name": "Read", "arguments": {}}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c0", "content": "a"},
+            {"role": "system", "content": "Runtime tip"},
+            {"role": "tool", "tool_call_id": "c1", "content": "b"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages,
+            self.LeadingSystemOnlyTokenizer(),
+            unsupported_mid_system_policy="user_note_safe",
+        )
+
+        assert [m["role"] for m in result] == [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+        ]
+        assert result[0]["content"] == "Runtime tip"
+
+    def test_system_note_after_tool_result_keeps_prompt_append_only(self):
+        tokenizer = self.LeadingSystemOnlyTokenizer()
+
+        def conversation(turns):
+            messages = [
+                {"role": "system", "content": "You are an agent."},
+                {"role": "user", "content": "Fix the bug."},
+            ]
+            for turn in range(turns):
+                messages.extend(self._tool_turn(f"c{turn}", f"result {turn}"))
+                messages.append(
+                    {"role": "system", "content": f"PostToolUse hook note {turn}"}
+                )
+            return messages
+
+        prompts = [
+            tokenizer.apply_chat_template(
+                prepare_system_messages_for_template(
+                    conversation(turns),
+                    tokenizer,
+                    unsupported_mid_system_policy="user_note_safe",
+                )
+            )
+            for turns in (1, 2, 3)
+        ]
+
+        assert prompts[0].startswith("system:You are an agent.\nuser:Fix the bug.")
+        for earlier, later in zip(prompts, prompts[1:]):
+            assert later.startswith(earlier)
+
+    def test_anthropic_system_message_after_tool_result_keeps_prompt_append_only(
+        self,
+    ):
+        tokenizer = self.LeadingSystemOnlyTokenizer()
+        tokenizer.has_tool_calling = True
+
+        def request(turns):
+            messages = [{"role": "user", "content": "Fix the bug."}]
+            for turn in range(turns):
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": f"t{turn}",
+                                "name": "Read",
+                                "input": {"file_path": "a.py"},
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": f"t{turn}",
+                                "content": f"result {turn}",
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {"role": "system", "content": f"PostToolUse hook note {turn}"}
+                )
+            return MessagesRequest(
+                model="claude-3",
+                max_tokens=1024,
+                system="You are Claude Code.",
+                messages=messages,
+            )
+
+        prompts = []
+        for turns in (1, 2, 3):
+            messages = convert_anthropic_to_internal(
+                request(turns),
+                tokenizer=tokenizer,
+                consolidate_system_messages=False,
+            )
+            prepared = prepare_system_messages_for_template(
+                messages,
+                tokenizer,
+                unsupported_mid_system_policy="user_note_safe",
+            )
+            prompts.append(tokenizer.apply_chat_template(prepared))
+
+        assert prompts[0].startswith("system:You are Claude Code.\nuser:")
+        for earlier, later in zip(prompts, prompts[1:]):
+            assert later.startswith(earlier)
+
     def test_user_note_policy_refuses_multimodal_user_target(self):
         messages = [
             {
@@ -2707,6 +2947,95 @@ class TestPrepareSystemMessagesForTemplate:
 
         assert after_user is True
         assert after_tool is False
+
+    def test_budget_marker_system_after_tool_result_keeps_prompt_append_only(self):
+        tokenizer = self.UserOnlyMidSystemTokenizer()
+
+        def conversation(turns):
+            messages = [
+                {"role": "system", "content": "You are an agent."},
+                {"role": "user", "content": "Fix the bug."},
+            ]
+            for turn in range(turns):
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": f"c{turn}",
+                                "type": "function",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"c{turn}",
+                        "content": f"result {turn}",
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"<total_tokens>{150000 - 1000 * turn} tokens left"
+                            "</total_tokens>"
+                        ),
+                    }
+                )
+            return messages
+
+        prompts = [
+            tokenizer.apply_chat_template(
+                prepare_system_messages_for_template(
+                    conversation(turns),
+                    tokenizer,
+                    unsupported_mid_system_policy="user_note_safe",
+                )
+            )
+            for turns in (1, 2, 3)
+        ]
+
+        for earlier, later in zip(prompts, prompts[1:]):
+            assert later.startswith(earlier)
+
+    def test_strips_marker_appended_to_leading_system(self):
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an agent."
+                    "\n\n<total_tokens>150000 tokens left</total_tokens>"
+                ),
+            },
+            {"role": "user", "content": "Hello"},
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert result[0]["content"] == "You are an agent."
+
+    def test_drops_marker_only_system_even_when_template_preserves_it(self):
+        messages = [
+            {"role": "system", "content": "You are an agent."},
+            {"role": "user", "content": "Hello"},
+            {
+                "role": "system",
+                "content": "<total_tokens>42 tokens left</total_tokens>",
+            },
+        ]
+
+        result = prepare_system_messages_for_template(
+            messages, self.PreserveTokenizer()
+        )
+
+        assert [message["role"] for message in result] == ["system", "user"]
+        assert result[0]["content"] == "You are an agent."
 
 
 class TestMergeConsecutiveRoles:
@@ -3466,6 +3795,29 @@ class TestDropVoidAssistantMessages:
         assert result[0]["role"] == "user"
         assert "hello" in result[0]["content"]
         assert "world" in result[0]["content"]
+
+    def test_multimodal_void_drop_then_merge_consecutive_users(self):
+        """The VLM path must also merge users left adjacent by the drop."""
+        msgs = [
+            Message(
+                role="user",
+                content=[
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": "data:,a"}},
+                ],
+            ),
+            Message(role="assistant", content=""),
+            Message(role="user", content="world"),
+        ]
+        result = extract_multimodal_content(msgs)
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [p["type"] for p in result[0]["content"]] == [
+            "text",
+            "image_url",
+            "text",
+        ]
+        assert result[0]["content"][2]["text"] == "world"
 
     def test_multiple_void_assistants_merge_surrounding_users(self):
         """Multiple void assistants should be dropped and adjacent users merged."""

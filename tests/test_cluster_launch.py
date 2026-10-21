@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from omlx.cluster import launch
+from omlx.cluster import launch, memory_guard
 from omlx.cluster.deployment import ClusterDeployment, ClusterHost
 from omlx.cluster.launch import (
     CudaFabricProbeHost,
@@ -544,9 +544,13 @@ def test_supervisor_stop_handles_reused_group_permission_error(
     assert supervisor.status().phase == "stopped"
 
 
-def test_remote_preflight_uses_prompt_free_noninteractive_ssh():
+def test_remote_preflight_uses_prompt_free_noninteractive_ssh(monkeypatch):
     calls = []
     versions = _local_runtime_versions()
+    # The local rank measures live memory, which other test workers consume.
+    monkeypatch.setattr(
+        memory_guard, "ceiling_breakdown", lambda tier: {"hard_limit": 1024**4}
+    )
 
     def runner(argv, **kwargs):
         calls.append((argv, kwargs))
@@ -1547,6 +1551,25 @@ def test_prompt_cache_ssd_can_be_turned_off(tmp_path):
         prompt_cache_ssd=False, state_dir=str(tmp_path), deployment_id="d"
     )
     assert _prompt_cache_ssd_dir(off, rank=0) is None
+
+
+def test_lightning_mtp_reaches_the_rank_load_settings(tmp_path):
+    from omlx.cluster.inference_worker import _mtp_load_settings
+
+    deployment = _deployment()
+    args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
+    assert _mtp_load_settings(args) is None
+
+    execution = replace(
+        deployment.execution, mtp=True, mtp_depth=3, mtp_fixed_depth=True
+    )
+    args, _plan_hash, _assignments = _parsed_plan(
+        replace(deployment, execution=execution), tmp_path
+    )
+    settings = _mtp_load_settings(args)
+    assert settings.mtp_enabled is True
+    assert settings.mtp_fixed_depth == 3
+    assert settings.mtp_adaptive_max_depth is None
 
 
 def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):

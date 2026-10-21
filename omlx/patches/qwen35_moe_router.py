@@ -20,8 +20,7 @@ Only short rows route here (decode and spec-verify widths); prefill keeps
 the composed chain, whose cost amortizes over the chunk.
 
 One-row decode also folds the combine ``(y * scores).sum(-2) +
-sigmoid(shared_gate) * shared`` (five launches) into one bit-identical launch;
-OMLX_QWEN35_MOE_COMBINE_FUSED=0 keeps the composed ops.
+sigmoid(shared_gate) * shared`` (five launches) into one bit-identical launch.
 
 ``softmax_topk_row`` runs the precise softmax and the top-k of one row in
 one launch for the fused routed decode: one simdgroup reproduces MLX's
@@ -32,23 +31,21 @@ selection packs each probability with its expert index into one integer
 key and keeps each lane's three largest keys at hand, so a selection is one
 simd_max; ``TOPK_HEADER`` exports it for launches that fold the routing in.
 ``softmax_topk_rows`` runs that source verbatim for each row of a verify
-window in one launch. OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD=0 keeps the two
-launches.
+window in one launch.
 
-``router_gemv`` runs the bias-free bf16 gate linear of one row with MLX's
+``router_gemv`` runs the bias-free bf16 or fp16 gate linear of one row with MLX's
 one-row gemv arithmetic (per-lane column order, shuffle-down tree) but one
 simdgroup per expert instead of MLX's four experts per simdgroup on 32
 threadgroups, so the logits are bit-identical and the 2.6 MB weight read
 spreads over the whole GPU. A verify window's rows share one launch with
 one simdgroup per (expert, row), each row keeping the one-row arithmetic;
 the simdgroups of one expert are adjacent, so its weight row is fetched
-once. OMLX_QWEN35_MOE_ROUTER_GEMV=0 keeps ``nn.Linear``.
+once.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from functools import wraps
 
 import mlx.core as mx
@@ -59,12 +56,8 @@ _KERNEL = None
 _ENGAGED_LOGGED = False
 _MAX_ROWS = 8
 _COMBINE_KERNEL = None
-_COMBINE_DISABLED = os.environ.get(
-    "OMLX_QWEN35_MOE_COMBINE_FUSED", "1"
-).strip().lower() in {"0", "false", "no", "off"}
 # Top-k widths whose k-sum order was checked against mlx's reduction.
 _COMBINE_TOP_K = (8, 10)
-_SOFTMAX_FOLD_DISABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD", "1") == "0"
 _SOFTMAX_TOPK_KERNEL = None
 
 # MLX 0.32.2 block softmax (precise: float accumulation, 4 reads per thread)
@@ -401,7 +394,6 @@ def fused_router_topk(probs, top_k: int):
     return inds, scores
 
 
-_GEMV_DISABLED = os.environ.get("OMLX_QWEN35_MOE_ROUTER_GEMV", "1") == "0"
 _GEMV_KERNEL = None
 _GEMV_SIMDGROUPS = 4
 
@@ -463,18 +455,18 @@ _GEMV_SOURCE = """
 
 
 def router_gemv(weight):
-    """A launcher for ``x @ weight.T`` (a bias-free bf16 ``nn.Linear``) on
-    bf16 rows of width K, or None outside the layout it reproduces.
+    """A launcher for ``x @ weight.T`` (a bias-free bf16 or fp16 ``nn.Linear``)
+    on rows of the weight dtype and width K, or None outside the layout it
+    reproduces.
 
     It runs MLX's one-row gemv arithmetic with one simdgroup per row (MLX
     runs four rows per simdgroup on N / 16 threadgroups). The layout is
     that gemv's: 64 < K < 16 * N and K % 128 == 0 (no guarded tail).
     Several input rows (a verify window, at most ``_MAX_ROWS``) run in one
     launch, each row with that one-row arithmetic.
-    OMLX_QWEN35_MOE_ROUTER_GEMV=0 returns None.
     """
     global _GEMV_KERNEL
-    if _GEMV_DISABLED or weight.ndim != 2 or weight.dtype != mx.bfloat16:
+    if weight.ndim != 2 or weight.dtype not in (mx.bfloat16, mx.float16):
         return None
     n, k = weight.shape
     if not 64 < k < 16 * n or k % 128 or n % _GEMV_SIMDGROUPS:
@@ -494,7 +486,7 @@ def router_gemv(weight):
         return kernel(
             inputs=[x, weight],
             template=[
-                ("T", mx.bfloat16),
+                ("T", weight.dtype),
                 ("K", k),
                 ("N", n),
                 ("M", rows),
@@ -503,15 +495,19 @@ def router_gemv(weight):
             grid=(32, n * rows, 1),
             threadgroup=(32, _GEMV_SIMDGROUPS, 1),
             output_shapes=[(*x.shape[:-1], n)],
-            output_dtypes=[mx.bfloat16],
+            output_dtypes=[weight.dtype],
         )[0]
 
     return launch
 
 
 def router_logits_row(x, weight):
-    """``x @ weight.T`` through ``router_gemv`` for one bf16 row, or None."""
-    if x.size != x.shape[-1] or x.shape[-1] != weight.shape[-1] or x.dtype != mx.bfloat16:
+    """``x @ weight.T`` through ``router_gemv`` for one row, or None."""
+    if (
+        x.size != x.shape[-1]
+        or x.shape[-1] != weight.shape[-1]
+        or x.dtype != weight.dtype
+    ):
         return None
     launch = router_gemv(weight)
     return None if launch is None else launch(x)
@@ -520,21 +516,20 @@ def router_logits_row(x, weight):
 def softmax_topk_eligible(logits, max_rows: int = _MAX_ROWS) -> bool:
     """Whether ``softmax_topk_rows`` reproduces the routing of ``logits``
     ([..., NE], 1..``max_rows`` rows), so a launch may run its source:
-    bf16 rows of MLX's single-row block softmax with whole simdgroups (NE %
-    128 == 0, NE <= 4096), unless OMLX_QWEN35_MOE_ROUTER_SOFTMAX_FOLD=0."""
+    bf16 or fp16 rows of MLX's single-row block softmax with whole simdgroups
+    (NE % 128 == 0, NE <= 4096)."""
     ne = logits.shape[-1]
     return (
-        not _SOFTMAX_FOLD_DISABLED
-        and logits.size // ne <= max_rows
+        logits.size // ne <= max_rows
         and ne % 128 == 0
         and ne <= 4096
-        and logits.dtype == mx.bfloat16
+        and logits.dtype in (mx.bfloat16, mx.float16)
     )
 
 
 def softmax_topk_row(logits, top_k: int):
     """``fused_router_topk(mx.softmax(logits, axis=-1, precise=True), top_k)``
-    for one bf16 row of gate logits, in one launch.
+    for one row of gate logits, in one launch.
 
     Returns None outside the layout this reproduces
     (``softmax_topk_eligible``) or for more than one row.
@@ -554,11 +549,11 @@ def softmax_topk_row(logits, top_k: int):
     lead = logits.shape[:-1]
     return _SOFTMAX_TOPK_KERNEL(
         inputs=[logits],
-        template=[("T", mx.bfloat16), ("NE", ne), ("K", top_k)],
+        template=[("T", logits.dtype), ("NE", ne), ("K", top_k)],
         grid=(32, 1, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(*lead, top_k), (*lead, top_k)],
-        output_dtypes=[mx.uint32, mx.bfloat16],
+        output_dtypes=[mx.uint32, logits.dtype],
     )
 
 
@@ -585,9 +580,8 @@ _SOFTMAX_TOPK_ROWS_KERNEL = None
 
 
 def softmax_topk_rows(logits, top_k: int, max_rows: int = _MAX_ROWS):
-    """``softmax_topk_row`` for each of 1..``max_rows`` rows of bf16 gate
-    logits ``[..., NE]``, in one launch; None where ``softmax_topk_row``
-    declines."""
+    """``softmax_topk_row`` for each of 1..``max_rows`` rows of gate logits
+    ``[..., NE]``, in one launch; None where ``softmax_topk_row`` declines."""
     global _SOFTMAX_TOPK_ROWS_KERNEL
     ne = logits.shape[-1]
     rows = logits.size // ne
@@ -606,11 +600,11 @@ def softmax_topk_rows(logits, top_k: int, max_rows: int = _MAX_ROWS):
     lead = logits.shape[:-1]
     return _SOFTMAX_TOPK_ROWS_KERNEL(
         inputs=[logits],
-        template=[("T", mx.bfloat16), ("NE", ne), ("K", top_k)],
+        template=[("T", logits.dtype), ("NE", ne), ("K", top_k)],
         grid=(32, rows, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(*lead, top_k), (*lead, top_k)],
-        output_dtypes=[mx.uint32, mx.bfloat16],
+        output_dtypes=[mx.uint32, logits.dtype],
     )
 
 
@@ -618,7 +612,8 @@ def softmax_topk_rows(logits, top_k: int, max_rows: int = _MAX_ROWS):
 # and the final multiply/add round to T like mlx's kernels. The k-sum follows
 # mlx col_reduce_small for one row: lane l (of 8) folds rows l, l + 8, ...
 # onto +0, then lanes 1..7 are added onto lane 0 in order. mx.sigmoid is
-# 1 / (1 + exp(|x|)) (1 - that for x >= 0) with mlx's non-fast-math exp.
+# 1 / (1 + exp(|x|)) (1 - that for x >= 0) with mlx's non-fast-math exp,
+# evaluated in half for fp16 operands.
 _COMBINE_SOURCE = """
     const uint h = thread_position_in_grid.x;
     if (h >= uint(H)) return;
@@ -635,10 +630,17 @@ _COMBINE_SOURCE = """
     for (int l = 1; l < 8; ++l) {
         acc = T(float(lane[l]) + float(acc));
     }
-    const float g = float(gate[0]);
-    const T e = T(1.0f + float(T(metal::precise::exp(metal::abs(g)))));
-    const T y = T(metal::precise::divide(1.0f, float(e)));
-    const T s = g < 0.0f ? y : T(1.0f - float(y));
+    T s;
+    if constexpr (metal::is_same<T, half>::value) {
+        const T g = gate[0];
+        auto y = 1 / (1 + metal::precise::exp(metal::abs(g)));
+        s = (g < 0) ? y : 1 - y;
+    } else {
+        const float g = float(gate[0]);
+        const T e = T(1.0f + float(T(metal::precise::exp(metal::abs(g)))));
+        const T y = T(metal::precise::divide(1.0f, float(e)));
+        s = g < 0.0f ? y : T(1.0f - float(y));
+    }
     const T sh = T(float(s) * float(shared[h]));
     out[h] = T(float(acc) + float(sh));
 """
@@ -648,12 +650,12 @@ def fused_moe_combine(routed, scores, shared, gate):
     """``(routed * scores[..., None]).sum(-2) + mx.sigmoid(gate) * shared`` in one launch.
 
     One row only: ``routed`` [..., k, H], ``scores`` [..., k], ``shared``
-    [..., H], ``gate`` [..., 1], all bf16, k in _COMBINE_TOP_K. Each row is
-    reduced in mlx's one-row col_reduce_small order. Returns None when the
-    operands are outside that layout or the kill switch is set.
+    [..., H], ``gate`` [..., 1], all bf16 or all fp16, k in _COMBINE_TOP_K.
+    Each row is reduced in mlx's one-row col_reduce_small order. Returns None
+    when the operands are outside that layout.
     """
     global _COMBINE_KERNEL
-    if _COMBINE_DISABLED or routed.ndim < 2:
+    if routed.ndim < 2:
         return None
     shape = routed.shape
     lead = shape[:-2]
@@ -664,7 +666,8 @@ def fused_moe_combine(routed, scores, shared, gate):
         and scores.shape == (*lead, top_k)
         and shared.shape == (*lead, hidden)
         and gate.shape == (*lead, 1)
-        and routed.dtype == scores.dtype == shared.dtype == gate.dtype == mx.bfloat16
+        and routed.dtype == scores.dtype == shared.dtype == gate.dtype
+        and routed.dtype in (mx.bfloat16, mx.float16)
     ):
         return None
     if _COMBINE_KERNEL is None:
@@ -676,11 +679,11 @@ def fused_moe_combine(routed, scores, shared, gate):
         )
     return _COMBINE_KERNEL(
         inputs=[routed, scores, shared, gate],
-        template=[("T", mx.bfloat16), ("K", top_k), ("H", hidden)],
+        template=[("T", routed.dtype), ("K", top_k), ("H", hidden)],
         grid=(hidden, 1, 1),
         threadgroup=(min(256, hidden), 1, 1),
         output_shapes=[(*lead, hidden)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[routed.dtype],
     )[0]
 
 

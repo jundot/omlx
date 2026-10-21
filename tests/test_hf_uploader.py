@@ -4,12 +4,16 @@
 import asyncio
 import json
 import os
+import struct
 import time
+from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
+from omlx._version import __version__
 from omlx.admin.hf_uploader import (
     HFUploader,
     UploadStatus,
@@ -19,6 +23,14 @@ from omlx.admin.hf_uploader import (
     _has_meaningful_readme,
     _is_oq_model,
 )
+
+
+def _write_safetensors_stub(path: Path, size: int) -> None:
+    """Write a tensorless safetensors file padded to *size* bytes."""
+    header = b'{"__metadata__":{"format":"mlx"}}'
+    header += b" " * (-len(header) % 8)
+    padding = b"\x00" * (size - 8 - len(header))
+    path.write_bytes(struct.pack("<Q", len(header)) + header + padding)
 
 
 async def _wait_for_upload_status(
@@ -118,23 +130,78 @@ class TestFormatSize:
 class TestGenerateModelCard:
     """Test model card generation."""
 
-    def test_basic_card(self):
-        config = {
-            "model_type": "qwen2",
-            "quantization": {"bits": 4, "group_size": 64},
-        }
-        card = _generate_model_card("Qwen-7B-oQ4", config)
-        assert "# Qwen-7B-oQ4" in card
-        assert "library_name: mlx" in card
-        assert "- oq" in card
-        assert "qwen2" in card
-        assert "4" in card
+    def test_card_tables_follow_stored_tensors(self, tmp_path):
+        weight = mx.ones((64, 64), dtype=mx.bfloat16)
+        packed, scales, biases = mx.quantize(weight, group_size=64, bits=4)
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {
+                "model.layers.0.mlp.up_proj.weight": packed,
+                "model.layers.0.mlp.up_proj.scales": scales,
+                "model.layers.0.mlp.up_proj.biases": biases,
+                "model.norm.weight": mx.ones((64,), dtype=mx.bfloat16),
+                "mtp.layers.0.eh_proj.weight": weight,
+            },
+        )
+        # A d3 code readout is stored beside the shards in FP32.
+        mx.save_safetensors(
+            str(tmp_path / "readout.safetensors"),
+            {"weight": mx.ones((4, 64), dtype=mx.float32)},
+        )
+        config = {"model_type": "qwen2", "quantization": {"bits": 4, "group_size": 64}}
 
-    def test_missing_quantization(self):
-        config = {"model_type": "llama"}
-        card = _generate_model_card("Model-oQ4", config)
-        assert "# Model-oQ4" in card
-        assert "?" in card  # missing bits
+        card = _generate_model_card(
+            "Qwen-7B-oQ4e", tmp_path, config, redownload_notice=True
+        )
+
+        assert "# Qwen-7B-oQ4e" in card
+        assert "- mtp" in card
+        assert (
+            f"> **Updated {date.today().isoformat()}:** Re-quantized with "
+            f"oMLX v{__version__}. Please re-download if you have an earlier copy."
+        ) in card
+        assert f"(oMLX v{__version__}) mixed-precision quantization." in card
+        rows = {line.split(" | ")[0]: line for line in card.splitlines()}
+        # 4096 weights in 2048 packed bytes plus a BF16 scale and bias per row.
+        assert rows["| Affine 4-bit, group 64"].endswith("| 4.50 |")
+        assert rows["| BF16"].endswith("| 16.00 |")
+        assert "| MTP head |" in card
+        assert "| Language model |" in card
+        assert "| Decision readout | 0.000B | 0.000 GB / 0.000 GiB |" in card
+
+    def test_lookup_tables_are_reported_apart_from_the_average(self, tmp_path):
+        ple = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0"
+        table = mx.ones((32, 160), dtype=mx.bfloat16)
+        packed, scales, biases = mx.quantize(table, group_size=32, bits=4)
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {
+                f"{ple}.weight": packed,
+                f"{ple}.scales": scales,
+                f"{ple}.biases": biases,
+                "language_model.model.norm.weight": mx.ones((160,), mx.bfloat16),
+            },
+        )
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {"model_type": "qwen4_exp_text"},
+            "quantization": {
+                "bits": 2,
+                "group_size": 64,
+                ple: {"bits": 4, "group_size": 32},
+            },
+        }
+
+        card = _generate_model_card("Qwen-oQ2.5e", tmp_path, config)
+
+        assert "[!NOTE]" not in card
+        assert "| N-gram affine 4-bit, group 32 |" in card
+        assert "| N-gram embedding |" in card
+        # Only the BF16 norm remains once the table is excluded.
+        assert (
+            "The effective average is 16.000 bits/weight excluding the N-gram "
+            "embedding table, or"
+        ) in card
 
 
 # =============================================================================
@@ -210,7 +277,7 @@ def model_dirs(tmp_path):
         "quantization": {"bits": 4, "group_size": 64},
     }))
     # Create a fake safetensors file
-    (oq_model / "model.safetensors").write_bytes(b"\x00" * 1024)
+    _write_safetensors_stub(oq_model / "model.safetensors", 1024)
 
     # Another oQ model
     oq_model2 = model_dir / "Qwen-7B-oQ3"
@@ -219,13 +286,13 @@ def model_dirs(tmp_path):
         "model_type": "qwen2",
         "quantization": {"bits": 3, "group_size": 64},
     }))
-    (oq_model2 / "model.safetensors").write_bytes(b"\x00" * 2048)
+    _write_safetensors_stub(oq_model2 / "model.safetensors", 2048)
 
     # Non-oQ model (has README)
     non_oq = model_dir / "Llama-3B-Instruct"
     non_oq.mkdir()
     (non_oq / "config.json").write_text(json.dumps({"model_type": "llama"}))
-    (non_oq / "model.safetensors").write_bytes(b"\x00" * 4096)
+    _write_safetensors_stub(non_oq / "model.safetensors", 4096)
     (non_oq / "README.md").write_text("# Llama 3B Instruct\nA great model.")
 
     return [str(model_dir)]
@@ -293,7 +360,7 @@ class TestHFUploaderListModels:
             "model_type": "phi",
             "quantization": {"bits": 4, "group_size": 64},
         }))
-        (extra_model / "model.safetensors").write_bytes(b"\x00" * 1024)
+        _write_safetensors_stub(extra_model / "model.safetensors", 1024)
 
         uploader.update_model_dirs(model_dirs + [str(extra_dir)])
         after = {m["name"] for m in await uploader.list_oq_models()}

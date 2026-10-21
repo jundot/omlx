@@ -35,7 +35,7 @@ from .planner import (
     ModelLayout,
     NodeBudget,
     PlanningError,
-    inspect_safetensors_layout,
+    complete_model_layout,
     plan_hybrid,
 )
 
@@ -527,7 +527,7 @@ def assess_model_path(
 
     root = Path(model_path)
     try:
-        layout = inspect_safetensors_layout(root)
+        layout = complete_model_layout(root)
     except (PlanningError, OSError, ValueError) as exc:
         return ModelFit(
             model_id=root.name,

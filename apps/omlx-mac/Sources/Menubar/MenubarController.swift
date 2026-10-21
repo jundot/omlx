@@ -635,13 +635,9 @@ final class MenubarController: NSObject {
         let liveActivity = statsPoller?.liveStats?.liveActivity
         let alltime = statsPoller?.alltimeStats
         if session == nil && alltime == nil {
-            statsSubmenu.addItem(disabled(statsPoller == nil
-                                          ? String(localized: "menubar.stats.no_api_key",
-                                                   defaultValue: "Set OMLX_API_KEY to enable stats",
-                                                   comment: "Disabled placeholder in the Serving Stats submenu when no API key is configured")
-                                          : String(localized: "menubar.stats.loading",
-                                                   defaultValue: "Loading stats…",
-                                                   comment: "Disabled placeholder shown while stats are loading")))
+            statsSubmenu.addItem(disabled(String(localized: "menubar.stats.loading",
+                                                 defaultValue: "Loading stats…",
+                                                 comment: "Disabled placeholder shown while stats are loading")))
             return
         }
 
@@ -662,11 +658,11 @@ final class MenubarController: NSObject {
         appendStat(String(localized: "menubar.stats.total_tokens",
                           defaultValue: "Total Tokens Processed",
                           comment: "Stats row label for total tokens processed"),
-                   compact(session?.totalPromptTokens))
+                   CountFormat.compact(session?.totalPromptTokens))
         appendStat(String(localized: "menubar.stats.cached_tokens",
                           defaultValue: "Cached Tokens",
                           comment: "Stats row label for cached tokens count"),
-                   compact(session?.totalCachedTokens))
+                   CountFormat.compact(session?.totalCachedTokens))
         appendStat(String(localized: "menubar.stats.cache_efficiency",
                           defaultValue: "Cache Efficiency",
                           comment: "Stats row label for the cache efficiency percentage"),
@@ -685,14 +681,22 @@ final class MenubarController: NSObject {
         statsSubmenu.addItem(disabled(String(localized: "menubar.stats.alltime_section",
                                              defaultValue: "All-Time",
                                              comment: "Section header inside the Serving Stats submenu for all-time metrics")))
+        // All-time stats come from an admin endpoint that needs the API key.
+        // The poller reloads the key after launch, so ask it, not the launch config.
+        if statsPoller?.hasAPIKey == false {
+            statsSubmenu.addItem(disabled(String(localized: "menubar.stats.no_api_key",
+                                                 defaultValue: "Set an API key in the Security screen to enable stats",
+                                                 comment: "Disabled placeholder in the All-Time section of the Serving Stats submenu when no API key is configured")))
+            return
+        }
         appendStat(String(localized: "menubar.stats.total_tokens",
                           defaultValue: "Total Tokens Processed",
                           comment: "Stats row label for total tokens processed"),
-                   compact(alltime?.totalPromptTokens))
+                   CountFormat.compact(alltime?.totalPromptTokens))
         appendStat(String(localized: "menubar.stats.cached_tokens",
                           defaultValue: "Cached Tokens",
                           comment: "Stats row label for cached tokens count"),
-                   compact(alltime?.totalCachedTokens))
+                   CountFormat.compact(alltime?.totalCachedTokens))
         appendStat(String(localized: "menubar.stats.cache_efficiency",
                           defaultValue: "Cache Efficiency",
                           comment: "Stats row label for the cache efficiency percentage"),
@@ -700,7 +704,7 @@ final class MenubarController: NSObject {
         appendStat(String(localized: "menubar.stats.total_requests",
                           defaultValue: "Total Requests",
                           comment: "Stats row label for total request count"),
-                   compact(alltime?.totalRequests))
+                   CountFormat.compact(alltime?.totalRequests))
     }
 
     // MARK: - Pollers
@@ -1332,14 +1336,6 @@ final class MenubarController: NSObject {
         let it = NSMenuItem(title: "\(label):  \(value)", action: nil, keyEquivalent: "")
         it.isEnabled = false
         statsSubmenu.addItem(it)
-    }
-
-    private func compact(_ value: Int?) -> String {
-        guard let n = value else { return "—" }
-        if n >= 1_000_000_000 { return String(format: "%.1fB", Double(n) / 1e9) }
-        if n >= 1_000_000     { return String(format: "%.1fM", Double(n) / 1e6) }
-        if n >= 1_000         { return String(format: "%.1fK", Double(n) / 1e3) }
-        return "\(n)"
     }
 
     private func percent(_ value: Double?) -> String {

@@ -30,7 +30,7 @@ struct Row<Trailing: View>: View {
             if let label {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(label)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     if let sublabel, !sublabel.isEmpty {
                         Text(sublabel)
@@ -174,10 +174,10 @@ struct LinkRow<Icon: View>: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(label)
-                        .font(.omlxText(13, weight: .medium))
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
                         .foregroundStyle(theme.text)
                     Text(sublabel)
-                        .font(.omlxText(11))
+                        .font(.omlxText(DesignTokens.FontSize.subheadline))
                         .foregroundStyle(theme.textSecondary)
                         .lineLimit(2)
                 }
@@ -190,6 +190,77 @@ struct LinkRow<Icon: View>: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(hovering ? theme.hoverBg : .clear)
+        .onHover { hovering = $0 }
+        .overlay(alignment: .bottom) {
+            if !isLast {
+                Rectangle()
+                    .fill(theme.rowSep)
+                    .frame(height: 0.5)
+                    .padding(.horizontal, 14)
+            }
+        }
+    }
+}
+
+/// Row that opens a sub-page, System Settings style: the trailing value
+/// summarizes the sub-page and the chevron marks the row as navigation.
+struct NavRow<Icon: View>: View {
+    let label: String
+    let value: String?
+    var isLast: Bool = false
+    var isDimmed: Bool = false
+    let action: () -> Void
+
+    private let icon: Icon
+
+    @Environment(\.omlxTheme) private var theme
+    @State private var hovering = false
+
+    init(
+        label: String,
+        value: String? = nil,
+        isLast: Bool = false,
+        isDimmed: Bool = false,
+        action: @escaping () -> Void,
+        @ViewBuilder icon: () -> Icon
+    ) {
+        self.label = label
+        self.value = value
+        self.isLast = isLast
+        self.isDimmed = isDimmed
+        self.action = action
+        self.icon = icon()
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                icon
+                Text(label)
+                    .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                    .foregroundStyle(theme.text)
+                    .lineLimit(1)
+                Spacer(minLength: 12)
+                if let value, !value.isEmpty {
+                    Text(value)
+                        .font(.omlxText(DesignTokens.FontSize.callout))
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(theme.textTertiary)
+            }
+            .opacity(isDimmed ? 0.5 : 1)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .frame(minHeight: 36)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }

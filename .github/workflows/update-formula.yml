@@ -4,6 +4,13 @@ on:
   release:
     types: [published]
 
+# Two releases landing back-to-back race the direct push to main: the loser
+# fails on a non-fast-forward and the formula stays stale at the older tag.
+# Serialize the runs; never cancel an in-flight update midway.
+concurrency:
+  group: update-formula
+  cancel-in-progress: false
+
 permissions:
   contents: write
 

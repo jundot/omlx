@@ -81,8 +81,6 @@ def _inputs(q_len, offset, window, pooled_len, ratio, trim=0):
 def _reset_wsdpa(monkeypatch):
     from omlx.patches.deepseek_v4 import wsdpa_attention as wsdpa
 
-    monkeypatch.setattr(wsdpa, "_ENABLED", True)
-    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_broken", False)
     monkeypatch.setattr(wsdpa, "_ready", False, raising=False)
     monkeypatch.setattr(wsdpa, "_topk_ready", False, raising=False)
@@ -192,7 +190,7 @@ def test_wsdpa_topk_first_evaluation_failure_keeps_route_inactive(monkeypatch):
     assert not wsdpa.wsdpa_prefill_route_active(topk=True)
 
 
-def test_wsdpa_route_state_respects_disable_and_failure(monkeypatch):
+def test_wsdpa_route_state_respects_failure(monkeypatch):
     wsdpa = _reset_wsdpa(monkeypatch)
     monkeypatch.setattr(wsdpa, "_ready", True)
     monkeypatch.setattr(wsdpa, "_topk_ready", True)
@@ -200,14 +198,6 @@ def test_wsdpa_route_state_respects_disable_and_failure(monkeypatch):
     assert wsdpa.wsdpa_prefill_route_active()
     assert wsdpa.wsdpa_prefill_route_active(topk=True)
 
-    monkeypatch.setattr(wsdpa, "_TOPK_ENABLED", False)
-    assert wsdpa.wsdpa_prefill_route_active()
-    assert not wsdpa.wsdpa_prefill_route_active(topk=True)
-
-    monkeypatch.setattr(wsdpa, "_ENABLED", False)
-    assert not wsdpa.wsdpa_prefill_route_active()
-
-    monkeypatch.setattr(wsdpa, "_ENABLED", True)
     monkeypatch.setattr(wsdpa, "_broken", True)
     assert not wsdpa.wsdpa_prefill_route_active()
     assert not wsdpa.wsdpa_prefill_route_active(topk=True)

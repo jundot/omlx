@@ -149,7 +149,7 @@ final class MenubarStatsPoller {
                 }
 
                 return LiveActivity(
-                    menuBarTitle: "PP \(percentage)% · \(formatTokenCount(processedTokens))/\(formatTokenCount(totalTokens))",
+                    menuBarTitle: "PP \(percentage)% · \(CountFormat.compact(processedTokens))/\(CountFormat.compact(totalTokens))",
                     detail: detailParts.joined(separator: " · ")
                 )
             }
@@ -196,17 +196,6 @@ final class MenubarStatsPoller {
                 )
             }
 
-            private static func formatTokenCount(_ tokenCount: Int) -> String {
-                if tokenCount >= 1_000_000 {
-                    let millions = Double(tokenCount) / 1_000_000
-                    return String(format: millions >= 10 ? "%.0fM" : "%.1fM", millions)
-                }
-                if tokenCount >= 1_000 {
-                    return "\(Int((Double(tokenCount) / 1_000).rounded()))k"
-                }
-                return "\(tokenCount)"
-            }
-
             private static func formatDuration(_ seconds: Double) -> String {
                 let roundedSeconds = max(0, Int(seconds.rounded()))
                 if roundedSeconds >= 60 {
@@ -222,7 +211,10 @@ final class MenubarStatsPoller {
     }
 
     private let baseURL: URL
-    private let apiKey: String?
+    private var apiKey: String?
+    /// The key can be set or changed after launch (Security screen, web
+    /// dashboard), so a 401 rechecks settings.json through this loader.
+    private let apiKeyLoader: () -> String?
     private let idleInterval: TimeInterval
     private let session: URLSession
     private var task: Task<Void, Never>?
@@ -249,10 +241,12 @@ final class MenubarStatsPoller {
         baseURL: URL,
         apiKey: String?,
         interval: TimeInterval = 2.0,
-        sessionConfiguration: URLSessionConfiguration? = nil
+        sessionConfiguration: URLSessionConfiguration? = nil,
+        apiKeyLoader: @escaping () -> String? = { AppConfig.load().apiKey }
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
+        self.apiKeyLoader = apiKeyLoader
         self.idleInterval = interval
 
         let cfg = sessionConfiguration ?? URLSessionConfiguration.default
@@ -379,15 +373,36 @@ final class MenubarStatsPoller {
     }
 
     private func fetchPublicStatus() async throws -> Stats {
-        let url = try makeURL(path: "/api/status")
-        var req = URLRequest(url: url)
+        let (data, response) = try await session.data(for: publicStatusRequest())
+
+        if let http = response as? HTTPURLResponse, http.statusCode == 401,
+           reloadAPIKey() {
+            let (authenticatedData, authenticatedResponse) = try await session.data(
+                for: publicStatusRequest()
+            )
+            try validateOK(authenticatedResponse)
+            return try JSONDecoder().decode(Stats.self, from: authenticatedData)
+        }
+        try validateOK(response)
+        return try JSONDecoder().decode(Stats.self, from: data)
+    }
+
+    private func publicStatusRequest() throws -> URLRequest {
+        var req = URLRequest(url: try makeURL(path: "/api/status"))
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if let key = apiKey, !key.isEmpty {
             req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
-        let (data, response) = try await session.data(for: req)
-        try validateOK(response)
-        return try JSONDecoder().decode(Stats.self, from: data)
+        return req
+    }
+
+    /// Returns true when the configured key differs from the one in use.
+    private func reloadAPIKey() -> Bool {
+        guard let latest = apiKeyLoader(), !latest.isEmpty, latest != apiKey else {
+            return false
+        }
+        apiKey = latest
+        return true
     }
 
     private func fetchAdminStats(scope: String) async throws -> Stats {
@@ -437,7 +452,7 @@ final class MenubarStatsPoller {
         try validateOK(response)
     }
 
-    private var hasAPIKey: Bool {
+    var hasAPIKey: Bool {
         guard let apiKey else { return false }
         return !apiKey.isEmpty
     }

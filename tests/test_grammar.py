@@ -414,6 +414,40 @@ class TestCompileWithStructuralTag:
         tag_arg = compiler.compile_structural_tag.call_args[0][0]
         assert tag_arg["format"]["elements"][1] == user_fmt
 
+    @requires_xgrammar
+    def test_harmony_final_ends_on_return_stop_token(self):
+        """gpt-oss uses <|return|> as EOS, so the final message must end on it."""
+        xgr = pytest.importorskip("xgrammar")
+
+        vocab = [
+            "<|start|>", "<|channel|>", "<|message|>", "<|end|>", "<|return|>",
+            "assistant", "analysis", "final", "Ok", '{"', "name", '":"', "A", '"}',
+        ]
+        ret = vocab.index("<|return|>")
+        compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(vocab, stop_token_ids=[ret]))
+        fmt = {
+            "type": "json_schema",
+            "json_schema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        }
+        matcher = xgr.GrammarMatcher(self._call(compiler, fmt, "harmony"))
+        output = [
+            "<|channel|>", "analysis", "<|message|>", "Ok", "<|end|>",
+            "<|start|>", "assistant", "<|channel|>", "final", "<|message|>",
+            '{"', "name", '":"', "A", '"}',
+        ]
+        for token in output:
+            assert matcher.accept_token(vocab.index(token)), token
+
+        bitmask = np.full((1, 1), -1, dtype=np.int32)
+        matcher.fill_next_token_bitmask(bitmask)
+        assert not (bitmask[0, 0] >> vocab.index("<|end|>")) & 1
+        assert matcher.accept_token(ret)
+        assert matcher.is_terminated()
+
 
 class TestCompileBareGrammar:
     """Tests for _compile_bare_grammar."""

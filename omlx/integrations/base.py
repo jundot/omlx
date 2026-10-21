@@ -11,6 +11,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def bracket_host(host: str) -> str:
+    """Return ``host`` in URL-authority form, bracketing bare IPv6 literals.
+
+    ``http://::1:8000`` is not a valid URL (requests rejects it with
+    InvalidURL); the RFC 3986 form is ``http://[::1]:8000``. IPv4 literals,
+    hostnames, and already-bracketed literals pass through unchanged.
+    """
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 @dataclass(frozen=True)
 class IntegrationContext:
     """Resolved launch/configuration inputs for an external tool integration."""
@@ -37,7 +49,7 @@ class IntegrationContext:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"http://{bracket_host(self.host)}:{self.port}"
 
     @property
     def openai_base_url(self) -> str:
@@ -192,13 +204,18 @@ class Integration:
 
 
 def backup_then_write(
-    path: Path, text: str, *, failure: str = "could not create backup",
+    path: Path,
+    text: str,
+    *,
+    failure: str = "could not create backup",
     note: str = "Config written",
+    mode: int | None = None,
 ) -> None:
     """Back up an existing config, then write ``text`` over it.
 
     Best effort: a config that cannot be backed up is still written, and a
-    failed copy only earns a warning.
+    failed copy only earns a warning. ``mode`` applies only when the file
+    is created.
     """
     if path.exists():
         backup = path.with_suffix(f".{int(time.time())}.bak")
@@ -209,7 +226,17 @@ def backup_then_write(
             print(f"Warning: {failure}: {e}")
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    if mode is not None:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        except FileExistsError:
+            # Existing file: write in place and keep its mode.
+            path.write_text(text, encoding="utf-8")
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+    else:
+        path.write_text(text, encoding="utf-8")
     print(f"{note}: {path}")
 
 

@@ -39,7 +39,6 @@ from typing import Optional
 import mlx.core as mx
 
 from omlx.custom_kernels.nax import is_nax_available
-from omlx.patches.glm_moe_dsa.deepseek_v32 import group_expert_select
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +67,8 @@ inline float glm_load_vector(const device T* x, thread float* x_thread) {
   float sum = 0;
   if (bits == 3) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 8.0f;
       x_thread[i + 2] = x[i + 2] / 64.0f;
@@ -81,7 +80,7 @@ inline float glm_load_vector(const device T* x, thread float* x_thread) {
     }
   } else if (bits == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 16.0f;
       x_thread[i + 2] = x[i + 2] / 256.0f;
@@ -89,8 +88,8 @@ inline float glm_load_vector(const device T* x, thread float* x_thread) {
     }
   } else if (bits == 5) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
-          x[i + 6] + x[i + 7];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 32.0f;
       x_thread[i + 2] = x[i + 2] / 4.0f;
@@ -102,7 +101,7 @@ inline float glm_load_vector(const device T* x, thread float* x_thread) {
     }
   } else if (bits == 6) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
       x_thread[i] = x[i];
       x_thread[i + 1] = x[i + 1] / 64.0f;
       x_thread[i + 2] = x[i + 2] / 16.0f;
@@ -773,7 +772,7 @@ def _down_kernel(
 
 # MLX uses the same qmv_fast alignment rule for 3-bit and 4/5/6/8-bit weights.
 def _qmv_fast_ok(bits: int, group_size: int, n: int, k: int) -> bool:
-    """Shapes on which MLX routes a one-token product to qmv_fast."""
+    """MLX qmv_fast shapes with full output tiles for the fused kernels."""
     if bits not in (3, 4, 5, 6, 8) or group_size not in (32, 64, 128):
         return False
     pack_factor = 8 if bits in (3, 5) else (4 if bits == 6 else 32 // bits)
@@ -2259,6 +2258,18 @@ def _atoi(text: str) -> int:
 
 
 @lru_cache(maxsize=None)
+def fused_decode_supported() -> bool:
+    """True on gen-15+ GPUs (M3 and newer). From gen 15 MLX runs multi-row
+    affine qmv as qmv_wide, which these kernels replay, and the 1024-thread
+    kernels fit the pipeline limit; on older GPUs neither holds."""
+    if not mx.metal.is_available():
+        return False
+    arch = str(mx.device_info().get("architecture", ""))
+    match = re.match(r"applegpu_g(\d+)", arch)
+    return match is not None and int(match.group(1)) >= 15
+
+
+@lru_cache(maxsize=None)
 def nax_relaxed_fp32_matmul() -> bool:
     """True when MLX runs fp32 GEMMs on NAX with relaxed (TF32) precision:
     NAX available and ``env::enable_tf32()`` (MLX_ENABLE_TF32, default 1).
@@ -2857,217 +2868,6 @@ def mla_head_qmv(x: mx.array, layer, nsg: int = 8) -> Optional[mx.array]:
         output_shapes=[(1, H, 1, N)],
         output_dtypes=[x.dtype],
     )[0]
-
-
-# Multi-row (verify block) router logits. The reference x @ W.T for
-# 2 <= L <= 8 rows runs MLX's NAX split-K GEMM: relaxed-precision 16x32x16
-# matmul2d ops along each K partition (2048 wide for 2048 < K <= 4096),
-# then the partitions summed in order from 0. One simdgroup per (32-expert
-# tile, K partition) issues the same op sequence along its partition, and
-# the partitions are summed in the same order before the sigmoid/bias
-# epilogue.
-_ROUTER_NAX_SOURCE = r"""
-  const ushort lane = thread_index_in_simdgroup;
-  const int p = int(simdgroup_index_in_threadgroup);
-  const int n0 = int(threadgroup_position_in_grid.x) * 32;
-  const short qid = lane >> 2;
-  const short fm = ((qid & 4) | ((lane >> 1) & 3));
-  const short fn = ((qid & 2) | (lane & 1)) * 4;
-  constexpr auto desc = matmul2d_descriptor(
-      16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
-  matmul2d<desc, execution_simdgroup> op;
-  auto ct_a = op.template get_left_input_cooperative_tensor<float, float, float>();
-  auto ct_b = op.template get_right_input_cooperative_tensor<float, float, float>();
-  auto ct_c = op.template get_destination_cooperative_tensor<
-      metal::remove_addrspace_t<decltype(ct_a)>,
-      metal::remove_addrspace_t<decltype(ct_b)>,
-      float>();
-  for (short i = 0; i < 16; i++) {
-    ct_c[i] = 0.0f;
-  }
-  const int k_begin = p * PART;
-  constexpr int CHUNKS = PART / 16;
-  // Operands of the next G chunks are loaded ahead of the (accumulator
-  // dependent) NAX chain; the chain itself is unchanged. Rows are addressed
-  // by offsets (an array of device pointers has been miscompiled).
-  const bool xok = fm < M;
-  const uint xoff = uint(xok ? fm : 0) * uint(K) + uint(k_begin + fn);
-  const uint w0 = uint(n0 + fm) * uint(K) + uint(k_begin + fn);
-  const uint w1 = w0 + 8u * uint(K);
-  const uint w2 = w0 + 16u * uint(K);
-  const uint w3 = w0 + 24u * uint(K);
-  float abuf[G][4];
-  float bbuf[G][16];
-#define GLM5_ROUTER_LOAD(kc, s)                                              \
-  {                                                                          \
-    const uint k0 = uint(kc) * 16u;                                          \
-    _Pragma("unroll") for (short e = 0; e < 4; e++) {                        \
-      abuf[s][e] = xok ? static_cast<float>(x[xoff + k0 + e]) : 0.0f;         \
-      bbuf[s][e] = w[w0 + k0 + e];                                           \
-      bbuf[s][4 + e] = w[w1 + k0 + e];                                       \
-      bbuf[s][8 + e] = w[w2 + k0 + e];                                       \
-      bbuf[s][12 + e] = w[w3 + k0 + e];                                      \
-    }                                                                        \
-  }
-  _Pragma("unroll") for (short s = 0; s < G; s++) {
-    if (s < CHUNKS) GLM5_ROUTER_LOAD(s, s);
-  }
-  for (int kc0 = 0; kc0 < CHUNKS; kc0 += G) {
-    _Pragma("unroll") for (short s = 0; s < G; s++) {
-      const int kc = kc0 + s;
-      if (kc < CHUNKS) {
-        _Pragma("unroll") for (short i = 0; i < 4; i++) {
-          ct_a[i] = abuf[s][i];
-          ct_a[4 + i] = 0.0f;  // rows fm + 8 >= 8 >= M
-        }
-        _Pragma("unroll") for (short i = 0; i < 16; i++) {
-          ct_b[i] = bbuf[s][i];
-        }
-        if (kc + G < CHUNKS) GLM5_ROUTER_LOAD(kc + G, s);
-        op.run(ct_a, ct_b, ct_c);
-      }
-    }
-  }
-#undef GLM5_ROUTER_LOAD
-  threadgroup float parts[NPART][16][32];
-  for (short i = 0; i < 8; i++) {
-    const short r = fm + (i >> 2) * 8;
-    const short c = fn + (i & 3);
-    parts[p][r][c] = ct_c[i];
-    parts[p][r][16 + c] = ct_c[8 + i];
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (p == 0) {
-    for (short i = 0; i < 8; i++) {
-      const short r = fm + (i >> 2) * 8;
-      const short c = fn + (i & 3);
-      if (r < M) {
-        for (short hh = 0; hh < 2; hh++) {
-          const int e = n0 + hh * 16 + c;
-          // gemm_splitk_accum: AccT out = 0; out += C_split[q] in order.
-          float logit = 0;
-          for (int q = 0; q < NPART; q++) {
-            logit += parts[q][r][hh * 16 + c];
-          }
-          float sgm = glm_sigmoid<float>(logit);
-          float biased = sgm + bias[e];
-          sig[r * E + e] = sgm;
-          biased_out[r * E + e] = biased;
-        }
-      }
-    }
-  }
-"""
-
-
-# Operand chunks (16 inputs each) loaded ahead of the router's NAX chain.
-_ROUTER_PREFETCH = 8
-
-
-@lru_cache(maxsize=None)
-def _router_nax_kernel():
-    return mx.fast.metal_kernel(
-        name="glm5_router_logits_nax_splitk",
-        input_names=["x", "w", "bias"],
-        output_names=["sig", "biased_out"],
-        header=_NAX_HEADER + _QMV_HEADER.replace("#include <metal_stdlib>\nusing namespace metal;\n", ""),
-        source=_ROUTER_NAX_SOURCE,
-    )
-
-
-def moe_router_rows(
-    x: mx.array,
-    weight: mx.array,
-    bias: mx.array,
-    top_k: int,
-    scaling: float,
-    norm_topk_prob: bool,
-):
-    """Router for 2..8 rows computed together (a verify block), bit-identical
-    to the reference's NAX split-K logits GEMM + group_expert_select.
-
-    Only valid (and only used) when MLX runs fp32 GEMMs on NAX with relaxed
-    precision; returns None otherwise or when the shape selects another
-    GEMM configuration.
-    """
-    if x.ndim != 2 or weight.ndim != 2 or bias.ndim != 1:
-        return None
-    T, K = x.shape
-    E = weight.shape[0]
-    if not 2 <= T <= 8 or weight.shape[1] != K or bias.shape[0] != E:
-        return None
-    if weight.dtype != mx.float32 or bias.dtype != mx.float32:
-        return None
-    if x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
-        return None
-    # steel_matmul_axpby routes this product to the NAX split-K GEMM when
-    # K >= 3 * max(M, N) (or max(M, N) <= 1024 and K > 2 * max(M, N)); the
-    # partition size follows steel_gemm_splitk_axpby_nax. Tile sizes only
-    # group the per-element 16-wide k chain, so any aligned K is covered.
-    mn = max(T, E)
-    if not (K >= 3 * mn or (mn <= 1024 and K > 2 * mn)):
-        return None
-    part = K // 2 if K <= 1024 else 1024 if K <= 2048 else 2048 if K <= 4096 else 4096
-    if part % 16 or K % part or not 1 <= K // part <= 8:
-        return None
-    if E % 32 or E > 1024 or not 1 <= top_k <= min(32, E):
-        return None
-    if not nax_relaxed_fp32_matmul():
-        return None
-    npart = K // part
-    sig, biased = _router_nax_kernel()(
-        inputs=[x, weight, bias],
-        template=[("M", T), ("K", K), ("E", E), ("PART", part), ("NPART", npart),
-                  ("G", _ROUTER_PREFETCH)],
-        grid=(32 * npart * (E // 32), 1, 1),
-        threadgroup=(32 * npart, 1, 1),
-        output_shapes=[(T, E), (T, E)],
-        output_dtypes=[mx.float32, mx.float32],
-    )
-    threads = 32  # one simdgroup per token (eight selection rounds)
-    indices, scores = _router_select_kernel()(
-        inputs=[sig, biased, mx.array([scaling], dtype=mx.float32)],
-        template=[("E", E), ("TOPK", top_k), ("NORM", int(bool(norm_topk_prob) and top_k > 1))],
-        grid=(threads * T, 1, 1),
-        threadgroup=(threads, 1, 1),
-        output_shapes=[(T, top_k), (T, top_k)],
-        output_dtypes=[mx.uint32, mx.float32],
-    )
-    key = (T, K, E, x.dtype, top_k)
-    if not _router_rows_verified(
-        key, indices, scores, x, weight, bias, top_k, scaling, norm_topk_prob
-    ):
-        return None
-    STATS["router_rows"] += 1
-    return indices, scores
-
-
-_ROUTER_ROWS_CHECKED: dict = {}
-
-
-def _router_rows_verified(key, indices, scores, x, weight, bias, top_k, scaling, norm) -> bool:
-    """First call of each configuration: compare with group_expert_select on
-    the reference logits."""
-    ok = _ROUTER_ROWS_CHECKED.get(key)
-    if ok is not None:
-        return ok
-    ref_idx, ref = group_expert_select(
-        x.astype(mx.float32) @ weight.T, bias, top_k, 1, 1, scaling, norm
-    )
-    try:
-        ok = bool(
-            (mx.array_equal(indices, ref_idx.astype(indices.dtype))
-             & mx.array_equal(scores.view(mx.uint32), ref.view(mx.uint32))).item()
-        )
-    except Exception:  # traced (mx.compile / vmap): check on an eager call
-        return False
-    _ROUTER_ROWS_CHECKED[key] = ok
-    if not ok:
-        logger.warning(
-            "GLM-5.3 fused verify router %s differs from the reference; "
-            "using the reference path for it", key,
-        )
-    return ok
 
 
 # ---------------------------------------------------------------------------

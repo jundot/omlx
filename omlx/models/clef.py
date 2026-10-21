@@ -379,6 +379,8 @@ class ClefModel:
 
     def encode(self, request: dict, truncate: bool = True) -> ClefPlan:
         """Tokenize and preprocess on the CPU; raises the request errors."""
+        if request.get("videos"):
+            raise DecisionRequestError("this model does not take videos")
         backbone = self.backbone
         images = decode_images(request.get("images"))
         pixel_values = image_grid_thw = None

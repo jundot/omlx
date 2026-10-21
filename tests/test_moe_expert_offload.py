@@ -11,7 +11,10 @@ output magnitude ~5), so those cases assert a rounding-scale tolerance —
 head-room for kernel choice, not for wrong experts, which show as O(1).
 """
 
+import gc
+import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -28,6 +31,7 @@ except ImportError:
 pytestmark = pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 
 if HAS_MLX:
+    from omlx.custom_kernels.moe_staging import Staging
     from omlx.patches import moe_expert_offload as offload_module
     from omlx.patches.moe_expert_offload import (
         CheckpointExpertStore,
@@ -646,12 +650,6 @@ class TestApplyAndForward:
         full = 10**6
         assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
 
-    def test_kill_switch(self, tmp_path, monkeypatch):
-        model, _ = self._wrapped_model(tmp_path)
-        monkeypatch.setenv("OMLX_MOE_EXPERT_OFFLOAD", "0")
-        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 0
-        assert type(model.layers[0].experts.switch_glu) is SwitchGLU
-
     def test_idempotent_second_apply_is_noop(self, tmp_path):
         model, _ = self._wrapped_model(tmp_path)
         assert apply_moe_expert_offload(model, tmp_path, 0.25) == 2
@@ -674,10 +672,8 @@ class TestParallelFetch:
         _shutdown_io_pool()
 
     def _wrap(self, tmp_path, glu, workers, monkeypatch, fraction=0.25):
-        if workers is None:
-            monkeypatch.delenv("OMLX_MOE_OFFLOAD_IO_WORKERS", raising=False)
-        else:
-            monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_WORKERS", workers)
+        if workers is not None:
+            monkeypatch.setattr(offload_module, "_IO_WORKERS", int(workers))
         _shutdown_io_pool()
         model = _MiniMoE([glu])
         assert apply_moe_expert_offload(model, tmp_path, fraction) == 1
@@ -769,19 +765,6 @@ class TestParallelFetch:
             cache.ensure(mx.array(ids))
         assert 0 in cache.slot_of  # Last routed 9 one-off experts ago
 
-    @pytest.mark.parametrize("workers", ["0", "-4", "abc", "1", None])
-    def test_io_workers_env_degenerate_values(self, tmp_path, monkeypatch, workers):
-        glu = _make_glu(seed=5)
-        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
-        x, i = mx.random.normal((4, 1, D)), _ri(4, 1, K)
-        ref = glu(x, i)
-        mx.eval(ref)
-        model, _ = self._wrap(tmp_path, glu, workers, monkeypatch)
-        got = model.layers[0].experts.switch_glu(x, i)
-        mx.eval(got)
-        assert bool(mx.array_equal(ref, got))
-        assert (_io_pool() is None) is (workers is not None)
-
     @pytest.mark.parametrize("workers", ["1", "4"])
     @pytest.mark.parametrize("full", [False, True])
     def test_read_failure_preserves_cache_for_retry(
@@ -852,8 +835,8 @@ class TestParallelFetch:
     def test_single_expert_window_keeps_reads_on_pool(self, tmp_path, monkeypatch):
         glu = _make_glu(seed=10)
         _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
-        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "1")
         _, cache = self._wrap(tmp_path, glu, "4", monkeypatch)
+        monkeypatch.setattr(offload_module, "_io_batch", lambda: 1)
         read = CheckpointExpertStore.read
         threads = []
 
@@ -892,7 +875,7 @@ class TestParallelFetch:
         buffering a whole layer's expert table in host memory."""
         glu = _make_glu(seed=7)
         _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
-        monkeypatch.setenv("OMLX_MOE_OFFLOAD_IO_BATCH", "4")
+        monkeypatch.setattr(offload_module, "_io_batch", lambda: 4)
         real_read, real_to_mx = CheckpointExpertStore.read, CheckpointExpertStore.to_mx
         lock = threading.Lock()
         live = {"now": 0, "peak": 0}
@@ -1302,6 +1285,7 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
         shared_expert_intermediate_size=64,
         num_experts=512,
         num_experts_per_tok=10,
+        norm_topk_prob=True,
     )
     model = nn.Module()
     model.language_model = nn.Module()
@@ -1426,3 +1410,94 @@ def test_packed_prefill_chunks_match_whole_expert_chunks(tmp_path, monkeypatch):
         outputs.append(out)
     assert packed == [[(0, 128), (128, 256), (256, 320)]]
     assert bool(mx.array_equal(*outputs))
+
+
+staging_native = pytest.mark.skipif(
+    not HAS_MLX or not offload_module.STAGING_AVAILABLE,
+    reason="native MoE staging not built",
+)
+
+
+@staging_native
+@pytest.mark.parametrize("buffers", [9, 90])
+def test_staging_matches_bytes_transport(tmp_path, monkeypatch, buffers):
+    """Staged and bytes reads give the same output and cache state, mixed or not."""
+    glu = _make_glu(seed=34)
+    _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    mx.random.seed(37)
+    calls = [
+        (mx.random.normal((1, 1, D)), mx.array([[[i % E, (i + 9) % E, (i + 17) % E]]]))
+        for i in range(12)
+    ]
+
+    def run(staged):
+        monkeypatch.setattr(offload_module, "STAGING_AVAILABLE", staged)
+        _shutdown_io_pool()
+        model = _MiniMoE([glu])
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        switch = model.layers[0].experts.switch_glu
+        cache = switch.cache
+        staging = cache.disk._store._staging
+        assert (staging is not None) == staged
+        if staging is not None:
+            sizes = [p.nbytes for e in range(10) for _, _, p in cache._plans(e)]
+            staging.sizes = sizes[:buffers]
+        outs = []
+        for x, indices in calls:
+            out = switch(x, indices)
+            mx.eval(out)
+            outs.append(np.array(out).tobytes())
+        state = (
+            dict(cache.slot_of),
+            list(cache.free),
+            cache.hits,
+            cache.misses,
+            np.array(cache.map).tolist(),
+            [
+                np.array(a.view(mx.uint8)).tobytes()
+                for triple in cache.resident.values()
+                for a in triple
+                if a is not None
+            ],
+        )
+        if staging is None:
+            return outs, state, None
+        del model, switch, cache
+        mx.synchronize()
+        gc.collect()
+        return outs, state, staging.pool.stats()
+
+    reference = run(False)
+    outs, state, stats = run(True)
+    assert (outs, state) == reference[:2]
+    assert stats["reads"] > 0 and stats["busy"] == 0
+    assert (stats["fallbacks"] > 0) == (buffers == 9)
+
+
+@staging_native
+def test_staging_lease_outlives_lazy_graph(tmp_path):
+    raw = bytes(range(64))
+    path = tmp_path / "raw"
+    path.write_bytes(raw)
+    with path.open("rb") as f:
+        plan = offload_module._ReadPlan(f.fileno(), 0, 64, np.uint8, None, (64,))
+        staging = Staging(
+            [64], CheckpointExpertStore.read, CheckpointExpertStore.to_mx
+        ).for_owner()
+        with pytest.raises(OSError, match="short read"):
+            staging.read(plan._replace(offset=32))
+        assert staging.pool.stats()["busy"] == 0
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            payload = pool.submit(staging.read, plan).result()
+        lazy = mx.concatenate([staging.to_mx(plan, payload)] * 2)
+        del payload
+        gc.collect()
+        assert staging.pool.stats()["busy"] == 1
+        assert isinstance(staging.read(plan), bytes)  # an occupied pool never waits
+        assert np.array(lazy).tobytes() == raw * 2
+        del lazy
+        mx.synchronize()
+        gc.collect()
+        assert staging.pool.stats()["busy"] == 0

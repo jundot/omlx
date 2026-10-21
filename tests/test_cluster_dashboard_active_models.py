@@ -3,7 +3,8 @@
 
 The Active Models card and runtime-cache observability are fed by
 ``GET /admin/api/stats``; distributed engines own no local scheduler, so the
-rows are adapted from rank zero's telemetry marker instead.
+rows are adapted from rank zero's telemetry marker instead. The template
+checks live in apps/omlx-web/tests/test_cluster_dashboard_active_models_ui.py.
 """
 
 import json
@@ -18,7 +19,6 @@ from omlx.cluster.planner import PipelineAssignment
 from omlx.engine.distributed import DistributedBatchedEngine
 from omlx.engine_pool import EngineEntry, EnginePool
 
-ROOT = Path(__file__).resolve().parents[1]
 
 
 def _deployment(
@@ -513,27 +513,3 @@ def test_runtime_cache_distributed_stale_marker_contributes_no_row(tmp_path):
 # ---------------------------------------------------------------------------
 # Template / i18n contract
 # ---------------------------------------------------------------------------
-
-
-def test_status_template_renders_cluster_badge_and_rank_cache_row():
-    blocks = ROOT / "omlx/admin/templates/dashboard/blocks"
-    status = (blocks / "_active_models.html").read_text() + (
-        blocks / "_cache_observability.html"
-    ).read_text()
-    javascript = (ROOT / "omlx/admin/static/js/dashboard.js").read_text()
-    en = json.loads((ROOT / "omlx/admin/i18n/en.json").read_text())
-
-    assert status.count("clusterBadgeLabel(m.cluster)") == 2  # mobile + desktop
-    assert "clusterBadgeLabel(cluster)" in javascript
-    assert "m.cluster?.live?.stale" in status
-    assert "m.cache_tier === 'rank-prompt-snapshot'" in status
-    assert "m.rank_prompt_cache" in status
-    for key in (
-        "cluster.badge.label",
-        "cluster.badge.tensor",
-        "cluster.badge.pipeline",
-        "cluster.badge.stale",
-        "cluster.badge.rank_cache",
-        "cluster.badge.rank_cache_entries",
-    ):
-        assert en.get(key), f"en.json missing {key}"

@@ -17,10 +17,13 @@ from typing import Callable, Optional
 import requests
 
 from .hf_downloader import (
+    _ETA_WARMUP,
+    _ETA_WINDOW,
     DownloadStatus,
     DownloadTask,
     _QueuePersistenceMixin,
     _SpeedMeter,
+    _WireSpeedMeter,
     _format_model_size,
     _format_param_count,
 )
@@ -230,9 +233,8 @@ async def _fetch_model_detail_size(model_id: str) -> int:
     """Fetch a model's storage size via the detail endpoint.
 
     Used as a fallback when list_models didn't populate StorageSize.
-    Prefers ModelInfos.safetensor.model_size (weights only) and falls
-    back to the repository StorageSize (weights + tokenizer + readme).
-    Returns 0 on any error.
+    ModelInfos.safetensor.model_size is an element count, not bytes, so
+    only the repository StorageSize is used. Returns 0 on any error.
     """
     if not model_id:
         return 0
@@ -246,9 +248,7 @@ async def _fetch_model_detail_size(model_id: str) -> int:
         if resp.status_code != 200:
             return 0
         data = resp.json().get("Data") or {}
-        model_infos = data.get("ModelInfos") or {}
-        st = model_infos.get("safetensor") or {}
-        size = st.get("model_size") or data.get("StorageSize") or 0
+        size = data.get("StorageSize") or 0
         return int(size) if isinstance(size, (int, float, str)) else 0
     except (TypeError, ValueError):
         return 0
@@ -315,9 +315,8 @@ def _parse_ms_model_entry(entry: dict) -> dict:
     Returns:
         Normalized model dict matching the HF format.
     """
-    # Path is the organization/owner, Name is the model name
-    # repo_id should be "owner/model" format
-    path = entry.get("Path") or ""
+    # Path (REST) or Owner (SDK) is the organization, Name is the model
+    path = entry.get("Path") or entry.get("Owner") or ""
     name = entry.get("Name") or ""
     if path and name:
         model_id = f"{path}/{name}"
@@ -719,7 +718,8 @@ class MSDownloader(_QueuePersistenceMixin):
             )
 
         model_id = model_id.strip()
-        if "/" not in model_id or len(model_id.split("/")) != 2:
+        parts = model_id.split("/")
+        if len(parts) != 2 or any(part in ("", ".", "..") for part in parts):
             raise ValueError(
                 f"Invalid model ID: '{model_id}'. "
                 "Expected format: 'owner/model' (e.g., 'qwen/Qwen2.5-7B-Instruct-MLX')"
@@ -1038,6 +1038,10 @@ class MSDownloader(_QueuePersistenceMixin):
         speed_meter = _SpeedMeter()
         activity = self._get_download_activity(target_dir)
         speed_meter.add(activity.files)
+        # Rate of the reported bytes, fed from the first moving tick to skip
+        # startup idle time.
+        eta_meter = _WireSpeedMeter(window=_ETA_WINDOW)
+        eta_started_at: float | None = None
 
         try:
             while task.status == DownloadStatus.DOWNLOADING:
@@ -1051,6 +1055,12 @@ class MSDownloader(_QueuePersistenceMixin):
                 latest_mtime = activity.latest_mtime_ns / 1e9
                 task.downloaded_size = current_size
                 task.speed_bps = speed_meter.add(activity.files)
+                if eta_started_at is None and task.speed_bps > 0:
+                    eta_started_at = time.monotonic()
+                if eta_started_at is not None:
+                    eta_bps = eta_meter.add(task.downloaded_size)
+                    if time.monotonic() - eta_started_at >= _ETA_WARMUP:
+                        task.eta_speed_bps = eta_bps
 
                 if task.total_size > 0:
                     # Cap at 99% until snapshot_download confirms completion
@@ -1088,6 +1098,7 @@ class MSDownloader(_QueuePersistenceMixin):
             pass
         finally:
             task.speed_bps = 0.0
+            task.eta_speed_bps = 0.0
 
     @staticmethod
     def _get_dir_size(path: Path) -> int:

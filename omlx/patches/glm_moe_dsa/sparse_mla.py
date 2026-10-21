@@ -182,7 +182,7 @@ def exact_block_token_attention(
     """Run fork-default exact block-token SDPA when the native op is available."""
 
     if (
-        not hasattr(glm_fast, "glm_dsa_exact_block_attention")
+        not hasattr(glm_fast, "block_mask_attention")
         or q.ndim != 4
         or k.ndim != 4
         or v.ndim != 4
@@ -210,7 +210,7 @@ def exact_block_token_attention(
         return None
     block_mask, block_token_mask = block_masks
     try:
-        return glm_fast.glm_dsa_exact_block_attention(
+        return glm_fast.block_mask_attention(
             q,
             k,
             v,
@@ -453,7 +453,7 @@ def sparse_mla_attention(
     ):
         return None
 
-    if not hasattr(glm_fast, "glm_dsa_sparse_mla_attention"):
+    if not hasattr(glm_fast, "sparse_mla_attention"):
         return None
 
     topk = (
@@ -463,7 +463,7 @@ def sparse_mla_attention(
     )
     if topk_length is not None and topk_length.dtype != mx.uint32:
         topk_length = topk_length.astype(mx.uint32)
-    return glm_fast.glm_dsa_sparse_mla_attention(
+    return glm_fast.sparse_mla_attention(
         q_latent,
         q_pe,
         kv_latent,
@@ -491,7 +491,7 @@ def q8_vup_flat(
         return None
 
     if (
-        not hasattr(glm_fast, "glm_dsa_q8_vup_flat")
+        not hasattr(glm_fast, "q8_head_flat_qmm")
         or x.ndim != 4
         or x.shape[1] != 64
         or x.shape[-1] != 512
@@ -518,7 +518,7 @@ def q8_vup_flat(
         or biases.dtype != x.dtype
     ):
         return None
-    return glm_fast.glm_dsa_q8_vup_flat(
+    return glm_fast.q8_head_flat_qmm(
         x,
         weight,
         scales,
