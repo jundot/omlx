@@ -9,6 +9,8 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from ..model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
+
 ExecutionProfileName = Literal["interactive", "balanced", "throughput"]
 
 _MAX_RATE = 1e18
@@ -171,6 +173,11 @@ class ExecutionSettings:
     async_overlap: bool = True
     ring_connections_per_ip: int = 2
     tuning_reason: str = "balanced profile defaults"
+    # Lightning MTP. Rank zero drafts and decides; the plan reserves the head
+    # there. A depth of 0 keeps the model family's default.
+    mtp: bool = False
+    mtp_depth: int = 0
+    mtp_fixed_depth: bool = False
 
     def __post_init__(self) -> None:
         if self.profile not in {"interactive", "balanced", "throughput"}:
@@ -205,6 +212,15 @@ class ExecutionSettings:
                 raise ValueError(f"{name} must be a positive integer when set")
         if not isinstance(self.tuning_reason, str) or not self.tuning_reason:
             raise ValueError("tuning_reason is required")
+        if (
+            not isinstance(self.mtp_depth, int)
+            or isinstance(self.mtp_depth, bool)
+            or not 0 <= self.mtp_depth <= MAX_LIGHTNING_MTP_DRAFT_TOKENS
+        ):
+            raise ValueError(
+                "mtp_depth must be an integer from 0 to "
+                f"{MAX_LIGHTNING_MTP_DRAFT_TOKENS}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -224,6 +240,9 @@ class ExecutionSettings:
             "async_overlap": self.async_overlap,
             "ring_connections_per_ip": self.ring_connections_per_ip,
             "tuning_reason": self.tuning_reason,
+            "mtp": self.mtp,
+            "mtp_depth": self.mtp_depth,
+            "mtp_fixed_depth": self.mtp_fixed_depth,
         }
 
     @classmethod

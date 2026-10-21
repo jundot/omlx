@@ -436,6 +436,28 @@ def test_unpair_revokes_everything(tmp_path):
     assert joiner.paired_devices() == []
 
 
+def test_forget_route_unpairs_through_the_real_manager(tmp_path, monkeypatch):
+    from omlx.cluster import routes
+
+    coordinator, joiner, _, _, _ = _loopback_pair(tmp_path)
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator.approve("join-node", code)
+    joiner.complete_join(joiner.poll_join("coordinator.local:8080"))
+    monkeypatch.setattr(pairing_routes, "_manager", lambda: coordinator)
+    monkeypatch.setattr(
+        routes, "get_cluster_registry", lambda: SimpleNamespace(list=lambda: [])
+    )
+    app = FastAPI()
+    app.include_router(routes.router)
+
+    response = TestClient(app).delete("/admin/api/cluster/forget?node_id=join-node")
+
+    assert response.status_code == 200
+    assert response.json()["forgotten_node_ids"] == ["join-node"]
+    assert coordinator.paired_devices() == []
+
+
 def test_unpair_unknown_device_fails_closed(tmp_path):
     coordinator = _manager(tmp_path, node_id="coord-node", name="Coordinator")
     with pytest.raises(PairingStateError, match="unknown device"):
@@ -645,6 +667,24 @@ def test_approval_requires_coordinator_ssh_material(tmp_path):
 
     assert coordinator.paired_devices() == []
     assert [row["node_id"] for row in coordinator.pending_requests()] == ["join-node"]
+
+
+def test_missing_ssh_host_key_asks_for_remote_login(tmp_path):
+    coordinator, joiner, *_ = _loopback_pair(tmp_path)
+    joiner._ssh_host_key_provider = lambda: None
+    joiner.start_join()
+
+    with pytest.raises(PairingRequestError, match="Remote Login"):
+        joiner.request_join("coordinator.local:8080")
+
+    joiner._ssh_host_key_provider = lambda: _test_public_key("host-join-node")
+    code = joiner.start_join()["code"]
+    joiner.request_join("coordinator.local:8080")
+    coordinator._ssh_host_key_provider = lambda: None
+
+    with pytest.raises(EnrollmentDriveError, match="Remote Login"):
+        coordinator.approve("join-node", code)
+    assert coordinator.paired_devices() == []
 
 
 def test_default_enrollment_requires_key_and_verified_address(monkeypatch):

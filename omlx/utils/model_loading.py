@@ -679,6 +679,12 @@ def maybe_apply_pre_load_patches(
         from ..patches.deepseek_v41 import apply_patch
 
         apply_patch()
+    if not for_vlm and model_type == "deepseek_v41":
+        # Cluster ranks are mlx-lm servers; see the patch docstring.
+        from ..patches.deepseek_v41_mlx_lm import apply_deepseek_v41_mlx_lm_patch
+
+        if apply_deepseek_v41_mlx_lm_patch():
+            logger.info("DeepSeek V4.1 mlx-lm registration applied for %s", model_name)
     if (
         isinstance(model_type, str)
         and model_type.startswith("deepseek_v4")
@@ -727,6 +733,13 @@ def maybe_apply_pre_load_patches(
         if apply_hy_v3_patch():
             logger.info("Hy3 pre-load patch applied for %s", model_name)
 
+    if model_type == "muse_spark":
+        # The VLM imports the same text model, so register it on both paths.
+        from ..patches.muse_spark import apply_muse_spark_patch
+
+        if apply_muse_spark_patch():
+            logger.info("Muse Spark mlx-lm registration applied for %s", model_name)
+
     text_config = config.get("text_config")
     text_model_type = (
         text_config.get("model_type") if isinstance(text_config, dict) else None
@@ -753,6 +766,13 @@ def maybe_apply_pre_load_patches(
 
         if apply_minimax_m3_mlx_lm_patch():
             logger.info("MiniMax-M3 mlx-lm registration applied for %s", model_name)
+
+    if not for_vlm and model_type == "glm5_next":
+        # Same reason as MiniMax-M3: cluster ranks are mlx-lm servers.
+        from ..patches.glm5_next_mlx_lm import apply_glm5_next_mlx_lm_patch
+
+        if apply_glm5_next_mlx_lm_patch():
+            logger.info("GLM-5.3 mlx-lm registration applied for %s", model_name)
 
     if for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
@@ -807,6 +827,17 @@ def maybe_apply_pre_load_patches(
         if apply_mlx_vlm_muse_glimmer_compat_patch():
             logger.info(
                 "Muse Glimmer mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
+    if for_vlm and model_type == "muse_spark":
+        from ..patches.mlx_vlm_muse_spark_compat import (
+            apply_mlx_vlm_muse_spark_compat_patch,
+        )
+
+        if apply_mlx_vlm_muse_spark_compat_patch():
+            logger.info(
+                "Muse Spark mlx-vlm compatibility patch applied for %s",
                 model_name,
             )
 

@@ -490,6 +490,8 @@ def parse_file_part(part: dict[str, Any], *, max_file_size_mb: int) -> MarkItDow
         filename = f"attachment{extension}"
 
     extension = Path(filename).suffix.lower()
+    if mime_type == "application/octet-stream":
+        mime_type = ""
     _validate_supported_file(filename, mime_type)
 
     data = _decode_data(data_value)

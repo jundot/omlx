@@ -23,6 +23,7 @@ from mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
 from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.model_settings import ModelSettings
 from omlx.patches import mlx_lm_mtp
 from omlx.patches.laguna import laguna_model
@@ -218,6 +219,102 @@ class TestMtpBoundaryCommit:
 
         assert copy_labels == [True]
         assert state.copy_drafts is False
+
+
+class _RecordedControlPlane:
+    """Rank zero's broadcasts, replayed in order to a rank run after it."""
+
+    def __init__(self, messages, *, leader):
+        self.messages = messages
+        self.leader = leader
+
+    def broadcast_object(self, obj):
+        if self.leader:
+            self.messages.append(obj)
+            return obj
+        return self.messages.pop(0)
+
+
+class TestClusterMtpReplay:
+    def test_follower_replays_rank_zero_inputs_acceptance_and_seed(self, monkeypatch):
+        from omlx.cluster.mtp_sync import ClusterMtpSync
+
+        messages = []
+        leader = SimpleNamespace(
+            _omlx_cluster_mtp=ClusterMtpSync(
+                rank=0, control_plane=_RecordedControlPlane(messages, leader=True)
+            )
+        )
+        follower = SimpleNamespace(
+            _omlx_cluster_mtp=ClusterMtpSync(
+                rank=1, control_plane=_RecordedControlPlane(messages, leader=False)
+            )
+        )
+        # Rank zero rejects its second draft; the follower's own logits would
+        # accept all three, but only rank zero's verdict may count.
+        targets = {id(leader): [1, 9, 7, 20], id(follower): [1, 2, 3, 20]}
+        seen_inputs, rollbacks, drafted, seeds = {}, {}, [], []
+
+        def fake_backbone(model, inputs, _cache, **_kwargs):
+            seen_inputs[id(model)] = inputs.tolist()
+            rows = []
+            for target in targets[id(model)]:
+                row = [-100.0] * 32
+                row[target] = 0.0
+                rows.append(row)
+            return mx.array([rows]), mx.zeros((1, 4, 8)), None
+
+        def fake_rollback(model, _cache, accepted, num_drafts, _gdn_states):
+            rollbacks[id(model)] = (accepted, num_drafts)
+            return True
+
+        monkeypatch.setattr(bg, "_call_backbone", fake_backbone)
+        monkeypatch.setattr(bg, "_chain_rollback", fake_rollback)
+        monkeypatch.setattr(
+            bg, "_chain_next_drafts", lambda batch, *a, **k: drafted.append(batch)
+        )
+        monkeypatch.setattr(mx.random, "seed", seeds.append)
+
+        def run(model, state):
+            batch = SimpleNamespace(
+                model=model,
+                prompt_cache=[SimpleNamespace()],
+                tokens=[[4, 5]],
+                samplers=[None],
+                fallback_sampler=lambda lp: mx.argmax(lp, axis=-1),
+                logits_processors=[],
+                _token_context=[],
+                max_tokens=[1000],
+                _num_tokens=[0],
+                _matchers=[SimpleNamespace(advance=lambda token: False)],
+            )
+            bg._run_verify_cycle_chain(batch, state)
+            return batch
+
+        lead_state = bg._MtpState(
+            uid=1,
+            chain=True,
+            depth=3,
+            mtp_cache=[],
+            next_main=mx.array([15], dtype=mx.uint32),
+            drafts=mx.array([1, 2, 3], dtype=mx.uint32),
+            draft_lps=[mx.zeros((32,))] * 3,
+        )
+        lead_batch = run(leader, lead_state)
+        follow_state = bg._MtpState(
+            uid=1, chain=True, depth=3, next_main=mx.array([15], dtype=mx.uint32)
+        )
+        run(follower, follow_state)
+
+        assert messages == []
+        assert seen_inputs[id(follower)] == seen_inputs[id(leader)] == [[15, 1, 2, 3]]
+        assert [item[0] for item in follow_state.queue] == [1, 9]
+        assert [item[0] for item in lead_state.queue] == [1, 9]
+        assert rollbacks[id(follower)] == rollbacks[id(leader)] == (1, 3)
+        assert follow_state.next_main.tolist() == [9]
+        assert follow_state.drafts is None
+        assert drafted == [lead_batch]
+        assert len(seeds) == 2 and seeds[0] == seeds[1]
 
 
 class TestQwen35Model:
@@ -2963,6 +3060,70 @@ class TestLoopTaxHygiene:
         model._omlx_mtp_loop_tax_ts = time.monotonic() - 3 * _STD_TAX_DECAY_S
         aged = _effective_loop_tax(model)
         assert _DepthController.EXIT_MARGIN <= aged < 1.2
+
+    def test_probe_armed_after_own_prefill_that_ended_before_the_run(self):
+        """The parked sequence's own prefill finished before its MTP run
+        started, so it cannot have shaped the run's t0: the probe arms, and
+        a clean sampling window latches the measured tax. Without this, an
+        interactive request (park ~1 s after its own prefill) never measures
+        the tax and keeps exiting against the 1.15 prior."""
+        import time
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        tracker = self._tracker()
+        tracker.update("own", 10, 100, "modelA")
+        tracker.update("own", 100, 100, "modelA")  # own prefill completes
+        run_started = time.monotonic()
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7, since_ts=run_started)
+        assert hasattr(gb, "_omlx_mtp_tax_probe")
+        self._drain_probe(gb, std_ms=12.0)
+        assert gb.model._omlx_mtp_loop_tax == pytest.approx(1.0)
+
+    def test_probe_not_armed_when_other_prefill_ran_during_the_run(self):
+        import time
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import _arm_std_tax_probe
+
+        run_started = time.monotonic()
+        tracker = self._tracker()
+        tracker.update("other", 10, 100, "modelB")
+        tracker.update("other", 100, 100, "modelB")  # contended the run
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 12.0, uid=7, since_ts=run_started)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+
+    def test_run_scoped_probe_discarded_when_prefill_starts_while_sampling(self):
+        import time
+
+        from omlx.patches.mlx_lm_mtp.batch_generator import (
+            _STD_TAX_SAMPLES,
+            _STD_TAX_SKIP,
+            _arm_std_tax_probe,
+            _record_std_tax_sample,
+        )
+
+        gb = self._fake_batch([7])
+        _arm_std_tax_probe(gb, 15.0, uid=7, since_ts=time.monotonic())
+        for _ in range(_STD_TAX_SKIP + _STD_TAX_SAMPLES - 1):
+            _record_std_tax_sample(gb, 10.0)
+        self._tracker().update("r2", 10, 100, "modelB")
+        _record_std_tax_sample(gb, 10.0)
+        assert not hasattr(gb, "_omlx_mtp_tax_probe")
+        assert not hasattr(gb.model, "_omlx_mtp_loop_tax")
+
+    def test_active_since(self):
+        import time
+
+        tracker = self._tracker()
+        before = time.monotonic()
+        tracker.update("r1", 10, 100, "m")
+        assert tracker.active_since(before)  # live prefill
+        tracker.update("r1", 100, 100, "m")
+        assert tracker.active_since(before)  # ended after `before`
+        after = time.monotonic()
+        assert not tracker.active_since(after)  # ended before `after`
 
     def test_recently_active_window(self):
         tracker = self._tracker()
@@ -6110,7 +6271,7 @@ def test_coarse_draft_head_splits_qwen4_logits_source_from_chain_hidden():
 @pytest.mark.parametrize("raised", [True, False])
 def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
     """Speculative steps raise MLX's buffer caps where measured and always restore them."""
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     caps = [(50, 50)]
 
@@ -6129,6 +6290,28 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
     assert caps[-1] == (50, 50)
 
 
+def test_spec_command_buffers_overlapping_engines_restore_mlx_caps(monkeypatch):
+    """Two engines whose cycles overlap must leave MLX's caps, not the raised ones."""
+    caps = [(50, 50)]
+
+    def fake_set(ops, mb):
+        previous = caps[-1]
+        caps.append((ops, mb))
+        return previous
+
+    target = SimpleNamespace(model_type="qwen3_5")
+    monkeypatch.setattr(quant_fast, "set_command_buffer_caps", fake_set)
+    monkeypatch.setattr(bg, "_raises_spec_buffer_caps", lambda: True)
+    monkeypatch.setattr(bg, "_spec_caps_holders", 0)
+    monkeypatch.setattr(bg, "_spec_caps_previous", None)
+    # The second cycle starts inside the first and ends after it.
+    with contextlib.ExitStack() as second_cycle:
+        with bg._spec_command_buffers(target):
+            second_cycle.enter_context(bg._spec_command_buffers(target))
+        assert caps[-1] == bg._SPEC_BUFFER_CAPS
+    assert caps[-1] == (50, 50)
+
+
 @pytest.mark.parametrize(
     "model_type,gpu,enabled,detected",
     [
@@ -6139,7 +6322,7 @@ def test_spec_command_buffers_restore_caps_after_the_step(monkeypatch, raised):
     ],
 )
 def test_spec_caps_target(monkeypatch, model_type, gpu, enabled, detected):
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import fast
 
     target = SimpleNamespace(model_type=model_type)
     calls, detections = [], []

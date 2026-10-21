@@ -60,7 +60,7 @@ _CALL_PATCHED = False
 
 # Loaded model classes whose module path marks a supported SwitchGLU family:
 # mlx-lm Qwen3.5/3.6 and HyV3, Qwen4-Exp's inherited SwitchGLU, the oMLX
-# single-checkpoint MTP wrapper, and the vendored Laguna module.
+# single-checkpoint MTP wrapper, the vendored Laguna module and Muse Spark.
 _FAMILY_TOKENS = (
     "qwen3_5",
     "qwen3_6",
@@ -68,6 +68,7 @@ _FAMILY_TOKENS = (
     "qwen4_exp",
     "laguna",
     "hy_v3",
+    "muse_spark",
 )
 
 
@@ -87,6 +88,10 @@ def _can_fuse(switch_mlp: Any) -> bool:
         return False
     gate, up = switch_mlp.gate_proj, switch_mlp.up_proj
     if type(gate) is not type(up):
+        return False
+    if any("global_scale" in p for p in (gate, up, switch_mlp.down_proj)):
+        # NVFP4 tensor scales stay per projection, and the fused forward does
+        # not apply the down projection's scale.
         return False
     if isinstance(gate, (QuantizedSwitchLinear, VLMQuantizedSwitchLinear)):
         if (gate.group_size, gate.bits, gate.mode) != (
@@ -334,10 +339,16 @@ def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
     """
     if not _is_supported_family(model):
         return 0
+    # Subclasses opt in when their forward defers to the patched SwitchGLU
+    # forward once gate_up_proj exists.
     targets = [
         m
         for _, m in model.named_modules()
-        if type(m) in (SwitchGLU, VLMSwitchGLU) and _can_fuse(m)
+        if (
+            type(m) in (SwitchGLU, VLMSwitchGLU)
+            or getattr(type(m), "_omlx_gate_up_fusion", False)
+        )
+        and _can_fuse(m)
     ]
     if not targets:
         return 0

@@ -24,12 +24,9 @@ The formula and workflow use Ruby and shell syntax, so these are text-level
 assertions that the guards stay present.
 """
 
-import re
 from pathlib import Path
 
 import pytest
-
-from omlx.custom_kernels import NATIVE_KERNEL_PACKAGES
 
 FORMULA_PATH = Path(__file__).resolve().parents[1] / "Formula" / "omlx.rb"
 WORKFLOW_PATH = (
@@ -118,15 +115,11 @@ class TestSharedPipFlags:
 
 class TestCustomKernelBuild:
     def test_formula_covers_every_native_kernel_package(self, formula):
-        """Source checks and import verification must cover every extension."""
-        match = re.search(
-            r"^\s*CUSTOM_KERNELS = %w\[([^]]+)\]\.freeze$", formula, re.MULTILINE
-        )
-
-        assert match is not None
-        assert tuple(match.group(1).split()) == NATIVE_KERNEL_PACKAGES
-        assert "kernel_sources = CUSTOM_KERNELS.map" in formula
-        assert "for package in #{CUSTOM_KERNELS.inspect}:" in formula
+        """The formula on main also builds the current release tarball, so it
+        reads the package list from the installed oMLX instead of a copy."""
+        assert "CUSTOM_KERNELS" not in formula
+        assert 'glob("*/csrc")' in formula
+        assert "from omlx.custom_kernels import native_kernel_status" in formula
 
     def test_cmake_pinned_to_venv_python(self, formula):
         """CMake must not discover a stray system Python for kernel builds."""
@@ -138,5 +131,10 @@ class TestCustomKernelBuild:
 
     def test_metal_toolchain_checked_before_kernel_build(self, formula):
         block = formula.index('if build.with?("custom-kernel")')
-        guard = formula.index('quiet_system("/usr/bin/xcrun", "-f", "metal")', block)
+        guard = formula.index('quiet_system("/usr/bin/xcrun", "metal", "--version")', block)
         assert guard < formula.index('ENV["OMLX_WITH_CUSTOM_KERNEL"]', block)
+
+    def test_metal_guard_executes_the_compiler(self, formula):
+        """`xcrun -f metal` succeeds whenever the shim exists, which it does even
+        when the Metal toolchain behind it cannot run, so it cannot be the guard."""
+        assert 'quiet_system("/usr/bin/xcrun", "-f", "metal")' not in formula

@@ -17,7 +17,7 @@
                             </div>
 
                             <!-- Auto-refresh indicator -->
-                            <div x-show="logAutoRefresh" class="flex items-center gap-2 text-sm text-green-600">
+                            <div x-show="logAutoRefresh" class="flex items-center gap-2 text-sm text-green-700">
                                 <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
                                 {{ t('logs.auto_refresh') }}
                             </div>
@@ -91,7 +91,7 @@
                     <!-- Log Content -->
                     <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-4 py-2 bg-neutral-100 border-b border-neutral-200">
-                            <span class="text-xs text-neutral-500" x-text="window.t('logs.showing_lines').replace('{lines}', logLines).replace('{total}', logTotalLines)"></span>
+                            <span class="text-xs text-neutral-500" x-text="window.t('logs.showing_lines').replace('{lines}', Math.min(logLines, logTotalLines)).replace('{total}', logTotalLines)"></span>
                             <div class="flex items-center gap-3">
                                 <span class="text-xs text-neutral-500" x-text="logFile"></span>
                                 {{ ui.segmented([('table', t('logs.view.table')), ('raw', t('logs.view.raw'))],

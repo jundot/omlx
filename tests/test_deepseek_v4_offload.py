@@ -123,12 +123,12 @@ def kernels(request, monkeypatch):
     """With the native GLM/DSv4 kernels, or without them as on a CI runner:
     the module then returns sorted routes unsummed and the caller applies the
     scores, and the adapter must follow the same rule."""
-    from omlx.custom_kernels.glm_moe_dsa import fast as k
+    from omlx.custom_kernels.quant_matmul import fast as k
 
     if request.param == "fallback":
         monkeypatch.setattr(k, "_ext", None)
         monkeypatch.setattr(k, "has_symbol", lambda name: False)
-    elif not k.has_symbol("glm_moe_weighted_sum"):
+    elif not k.has_symbol("moe_weighted_sum"):
         pytest.skip("native GLM kernels are not built here")
     return request.param
 
@@ -167,6 +167,32 @@ def test_decode_bit_exact_at_quarter_residency(tmp_path, reference):
     assert moe_offload_stats(_Model([wrapped]))["misses"] == len(
         set(i.reshape(-1).tolist())
     )
+
+
+def test_nvfp4_global_scale_follows_slots(tmp_path):
+    def make():
+        mx.random.seed(0)
+        glu = SwitchGLU(D, INTER, E)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            glu[proj].global_scale = mx.random.uniform(1, 8, (E,))
+            glu[proj] = glu[proj].to_quantized(group_size=16, bits=4, mode="nvfp4")
+        mx.eval(glu.parameters())
+        return glu
+
+    reference = make()
+    tensors = {
+        f"{PREFIX}.{proj}.{field}": reference[proj][field]
+        for proj in ("gate_proj", "up_proj", "down_proj")
+        for field in ("weight", "scales")
+    }
+    _write(tmp_path, tensors)
+    model = _Model([make()])
+    assert dsv4.apply_deepseek_v4_moe_expert_offload(model, tmp_path, 0.25) == 1
+    wrapped = model.model.layers[0].ffn.switch_mlp
+    x, i = _x(4, 1, D), _routes((4, 1, K))
+    ref, got = reference(x, i), wrapped(x, i)
+    mx.eval(ref, got)
+    assert bool(mx.array_equal(ref, got))
 
 
 def test_sorted_prefill_bit_exact_at_full_residency(tmp_path, reference, kernels):

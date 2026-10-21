@@ -198,7 +198,6 @@ class TestModelSettings:
         assert settings.temperature == 0.8
         assert settings.chat_template_kwargs == {"reasoning_effort": "high"}
 
-
     def test_ttl_seconds_default(self):
         """Test ttl_seconds defaults to None."""
         settings = ModelSettings()
@@ -260,6 +259,62 @@ class TestModelSettings:
         """Default bit depth = 4."""
         settings = ModelSettings()
         assert settings.turboquant_kv_bits == 4
+
+    @pytest.mark.parametrize(
+        "scheme,bits",
+        [("unknown", 4), ("affine4", 8), ("affine8", 4)],
+    )
+    def test_invalid_kv_compression_rejected(self, scheme, bits):
+        with pytest.raises(ValueError, match="turboquant_kv_"):
+            ModelSettings(
+                turboquant_kv_enabled=True,
+                turboquant_kv_scheme=scheme,
+                turboquant_kv_bits=bits,
+            )
+
+    @pytest.mark.parametrize(
+        "scheme,bits", [("turboquant", 4), ("affine4", 4), ("affine8", 8)]
+    )
+    def test_kv_compression_save_load(self, tmp_path, scheme, bits):
+        manager = ModelSettingsManager(tmp_path)
+        settings = ModelSettings(
+            turboquant_kv_enabled=True,
+            turboquant_kv_scheme=scheme,
+            turboquant_kv_bits=bits,
+        )
+        manager.set_settings("model", settings)
+        restored = ModelSettingsManager(tmp_path).get_settings("model")
+        assert restored == settings
+        assert restored.to_dict()["turboquant_kv_scheme"] == scheme
+
+    def test_legacy_kv_compression_file_load(self, tmp_path):
+        manager = ModelSettingsManager(tmp_path)
+        manager.settings_file.write_text(json.dumps({
+            "version": 1,
+            "models": {"model": {"turboquant_kv_enabled": True, "turboquant_kv_bits": 2.5}},
+        }))
+        restored = ModelSettingsManager(tmp_path).get_settings("model")
+        assert restored.turboquant_kv_scheme == "turboquant"
+        assert restored.turboquant_kv_bits == 2.5
+        assert restored.turboquant_kv_enabled is True
+
+    def test_invalid_legacy_turboquant_bits_keep_other_settings(self, tmp_path):
+        manager = ModelSettingsManager(tmp_path)
+        manager.settings_file.write_text(json.dumps({
+            "version": 1,
+            "models": {
+                "model": {
+                    "model_alias": "fast",
+                    "is_pinned": True,
+                    "turboquant_kv_enabled": True,
+                    "turboquant_kv_bits": 5,
+                }
+            },
+        }))
+        restored = ModelSettingsManager(tmp_path).get_settings("model")
+        assert restored.model_alias == "fast"
+        assert restored.is_pinned is True
+        assert restored.turboquant_kv_bits == 5
 
     def test_turboquant_kv_bits_roundtrip(self):
         original = ModelSettings(turboquant_kv_bits=2.5)

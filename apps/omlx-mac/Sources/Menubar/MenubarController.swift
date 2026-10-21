@@ -635,13 +635,9 @@ final class MenubarController: NSObject {
         let liveActivity = statsPoller?.liveStats?.liveActivity
         let alltime = statsPoller?.alltimeStats
         if session == nil && alltime == nil {
-            statsSubmenu.addItem(disabled(statsPoller == nil
-                                          ? String(localized: "menubar.stats.no_api_key",
-                                                   defaultValue: "Set OMLX_API_KEY to enable stats",
-                                                   comment: "Disabled placeholder in the Serving Stats submenu when no API key is configured")
-                                          : String(localized: "menubar.stats.loading",
-                                                   defaultValue: "Loading stats…",
-                                                   comment: "Disabled placeholder shown while stats are loading")))
+            statsSubmenu.addItem(disabled(String(localized: "menubar.stats.loading",
+                                                 defaultValue: "Loading stats…",
+                                                 comment: "Disabled placeholder shown while stats are loading")))
             return
         }
 
@@ -685,6 +681,14 @@ final class MenubarController: NSObject {
         statsSubmenu.addItem(disabled(String(localized: "menubar.stats.alltime_section",
                                              defaultValue: "All-Time",
                                              comment: "Section header inside the Serving Stats submenu for all-time metrics")))
+        // All-time stats come from an admin endpoint that needs the API key.
+        // The poller reloads the key after launch, so ask it, not the launch config.
+        if statsPoller?.hasAPIKey == false {
+            statsSubmenu.addItem(disabled(String(localized: "menubar.stats.no_api_key",
+                                                 defaultValue: "Set an API key in the Security screen to enable stats",
+                                                 comment: "Disabled placeholder in the All-Time section of the Serving Stats submenu when no API key is configured")))
+            return
+        }
         appendStat(String(localized: "menubar.stats.total_tokens",
                           defaultValue: "Total Tokens Processed",
                           comment: "Stats row label for total tokens processed"),

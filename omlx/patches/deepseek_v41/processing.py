@@ -7,6 +7,9 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image, ImageOps
 
+from .config import ModelConfig
+from .tool_parser import parse_tool_call, tool_call_end, tool_call_start
+
 
 def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
     return n_llm_h * (n_llm_w + 1) + 2
@@ -110,6 +113,24 @@ def image_patches(image, config):
     )
     types = [0] + ([1] * nw + [2]) * nh + [3]
     return mx.array(patches).astype(mx.bfloat16), height // p, width // p, types
+
+
+def install_tokenizer_protocol(tokenizer, raw_config):
+    """Serve V4.1 through an mlx-lm tokenizer: its encoder and DSML tool calls.
+
+    Cluster ranks and the coordinator load the tokenizer with mlx-lm, whose
+    wrapper reads these private fields and has no template of its own here.
+    """
+    Processor(tokenizer, ModelConfig.from_dict(raw_config))
+    tokenizer.has_chat_template = True
+    tokenizer._tool_parser = parse_tool_call
+    for name, marker in (("start", tool_call_start), ("end", tool_call_end)):
+        setattr(tokenizer, f"_tool_call_{name}", marker)
+        setattr(
+            tokenizer,
+            f"_tool_call_{name}_tokens",
+            tuple(tokenizer.encode(marker, add_special_tokens=False)),
+        )
 
 
 class Processor:

@@ -73,7 +73,7 @@ def test_native_prefill_owns_weights_outputs_and_keeps_gpu_decode(rows, bits, dt
 
 @pytest.mark.skipif(os.environ.get("OMLX_TEST_K2_ANE") != "1", reason="requires ANE")
 def test_mova_prefill_preserves_routes_and_gpu_decode():
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     mx.random.seed(51)
     config = small_config(
@@ -103,23 +103,23 @@ def test_mova_prefill_preserves_routes_and_gpu_decode():
     ]
     prefill = enable_ane_prefill(model, fraction=0.5, width=32)
     cache = make_prompt_cache(model)
-    fast.qwen35_ane_profile_set_enabled(True)
-    fast.qwen35_ane_profile_reset()
+    fast.ane_profile_set_enabled(True)
+    fast.ane_profile_reset()
     try:
         with mx.stream(mx.new_stream(mx.gpu)):
             prefill(ids, cache=cache)
-        ops = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+        ops = fast.ane_profile_snapshot()["mlp"]["operations"]
         assert ops == 2
         assert all(c.offset == 39 for c in cache)
         actual = model(mx.array([[43]]), cache=cache)
         mx.eval(actual)
         close(expected, actual)
-        assert fast.qwen35_ane_profile_snapshot()["mlp"]["operations"] == ops
+        assert fast.ane_profile_snapshot()["mlp"]["operations"] == ops
         assert all(c.offset == 40 for c in cache)
         for (a, b), layer in zip(routers, model.layers[1:]):
             assert a is layer.mlp.gate.weight and b is layer.self_attn.v_router.weight
     finally:
-        fast.qwen35_ane_profile_set_enabled(False)
+        fast.ane_profile_set_enabled(False)
     program = model.layers[0].mlp._omlx_ane_prefill
     finish = program.finish
     program.finish = Mock(side_effect=RuntimeError("injected failure"))
@@ -152,7 +152,7 @@ def test_family_partitions_use_checkpoint_dimensions():
 @pytest.mark.parametrize("chunked", [False, True])
 @pytest.mark.parametrize("prefix", [0, 16, 48])
 def test_mova_scheduler_prefill_and_restored_cache(mock_tokenizer, chunked, prefix):
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
     from omlx.request import Request, SamplingParams
     from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -196,8 +196,8 @@ def test_mova_scheduler_prefill_and_restored_cache(mock_tokenizer, chunked, pref
         mx.eval([c.state for c in cache])
         cache = [type(c).from_state(c.state, c.meta_state) for c in cache]
     scheduler.requests[request.request_id] = request
-    fast.qwen35_ane_profile_set_enabled(True)
-    fast.qwen35_ane_profile_reset()
+    fast.ane_profile_set_enabled(True)
+    fast.ane_profile_reset()
     try:
         if chunked:
             state = scheduler._begin_prefill(request, prompt[prefix:], cache)
@@ -210,14 +210,14 @@ def test_mova_scheduler_prefill_and_restored_cache(mock_tokenizer, chunked, pref
             )
         assert last == prompt[-1:]
         assert all(c.offset == 64 for c in cache)
-        ops = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+        ops = fast.ane_profile_snapshot()["mlp"]["operations"]
         assert ops == 2 * ((64 - prefix) // 32)
         logits = model(mx.array([last]), cache=cache)
         assert mx.all(mx.isfinite(logits)).item()
         assert all(c.offset == 65 for c in cache)
-        assert fast.qwen35_ane_profile_snapshot()["mlp"]["operations"] == ops
+        assert fast.ane_profile_snapshot()["mlp"]["operations"] == ops
     finally:
-        fast.qwen35_ane_profile_set_enabled(False)
+        fast.ane_profile_set_enabled(False)
 
 
 @pytest.mark.skipif(os.getenv("OMLX_TEST_K2_ANE") != "1", reason="requires local ANE")
@@ -226,7 +226,7 @@ def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
     mock_tokenizer, monkeypatch, prefix
 ):
     from mlx_lm.generate import BatchGenerator, GenerationBatch
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
     from omlx.request import Request, SamplingParams
     from omlx.scheduler import Scheduler, SchedulerConfig
 
@@ -270,22 +270,22 @@ def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
         )
         request.prompt_token_ids, request.num_prompt_tokens = prompt, len(prompt)
         request.cached_tokens = prefix
-        before = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+        before = fast.ane_profile_snapshot()["mlp"]["operations"]
         cache, last = scheduler._do_external_prefill(request, prompt[prefix:], cache)
-        after = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+        after = fast.ane_profile_snapshot()["mlp"]["operations"]
         assert after - before == (0 if prefix else model._omlx_k2_ane_prefill_count)
         return batch.insert([last], caches=[cache], all_tokens=[prompt[:-1]])[0]
 
-    fast.qwen35_ane_profile_set_enabled(True)
-    fast.qwen35_ane_profile_reset()
+    fast.ane_profile_set_enabled(True)
+    fast.ane_profile_reset()
     try:
         with mx.stream(scheduler._stream):
             assert insert(0) == 0
             joined = removed = False
             for _ in range(50):
-                before = fast.qwen35_ane_profile_snapshot()["mlp"]["operations"]
+                before = fast.ane_profile_snapshot()["mlp"]["operations"]
                 responses = batch.next_generated()
-                assert fast.qwen35_ane_profile_snapshot()["mlp"]["operations"] == before
+                assert fast.ane_profile_snapshot()["mlp"]["operations"] == before
                 for response in responses:
                     received[response.uid].append(response.token)
                     if response.prompt_cache is not None:
@@ -311,7 +311,7 @@ def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
                     break
             assert peak == 8 and removed and completed == set(range(7))
     finally:
-        fast.qwen35_ane_profile_set_enabled(False)
+        fast.ane_profile_set_enabled(False)
         scheduler.shutdown()
 
 
@@ -321,7 +321,7 @@ def test_ane_prefill_preserves_eight_decode_rows_and_cache_after_removal(
 def test_planar_transfer_preserves_outputs_from_lazy_inputs_on_multiple_streams(
     asynchronous, reverse
 ):
-    from omlx.custom_kernels.qwen35_prefill import fast
+    from omlx.custom_kernels.quant_matmul import ane as fast
 
     model = make_model()
     model.set_dtype(mx.float16)

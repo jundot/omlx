@@ -11,6 +11,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def bracket_host(host: str) -> str:
+    """Return ``host`` in URL-authority form, bracketing bare IPv6 literals.
+
+    ``http://::1:8000`` is not a valid URL (requests rejects it with
+    InvalidURL); the RFC 3986 form is ``http://[::1]:8000``. IPv4 literals,
+    hostnames, and already-bracketed literals pass through unchanged.
+    """
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 @dataclass(frozen=True)
 class IntegrationContext:
     """Resolved launch/configuration inputs for an external tool integration."""
@@ -37,7 +49,7 @@ class IntegrationContext:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        return f"http://{bracket_host(self.host)}:{self.port}"
 
     @property
     def openai_base_url(self) -> str:

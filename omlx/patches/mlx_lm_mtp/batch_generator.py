@@ -17,6 +17,7 @@ import functools
 import inspect
 import logging
 import math
+import threading
 import time
 import weakref
 from collections import deque
@@ -362,7 +363,42 @@ def _model_has_mtp_module(model: Any) -> bool:
     the actual module's presence.
     """
     inner = getattr(model, "language_model", model)
-    return hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None
+    if hasattr(inner, "mtp") and getattr(inner, "mtp", None) is not None:
+        return True
+    # A cluster rank without the head replays rank zero's drafts.
+    sync = _cluster_mtp(model)
+    return sync is not None and not sync.is_leader
+
+
+def _cluster_mtp(model: Any) -> Optional[Any]:
+    """The cluster rank's Lightning MTP decision channel, if it serves in one.
+
+    Rank zero alone holds the head and samples; the other ranks replay its
+    choices (omlx.cluster.mtp_sync). Clusters run singleton MTP only.
+    """
+    for host in (model, getattr(model, "language_model", None)):
+        if host is None:
+            continue
+        sync = inspect.getattr_static(host, "_omlx_cluster_mtp", None)
+        if sync is not None:
+            return sync
+    return None
+
+
+def _cluster_shared_token(gen_batch: Any, tok: Any) -> Tuple[Any, Optional[int]]:
+    """Rank zero's sampled ``tok`` on every cluster rank, plus the seed to apply.
+
+    Outside a cluster ``tok`` is returned as is with no seed.
+    """
+    import mlx.core as mx
+
+    sync = _cluster_mtp(gen_batch.model)
+    if sync is None:
+        return tok, None
+    # A rank's forward must reach its peers before it waits on rank zero.
+    mx.eval(tok)
+    ids, seed = sync.share_tokens(tok.tolist() if sync.is_leader else None)
+    return mx.array(ids, dtype=mx.uint32), seed
 
 
 # MLX commits a command buffer every ~50 ops or 50 MB of inputs, weights
@@ -406,23 +442,35 @@ def _raises_spec_buffer_caps() -> bool:
     return architecture.startswith("applegpu_g15")
 
 
+# The caps live on the MLX device, so engines running cycles at the same time
+# share one raise and the last one out restores MLX's values.
+_spec_caps_lock = threading.Lock()
+_spec_caps_holders = 0
+_spec_caps_previous: Optional[Tuple[int, int]] = None
+
+
 @contextlib.contextmanager
 def _spec_command_buffers(model: Any = None):
     """Raise caps for supported Qwen targets and GPUs, then restore them."""
-    if not _spec_caps_target(model):
+    global _spec_caps_holders, _spec_caps_previous
+    if not _spec_caps_target(model) or not _raises_spec_buffer_caps():
         yield
         return
 
-    from omlx.custom_kernels.qwen35_prefill.fast import set_command_buffer_caps
+    from omlx.custom_kernels.quant_matmul.fast import set_command_buffer_caps
 
-    previous = None
-    if _raises_spec_buffer_caps():
-        previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+    with _spec_caps_lock:
+        if _spec_caps_holders == 0:
+            _spec_caps_previous = set_command_buffer_caps(*_SPEC_BUFFER_CAPS)
+        _spec_caps_holders += 1
     try:
         yield
     finally:
-        if previous is not None:
-            set_command_buffer_caps(*previous)
+        with _spec_caps_lock:
+            _spec_caps_holders -= 1
+            if _spec_caps_holders == 0 and _spec_caps_previous is not None:
+                set_command_buffer_caps(*_spec_caps_previous)
+                _spec_caps_previous = None
 
 
 def _drafter_for(model: Any) -> Optional[Any]:
@@ -689,6 +737,8 @@ def _is_mtp_eligible(gen_batch: Any) -> bool:
 
 def _model_supports_batch_mtp(model: Any) -> bool:
     """Only validated model adapters opt into multi-request Lightning MTP."""
+    if _cluster_mtp(model) is not None:
+        return False
     return any(
         getattr(host, "_omlx_mtp_multi_request", False) is True
         for host in (
@@ -1550,6 +1600,7 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
     tokens = gen_batch.tokens[0] if getattr(gen_batch, "tokens", None) else None
     if not tokens:
         return False
+    started = time.perf_counter()
     try:
         new_cache = _rebuild_singleton_cache(gen_batch.model)
         if new_cache is None:
@@ -1582,6 +1633,9 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             ll = _apply_processors(procs, prev_buf, last_logits)
             next_lp_2d = _logprobs(ll)
             next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
+            next_tok, seed = _cluster_shared_token(gen_batch, next_tok)
+            if seed is not None:
+                mx.random.seed(seed)
             next_lp = next_lp_2d.squeeze(0)
 
         mx.eval(next_tok)
@@ -1593,11 +1647,14 @@ def _reconcile_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
             from mlx_lm.models.cache import TokenBuffer
 
             gen_batch._token_context[0] = TokenBuffer(list(tokens))
-        logger.debug(
-            "MTP reconciled to standard on reshape (uid=%s tokens=%d queue=%d)",
+        logger.info(
+            "MTP reconciled to standard on reshape (uid=%s tokens=%d chunks=%d "
+            "queue=%d, %.2fs)",
             getattr(state, "uid", "?"),
             len(tokens),
+            -(-total // step),
             len(state.queue),
+            time.perf_counter() - started,
         )
         return True
     except Exception as exc:
@@ -2403,10 +2460,40 @@ def _prefill_activity_recent() -> bool:
         return False
 
 
-def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float], uid: Any = None) -> None:
+def _prefill_activity_since(since_ts: float) -> bool:
+    try:
+        return get_prefill_tracker().active_since(since_ts)
+    except Exception:
+        return False
+
+
+def _arm_std_tax_probe(
+    gen_batch: Any,
+    t0_ms: Optional[float],
+    uid: Any = None,
+    since_ts: Optional[float] = None,
+) -> None:
+    """Arm the post-park standard-step probe.
+
+    ``since_ts`` is the monotonic start of the MTP run that produced
+    ``t0_ms``. When given, only prefill activity after it counts as
+    contention: the sequence's own prefill ended before its run began and
+    cannot have shaped t0. Without it, any prefill in the last
+    ``_STD_TAX_CONTENTION_WINDOW_S`` blocks the probe, which in practice
+    skips every probe of an interactive request (it parks about a second
+    after its own prefill) and leaves the exit margin at its prior.
+    """
     if not (t0_ms and t0_ms > 0.0):
         return
-    if _prefill_activity_recent():
+    if since_ts is not None:
+        if _prefill_activity_since(since_ts):
+            logger.debug(
+                "MTP loop-tax probe skipped: prefill activity during the run, "
+                "t0=%.1fms is contention-contaminated",
+                t0_ms,
+            )
+            return
+    elif _prefill_activity_recent():
         logger.debug(
             "MTP loop-tax probe skipped: prefill activity within %.1fs, "
             "t0=%.1fms is contention-contaminated",
@@ -2419,6 +2506,8 @@ def _arm_std_tax_probe(gen_batch: Any, t0_ms: Optional[float], uid: Any = None) 
         "skip": _STD_TAX_SKIP,
         "samples": [],
         "uid": uid,
+        # Run-scoped probes finalize against activity after arming only.
+        "armed_ts": time.monotonic() if since_ts is not None else None,
     }
 
 
@@ -2449,7 +2538,13 @@ def _record_std_tax_sample(gen_batch: Any, duration_ms: float) -> None:
     t_std = samples[len(samples) // 2]
     if t_std <= 0.0:
         return
-    if _prefill_activity_recent():
+    armed_ts = probe.get("armed_ts")
+    contended = (
+        _prefill_activity_since(armed_ts)
+        if armed_ts is not None
+        else _prefill_activity_recent()
+    )
+    if contended:
         logger.debug(
             "MTP loop-tax probe discarded: prefill activity during the "
             "std sampling window"
@@ -2587,6 +2682,17 @@ class _DepthController:
     # a hardcoded ratio.
     EXIT_MARGIN = 1.15
     EXIT_STREAK = 16
+    # Depth 0 drafts nothing, so acceptance does not update while the
+    # controller sits there: a losing verdict built at depth 0 rests on the
+    # estimate that sent it there. A hand-off therefore needs this many
+    # speculative cycles inside the losing streak; when they are missing,
+    # the best speculative depth is re-measured first (the depth-0 trap:
+    # one dip in a story's acceptance otherwise parks MTP for content where
+    # depth 1 beats the plain step). 16 cycles let the acceptance EMA
+    # (ALPHA 0.08) climb back from a dip; in simulation 8 cycles still
+    # parked ~40% of stale dips, 16 parks ~6%, and truly losing content
+    # exits by cycle ~37 (24 before this gate).
+    EXIT_CONFIRM = 16
 
     def __init__(
         self,
@@ -2600,6 +2706,9 @@ class _DepthController:
         if exit_margin:
             self.EXIT_MARGIN = min(_STD_TAX_MAX, max(1.0, float(exit_margin)))
         self.max_depth = max(1, int(max_depth))
+        # Start of this MTP run: a park scopes its loop-tax contention check
+        # to prefill activity after it (see _arm_std_tax_probe).
+        self.started_ts = time.monotonic()
         self.cur = self.max_depth  # first cycle drafts deep; warmup sweeps down
         # A position never reached yet (None) borrows the estimate of the
         # position before it; a flat 0.6 prior kept deep drafts unexplored.
@@ -2609,6 +2718,7 @@ class _DepthController:
         self.cycles = 0
         self.probe_left = 0
         self.exit_streak = 0
+        self._streak_spec = 0  # speculative cycles in the current losing streak
         self._ms_probe = 0.0  # wall-time since any probe burst
         self._ms_explore = 0.0  # wall-time since a staleness-exploration burst
         # Measure each depth once (max..1), then the depth-0 plain step
@@ -2667,8 +2777,11 @@ class _DepthController:
 
         if self._speculation_losing():
             self.exit_streak += 1
+            if used > 0 and time_sample:
+                self._streak_spec += 1
         else:
             self.exit_streak = 0
+            self._streak_spec = 0
 
         # Warmup sweep: keep walking max..1 until every depth is measured once.
         if self._warmup:
@@ -2679,6 +2792,19 @@ class _DepthController:
                 self.cur = self._warmup[0]
                 return
             self.cur = self._best()
+            self._ms_probe = 0.0
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("MTP controller warmup done: %s", self.describe())
+            return
+
+        # Confirm a losing verdict before it can hand off (EXIT_CONFIRM).
+        if (
+            self.probe_left == 0
+            and self.exit_streak >= self.EXIT_STREAK
+            and self._streak_spec < self.EXIT_CONFIRM
+        ):
+            self.cur = max(range(1, self.max_depth + 1), key=self._score)
+            self.probe_left = self.EXIT_CONFIRM - self._streak_spec
             self._ms_probe = 0.0
             return
 
@@ -2802,8 +2928,27 @@ class _DepthController:
 
     def should_exit(self) -> bool:
         """Sustained losing speculation: hand the sequence back to the
-        standard decoder."""
-        return self.exit_streak >= self.EXIT_STREAK
+        standard decoder. The streak must include EXIT_CONFIRM speculative
+        cycles, so the verdict is not just the estimate that led to depth 0."""
+        return (
+            self.exit_streak >= self.EXIT_STREAK
+            and self._streak_spec >= self.EXIT_CONFIRM
+        )
+
+    def describe(self) -> str:
+        """Compact state for debug logs: costs, acceptance and scores."""
+        t = ", ".join(f"{d}:{v:.1f}" for d, v in sorted(self.t.items()))
+        p = ", ".join("-" if v is None else f"{v:.2f}" for v in self.p)
+        scores = ", ".join(
+            f"{d}:{self._score(d) * 1000.0:.1f}"
+            for d in range(0, self.max_depth + 1)
+            if d > 0 or 0 in self.t
+        )
+        return (
+            f"cur={self.cur} cycles={self.cycles} t_ms={{{t}}} p=[{p}] "
+            f"tok_per_s={{{scores}}} exit_margin={self.EXIT_MARGIN:.3f} "
+            f"exit_streak={self.exit_streak}"
+        )
 
     def _select_candidates(self) -> List[int]:
         # Depth 0 is only selectable once its cost has actually been
@@ -3196,6 +3341,10 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         # Nothing was sampled in the standard _step (empty batch). The
         # next() call will be a no-op anyway; leave the patch inert.
         return
+    sync = _cluster_mtp(gen_batch.model)
+    if sync is not None and not _resolve_mtp_chain_depth(gen_batch.model)[0]:
+        # Cluster ranks replay the chain cycle only.
+        return
 
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
@@ -3231,6 +3380,7 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     next_main_logits = _apply_processors(procs, prev_buf, next_main_logits)
     next_main_lp = _logprobs(next_main_logits)
     next_main_tok = sampler(next_main_lp)  # (1,)
+    next_main_tok, seed = _cluster_shared_token(gen_batch, next_main_tok)
 
     chain, depth, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
 
@@ -3243,6 +3393,16 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         state.chain = True
         state.depth = depth
         state.head_clone = head_clone
+        if sync is not None and not sync.is_leader:
+            # Rank zero sends the drafts at each cycle.
+            state.next_main = _ensure_uint32(next_main_tok)
+            state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+            state.queue.append(
+                (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+            )
+            gen_batch._omlx_mtp_state = state
+            mx.random.seed(seed)
+            return
         if depth > 1 and not _mtp_depth_fixed(gen_batch.model):
             factory = getattr(
                 _dspark_host(gen_batch.model), "make_mtp_depth_controller", None
@@ -3300,6 +3460,8 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
             prev_buf,
         )
         gen_batch._omlx_mtp_state = state
+        if seed is not None:
+            mx.random.seed(seed)
         return
 
     # MTP head sees (hidden_at_main, next_main_tok) and proposes the draft
@@ -3637,6 +3799,9 @@ def _feed_next_main_to_standard(
         last = _apply_processors(procs, prev_buf, logits[:, -1, :])
         lp_2d = _logprobs(last)
         next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(lp_2d))
+        next_tok, seed = _cluster_shared_token(gen_batch, next_tok)
+        if seed is not None:
+            mx.random.seed(seed)
         mx.eval(next_tok)
         gen_batch._next_tokens = next_tok
         gen_batch._next_logprobs = [lp_2d.squeeze(0)]
@@ -3671,7 +3836,15 @@ def _park_mtp_to_standard(gen_batch: Any, state: _MtpState) -> bool:
         park_state = _MtpParkState(uid=state.uid)
         gen_batch._omlx_mtp_park_state = park_state
     if state.controller is not None:
-        _arm_std_tax_probe(gen_batch, state.controller.t.get(0), state.uid)
+        describe = getattr(state.controller, "describe", None)
+        if describe is not None and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("MTP[%s] park decision: %s", state.uid, describe())
+        _arm_std_tax_probe(
+            gen_batch,
+            state.controller.t.get(0),
+            state.uid,
+            since_ts=getattr(state.controller, "started_ts", None),
+        )
     logger.info(
         "MTP[%s] parked for %d standard tokens before re-entry probe",
         state.uid,
@@ -3737,6 +3910,7 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
     if (
         state.chain
         and state.controller is not None
+        and _cluster_mtp(gen_batch.model) is None
         and state.controller.should_exit()
         and not state.queue
         and result[0].finish_reason is None
@@ -4095,8 +4269,26 @@ def _run_verify_cycle_chain(
 
     import mlx.core as mx
 
+    missing = "chain cycle entered without next_main / drafts"
+    sync = _cluster_mtp(gen_batch.model)
+    follower = sync is not None and not sync.is_leader
+    seed = None
+    if sync is not None:
+        # Every rank verifies rank zero's tokens, or leaves MTP with it.
+        ready = state.next_main is not None and state.drafts is not None
+        lead = ready and not follower
+        main_ids, shared_drafts, reason = sync.share_cycle_inputs(
+            state.next_main.tolist() if lead else None,
+            state.drafts.tolist() if lead else None,
+            fallback=None if ready or follower else missing,
+        )
+        if reason:
+            raise _MtpStepFallback(reason)
+        if follower:
+            state.next_main = mx.array(main_ids, dtype=mx.uint32)
+            state.drafts = mx.array(shared_drafts, dtype=mx.uint32)
     if state.next_main is None or state.drafts is None:
-        raise _MtpStepFallback("chain cycle entered without next_main / drafts")
+        raise _MtpStepFallback(missing)
 
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
@@ -4179,7 +4371,9 @@ def _run_verify_cycle_chain(
         state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
         state.stats.zero_cycles += 1
-    elif is_greedy:
+    elif is_greedy or follower:
+        # A follower has no draft distribution; this sync only completes its
+        # forward before rank zero's result replaces the outcome.
         if greedy_result is None:
             targets = _greedy_targets(combined_lp)  # (k+1,)
             matches = (targets[:k] == state.drafts.astype(mx.int32)).astype(mx.int32)
@@ -4284,6 +4478,11 @@ def _run_verify_cycle_chain(
         emit_last_id = draft_ids[m]
         emit_last_lp = combined_lp[m]
 
+    if sync is not None:
+        m, emit_last_id, seed = sync.share_cycle_result(m, emit_last_id)
+        # Every branch above emits from row m.
+        emit_last_lp = combined_lp[m]
+
     # Rewind budget-capable processors to the last emitted position.
     # Rows 0..m produced the m+1 emitted tokens (m accepted drafts + the
     # bonus/verify correction); rows m+1..k predicted rejected drafts that
@@ -4328,6 +4527,10 @@ def _run_verify_cycle_chain(
     accept_ms = (time.perf_counter() - cycle_t0) * 1000
 
     def draft_next():
+        if follower:
+            state.next_main = mx.array([int(emit_last_id)], dtype=mx.uint32)
+            state.drafts = None
+            return
         # --- MTP-head history + next draft chain (async-dispatched) ---
         t0 = time.perf_counter()
         if draft_jobs is None and not state.head_clone:
@@ -4407,6 +4610,9 @@ def _run_verify_cycle_chain(
         elif not _chain_rollback(
             gen_batch.model, gen_batch.prompt_cache, m, k, gdn_states
         ):
+            if sync is not None:
+                # Falling back on this rank alone would desync the cluster.
+                raise RuntimeError("cluster rank could not roll back its MTP cache")
             raise _MtpStepFallback("cache layer rejects chain rollback")
         state.stats.cache_ops_ms += (time.perf_counter() - t0) * 1000 + shared_commit_ms
         if not draft_first:
@@ -4434,6 +4640,8 @@ def _run_verify_cycle_chain(
                 state,
                 was_warmup=was_warmup,
             )
+        if seed is not None:
+            mx.random.seed(seed)
 
     if defer_commit:
         return m, finish
@@ -4475,15 +4683,19 @@ def _materialize_mtp_boundary_emit(gen_batch: Any, state: _MtpState) -> None:
     next_logits = _apply_processors(procs, prev_buf, logits[:, -1, :])
     next_lp_2d = _logprobs(next_logits)
     next_tok = _ensure_uint32(_resolve_sampler(gen_batch)(next_lp_2d))
+    # The cycle's own seed is applied after this, once the drafts are built.
+    next_tok, _ = _cluster_shared_token(gen_batch, next_tok)
     mx.eval(next_tok)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     # The drafts below replace any copied window.
     state.copy_drafts = False
     t0 = time.perf_counter()
+    sync = _cluster_mtp(gen_batch.model)
     if drafter is not None:
         drafter.draft([(gen_batch, state, captured, next_tok, prev_buf)])
-    else:
+    elif sync is None or sync.is_leader:
+        # Other cluster ranks receive rank zero's drafts at the next cycle.
         _chain_next_drafts(
             gen_batch,
             state,

@@ -66,12 +66,17 @@
                     <i data-lucide="network" class="w-4 h-4"></i>
                     {{ t('navbar.tab.cluster') }}
                 </button>
-                <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false">
+                <div class="relative" @mouseenter="modelsDropdown = true" @mouseleave="modelsDropdown = false"
+                     @focusin="modelsDropdown = true"
+                     @focusout="if (!$el.contains($event.relatedTarget)) modelsDropdown = false"
+                     @keydown.escape="modelsDropdown = false">
                     <button
                         @click="setMainTab('models')"
                         role="tab"
                         id="tab-models"
                         aria-controls="panel-models"
+                        aria-haspopup="true"
+                        :aria-expanded="modelsDropdown ? 'true' : 'false'"
                         :aria-selected="mainTab === 'models'"
                         :tabindex="mainTab === 'models' ? 0 : -1"
                         :class="mainTab === 'models'
@@ -85,7 +90,7 @@
                     <!-- Download count badge -->
                     <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
                           x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="absolute -top-1 -right-1 w-4 h-4 bg-blue-500 text-white text-caption font-bold rounded-full flex items-center justify-center pointer-events-none"
+                          class="absolute -top-1 -right-1 w-4 h-4 bg-neutral-900 text-white text-caption font-bold rounded-full flex items-center justify-center pointer-events-none"
                           x-cloak></span>
                     <!-- Dropdown menu -->
                     <div
@@ -141,12 +146,17 @@
                         </button>
                     </div>
                 </div>
-                <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false">
+                <div class="relative" @mouseenter="settingsDropdown = true" @mouseleave="settingsDropdown = false"
+                     @focusin="settingsDropdown = true"
+                     @focusout="if (!$el.contains($event.relatedTarget)) settingsDropdown = false"
+                     @keydown.escape="settingsDropdown = false">
                     <button
                         @click="setMainTab('settings')"
                         role="tab"
                         id="tab-settings"
                         aria-controls="panel-settings"
+                        aria-haspopup="true"
+                        :aria-expanded="settingsDropdown ? 'true' : 'false'"
                         :aria-selected="mainTab === 'settings'"
                         :tabindex="mainTab === 'settings' ? 0 : -1"
                         :class="mainTab === 'settings'
@@ -216,12 +226,17 @@
                     <i data-lucide="scroll-text" class="w-4 h-4"></i>
                     {{ t('navbar.tab.logs') }}
                 </button>
-                <div class="relative" @mouseenter="benchDropdown = true" @mouseleave="benchDropdown = false">
+                <div class="relative" @mouseenter="benchDropdown = true" @mouseleave="benchDropdown = false"
+                     @focusin="benchDropdown = true"
+                     @focusout="if (!$el.contains($event.relatedTarget)) benchDropdown = false"
+                     @keydown.escape="benchDropdown = false">
                     <button
                         @click="setMainTab('bench')"
                         role="tab"
                         id="tab-bench"
                         aria-controls="panel-bench"
+                        aria-haspopup="true"
+                        :aria-expanded="benchDropdown ? 'true' : 'false'"
                         :aria-selected="mainTab === 'bench'"
                         :tabindex="mainTab === 'bench' ? 0 : -1"
                         :class="mainTab === 'bench'
@@ -423,7 +438,7 @@
                     {{ t('navbar.tab.models') }}
                     <span x-show="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length > 0"
                           x-text="hfTasks.filter(t => t.status === 'downloading' || t.status === 'pending').length"
-                          class="w-4 h-4 bg-blue-500 text-white text-caption font-bold rounded-full flex items-center justify-center"
+                          class="w-4 h-4 bg-neutral-900 text-white text-caption font-bold rounded-full flex items-center justify-center"
                           x-cloak></span>
                 </button>
                 <button @click="setMainTab('settings'); mobileMenuOpen = false"

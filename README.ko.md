@@ -225,7 +225,7 @@ Claude Code에서 작은 컨텍스트 모델을 실행할 수 있도록 토큰 �
 
 ### 모델 다운로드
 
-관리자 대시보드에서 HuggingFace의 MLX 모델을 직접 검색하고 다운로드합니다. 모델 카드 확인, 파일 크기 확인, 원클릭 다운로드가 가능합니다.
+관리자 대시보드에서 HuggingFace 모델을 MLX, GGUF 또는 전체 형식으로 직접 검색하고 다운로드합니다. 모델 카드를 확인한 뒤 받을 파일을 고를 수 있으며, MLX 체크포인트는 필요한 파일을 항상 받고 GGUF는 vision projector를 함께 받습니다.
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX 모델 다운로드" width="720">

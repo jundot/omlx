@@ -11,6 +11,8 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from omlx.api.anthropic_models import MessagesRequest as AnthropicMessagesRequest
+from omlx.api.audio_models import AudioSpeechRequest
 from omlx.api.openai_models import (
     AssistantMessage,
     ChatCompletionChoice,
@@ -33,6 +35,7 @@ from omlx.api.openai_models import (
     ToolDefinition,
     Usage,
 )
+from omlx.api.responses_models import ResponsesRequest
 
 
 class TestContentPart:
@@ -961,3 +964,25 @@ class TestStopCoercion:
             stop=["a"],
         )
         assert req.stop == ["a"]
+
+
+_USER_MESSAGES = [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.parametrize(
+    ("model_cls", "payload"),
+    [
+        (ChatCompletionRequest, {"messages": _USER_MESSAGES, "max_tokens": 0}),
+        (
+            ChatCompletionRequest,
+            {"messages": _USER_MESSAGES, "max_completion_tokens": -1},
+        ),
+        (CompletionRequest, {"prompt": "hi", "max_tokens": -1}),
+        (AnthropicMessagesRequest, {"messages": _USER_MESSAGES, "max_tokens": 0}),
+        (ResponsesRequest, {"input": "hi", "max_output_tokens": -1}),
+        (AudioSpeechRequest, {"input": "hi", "max_tokens": 0}),
+    ],
+)
+def test_output_token_caps_must_be_positive(model_cls, payload):
+    with pytest.raises(ValidationError):
+        model_cls.model_validate({"model": "m", **payload})

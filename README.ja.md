@@ -192,7 +192,7 @@ Claude Codeで小さなコンテキストモデルを実行するため、トー
 
 ### モデルダウンロード
 
-管理画面からHuggingFaceのMLXモデルを直接検索してダウンロードします。モデルカードの確認、ファイルサイズの確認、ワンクリックダウンロードが可能です。
+管理画面からHuggingFaceのモデルをMLX、GGUF、またはすべての形式で直接検索してダウンロードします。モデルカードを確認してからダウンロードするファイルを選べます。MLXチェックポイントは必要なファイルを常にダウンロードし、GGUFはvision projectorも一緒にダウンロードします。
 
 <p align="center">
   <img src="docs/images/downloader_omlx.png" alt="oMLX モデルダウンロード" width="720">

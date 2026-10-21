@@ -749,7 +749,7 @@ class Glm5NextLinearAttention(nn.Module):
 
 def _small_selector_ok(indexer, pool, batch_size, query_rows):
     """Validate native selection and complete pool history before advancing it."""
-    from omlx.custom_kernels.glm_moe_dsa import fast
+    from omlx.custom_kernels.sparse_index import fast
 
     try:
         if not fast.has_symbol("dsa_topk_indices"):
@@ -875,7 +875,7 @@ class Glm5NextIndexer(nn.Module):
         ):
             return None
         try:
-            from omlx.custom_kernels.glm_moe_dsa import fast
+            from omlx.custom_kernels.sparse_index import fast
 
             if not fast.has_symbol("dsa_indexer_scores"):
                 return None
@@ -909,7 +909,7 @@ class Glm5NextIndexer(nn.Module):
         if topk != 512:
             return None
         try:
-            from omlx.custom_kernels.glm_moe_dsa import fast
+            from omlx.custom_kernels.sparse_index import fast
 
             if fast.has_symbol("dsa_topk_indices"):
                 return fast.dsa_topk_indices(scores[:, None], topk)[:, 0]
@@ -926,7 +926,7 @@ class Glm5NextIndexer(nn.Module):
         Same scores, top-k kernel and index expansion as the general path;
         see ``decode_kernels.dsa_decode_scores``.  Returns None to fall back.
         """
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.sparse_index import fast
 
         # The fused top-k follows native ordering, not the argpartition fallback.
         if not fast.has_symbol("dsa_topk_indices"):

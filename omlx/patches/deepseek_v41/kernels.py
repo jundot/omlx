@@ -215,9 +215,13 @@ _INDEX = r"""
         float dot = 0.0f;
         for (int v = 0; v < D / 32; ++v)
             dot += float(q[(query * H + h) * D + lane + v * 32]) * key[v];
-        result += max(simd_sum(dot), 0.0f) * weights[query * H + h];
+        // DeepSeek-V4.1-Flash-1017 Indexer: the einsum output and relu(s) * w are tensors of
+        // the activation dtype R (bf16 for the released checkpoints); the head sum
+        // accumulates in fp32 (order free) and is stored as R.
+        const float s = float(R(simd_sum(dot)));
+        result += float(R(max(s, 0.0f) * weights[query * H + h]));
     }
-    if (lane == 0) scores[query * M + position] = result;
+    if (lane == 0) scores[query * M + position] = float(R(result));
 """
 
 
@@ -258,8 +262,10 @@ _INDEX_MMA = r"""
             simdgroup_multiply_accumulate(acc, a, b, acc);
         }
         const float weight = h + fm < H ? weights[query * H + h + fm] : 0.0f;
-        float v0 = max(acc.thread_elements()[0], 0.0f) * weight;
-        float v1 = max(acc.thread_elements()[1], 0.0f) * weight;
+        // Reference rounding points (einsum output and relu * weight in the activation dtype
+        // R); the cross-head sum below is fp32 in any order and rounded to R when stored.
+        float v0 = float(R(max(float(R(acc.thread_elements()[0])), 0.0f) * weight));
+        float v1 = float(R(max(float(R(acc.thread_elements()[1])), 0.0f) * weight));
         // Lane bits 1, 2 and 4 span the eight head rows of each column.
         for (uint i = 0; i < 3; ++i) {
             const uint mask = i == 0 ? 2 : (i == 1 ? 4 : 16);
@@ -280,7 +286,7 @@ _INDEX_MMA = r"""
             const uint pos = block + tid;
             const int row = CANDIDATES ? candidates[query * M + pos] : int(pos);
             const bool valid = row >= 0 && row < N && row + meta[5] < (start + int(query) + 1) / ratio;
-            scores[query * M + pos] = valid ? head_totals[tid] + head_totals[tid + COLS] : -INFINITY;
+            scores[query * M + pos] = valid ? float(R(head_totals[tid] + head_totals[tid + COLS])) : -INFINITY;
         }
     } else if (fm == 0) {
         for (uint j = 0; j < 2; ++j) {
@@ -288,7 +294,7 @@ _INDEX_MMA = r"""
             if (pos >= M) continue;
             const int row = CANDIDATES ? candidates[query * M + pos] : int(pos);
             const bool valid = row >= 0 && row < N && row + meta[5] < (start + int(query) + 1) / ratio;
-            scores[query * M + pos] = valid ? (j == 0 ? total0 : total1) : -INFINITY;
+            scores[query * M + pos] = valid ? float(R(j == 0 ? total0 : total1)) : -INFINITY;
         }
     }
 """
@@ -443,6 +449,7 @@ def packed_index_scores(
             ("HEAD_SPLIT", head_split),
             ("HEADS", heads),
             ("RATIO", ratio),
+            ("R", q.dtype),
         ],
         grid=(
             ((width + cols - 1) // cols if mma else (width + 3) // 4) * 128,
@@ -904,6 +911,119 @@ def _radix_topk(scores, count):
     )[0]
 
 
+# Exact top K of each score row in one threadgroup, written the way the selection pipelines
+# return it: -1 for each selected -inf score (and for K beyond the row) first, then the
+# selected ids ascending (ids are row positions, or candidates[position], which ascend with
+# the position). Ties go to the lower position, as in a stable sort.
+# - Three histogram passes over key bits 31..20, 19..8 and 7..0 find the K-th largest key T.
+# - A last pass over contiguous per-thread ranges writes the keys above T and the first ties
+#   at T in position order.
+_INDEX_SELECT = r"""
+    constexpr uint TPG = 1024, BINS = 4096;
+    const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup, row = threadgroup_position_in_grid.x;
+    const uint n = meta[0], K = meta[1], k = min(K, n);
+    const auto s = scores + size_t(row) * n;
+    device int* out = ids + size_t(row) * K;
+    threadgroup atomic_uint hist[BINS];
+    threadgroup uint part[32];
+    threadgroup uint found_bin, found_above;
+    uint prefix = 0, above = 0;
+    for (uint p = 0; p < 3; ++p) {
+        const uint shift = p == 0 ? 20u : p == 1 ? 8u : 0u, bits = p == 2 ? 8u : 12u, nb = 1u << bits;
+        for (uint b = tid; b < nb; b += TPG) atomic_store_explicit(hist + b, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < n; i += TPG) {
+            const uint key = v41_score_key(s[i]);
+            if (p == 0 || (key >> (shift + bits)) == prefix)
+                atomic_fetch_add_explicit(hist + ((key >> shift) & (nb - 1u)), 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Thread t owns bins counted down from the top: nb - 1 - (t * per) - j.
+        const uint per = nb / TPG > 0 ? nb / TPG : 1u;
+        uint local = 0;
+        if (tid * per < nb)
+            for (uint j = 0; j < per; ++j) local += atomic_load_explicit(hist + (nb - 1u - (tid * per + j)), memory_order_relaxed);
+        const uint incl = simd_prefix_inclusive_sum(local);
+        if (lane == 31) part[sg] = incl;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint before = incl - local;
+        for (uint q = 0; q < sg; ++q) before += part[q];
+        const uint want = k - above;
+        if (tid * per < nb && before < want && before + local >= want) {
+            uint acc = before;
+            for (uint j = 0; j < per; ++j) {
+                const uint bin = nb - 1u - (tid * per + j);
+                const uint c = atomic_load_explicit(hist + bin, memory_order_relaxed);
+                if (acc + c >= want) { found_bin = bin; found_above = acc; break; }
+                acc += c;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = (prefix << bits) | found_bin;
+        above += found_above;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // prefix = T, the k-th largest key; above = keys > T; take k - above ties at T by position.
+    const uint kinf = v41_score_key(-INFINITY);
+    const uint ties = prefix == kinf ? 0u : k - above;
+    const uint lead = (K - k) + (prefix == kinf ? k - above : 0u);
+    const uint first = uint((ulong(n) * tid) / TPG), last = uint((ulong(n) * (tid + 1)) / TPG);
+    uint ng = 0, ne = 0;
+    for (uint i = first; i < last; ++i) {
+        const uint key = v41_score_key(s[i]);
+        ng += key > prefix;
+        ne += key == prefix;
+    }
+    const uint ig = simd_prefix_inclusive_sum(ng), ie = simd_prefix_inclusive_sum(ne);
+    threadgroup uint pg[32], pe[32];
+    if (lane == 31) { pg[sg] = ig; pe[sg] = ie; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint gb = ig - ng, eb = ie - ne;
+    for (uint q = 0; q < sg; ++q) { gb += pg[q]; eb += pe[q]; }
+    for (uint i = tid; i < lead; i += TPG) out[i] = -1;
+    uint o = lead + gb + min(eb, ties), r = eb;
+    for (uint i = first; i < last; ++i) {
+        const uint key = v41_score_key(s[i]);
+        const bool take = key > prefix || (key == prefix && r < ties);
+        r += key == prefix;
+        if (take) out[o++] = CAND ? cand[size_t(row) * n + i] : int(i);
+    }
+"""
+
+
+@cache
+def _index_select_kernel():
+    return mx.fast.metal_kernel(
+        name="deepseek_v41_index_select",
+        input_names=["scores", "cand", "meta"],
+        output_names=["ids"],
+        source=_INDEX_SELECT,
+        header=_RADIX_HEADER,
+    )
+
+
+def index_select(scores, count, candidates=None):
+    """Top ``count`` of each row of ``scores`` ([1, rows, n]) as the selection pipelines
+    give it: ``sort(where(selected score > -inf, id, -1))`` with ties to the lower position;
+    ids are positions, or ``candidates[position]`` (ascending in position)."""
+    rows, n = scores.shape[1], scores.shape[2]
+    if not min(n, count):
+        return mx.full((1, rows, count), -1, mx.int32)
+    return _index_select_kernel()(
+        inputs=[
+            scores.astype(mx.float32),
+            mx.zeros((8,), mx.int32) if candidates is None else candidates.astype(mx.int32),
+            mx.array([n, count, 0, 0, 0, 0, 0, 0], mx.uint32),
+        ],
+        template=[("CAND", candidates is not None)],
+        grid=(1024 * rows, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(1, rows, count)],
+        output_dtypes=[mx.int32],
+    )[0]
+
+
 def _radix_index_topk(q, keys, weights, start, ratio, count):
     """Score bounded query groups, then select with the radix kernel."""
     # At most 64 MiB of FP32 scores per group.
@@ -1004,12 +1124,17 @@ def packed_index_topk(
                 ratio,
                 key_start=first,
             )
-            values, ids = _tile_topk(scores, count, offset=first)
-            running = (
-                (values, ids)
-                if first == 0 and values.shape[-1] == count
-                else _merge_topk(running, (values, ids), count)
-            )
+            if single_tile and q.shape[1] <= 8:
+                # Decode and verify rows: one selection kernel, already in the final form.
+                running = None
+                selected = index_select(scores, count)
+            else:
+                values, ids = _tile_topk(scores, count, offset=first)
+                running = (
+                    (values, ids)
+                    if first == 0 and values.shape[-1] == count
+                    else _merge_topk(running, (values, ids), count)
+                )
             if block_count:
                 values, ids = _tile_topk(
                     scores,
@@ -1035,7 +1160,9 @@ def packed_index_topk(
                 pending = (*running, *blocks)
                 mx.async_eval(*pending)
         results.append(
-            mx.sort(mx.where(running[0] > -float("inf"), running[1], -1), axis=-1)
+            selected
+            if running is None
+            else mx.sort(mx.where(running[0] > -float("inf"), running[1], -1), axis=-1)
         )
         block_results.append(
             mx.sort(mx.where(blocks[0] > -float("inf"), blocks[1], -1), axis=-1)

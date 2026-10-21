@@ -92,6 +92,7 @@ from .performance import (
 )
 from .planner import (
     LOCAL_NODE,
+    ModelLayout,
     NodeBudget,
     PlanningError,
     ShardPlan,
@@ -101,6 +102,7 @@ from .planner import (
     plan_unequal_pipeline,
     remote_model_layout,
     synthetic_model_layout,
+    with_mtp_head,
 )
 from .probe import collect_cluster_status
 from .rdma.link_routes import cluster_rdma_link_verify, cluster_rdma_links
@@ -116,6 +118,7 @@ from .runtime import read_runtime_markers
 from .staging import (
     DEFAULT_REMOTE_PYTHON,
     InsufficientDiskError,
+    fabric_transfer_address,
     home_relative_model_path,
     index_shards,
     model_staging_inventory,
@@ -134,6 +137,7 @@ from .transport import (
     assess_link,
     configure_link,
     detect_cluster_transports,
+    link_warnings,
     probe_host_interfaces,
     resolve_link_addresses,
     verify_link_reachability,
@@ -151,6 +155,7 @@ router = APIRouter(prefix="/admin/api/cluster", tags=["cluster"])
 join_router = APIRouter(prefix="/cluster/join", tags=["cluster-enrollment"])
 
 _get_engine_pool: Any | None = None
+_get_settings_manager: Any | None = None
 
 
 class ClusterPairingTokenRequest(BaseModel):
@@ -276,11 +281,49 @@ def inspect_safetensors_layout(model_path: str | Path):
     return complete_model_layout(model_path)
 
 
-def set_cluster_getters(engine_pool_getter: Any) -> None:
+def set_cluster_getters(
+    engine_pool_getter: Any, settings_manager_getter: Any | None = None
+) -> None:
     """Inject server-owned dependencies without importing ``omlx.server``."""
 
-    global _get_engine_pool
+    global _get_engine_pool, _get_settings_manager
     _get_engine_pool = engine_pool_getter
+    _get_settings_manager = settings_manager_getter
+
+
+def _saved_lightning_mtp(model_path: str) -> bool | None:
+    """The coordinator's saved Lightning MTP setting for this model, if any."""
+
+    manager = _get_settings_manager() if _get_settings_manager else None
+    if manager is None or _get_engine_pool is None:
+        return None
+    target = Path(model_path).expanduser().resolve()
+    for item in engine_pool_model_inventory(_engine_pool()):
+        if Path(item["model_path"]).expanduser().resolve() != target:
+            continue
+        if not manager.has_settings(item["id"]):
+            return None
+        return bool(manager.get_settings(item["id"]).mtp_enabled)
+    return None
+
+
+def _cluster_mtp(
+    requested: bool | None, model: ModelLayout, model_path: str | None
+) -> bool:
+    """Whether a new plan budgets the Lightning MTP head on rank zero.
+
+    Unset follows the model like a single Mac does: a checkpoint with a head
+    starts with MTP on unless its saved settings turned it off.
+    """
+
+    if requested is not None:
+        if requested:
+            with_mtp_head(model)
+        return requested
+    if model.mtp_weight_bytes <= 0:
+        return False
+    saved = _saved_lightning_mtp(model_path) if model_path else None
+    return saved is not False
 
 
 def _engine_pool() -> Any:
@@ -454,6 +497,8 @@ class ClusterPlanRequest(BaseModel):
     # Cluster v2: optional node_id → absolute model path on that node. Empty
     # keeps the legacy same-absolute-path-on-every-node behavior.
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
+    # Lightning MTP: reserve the draft head on rank zero.
+    mtp: bool = False
 
 
 class ClusterHostRequest(BaseModel):
@@ -515,6 +560,7 @@ class ClusterDeploymentRequest(BaseModel):
     # Cluster v2: node_id → absolute model path on that node. Nodes not listed
     # load ``model_path`` — the pre-v2 shared-path behavior.
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
+    mtp: bool = False
 
 
 class ClusterPeerProbeRequest(BaseModel):
@@ -847,6 +893,8 @@ def _create_cluster_plan(request: ClusterPlanRequest):
         request.path_map,
         tuple(node.node_id.strip() for node in request.nodes),
     )
+    pipeline_model = with_mtp_head(model) if request.mtp else model
+    head_bytes = model.mtp_weight_bytes if request.mtp else 0
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
         if request.allocation != "balanced":
@@ -863,10 +911,11 @@ def _create_cluster_plan(request: ClusterPlanRequest):
                 request.pipeline_microbatch_size or defaults.pipeline_microbatch_size
             ),
             context_tokens=request.target_context_tokens,
+            head_rank_extra_bytes=head_bytes,
         )
     elif request.allocation == "proportional":
         plan = plan_proportional_pipeline(
-            model,
+            pipeline_model,
             nodes,
             workload_profile=request.execution_profile,
             microbatch_size=(
@@ -876,7 +925,7 @@ def _create_cluster_plan(request: ClusterPlanRequest):
         )
     else:
         plan = plan_unequal_pipeline(
-            model,
+            pipeline_model,
             nodes,
             workload_profile=request.execution_profile,
             microbatch_size=(
@@ -922,6 +971,8 @@ class ClusterAutoconfigureRequest(BaseModel):
     max_kv_size: int | None = Field(default=None, gt=0)
     ring_connections_per_ip: int | None = Field(default=None, ge=1, le=32)
     target_context_tokens: int = Field(default=8192, ge=1, le=1_048_576)
+    # None follows the checkpoint and the model's saved Lightning MTP setting.
+    mtp: bool | None = None
 
 
 def _measured_link_profiles(
@@ -1034,6 +1085,11 @@ def _resolve_fabric(
         )
         for index, host in enumerate(hosts)
     ]
+    pairs = [
+        (source, peer)
+        for index, source in enumerate(hosts)
+        for peer in hosts[index + 1 :]
+    ]
     pair_links = [
         resolve_link_addresses(
             source,
@@ -1041,9 +1097,15 @@ def _resolve_fabric(
             probe=lambda target: interfaces[target],
             verify=verify_once,
         )
-        for index, source in enumerate(hosts)
-        for peer in hosts[index + 1 :]
+        for source, peer in pairs
     ]
+    warnings = list(
+        dict.fromkeys(
+            warning
+            for (source, peer), link in zip(pairs, pair_links)
+            for warning in link_warnings(interfaces[source], interfaces[peer], link)
+        )
+    )
     matrix = build_rdma_matrix([interfaces[host] for host in hosts])
     rdma = matrix.to_dict()
     unverified_rdma = next(
@@ -1081,6 +1143,7 @@ def _resolve_fabric(
         "backend_reason": reason,
         "blocker": blocker,
         "fell_back": fell_back,
+        "warnings": warnings,
         "link": (unresolved or links[0]).to_dict(),
         "rdma": rdma,
         "hosts": [
@@ -1149,6 +1212,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     )
     try:
         model, nodes = _model_and_nodes(plan_request)
+        mtp = _cluster_mtp(request.mtp, model, request.model_path)
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1186,7 +1250,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         str(fabric["backend"]) if fabric is not None else choose_backend(transports)[0]
     )
     strategy_transports = transports
-    if provisional_backend == "ring" and transports:
+    # A resolved ring fabric is slow even when the transport probe failed.
+    if provisional_backend == "ring" and (transports or fabric is not None):
         strategy_transports = (SimpleNamespace(kind="ethernet"),)
 
     measurements = {}
@@ -1215,6 +1280,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             measurements=measurements,
             workload_profile=request.execution_profile,
             context_tokens=request.target_context_tokens,
+            head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
         )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1268,6 +1334,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         warnings.append(f"Transport detection failed: {transport_error}")
     if fabric_error:
         warnings.append(f"Address discovery failed: {fabric_error}")
+    if fabric is not None:
+        warnings.extend(fabric.get("warnings", ()))
 
     # Place tensor-parallel groups on the fastest links: TP all-reduces once
     # per layer per token, while a pipeline boundary sends one tensor per
@@ -1322,6 +1390,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             tensor_parallel_size=choice.tensor_parallel_size,
             workload_profile=request.execution_profile,
             context_tokens=request.target_context_tokens,
+            head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
         )
         choice = replace(choice, plan=ordered_plan)
     for group in tp_groups_spanning_slow_links(
@@ -1456,6 +1525,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 workload_profile=request.execution_profile,
                 microbatch_size=probe_execution.pipeline_microbatch_size,
                 context_tokens=request.target_context_tokens,
+                mtp=mtp,
             )
             performance_changes = _plan_changes(
                 choice.plan.to_dict(),
@@ -1557,6 +1627,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             "ring_connections_per_ip": (
                 request.ring_connections_per_ip if backend == "ring" else None
             ),
+            "mtp": mtp,
             "tensor_parallel_size": choice.tensor_parallel_size,
             "nodes": [node.model_dump() for node in profiled_request_nodes],
             "hosts": activation_hosts,
@@ -1671,6 +1742,9 @@ def _run_staging_job(
         # disk-space check). Resolve each peer's copy in its OWN home from the
         # portable ~-form.
         portable_model_path = home_relative_model_path(deployment.model)
+        source_entry = next(
+            (item for item in deployment.hosts if item.ssh == source_host), None
+        )
         failed_nodes: list[str] = []
         for host, assignment in zip(deployment.hosts, assignments):
             # Cluster v2: files land at the node's path_map entry when one
@@ -1750,6 +1824,16 @@ def _run_staging_job(
                 name: (shard_sizes | sidecar_sizes)[name]
                 for name in needed
             }
+            # When this Mac is one end, the data takes the address the
+            # collectives verified (Thunderbolt first) if SSH answers there.
+            source_address = destination_address = None
+            if needed and _local_ssh_target(source_host) != _local_ssh_target(host.ssh):
+                if not _local_ssh_target(host.ssh):
+                    destination_address = fabric_transfer_address(host.ssh, host.ips)
+                elif source_entry is not None:
+                    source_address = fabric_transfer_address(
+                        source_host, source_entry.ips
+                    )
             result = stage_files_from_source(
                 plan,
                 model_path=model_path,
@@ -1759,7 +1843,18 @@ def _run_staging_job(
                 destination_dir=destination_dir,
                 parallel=parallel,
                 progress=progress,
+                source_address=source_address,
+                destination_address=destination_address,
             )
+            if result.bytes_copied:
+                logger.info(
+                    "Staged %.1f GiB to %s over %s in %.0f s (%.2f GB/s)",
+                    result.bytes_copied / 1024**3,
+                    assignment.node_id,
+                    destination_address or source_address or "the paired address",
+                    result.seconds,
+                    result.gigabytes_per_second,
+                )
 
             def finish(
                 job: dict[str, Any],
@@ -2778,6 +2873,7 @@ def _execution_for_request(
         ring_connections_per_ip=(
             request.ring_connections_per_ip or requested.ring_connections_per_ip
         ),
+        mtp=bool(getattr(request, "mtp", False)),
     )
     return tune_execution_settings(
         requested,
@@ -2829,6 +2925,7 @@ def _create_deployment(
         tensor_parallel_size=request.tensor_parallel_size,
         target_context_tokens=request.target_context_tokens,
         path_map=request.path_map,
+        mtp=request.mtp,
     )
     plan = _create_cluster_plan(plan_request)
     execution = _execution_for_request(
@@ -2885,6 +2982,7 @@ def _build_performance_plan(
     workload_profile: str,
     microbatch_size: int,
     context_tokens: int,
+    mtp: bool = False,
 ) -> ShardPlan:
     """Build a shard plan using the hybrid planner when tensor parallelism is active."""
 
@@ -2896,9 +2994,10 @@ def _build_performance_plan(
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,
+            head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
         )
     return plan_unequal_pipeline(
-        model,
+        with_mtp_head(model) if mtp else model,
         nodes,
         workload_profile=workload_profile,
         microbatch_size=microbatch_size,
@@ -2942,6 +3041,7 @@ def _performance_optimized_deployment(
         workload_profile=deployment.execution.profile,
         microbatch_size=deployment.execution.pipeline_microbatch_size,
         context_tokens=request.target_context_tokens,
+        mtp=deployment.execution.mtp,
     )
     execution = tune_execution_settings(
         deployment.execution,
@@ -2959,6 +3059,7 @@ def _performance_optimized_deployment(
             workload_profile=execution.profile,
             microbatch_size=execution.pipeline_microbatch_size,
             context_tokens=request.target_context_tokens,
+            mtp=deployment.execution.mtp,
         )
     deployment_id = (
         request.deployment_id.strip()
@@ -3696,6 +3797,8 @@ class ClusterReplanRequest(BaseModel):
     tensor_parallel_size: int | None = Field(default=None, ge=1, le=64)
     target_context_tokens: int | None = Field(default=None, ge=1, le=1_048_576)
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
+    # None keeps the current deployment's Lightning MTP choice.
+    mtp: bool | None = None
     approved_placement: str | None = Field(default=None, min_length=16, max_length=64)
 
 
@@ -3826,6 +3929,11 @@ async def replan_cluster_deployment(request: ClusterReplanRequest):
                 else current.target_context_tokens if current is not None else 8192
             ),
             path_map=path_map,
+            mtp=(
+                request.mtp
+                if request.mtp is not None
+                else current is not None and current.execution.mtp
+            ),
             # Not consulted by planning; activation re-checks the real one
             # below. Preview callers do not have a signature yet.
             approved_placement=request.approved_placement or ("0" * 16),
@@ -3894,7 +4002,7 @@ async def forget_cluster(node_id: str | None = None):
     from .pairing_routes import PairingError, _manager, _pairing_http_error
 
     manager = _manager()
-    peers = await asyncio.to_thread(manager.list_paired)
+    peers = await asyncio.to_thread(manager.paired_devices)
     deployments = await asyncio.to_thread(get_cluster_registry().list)
     forget_all = node_id is None or node_id == manager.node_id
     affected = [

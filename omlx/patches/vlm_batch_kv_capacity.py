@@ -363,15 +363,24 @@ def _set_lm_state(cache, state):
     cache.keys, cache.values, cache.offset, cache.left_padding, cache._idx = state
 
 
+def install_capacity_methods(cls) -> None:
+    """Put one ``BatchKVCache`` class on the capacity ladder (idempotent).
+
+    Model packages that carry their own copy of the class (qwen4_exp) call
+    this for it.
+    """
+    if getattr(cls, "_omlx_capacity_managed", False):
+        return
+    for name, member in vars(_CapacityMethods).items():
+        if not name.startswith("__"):
+            setattr(cls, name, member)
+    if cls is LMBatchKVCache:
+        cls.state = property(_lm_state, _set_lm_state)
+    cls._omlx_capacity_managed = True
+
+
 def apply_batch_kv_capacity_patch() -> bool:
     """Patch in place before cache creation; repeated installation is a no-op."""
     for cls in (BatchKVCache, LMBatchKVCache):
-        if getattr(cls, "_omlx_capacity_managed", False):
-            continue
-        for name, member in vars(_CapacityMethods).items():
-            if not name.startswith("__"):
-                setattr(cls, name, member)
-        if cls is LMBatchKVCache:
-            cls.state = property(_lm_state, _set_lm_state)
-        cls._omlx_capacity_managed = True
+        install_capacity_methods(cls)
     return True

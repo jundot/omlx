@@ -1304,6 +1304,10 @@ function clusterV2Wizard() {
             return device?.caps?.chip || window.t('cluster.v2.device.apple_silicon');
         },
 
+        deviceLoopbackOnly(device) {
+            return !!device?.caps?.loopback_only;
+        },
+
         deviceLinkMeta(device) {
             return (
                 CLUSTER_V2_LINK_META[device?.link] ||
@@ -2671,6 +2675,13 @@ function clusterV2Wizard() {
         planAssignments() {
             const assignments = this.plan?.assignments;
             return Array.isArray(assignments) ? assignments : [];
+        },
+
+        // Server-written, already redacted. They name what to fix before
+        // activating, like a Thunderbolt cable the cluster cannot use.
+        planWarnings() {
+            const warnings = this.planProposal?.warnings;
+            return Array.isArray(warnings) ? warnings : [];
         },
 
         planTotalLayers() {

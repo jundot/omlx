@@ -261,6 +261,119 @@ def _model(*, start=2, end=5, layers=None):
     )
 
 
+def test_cluster_mtp_runs_only_with_every_rank_in_its_role():
+    class Votes:
+        def __init__(self, total):
+            self.total = total
+
+        def item(self):
+            return self.total
+
+    def fake_mx(total):
+        return SimpleNamespace(
+            cpu="cpu",
+            array=int,
+            distributed=SimpleNamespace(all_sum=lambda vote, **_: Votes(total)),
+        )
+
+    def rank_zero(calls):
+        return SimpleNamespace(
+            language_model=SimpleNamespace(
+                _omlx_mtp_decode_enabled=True,
+                mtp=object(),
+                configure_mtp=calls.append,
+            )
+        )
+
+    group = SimpleNamespace(size=lambda: 2)
+    calls = []
+    ready = rank_zero(calls)
+    sync = inference_worker._arm_cluster_mtp(ready, group, 0, fake_mx(2))
+    assert sync.is_leader and ready._omlx_cluster_mtp is sync
+    # A peer short of its role turns MTP off on every rank.
+    lost = rank_zero(calls)
+    assert inference_worker._arm_cluster_mtp(lost, group, 0, fake_mx(1)) is None
+    assert calls == [False]
+    assert not lost.language_model._omlx_mtp_decode_enabled
+    assert not hasattr(lost, "_omlx_cluster_mtp")
+
+
+def test_cluster_mtp_sees_the_sampling_a_request_asked_for():
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    args = SimpleNamespace(
+        sampling=SimpleNamespace(
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.0,
+            xtc_probability=0.0,
+            xtc_threshold=0.0,
+        )
+    )
+    tokenizer = SimpleNamespace(encode=lambda text: [10], eos_token_ids={2})
+    original = mlx_server.make_sampler
+
+    with inference_worker._sample_with_stated_parameters(mlx_server):
+        sampler = mlx_server._make_sampler(args, tokenizer)
+    batch = SimpleNamespace(samplers=[sampler], fallback_sampler=None)
+    assert not bg._is_greedy(batch)
+    assert (sampler.temp, sampler.top_p, sampler.top_k) == (1.0, 0.95, 20)
+    assert mlx_server.make_sampler is original
+
+
+def test_rank_keeps_gpu_warm_while_serving_and_after_until_idle_window():
+    ticks = threading.Semaphore(0)
+
+    class FakeMx:
+        gpu = "gpu"
+        float32 = "float32"
+
+        def new_stream(self, device):
+            return device
+
+        @contextlib.contextmanager
+        def stream(self, _stream):
+            yield
+
+        def zeros(self, _shape, dtype):
+            return 0
+
+        def eval(self, _value):
+            ticks.release()
+
+    active = [1]
+    now = [0.0]
+    telemetry = SimpleNamespace(active_request_count=lambda: active[0])
+
+    def drained() -> bool:
+        while ticks.acquire(timeout=0.05):
+            pass
+        return not ticks.acquire(timeout=0.05)
+
+    with inference_worker._keep_rank_gpu_warm(
+        FakeMx(),
+        telemetry,
+        interval=0.001,
+        idle_window=10.0,
+        clock=lambda: now[0],
+    ):
+        # A pipeline stage idles while its peers compute, so requests in
+        # flight do not suppress the ticks.
+        assert ticks.acquire(timeout=2)
+        active[0] = 0
+        now[0] = 5.0
+        assert ticks.acquire(timeout=2)
+        now[0] = 20.0
+        assert drained()
+        active[0] = 1
+        assert ticks.acquire(timeout=2)
+
+    assert not any(
+        thread.name == "omlx-cluster-gpu-keep-warm" for thread in threading.enumerate()
+    )
+
+
 def test_loaded_stage_matches_approved_unequal_range():
     _validate_loaded_stage(_model(), _assignment())
 
@@ -754,7 +867,7 @@ def _run_rank(
         pipeline_index, "apply_mlx_lm_pipeline_index_patch", lambda: None
     )
     monkeypatch.setattr(
-        model_loading, "maybe_apply_pre_load_patches", lambda _model: None
+        model_loading, "maybe_apply_pre_load_patches", lambda _model, _settings: None
     )
     monkeypatch.setattr(
         inference_worker,
@@ -859,7 +972,7 @@ def _run_rank(
 
     @contextlib.contextmanager
     def fake_telemetry(_marker, **_kwargs):
-        yield SimpleNamespace()
+        yield SimpleNamespace(active_request_count=lambda: 0)
 
     monkeypatch.setattr(inference_worker, "install_server_telemetry", fake_telemetry)
 

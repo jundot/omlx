@@ -178,6 +178,7 @@ def serve_command(args):
 
     from ._version import __version__
     from . import process_title
+    from .integrations.base import bracket_host
     from .settings import burst_decode_env, init_settings
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
 
@@ -319,7 +320,7 @@ def serve_command(args):
             print(f"Warning: skipping {h}, it is not assigned to any local interface")
             bind_hosts.remove(h)
     for h in bind_hosts:
-        print(f"Binding server at http://{h}:{settings.server.port}")
+        print(f"Binding server at http://{bracket_host(h)}:{settings.server.port}")
     # uvicorn does not support "trace" — map to "debug" for its internal logging
     uvicorn_level = (
         "debug" if settings.server.log_level == "trace" else settings.server.log_level
@@ -473,7 +474,7 @@ def serve_command(args):
         )
 
         for h in bind_hosts:
-            print(f"Starting server at http://{h}:{settings.server.port}")
+            print(f"Starting server at http://{bracket_host(h)}:{settings.server.port}")
         try:
             uvicorn.Server(uvicorn_config).run(sockets=serve_sockets)
         except KeyboardInterrupt:
@@ -494,6 +495,7 @@ def launch_command(args, extra_args: list[str] | None = None):
     import requests
 
     from .integrations import IntegrationContext, get_integration, list_integrations
+    from .integrations.base import bracket_host
     from .settings import GlobalSettings
 
     def _optional_str(value) -> str | None:
@@ -526,9 +528,22 @@ def launch_command(args, extra_args: list[str] | None = None):
     connect_host = (
         first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
     )
+    base_url = f"http://{bracket_host(connect_host)}:{port}"
+
+    # Claude Desktop resolves tier aliases server-side, so it needs no
+    # launch-time model — but it does need the desktop switch. The toggle
+    # lives in the dashboard; the CLI only points the user there.
+    if tool_name == "claude_desktop" and not bool(
+        getattr(getattr(settings, "claude_code", None), "desktop_enabled", False)
+    ):
+        print("Claude Desktop mode is not enabled in oMLX settings.")
+        print(
+            "Enable it in the oMLX dashboard (Integrations → Claude Desktop) "
+            "and re-run this command."
+        )
+        sys.exit(1)
 
     # Check if oMLX server is running
-    base_url = f"http://{connect_host}:{port}"
     try:
         resp = requests.get(f"{base_url}/health", timeout=3)
         resp.raise_for_status()
@@ -572,7 +587,9 @@ def launch_command(args, extra_args: list[str] | None = None):
         pass
 
     # Determine model. Explicit CLI tier flags bypass the picker; otherwise always
-    # prompt interactively so the user's selection is honoured.
+    # prompt interactively so the user's selection is honoured. Integrations
+    # that resolve models server-side (requires_model_selection=False) skip
+    # this block.
     model = args.model
     if not model and not integration.requires_model_selection:
         # The integration registers the server's whole model catalog, so
@@ -1379,8 +1396,9 @@ Example directory structure:
         "launch",
         help="Launch an external tool with oMLX integration",
         description=(
-            "Configure and launch external coding tools (Claude Code, Copilot, "
-            "Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, Mistral Vibe, DeepSeek "
+            "Configure and launch external coding tools (Claude Code, Claude Desktop, "
+            "Copilot, Codex, Codex App, OpenCode, OpenClaw, Hermes Agent, Pi, Mistral Vibe, "
+            "DeepSeek "
             "Harness) to use the running oMLX server."
         ),
     )
@@ -1388,7 +1406,7 @@ Example directory structure:
         "tool",
         type=str,
         help=(
-            "Tool to launch: claude, copilot, codex, codex_app, opencode, "
+            "Tool to launch: claude, claude_desktop, copilot, codex, codex_app, opencode, "
             "openclaw, hermes, pi, vibe, dsh, or 'list' to show available"
         ),
     )

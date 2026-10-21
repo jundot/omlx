@@ -100,7 +100,7 @@ class ResponsesRequest(BaseModel):
     instructions: Optional[str] = None
     temperature: Optional[float] = None
     top_p: Optional[float] = None
-    max_output_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = Field(default=None, gt=0)
     stream: bool = False
     tools: Optional[List[ResponsesTool]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None

@@ -757,6 +757,12 @@ def _left_padded_batch_attention(real_cache, queries, keys, values, scale, mask)
     and row b starts at ``left_padding[b]``, so the MMA kernel reads
     ``left_padding`` instead. Returns None for verify rows outside its envelope.
     """
+    from ..affine4 import Affine4KVCache, Affine8KVCache
+
+    if isinstance(real_cache, (Affine4KVCache, Affine8KVCache)):
+        return real_cache.attention(
+            queries, keys_state=keys, values_state=values, scale=scale, mask=mask
+        )
     out = _mma_mse_attention(
         real_cache, queries, keys, values, scale, starts=real_cache.left_padding
     )
@@ -896,6 +902,17 @@ def apply_turboquant_attention_patch() -> bool:
             real_cache = cache._cache
 
         if isinstance(real_cache, (_TQCache, BatchTurboQuantKVCache)):
+            from ..affine4 import Affine4KVCache, Affine8KVCache
+
+            if isinstance(real_cache, (Affine4KVCache, Affine8KVCache)):
+                return real_cache.attention(
+                    queries,
+                    keys_state=keys,
+                    values_state=values,
+                    scale=scale,
+                    mask=mask,
+                    sinks=sinks,
+                )
             if sinks is not None:
                 # TurboQuant's quantized kernels do not implement attention
                 # sinks. Preserve correctness by falling back to MLX's

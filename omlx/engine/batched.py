@@ -460,7 +460,11 @@ class BatchedEngine(BaseEngine):
 
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
-                logger.info(f"TurboQuant KV cache enabled: {tq_bits} bits")
+                logger.info(
+                    "KV cache compression enabled: %s, %s bits",
+                    getattr(self._model_settings, "turboquant_kv_scheme", "turboquant"),
+                    tq_bits,
+                )
 
         # Install after TurboQuant so only non-quantized, long SDPA256 prefills
         # take the bounded route used by the prefill memory estimator.
@@ -744,6 +748,9 @@ class BatchedEngine(BaseEngine):
             if tq_enabled:
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_kv_scheme = getattr(
+                    self._model_settings, "turboquant_kv_scheme", "turboquant"
+                )
                 scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
@@ -1186,6 +1193,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
@@ -1256,6 +1264,7 @@ class BatchedEngine(BaseEngine):
             presence_penalty=presence_penalty,
             frequency_penalty=kwargs.get("frequency_penalty", 0.0),
             stop=stop or [],
+            ignore_eos=bool(kwargs.get("ignore_eos", False)),
             thinking_budget=kwargs.get("thinking_budget", None),
             compiled_grammar=kwargs.get("compiled_grammar", None),
             seed=kwargs.get("seed", None),

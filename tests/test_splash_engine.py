@@ -19,6 +19,8 @@ import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from tokenizers import pre_tokenizers
+from transformers import AutoTokenizer
 
 import omlx.server as srv
 from omlx.admin import routes as admin_routes
@@ -53,11 +55,24 @@ from omlx.engine.splash import (
 )
 from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.exceptions import InvalidRequestError, ModelLoadingError
+from omlx.model_discovery import discover_models
 from omlx.model_settings import ModelSettings
 from omlx.settings import GlobalSettings
 from omlx.utils.proc_memory import list_process_group_pids
 
 QWEN38_TEXT = dict(splash_mod.SPLASH_FAMILIES["Qwen3.8-27B"])
+FLASH_NEXT_TEXT = {
+    "model_type": "qwen4_exp_text",
+    "max_position_embeddings": 262144,
+    "hidden_size": 2560,
+    "num_hidden_layers": 48,
+    "vocab_size": 248320,
+    "num_attention_heads": 24,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+}
 REPO_ID = splash_repo_id("Qwen3.8-27B-4bit")
 MLX_4BIT = {"mode": "affine", "bits": 4, "group_size": 64}
 GIB = 1024**3
@@ -93,6 +108,23 @@ def _write_draft(path: Path, text=None) -> Path:
     return path
 
 
+def _add_optiq_vision(model: Path) -> dict:
+    """OptiQ's layout: the vision tower in optiq/, listed by the index, and no
+    processor file. Returns the index's weight map."""
+    config = json.loads((model / "config.json").read_text())
+    vision = {"patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2}
+    (model / "config.json").write_text(json.dumps({**config, "vision_config": vision}))
+    (model / "optiq").mkdir()
+    (model / "optiq" / "optiq_vision.safetensors").write_bytes(b"0" * 512)
+    weight_map = {
+        "lm_head.weight": "model.safetensors",
+        "vision_tower.blocks.0.attn.qkv.weight": "optiq/optiq_vision.safetensors",
+    }
+    index = model / "model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": weight_map}))
+    return weight_map
+
+
 def _fake_launcher(path: Path, version: str = "1.3.1", body: str = "exit 0\n") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -121,9 +153,9 @@ def _binary(version="1.3.1", path="/opt/homebrew/bin/splash") -> SplashBinary:
     return SplashBinary(Path(path), version, auto_detected=True)
 
 
-def _engine(tmp_path, **options) -> SplashEngine:
+def _engine(tmp_path, version="1.3.1", **options) -> SplashEngine:
     model = tmp_path / "models" / "Qwen3.8-27B-4bit"
-    target = SplashTarget(_binary(), "Qwen3.8-27B", tmp_path / "draft")
+    target = SplashTarget(_binary(version), "Qwen3.8-27B", tmp_path / "draft")
     return SplashEngine(
         model_name=str(model),
         model_id="Qwen3.8-27B-4bit",
@@ -205,6 +237,19 @@ class TestBinary:
 
 
 class TestCompatibility:
+
+    def test_flash_next_mlx_checkpoint_explains_gguf_requirement(
+        self, tmp_path, launchers
+    ):
+        launchers("splash", version="1.4.0")
+        model = _write_model(tmp_path / "Flash-Next-MLX", FLASH_NEXT_TEXT)
+
+        target, reason = resolve_splash_target(model, None, [])
+
+        assert target is None
+        assert "Qwen3.8-Flash-Next needs a GGUF" in reason
+        assert splash_mod.splash_draft_to_download(model, None, []) is None
+
     def test_supported_checkpoint_resolves_with_its_draft(self, tmp_path, launchers):
         launchers("splash")
         model = _write_model(tmp_path / "Qwen3.8-27B-4bit")
@@ -247,6 +292,53 @@ class TestCompatibility:
         launchers("splash", version="1.3.1")
         assert resolve_splash_target(model, None, [str(draft)])[0] is not None
 
+    @pytest.mark.parametrize(
+        "quantization_config",
+        [
+            {
+                "quant_method": "modelopt",
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "a": {"quant_algo": "NVFP4"},
+                    "b": {"quant_algo": "FP8"},
+                },
+            },
+            {
+                "quant_method": "compressed-tensors",
+                "format": "mixed-precision",
+                "config_groups": {
+                    "group_0": {"format": "float-quantized"},
+                    "group_1": {"format": "nvfp4-pack-quantized"},
+                },
+            },
+        ],
+    )
+    def test_nvfp4_and_fp8_checkpoints_need_splash_1_3_2(
+        self, tmp_path, launchers, quantization_config
+    ):
+        model = _write_model(tmp_path / "Qwen3.8-27B-NVFP4")
+        config = json.loads((model / "config.json").read_text())
+        del config["quantization"]
+        config["quantization_config"] = quantization_config
+        (model / "config.json").write_text(json.dumps(config))
+        draft = _write_draft(tmp_path / "draft")
+
+        launchers("splash", version="1.3.1")
+        _, reason = resolve_splash_target(model, None, [str(draft)])
+        assert "Splash 1.3.2 also serves NVFP4 and FP8" in reason
+        launchers("splash", version="1.3.2")
+        target, reason = resolve_splash_target(model, None, [str(draft)])
+        assert target is not None and reason == ""
+
+        # Other schemes of the same tools are not formats Splash reads.
+        config["quantization_config"] = {
+            "quant_method": "compressed-tensors",
+            "config_groups": {"g": {"format": "pack-quantized"}},
+        }
+        (model / "config.json").write_text(json.dumps(config))
+        _, reason = resolve_splash_target(model, None, [str(draft)])
+        assert "MLX, NVFP4 or FP8" in reason
+
     def test_missing_files_and_draft_explain_why(self, tmp_path, launchers):
         launchers("splash")
         model = _write_model(tmp_path / "m")
@@ -266,6 +358,181 @@ SPLASH_REPO_ID = re.compile(
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?/"
     r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
 )
+
+
+def _qwen38_gguf(vocab: list[str]) -> dict:
+    return {
+        "general.architecture": "qwen35",
+        "qwen35.block_count": 64,
+        "qwen35.context_length": 262144,
+        "qwen35.embedding_length": 5120,
+        "qwen35.attention.head_count": 24,
+        "qwen35.attention.head_count_kv": 4,
+        "qwen35.attention.key_length": 256,
+        "qwen35.full_attention_interval": 4,
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "qwen35",
+        "tokenizer.ggml.tokens": vocab,
+        "tokenizer.ggml.token_type": [3 if t.startswith("<|") else 1 for t in vocab],
+        "tokenizer.ggml.merges": [],
+        "tokenizer.ggml.eos_token_id": vocab.index("<|im_end|>"),
+        "tokenizer.chat_template": (
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}"
+            "<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        ),
+    }
+
+
+class TestGguf:
+
+    @pytest.mark.parametrize("layout", ["single", "split", "variant"])
+    def test_flash_next_gguf_discovery_draft_and_engine(
+        self, tmp_path, monkeypatch, launchers, write_gguf, global_settings, layout
+    ):
+        vocab = sorted(pre_tokenizers.ByteLevel.alphabet()) + [
+            "<|im_start|>",
+            "<|im_end|>",
+        ]
+        repo = tmp_path / "models" / "ISTA-DASLab" / "Flash-Next-GGUF"
+        metadata = {
+            key: value
+            for key, value in _qwen38_gguf(vocab).items()
+            if key.startswith("tokenizer.")
+        }
+        metadata.update(
+            {
+                "general.architecture": "qwen4exp",
+                "qwen4exp.block_count": 49,
+                "qwen4exp.nextn_predict_layers": 1,
+                "qwen4exp.context_length": 262144,
+                "qwen4exp.embedding_length": 2560,
+                "qwen4exp.attention.head_count": 24,
+                "qwen4exp.attention.head_count_kv": 2,
+                "qwen4exp.attention.key_length": 256,
+                "qwen4exp.full_attention_interval": 4,
+                "qwen4exp.expert_count": 512,
+                "qwen4exp.expert_used_count": 10,
+            }
+        )
+        name = "Flash-Next-Q2_0"
+        source_folder = repo / "Q2_0" if layout == "variant" else repo
+        first = f"{name}.gguf" if layout == "single" else f"{name}-00001-of-00002.gguf"
+        write_gguf(source_folder / first, metadata)
+        if layout != "single":
+            write_gguf(source_folder / f"{name}-00002-of-00002.gguf", {})
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        model = models[name]
+        text = {**FLASH_NEXT_TEXT, "vocab_size": len(vocab)}
+        folder = Path(model.model_path)
+        config = json.loads((folder / "config.json").read_text())
+        assert config["model_type"] == "qwen4_exp"
+        assert config["text_config"] == {**text, "full_attention_interval": 4}
+        assert model.model_format == "gguf"
+        family = splash_mod.SPLASH_FAMILIES["Qwen3.8-Flash-Next"]
+        monkeypatch.setitem(family, "vocab_size", len(vocab))
+
+        launchers("splash", version="1.3.2")
+        target, reason = resolve_splash_target(folder, None, [])
+        assert target is None
+        assert "Splash 1.4.0 or later" in reason
+        assert splash_mod.splash_draft_to_download(folder, None, []) is None
+
+        launchers("splash", version="1.4.0")
+        wrong_draft = _write_draft(tmp_path / "27B-draft")
+        assert (
+            splash_mod.splash_draft_to_download(folder, None, [str(wrong_draft)])
+            == "incoai/Qwen3.8-Flash-Next-DFlash2"
+        )
+        _, reason = resolve_splash_target(folder, None, [str(wrong_draft)])
+        assert "incoai/Qwen3.8-Flash-Next-DFlash2" in reason
+        draft = _write_draft(
+            tmp_path / "models" / "incoai" / "Qwen3.8-Flash-Next-DFlash2", text
+        )
+        target, reason = resolve_splash_target(
+            folder, None, [str(wrong_draft), str(draft)]
+        )
+        assert reason == ""
+        assert target.family == "Qwen3.8-Flash-Next"
+        assert target.draft_path == draft
+
+        tokenizer = AutoTokenizer.from_pretrained(folder)
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        assert tokenizer.decode(tokenizer.encode(prompt)) == prompt
+        staged = stage_model(folder, "omlx/Flash-Next", tmp_path / "hub")
+        for part in config["omlx_gguf"]["parts"]:
+            assert (staged / part).resolve() == (
+                source_folder / Path(part).name
+            ).resolve()
+
+        pool = EnginePool()
+        pool.discover_models([str(tmp_path / "models")])
+        assert pool._entries[draft.name].is_helper
+        engine = pool._external_engine_for(
+            pool._entries[name], ModelSettings(), model.engine_type
+        )
+        assert isinstance(engine, SplashEngine)
+        assert engine._target.draft_path == draft
+        command = engine._serve_command(9000)
+        model_arg = command[command.index("--model") + 1]
+        assert model_arg == engine._repo_id + (":split" if layout != "single" else "")
+        if layout != "single":
+            assert command[command.index("--served-model-name") + 1] == engine._repo_id
+        assert "--offline" in command
+        assert "--language-only" in command
+        assert command[command.index("--draft-model") + 1] == str(draft.resolve())
+        assert engine._options.max_memory_bytes == splash_memory_estimate(
+            folder, draft, 262144, "int8"
+        )
+
+    def test_qwen_gguf_serves_on_splash_with_a_derived_tokenizer(
+        self, tmp_path, monkeypatch, launchers, write_gguf
+    ):
+        # A small vocabulary keeps the derived tokenizer cheap to build.
+        family = splash_mod.SPLASH_FAMILIES["Qwen3.8-27B"]
+        monkeypatch.setitem(family, "vocab_size", 300)
+        alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
+        specials = ["<|im_start|>", "<|im_end|>"]
+        vocab = alphabet + specials + [f"t{i}" for i in range(300 - 258)]
+        launchers("splash", version="1.3.2")
+        repo = tmp_path / "models" / "unsloth" / "Qwen3.8-27B-GGUF"
+        metadata = _qwen38_gguf(vocab)
+        write_gguf(repo / "Qwen3.8-27B-UD-Q4_K_M.gguf", metadata)
+        write_gguf(repo / "Qwen3.8-27B-BF16-00001-of-00002.gguf", metadata)
+        write_gguf(repo / "Qwen3.8-27B-BF16-00002-of-00002.gguf", {})
+        projector = {"general.architecture": "clip"}
+        write_gguf(repo / "mmproj-BF16.gguf", projector, size=512)
+        draft = _write_draft(tmp_path / "draft", {**QWEN38_TEXT, "vocab_size": 300})
+
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        folder = models["Qwen3.8-27B-UD-Q4_K_M"].model_path
+        target, reason = resolve_splash_target(folder, None, [str(draft)])
+
+        assert reason == ""
+        assert target.family == "Qwen3.8-27B"
+        gguf_bytes = (repo / "Qwen3.8-27B-UD-Q4_K_M.gguf").stat().st_size
+        assert splash_mod._weight_bytes(Path(folder)) == gguf_bytes + 512
+        split = models["Qwen3.8-27B-BF16"].model_path
+        assert resolve_splash_target(split, None, [str(draft)]) == (
+            None,
+            "Split GGUFs need Splash 1.4.0 or later",
+        )
+
+        # The tokenizer comes from the GGUF header, chat template included.
+        tokenizer = AutoTokenizer.from_pretrained(folder)
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        assert prompt == "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        assert tokenizer.decode(tokenizer.encode(prompt)) == prompt
+        assert tokenizer.encode("<|im_end|>") == [vocab.index("<|im_end|>")]
+        assert tokenizer.eos_token == "<|im_end|>"
 
 
 class TestStaging:
@@ -330,6 +597,32 @@ class TestStaging:
         staged = stage_model(snapshot, "omlx/m", tmp_path / "hub")
 
         assert (staged / "config.json").resolve().parent == blobs.resolve()
+
+    def test_optiq_layout_stages_as_splash_reads_it(self, tmp_path):
+        # Splash refuses index shards outside the snapshot root and a vision
+        # checkpoint without a processor file.
+        model = _write_model(tmp_path / "m")
+        weight_map = _add_optiq_vision(model)
+
+        snapshot = stage_model(model, "omlx/m", tmp_path / "hub")
+
+        index = snapshot / "model.safetensors.index.json"
+        assert not index.is_symlink()
+        assert set(json.loads(index.read_text())["weight_map"].values()) == {
+            "model.safetensors",
+            "optiq-optiq_vision.safetensors",
+        }
+        sidecar = (model / "optiq" / "optiq_vision.safetensors").resolve()
+        assert (snapshot / "optiq-optiq_vision.safetensors").resolve() == sidecar
+        assert json.loads((snapshot / "preprocessor_config.json").read_text()) == {
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+        }
+        model_index = json.loads((model / "model.safetensors.index.json").read_text())
+        assert model_index["weight_map"] == weight_map
 
 
 # -- request translation -----------------------------------------------------------
@@ -453,6 +746,34 @@ class TestRequestTranslation:
         assert body["seed"] == 7
         assert "stop" not in body
 
+    def _body_with(self, tmp_path, version, kwargs):
+        return _engine(tmp_path, version=version)._request_body(
+            max_tokens=100,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=0,
+            min_p=0.0,
+            repetition_penalty=1.0,
+            presence_penalty=0.0,
+            kwargs=kwargs,
+        )
+
+    def test_request_body_passes_the_thinking_budget(self, tmp_path):
+        body = self._body_with(tmp_path, "1.3.2", {"thinking_budget": 4096})
+
+        assert body["thinking_token_budget"] == 4096
+
+    def test_request_body_leaves_an_unset_budget_to_splash(self, tmp_path):
+        body = self._body_with(tmp_path, "1.3.2", {"thinking_budget": None})
+
+        assert "thinking_token_budget" not in body
+
+    def test_splash_before_1_3_2_gets_no_budget_field(self, tmp_path):
+        # thinking_token_budget arrived in Splash 1.3.2.
+        body = self._body_with(tmp_path, "1.3.1", {"thinking_budget": 4096})
+
+        assert "thinking_token_budget" not in body
+
 
 # -- streaming -------------------------------------------------------------------
 
@@ -535,6 +856,33 @@ class TestStreaming:
         assert body["stream"] is True and body["return_progress"] is True
         assert engine.has_active_requests() is False
 
+    @pytest.mark.parametrize(
+        "kwargs, expected",
+        [
+            ({"preserve_thinking": True}, True),
+            ({"preserve_thinking": False}, False),
+            ({"reasoning_effort": "high"}, None),
+            (None, None),
+        ],
+    )
+    async def test_preserve_thinking_is_forwarded(self, tmp_path, kwargs, expected):
+        # Qwen 3.6+ templates drop reasoning from turns before the latest user
+        # message unless preserve_thinking is set, which defeats prefix caching.
+        seen = {}
+
+        def handler(request):
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(
+                200, content=_sse({"choices": [{"delta": {"content": "x"}}]})
+            )
+
+        engine = _engine_with_transport(tmp_path, handler)
+        async for _ in engine.stream_chat(
+            [{"role": "user", "content": "hi"}], chat_template_kwargs=kwargs
+        ):
+            pass
+        assert seen["body"].get("preserve_thinking") is expected
+
     async def test_unfinished_reasoning_is_closed(self, tmp_path):
         def handler(request):
             return httpx.Response(
@@ -580,6 +928,7 @@ class TestStreaming:
                 live = engine.get_live_requests()
                 assert live["generating"] == []
                 row = live["prefilling"][0]
+                assert row["request_id"] == "req-1"
                 assert (row["total"], row["processed"]) == (100, 60)
                 assert row["speed"] == (60 - 20) / 0.2
                 assert row["eta"] == (100 - 60) / 200.0
@@ -592,7 +941,7 @@ class TestStreaming:
             tmp_path, lambda request: httpx.Response(200, stream=StreamingBody())
         )
         async for out in engine.stream_chat(
-            [{"role": "user", "content": "hi"}], max_tokens=128
+            [{"role": "user", "content": "hi"}], max_tokens=128, _request_id="req-1"
         ):
             if not out.finished:
                 live = engine.get_live_requests()
@@ -821,6 +1170,19 @@ class TestEnginePool:
                 entry, ModelSettings(external_engine="splash"), "vlm"
             )
 
+    def test_a_gguf_runs_on_an_external_engine_without_the_setting(
+        self, tmp_path, launchers, global_settings
+    ):
+        pool, entry = _pool(tmp_path)
+        entry.model_format = "gguf"
+
+        # No in-process fallback, even with no engine to run it.
+        with pytest.raises(ModelLoadingError, match="Splash is not installed"):
+            pool._external_engine_for(entry, None, "vlm")
+        launchers("splash")
+        engine = pool._external_engine_for(entry, ModelSettings(), "vlm")
+        assert isinstance(engine, SplashEngine)
+
     def test_options_follow_omlx_settings(self, tmp_path, launchers, global_settings):
         launchers("splash")
         pool, entry = _pool(tmp_path)
@@ -893,6 +1255,40 @@ class TestEnginePool:
         pool._current_model_memory = 100 * GIB
         with pytest.raises(ModelLoadingError, match="leaves no memory"):
             pool._external_engine_for(entry, settings, "vlm")
+
+    def test_limit_the_shrunk_budget_cannot_hold_is_left_to_splash(
+        self, tmp_path, launchers, global_settings
+    ):
+        launchers("splash")
+        pool, entry = _pool(tmp_path)
+        pool._get_final_ceiling = lambda: 40 * GIB
+        settings = ModelSettings(external_engine="splash", max_context_window=262144)
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        draft = engine._target.draft_path
+        wanted = splash_memory_estimate(entry.model_path, draft, 262144, "int8")
+
+        # Room for the whole window: the limit goes to Splash.
+        assert engine._options.max_memory_bytes == wanted
+        assert engine._options.max_context == 262144
+
+        # Other models take memory, and the room left cannot hold 256K:
+        # Splash would refuse --max-context 262144, so it fits the context.
+        pool._current_model_memory = 40 * GIB - (wanted - 1)
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        assert engine._options.max_memory_bytes == wanted - 1
+        assert engine._options.max_context is None
+
+        # A smaller limit the shrunk room still holds goes to Splash.
+        small = ModelSettings(external_engine="splash", max_context_window=32768)
+        engine = pool._external_engine_for(entry, small, "vlm")
+        assert engine._options.max_context == 32768
+
+        # A configured budget too small for the limit leaves it to Splash too.
+        pool._current_model_memory = 0
+        global_settings.integrations.splash_max_memory_gb = 4
+        engine = pool._external_engine_for(entry, settings, "vlm")
+        assert engine._options.max_memory_bytes == 4 * GIB
+        assert engine._options.max_context is None
 
     async def test_load_counts_the_planned_budget_and_unload_skips_mlx_barrier(
         self, tmp_path, launchers, global_settings
@@ -1095,9 +1491,31 @@ class TestAdminAPI:
         }
 
         assert rows[entry.model_id] == [
-            {"id": "splash", "label": "Splash", "compatible": True, "reason": ""}
+            {
+                "id": "splash",
+                "label": "Splash",
+                "compatible": True,
+                "reason": "",
+                "draft_repo": None,
+            }
         ]
         assert rows["Qwen3.8-27B-DFlash2"] == []
+
+        # Without its draft the model names the repo that provides it.
+        del pool._entries["Qwen3.8-27B-DFlash2"]
+        info = pool.get_status()["models"][0]
+        (row,) = admin_routes._external_engines_for_model(pool, info, None)
+        assert not row["compatible"]
+        assert row["draft_repo"] == "incoai/Qwen3.8-27B-DFlash2"
+
+        # A draft would not help a checkpoint Splash refuses for another reason.
+        bf16 = _write_model(tmp_path / "bf16")
+        config = json.loads((bf16 / "config.json").read_text())
+        del config["quantization"]
+        (bf16 / "config.json").write_text(json.dumps(config))
+        entry.model_path = str(bf16)
+        (row,) = admin_routes._external_engines_for_model(pool, info, None)
+        assert row["draft_repo"] is None
 
 
 # -- native response_format ---------------------------------------------------
@@ -1267,6 +1685,15 @@ class TestMemoryEstimate:
         # Splash caps context at 256K, and no limit means the whole window.
         assert splash_memory_estimate(model, draft, None, "int8") == int8
         assert splash_memory_estimate(model, draft, 10**6, "int8") == int8
+
+    def test_counts_a_vision_tower_in_a_subdirectory(self, tmp_path):
+        model = _write_model(tmp_path / "m")
+        draft = _write_draft(tmp_path / "draft")
+        before = splash_memory_estimate(model, draft, 1024, "int8")
+
+        _add_optiq_vision(model)
+
+        assert splash_memory_estimate(model, draft, 1024, "int8") == before + 512
 
 
 class TestProcessMemory:
@@ -1618,3 +2045,47 @@ class TestVision:
             {"type": "text", "text": "?"},
             {"type": "image_url", "image_url": {"url": url, "detail": "auto"}},
         ]
+
+
+# -- later system messages (#4697) -------------------------------------------------
+
+
+class TestLaterSystem:
+    @pytest.mark.parametrize(
+        ("later_system", "expected"),
+        [
+            ("native", True),
+            ("patched", True),
+            ("unsupported", False),
+            ({"default": "patched", "tool_use": "native"}, None),
+        ],
+    )
+    async def test_status_sets_the_tokenizer_capability(
+        self, tmp_path, later_system, expected
+    ):
+        status = {"chat_template": {"later_system": later_system}}
+        engine = _engine_with_transport(
+            tmp_path, lambda request: httpx.Response(200, json=status)
+        )
+        engine._tokenizer = SimpleNamespace()
+
+        await engine._refresh_status()
+
+        assert engine._tokenizer._omlx_supports_mid_system_messages is expected
+
+    def test_token_count_folds_later_system_messages(self, tmp_path):
+        class StrictTemplate:
+            def apply_chat_template(self, messages, **kwargs):
+                if any(m["role"] == "system" for m in messages[1:]):
+                    raise ValueError("System message must be at the beginning.")
+                return list("".join(f"<{m['role']}>{m['content']}" for m in messages))
+
+        engine = _engine(tmp_path)
+        engine._tokenizer = StrictTemplate()
+        messages = [
+            {"role": "system", "content": "lead"},
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "note"},
+        ]
+
+        assert engine.count_chat_tokens(messages) == len("<system>lead\n\nnote<user>hi")

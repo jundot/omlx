@@ -381,7 +381,7 @@ def test_qwen4_decode_sdpa_fails_closed_when_native_shape_is_rejected(monkeypatc
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
 
-    from omlx.custom_kernels.decode_fast import fast
+    from omlx.custom_kernels.attention import fast
 
     q = mx.random.normal((1, 4, 1, 8))
     k = mx.random.normal((1, 2, 9, 8))
@@ -408,7 +408,7 @@ def test_qwen4_decode_sdpa_uses_native_only_after_capability_accepts(monkeypatch
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx_vlm.models.qwen4_exp.qsa_fast as qsa_fast
 
-    from omlx.custom_kernels.decode_fast import fast
+    from omlx.custom_kernels.attention import fast
 
     q = mx.random.normal((1, 24, 1, 256)).astype(mx.bfloat16)
     k = mx.random.normal((1, 2, 2051, 256)).astype(mx.bfloat16)

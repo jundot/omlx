@@ -52,6 +52,11 @@ NEMOTRON_H = TensorStrategy(
     model_types=("nemotron_h",),
     source="oMLX adapter derived from Exo's attention/Mamba/MoE strategy",
 )
+GLM5_NEXT = TensorStrategy(
+    name="glm5_next",
+    model_types=("glm5_next",),
+    source="oMLX adapter for the vendored GLM-5.3 KDA, sparse MLA and MoE layers",
+)
 
 
 def registered_model_types() -> frozenset[str]:
@@ -620,6 +625,126 @@ def _shard_nemotron_h(
         )
 
 
+def _glm5_rows(path: str, weight: Any) -> Any:
+    # Per-expert NVFP4 tensor scales stay whole: every rank keeps every expert.
+    if path.endswith("global_scale"):
+        return None
+    return -1 if path.endswith("bias") else max(weight.ndim - 2, 0)
+
+
+def _glm5_columns(path: str, weight: Any) -> Any:
+    if path.endswith(("bias", "global_scale")):
+        return None
+    return -1
+
+
+def _sum_outputs(module: Any, group: Any, mx: Any) -> None:
+    """Make ``module`` all-sum its output and keep its type.
+
+    The fused decode paths and the cache factory read attributes of the
+    attention and MLP modules, so a wrapper module cannot replace them.
+    """
+
+    base = type(module)
+
+    class Summed(base):  # type: ignore[misc, valid-type]
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            output = base.__call__(self, *args, **kwargs)
+            return mx.distributed.all_sum(output, group=group)
+
+    Summed.__name__ = Summed.__qualname__ = base.__name__
+    module.__class__ = Summed
+
+
+def _shard_glm5_mlp(mlp: Any, group: Any) -> None:
+    from mlx.nn.layers.distributed import shard_inplace
+
+    shard_inplace(mlp.gate_proj, _glm5_rows, group=group)
+    shard_inplace(mlp.up_proj, _glm5_rows, group=group)
+    shard_inplace(mlp.down_proj, _glm5_columns, group=group)
+
+
+@_register(GLM5_NEXT)
+def _shard_glm5_next(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    # Projections are sliced in place: the model calls its quantized matmul
+    # kernels on them directly, which would skip a sharded linear's all_sum.
+    from mlx.nn.layers.distributed import shard_inplace
+
+    layers = list(model.layers)
+    size = int(group.size())
+    rank = int(group.rank())
+    total = len(layers)
+    for index, layer in enumerate(layers):
+        mx.eval(layer.parameters())
+        attention = layer.self_attn
+        if "bias" in attention.o_proj:
+            raise ValueError("GLM-5.3 tensor parallelism needs a bias-free o_proj")
+        if layer.is_linear:
+            _require_divisible(attention.num_heads, size, "linear attention heads")
+            heads = attention.num_heads // size
+            width = heads * attention.head_dim
+            gate = attention.forget_gate
+            for projection in (
+                attention.q_proj,
+                attention.k_proj,
+                attention.v_proj,
+                attention.b_proj,
+                attention.g_b_proj,
+                gate.f_b_proj,
+            ):
+                shard_inplace(projection, _glm5_rows, group=group)
+            shard_inplace(attention.o_proj, _glm5_columns, group=group)
+            # The short conv runs over q|k|v channels.
+            channels = mx.concatenate(
+                [
+                    mx.arange(start + rank * width, start + (rank + 1) * width)
+                    for start in range(0, 3 * attention.qkv_dim, attention.qkv_dim)
+                ]
+            )
+            attention.conv1d.weight = mx.contiguous(attention.conv1d.weight[channels])
+            gate.A_log = mx.contiguous(mx.split(gate.A_log, size)[rank])
+            gate.dt_bias = mx.contiguous(mx.split(gate.dt_bias, size)[rank])
+            attention.num_heads = gate.num_heads = heads
+            attention.qkv_dim = gate.qkv_dim = width
+            attention.conv_dim = attention.conv1d.groups = 3 * width
+        else:
+            _require_divisible(attention.num_heads, size, "attention heads")
+            heads = attention.num_heads // size
+            shard_inplace(attention.q_b_proj, _glm5_rows, group=group)
+            shard_inplace(attention.o_proj, _glm5_columns, group=group)
+            for projection in (attention.embed_q, attention.unembed_out):
+                projection.apply(lambda w: mx.contiguous(mx.split(w, size)[rank]))
+            attention.num_heads = heads
+        # The latent projections, the indexer and the router stay replicated.
+        _sum_outputs(attention, group, mx)
+
+        mlp = layer.mlp
+        if hasattr(mlp, "switch_mlp"):
+            switch = mlp.switch_mlp
+            shard_inplace(switch.gate_proj, _glm5_rows, group=group)
+            shard_inplace(switch.up_proj, _glm5_rows, group=group)
+            shard_inplace(switch.down_proj, _glm5_columns, group=group)
+            if mlp.shared_experts is not None:
+                _shard_glm5_mlp(mlp.shared_experts, group)
+        else:
+            _shard_glm5_mlp(mlp, group)
+        _sum_outputs(mlp, group, mx)
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        _emit(
+            progress,
+            strategy=GLM5_NEXT.name,
+            layer=index,
+            loaded=index + 1,
+            total=total,
+        )
+
+
 def apply_tensor_strategy(
     model: Any,
     group: Any,
@@ -645,6 +770,7 @@ def apply_tensor_strategy(
 
 
 __all__ = [
+    "GLM5_NEXT",
     "NEMOTRON_H",
     "QWEN3_NEXT",
     "TensorStrategy",

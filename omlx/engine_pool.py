@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 import mlx.core as mx
 
+from . import gguf
 from .engine import BaseEngine, BatchedEngine
 from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
@@ -43,6 +44,7 @@ from .engine.splash import (
     SplashTarget,
     find_splash_binary,
     resolve_splash_target,
+    splash_draft_to_download,
     splash_memory_estimate,
     splash_repo_id,
 )
@@ -63,6 +65,7 @@ from .exceptions import (
 )
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
+    detect_model_type,
     discover_models,
     format_size,
     is_realtime_stt_model,
@@ -76,7 +79,7 @@ from .patches.qwen35_yarn import yarn_factor
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
 from .speculative.dflash import context_bytes_per_row, load_dflash_drafter
-from .utils.fatal import exit_if_gpu_submissions_ignored
+from .utils.fatal import exit_if_gpu_submissions_ignored, is_command_buffer_error
 from .utils.generation_config import SAMPLING_SETTING_KEYS, load_sampling_defaults
 from .utils.metal_sync import unreleased_graphics_bytes
 from .utils.model_loading import (
@@ -88,6 +91,14 @@ from .utils.model_loading import (
 from .utils.proc_memory import get_phys_footprint
 
 logger = logging.getLogger(__name__)
+
+
+def _gguf_model_root() -> Path | None:
+    """Where GGUF model folders are generated; None before settings load."""
+    try:
+        return get_global_settings().base_path / "gguf"
+    except RuntimeError:
+        return None
 
 
 def _touch_gpu() -> None:
@@ -108,9 +119,52 @@ def _touch_gpu() -> None:
 # with a resident model still lets the GPU reach its idle power state.
 _GPU_KEEP_WARM_IDLE_WINDOW_S = 300.0
 
+# Claude Desktop tier alias slots. When ``ClaudeCodeSettings.desktop_enabled``
+# is set, oMLX exposes these slot IDs as derived (non-persisted) model IDs
+# that resolve at runtime to the models configured in the Claude Code tiers.
+# Each entry maps the public slot ID to the tier attribute name on the
+# Claude Code settings object (``opus_model`` / ``sonnet_model`` /
+# ``haiku_model``).
+CLAUDE_DESKTOP_TIER_SLOTS: tuple[tuple[str, str], ...] = (
+    ("claude-opus", "opus"),
+    ("claude-sonnet", "sonnet"),
+    ("claude-haiku", "haiku"),
+)
+
+# Anthropic family tier label exposed per slot in /v1/models metadata.
+CLAUDE_DESKTOP_TIER_FAMILY: dict[str, str] = {
+    "claude-opus": "opus",
+    "claude-sonnet": "sonnet",
+    "claude-haiku": "haiku",
+}
+
+
+def build_claude_tier_aliases(claude_code_settings) -> dict[str, str]:
+    """Build slot-ID -> tier-model map from Claude Code settings.
+
+    Returns an empty dict when ``desktop_enabled`` is falsy. Tiers with no
+    configured model (None/empty) are omitted, so their slot is neither
+    exposed nor resolved. Duck-typed on purpose: anything exposing
+    ``desktop_enabled`` / ``<tier>_model`` attributes works.
+    """
+    if claude_code_settings is None or not getattr(
+        claude_code_settings, "desktop_enabled", False
+    ):
+        return {}
+    aliases: dict[str, str] = {}
+    for slot_id, tier in CLAUDE_DESKTOP_TIER_SLOTS:
+        target = getattr(claude_code_settings, f"{tier}_model", None)
+        if target:
+            aliases[slot_id] = target
+    return aliases
+
+
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+# Cluster ranks load the text model through mlx-lm, so a VLM-classified
+# checkpoint is served text-only while its deployment is active.
+_CLUSTER_ENGINE_TYPES = frozenset({"batched", "vlm"})
 
 
 def _positive_int(value: object) -> int:
@@ -328,6 +382,8 @@ class EngineEntry:
     source_type: str = "local"
     source_repo_id: str | None = None
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+    model_format: str | None = None  # "gguf": served by an external engine only
+    source_path: str | None = None  # The GGUF file a generated folder links to
     engine: (
         BaseEngine
         | EmbeddingEngine
@@ -504,7 +560,7 @@ class EnginePool:
             deployment = getattr(entry.engine, "deployment", None)
             return deployment if isinstance(deployment, ClusterDeployment) else None
         registry = self._cluster_registry
-        if registry is None or entry.engine_type != "batched":
+        if registry is None or entry.engine_type not in _CLUSTER_ENGINE_TYPES:
             return None
         return registry.get_for_model(entry.model_path)
 
@@ -540,7 +596,7 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
-        if getattr(runtime_settings, "external_engine", None):
+        if self.external_engine_id(entry.model_id, runtime_settings):
             # Splash plans its own budget; none of the MLX reservations apply.
             target, _ = self.splash_target(entry.model_id, runtime_settings)
             if target is not None:
@@ -1143,6 +1199,7 @@ class EnginePool:
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:
+            add("turboquant_kv_scheme", data.get("turboquant_kv_scheme", "turboquant"))
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
@@ -1351,10 +1408,11 @@ class EnginePool:
             dirs = [Path(d) for d in model_dirs]
         self._model_dirs = dirs
 
+        gguf_root = _gguf_model_root()
         if len(dirs) == 1:
-            discovered = discover_models(dirs[0])
+            discovered = discover_models(dirs[0], gguf_root)
         else:
-            discovered = discover_models_from_dirs(dirs)
+            discovered = discover_models_from_dirs(dirs, gguf_root)
 
         pinned_set = set(pinned_models or [])
 
@@ -1386,6 +1444,8 @@ class EnginePool:
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
                     is_helper=getattr(info, "is_helper", False),
+                    model_format=getattr(info, "model_format", None),
+                    source_path=getattr(info, "source_path", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -1404,6 +1464,13 @@ class EnginePool:
         ]
         for mid in stale:
             del self._entries[mid]
+        if gguf_root is not None:
+            # Loaded models keep their folder until they unload.
+            in_use = [
+                *(entry.model_path for entry in self._entries.values()),
+                *(info.model_path for info in discovered.values()),
+            ]
+            gguf.prune_model_folders(gguf_root, {Path(path).name for path in in_use})
 
         # Warn about pinned models not found
         found_models = set(self._entries.keys())
@@ -1569,10 +1636,10 @@ class EnginePool:
         if not matches:
             raise ModelNotFoundError(model_path, list(self._entries.keys()))
         model_id, entry = self._select_cluster_path_match(matches)
-        if entry.engine_type != "batched":
+        if entry.engine_type not in _CLUSTER_ENGINE_TYPES:
             raise ValueError(
                 f"Model '{model_id}' is a {entry.model_type} model. "
-                "Distributed cluster inference currently supports text LLM "
+                "Distributed cluster inference supports text generation "
                 "models only."
             )
         return model_id
@@ -1607,11 +1674,11 @@ class EnginePool:
         ]
         if exact:
             model_id, entry = self._select_cluster_path_match(exact)
-            if entry.engine_type != "batched":
+            if entry.engine_type not in _CLUSTER_ENGINE_TYPES:
                 raise ValueError(
                     f"Model '{model_id}' is already registered as "
                     f"{entry.model_type}; stop or remove that local model "
-                    "before activating it as a text cluster model."
+                    "before activating it as a cluster model."
                 )
             return model_id, False
 
@@ -1637,7 +1704,8 @@ class EnginePool:
         self._entries[model_id] = EngineEntry(
             model_id=model_id,
             model_path=str(path),
-            model_type="llm",
+            # Matches the local entry, so media input is refused the same way.
+            model_type="vlm" if detect_model_type(path) == "vlm" else "llm",
             engine_type="batched",
             estimated_size=int(estimated_size),
             config_model_type=str(config.get("model_type") or ""),
@@ -1719,7 +1787,12 @@ class EnginePool:
     ) -> None:
         """Drop stale unloaded entries whose backing model directory vanished."""
         model_path = Path(entry.model_path)
-        if model_path.exists() and (model_path / "config.json").exists():
+        source = entry.source_path
+        if (
+            model_path.exists()
+            and (model_path / "config.json").exists()
+            and (source is None or Path(source).exists())
+        ):
             return
 
         if entry.engine is None:
@@ -1770,14 +1843,23 @@ class EnginePool:
                 return mid
         return None
 
-    def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
+    def resolve_model_id(
+        self,
+        model_id_or_alias: str,
+        settings_manager,
+        claude_tier_aliases: dict[str, str] | None = None,
+    ) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
         Tries exact match in _entries first, then case-insensitive match,
         then active cluster deployment IDs, exposed profile model IDs, and
-        model settings aliases. If those fail and input contains a provider
-        prefix (e.g. "omlx/my-model"), strips the prefix and retries. Returns
-        the original string if no match is found.
+        model settings aliases. Claude Desktop tier aliases (derived at
+        runtime from the Claude Code tier models, passed via
+        ``claude_tier_aliases``) resolve AFTER exact directory matches and
+        custom ``model_alias`` entries, so a real model or user alias with
+        the same name always wins. If those fail and input contains a
+        provider prefix (e.g. "omlx/my-model"), strips the prefix and
+        retries. Returns the original string if no match is found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
@@ -1818,6 +1900,13 @@ class EnginePool:
                 if ms.model_alias and ms.model_alias == model_id_or_alias:
                     return mid
 
+        # Claude Desktop tier aliases are derived at runtime and resolve only
+        # after exact directory matches and custom aliases.
+        if claude_tier_aliases:
+            tier_target = claude_tier_aliases.get(model_id_or_alias)
+            if tier_target is not None:
+                return tier_target
+
         # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
         if "/" in model_id_or_alias:
             stripped = model_id_or_alias.split("/", 1)[1]
@@ -1830,6 +1919,10 @@ class EnginePool:
                 for mid, ms in all_settings.items():
                     if ms.model_alias and ms.model_alias == stripped:
                         return mid
+            if claude_tier_aliases:
+                tier_target = claude_tier_aliases.get(stripped)
+                if tier_target is not None:
+                    return tier_target
 
         return model_id_or_alias
 
@@ -1942,6 +2035,19 @@ class EnginePool:
             self._splash_draft_candidates(model_settings),
         )
 
+    def splash_draft_to_download(
+        self, model_id: str, model_settings: object | None
+    ) -> str | None:
+        """The DFlash2 draft repo ``model_id`` lacks for Splash, or None."""
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return None
+        return splash_draft_to_download(
+            entry.model_path,
+            get_global_settings().integrations.splash_path,
+            self._splash_draft_candidates(model_settings),
+        )
+
     def _splash_sizing_context(
         self, entry: EngineEntry, model_settings: object | None
     ) -> int | None:
@@ -2015,10 +2121,34 @@ class EnginePool:
             get_settings = getattr(self._settings_manager, "get_settings", None)
             if callable(get_settings):
                 settings = get_settings(model_id)
-        if getattr(settings, "external_engine", None):
+        if self.external_engine_id(model_id, settings):
             await asyncio.to_thread(
                 find_splash_binary, get_global_settings().integrations.splash_path
             )
+
+    async def external_engine_problem(
+        self, model_id: str, model_settings: object | None
+    ) -> str:
+        """Why no external engine can serve ``model_id``; empty when one can."""
+        await self._check_splash_launcher(model_id, model_settings)
+        _, reason = self.splash_target(model_id, model_settings)
+        return reason
+
+    def external_engine_id(
+        self, model_id: str, model_settings: object | None
+    ) -> str | None:
+        """The external engine that serves ``model_id``, else None.
+
+        A GGUF, which no in-process engine loads, falls back to the default
+        external engine when its settings pick none.
+        """
+        engine_id = getattr(model_settings, "external_engine", None)
+        if engine_id:
+            return engine_id
+        entry = self._entries.get(model_id)
+        if entry is not None and entry.model_format == "gguf":
+            return next(iter(EXTERNAL_ENGINES))
+        return None
 
     def _external_engine_for(
         self,
@@ -2031,7 +2161,7 @@ class EnginePool:
         A model that cannot run on its selected engine fails to load with the
         reason instead of falling back to MLX, since the user asked for it.
         """
-        engine_id = getattr(model_settings, "external_engine", None)
+        engine_id = self.external_engine_id(entry.model_id, model_settings)
         if not engine_id:
             return None
         if engine_id not in EXTERNAL_ENGINES:
@@ -2071,6 +2201,26 @@ class EnginePool:
         # Only an explicit limit goes to Splash; otherwise Splash fits the
         # context to its budget and the server adopts what it planned.
         requested_context = getattr(model_settings, "max_context_window", None)
+        budget = self._splash_memory_budget(entry, model_settings, target)
+        if requested_context and budget < splash_memory_estimate(
+            entry.model_path,
+            target.draft_path,
+            requested_context,
+            integrations.splash_kv_format,
+        ):
+            # The budget cannot hold the explicit limit (the room under the
+            # memory limit shrank, or splash_max_memory_gb is small), and
+            # Splash refuses to start on a limit it cannot hold. Without it
+            # Splash fits the context to the budget, and the server still
+            # caps prompts at the configured limit.
+            logger.warning(
+                "Splash: a %.1fGB budget cannot hold the %d-token context of "
+                "%s; letting Splash fit the context to the budget",
+                budget / 1024**3,
+                requested_context,
+                entry.model_id,
+            )
+            requested_context = None
         return SplashEngine(
             model_name=entry.model_path,
             model_id=entry.model_id,
@@ -2079,9 +2229,7 @@ class EnginePool:
             log_dir=settings.logging.get_log_dir(settings.base_path) / "splash",
             options=SplashOptions(
                 max_context=requested_context,
-                max_memory_bytes=self._splash_memory_budget(
-                    entry, model_settings, target
-                ),
+                max_memory_bytes=budget,
                 kv_format=integrations.splash_kv_format,
                 ane_prefill=integrations.splash_ane_prefill,
                 cache_disk_bytes=cache_disk_bytes,
@@ -3030,9 +3178,9 @@ class EnginePool:
                         continue
                     if not ane_release_attempted:
                         # Last rung before giving up: shed the requesting
-                        # model's own ANE prefill banks. They hold the packed
-                        # weight blobs mapped into the native programs (~13 GB
-                        # for a 27B at the default fractions) and are purely
+                        # model's own ANE prefill banks. The ANE driver wires
+                        # their program weights during prefill (~7 GiB for a
+                        # 27B at the default fractions) and they are purely
                         # an accelerator — the per-module failure-latch
                         # fallback serves the same modules on GPU — so at
                         # long context the trade is a slower-but-unthrottled
@@ -3240,12 +3388,10 @@ class EnginePool:
     ) -> int:
         """Release the requesting model's ANE prefill banks; report bytes freed.
 
-        The compiled banks keep the packed weight blobs mapped into the
-        native ANE programs for the model's whole residency, so a config
-        tuned at a short calibration length silently competes with the KV
-        cache at long context — on a 27B at mlp 0.35 / gdn 0.45 the banks
-        hold ~13 GB, which is the difference between full 2048-token prefill
-        chunks and the guard throttling to the floor. Shedding them is safe:
+        The ANE driver wires the banks' program weights during every
+        prefill (about 7 GiB on a 27B at the default split), which the
+        admission estimate reserves on top of the KV cache at long context.
+        Shedding them is safe:
         the release latches every sliced module through the existing
         per-module failure flags, so the dispatch sites fall back to stock
         GPU compute exactly as they do after a warmup failure. The banks are
@@ -3315,8 +3461,8 @@ class EnginePool:
             )
             return 0
         freed = max(0, before - get_phys_footprint())
-        # The load-time admission reservation priced these I/O surfaces; drop
-        # it so later passes stop pausing for memory that no longer exists.
+        # The load-time admission reservation priced these program weights;
+        # drop it so later passes stop pausing for memory that no longer exists.
         # The next load re-prices it from the rebuilt banks.
         monitor = getattr(getattr(core, "scheduler", None), "memory_monitor", None)
         if monitor is not None and hasattr(monitor, "clear_ane_prefill_transient"):
@@ -3393,7 +3539,7 @@ class EnginePool:
         try:
             await loop.run_in_executor(get_mlx_executor(), sync_clear)
         except RuntimeError as e:
-            if "Command buffer execution failed" not in str(e):
+            if not is_command_buffer_error(e):
                 raise
             exit_if_gpu_submissions_ignored(e)
             # A failed prefill can leave this error pending. MLX clears it when
@@ -3795,7 +3941,7 @@ class EnginePool:
 
             # An external engine replaces every in-process engine.
             engine = self._external_engine_for(entry, model_settings, effective_type)
-            deployment = deployment if effective_type == "batched" else None
+            deployment = deployment if effective_type in _CLUSTER_ENGINE_TYPES else None
             # Decision models never decode, so speculative decoding settings
             # saved for the same checkpoint do not apply.
             if (
@@ -3872,6 +4018,7 @@ class EnginePool:
                             model_settings, "enable_thinking", None
                         ),
                         model_settings=model_settings,
+                        vision_checkpoint=entry.model_type == "vlm",
                     )
                     logger.info(
                         "Distributed inference enabled for %s: ranks=%d "
@@ -4371,6 +4518,8 @@ class EnginePool:
                     "reasoning_efforts": e.reasoning_efforts,
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
+                    "model_format": e.model_format,
+                    "source_path": e.source_path,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
             )

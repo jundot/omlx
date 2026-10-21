@@ -149,6 +149,7 @@ def choose_parallelism(
     measurements: Mapping[int, Any] | None = None,
     workload_profile: str = "balanced",
     context_tokens: int = 8192,
+    head_rank_extra_bytes: int = 0,
 ) -> ParallelismChoice:
     """Pick the tensor-parallel degree and produce the plan it implies.
 
@@ -270,6 +271,7 @@ def choose_parallelism(
                 tensor_parallel_size=tensor_parallel_size,
                 workload_profile=workload_profile,
                 context_tokens=context_tokens,
+                head_rank_extra_bytes=head_rank_extra_bytes,
             )
         except PlanningError as exc:
             last_error = exc

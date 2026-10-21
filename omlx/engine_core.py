@@ -20,6 +20,7 @@ import os
 import threading
 import time
 import uuid
+import weakref
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import (
@@ -36,6 +37,7 @@ from typing import (
 
 import mlx.core as mx
 
+from .custom_kernels.quant_matmul.fast import share_command_queue
 from .exceptions import (
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
@@ -50,6 +52,7 @@ from .utils.fatal import (
     FATAL_TEARDOWN_TIMEOUT_S,
     exit_if_gpu_submissions_ignored,
     fatal_exit,
+    is_command_buffer_error,
 )
 from .utils.hardware import format_bytes
 from .utils.metal_sync import clear_thread_streams
@@ -192,12 +195,65 @@ def _raise_request_output_error(output: RequestOutput) -> None:
 
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_engines_on_own_queues: "weakref.WeakSet[EngineCore]" = weakref.WeakSet()
+_warned_own_queues = False
+
+
+def _note_engine_on_own_queue(engine: "EngineCore") -> None:
+    """Warn once when two live engines submit on separate Metal queues."""
+    global _warned_own_queues
+    _engines_on_own_queues.add(engine)
+    live = sum(1 for e in _engines_on_own_queues if not e._closed)
+    if _warned_own_queues or live < 2:
+        return
+    _warned_own_queues = True
+    logger.warning(
+        "Loaded models submit GPU work on separate Metal command queues "
+        "because the native quant_matmul extension is missing or predates "
+        "share_command_queue. Running several models at once can then hang "
+        "the GPU (#4224). Rebuild the native kernels with `make kernels`."
+    )
+
+
+def _teardown_sync_and_clear_cache(stream: Any = None) -> None:
+    """Drain and clear the Metal pool past errors a GPU reset left behind.
+
+    MLX raises an encoder's stored command-buffer error once and then clears
+    it, so the given stream and the thread's default stream need at most one
+    retry each.
+    """
+    for attempt in range(3):
+        try:
+            _sync_and_clear_cache(stream)
+            return
+        except RuntimeError as exc:
+            if attempt == 2 or not is_command_buffer_error(exc):
+                raise
+            logger.warning("Dropping a pending Metal error during teardown: %s", exc)
+
+
+def _drop_pending_gpu_errors(stream: Any) -> None:
+    """Raise and log errors a GPU reset left on this thread's streams.
+
+    Later teardown syncs then run to completion. No buffer lock is taken, so
+    this does not wait on an in-flight store worker.
+    """
+    for sync in (lambda: mx.synchronize(stream), mx.synchronize):
+        try:
+            sync()
+        except RuntimeError as exc:
+            exit_if_gpu_submissions_ignored(exc)
+            if "no Stream" in str(exc):
+                continue
+            if not is_command_buffer_error(exc):
+                raise
+            logger.warning("Dropping a pending Metal error during teardown: %s", exc)
 
 
 def _final_engine_thread_reclaim(stream: Any) -> None:
     """Drop Python cycles and reclaim MLX buffers on the engine worker thread."""
     gc.collect()
-    _sync_and_clear_cache(stream)
+    _teardown_sync_and_clear_cache(stream)
     gc.collect()
     clear_thread_streams()
 
@@ -205,7 +261,7 @@ def _final_engine_thread_reclaim(stream: Any) -> None:
 def _final_global_mlx_thread_reclaim() -> None:
     """Reclaim MLX state before the process-wide worker thread exits."""
     gc.collect()
-    _sync_and_clear_cache()
+    _teardown_sync_and_clear_cache()
     gc.collect()
     clear_thread_streams()
 
@@ -388,6 +444,14 @@ class EngineCore:
         model = None
         tokenizer = None
 
+        # Engine streams submit to one Metal command queue. Busy engines on
+        # separate queues can trip a GPU firmware lockup (#4224).
+        queue = self._mlx_executor.submit(
+            share_command_queue, self._mlx_stream
+        ).result()
+        if queue is None:
+            _note_engine_on_own_queue(self)
+
         logger.debug(f"Engine {self._engine_id} initialized")
 
     async def start(self) -> None:
@@ -493,8 +557,8 @@ class EngineCore:
     async def _engine_loop(self) -> None:
         """Main engine loop - runs scheduler steps on the MLX executor.
 
-        All scheduler steps run on _mlx_executor (single-worker thread) to
-        guarantee that MLX GPU operations are never concurrent.  VLM vision
+        All scheduler steps run on _mlx_executor (single-worker thread), so
+        this engine's MLX GPU operations are never concurrent.  VLM vision
         encoding also runs on the same executor, so inline scheduler.step()
         on the event loop would race with vision mx.eval() and segfault.
         """
@@ -1263,17 +1327,25 @@ class EngineCore:
 
         self.scheduler._engine_teardown = teardown
 
+        def drain_gpu_errors() -> None:
+            _drop_pending_gpu_errors(self._mlx_stream)
+
         # Both shutdown() and deep_reset() touch the engine stream (directly
         # or via _drain_pending_async_removes / _do_abort_request). The
         # stream is bound to the engine's executor thread, so dispatch both
         # through the executor. Rejection cannot safely move MLX cleanup
-        # onto the close caller's thread.
-        for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
+        # onto the close caller's thread. Errors a GPU reset left on the
+        # stream are drained first so the two steps do not stop on them.
+        for fn in (
+            drain_gpu_errors,
+            self.scheduler.shutdown,
+            self.scheduler.deep_reset,
+        ):
             fn_name = getattr(fn, "__name__", repr(fn))
             try:
                 teardown.set_phase(fn_name)
                 self._mlx_executor.submit(fn).result(
-                    timeout=teardown.remaining(mlx=fn_name == "deep_reset")
+                    timeout=teardown.remaining(mlx=fn_name != "shutdown")
                 )
             except concurrent.futures.TimeoutError:
                 fatal_exit(

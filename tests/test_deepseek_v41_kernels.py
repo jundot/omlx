@@ -101,11 +101,14 @@ def test_index_scores_packed_candidates_and_causal(
         )
     actual = packed_index_scores(q, keys, weights, 263, 2, candidates)
     expanded = unpack_activation(keys, 4, dtype=mx.float32)
-    expected = mx.sum(
-        mx.maximum(mx.einsum("bshd,btd->bsht", q.astype(mx.float32), expanded), 0)
-        * weights[..., None],
-        -2,
+    # DeepSeek-V4.1-Flash-1017 Indexer rounding points, in the activation dtype R:
+    # R(q.k), R(relu(.) * w), then an fp32 head sum stored as R.
+    rnd = lambda v: v.astype(dtype).astype(mx.float32)
+    terms = rnd(
+        mx.maximum(rnd(mx.einsum("bshd,btd->bsht", q.astype(mx.float32), expanded)), 0)
+        * weights[..., None]
     )
+    expected, magnitude = rnd(mx.sum(terms, -2)), mx.sum(mx.abs(terms), -2)
     valid = mx.arange(n) < ((263 + mx.arange(length) + 1) // 2)[:, None]
     expected = mx.where(valid, expected, -float("inf"))
     if candidates is not None:
@@ -113,7 +116,18 @@ def test_index_scores_packed_candidates_and_causal(
         expected = mx.where(
             (candidates >= 0) & (candidates < n), expected, -float("inf")
         )
-    np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-5)
+        magnitude = mx.take_along_axis(magnitude, mx.clip(candidates, 0, n - 1), -1)
+    # Free orders (the q.k dot and the head sum) can move each R rounding by one ulp.
+    eps = float(np.finfo(np.float32).eps) if dtype == mx.float32 else (
+        2.0**-10 if dtype == mx.float16 else 2.0**-7
+    )
+    actual, expected = np.asarray(actual), np.asarray(expected)
+    finite = np.isfinite(expected)
+    np.testing.assert_array_equal(np.isfinite(actual), finite)
+    np.testing.assert_array_less(
+        np.abs(actual - expected)[finite],
+        (2 * eps * np.asarray(magnitude) + 3e-5)[finite],
+    )
 
 
 def test_candidate_block_ids_preserve_latest_and_partial_blocks():
@@ -550,6 +564,34 @@ def test_radix_selection_matches_tile_selection(width, distinct):
         np.testing.assert_array_equal(
             np.sort(np.asarray(actual), -1), np.sort(np.asarray(expected), -1)
         )
+
+
+@pytest.mark.parametrize("width,distinct", [(7, 0), (2048, 0), (4096, 4), (9000, 0)])
+def test_index_select_matches_selection_pipelines(width, distinct):
+    """Decode / verify selection: the tile top-k + sort pipeline (packed_index_topk) and the
+    argsort pipeline over candidates (Indexer), ties to the lower position, -inf as -1."""
+    rng = np.random.default_rng(width + distinct)
+    if distinct:
+        data = rng.integers(0, distinct, (1, 4, width)).astype(np.float32)
+    else:
+        data = rng.normal(size=(1, 4, width)).astype(np.float32)
+    data[0, 0, : width * 4 // 5] = -np.inf   # fewer finite scores than selected
+    data[0, 1, ::3] = 0.0
+    data[0, 1, 1::3] = -0.0
+    scores = mx.array(data)
+    candidates = np.sort(rng.choice(10 * width, width, replace=False)).astype(np.int32)
+    candidates = mx.array(np.broadcast_to(candidates, (1, 4, width)).copy())
+    for count in (1, 512, 2048):
+        c = min(count, width)
+        values, ids = kernels._tile_topk(scores, c)
+        expected = mx.sort(mx.where(values > -float("inf"), ids, -1), axis=-1)
+        if c < count:
+            expected = mx.concatenate([mx.full((1, 4, count - c), -1, mx.int32), expected], -1)
+        assert mx.array_equal(kernels.index_select(scores, count), expected).item()
+        order = mx.argsort(-scores, axis=-1)[..., :c].astype(mx.int32)
+        valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
+        expected = mx.sort(mx.where(valid, mx.take_along_axis(candidates, order, -1), -1), axis=-1)
+        assert mx.array_equal(kernels.index_select(scores, c, candidates), expected).item()
 
 
 def test_deep_prefill_index_selection_matches_full_scores():

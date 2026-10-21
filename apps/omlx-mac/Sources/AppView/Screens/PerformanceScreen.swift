@@ -268,7 +268,7 @@ private struct MemoryLifecycleSection: View {
                             .foregroundStyle(theme.warningText)
                         VStack(alignment: .leading, spacing: 6) {
                             Text(warning)
-                                .font(.omlxText(11))
+                                .font(.omlxText(DesignTokens.FontSize.subheadline))
                                 .foregroundStyle(theme.text)
                                 .fixedSize(horizontal: false, vertical: true)
                             CodeChip(value: vm.wiredLimitCommand)

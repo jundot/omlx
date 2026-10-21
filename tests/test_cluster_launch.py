@@ -1553,6 +1553,25 @@ def test_prompt_cache_ssd_can_be_turned_off(tmp_path):
     assert _prompt_cache_ssd_dir(off, rank=0) is None
 
 
+def test_lightning_mtp_reaches_the_rank_load_settings(tmp_path):
+    from omlx.cluster.inference_worker import _mtp_load_settings
+
+    deployment = _deployment()
+    args, _plan_hash, _assignments = _parsed_plan(deployment, tmp_path)
+    assert _mtp_load_settings(args) is None
+
+    execution = replace(
+        deployment.execution, mtp=True, mtp_depth=3, mtp_fixed_depth=True
+    )
+    args, _plan_hash, _assignments = _parsed_plan(
+        replace(deployment, execution=execution), tmp_path
+    )
+    settings = _mtp_load_settings(args)
+    assert settings.mtp_enabled is True
+    assert settings.mtp_fixed_depth == 3
+    assert settings.mtp_adaptive_max_depth is None
+
+
 def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):
     deployment = _mixed_role_deployment()
 

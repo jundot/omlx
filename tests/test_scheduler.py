@@ -51,6 +51,7 @@ from omlx.scheduler import (
     _StoreCacheGate,
     _VLMMTPDecodeState,
 )
+from omlx.utils import metal_sync
 
 
 def test_boundary_snapshot_provider_removes_failed_promotion(tmp_path):
@@ -858,7 +859,8 @@ class TestSchedulerAddRequest:
 
         scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
-            block_table
+            block_table,
+            promote_to_hot_cache=True,
         )
 
     def test_add_request_hot_cache_only_ignores_pressure_bypass(
@@ -896,7 +898,8 @@ class TestSchedulerAddRequest:
 
         scheduler.block_aware_cache.preload_blocks.assert_not_called()
         scheduler.block_aware_cache.reconstruct_cache.assert_called_once_with(
-            block_table
+            block_table,
+            promote_to_hot_cache=True,
         )
         scheduler._current_usage_bytes.assert_not_called()
 
@@ -1634,6 +1637,36 @@ class TestSchedulerAbortRequest:
         scheduled, _ = scheduler._schedule_waiting()
         assert scheduled == [request]
 
+    def test_specprefill_deferred_while_plain_request_decoding(
+        self, mock_model, mock_tokenizer
+    ):
+        """The model-wide offset RoPE must not reach live decode rows."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        plain = Request(
+            request_id="plain",
+            prompt="Hi",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=[1],
+            num_prompt_tokens=1,
+            status=RequestStatus.RUNNING,
+        )
+        scheduler.running["plain"] = plain
+        scheduler.requests["plain"] = plain
+
+        spec = Request(
+            request_id="sp",
+            prompt="Long prompt",
+            sampling_params=SamplingParams(),
+        )
+        spec.specprefill_indices = [0, 1, 2]
+        scheduler.requests["sp"] = spec
+        scheduler.waiting.append(spec)
+
+        scheduled, _ = scheduler._schedule_waiting()
+
+        assert scheduled == []
+        assert list(scheduler.waiting) == [spec]
+
     def test_abort_nonexistent_request(self, mock_model, mock_tokenizer):
         """Test aborting a non-existent request is silently ignored."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
@@ -2254,7 +2287,7 @@ class TestSchedulerStatistics:
         self, mock_model, mock_tokenizer, offload
     ):
         """On a 24 GB host without NAX, the wide qwen4 step needs offload."""
-        from omlx.custom_kernels.glm_moe_dsa import fast
+        from omlx.custom_kernels.attention import fast
 
         mock_model.config.model_type = "qwen4_exp_text"
         with (
@@ -2910,14 +2943,7 @@ class TestSchedulerXtcSpecialTokens:
 class TestSyncAndClearCache:
     """Tests for module-level _sync_and_clear_cache() helper (#300, #888)."""
 
-    @pytest.mark.parametrize(
-        "message",
-        [
-            "There is no Stream(gpu, 0) in current thread.",
-            "kIOGPUCommandBufferCallbackErrorTimeout",
-        ],
-    )
-    def test_swallows_generation_stream_thread_error(self, message):
+    def test_swallows_generation_stream_thread_error(self):
         """generation_stream sync failing must not break cache clear.
 
         Reproduces #888: on some MLX builds mx.synchronize(generation_stream)
@@ -2933,7 +2959,7 @@ class TestSyncAndClearCache:
 
         def fake_gen_sync(stream):
             calls.append(("gen_sync", stream))
-            raise RuntimeError(message)
+            raise RuntimeError("There is no Stream(gpu, 0) in current thread.")
 
         def fake_default_sync():
             calls.append(("default_sync",))
@@ -2956,6 +2982,34 @@ class TestSyncAndClearCache:
         assert calls[0][0] == "gen_sync"
         assert ("default_sync",) in calls
         assert ("clear_cache",) in calls
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "00000003:kIOGPUCommandBufferCallbackErrorHang",
+            "00000005:kIOGPUCommandBufferCallbackErrorInnocentVictim",
+            "00000002:kIOGPUCommandBufferCallbackErrorTimeout",
+        ],
+    )
+    def test_raises_generation_stream_command_buffer_error(self, code):
+        """A failed engine-stream buffer must reach the caller (#4224).
+
+        MLX clears the stored error when it raises, so a swallowed error
+        lets the engine keep decoding on results the GPU discarded.
+        """
+        error = RuntimeError(f"[METAL] Command buffer execution failed: ({code}).")
+
+        def synchronize(*args):
+            if args:
+                raise error
+
+        with (
+            patch.object(metal_sync.mx, "synchronize", side_effect=synchronize),
+            patch.object(metal_sync.mx, "clear_cache") as clear,
+            pytest.raises(RuntimeError, match=code),
+        ):
+            metal_sync._sync_and_clear_cache("engine-stream")
+        clear.assert_not_called()
 
     @pytest.mark.parametrize("stage", ["generation", "default", "clear"])
     def test_terminal_gpu_error_exits_before_further_cleanup(self, stage):
@@ -4370,7 +4424,7 @@ class TestSchedulerArraysCacheBlockAlignment:
     """ArraysCache boundaries must match the effective prefill chunk."""
 
     @pytest.mark.parametrize("nested", [False, True])
-    def test_deepseek_v41_subclass_uses_2048_boundaries(
+    def test_deepseek_v41_subclass_uses_8192_boundaries(
         self, mock_tokenizer, tmp_path, nested
     ):
         model = self._hybrid_model(model_type="deepseek_v41")
@@ -4390,9 +4444,9 @@ class TestSchedulerArraysCacheBlockAlignment:
         )
         try:
             assert scheduler._model_has_arrays_cache()
-            assert scheduler._qwen35_prefill_floor == 0
-            assert scheduler.config.paged_cache_block_size == 2048
-            assert scheduler._prefill_step_size_for_progress(0, 9216) == 2048
+            assert scheduler._qwen35_prefill_floor == 8192
+            assert scheduler.config.paged_cache_block_size == 8192
+            assert scheduler._prefill_step_size_for_progress(0, 9216) == 8192
         finally:
             scheduler.shutdown()
 
@@ -4458,11 +4512,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4502,11 +4556,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             ),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4544,11 +4598,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=256 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=False),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=native_available,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=symbol_available,
             ),
         ):
@@ -4576,11 +4630,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):
@@ -4628,11 +4682,11 @@ class TestSchedulerArraysCacheBlockAlignment:
             patch("omlx.settings.get_system_memory", return_value=128 * 1024**3),
             patch("omlx.custom_kernels.nax.is_nax_available", return_value=True),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.is_native_available",
+                "omlx.custom_kernels.attention.fast.is_native_available",
                 return_value=True,
             ),
             patch(
-                "omlx.custom_kernels.glm_moe_dsa.fast.has_symbol",
+                "omlx.custom_kernels.attention.fast.has_symbol",
                 return_value=True,
             ),
         ):

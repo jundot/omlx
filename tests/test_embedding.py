@@ -107,6 +107,14 @@ class TestEmbeddingModels:
         with pytest.raises(ValueError, match="greater than 0"):
             EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", max_length=0)
 
+    def test_embedding_request_rejects_non_positive_dimensions(self):
+        """dimensions=0 returned the full-length vector and -1 silently
+        truncated from the end; both must fail validation like max_length."""
+        with pytest.raises(ValueError, match="greater than 0"):
+            EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", dimensions=0)
+        with pytest.raises(ValueError, match="greater than 0"):
+            EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", dimensions=-1)
+
     def test_embedding_request_items_input(self):
         """Test EmbeddingRequest with structured items."""
         request = EmbeddingRequest(
@@ -598,6 +606,31 @@ class TestEmbeddingCompileFallback:
             model.embed(["test"])
 
         assert generate.call_args.kwargs["max_length"] == 40960
+
+    def test_eager_usage_counts_tokens_left_after_truncation(self):
+        """generate() returns no mask, so usage is counted from the text."""
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = MagicMock()
+        model.processor = MagicMock(spec=["encode"])
+        model.processor.encode.side_effect = lambda text, add_special_tokens: (
+            text.split()
+        )
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6], [0.1, 0.2]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        texts = [" ".join(["w"] * 100), "a b c"]
+        with patch("mlx_embeddings.generate", return_value=mock_outputs):
+            truncated = model.embed(texts, max_length=8)
+            full = model.embed(texts, max_length=8, truncation=False)
+
+        assert truncated.total_tokens == 8 + 3
+        assert full.total_tokens == 100 + 3
 
     def test_default_max_length_uses_tokenizer_config_fallback(self):
         """Tokenizer model_max_length is used when model config lacks a limit."""
