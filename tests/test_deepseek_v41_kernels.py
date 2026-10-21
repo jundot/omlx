@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from omlx.patches.deepseek_v41 import activation, hyper_connection, kernels, routing
-from omlx.patches.deepseek_v41.gemv import mxfp8_gemv, mxfp8_gemv_each
+from omlx.patches.deepseek_v41.gemv import mxfp8_gemv
 from omlx.patches.deepseek_v41.kernels import (
     packed_index_scores,
     packed_sparse_attention,
@@ -544,23 +544,6 @@ def test_mxfp8_gemv_matches_quantized_matmul(n, k, dtype):
         )
     # Rows spread over a batch axis are separate MLX GEMVs.
     assert mxfp8_gemv(mx.zeros((5, 1, k), dtype), weight, scales) is None
-
-
-@pytest.mark.parametrize("n,k", [(2560, 6144), (1280, 5120)])
-def test_mxfp8_gemv_each_matches_one_row_quantized_matmul(n, k):
-    """Every row of a multi-row block gets the one-row MLX GEMV result (Engram verify rows)."""
-    mx.random.seed(n)
-    weight, scales = mx.quantize(
-        mx.random.normal((n, k)) * 0.02, group_size=32, bits=8, mode="mxfp8"
-    )
-    x = mx.random.normal((8, k)).astype(mx.bfloat16)
-    for rows in (2, 5, 8):
-        actual = mxfp8_gemv_each(x[:rows], weight, scales)
-        for r in range(rows):
-            expected = mx.quantized_matmul(
-                x[r : r + 1], weight, scales, group_size=32, bits=8, mode="mxfp8"
-            )
-            assert mx.array_equal(actual[r : r + 1], expected).item()
 
 
 @pytest.mark.parametrize("width,distinct", [(4096, 0), (70000, 0), (9000, 3)])

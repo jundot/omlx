@@ -2,10 +2,10 @@
 
 A five-layer model at the fused kernels' shapes (dim 1024, eight 512-wide heads, MXFP8
 attention and shared-expert projections, MXFP4 routed experts, an MXFP8-exact bf16 wo_a, the
-checkpoint's parameter dtypes) decodes the same tokens from identical caches with the fused
-path on and off. The fused kernels only change accumulation orders the DeepSeek reference
-leaves free, so the logits must agree to rounding noise. build(fmt="affine") gives the
-projections an oQ export's affine layouts instead.
+checkpoint's parameter dtypes) runs every decode layer with the fused path on and off from the
+same input. The fused kernels only change accumulation orders the DeepSeek reference leaves
+free, so each layer's output must agree to rounding noise. build(fmt="affine") gives the
+projections the affine layouts of oQ2-oQ3 exports instead.
 """
 
 import zlib
@@ -19,7 +19,7 @@ from mlx.utils import tree_flatten
 
 from omlx.patches.deepseek_v41 import decode_fused
 from omlx.patches.deepseek_v41.config import ModelConfig
-from omlx.patches.deepseek_v41.language import LanguageModel
+from omlx.patches.deepseek_v41.language import Block, LanguageModel
 from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan, OffloadedExpert
 from omlx.patches.deepseek_v41.quantization import QuantizedProjection
 from tests.test_deepseek_v41 import run_two_ranks
@@ -62,8 +62,9 @@ def config():
 _FP32 = ("hc_", "attn_sink", "gate.bias", "compressor.")
 
 
-# oQ exports: affine attention projections of mixed widths, 3-bit routed and 8-bit shared experts.
-_AFFINE_BITS = {"wq_a": 8, "wkv": 4, "wq_b": 4, "wo_b": 6, "experts": 3, "shared_experts": 8}
+# Every width oQ2-oQ3 exports use: affine attention projections of mixed widths, 2-bit w1 / w3
+# and 3-bit w2 routed experts (oQ2.5e), 8-bit shared experts.
+_AFFINE_BITS = {"wq_a": 8, "wkv": 4, "wq_b": 4, "wo_b": 6, "w1": 2, "w3": 2, "w2": 3, "shared_experts": 8}
 
 
 def build(seed=4121, fmt="mxfp", **overrides):
@@ -97,7 +98,7 @@ def build(seed=4121, fmt="mxfp", **overrides):
         packed, scales = mx.quantize(att.wo_a.weight, group_size=32, bits=8, mode="mxfp8")[:2]
         att.wo_a.weight = mx.dequantize(packed, scales, None, group_size=32, bits=8, mode="mxfp8", dtype=mx.bfloat16)
         for name in ("w1", "w2", "w3"):
-            role = "experts"
+            role = name
             setattr(ffn.experts, name, quantized(getattr(ffn.experts, name).weight, 4, "mxfp4"))
             role = "shared_experts"
             setattr(ffn.shared_experts, name, quantized(getattr(ffn.shared_experts, name).weight, 8, "mxfp8"))
@@ -125,34 +126,40 @@ def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles):
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block", counted)
-    supported = decode_fused.supported
+    supported, fused_on = decode_fused.supported, [False]
+    monkeypatch.setattr(decode_fused, "supported", lambda layer, c: fused_on[0] and supported(layer, c))
     ids = np.random.default_rng(3).integers(3, 60, 24).tolist()
     caches = []
-    monkeypatch.setattr(decode_fused, "supported", lambda layer, c: False)
     for _ in range(2):
         cache = model.make_cache()
         mx.eval(model(mx.array([ids[:17]]), cache=cache))
         caches.append(cache)
-    token, worst = ids[17], 0.0
-    for step in range(6):
-        monkeypatch.setattr(decode_fused, "supported", lambda layer, c: False)
-        reference = model(mx.array([[token]]), cache=caches[0])[0, -1].astype(mx.float32)
-        monkeypatch.setattr(decode_fused, "supported", supported)
-        fused = model(mx.array([[token]]), cache=caches[1])[0, -1].astype(mx.float32)
-        reference, fused = np.asarray(reference), np.asarray(fused)
-        scale = np.abs(reference).max()
-        worst = max(worst, float(np.abs(fused - reference).max() / scale))
-        top2 = np.sort(reference)[-2:]
-        if top2[1] - top2[0] > 0.02 * scale:
-            assert fused.argmax() == reference.argmax()
-        token = ids[18 + step]
+    # The fused pass feeds every layer the unfused layer's input, so rounding differences do
+    # not compound through the layers (on this random model a one-ulp change per embedding row
+    # moves the logits by 30-50%).
+    unfused, worst = [], 0.0
+    block_call = Block.__call__
+
+    def layer_by_layer(self, h, pre, *args, **kwargs):
+        nonlocal worst
+        if not fused_on[0]:
+            unfused.append((h, pre, block_call(self, h, pre, *args, **kwargs)))
+            return unfused[-1][2]
+        h, pre, (expected, _) = unfused.pop(0)
+        out = block_call(self, h, pre, *args, **kwargs)
+        ref = np.asarray(expected.astype(mx.float32))
+        worst = max(worst, float(np.abs(np.asarray(out[0].astype(mx.float32)) - ref).max() / np.abs(ref).max()))
+        return out
+
+    monkeypatch.setattr(Block, "__call__", layer_by_layer)
+    for token in ids[17:23]:
+        for fused_on[0], cache in ((False, caches[0]), (True, caches[1])):
+            mx.eval(model(mx.array([[token]]), cache=cache))
+        assert not unfused
     assert calls["fused"] == 6 * c.n_layers
-    # Free-order rounding differences grow through the layers: on this random model the fused
-    # path stays within 0-3% of the largest logit (seeds 11-13, 4121), while a one-ulp change
-    # of a single element per embedding row already moves the logits by 30-50%. A wrong layout
-    # or kernel selection gives O(1) garbage. Rounding-point conformance per stage is checked
-    # on the released weights by the decode audit, not here.
-    assert worst < 0.08, worst
+    # Free-order rounding moves a layer's output by up to ~2.5% of its largest value (2-8 bit
+    # affine maps); a wrong layout or kernel selection gives O(1) errors.
+    assert worst < 0.05, worst
 
 
 def test_fused_decode_rejects_unsupported_layouts():
@@ -395,9 +402,9 @@ def test_batched_moe_matches_single_token_moe(monkeypatch, nb, fmt):
 
 @pytest.mark.parametrize("batch", [2, 8])
 def test_batched_engram_projects_each_request_like_a_single_request(batch):
-    """Batched decode feeds Engram one row per request. Each row is projected on its own
-    (mxfp8_gemv, as when the request decodes alone); a B-row quantized_matmul rounds its fp32
-    sums differently, which made a request's tokens depend on its batch."""
+    """Batched decode feeds Engram one row per request. Each row gets the one-row arithmetic
+    (mxfp8_gemv_each, as when the request decodes alone); a B-row quantized_matmul rounds its
+    fp32 sums differently, which made a request's tokens depend on its batch."""
     from test_deepseek_v41 import tiny
 
     from omlx.patches.deepseek_v41.engram import Engram
@@ -488,7 +495,10 @@ def test_mtp_generation_matches_greedy_with_fused_kernels(monkeypatch, fmt):
     prompt = [3, 4, 5, 6, 7, 8, 9, 10, 11]
     model.configure_mtp(True, 3)
     expected, cache = [], model.make_cache()
-    ids = mx.array([prompt])
+    # The generator prefills prompt[:-1] in steps of 4; other prefill chunks round differently.
+    for s in range(0, len(prompt) - 1, 4):
+        model(mx.array([prompt[s : min(s + 4, len(prompt) - 1)]]), cache=cache)
+    ids = mx.array([prompt[-1:]])
     for _ in range(24):
         token = int(mx.argmax(model(ids, cache=cache)[0, -1]).item())
         expected.append(token)

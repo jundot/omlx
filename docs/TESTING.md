@@ -118,7 +118,7 @@ Run `python -m pytest -q tests/test_deepseek_v41.py` for the text/vision port. S
 
 FP8 activation boundary and layout checks: `python -m pytest tests/test_deepseek_v41_activation.py -q`. These compare fused FP8 and weighted SwiGLU kernels against reference arithmetic across rounding ties, scale transitions, clipping, intermediate casts and floating-point dtypes, and the one-pass RoPE kernel (with its fused act_quant and heads-major input) against the reference rotation.
 
-Fused decode kernels: `python -m pytest tests/test_deepseek_v41_fused_decode.py -q`. A five-layer random model with MXFP or oQ affine layouts decodes against the unfused block, batched and MTP verify blocks are checked bitwise against single-token decode (including the matrix-tile kernels an MTP-enabled model uses), and DSpark generation must reproduce greedy decoding.
+Fused decode kernels: `python -m pytest tests/test_deepseek_v41_fused_decode.py -q`. A five-layer random model with MXFP or oQ2-oQ3 affine layouts (2-8 bits) runs each decode layer against the unfused block, batched and MTP verify blocks are checked bitwise against single-token decode (including the matrix-tile kernels an MTP-enabled model uses), and DSpark generation must reproduce greedy decoding.
 
 MoE activation reuse and per-expert reference checks: `python -m pytest tests/test_deepseek_v41_moe.py -q`. These cover sorted prefill, decode, independent routed/shared activation policies, and repeated outputs with small quantized weights.
 
