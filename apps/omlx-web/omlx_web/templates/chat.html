@@ -1337,18 +1337,18 @@
                                 x-text="displayChatTitle(chat)"></span>
                             <button @click.stop="togglePinChat(chat.id)"
                                 class="p-1 hover:bg-surface-alt rounded transition-opacity"
-                                :class="chat.pinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'"
+                                :class="chat.pinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'"
                                 :title="chat.pinned ? window.t('chat.unpin_chat') : window.t('chat.pin_chat')">
                                 <i x-show="!chat.pinned" data-lucide="pin" class="w-3 h-3" style="color: var(--text-muted);"></i>
                                 <i x-show="chat.pinned" data-lucide="pin-off" class="w-3 h-3" style="color: var(--text-muted);"></i>
                             </button>
                             <button @click.stop="startRenamingChat(chat)"
-                                class="opacity-0 group-hover:opacity-100 p-1 hover:bg-surface-alt rounded transition-opacity"
+                                class="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 p-1 hover:bg-surface-alt rounded transition-opacity"
                                 title="{{ t('chat.rename_tooltip') }}">
                                 <i data-lucide="pencil" class="w-3 h-3" style="color: var(--text-muted);"></i>
                             </button>
                             <button @click.stop="deleteChat(chat.id)"
-                                class="opacity-0 group-hover:opacity-100 p-1 hover:bg-danger-bg rounded transition-opacity"
+                                class="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 p-1 hover:bg-danger-bg rounded transition-opacity"
                                 title="{{ t('chat.delete_tooltip') }}">
                                 <i data-lucide="trash-2" class="w-3 h-3 text-danger"></i>
                             </button>
@@ -1960,7 +1960,7 @@
                                 <img x-show="img.base64" :src="img.base64"
                                     class="h-16 w-16 object-cover rounded-lg border border-line">
                                 <button @click="removeImage(idx)"
-                                    class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
+                                    class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-surface-muted hover:text-fg"
                                     :title="window.t('chat.remove_image')">
                                     <i data-lucide="x" class="w-3 h-3"></i>
                                 </button>
@@ -1974,7 +1974,7 @@
                                 <span class="truncate max-w-48" x-text="doc.filename"></span>
                                 <span x-show="!doc.base64" class="text-caption" style="color: var(--text-tertiary);">...</span>
                                 <button @click="removeDocument(idx)"
-                                    class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
+                                    class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-surface-muted hover:text-fg"
                                     :title="window.t('chat.remove_document')">
                                     <i data-lucide="x" class="w-3 h-3"></i>
                                 </button>
@@ -1987,7 +1987,7 @@
                             <span class="truncate max-w-48" x-text="uploadAudio?.filename"></span>
                             <span class="text-caption" style="color: var(--text-tertiary);" x-text="formatAudioSize(uploadAudio?.size)"></span>
                             <button @click="removeAudio()"
-                                class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 hover:bg-surface-muted hover:text-fg"
+                                class="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full flex items-center justify-center bg-surface-alt border border-line-strong text-fg-tertiary cursor-pointer transition-all opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 hover:bg-surface-muted hover:text-fg"
                                 :title="window.t('chat.remove_audio')">
                                 <i data-lucide="x" class="w-3 h-3"></i>
                             </button>
@@ -2366,7 +2366,7 @@
                                         :class="activePromptProfile === p.name ? 'bg-blue-500' : 'border border-line'"></span>
                                     <span class="flex-1 text-xs font-medium truncate"
                                         style="color: var(--text-primary);" x-text="profileLabel(p.name)"></span>
-                                    <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity"
+                                    <div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
                                         :class="{'!opacity-100': activePromptProfile === p.name}">
                                         <button x-show="p.name !== 'System Default'" @click.stop="startRenamingPromptProfile()"
                                             class="p-1 rounded hover:bg-surface-alt transition-colors" title="{{ t('chat.profile_rename_tooltip') }}">

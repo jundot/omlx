@@ -178,7 +178,7 @@
                         <!-- Memory size -->
                         <span class="text-xs text-neutral-400 font-mono w-60 text-right" x-text="modelSizeLabel(m)"></span>
                         <!-- Unload button -->
-                        <div x-show="!m.is_loading" class="relative opacity-0 group-hover:opacity-100 transition-all"
+                        <div x-show="!m.is_loading" class="relative opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-all"
                              x-data="{ showTip: false }"
                              @mouseenter="showTip = true" @mouseleave="showTip = false">
                             <button @click="unloadModel(m.id)"
