@@ -20,7 +20,9 @@ unrelated `model_index.json`, and an ordinary language-model encoder config do
 not establish image ownership. Consequently an unmarked encoder packaged as an
 ordinary language model cannot be distinguished automatically.
 
-A future inspector/runtime can use the explicit sidecar, but this guard does not
+The release format uses `model_index.json`; the explicit oMLX sidecar remains
+a legacy research boundary only. A future inspector/runtime can validate the
+model index and component metadata, but this guard does not
 introduce a serving schema, image engine or inference dependency. It complements
 architecture support checks: an individually loadable encoder can still belong
 to an unsupported image pipeline.
