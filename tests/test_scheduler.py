@@ -4394,7 +4394,7 @@ class TestSchedulerArraysCacheBlockAlignment:
     """ArraysCache boundaries must match the effective prefill chunk."""
 
     @pytest.mark.parametrize("nested", [False, True])
-    def test_deepseek_v41_subclass_uses_2048_boundaries(
+    def test_deepseek_v41_subclass_uses_8192_boundaries(
         self, mock_tokenizer, tmp_path, nested
     ):
         model = self._hybrid_model(model_type="deepseek_v41")
@@ -4414,9 +4414,9 @@ class TestSchedulerArraysCacheBlockAlignment:
         )
         try:
             assert scheduler._model_has_arrays_cache()
-            assert scheduler._qwen35_prefill_floor == 0
-            assert scheduler.config.paged_cache_block_size == 2048
-            assert scheduler._prefill_step_size_for_progress(0, 9216) == 2048
+            assert scheduler._qwen35_prefill_floor == 8192
+            assert scheduler.config.paged_cache_block_size == 8192
+            assert scheduler._prefill_step_size_for_progress(0, 9216) == 8192
         finally:
             scheduler.shutdown()
 
