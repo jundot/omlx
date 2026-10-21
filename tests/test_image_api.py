@@ -224,3 +224,35 @@ async def test_image_profile_creation_rejected(monkeypatch):
             "image", routes.CreateProfileRequest(name="chat", display_name="Chat"), True
         )
     assert exc.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_image_unload_does_not_reclaim_its_already_released_reservation(
+    monkeypatch,
+):
+    from unittest.mock import MagicMock
+
+    from omlx.engine.image import ImageEngine
+    from omlx.engine_pool import EngineEntry, EnginePool
+
+    pool = EnginePool()
+    engine = MagicMock(spec=ImageEngine)
+    engine.stop = AsyncMock()
+    reserved = 32 * 1024**3
+    entry = EngineEntry(
+        model_id="image",
+        model_path="/unused",
+        model_type="image",
+        engine_type="image",
+        estimated_size=reserved,
+        engine=engine,
+    )
+    pool._entries = {"image": entry}
+    pool._current_model_memory = reserved
+    pool._metal_sync_clear_cache = AsyncMock()
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 1024)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 1024)
+    await pool._stop_and_unload_engine("image")
+    engine.stop.assert_awaited_once()
+    pool._metal_sync_clear_cache.assert_awaited_once_with("image")
+    assert pool._current_model_memory == 0 and entry.engine is None
