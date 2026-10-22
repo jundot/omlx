@@ -12,6 +12,7 @@ import pytest
 CHAT_TEMPLATE = Path(__file__).parents[1] / "omlx_web" / "templates" / "chat.html"
 
 METHODS = [
+    "messageForStorage",
     "saveCurrentChat",
     "saveChatHistory",
     "sortChatHistory",
