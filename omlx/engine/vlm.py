@@ -4090,6 +4090,12 @@ class VLMBatchedEngine(BaseEngine):
         num_videos = len(videos) if videos else 0
 
         model_type = self.model_type or _read_config_model_type(self._model_name) or ""
+        if model_type == "flint" and (num_images or num_audios or num_videos):
+            raise InvalidRequestError(
+                "Flint is a text-only model and does not support "
+                "image, audio, or video input.",
+                field="messages",
+            )
         if model_type == COHERE2_MOE_MODEL_TYPE and (
             num_images > 0 or num_audios > 0
         ):

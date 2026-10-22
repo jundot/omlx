@@ -1280,17 +1280,18 @@ class TestVLMFallback:
             await pool._load_engine("model-a", force_lm=True)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("model_type", ["glm5_next", "flint"])
     async def test_force_lm_keeps_vlm_engine_for_vlm_native_text_model(
-        self, small_mock_model_dir
+        self, small_mock_model_dir, model_type
     ):
-        """glm5_next has no mlx-lm class: force_lm loads the VLM engine directly
+        """Native text families have no mlx-lm class: load the VLM engine directly
         and never unloads a resident VLM engine to retry the LM load (#3959)."""
         pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
         entry = pool.get_entry("model-a")
         entry.model_type = "vlm"
         entry.engine_type = "vlm"
-        entry.config_model_type = "glm5_next"
+        entry.config_model_type = model_type
 
         mock_vlm_engine = MagicMock()
         mock_vlm_engine.start = AsyncMock()
@@ -1313,15 +1314,18 @@ class TestVLMFallback:
         assert pool._force_lm_replaces_engine("model-a") is True
 
     @pytest.mark.asyncio
-    async def test_vlm_native_text_model_skips_llm_fallback(self, small_mock_model_dir):
-        """A glm5_next VLM start failure surfaces as-is instead of an LLM
+    @pytest.mark.parametrize("model_type", ["glm5_next", "flint"])
+    async def test_vlm_native_text_model_skips_llm_fallback(
+        self, small_mock_model_dir, model_type
+    ):
+        """A native text VLM start failure surfaces as-is instead of an LLM
         fallback error that can never succeed (#3956)."""
         pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
         entry = pool.get_entry("model-a")
         entry.model_type = "vlm"
         entry.engine_type = "vlm"
-        entry.config_model_type = "glm5_next"
+        entry.config_model_type = model_type
 
         mock_vlm_engine = MagicMock()
         mock_vlm_engine.start = AsyncMock(side_effect=RuntimeError("bad expert table"))

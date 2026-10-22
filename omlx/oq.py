@@ -6499,6 +6499,11 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
+    if normalized_model_type == "flint":
+        raise ValueError(
+            "Flint serving is supported, but Flint oQ conversion and calibration "
+            "are not supported. Use an existing MLX-format checkpoint."
+        )
     mimo_multimodal = (
         normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
         and _has_vision_subconfig(config)

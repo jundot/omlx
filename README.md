@@ -325,6 +325,13 @@ Models are auto-detected by type. You can also download models directly from the
 | Reranker | ModernBERT, XLM-RoBERTa |
 | Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
 
+**Flint** (`model_type: flint`, `FlintForCausalLM`) is text-only and uses the
+mlx-vlm backend, including its native full/sliding attention caches. Both BF16
+and prequantized MLX checkpoints are auto-detected; image, audio, and video input
+are not supported. Native Flint requires the pinned mlx-vlm revision
+`a549bc778716e45b66d1caf6c746f60d93310d6e` or a compatible later version.
+Flint oQ conversion and calibration are not supported.
+
 ## CLI Configuration
 
 ```bash
