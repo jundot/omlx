@@ -97,7 +97,7 @@ Sample selection uses a fixed seed, so repeated runs on the same model see the s
 Writing the quantized model needs little memory because tensors are read and written one at a time. Calibration needs the model in memory:
 
 - If the model does not fit in about 75% of the available memory, oQ makes a temporary 4-bit copy on disk, calibrates on that copy and deletes it afterwards. This needs extra free disk space while it runs.
-- Supported families, including Flint, MiniMax M3 and Qwen4-Exp, can calibrate one layer at a time instead.
+- MiniMax M3 and Qwen4-Exp models calibrate one layer at a time instead.
 
 ### Flint
 
