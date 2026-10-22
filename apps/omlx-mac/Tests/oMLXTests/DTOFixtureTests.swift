@@ -84,6 +84,7 @@ final class DTOFixtureTests: XCTestCase {
             textOnly: false,
             dtype: "bfloat16",
             preserveMtp: false,
+            preserveNgramTable: false,
             enhanced: true,
             imatrixCachePath: "/Users/test/cache/imatrix.npz",
             imatrixReuseCache: true,
@@ -97,6 +98,8 @@ final class DTOFixtureTests: XCTestCase {
         XCTAssertEqual(body?["imatrix_cache_path"] as? String, "/Users/test/cache/imatrix.npz")
         XCTAssertEqual(body?["imatrix_reuse_cache"] as? Bool, true)
         XCTAssertEqual(body?["imatrix_strict"] as? Bool, true)
+        XCTAssertEqual(body?["preserve_mtp"] as? Bool, false)
+        XCTAssertEqual(body?["preserve_ngram_table"] as? Bool, false)
     }
 
     // MARK: - Stats

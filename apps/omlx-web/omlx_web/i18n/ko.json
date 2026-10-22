@@ -427,6 +427,8 @@
   "models.oq.preserve_mtp": "MTP weights 보존",
   "models.oq.preserve_mtp_help": "양자화 후에도 Lightning MTP 토글이 동작하도록 mtp.* 텐서와 config 필드를 출력 모델에 유지합니다. 출력 이름에 -mtp 접미사가 붙습니다.",
   "models.oq.preserve_mtp_unavailable": "소스 모델에 MTP heads 가 없습니다.",
+  "models.oq.preserve_ngram_table": "N-gram 테이블 보존",
+  "models.oq.preserve_ngram_table_help": "Qwen3.8-Flash-Next의 PLE N-gram 테이블을 4비트 대신 원본 정밀도로 기록합니다. 테이블은 약 3.2배 더 커지므로 SSD N-gram 오프로드를 켜 두거나 추가 메모리를 비워 두세요. 출력 이름에 -plebf16 접미사가 붙습니다.",
   "models.oq.combine_assistant": "Combine assistant model as MTP head",
   "models.oq.combine_assistant_help": "Merge a separate gemma4_assistant checkpoint into the output as a Lightning MTP head. The output name gets a -mtp suffix and the Lightning MTP toggle works on the result.",
   "models.oq.combine_assistant_none": "None",

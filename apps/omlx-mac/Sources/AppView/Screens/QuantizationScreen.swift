@@ -94,8 +94,10 @@ struct QuantizationScreen: View {
                 isOpen: $vm.advancedOpen,
                 selectedIsVLM: vm.selectedIsVLM,
                 selectedHasMTP: vm.selectedHasMTP,
+                selectedHasNgramTable: vm.selectedHasNgramTable,
                 textOnly: $vm.textOnly,
                 preserveMtp: $vm.preserveMtp,
+                preserveNgramTable: $vm.preserveNgramTable,
                 dtype: $vm.dtype
             )
             .padding(.bottom, 12)
@@ -137,6 +139,9 @@ struct QuantizationScreen: View {
             vm.scheduleEstimateRefresh(client: services.client)
         }
         .onChange(of: vm.preserveMtp) { _, _ in
+            vm.scheduleEstimateRefresh(client: services.client)
+        }
+        .onChange(of: vm.preserveNgramTable) { _, _ in
             vm.scheduleEstimateRefresh(client: services.client)
         }
         .sheet(item: $vm.uploadTarget) { task in
@@ -335,8 +340,10 @@ private struct AdvancedSection: View {
     @Binding var isOpen: Bool
     let selectedIsVLM: Bool
     let selectedHasMTP: Bool
+    let selectedHasNgramTable: Bool
     @Binding var textOnly: Bool
     @Binding var preserveMtp: Bool
+    @Binding var preserveNgramTable: Bool
     @Binding var dtype: String
 
     @Environment(\.omlxTheme) private var theme
@@ -395,6 +402,19 @@ private struct AdvancedSection: View {
                     ) {
                         RowSwitch(isOn: $preserveMtp)
                             .disabled(!selectedHasMTP)
+                    }
+
+                    if selectedHasNgramTable {
+                        Row(
+                            label: String(localized: "quant.advanced.preserve_ngram_table.label",
+                                          defaultValue: "Preserve N-gram table",
+                                          comment: "Toggle row label: keep the Qwen3.8-Flash-Next PLE N-gram table at source precision"),
+                            sublabel: String(localized: "quant.advanced.preserve_ngram_table.sub",
+                                             defaultValue: "Write the Qwen3.8-Flash-Next PLE N-gram table at source precision instead of 4-bit. The table is about 3.2x larger; keep PLE SSD offload enabled or have the extra memory free. Output name gets a -plebf16 suffix.",
+                                             comment: "Toggle row sublabel: what preserving the PLE N-gram table at source precision costs (size) and what to have ready (SSD offload or free memory)")
+                        ) {
+                            RowSwitch(isOn: $preserveNgramTable)
+                        }
                     }
 
                     Row(

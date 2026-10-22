@@ -427,6 +427,8 @@
   "models.oq.preserve_mtp": "Preserve MTP weights",
   "models.oq.preserve_mtp_help": "Keep mtp.* tensors and config fields in the output model so the Lightning MTP toggle works after quantization. Output name gets a -mtp suffix.",
   "models.oq.preserve_mtp_unavailable": "Source model has no MTP heads.",
+  "models.oq.preserve_ngram_table": "N-gram テーブルを保存",
+  "models.oq.preserve_ngram_table_help": "Qwen3.8-Flash-Next の PLE N-gram テーブルを 4 ビットではなくソースの精度で書き込みます。テーブルは約 3.2 倍のサイズになるため、SSD N-gram オフロードを有効にしておくか、追加のメモリを空けておいてください。出力名に -plebf16 サフィックスが付きます。",
   "models.oq.combine_assistant": "Combine assistant model as MTP head",
   "models.oq.combine_assistant_help": "Merge a separate gemma4_assistant checkpoint into the output as a Lightning MTP head. The output name gets a -mtp suffix and the Lightning MTP toggle works on the result.",
   "models.oq.combine_assistant_none": "None",

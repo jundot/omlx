@@ -695,6 +695,37 @@ class TestResolveOutputName:
             == "Model-oQ4-mtp"
         )
 
+    def test_output_name_tags_the_preserved_table(self):
+        assert (
+            resolve_output_name(
+                "Qwen3.8-Flash-Next", 4, "bfloat16", preserve_ngram_table=True
+            )
+            == "Qwen3.8-Flash-Next-oQ4-plebf16"
+        )
+        assert (
+            resolve_output_name(
+                "Qwen3.8-Flash-Next",
+                4,
+                "float16",
+                preserve_mtp=True,
+                enhanced=True,
+                preserve_ngram_table=True,
+            )
+            == "Qwen3.8-Flash-Next-oQ4e-fp16-mtp-plefp16"
+        )
+
+    def test_requantizing_an_existing_ple_suffix_drops_it(self):
+        assert (
+            resolve_output_name("Qwen3.8-Flash-Next-oQ4-plebf16", 5)
+            == "Qwen3.8-Flash-Next-oQ5"
+        )
+        assert (
+            resolve_output_name(
+                "Qwen3.8-Flash-Next-oQ4-plefp16", 4, preserve_ngram_table=True
+            )
+            == "Qwen3.8-Flash-Next-oQ4-plebf16"
+        )
+
 
 class TestOqDtypeModelSupport:
     def test_rejects_deepseek_v4_float16(self):
@@ -7727,6 +7758,68 @@ class TestEstimateBpwPostSanitizeNames:
         # Experts dominate the parameter count; a raw-name scan reports
         # ~15-16 bpw because none of them end in ".weight".
         assert est["effective_bpw"] < 8.0, est
+
+
+class TestPreserveNgramTable:
+    """``preserve_ngram_table`` keeps qwen4_exp's PLE N-gram table unquantized."""
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_estimate_prices_the_preserved_table_at_source_precision(self, tmp_path):
+        rows, dims, shards = 8, 160, 4
+        table_elements = rows * dims * shards
+        src = tmp_path / "Qwen3.8-Flash-Next"
+        src.mkdir()
+        tensors = {
+            f"model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+            f".shard_{index}.weight": (
+                b"\x3f" * (rows * dims * 2),
+                [rows, dims],
+                "BF16",
+            )
+            for index in range(shards)
+        }
+        # One resident projection so the run also prices a quantized tensor.
+        tensors["model.language_model.embed_tokens.weight"] = np.zeros(
+            (64, 256), dtype=np.float16
+        )
+        _write_safetensors(str(src / "weights.safetensors"), tensors)
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen4_exp",
+                    "text_config": {
+                        "model_type": "qwen4_exp_text",
+                        "hidden_size": 256,
+                        "num_hidden_layers": 2,
+                        "num_experts": 8,
+                        "ple_layer_ids": [2],
+                        "ple_embed_dim": 256,
+                        "split_ngram_parts": shards,
+                        "ngram_size": 3,
+                        "heads_per_ngram": 8,
+                        "ngram_vocab_size_base": 1000,
+                        "make_ngram_vocab_size_divisible_by": 128,
+                    },
+                }
+            )
+        )
+
+        packed = estimate_bpw_and_size(str(src), 4)
+        preserved = estimate_bpw_and_size(str(src), 4, preserve_ngram_table=True)
+
+        # A 160-wide row costs 100 bytes at 4-bit with groups of 32 (80 packed
+        # weight bytes plus 5 bf16 scale and 5 bias bytes) and 320 bytes raw.
+        packed_table_bytes = table_elements // 2 + rows * shards * (dims // 32) * 4
+        assert packed["ngram_table_size_bytes"] == packed_table_bytes
+        assert preserved["ngram_table_size_bytes"] == table_elements * 2
+        assert preserved["output_size_bytes"] - packed["output_size_bytes"] == (
+            table_elements * 2 - packed_table_bytes
+        )
+        # The table is gathered by row id, so it is priced outside the resident
+        # bit budget: identical bpw and resident size whichever way the option
+        # goes, and only the file grows.
+        assert preserved["effective_bpw"] == packed["effective_bpw"]
+        assert preserved["resident_size_bytes"] == packed["resident_size_bytes"]
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
