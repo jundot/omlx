@@ -705,3 +705,104 @@ def test_short_calls_fuse_head_norms_and_rope_bit_exactly(language, monkeypatch)
     separate = run()
     for a, b in zip(separate, fused):
         assert mx.array_equal(a, b).item()
+
+
+@pytest.mark.parametrize("rows", [1, 3, 8])
+def test_decode_router_logits_match_one_row_matmul(language, rows):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(17)
+    weight = mx.random.normal((128, 6144)) * 0.02
+    x = (mx.random.normal((1, rows, 6144)) * 2).astype(mx.bfloat16)
+    logits = dk.moe_router_logits(x, weight)
+    assert logits is not None and logits.shape == (1, rows, 128)
+    for r in range(rows):
+        one = x[:, r : r + 1].astype(mx.float32) @ weight.T
+        assert mx.array_equal(logits[:, r : r + 1], one).item()
+    # Under 16 inputs per expert MLX's gemv splits K differently.
+    assert dk.moe_router_logits(x[..., :1024], weight[:, :1024]) is None
+
+
+@pytest.mark.parametrize("rows", [1, 2, 8])
+@pytest.mark.parametrize("down", [False, True])
+def test_decode_router_select_matches_moe_select(language, rows, down):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    rng = np.random.default_rng(rows)
+    logits = rng.normal(size=(1, rows, 128)).astype(np.float32) * 3
+    bias = rng.normal(size=128).astype(np.float32) * 0.1
+    # Five experts tie for the top; argpartition keeps the lower indices.
+    tied = [3, 10, 11, 12, 13]
+    logits[..., tied] = 8.0
+    bias[tied] = 1.0
+    logits, bias = mx.array(logits), mx.array(bias)
+    down_scale = mx.array(rng.uniform(0.5, 2.0, 128).astype(np.float32))
+    routed = dk.moe_router_select(logits, bias, 4, 2.0, down_scale if down else None)
+    assert routed is not None
+    inds, weights = language._minimax_moe_select(logits, bias, 4, 2.0, "sigmoid")
+    if down:
+        weights = weights * down_scale[inds]
+    assert inds[0, 0].tolist() == [3, 10, 11, 12]
+    assert mx.array_equal(routed[0], inds).item()
+    assert mx.array_equal(routed[1], weights).item()
+
+
+def _moe_block(language, experts=64, hidden=1024, inter=64):
+    args = _tiny_args(
+        hidden_size=hidden,
+        intermediate_size=inter,
+        shared_intermediate_size=inter,
+        num_local_experts=experts,
+        pack_shared_expert=False,
+        routed_expert_scales=True,
+    )
+    block = language.MiniMaxSparseMoeBlock(args)
+    block.gate.weight = mx.random.normal((experts, hidden)) * 0.05
+    block.e_score_correction_bias = mx.random.normal((experts,)) * 0.1
+    switch = block.switch_mlp
+    switch.gate_scale = mx.random.uniform(0.5, 4.0, (experts,))
+    switch.up_scale = mx.random.uniform(0.5, 4.0, (experts,))
+    switch.down_scale = mx.random.uniform(0.5, 2.0, (experts,))
+    return block
+
+
+@pytest.mark.parametrize("rows,armed", [(1, False), (3, True), (3, False)])
+def test_short_calls_route_bit_exactly(language, monkeypatch, rows, armed):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
+
+    mx.random.seed(23)
+    block = _moe_block(language)
+    x = mx.random.normal((1, rows, 1024)).astype(mx.bfloat16)
+
+    def run():
+        set_verify_qmm_armed(armed, row_exact=armed)
+        try:
+            y = block(x)
+            mx.eval(y)
+        finally:
+            set_verify_qmm_armed(False)
+        return y
+
+    used = []
+
+    def spy(name):
+        fn = getattr(dk, name)
+
+        def call(*args):
+            used.append(name)
+            return fn(*args)
+
+        monkeypatch.setattr(dk, name, call)
+
+    spy("moe_router_logits")
+    spy("moe_router_select")
+    fused = run()
+    # One row and the rows of a row-exact verify take the logits kernel.
+    expected = ["moe_router_select"]
+    if rows == 1 or armed:
+        expected.insert(0, "moe_router_logits")
+    assert used == expected
+    monkeypatch.setattr(dk, "moe_router_select", lambda *args: None)
+    assert mx.array_equal(run(), fused).item()

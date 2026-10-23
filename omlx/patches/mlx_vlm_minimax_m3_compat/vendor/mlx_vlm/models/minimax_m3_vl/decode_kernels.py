@@ -17,6 +17,11 @@ arithmetic bit for bit:
   with log2(base) rounded as MLX's host code does (log2f), fast::cos /
   fast::sin, and the position as rope_single (signed offset) or rope
   (unsigned sum) converts it.
+* ``moe_router_logits`` and ``moe_router_select``: the MoE router's FP32
+  logits (MLX's one-row gemv for every row) and the expert selection after
+  them (sigmoid, correction bias, the stable argpartition order, the FP32
+  normalization with its 1e-20, the routed scaling and the down-scale fold)
+  in two launches instead of ten.
 
 Exactness rules: every reduction replays the order of the kernel it replaces,
 every intermediate is rounded where the replaced code materializes it, and a
@@ -319,4 +324,201 @@ def head_norm_rope(
         threadgroup=(32, 1, 1),
         output_shapes=[(batch, y.shape[2], length, head_dim) for y in xs],
         output_dtypes=[x.dtype] * len(xs),
+    )
+
+
+# Router logits: MLX's gemv for an FP32 matrix with K >= 16 * E (GEMVKernel
+# BM 1, BN 8, SM 1, SN 32, TM 4, TN 4). Threadgroup t computes the four
+# logits [4 t, 4 t + 4) of row t / (E / 4): simdgroup s takes 4 values per lane
+# at 128 s + 4 lane of every 1024-value strip of K, the lanes are reduced with
+# a shuffle-down tree, then simdgroups 1..7 are added to simdgroup 0's sums in
+# order. x is read as T and widened (exact).
+_ROUTER_LOGITS_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint sgn = simdgroup_index_in_threadgroup;
+    const int tg = int(threadgroup_position_in_grid.x);
+    const int r = tg / (E / 4);
+    const int out_row = (tg - r * (E / 4)) * 4;
+    threadgroup float tgp[8 * 4];
+    float result[4] = {0, 0, 0, 0};
+    int bn = (32 * int(sgn) + int(lane)) * 4;
+    const device float* mat = w + size_t(out_row) * K;
+    const device T* xr = x + size_t(r) * K;
+    for (int i = 0; i < K / 1024; i++) {
+        float v_coeff[4];
+        for (int tn = 0; tn < 4; tn++) {
+            v_coeff[tn] = static_cast<float>(xr[bn + tn]);
+        }
+        for (int tm = 0; tm < 4; tm++) {
+            float inter[4];
+            for (int tn = 0; tn < 4; tn++) {
+                inter[tn] = mat[tm * K + bn + tn];
+            }
+            for (int tn = 0; tn < 4; tn++) {
+                result[tm] += inter[tn] * v_coeff[tn];
+            }
+        }
+        bn += 1024;
+    }
+    for (int tm = 0; tm < 4; tm++) {
+        for (ushort sn = 16; sn >= 1; sn >>= 1) {
+            result[tm] += simd_shuffle_down(result[tm], sn);
+        }
+    }
+    if (lane == 0) {
+        for (int tm = 0; tm < 4; tm++) {
+            tgp[sgn * 4 + tm] = result[tm];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgn == 0 && lane == 0) {
+        for (int s = 1; s < 8; s++) {
+            for (int tm = 0; tm < 4; tm++) {
+                result[tm] += tgp[s * 4 + tm];
+            }
+        }
+        for (int tm = 0; tm < 4; tm++) {
+            logits[r * E + out_row + tm] = result[tm];
+        }
+    }
+"""
+
+# _minimax_moe_select for sigmoid scores, then the down-scale fold; one
+# threadgroup per row, one thread per expert. Sigmoid is MLX's functor; an
+# expert's rank is its place in MLX's stable argpartition order (biased score
+# descending, ties to the lower index); the first TOPK experts' scores are
+# summed in MLX's order (total = value + total), + 1e-20, divided, scaled and
+# times the expert's down scale, each step rounded in FP32 like the ops.
+_ROUTER_SELECT_SOURCE = r"""
+    const uint e = thread_position_in_threadgroup.x;
+    const uint r = threadgroup_position_in_grid.x;
+    threadgroup float score[E];
+    threadgroup float biased[E];
+    threadgroup uint chosen[TOPK];
+    const float g = logits[r * E + e];
+    const float y = 1 / (1 + metal::precise::exp(metal::abs(g)));
+    const float s = (g < 0) ? y : 1 - y;
+    const float b = s + bias[e];
+    score[e] = s;
+    biased[e] = b;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint rank = 0;
+    for (uint i = 0; i < E; i++) {
+        const float bi = biased[i];
+        rank += (bi > b || (bi == b && i < e)) ? 1 : 0;
+    }
+    if (rank < TOPK) {
+        chosen[rank] = e;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e == 0) {
+        float w[TOPK];
+        float total = 0;
+        for (int t = 0; t < TOPK; t++) {
+            w[t] = score[chosen[t]];
+            total = w[t] + total;
+        }
+        const float denom = total + 1e-20f;
+        const float scaling = as_type<float>(uint(SCALING_BITS));
+        for (int t = 0; t < TOPK; t++) {
+            const float normed = w[t] / denom;
+            const float scaled = normed * scaling;
+            inds[r * TOPK + t] = chosen[t];
+            weights[r * TOPK + t] = DOWN_SCALE ? scaled * down_scale[chosen[t]] : scaled;
+        }
+    }
+"""
+
+
+@cache
+def _router_logits_kernel():
+    return mx.fast.metal_kernel(
+        name="minimax_m3_moe_router_logits",
+        input_names=["x", "w"],
+        output_names=["logits"],
+        source=_ROUTER_LOGITS_SOURCE,
+    )
+
+
+@cache
+def _router_select_kernel():
+    return mx.fast.metal_kernel(
+        name="minimax_m3_moe_router_select",
+        input_names=["logits", "bias", "down_scale"],
+        output_names=["inds", "weights"],
+        source=_ROUTER_SELECT_SOURCE,
+    )
+
+
+def moe_router_logits(x: mx.array, weight: mx.array) -> mx.array | None:
+    """``x.astype(mx.float32) @ weight.T`` for an FP32 router ``weight`` and up
+    to eight rows, each row as MLX's one-row matrix-vector product computes
+    it, or None when not covered."""
+    hidden = x.shape[-1]
+    rows = _rows(x)
+    experts = weight.shape[0]
+    if not (
+        weight.ndim == 2
+        and weight.dtype == mx.float32
+        and weight.shape[1] == hidden
+        and x.dtype in (mx.bfloat16, mx.float16, mx.float32)
+        and hidden % 1024 == 0
+        and hidden >= 16 * experts  # MLX's gemv uses BM 1, BN 8 here
+        and experts >= 4
+        and experts % 4 == 0
+        and 1 <= rows <= MAX_ROWS
+        and mx.metal.is_available()
+    ):
+        return None
+    return _router_logits_kernel()(
+        inputs=[x, weight],
+        template=[("T", x.dtype), ("K", hidden), ("E", experts)],
+        grid=(256 * rows * (experts // 4), 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(*x.shape[:-1], experts)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def moe_router_select(
+    logits: mx.array,
+    bias: mx.array,
+    top_k: int,
+    scaling: float,
+    down_scale: mx.array | None = None,
+) -> tuple[mx.array, mx.array] | None:
+    """``_minimax_moe_select(logits, bias, top_k, scaling, "sigmoid")`` and,
+    with ``down_scale``, the weights times ``down_scale[inds]``, in one launch
+    for up to eight rows of FP32 logits, or None when not covered."""
+    experts = logits.shape[-1]
+    rows = _rows(logits)
+    if not (
+        logits.dtype == mx.float32
+        and bias.dtype == mx.float32
+        and bias.shape == (experts,)
+        and (
+            down_scale is None
+            or (down_scale.dtype == mx.float32 and down_scale.shape == (experts,))
+        )
+        and 1 <= top_k <= 16
+        and top_k <= experts <= 1024
+        and 1 <= rows <= MAX_ROWS
+        and mx.metal.is_available()
+    ):
+        return None
+    shape = (*logits.shape[:-1], top_k)
+    return tuple(
+        _router_select_kernel()(
+            inputs=[logits, bias, bias if down_scale is None else down_scale],
+            template=[
+                ("E", experts),
+                ("TOPK", top_k),
+                ("SCALING_BITS", _float_bits(scaling)),
+                ("DOWN_SCALE", down_scale is not None),
+            ],
+            grid=(experts * rows, 1, 1),
+            threadgroup=(experts, 1, 1),
+            output_shapes=[shape, shape],
+            output_dtypes=[mx.uint32, mx.float32],
+        )
     )

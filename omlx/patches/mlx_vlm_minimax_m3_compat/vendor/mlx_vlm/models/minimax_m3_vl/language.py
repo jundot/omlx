@@ -1516,9 +1516,53 @@ class MiniMaxSparseMoeBlock(nn.Module):
         )
         self.sharding_group = None
 
+    def _fused_short_call(self, x: mx.array) -> Optional[mx.array]:
+        """The block for up to eight rows with fused routing, as the ops below
+        compute it, or None when not covered.
+
+        The router logits kernel is MLX's one-row matrix-vector product: it
+        takes one row, or the rows of a row-exact verify, which
+        ``_router_gates`` computes one by one. Other short calls keep their
+        logits. The expert selection then runs in one launch.
+        """
+        gate = self.gate
+        if (
+            self.sharding_group is not None
+            or self.pack_shared_expert
+            or self.scoring_func != "sigmoid"
+            or self.e_score_correction_bias is None
+            or type(gate) is not nn.Linear
+            or "bias" in gate
+            or x.size > decode_kernels.MAX_ROWS * x.shape[-1]
+        ):
+            return None
+        logits = None
+        if x.size == x.shape[-1] or is_row_exact_armed():
+            logits = decode_kernels.moe_router_logits(x, gate.weight)
+        if logits is None:
+            logits = _router_gates(gate, x)
+        routed = decode_kernels.moe_router_select(
+            logits,
+            self.e_score_correction_bias,
+            self.num_experts_per_tok,
+            self.routed_scaling_factor,
+            self.switch_mlp.down_scale if self.routed_expert_scales else None,
+        )
+        if routed is None:
+            return None
+        inds, scores = routed
+        y = _combine_routed(self.switch_mlp(x, inds), scores)
+        if self.shared_experts is not None:
+            y = y + self.shared_experts(x)
+        return y
+
     def __call__(self, x: mx.array) -> mx.array:
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
+
+        y = self._fused_short_call(x)
+        if y is not None:
+            return y
 
         gates = _router_gates(self.gate, x)
         bias = self.e_score_correction_bias
