@@ -70,9 +70,45 @@ class PrefillTransientTracker:
         return self._gathered_history if gathered_core is True else self._dense_history
 
     def record_reclaim(self, reclaimed_bytes: int) -> None:
-        """Accumulate footprint released since the last positive sample."""
-        if reclaimed_bytes > 0:
-            self._recent_reclaim_bytes += int(reclaimed_bytes)
+        """Accumulate footprint released since the last positive sample.
+
+        The pool-reallocation charge is bounded by ``reclaim_charge_ceiling_bytes``
+        — what one next chunk can plausibly re-allocate. Without the bound a
+        long-running server whose enforcer reclaims an idle 15-17 GB pool
+        roughly every 20 s accumulates tens of GB between two positive samples
+        and charges all of it to the next chunk: a 2-11x over-prediction that
+        starts an idle-model eviction ladder which cannot succeed, because the
+        prediction alone exceeds the target (#4417). The flat-overhead route
+        already bounds its debit the same way (``record_flat_reclaim``).
+        """
+        if reclaimed_bytes <= 0:
+            return
+        self._recent_reclaim_bytes += int(reclaimed_bytes)
+        ceiling = self.reclaim_charge_ceiling_bytes()
+        if ceiling > 0:
+            self._recent_reclaim_bytes = min(self._recent_reclaim_bytes, ceiling)
+
+    def reclaim_charge_ceiling_bytes(self) -> int:
+        """Ceiling for the accumulated reallocation charge (0 = no bound yet).
+
+        A single next chunk can re-allocate no more than the largest chunk
+        growth actually measured this session, itself clamped to
+        ``_OBSERVED_MAX_CLAMP_BYTES`` (a transient above that is a one-off
+        pool/Metal spike, not a repeatable per-chunk cost — the same clamp the
+        running max uses). Both execution regimes are folded in so switching
+        between the dense and gathered cores cannot reintroduce an unbounded
+        charge. Returns 0 before any positive sample exists: nothing has been
+        measured to bound by, so the ledger accumulates as it did before.
+        """
+        observed = max(
+            self._dense_history.observed_max_bytes,
+            self._dense_history.last_delta_bytes,
+            self._gathered_history.observed_max_bytes,
+            self._gathered_history.last_delta_bytes,
+        )
+        if observed <= 0:
+            return 0
+        return min(observed, self._OBSERVED_MAX_CLAMP_BYTES)
 
     def clear_reclaim(self) -> None:
         """Drop the charge once any positive measurement confirms realloc.
