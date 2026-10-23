@@ -8248,10 +8248,12 @@ class Scheduler:
         return None
 
     def _detect_needs_think_prefix(self, request: "Request") -> bool:
-        """Detect if prompt ends with an open <think> tag (thinking enabled).
+        """Detect if the prompt ends inside an open <think> block.
 
-        Returns False for disabled-thinking patterns like <think></think>
-        where </think> immediately follows <think> in the prompt tail.
+        That is the template's ``<think>\\n`` generation prompt, or a prompt
+        that continues a partial reasoning trace in the final turn. Returns
+        False for disabled-thinking patterns like <think></think>. Without a
+        known turn marker only the prompt tail is checked.
         """
         factory = getattr(self, "_output_parser_factory", None)
         if factory is not None and factory.kind == "k2_horizon":
@@ -8292,6 +8294,19 @@ class Scheduler:
 
         if not think_start_ids or not request.prompt_token_ids:
             return False
+
+        # With known turn markers, look back to the start of the final turn
+        # so a prompt that continues a partial reasoning trace counts too.
+        from .api.thinking import thinking_open_in_final_turn, turn_start_token_ids
+
+        turn_start_ids = turn_start_token_ids(self.tokenizer)
+        if turn_start_ids:
+            return thinking_open_in_final_turn(
+                request.prompt_token_ids,
+                think_start_ids,
+                self._resolve_think_end_token_ids(),
+                turn_start_ids,
+            )
 
         lookback = max(3, len(think_start_ids) + 2)
         last_tokens = list(request.prompt_token_ids[-lookback:])
