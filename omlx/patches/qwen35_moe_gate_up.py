@@ -60,7 +60,8 @@ _CALL_PATCHED = False
 
 # Loaded model classes whose module path marks a supported SwitchGLU family:
 # mlx-lm Qwen3.5/3.6 and HyV3, Qwen4-Exp's inherited SwitchGLU, the oMLX
-# single-checkpoint MTP wrapper, the vendored Laguna module and Muse Spark.
+# single-checkpoint MTP wrapper, the vendored Laguna module, Muse Spark and
+# mlx-lm LFM2-MoE.
 _FAMILY_TOKENS = (
     "qwen3_5",
     "qwen3_6",
@@ -69,6 +70,7 @@ _FAMILY_TOKENS = (
     "laguna",
     "hy_v3",
     "muse_spark",
+    "lfm2_moe",
 )
 
 

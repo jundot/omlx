@@ -450,6 +450,25 @@ class BatchedEngine(BaseEngine):
         except Exception:
             logger.debug("Qwen MoE router patch not applied", exc_info=True)
 
+        # LFM2-MoE decode: the MoE feed-forward in three launches and the
+        # short-conv mixer in two (about 25 composed launches per layer), and
+        # attention through a copy-free KV decode tail. Serves one decode
+        # token or an MTP verify block of up to four rows; prefill and batched
+        # rows keep the stock layer.
+        if (
+            self.model_type == "lfm2_moe"
+            and getattr(self._model_settings, "lfm2_fused_decode_enabled", True)
+            is not False
+        ):
+            try:
+                from ..patches.kv_decode_tail import apply_kv_decode_tail_patch
+                from ..patches.lfm2_moe_decode import apply_lfm2_moe_decode_patch
+
+                apply_kv_decode_tail_patch()
+                apply_lfm2_moe_decode_patch()
+            except Exception:
+                logger.debug("LFM2-MoE fused decode patch not applied", exc_info=True)
+
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
