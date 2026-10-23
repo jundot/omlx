@@ -5297,6 +5297,35 @@ def test_final_qwen_recovery_requires_complete_schema_valid_arguments(
     assert result.parse_errors == ("malformed",)
 
 
+@pytest.mark.parametrize(
+    ("finish_reason", "expected_errors"),
+    [("length", ()), ("stop", ("incomplete",))],
+)
+def test_final_qwen_cap_truncated_payload_is_text_not_a_coded_error(
+    final_qwen_parser, finish_reason, expected_errors
+):
+    """A payload cut off at the output cap is partial text, not a call attempt.
+
+    ``finish_reason=length`` means generation stopped at the token cap while the
+    envelope was still open, so no function element ever closed: there is no
+    call to recover and no malformed call to report.  The withheld bytes stay
+    visible as content and the truncation travels as ``finish_reason`` itself,
+    matching what the generic tokenizer path already does for this shape.  A
+    normal ``stop`` keeps the coded error, because there the model chose to end
+    an unfinished call.
+    """
+    tok, tools = final_qwen_parser
+    raw = "<tool_call><function=write><parameter=content>" + "x" * 512
+
+    result = extract_tool_calls_with_thinking(
+        "", raw, tok, tools, finish_reason=finish_reason
+    )
+
+    assert result.parse_errors == expected_errors
+    assert not result.tool_calls
+    assert result.cleaned_text == (raw if finish_reason == "length" else "")
+
+
 class TestAttributeStyleFunctionDialect:
     """Tests for the attribute-style <function name="..."> dialect (#3429).
 
