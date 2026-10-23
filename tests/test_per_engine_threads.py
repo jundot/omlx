@@ -393,6 +393,7 @@ class TestPrefixCacheReconstructStream:
 
     def test_prepare_prefix_cache_runs_on_engine_stream(self):
         observed_streams = []
+        recorded_results = []
 
         model = MagicMock()
         model.model_type = "test"
@@ -422,6 +423,9 @@ class TestPrefixCacheReconstructStream:
                 observed_streams.append(mx.default_stream(mx.gpu))
                 return None, list(prompt_token_ids)
 
+            def record_cache_result(self, num_tokens, cached_tokens):
+                recorded_results.append((num_tokens, cached_tokens))
+
         scheduler.block_aware_cache = RecordingBlockAwareCache()
 
         request = Request(
@@ -450,3 +454,4 @@ class TestPrefixCacheReconstructStream:
 
         assert observed_streams == [expected_engine_stream]
         assert expected_engine_stream != worker_default
+        assert recorded_results == [(3, 0)]
