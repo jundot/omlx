@@ -35,6 +35,7 @@ import mlx.core as mx
 from . import gguf
 from .engine import BaseEngine, BatchedEngine
 from .engine.decision import DecisionEngine
+from .engine.image import ImageEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.splash import (
@@ -347,6 +348,7 @@ class EngineEntry:
         "audio_tts",
         "audio_sts",
         "decision",
+        "image",
     ]  # Model type
     engine_type: Literal[
         "batched",
@@ -358,6 +360,7 @@ class EngineEntry:
         "audio_tts",
         "audio_sts",
         "decision",
+        "image",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -1489,6 +1492,7 @@ class EnginePool:
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
         "decision": "decision",
+        "image": "image",
     }
 
     @staticmethod
@@ -1496,9 +1500,7 @@ class EnginePool:
         model_type = (entry.config_model_type or "").lower().replace("-", "_")
         return model_type == "diffusion_gemma"
 
-    def apply_settings_overrides(
-        self, settings_manager: ModelSettingsManager
-    ) -> None:
+    def apply_settings_overrides(self, settings_manager: ModelSettingsManager) -> None:
         """Apply persisted settings to discovered entries.
 
         Applies model_type_override, then saves the recommended sampling
@@ -1507,7 +1509,7 @@ class EnginePool:
         """
         for model_id, entry in self._entries.items():
             settings = settings_manager.get_settings(model_id)
-            if settings.model_type_override:
+            if settings.model_type_override and entry.model_type != "image":
                 entry.model_type = settings.model_type_override
                 entry.engine_type = self._MODEL_TYPE_TO_ENGINE.get(
                     settings.model_type_override, "batched"
@@ -1790,7 +1792,14 @@ class EnginePool:
         source = entry.source_path
         if (
             model_path.exists()
-            and (model_path / "config.json").exists()
+            and (
+                model_path
+                / (
+                    "omlx-pipeline.json"
+                    if entry.model_type == "image"
+                    else "config.json"
+                )
+            ).is_file()
             and (source is None or Path(source).exists())
         ):
             return
@@ -3577,6 +3586,11 @@ class EnginePool:
             if entry.runtime_settle_size is not None
             else resident_size
         )
+        if isinstance(entry.engine, ImageEngine):
+            # Image weights are request-scoped. stop() drains and closes the
+            # pipeline before returning; the admission reservation is not a
+            # resident allocation that can be measured as an unload delta.
+            settle_size = 0
         pre_unload_active = 0 if external else mx.get_active_memory()
         pre_unload_footprint = 0 if external else get_phys_footprint()
 
@@ -4044,6 +4058,11 @@ class EnginePool:
                     engine = RerankerEngine(
                         model_name=entry.model_path,
                         trust_remote_code=trc,
+                    )
+                elif effective_type == "image":
+                    engine = ImageEngine(
+                        model_name=entry.model_path,
+                        scheduler_config=self._scheduler_config,
                     )
                 elif effective_type == "decision":
                     engine = DecisionEngine(
