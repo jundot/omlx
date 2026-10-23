@@ -936,6 +936,101 @@ def test_attention_patch_routes_single_token_decode_to_mma(monkeypatch):
     assert mx.abs(out.astype(mx.float32) - ref).max().item() < 5e-3
 
 
+@pytest.mark.parametrize("bits", [2.0, 4.0, 8.0])
+def test_dequantize_rotated_reads_step_allocated_buffers(bits):
+    """Rotated-space values, rotated back, are the codec's dequantized keys;
+    the kernel reads the step-allocated buffer in place."""
+    from omlx.patches import turboquant_attention as tq_attention
+
+    mx.random.seed(5)
+    D = 128
+    tq = TurboQuantKVCache(bits=bits)
+    tq.update_and_fetch(
+        mx.random.normal((1, 2, 300, D)).astype(mx.float16),
+        mx.random.normal((1, 2, 300, D)).astype(mx.float16),
+    )
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((1, 2, 5, D)).astype(mx.float16),
+        mx.random.normal((1, 2, 5, D)).astype(mx.float16),
+    )
+    assert tq.keys.norms.shape[2] > tq.offset
+    total = tq.offset
+    k_rot = tq_attention._dequantize_rotated(tq.keys, tq.key_codec, total, mx.float32)
+    dk, _ = tq.dequantize(keys_state=ks, values_state=vs)
+    back = tq.key_codec._rotate_inverse(k_rot)
+    assert back.shape == dk.shape
+    assert mx.allclose(back, dk.astype(mx.float32), atol=1e-3, rtol=1e-3).item()
+
+
+def _native_fa256_launch():
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    if not mx.metal.is_available() or not fast.has_symbol("qwen35_fa256_attention"):
+        pytest.skip("native qwen35_fa256_attention is unavailable")
+    from omlx.patches import qwen35_fa256_attention as fa256
+
+    return (fast.qwen35_fa256_attention, 32, 8, fa256._DEFAULT_DISPATCH_BUDGET)
+
+
+def test_long_prefill_attends_in_rotated_space(monkeypatch):
+    """Past the long-prefill threshold a causal chunk takes FA-256 over
+    rotated K/V and matches dequantize+SDPA with the chunk's causal offset."""
+    from mlx_lm.models import base as mlx_base
+
+    from omlx.patches import qwen35_fa256_attention as fa256
+    from omlx.patches import turboquant_attention as tq_attention
+
+    monkeypatch.setattr(fa256, "_PREFILL_LAUNCH", _native_fa256_launch())
+    monkeypatch.setattr(tq_attention, "_LONG_PREFILL_QUANTIZED_THRESHOLD", 64)
+    tq_attention.apply_turboquant_attention_patch()
+    calls = []
+    original = tq_attention._rotated_prefill_attention
+
+    def spy(*args, **kwargs):
+        out = original(*args, **kwargs)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(tq_attention, "_rotated_prefill_attention", spy)
+    mx.random.seed(6)
+    D, ctx, L = 256, 300, 48
+    tq = TurboQuantKVCache(bits=4.0)
+    tq.update_and_fetch(
+        mx.random.normal((1, 2, ctx, D)).astype(mx.float16),
+        mx.random.normal((1, 2, ctx, D)).astype(mx.float16),
+    )
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((1, 2, L, D)).astype(mx.float16),
+        mx.random.normal((1, 2, L, D)).astype(mx.float16),
+    )
+    queries = mx.random.normal((1, 8, L, D)).astype(mx.float16)
+    out = mlx_base.scaled_dot_product_attention(
+        queries, ks, vs, tq, scale=D**-0.5, mask="causal"
+    )
+    assert calls == [True]
+    ref = _mma_reference(tq, queries, ks, vs, D**-0.5)
+    rel = mx.abs(out.astype(mx.float32) - ref).max() / mx.abs(ref).max()
+    assert rel.item() < 5e-3
+
+
+def test_long_prefill_rotated_route_needs_fa256(monkeypatch):
+    """Without the FA-256 patch the rotated route declines, leaving the
+    quantized prefill paths."""
+    from omlx.patches import qwen35_fa256_attention as fa256
+    from omlx.patches import turboquant_attention as tq_attention
+
+    monkeypatch.setattr(fa256, "_PREFILL_LAUNCH", None)
+    mx.random.seed(7)
+    D = 256
+    tq = TurboQuantKVCache(bits=4.0)
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((1, 2, 64, D)).astype(mx.float16),
+        mx.random.normal((1, 2, 64, D)).astype(mx.float16),
+    )
+    queries = mx.random.normal((1, 4, 32, D)).astype(mx.float16)
+    assert tq_attention._rotated_prefill_attention(tq, queries, ks, vs, D**-0.5) is None
+
+
 def test_fused_multirow_kernel_respects_token_floor(monkeypatch):
     """Below the token floor the dispatcher must not call the fused helper
     (the fold path is already cheap there and the 2-pass block split needs

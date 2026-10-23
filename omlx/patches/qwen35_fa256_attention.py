@@ -70,6 +70,10 @@ _MAX_AUTO_BUDGET = 2_000_000_000
 _Q_BLOCK = 32
 _K_BLOCK = 8
 
+# Launch parameters of the installed patch, shared with callers that bring
+# their own dense K/V (TurboQuant prefill); None until the patch applies.
+_PREFILL_LAUNCH = None
+
 
 def _native_kernel():
     try:
@@ -79,6 +83,26 @@ def _native_kernel():
     if not fast.has_symbol("fa256_attention"):
         return None
     return fast.fa256_attention
+
+
+def causal_prefill_attention(queries, keys, values, scale):
+    """Causal FA-256 over dense ``keys``/``values``, or None when the patch
+    is not installed or the shapes are outside the kernel's envelope."""
+    if _PREFILL_LAUNCH is None or not _should_route(
+        queries, keys, None, "causal", None, 0
+    ):
+        return None
+    kernel, q_block, k_block, dispatch_budget = _PREFILL_LAUNCH
+    return kernel(
+        queries,
+        keys,
+        values,
+        scale,
+        causal=True,
+        q_block=q_block,
+        k_block=k_block,
+        dispatch_budget=dispatch_budget,
+    )
 
 
 def _has_quantized_cache(cache) -> bool:
@@ -205,7 +229,7 @@ def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
 
 
 def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
-    global _PATCHED
+    global _PATCHED, _PREFILL_LAUNCH
     if _PATCHED:
         return True
     if is_nax_available():
@@ -353,6 +377,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                 exc_info=True,
             )
         _PATCHED = True
+        _PREFILL_LAUNCH = (kernel, q_block, k_block, dispatch_budget)
         logger.info(
             "Qwen3.5/3.6 FA-256 steel attention patch applied "
             "(min_kv_len=%d, q_block=%d, k_block=%d, dispatch_budget=%d)",
