@@ -61,6 +61,8 @@ def _path_resolves_to_app_managed_cli() -> bool:
 def is_homebrew() -> bool:
     """Return True if running inside a Homebrew-installed virtualenv."""
     prefix = sys.prefix
+    if "/Caskroom/" in prefix:
+        return False
     return "/Cellar/" in prefix or "/homebrew/" in prefix
 
 
