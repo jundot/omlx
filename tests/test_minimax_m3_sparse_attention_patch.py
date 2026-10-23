@@ -935,3 +935,25 @@ def test_one_row_mxfp8_kernel_matches_quantized_matmul(language, k, n):
         y = dk.mxfp8_one_row(x, proj.weight, proj.scales)
         assert y is not None
         assert mx.array_equal(y, proj(x)).item()
+
+
+def test_decode_batch_affine_head_matches_one_row_decode(language, monkeypatch):
+    import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
+
+    mx.random.seed(61)
+    # As wide as a vocabulary head: a decode batch takes the row-exact tile.
+    head = nn.QuantizedLinear.from_linear(
+        nn.Linear(512, 65536, bias=False), group_size=64, bits=8
+    )
+    head.set_dtype(mx.bfloat16)
+    x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
+    expected = mx.concatenate([head(x[:, i : i + 1]) for i in range(3)], axis=1)
+    tiled = qmv_rows.row_exact_qmv.quantized_linears_tiled
+    calls = []
+    monkeypatch.setattr(
+        qmv_rows.row_exact_qmv,
+        "quantized_linears_tiled",
+        lambda *a, **k: calls.append(1) or tiled(*a, **k),
+    )
+    assert mx.array_equal(qmv_rows.rows_linear(head, x), expected).item()
+    assert calls

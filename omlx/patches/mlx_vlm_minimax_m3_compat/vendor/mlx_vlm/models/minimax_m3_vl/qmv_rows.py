@@ -89,15 +89,21 @@ def _row_exact_tile(rows: int, columns: int) -> tuple[int, int]:
 
 
 def row_exact_linears(linears, x: mx.array) -> tuple | None:
-    """Affine projections of ``x`` in a row-exact verify forward, or None.
+    """Affine projections of ``x`` in a row-exact verify forward (and the
+    vocabulary head of a decode batch), or None.
 
     One launch whose threadgroups apply each weight block to several rows, so
     the weights are read once per row group instead of once per row.
     """
     rows = x.size // x.shape[-1]
-    if not (2 <= rows <= MAX_ROWS and is_row_exact_armed()):
-        return None
     columns = sum(int(linear.weight.shape[0]) for linear in linears)
+    # A decode batch runs the vocabulary head here too, so its rows match the
+    # requests decoded alone.
+    if not (
+        2 <= rows <= MAX_ROWS
+        and (is_row_exact_armed() or columns >= _WIDE_OUTPUT_COLUMNS)
+    ):
+        return None
     padded, per_group = _row_exact_tile(rows, columns)
     flat = x.reshape(rows, x.shape[-1])
     if padded > rows:
