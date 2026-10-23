@@ -898,6 +898,9 @@ def _is_vision_tensor(name: str) -> bool:
             "pos_embed",
             "image_newline",
             "multi_modal_projector",
+            # MiniMax M3: maps merged image patches into the text space after
+            # multi_modal_projector.
+            "patch_merge_mlp",
             "visual.merger",
             "image_norm",
             "temporal_embed",

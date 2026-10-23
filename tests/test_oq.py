@@ -204,6 +204,12 @@ class TestUniversalQuantPredicate:
             is False
         )
 
+    def test_minimax_patch_merger_not_quantized(self, dense_config, module):
+        # MiniMax M3 projects merged image patches into the text space with
+        # patch_merge_mlp, after multi_modal_projector: part of the vision path.
+        for path in ("patch_merge_mlp.linear_1", "patch_merge_mlp.linear_2"):
+            assert universal_quant_predicate(path, module, dense_config) is False
+
     def test_ssm_alpha_not_quantized(self, dense_config, module):
         assert (
             universal_quant_predicate("model.layers.0.ssm_alpha", module, dense_config)
