@@ -784,10 +784,23 @@ _MSA_SMALL_L_BLOCK_SCORES = mx.fast.metal_kernel(
         for (int i = 0; i < HL; ++i) {
             acc[i] = 0.0f;
         }
+        bool k_vec = k_strides[3] == 1 && ((k_strides[0] | k_strides[2]) & 3) == 0;
         for (int d0 = 0; d0 < D; d0 += 32) {
             float kc[32];
-            for (int j = 0; j < 32; ++j) {
-                kc[j] = stored ? float(k[key_offset + (d0 + j) * k_strides[3]]) : 0.0f;
+            if (k_vec) {
+                for (int j = 0; j < 32; j += 4) {
+                    float4 v4 = stored
+                        ? float4(as_type<vec<T, 4>>(*(const device uint2*)(k + key_offset + d0 + j)))
+                        : float4(0.0f);
+                    kc[j] = v4.x;
+                    kc[j + 1] = v4.y;
+                    kc[j + 2] = v4.z;
+                    kc[j + 3] = v4.w;
+                }
+            } else {
+                for (int j = 0; j < 32; ++j) {
+                    kc[j] = stored ? float(k[key_offset + (d0 + j) * k_strides[3]]) : 0.0f;
+                }
             }
             for (int i = 0; i < HL; ++i) {
                 float s = 0.0f;
@@ -964,11 +977,17 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
         }
         int k_off = int(b) * k_strides[0] + kv * k_strides[1] + col_s[key] * k_strides[2];
         int ks = k_strides[3];
+        // A contiguous, 4-aligned head dimension loads four values at once.
+        bool k_vec = ks == 1 && ((k_strides[0] | k_strides[1] | k_strides[2]) & 3) == 0;
         for (int d0 = 0; d0 < D; d0 += 32) {
             float4 kc[8];
             for (int j = 0; j < 8; ++j) {
                 int o = k_off + (d0 + 4 * j) * ks;
-                kc[j] = float4(float(k[o]), float(k[o + ks]), float(k[o + 2 * ks]), float(k[o + 3 * ks]));
+                if (k_vec) {
+                    kc[j] = float4(as_type<vec<T, 4>>(*(const device uint2*)(k + o)));
+                } else {
+                    kc[j] = float4(float(k[o]), float(k[o + ks]), float(k[o + 2 * ks]), float(k[o + 3 * ks]));
+                }
             }
             for (int h = 0; h < HPT; ++h) {
                 float acc = 0.0f;
