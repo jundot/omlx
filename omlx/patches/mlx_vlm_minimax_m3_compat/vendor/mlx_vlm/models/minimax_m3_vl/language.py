@@ -30,6 +30,7 @@ from .msa import (
     msa_prefill_supported,
     msa_sparse_attention_b1,
     small_l_block_scores,
+    small_l_select_blocks,
     small_l_sparse_attention,
 )
 from .qmv_rows import mxfp8_rows_matmul, row_exact_linears, rows_linear
@@ -159,6 +160,9 @@ def _sparse_block_selection(
             local_blocks,
         )
         if negated is not None:
+            selected = small_l_select_blocks(negated, k)
+            if selected is not None:
+                return selected
             return mx.argpartition(negated, kth=k - 1, axis=-1)[..., :k].astype(
                 mx.int32
             )

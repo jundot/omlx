@@ -957,3 +957,17 @@ def test_decode_batch_affine_head_matches_one_row_decode(language, monkeypatch):
     )
     assert mx.array_equal(qmv_rows.rows_linear(head, x), expected).item()
     assert calls
+
+
+@pytest.mark.parametrize("blocks", [17, 40, 125, 1000, 4096])
+def test_block_selection_kernel_matches_argpartition(language, blocks):
+    import mlx_vlm.models.minimax_m3_vl.msa as msa
+
+    rng = np.random.default_rng(blocks)
+    # Few distinct values, so ties fall across the k-th boundary.
+    choices = np.array([-1e30, -1e29, -3.0, -2.0, -1.0, 0.0, np.inf], dtype=np.float32)
+    negated = mx.array(rng.choice(choices, size=(2, 4, 3, blocks)))
+    expected = mx.argpartition(negated, kth=15, axis=-1)[..., :16].astype(mx.int32)
+    selected = msa.small_l_select_blocks(negated, 16)
+    assert selected is not None
+    assert mx.array_equal(selected, expected).item()

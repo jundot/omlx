@@ -849,6 +849,67 @@ _MSA_SMALL_L_BLOCK_SCORES = mx.fast.metal_kernel(
 
 SMALL_L_BLOCK_SCORES_MAX_QUERIES = 16
 
+# Block j's rank is the number of blocks before it in a stable ascending sort
+# of the negated scores (a smaller score, or an equal one at a lower index).
+# The first TOPK ranks are the blocks, in order, that
+# mx.argpartition(kth=TOPK - 1)[..., :TOPK] returns: MLX sorts stably there.
+# One simdgroup per (row, block): its lanes count the blocks ahead over
+# interleaved slices of the row and simd_sum adds the counts, which is exact
+# in any order.
+_MSA_SMALL_L_SELECT = mx.fast.metal_kernel(
+    name="minimax_m3_msa_small_l_select",
+    input_names=["scores"],
+    output_names=["out"],
+    source=r"""
+        uint row = threadgroup_position_in_grid.y;
+        uint t = thread_index_in_threadgroup;
+        uint lane = t % 32;
+        threadgroup float s[NB];
+        for (int j = int(t); j < NB; j += TG) {
+            s[j] = scores[size_t(row) * NB + j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int j = int(threadgroup_position_in_grid.x) * (TG / 32) + int(t / 32);
+        if (j < NB) {
+            float v = s[j];
+            int ahead = 0;
+            for (int i = int(lane); i < NB; i += 32) {
+                float u = s[i];
+                ahead += (u < v || (u == v && i < j)) ? 1 : 0;
+            }
+            int rank = simd_sum(ahead);
+            if (lane == 0 && rank < TOPK) {
+                out[size_t(row) * TOPK + rank] = j;
+            }
+        }
+    """,
+)
+
+_SELECT_MAX_BLOCKS = 4096
+
+
+def small_l_select_blocks(negated: mx.array, k: int) -> Optional[mx.array]:
+    """``mx.argpartition(negated, kth=k - 1, axis=-1)[..., :k]`` as int32 in
+    one launch, or None when not covered."""
+    num_blocks = negated.shape[-1]
+    if (
+        not mx.metal.is_available()
+        or negated.dtype != mx.float32
+        or not 1 <= k <= num_blocks <= _SELECT_MAX_BLOCKS
+    ):
+        return None
+    rows = negated.size // num_blocks
+    threads = min(1024, 32 * num_blocks)
+    groups = -(-num_blocks // (threads // 32))
+    return _MSA_SMALL_L_SELECT(
+        inputs=[negated],
+        template=[("NB", num_blocks), ("TOPK", k), ("TG", threads)],
+        grid=(groups * threads, rows, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(*negated.shape[:-1], k)],
+        output_dtypes=[mx.int32],
+    )[0]
+
 
 def _row_pad(left_padding: Optional[mx.array], batch: int, dummy: mx.array):
     # Kernels read the padding only when HAS_PAD is set; without it any
