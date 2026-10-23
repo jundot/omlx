@@ -2133,14 +2133,14 @@
                             <button @click="open = !open" class="composer-pill" :class="{ 'is-open': open }"
                                 :title="window.t('chat.switch_model')" :aria-expanded="open" style="max-width: 15rem;">
                                 <i data-lucide="box" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
-                                <span class="truncate min-w-0" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
+                                <span class="truncate min-w-0" :title="(availableModels.find(m => m.id === currentModel)?.name) || currentModel" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
                                 <i data-lucide="chevron-down" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
                             </button>
                             <div x-show="open" x-transition.opacity x-cloak
                                 class="composer-popover right-0 p-1.5 overflow-y-auto"
                                 style="--popover-w: 17rem; max-height: 20rem;">
                                 <template x-for="model in availableModels" :key="model.id">
-                                    <button @click="selectModel(model.id); open = false"
+                                    <button @click="selectModel(model.id); open = false" :title="model.name"
                                         class="composer-menu-item" :class="model.id === currentModel ? 'font-semibold' : ''">
                                         <span class="w-3.5 h-3.5 flex-shrink-0 flex items-center justify-center"
                                             :style="'color: var(--timeline-accent); visibility:' + (model.id === currentModel ? 'visible' : 'hidden')">
