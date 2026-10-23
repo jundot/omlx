@@ -635,13 +635,19 @@ def _verify_ws_api_key(websocket: WebSocket, api_key: Optional[str]) -> bool:
     if not api_key or not isinstance(api_key, str):
         return False
 
-    from omlx.admin.auth import check_api_key, verify_any_api_key
+    from omlx.admin.auth import check_api_key, identify_api_key
+    from omlx.client_identity import set_key_identity
 
     sub_keys = gs.auth.sub_keys if gs is not None else []
-    return check_api_key(
-        websocket,
-        lambda: verify_any_api_key(api_key, _server_state.api_key, sub_keys),
-    )
+
+    def verify_client_key() -> bool:
+        identity = identify_api_key(api_key, _server_state.api_key, sub_keys)
+        if identity is None:
+            return False
+        set_key_identity(*identity)
+        return True
+
+    return check_api_key(websocket, verify_client_key)
 
 
 @realtime_router.websocket("/v1/audio/transcriptions/realtime")
