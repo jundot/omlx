@@ -776,6 +776,33 @@ async def test_mtp_depth_rejects_out_of_range_values(field, value):
         )
 
 
+@pytest.mark.parametrize("value", [0, -5])
+def test_output_token_caps_below_one_are_rejected_at_the_admin_boundary(value):
+    """A stored default below 1 would make every request that sends no cap
+    a 400, so the admin boundary never accepts one."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError, match="max_tokens"):
+        admin_routes.ModelSettingsRequest(max_tokens=value)
+    with pytest.raises(pydantic.ValidationError, match="max_tokens"):
+        admin_routes.CreateProfileRequest(
+            name="p", display_name="P", settings={"max_tokens": value}
+        )
+    # The global route applies the runtime copy before validate(), so the
+    # bound has to hold at the request model.
+    with pytest.raises(pydantic.ValidationError, match="sampling_max_tokens"):
+        admin_routes.GlobalSettingsRequest(sampling_max_tokens=value)
+
+
+def test_output_token_caps_of_one_or_unset_are_accepted_at_the_admin_boundary():
+    assert admin_routes.ModelSettingsRequest(max_tokens=1).max_tokens == 1
+    assert admin_routes.ModelSettingsRequest(max_tokens=None).max_tokens is None
+    assert (
+        admin_routes.GlobalSettingsRequest(sampling_max_tokens=1).sampling_max_tokens
+        == 1
+    )
+
+
 def test_unknown_settings_fields_are_rejected_loudly():
     """Unknown keys must 422 instead of silently returning success:true."""
     import pydantic

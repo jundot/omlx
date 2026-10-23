@@ -1832,6 +1832,22 @@ async def get_decision_engine(model: str, lease: _LLMEngineLease) -> DecisionEng
     return engine
 
 
+def _resolve_max_tokens(
+    req_max_tokens: int | None, model_settings, ocr_defaults: dict | None
+) -> int:
+    """Output token cap: request > model settings > OCR defaults > global."""
+    max_tokens: int
+    if req_max_tokens is not None:
+        max_tokens = req_max_tokens
+    elif model_settings and model_settings.max_tokens is not None:
+        max_tokens = model_settings.max_tokens
+    elif ocr_defaults and "max_tokens" in ocr_defaults:
+        max_tokens = ocr_defaults["max_tokens"]
+    else:
+        max_tokens = _server_state.sampling.max_tokens
+    return max_tokens
+
+
 def get_sampling_params(
     req_temperature: float | None,
     req_top_p: float | None,
@@ -1962,14 +1978,7 @@ def get_sampling_params(
 
     # Max tokens is an output length cap, not a sampling knob. Honor request
     # bounds even when force_sampling pins token-selection parameters.
-    if req_max_tokens is not None:
-        max_tokens = req_max_tokens
-    elif model_settings and model_settings.max_tokens is not None:
-        max_tokens = model_settings.max_tokens
-    elif ocr_defaults and "max_tokens" in ocr_defaults:
-        max_tokens = ocr_defaults["max_tokens"]
-    else:
-        max_tokens = global_sampling.max_tokens
+    max_tokens = _resolve_max_tokens(req_max_tokens, model_settings, ocr_defaults)
 
     # XTC probability: request > default (0.0 = disabled)
     xtc_probability = req_xtc_probability if req_xtc_probability is not None else 0.0
@@ -2351,6 +2360,29 @@ def validate_context_window(
                 f"Prompt is too long: {num_prompt_tokens} tokens > "
                 f"{max_ctx} maximum context length"
             ),
+        )
+
+
+def validate_output_token_limit(
+    value: int | None, field: str, model_id: str | None = None
+) -> None:
+    """Reject an invalid effective default before a stream answers HTTP 200.
+
+    Request schemas validate explicit caps; omitted caps use the same model,
+    OCR and global defaults as get_sampling_params().
+    """
+    if value is not None:
+        return
+    default = _resolve_max_tokens(
+        None,
+        get_model_settings_for_request(model_id),
+        _get_ocr_defaults(resolve_model_id(model_id)),
+    )
+    if default < 1:
+        raise InvalidRequestError(
+            f"{field} was not sent and the server's default output token cap "
+            f"for this model is {default}; send {field} of at least 1",
+            field=field,
         )
 
 
@@ -4462,6 +4494,7 @@ async def create_completion(
 ):
     """Create a text completion."""
     _reject_lone_surrogates(request)
+    validate_output_token_limit(request.max_tokens, "max_tokens", request.model)
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -4908,6 +4941,9 @@ async def create_chat_completion(
 
     if is_markitdown_model(request.model):
         return await _create_markitdown_chat_completion(request, http_request)
+
+    # Engine-bound from here: a missing cap falls back to the model default.
+    validate_output_token_limit(request.max_tokens, "max_tokens", request.model)
 
     request = await _preprocess_markitdown_files_for_llm(request)
 
@@ -8275,6 +8311,9 @@ async def create_response(
 ):
     """Create a response (OpenAI Responses API)."""
     _reject_lone_surrogates(request)
+    validate_output_token_limit(
+        request.max_output_tokens, "max_output_tokens", request.model
+    )
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,

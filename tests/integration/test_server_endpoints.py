@@ -2895,6 +2895,173 @@ class TestErrorHandling:
         assert response.status_code == 422
 
 
+_CHAT_BODY = {"messages": [{"role": "user", "content": "Hello"}]}
+# (endpoint, body without the cap, request field carrying the cap, error param)
+_OUTPUT_TOKEN_CAPS = [
+    ("/v1/chat/completions", _CHAT_BODY, "max_tokens", "max_tokens"),
+    (
+        "/v1/chat/completions",
+        _CHAT_BODY,
+        "max_completion_tokens",
+        "max_completion_tokens",
+    ),
+    ("/v1/completions", {"prompt": "Hello"}, "max_tokens", "max_tokens"),
+    ("/v1/messages", _CHAT_BODY, "max_tokens", "max_tokens"),
+    ("/v1/responses", {"input": "Hello"}, "max_output_tokens", "max_output_tokens"),
+]
+
+
+class TestOutputTokenLimitValidation:
+    """Invalid explicit caps and effective defaults fail before engine work."""
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("value", [0, -5])
+    @pytest.mark.parametrize("endpoint,body,field,param", _OUTPUT_TOKEN_CAPS)
+    def test_non_positive_cap_is_rejected_before_engine_work(
+        self, client, mock_engine_pool, endpoint, body, field, param, value, stream
+    ):
+        response = client.post(
+            endpoint,
+            json={"model": "test-model", **body, field: value, "stream": stream},
+        )
+
+        assert response.status_code == 422
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["param"] == param
+        assert "Input should be greater than 0" in error["message"]
+        assert mock_engine_pool.get_engine_calls == []
+
+    @pytest.mark.parametrize("endpoint,body,field,param", _OUTPUT_TOKEN_CAPS)
+    def test_one_token_cap_is_accepted(
+        self, client, mock_engine_pool, endpoint, body, field, param
+    ):
+        response = client.post(endpoint, json={"model": "test-model", **body, field: 1})
+
+        assert response.status_code == 200
+        assert mock_engine_pool.get_engine_calls
+
+    @pytest.mark.parametrize(
+        "caps,param,value",
+        [
+            (
+                {"max_tokens": 16, "max_completion_tokens": 0},
+                "max_completion_tokens",
+                0,
+            ),
+            ({"max_tokens": 0, "max_completion_tokens": 16}, "max_tokens", 0),
+            (
+                {"max_completion_tokens": -5, "max_tokens": 16},
+                "max_completion_tokens",
+                -5,
+            ),
+        ],
+    )
+    def test_each_chat_alias_is_checked_under_its_own_name(
+        self, client, mock_engine_pool, caps, param, value
+    ):
+        response = client.post(
+            "/v1/chat/completions", json={"model": "test-model", **_CHAT_BODY, **caps}
+        )
+
+        assert response.status_code == 422
+        error = response.json()["error"]
+        assert error["param"] == param
+        assert "Input should be greater than 0" in error["message"]
+        assert mock_engine_pool.get_engine_calls == []
+
+    def test_valid_chat_aliases_keep_max_tokens_precedence(
+        self, client, mock_llm_engine
+    ):
+        mock_llm_engine.chat = AsyncMock(
+            return_value=MockGenerationOutput(text="Chat response.")
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                **_CHAT_BODY,
+                "max_completion_tokens": 32,
+                "max_tokens": 16,
+            },
+        )
+
+        assert response.status_code == 200
+        assert mock_llm_engine.chat.call_args.kwargs["max_tokens"] == 16
+
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("source", ["model", "global"])
+    @pytest.mark.parametrize(
+        "endpoint,body,param",
+        [
+            ("/v1/chat/completions", _CHAT_BODY, "max_tokens"),
+            ("/v1/completions", {"prompt": "Hello"}, "max_tokens"),
+            ("/v1/responses", {"input": "Hello"}, "max_output_tokens"),
+        ],
+    )
+    def test_non_positive_default_cap_is_rejected_before_engine_work(
+        self,
+        client,
+        mock_engine_pool,
+        monkeypatch,
+        endpoint,
+        body,
+        param,
+        source,
+        stream,
+    ):
+        from omlx.model_settings import ModelSettings
+        from omlx.server import _server_state
+
+        if source == "model":
+
+            class StubSettingsManager:
+                def get_settings(self, model_id):
+                    return ModelSettings(max_tokens=0)
+
+            monkeypatch.setattr(
+                _server_state, "settings_manager", StubSettingsManager()
+            )
+        else:
+            monkeypatch.setattr(_server_state, "settings_manager", None)
+            monkeypatch.setattr(_server_state.sampling, "max_tokens", 0)
+
+        response = client.post(
+            endpoint, json={"model": "test-model", **body, "stream": stream}
+        )
+
+        assert response.status_code == 400
+        error = response.json()["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["param"] == param
+        assert error["message"] == (
+            f"{param} was not sent and the server's default output token cap "
+            f"for this model is 0; send {param} of at least 1"
+        )
+        assert mock_engine_pool.get_engine_calls == []
+
+    @pytest.mark.parametrize(
+        "endpoint,body,param",
+        [
+            ("/v1/chat/completions", _CHAT_BODY, "max_tokens"),
+            ("/v1/responses", {"input": "Hello"}, "max_output_tokens"),
+        ],
+    )
+    def test_request_cap_overrides_a_non_positive_default(
+        self, client, mock_engine_pool, monkeypatch, endpoint, body, param
+    ):
+        from omlx.server import _server_state
+
+        monkeypatch.setattr(_server_state, "settings_manager", None)
+        monkeypatch.setattr(_server_state.sampling, "max_tokens", 0)
+
+        response = client.post(endpoint, json={"model": "test-model", **body, param: 8})
+
+        assert response.status_code == 200
+        assert mock_engine_pool.get_engine_calls
+
+
 class TestJsonOutputParsing:
     """Tests for parse_json_output in non-streaming endpoints."""
 

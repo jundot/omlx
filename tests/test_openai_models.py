@@ -986,3 +986,23 @@ _USER_MESSAGES = [{"role": "user", "content": "hi"}]
 def test_output_token_caps_must_be_positive(model_cls, payload):
     with pytest.raises(ValidationError):
         model_cls.model_validate({"model": "m", **payload})
+
+
+@pytest.mark.parametrize("value", [0, -1, "invalid", 0.5])
+def test_chat_rejects_invalid_losing_output_token_alias(value):
+    with pytest.raises(ValidationError) as error:
+        ChatCompletionRequest(
+            model="m",
+            messages=_USER_MESSAGES,
+            max_tokens=16,
+            max_completion_tokens=value,
+        )
+    assert error.value.errors()[0]["loc"] == ("max_completion_tokens",)
+
+
+def test_chat_output_token_alias_is_not_serialized_twice():
+    request = ChatCompletionRequest(
+        model="m", messages=_USER_MESSAGES, max_completion_tokens=5
+    )
+    assert request.max_tokens == 5
+    assert "max_completion_tokens" not in request.model_dump()

@@ -347,6 +347,8 @@ class ChatCompletionRequest(BaseModel):
         gt=0,
         validation_alias=AliasChoices("max_tokens", "max_completion_tokens"),
     )
+    # AliasChoices otherwise drops this value when max_tokens is also sent.
+    max_completion_tokens: int | None = Field(default=None, gt=0, exclude=True)
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
     # llama.cpp extension: stream prompt_progress chunks during prefill.

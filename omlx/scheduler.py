@@ -58,6 +58,7 @@ from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .decode_activity import get_decode_activity
 from .exceptions import (
+    InvalidRequestError,
     PrefillMemoryExceededError,
     describe_ceiling_binding,
     is_cache_corruption_error,
@@ -6991,12 +6992,36 @@ class Scheduler:
                 _materialize_cache_storage(prompt_cache)
         Scheduler._clear_cache(self)
 
+    def _fail_uninsertable_request(
+        self, request: "Request", exc: ValueError
+    ) -> RequestOutput:
+        """Fail one prefilled request that BatchGenerator.insert refused.
+
+        mlx-lm validates every insert argument (a non-empty prompt,
+        max_tokens > 0, one option per segment) before it touches batch
+        state, and each insert here carries a single request, so the
+        ValueError concerns that request alone. Tear it down the way a
+        client abort between prefill and insert is torn down, and fail only
+        it, instead of letting step() raise into engine_core's recovery,
+        which fails every request on the engine. _insert_max_tokens keeps
+        the cap at 1 or more, so the refusal that still arrives here is an
+        empty prompt, such as a completion prompt that encodes to no tokens.
+        """
+        logger.error("BatchGenerator refused request %s: %s", request.request_id, exc)
+        self._do_abort_request(request.request_id)
+        return RequestOutput(
+            request_id=request.request_id,
+            finished=True,
+            finish_reason="error",
+            error=str(exc),
+        )
+
     def _insert_prefilled_request(
         self,
         request: "Request",
         state: _PrefillState,
         scheduled: "list[Request]",
-    ) -> None:
+    ) -> RequestOutput | None:
         """Insert a fully-prefilled request into BatchGenerator.
 
         Handles the batch_generator.insert() call, uid bookkeeping, and moving
@@ -7005,6 +7030,9 @@ class Scheduler:
         (last chunk completed across steps).
 
         Precondition: state.sampler, state.sm, state.per_row_lps are set.
+
+        Returns the request's error output when insert() refuses it (see
+        _fail_uninsertable_request), otherwise None.
         """
         # A requeued row keeps the random stream it was already sampling from.
         if request.sampling_params.seed is not None and not _request_count(
@@ -7046,7 +7074,7 @@ class Scheduler:
                     request.request_id,
                     vlm_mtp_uid,
                 )
-                return
+                return None
 
         self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
 
@@ -7054,16 +7082,19 @@ class Scheduler:
         # insert() merges the prompt cache into the batch KV caches with lazy
         # ops; keep them on the engine stream so the next decode step's eval
         # graph stays single-stream (#2235, see _remove_uid_from_active_batch).
-        with mx.stream(self._stream):
-            uids = self.batch_generator.insert(
-                [state.last_token],
-                max_tokens=[_insert_max_tokens(request)],
-                caches=[state.cache] if state.cache else None,
-                all_tokens=[_batch_generator_all_tokens(request)],
-                samplers=[state.sampler],
-                logits_processors=[per_row_lps],
-                stop_sequences=[state.sm],
-            )
+        try:
+            with mx.stream(self._stream):
+                uids = self.batch_generator.insert(
+                    [state.last_token],
+                    max_tokens=[_insert_max_tokens(request)],
+                    caches=[state.cache] if state.cache else None,
+                    all_tokens=[_batch_generator_all_tokens(request)],
+                    samplers=[state.sampler],
+                    logits_processors=[per_row_lps],
+                    stop_sequences=[state.sm],
+                )
+        except ValueError as exc:
+            return self._fail_uninsertable_request(request, exc)
         if uids:
             # The generator owns the restored cache now. Keeping the request's
             # alias pins its old full-window banks after batching copies them.
@@ -7115,6 +7146,7 @@ class Scheduler:
                 request.num_prompt_tokens,
                 cache_info,
             )
+        return None
 
     def _packed_prefill_ready(self) -> bool:
         """Whether in-flight prefills of this model may share one forward."""
@@ -7340,8 +7372,12 @@ class Scheduler:
         state: _PrefillState,
         scheduled: "list[Request]",
         still_prefilling: "deque[Request] | None",
-    ) -> None:
-        """Insert a fully prefilled request into BatchGenerator."""
+    ) -> RequestOutput | None:
+        """Insert a fully prefilled request into BatchGenerator.
+
+        Returns the request's error output when insert() refuses it (see
+        _fail_uninsertable_request), otherwise None.
+        """
         rid = request.request_id
         # Prefill complete - emit final boundary snapshot and insert.
         self._prefill_states.pop(rid, None)
@@ -7361,12 +7397,12 @@ class Scheduler:
             self._prefill_states[rid] = state
             if still_prefilling is not None:
                 still_prefilling.append(request)
-            return
+            return None
 
         # Clean up the prefill-progress tracker entry.
         get_prefill_tracker().remove(rid)
 
-        self._insert_prefilled_request(request, state, scheduled)
+        return self._insert_prefilled_request(request, state, scheduled)
 
     def _advance_chunked_prefills(
         self,
@@ -7501,18 +7537,22 @@ class Scheduler:
                 if packed:
                     # The final tail snapshot reads the active priming slot.
                     _mtp_priming.activate_request(self.model, rid)
-                self._complete_chunked_prefill(
+                refused = self._complete_chunked_prefill(
                     request, state, scheduled, still_prefilling
                 )
+                if refused is not None:
+                    rejected.append(refused)
             # Companions stay queued in their own FCFS position; finished
             # ones are inserted now so their slot is skipped later.
             for plan, finished in zip(plans[1:], done[1:]):
                 if finished:
                     companion = plan.state.request
                     _mtp_priming.activate_request(self.model, companion.request_id)
-                    self._complete_chunked_prefill(
+                    refused = self._complete_chunked_prefill(
                         companion, plan.state, scheduled, None
                     )
+                    if refused is not None:
+                        rejected.append(refused)
             if packed or contended:
                 # One forward per step after a pack or a contended chunk, so
                 # finished rows decode first. An uncontended lone head lets
@@ -10664,7 +10704,8 @@ class Scheduler:
 
         Raises SchedulerQueueFullError when the waiting queue is at or above
         the configured cap (max(max_num_seqs * 4, 32)). Server layer maps
-        this to HTTP 503 + Retry-After.
+        this to HTTP 503 + Retry-After. Raises InvalidRequestError (HTTP
+        400) when sampling_params.max_tokens is below 1.
 
         Args:
             request: The request to add
@@ -10716,6 +10757,15 @@ class Scheduler:
             except Exception:
                 self._release_paged_cache_for_request(request.request_id)
                 raise
+
+        # _insert_max_tokens would serve this as one token after the full
+        # prefill; refuse it here instead, before any work is queued.
+        if request.sampling_params.max_tokens < 1:
+            raise InvalidRequestError(
+                "max_tokens must be at least 1, got "
+                f"{request.sampling_params.max_tokens}",
+                field="max_tokens",
+            )
 
         # Add to tracking
         self.requests[request.request_id] = request
@@ -13227,7 +13277,11 @@ class Scheduler:
                         self._emit_final_boundary_if_needed(state)
                         Scheduler._clear_cache(self)
                         get_prefill_tracker().remove(request.request_id)
-                        self._insert_prefilled_request(request, state, scheduled)
+                        refused = self._insert_prefilled_request(
+                            request, state, scheduled
+                        )
+                        if refused is not None:
+                            rejected_outputs.append(refused)
                     else:
                         self.prefilling.append(request)
                         self._prefill_states[request.request_id] = state
@@ -13389,16 +13443,20 @@ class Scheduler:
             # lazy ops; keep them on the engine stream so the next decode
             # step's eval graph stays single-stream (#2235, see
             # _remove_uid_from_active_batch).
-            with mx.stream(self._stream):
-                uids = self.batch_generator.insert(
-                    [tokens_to_process],
-                    max_tokens=[_insert_max_tokens(request)],
-                    caches=[cache_to_use] if cache_to_use else None,
-                    all_tokens=[_batch_generator_all_tokens(request)],
-                    samplers=[sampler],
-                    logits_processors=[per_row_lps],
-                    stop_sequences=[sm],
-                )
+            try:
+                with mx.stream(self._stream):
+                    uids = self.batch_generator.insert(
+                        [tokens_to_process],
+                        max_tokens=[_insert_max_tokens(request)],
+                        caches=[cache_to_use] if cache_to_use else None,
+                        all_tokens=[_batch_generator_all_tokens(request)],
+                        samplers=[sampler],
+                        logits_processors=[per_row_lps],
+                        stop_sequences=[sm],
+                    )
+            except ValueError as exc:
+                rejected_outputs.append(self._fail_uninsertable_request(request, exc))
+                continue
             if uids:
                 # As in the chunked path, transfer ownership after insertion.
                 request.prompt_cache = None

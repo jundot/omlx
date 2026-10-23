@@ -354,7 +354,8 @@ class ModelSettingsRequest(BaseModel):
     model_alias: str | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
-    max_tokens: int | None = None
+    # Invalid stored caps would reject every request that omits an explicit cap.
+    max_tokens: int | None = Field(default=None, ge=1)
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -733,7 +734,8 @@ class GlobalSettingsRequest(BaseModel):
     # Sampling defaults
     sampling_max_context_window: int | None = None
     sampling_max_context_window_policy: int | None = Field(default=None, ge=1)
-    sampling_max_tokens: int | None = None
+    # Checked here because the runtime copy is updated before validate().
+    sampling_max_tokens: int | None = Field(default=None, ge=1)
     sampling_temperature: float | None = None
     sampling_top_p: float | None = None
     sampling_top_k: int | None = None
