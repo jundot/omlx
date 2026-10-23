@@ -294,46 +294,6 @@ class DecisionBackbone:
             return self._lm_head.as_linear(hidden)
         return self._lm_head(hidden)
 
-    def prefill_block(
-        self,
-        embeds: mx.array,
-        positions: mx.array | None,
-        cache: list,
-        chunk_size: ChunkSize,
-    ) -> Generator[int, None, mx.array]:
-        """Read one bidirectional block, attending to its cached predecessors.
-
-        A block cannot be split across tokens: every full-attention query must
-        see its whole block. Yield between groups of layers instead. Gated
-        DeltaNet retains its causal recurrence and its own cache state.
-        """
-        layers = self._text_model.layers
-        depth, length = len(layers), embeds.shape[1]
-        position_embeddings = None
-        if self.has_vision:
-            for layer in layers:
-                if not layer.is_linear:
-                    rotary = layer.self_attn.rotary_emb
-                    if not rotary.fused_apply:
-                        position_embeddings = rotary(embeds, positions)
-                    break
-        hidden = embeds
-        done = 0
-        while done < depth:
-            end = min(depth, done + max(1, chunk_size() * depth // length))
-            for index in range(done, end):
-                kwargs = {}
-                if self.has_vision:
-                    kwargs = {
-                        "position_ids": positions,
-                        "position_embeddings": position_embeddings,
-                    }
-                hidden = layers[index](hidden, mask=None, cache=cache[index], **kwargs)
-            mx.eval(hidden, [entry.state for entry in cache[done:end]])
-            yield length * end // depth - length * done // depth
-            done = end
-        return self._text_model.norm(hidden[0, -1])
-
     def output_rows(self, ids: mx.array) -> mx.array:
         """Rows of the output projection for ``ids``, dequantized if needed."""
         head = self._lm_head

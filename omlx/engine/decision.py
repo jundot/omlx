@@ -107,7 +107,7 @@ class DecisionEngine(BaseNonStreamingEngine):
         )
         logger.info(f"Decision engine stopped: {self._model_name}")
 
-    def _require_model(self) -> ClefModel | OpenJevModel | D3Model:
+    def _require_model(self) -> ClefModel | OpenJevModel | D3Model | BaseLabsModel:
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
         return self._model
