@@ -129,8 +129,6 @@ DECISION_SIDECAR_FILES = (
     *DECISION_SIDECAR_WEIGHTS,
     CLEF_HEAD_CONFIG,
     D3_DECISION_CONFIG,
-    "readout.json",  # Mammoth-1 / Elephant-1 slot readout metadata
-    "calibration.json",
 )
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
@@ -527,8 +525,13 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
     if isinstance(overrides, dict):
         attention = overrides.get("attention")
         if (
-            isinstance(attention, dict)
-            and attention.get("full_attention") == "block_bidirectional"
+            attention
+            == {
+                "full_attention": "block_bidirectional",
+                "linear_attention": "causal",
+            }
+            and overrides.get("readout") == "slot_lm"
+            and overrides.get("n_slots") == 256
             and (model_path / "readout.json").is_file()
         ):
             return "baselabs"
@@ -1032,7 +1035,10 @@ def _read_model_context_length(model_path: Path) -> int | None:
 
         # The decision models were trained for 16K, even though their Qwen
         # backbone still declares its original 256K positional capacity.
-        if decision_kind(model_path, model_config) == "baselabs":
+        if (
+            model_config.get("modeling_overrides")
+            and decision_kind(model_path, model_config) == "baselabs"
+        ):
             text_config = model_config.get("text_config") or model_config
             value = text_config.get("max_position_embeddings")
             return (

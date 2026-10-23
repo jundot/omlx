@@ -1112,7 +1112,7 @@ def test_baselabs_rejects_invalid_questions(question):
 @pytest.fixture(params=["text", "vision"])
 def block_backbone(request, tiny_backbone):
     if request.param == "vision":
-        return tiny_backbone
+        return copy.copy(tiny_backbone)
     from mlx_lm.models.qwen3_5 import Model, ModelArgs
 
     model = Model(
@@ -1155,6 +1155,8 @@ def _full_block_readout(backbone, ids, boundary, pixels=None, grid=None):
 @pytest.mark.parametrize("chunk", [1, 4096])
 def test_block_prefill_matches_full_masked_forward(block_backbone, chunk):
     backbone = block_backbone
+    model = baselabs.BaseLabsModel("tiny")
+    model.backbone = backbone
     ids = np.arange(5, 35, dtype=np.int32)
     pixels = grid = None
     if backbone.has_vision:
@@ -1163,15 +1165,13 @@ def test_block_prefill_matches_full_masked_forward(block_backbone, chunk):
     expected = _full_block_readout(backbone, ids, split, pixels, grid)
     prefix_embeds, positions = backbone.embed(ids[:split], pixels, grid)
     prefix_cache = backbone.make_cache()
-    steps = backbone.prefill_block(
-        prefix_embeds, positions, prefix_cache, lambda: chunk
-    )
+    steps = model._prefill_block(prefix_embeds, positions, prefix_cache, lambda: chunk)
     assert sum(steps) == split
     last_position = None if positions is None else positions[:, :, -1]
     for _ in range(2):
         embeds, tail_positions = backbone.embed_continuation(ids[split:], last_position)
         actual = _drain(
-            backbone.prefill_block(
+            model._prefill_block(
                 embeds, tail_positions, copy.deepcopy(prefix_cache), lambda: chunk
             )
         )

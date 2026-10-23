@@ -43,10 +43,10 @@ The `model` is the directory/model ID shown by `GET /v1/models`.
 }
 ```
 
-Choice supports 1–255 options; Noul returns P(yes); Score returns the expected
-zero-based level and per-level probabilities. Criteria preserve their input
-order, and question IDs do not enter the prompt. Requests exceeding 16,384
-tokens for a branch or 65,536 tokens across the shared prefix and suffixes
+Choice supports 1–255 options; Noul returns P(yes); Score supports 1–10 levels
+and returns the expected zero-based level and per-level probabilities. Criteria
+preserve their input order, and question IDs do not enter the prompt. Requests
+exceeding 16,384 tokens for a branch or 65,536 tokens across the shared prefix and suffixes
 return 413. Evidence is never silently truncated, including with `truncate: true`.
 
 ## Inference and validation

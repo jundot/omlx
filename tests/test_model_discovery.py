@@ -723,9 +723,19 @@ class TestDetectModelType:
         config["text_config"]["max_position_embeddings"] = 8192
         (model_dir / "config.json").write_text(json.dumps(config))
         assert _read_model_context_length(model_dir) == 8192
-        config["modeling_overrides"]["attention"]["full_attention"] = "causal"
-        (model_dir / "config.json").write_text(json.dumps(config))
-        assert decision_kind(model_dir) is None
+        config["text_config"]["max_position_embeddings"] = 262144
+        overrides = config["modeling_overrides"]
+        for unsupported in (
+            {"attention": {**overrides["attention"], "full_attention": "causal"}},
+            {"attention": {**overrides["attention"], "linear_attention": "noncausal"}},
+            {"readout": "head"},
+            {"n_slots": 128},
+        ):
+            config["modeling_overrides"] = {**overrides, **unsupported}
+            (model_dir / "config.json").write_text(json.dumps(config))
+            assert decision_kind(model_dir) is None
+            assert detect_model_type(model_dir) == "vlm"
+            assert _read_model_context_length(model_dir) == 262144
 
     def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
         """Qwen3 with CausalLM architecture should be LLM, not embedding."""

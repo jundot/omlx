@@ -379,6 +379,46 @@ class BaseLabsModel:
             grid,
         )
 
+    def _prefill_block(
+        self,
+        embeds: mx.array,
+        positions: mx.array | None,
+        cache: list,
+        chunk_size: ChunkSize,
+    ) -> Generator[int, None, mx.array]:
+        """Read one bidirectional block, attending to its cached predecessors.
+
+        A block cannot be split across tokens: every full-attention query must
+        see its whole block. Yield between groups of layers instead. Gated
+        DeltaNet retains its causal recurrence and its own cache state.
+        """
+        backbone = self.backbone
+        layers = backbone._text_model.layers
+        depth, length = len(layers), embeds.shape[1]
+        positional = {}
+        if backbone.has_vision:
+            rotary = next(
+                layer.self_attn.rotary_emb for layer in layers if not layer.is_linear
+            )
+            positional = {
+                "position_ids": positions,
+                "position_embeddings": (
+                    None if rotary.fused_apply else rotary(embeds, positions)
+                ),
+            }
+        hidden = embeds
+        done = 0
+        while done < depth:
+            end = min(depth, done + max(1, chunk_size() * depth // length))
+            for index in range(done, end):
+                hidden = layers[index](
+                    hidden, mask=None, cache=cache[index], **positional
+                )
+            mx.eval(hidden, [entry.state for entry in cache[done:end]])
+            yield length * end // depth - length * done // depth
+            done = end
+        return backbone._text_model.norm(hidden[0, -1])
+
     def run(
         self, plan: BaseLabsPlan, chunk_size: ChunkSize
     ) -> Generator[int, None, dict]:
@@ -389,13 +429,13 @@ class BaseLabsModel:
             plan.prefix_ids, plan.pixel_values, plan.image_grid_thw
         )
         prefix_cache = backbone.make_cache()
-        yield from backbone.prefill_block(embeds, positions, prefix_cache, chunk_size)
+        yield from self._prefill_block(embeds, positions, prefix_cache, chunk_size)
         last_position = None if positions is None else positions[:, :, -1]
         answers = {}
         for item, suffix in zip(plan.items, plan.suffix_ids):
             cache = copy.deepcopy(prefix_cache)
             embeds, positions = backbone.embed_continuation(suffix, last_position)
-            hidden = yield from backbone.prefill_block(
+            hidden = yield from self._prefill_block(
                 embeds, positions, cache, chunk_size
             )
             logits = (
