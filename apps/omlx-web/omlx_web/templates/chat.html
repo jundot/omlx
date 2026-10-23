@@ -5176,7 +5176,6 @@
                     searxngUrlSet: Boolean(integrations.web_search_searxng_url),
                     ddgsBackendsSet: Boolean(integrations.web_search_ddgs_backends),
                 };
-                this._globalMaxContextWindow = settingsData.sampling?.max_context_window || 32768;
             }
             this._mirrorAliasModelTypes();
 
@@ -5199,7 +5198,8 @@
                     id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
                     name: m.id, // original name (alias or directory name) for display
                     owned_by: m.owned_by,
-                    is_favorite: favoriteIds.has(this.aliasToGateway[m.id] || m.id)
+                    is_favorite: favoriteIds.has(this.aliasToGateway[m.id] || m.id),
+                    max_context_window: m.max_model_len
                 }))
             );
 
@@ -7953,15 +7953,10 @@
     },
 
     contextWindowForCurrentModel() {
-        // Per-model max_context_window from admin settings, then global fallback, then 32768.
-        try {
-            const list = this._adminModelsList || [];
-            const gw = this.aliasToGateway?.[this.currentModel] || this.currentModel;
-            const m = list.find(x => x.id === gw || x.id === this.currentModel);
-            const perModel = m?.settings?.max_context_window ?? m?.max_context_window;
-            if (perModel) return perModel;
-        } catch (e) { /* ignore */ }
-        return this._globalMaxContextWindow || 32768;
+        // Get the value already obtained from the backend || 32768.
+        const id = this.resolveGatewayModelId(this.currentModel);
+        const m = (this.availableModels || []).find(x => x.id === id);
+        return m?.max_context_window || 32768;
     },
 
     // Cache the latest known context-token count on the conversation so the meter
