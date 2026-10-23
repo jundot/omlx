@@ -42,6 +42,8 @@ from omlx.request import Request, SamplingParams
 # they share one worker so concurrent command buffers do not trip the Metal
 # GPU timeout. Every other test file stays on a single worker.
 _GPU_SERIAL_TEST_FILES = (
+    "test_image_conditioning.py",
+    "test_image_pipeline.py",
     "test_deepseek_v4*",
     "test_glm5_*",
     "test_glm_moe_*",

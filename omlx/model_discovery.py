@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import gguf
+from .image_bundle import image_boundary
 
 logger = logging.getLogger(__name__)
 
@@ -1676,6 +1677,8 @@ def _register_model(
     source_repo_id: str | None = None,
 ) -> None:
     """Try to register a single model directory into the models dict."""
+    if image_boundary(model_dir):
+        return
     if model_id in models:
         logger.warning(
             f"Duplicate model_id '{model_id}' found in {model_dir}, "
@@ -2001,6 +2004,9 @@ def discover_models(
         raise ValueError(access_error)
 
     models: dict[str, DiscoveredModel] = {}
+    if image_boundary(model_dir):
+        logger.warning("Skipping image pipeline/component %s: image serving is unavailable", model_dir)
+        return models
 
     for subdir in _iter_readable_entries(model_dir, "model directory"):
         if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
@@ -2008,6 +2014,9 @@ def discover_models(
         if gguf_root is not None and subdir.resolve() == gguf_root.resolve():
             continue
 
+        if image_boundary(subdir):
+            logger.warning("Skipping image pipeline/component %s: image serving is unavailable", subdir)
+            continue
         if _is_adapter_dir(subdir):
             logger.info(
                 f"Skipping LoRA adapter: {subdir.name} "
@@ -2022,6 +2031,9 @@ def discover_models(
             # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
+                if image_boundary(hf_resolved.snapshot_path):
+                    logger.warning("Skipping image pipeline/component %s: image serving is unavailable", hf_resolved.snapshot_path)
+                    continue
                 if _register_gguf_folder(
                     models,
                     hf_resolved.snapshot_path,
@@ -2053,6 +2065,10 @@ def discover_models(
                     not _is_readable_dir(child, "model group entry")
                     or child.name.startswith(".")
                 ):
+                    continue
+                if image_boundary(child):
+                    logger.warning("Skipping image pipeline/component %s: image serving is unavailable", child)
+                    has_children = True
                     continue
                 if _is_adapter_dir(child):
                     logger.info(
