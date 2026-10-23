@@ -599,3 +599,109 @@ def test_rms_norm_caches_its_fp32_scale(language):
     # Loading a new weight array rebuilds the scale.
     norm.weight = mx.zeros((64,), dtype=mx.bfloat16)
     assert mx.array_equal(norm._scale(), mx.ones((64,))).item()
+
+
+def _head_inputs(batch, length):
+    heads = (64, 4, 4, 1)  # M3.1-Flash q, k, index q, index k
+    xs = [
+        (mx.random.normal((batch, length, h, 128)) * 3).astype(mx.bfloat16)
+        for h in heads
+    ]
+    return xs, [1.0 + mx.random.normal((128,)) * 0.3 for _ in heads]
+
+
+@pytest.mark.parametrize(
+    "batch,length,offset",
+    [
+        (1, 1, 4097),
+        (1, 1, [-3]),
+        (2, 1, [37, 50]),
+        (1, 4, 300),
+        # A left-padded prefill puts its padding at negative positions.
+        (2, 3, [-2, 5]),
+        (8, 1, [0, 1, 2, 3, 4, 5, 6, 7]),
+    ],
+)
+@pytest.mark.parametrize("dims,rope_scale", [(64, 1.0), (128, 1.0), (64, 0.25)])
+def test_decode_head_norm_rope_matches_mlx(
+    language, batch, length, offset, dims, rope_scale
+):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(13)
+    xs, scales = _head_inputs(batch, length)
+    if isinstance(offset, list):
+        offset = mx.array(offset)
+    rotated = dk.head_norm_rope(xs, scales, 1e-6, offset, dims, 1e7, rope_scale)
+    assert rotated is not None
+    for x, scale, y in zip(xs, scales, rotated):
+        normed = mx.fast.rms_norm(x, scale, 1e-6).transpose(0, 2, 1, 3)
+        expected = mx.fast.rope(
+            normed, dims, traditional=False, base=1e7, scale=rope_scale, offset=offset
+        ).astype(x.dtype)
+        assert mx.array_equal(y, expected).item()
+
+
+def test_decode_head_norm_rope_coverage(language):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    def covered(xs, scales, offset, dims):
+        return dk.head_norm_rope(xs, scales, 1e-6, offset, dims, 1e7, 1.0) is not None
+
+    xs, scales = _head_inputs(2, 4)
+    assert covered(xs, scales, mx.array([3, 0]), 64)
+    assert not covered(_head_inputs(3, 3)[0], scales, 0, 64)
+    assert not covered(xs, scales, mx.array([1, 2, 3]), 64)
+    assert not covered(xs, scales, 0, 48)
+    assert not covered(xs, [s.astype(mx.bfloat16) for s in scales], 0, 64)
+
+
+def test_short_calls_fuse_head_norms_and_rope_bit_exactly(language, monkeypatch):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(9)
+    args = _tiny_args(
+        head_dim=128, rotary_dim=64, rope_theta=1e7, sparse={"sparse_index_dim": 128}
+    )
+    attention = language.MiniMaxAttention(args, 0)
+    for name in ("q_norm", "k_norm", "index_q_norm", "index_k_norm"):
+        attention[name].weight = mx.random.normal((128,)) * 0.3
+    attention.set_dtype(mx.bfloat16)
+    prompt = mx.random.normal((1, 40, 64)).astype(mx.bfloat16)
+    steps = [mx.random.normal((1, n, 64)).astype(mx.bfloat16) for n in (1, 3, 8)]
+
+    def run():
+        outs, caches = [], []
+        for n in (37, 40):
+            cache = language.MiniMaxM3KVCache()
+            outs.append(attention(prompt[:, :n], mask="causal", cache=cache))
+            for step in steps:
+                outs.append(attention(step, cache=cache))
+                cache.trim(step.shape[1])
+            caches.append(cache)
+        batch = language.MiniMaxM3BatchKVCache.merge(caches)
+        outs.append(
+            attention(
+                mx.concatenate([steps[0], steps[0]]),
+                mask=batch.make_mask(1),
+                cache=batch,
+                position_ids=mx.array([[37], [40]]),
+            )
+        )
+        mx.eval(outs)
+        return outs
+
+    calls = []
+    head_norm_rope = dk.head_norm_rope
+
+    def spy(xs, *args):
+        calls.append(xs[0].shape[:2])
+        return head_norm_rope(xs, *args)
+
+    monkeypatch.setattr(dk, "head_norm_rope", spy)
+    fused = run()
+    assert calls == [(1, 1), (1, 3), (1, 8)] * 2 + [(2, 1)]
+    monkeypatch.setattr(dk, "head_norm_rope", lambda *args: None)
+    separate = run()
+    for a, b in zip(separate, fused):
+        assert mx.array_equal(a, b).item()

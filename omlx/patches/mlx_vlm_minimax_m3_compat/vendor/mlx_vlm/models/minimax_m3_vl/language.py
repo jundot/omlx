@@ -1215,6 +1215,47 @@ class MiniMaxAttention(nn.Module):
         names = _INPUT_PROJECTIONS if self.has_sparse_index else _INPUT_PROJECTIONS[:3]
         return _project(self, names, x)
 
+    def _fused_head_norm_rope(
+        self, queries, keys, projected, rope_offset, use_sparse_mask
+    ):
+        """The head norms and RoPE below for a call of up to eight rows in one
+        launch: the rotated queries, keys, index queries and index keys, or
+        None when the call is not covered."""
+        B, L = queries.shape[:2]
+        rope = self.rope
+        if (
+            B * L > decode_kernels.MAX_ROWS
+            or not self.use_qk_norm
+            or type(rope) is not nn.RoPE
+            or rope.traditional
+        ):
+            return None
+        xs = [queries, keys]
+        norms = [self.q_norm, self.k_norm]
+        if use_sparse_mask:
+            index_q = projected["index_q_proj"]
+            index_k = projected["index_k_proj"]
+            xs += [
+                index_q.reshape(B, L, self.index_heads, self.index_dim),
+                index_k.reshape(B, L, 1, self.index_dim),
+            ]
+            norms += [self.index_q_norm, self.index_k_norm]
+        eps = norms[0].eps
+        if any(norm.eps != eps for norm in norms):
+            return None
+        rotated = decode_kernels.head_norm_rope(
+            xs,
+            [norm._scale() for norm in norms],
+            eps,
+            rope_offset,
+            rope.dims,
+            rope.base,
+            rope.scale,
+        )
+        if rotated is not None and not use_sparse_mask:
+            rotated += [None, None]
+        return rotated
+
     def __call__(
         self,
         x: mx.array,
@@ -1244,34 +1285,43 @@ class MiniMaxAttention(nn.Module):
         keys = keys.reshape(B, L, self.num_key_value_heads, self.head_dim)
         values = values.reshape(B, L, self.num_key_value_heads, self.head_dim)
 
-        # q/k norms and RoPE run in float32 and round to the model dtype once.
-        if self.use_qk_norm:
-            queries = self.q_norm(queries, dtype=mx.float32)
-            keys = self.k_norm(keys, dtype=mx.float32)
-
-        if use_sparse_mask:
-            idx_queries = projected["index_q_proj"]
-            idx_keys = projected["index_k_proj"]
-            idx_queries = idx_queries.reshape(B, L, self.index_heads, self.index_dim)
-            idx_keys = idx_keys.reshape(B, L, 1, self.index_dim)
-            idx_queries = self.index_q_norm(idx_queries, dtype=mx.float32)
-            idx_keys = self.index_k_norm(idx_keys, dtype=mx.float32)
-            idx_queries = self.rope(
-                idx_queries.transpose(0, 2, 1, 3), offset=rope_offset
-            ).astype(x.dtype)
-            idx_keys = self.rope(
-                idx_keys.transpose(0, 2, 1, 3), offset=rope_offset
-            ).astype(x.dtype)
+        fused = self._fused_head_norm_rope(
+            queries, keys, projected, rope_offset, use_sparse_mask
+        )
+        if fused is not None:
+            queries, keys, idx_queries, idx_keys = fused
+            values = values.transpose(0, 2, 1, 3)
         else:
-            idx_queries = None
-            idx_keys = None
+            # q/k norms and RoPE run in float32 and round to the model dtype once.
+            if self.use_qk_norm:
+                queries = self.q_norm(queries, dtype=mx.float32)
+                keys = self.k_norm(keys, dtype=mx.float32)
 
-        queries = queries.transpose(0, 2, 1, 3)
-        keys = keys.transpose(0, 2, 1, 3)
-        values = values.transpose(0, 2, 1, 3)
+            if use_sparse_mask:
+                idx_queries = projected["index_q_proj"]
+                idx_keys = projected["index_k_proj"]
+                idx_queries = idx_queries.reshape(
+                    B, L, self.index_heads, self.index_dim
+                )
+                idx_keys = idx_keys.reshape(B, L, 1, self.index_dim)
+                idx_queries = self.index_q_norm(idx_queries, dtype=mx.float32)
+                idx_keys = self.index_k_norm(idx_keys, dtype=mx.float32)
+                idx_queries = self.rope(
+                    idx_queries.transpose(0, 2, 1, 3), offset=rope_offset
+                ).astype(x.dtype)
+                idx_keys = self.rope(
+                    idx_keys.transpose(0, 2, 1, 3), offset=rope_offset
+                ).astype(x.dtype)
+            else:
+                idx_queries = None
+                idx_keys = None
 
-        queries = self.rope(queries, offset=rope_offset).astype(x.dtype)
-        keys = self.rope(keys, offset=rope_offset).astype(x.dtype)
+            queries = queries.transpose(0, 2, 1, 3)
+            keys = keys.transpose(0, 2, 1, 3)
+            values = values.transpose(0, 2, 1, 3)
+
+            queries = self.rope(queries, offset=rope_offset).astype(x.dtype)
+            keys = self.rope(keys, offset=rope_offset).astype(x.dtype)
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
