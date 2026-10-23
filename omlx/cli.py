@@ -720,6 +720,43 @@ def _app_control_socket_path():
     return Path.home() / "Library" / "Application Support" / "oMLX" / "control.sock"
 
 
+def _app_config_port():
+    """Port the menu-bar app manages, from its own config.json.
+
+    ``None`` when the file is missing or unreadable, so callers fall back to
+    the old "socket unreachable means stopped" behavior instead of failing on
+    a machine that never ran the app.
+    """
+    import json
+    from pathlib import Path
+
+    path = (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "oMLX"
+        / "config.json"
+    )
+    try:
+        port = int(json.loads(path.read_text()).get("port") or 0)
+    except (OSError, ValueError, TypeError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def _server_port_is_listening(port: int, timeout: float = 0.25) -> bool:
+    """Whether something accepts TCP connections on the loopback port."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        try:
+            sock.connect(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
 def _app_bundle_path():
     from pathlib import Path
 
@@ -818,7 +855,26 @@ def lifecycle_command(args) -> int:
             if command == "stop":
                 try:
                     response = _send_app_control(command)
+                except TimeoutError:
+                    # The socket accepted the connection but the app never
+                    # answered. That is not a completed stop: the app may be
+                    # blocked behind a modal while its server keeps serving.
+                    print(
+                        "oMLX.app did not answer the stop request; "
+                        "the server may still be running."
+                    )
+                    return 1
                 except OSError:
+                    # The app is gone (or its socket is stale) but the managed
+                    # server can outlive it. Claiming "stopped" while the port
+                    # still serves is how #3431 hides a live server.
+                    port = _app_config_port()
+                    if port is not None and _server_port_is_listening(port):
+                        print(
+                            f"oMLX.app did not answer, but a server is still "
+                            f"listening on port {port}; it may still be running."
+                        )
+                        return 1
                     print("oMLX stopped")
                     return 0
             else:
@@ -826,6 +882,27 @@ def lifecycle_command(args) -> int:
             if not response.get("ok"):
                 print(response.get("message") or f"oMLX {command} failed")
                 return 1
+
+            if command == "stop" and not no_wait:
+                # The app replies ok even when it never tracked the process
+                # (ServerProcess.stop returns early), and that reply carries
+                # the state it is actually in. Trust the state, not "ok", or
+                # a server that keeps listening is reported as stopped.
+                state = response.get("state")
+                if state != "stopped":
+                    try:
+                        state = _wait_app_control_state({"stopped"}, timeout).get(
+                            "state"
+                        )
+                    except OSError:
+                        # The app quit and took its control socket with it.
+                        state = "stopped"
+                    if state != "stopped":
+                        print(
+                            f"oMLX server is {state or 'unknown'} "
+                            f"after {int(timeout)}s."
+                        )
+                        return 1
 
             if command in {"start", "restart"} and not no_wait:
                 response = _wait_app_control_state({"running", "unresponsive"}, timeout)
