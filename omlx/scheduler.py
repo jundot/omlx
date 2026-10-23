@@ -10613,13 +10613,11 @@ class Scheduler:
             else:
                 request.remaining_tokens = request.prompt_token_ids
             # Index matches can outlive their tensor payloads, and successful
-            # reconstruction can still be truncated or rejected above. Count
-            # only the final reusable KV, once per external request; memory
-            # requeues restore this request's own progress.
+            # reconstruction can still be rejected during scheduling. Keep
+            # ordinary reuse separate from SpecPrefill's exact static-prefix
+            # restores, and skip requeues of this request's own progress.
             if not _request_count(request, "memory_requeues"):
-                self.block_aware_cache.record_cache_result(
-                    len(request.prompt_token_ids), request.cached_tokens
-                )
+                request.pending_prefix_cache_tokens = request.cached_tokens
         else:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
@@ -10664,6 +10662,18 @@ class Scheduler:
                 0, request.cached_tokens - request.requeue_reported_cached_tokens
             )
         self._prefix_cache_prepared.add(request.request_id)
+
+    def _record_prefix_cache_result(self, request: Request) -> None:
+        """Finalize ordinary prefix metrics after scheduling's fallback guards."""
+        pending_tokens = request.pending_prefix_cache_tokens
+        if pending_tokens is None:
+            return
+        if self.block_aware_cache is not None:
+            self.block_aware_cache.record_cache_result(
+                len(request.prompt_token_ids),
+                min(pending_tokens, request.cached_tokens),
+            )
+        request.pending_prefix_cache_tokens = None
 
     def add_request(self, request: Request) -> None:
         """
@@ -13097,6 +13107,10 @@ class Scheduler:
                         request.remaining_tokens = request.prompt_token_ids
                         tokens_to_process = request.prompt_token_ids
                     # Fall through to normal prefill
+            # Cache validation and sparse-prefill failure can discard all
+            # restored KV. Commit metrics only after both guards have run.
+            self._record_prefix_cache_result(request)
+
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
             # Only the last token goes to insert() for the first decode step.
             # SpecPrefill already handled its own prefill above, so skip for those.

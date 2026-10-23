@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Serving cache metrics count restored KV, not stale prefix-index matches."""
 
+from unittest.mock import MagicMock, patch
+
 import mlx.core as mx
 import pytest
 from mlx_lm.models.cache import ArraysCache
@@ -40,6 +42,15 @@ def cached_scheduler(tmp_path, mock_model, mock_tokenizer, request):
     scheduler.block_aware_cache = prefix
     scheduler.paged_cache_manager = paged
     scheduler.paged_ssd_cache_manager = ssd
+    scheduler.batch_generator = MagicMock()
+    scheduler.batch_generator.insert.return_value = [42]
+    scheduler._ensure_batch_generator = MagicMock()
+    scheduler._build_sampler_and_processors = MagicMock(return_value=(None, []))
+    scheduler._build_state_machine = MagicMock(return_value=None)
+    scheduler._preflight_memory_check = MagicMock(return_value=None)
+    scheduler._do_external_prefill = MagicMock(
+        return_value=(mock_model.make_cache(), [8])
+    )
 
     tokens = list(range(8))
     keys = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
@@ -99,8 +110,10 @@ def test_serving_stats_count_only_restored_tokens(
         sampling_params=SamplingParams(max_tokens=1),
     )
     scheduler.add_request(request)
-    scheduler._prepare_prefix_cache_for_request(request)
+    scheduled, rejected = scheduler._schedule_waiting()
 
+    assert scheduled == [request]
+    assert rejected == []
     assert request.cached_tokens == expected_reused
     counters = scheduler._collect_cache_counters()
     assert counters["prefix_hits"] == int(expected_reused > 0)
@@ -121,7 +134,7 @@ def test_stateful_exact_hit_fallback_is_counted_as_a_miss(cached_scheduler):
         request_id="stateful", prompt=list(range(8)), sampling_params=SamplingParams()
     )
     scheduler.add_request(request)
-    scheduler._prepare_prefix_cache_for_request(request)
+    scheduler._schedule_waiting()
 
     assert request.cached_tokens == 0
     assert request.prompt_cache is None
@@ -139,12 +152,35 @@ def test_cold_lookup_is_counted_as_a_miss(cached_scheduler):
         request_id="cold", prompt=list(range(10, 19)), sampling_params=SamplingParams()
     )
     scheduler.add_request(request)
-    scheduler._prepare_prefix_cache_for_request(request)
+    scheduler._schedule_waiting()
 
     counters = scheduler._collect_cache_counters()
     assert counters["prefix_hits"] == 0
     assert counters["prefix_misses"] == 1
     assert counters["prefix_tokens_saved"] == 0
+    assert counters["prefix_tokens_requested"] == 9
+
+
+def test_deferred_admission_records_the_lookup_once(cached_scheduler):
+    scheduler, _ = cached_scheduler
+    request = Request(
+        request_id="deferred", prompt=list(range(9)), sampling_params=SamplingParams()
+    )
+    scheduler.add_request(request)
+    scheduler._specprefill_active_request_id = "other-request"
+    scheduled, rejected = scheduler._schedule_waiting()
+    assert scheduled == rejected == []
+    counters = scheduler._collect_cache_counters()
+    assert counters["prefix_hits"] == counters["prefix_misses"] == 0
+    assert counters["prefix_tokens_requested"] == 0
+
+    scheduler._specprefill_active_request_id = None
+    scheduled, rejected = scheduler._schedule_waiting()
+    assert scheduled == [request]
+    assert rejected == []
+    counters = scheduler._collect_cache_counters()
+    assert counters["prefix_hits"] == 1
+    assert counters["prefix_tokens_saved"] == 8
     assert counters["prefix_tokens_requested"] == 9
 
 
@@ -154,17 +190,57 @@ def test_prefill_memory_requeue_does_not_count_another_cache_hit(cached_schedule
         request_id="lookup", prompt=list(range(9)), sampling_params=SamplingParams()
     )
     scheduler.add_request(request)
-    scheduler._prepare_prefix_cache_for_request(request)
+    scheduler._schedule_waiting()
     counters = scheduler._collect_cache_counters()
     assert counters["prefix_hits"] == 1
 
     request.memory_requeues = 1
     request.requeue_reported_cached_tokens = request.cached_tokens
+    scheduler.running.pop(request.request_id)
+    scheduler.waiting.append(request)
     scheduler._prefix_cache_prepared.discard(request.request_id)
     scheduler.paged_cache_manager.delete_block_table(request.request_id)
-    scheduler._prepare_prefix_cache_for_request(request)
+    scheduler._schedule_waiting()
 
     after_requeue = scheduler._collect_cache_counters()
     assert {k: v for k, v in after_requeue.items() if k.startswith("prefix_")} == {
         k: v for k, v in counters.items() if k.startswith("prefix_")
     }
+
+
+@pytest.mark.parametrize("fallback", ["validation", "sparse-prefill"])
+def test_scheduling_fallback_counts_a_miss(cached_scheduler, fallback):
+    scheduler, _ = cached_scheduler
+    request = Request(
+        request_id="fallback", prompt=list(range(9)), sampling_params=SamplingParams()
+    )
+    scheduler.add_request(request)
+    scheduler._prepare_prefix_cache_for_request(request)
+    assert request.cached_tokens == 8
+    assert scheduler._collect_cache_counters()["prefix_hits"] == 0
+    if fallback == "validation":
+        scheduler._validate_cache = MagicMock(return_value=False)
+    else:
+        scheduler.model.layers = []
+        request.specprefill_indices = mx.array([0])
+        request.specprefill_system_end = 8
+        request._specprefill_system_tokens = 0
+    with patch(
+        "omlx.specprefill.target.run_specprefill_target_prefill",
+        side_effect=RuntimeError("sparse prefill failed mid-append"),
+    ):
+        scheduled, rejected = scheduler._schedule_waiting()
+
+    assert scheduled == [request]
+    assert rejected == []
+    assert request.cached_tokens == 0
+    assert scheduler._do_external_prefill.call_args.args[1:] == (
+        request.prompt_token_ids,
+        None,
+    )
+    counters = scheduler._collect_cache_counters()
+    assert counters["prefix_hits"] == 0
+    assert counters["prefix_misses"] == 1
+    assert counters["prefix_tokens_saved"] == 0
+    assert counters["prefix_tokens_matched"] == 0
+    assert counters["prefix_tokens_requested"] == 9

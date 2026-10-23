@@ -100,7 +100,7 @@ Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_c
 
 # Prefix cache serving statistics
 
-Run `python -m pytest -q tests/test_prefix_cache_restore_stats.py tests/test_cache_observability.py tests/test_runtime_cache_observability.py` to check serving cache hit rates and saved-token counters. Serving lookups count only KV retained after reconstruction and prefix/kickoff guards. A stale index match with no restored KV is a miss; a partial restore counts only its reusable tokens. Memory requeues do not count the same external request again. These tests use real paged metadata, hot-cache tensor storage and KV/ArraysCache reconstruction with small arrays, without a model download.
+Run `python -m pytest -q tests/test_prefix_cache_restore_stats.py tests/test_cache_observability.py tests/test_runtime_cache_observability.py` to check serving cache hit rates and saved-token counters. Serving lookups count only KV retained after reconstruction, prefix/kickoff guards, scheduling validation and sparse-prefill fallback. A stale index match with no restored KV is a miss; a partial restore counts only its reusable tokens. Deferred admissions count once, and memory requeues do not count the same external request again. These tests use real paged metadata, hot-cache tensor storage and KV/ArraysCache reconstruction with small arrays, without a model download.
 
 # Batch KV capacity tests
 
