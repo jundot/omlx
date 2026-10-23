@@ -1518,14 +1518,13 @@ class MiniMaxSparseMoeBlock(nn.Module):
 
     def _fused_short_call(self, x: mx.array) -> Optional[mx.array]:
         """The block for up to eight rows with fused routing, and for one row
-        with fused experts, as the ops below compute it, or None when not
-        covered.
+        with fused experts, or None when not covered.
 
-        The router logits kernel is MLX's one-row matrix-vector product: it
-        takes one row, or the rows of a row-exact verify, which
-        ``_router_gates`` computes one by one. Other short calls keep their
-        logits. The expert selection then runs in one launch, and one row's
-        routed and shared experts in two.
+        Every row's router logits are MLX's one-row matrix-vector product, as
+        ``_router_gates`` computes them for one row and in a row-exact verify,
+        so a batched decode row routes like the same request alone. The expert
+        selection runs in one launch, and one row's routed and shared experts
+        in two.
         """
         gate = self.gate
         if (
@@ -1538,9 +1537,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
             or x.size > decode_kernels.MAX_ROWS * x.shape[-1]
         ):
             return None
-        logits = None
-        if x.size == x.shape[-1] or is_row_exact_armed():
-            logits = decode_kernels.moe_router_logits(x, gate.weight)
+        logits = decode_kernels.moe_router_logits(x, gate.weight)
         if logits is None:
             logits = _router_gates(gate, x)
         routed = decode_kernels.moe_router_select(

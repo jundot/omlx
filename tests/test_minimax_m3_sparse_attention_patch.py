@@ -296,8 +296,8 @@ def test_short_calls_fuse_mlp_gate_and_up_bit_exactly(language, monkeypatch, mod
         assert mx.array_equal(a, b).item()
 
 
-@pytest.mark.parametrize("rows", [3, 8])
-def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
+@pytest.mark.parametrize("rows", [2, 3, 8])
+def test_short_row_mxfp8_matmul_matches_one_row_decode(language, monkeypatch, rows):
     import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
 
     mx.random.seed(6)
@@ -306,7 +306,15 @@ def test_short_row_mxfp8_matmul_matches_one_row_decode(language, rows):
     )
     x = mx.random.normal((1, rows, 512)).astype(mx.bfloat16)
     expected = mx.concatenate([proj(x[:, i : i + 1]) for i in range(rows)], axis=1)
+    # MLX's multi-row kernel splits K differently and rounds a few outputs
+    # in ten thousand differently, so check the call takes the exact rows.
+    exact = qmv_rows.exact_rows_qmv
+    calls = []
+    monkeypatch.setattr(
+        qmv_rows, "exact_rows_qmv", lambda *a, **k: calls.append(1) or exact(*a, **k)
+    )
     assert mx.array_equal(qmv_rows.rows_linear(proj, x), expected).item()
+    assert calls
 
 
 def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language):
@@ -339,8 +347,9 @@ def test_row_exact_verify_router_and_mxfp8_match_one_row_decode(language):
     assert mx.array_equal(projected, expected_proj).item()
 
 
+@pytest.mark.parametrize("armed", [True, False])
 @pytest.mark.parametrize("rows", [2, 8])
-def test_row_exact_verify_dense_head_matches_one_row_decode(language, rows):
+def test_row_exact_verify_dense_head_matches_one_row_decode(language, rows, armed):
     import mlx_vlm.models.minimax_m3_vl.qmv_rows as qmv_rows
 
     from omlx.patches.qwen35_verify_qmm import set_verify_qmm_armed
@@ -350,7 +359,8 @@ def test_row_exact_verify_dense_head_matches_one_row_decode(language, rows):
     head.set_dtype(mx.bfloat16)
     x = mx.random.normal((1, rows, 6144)).astype(mx.bfloat16)
     expected = mx.concatenate([head(x[:, i : i + 1]) for i in range(rows)], axis=1)
-    set_verify_qmm_armed(True, row_exact=True)
+    # A decode batch (not armed) takes the one-row arithmetic too.
+    set_verify_qmm_armed(armed, row_exact=armed)
     try:
         projected = qmv_rows.rows_linear(head, x)
         mx.eval(projected)
@@ -766,7 +776,7 @@ def _moe_block(language, experts=64, hidden=1024, inter=64):
     return block
 
 
-@pytest.mark.parametrize("rows,armed", [(1, False), (3, True), (3, False)])
+@pytest.mark.parametrize("rows,armed", [(1, False), (3, True)])
 def test_short_calls_route_bit_exactly(language, monkeypatch, rows, armed):
     import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
 
@@ -799,13 +809,28 @@ def test_short_calls_route_bit_exactly(language, monkeypatch, rows, armed):
     spy("moe_router_logits")
     spy("moe_router_select")
     fused = run()
-    # One row and the rows of a row-exact verify take the logits kernel.
-    expected = ["moe_router_select"]
-    if rows == 1 or armed:
-        expected.insert(0, "moe_router_logits")
-    assert used == expected
+    assert used == ["moe_router_logits", "moe_router_select"]
     monkeypatch.setattr(dk, "moe_router_select", lambda *args: None)
     assert mx.array_equal(run(), fused).item()
+
+
+def test_batched_rows_route_on_one_row_logits(language, monkeypatch):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(43)
+    block = _moe_block(language)
+    x = mx.random.normal((3, 1, 1024)).astype(mx.bfloat16)
+    seen = []
+    select = dk.moe_router_select
+
+    def spy(logits, *args):
+        seen.append(logits)
+        return select(logits, *args)
+
+    monkeypatch.setattr(dk, "moe_router_select", spy)
+    mx.eval(block(x))
+    expected = [block.gate(x[i : i + 1].astype(mx.float32)) for i in range(3)]
+    assert mx.array_equal(seen[0], mx.concatenate(expected)).item()
 
 
 def _quantized_moe_block(language):

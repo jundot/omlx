@@ -5,10 +5,9 @@ a one-row decode step, and from three rows on they stream the weights again
 for every row. ``exact_rows_qmv`` keeps MLX ``fp_qmv_fast``'s per-row
 arithmetic and 32-lane reduction order but reads each weight once for all
 rows, so speculative verify rows and small decode batches match one-row decode
-bit for bit. Two-row calls stay on MLX, which reads the weights once for them
-and is slightly faster there, except inside a row-exact verify forward. A
-row-exact verify also runs the base checkpoint's BF16 vocabulary head through
-``exact_verify_gemv``, MLX's one-row GEMV with every row sharing a weight load.
+bit for bit. The base checkpoint's BF16 vocabulary head runs through
+``exact_verify_gemv`` for the same reason: MLX's one-row GEMV with every row
+sharing a weight load.
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ from omlx.patches.deepseek_v4.verify_qmv import (
 )
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
-MIN_ROWS = 3
+MIN_ROWS = 2
 MAX_ROWS = 8
 # Up to this many rows keep their inputs in registers. Longer calls read them
 # from cache inside the row loop, which avoids register spills.
@@ -39,16 +38,12 @@ _WIDE_OUTPUT_COLUMNS = 65536
 def mxfp8_rows_matmul(
     x: mx.array, weight: mx.array, scales: mx.array, quant: dict
 ) -> mx.array | None:
-    """``x @ dequantized(weight).T`` for 3-8 rows, or None when not covered.
-
-    A row-exact verify forward takes two-row calls here too.
-    """
+    """``x @ dequantized(weight).T`` for 2-8 rows, or None when not covered."""
     k = x.shape[-1]
     rows = x.size // k
     n = weight.shape[0]
-    min_rows = 2 if is_row_exact_armed() else MIN_ROWS
     if not (
-        min_rows <= rows <= MAX_ROWS
+        MIN_ROWS <= rows <= MAX_ROWS
         and quant.get("mode") == "mxfp8"
         and quant.get("bits") == 8
         and quant.get("group_size") == 32
@@ -123,10 +118,6 @@ def rows_linear(proj, x: mx.array) -> mx.array:
         out = row_exact_linears((proj,), x)
         if out is not None:
             return out[0]
-    elif (
-        type(proj) is nn.Linear
-        and is_row_exact_armed()
-        and dense_eligible(proj, x, max_rows=MAX_ROWS)
-    ):
+    elif type(proj) is nn.Linear and dense_eligible(proj, x, max_rows=MAX_ROWS):
         return exact_verify_gemv(proj, x)
     return proj(x)
