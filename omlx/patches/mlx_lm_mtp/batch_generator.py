@@ -4207,7 +4207,10 @@ def _predraft(gen_batch, state, drafter, captured, host_arr, m_arr, anchor) -> b
 
 
 def _context_copy_drafts(
-    gen_batch: Any, state: _MtpState, committed_ids: List[int]
+    gen_batch: Any,
+    state: _MtpState,
+    committed_ids: List[int],
+    block: Optional[int] = None,
 ) -> List[int]:
     """Draft the next window by copying from the context, if it repeats.
 
@@ -4216,7 +4219,8 @@ def _context_copy_drafts(
     distribution with all its mass on the copied token (``_copy_draft_q``),
     so the Leviathan/Chen rule keeps the sampled distribution exact. Either
     way any draft source leaves the output distribution unchanged. Returns
-    ``[]`` when the MTP head should draft instead.
+    ``[]`` when the MTP head should draft instead. With ``block``, only a copy
+    of exactly that many tokens replaces the drafter's block.
     """
     if state.context_copy is None:
         state.context_copy = _context_copy.ContextCopy(
@@ -4228,12 +4232,14 @@ def _context_copy_drafts(
     room = (
         gen_batch.max_tokens[0] - gen_batch._num_tokens[0] - len(committed_ids) - 1
     )
-    if _dspark_host(gen_batch.model) is None:
+    if block is None and _dspark_host(gen_batch.model) is not None:
+        # Copies verify in DSpark's window sizes, and only a copy that fills
+        # the block replaces it: DSpark already drafts repeated text accurately.
+        block = state.depth
+    if block is None:
         return copier.propose(room)
-    # Copies verify in DSpark's window sizes, and only a copy that fills the
-    # block replaces it: DSpark already drafts repeated text accurately.
-    copied = copier.propose(min(room, state.depth))
-    return copied if len(copied) == state.depth else []
+    copied = copier.propose(min(room, block))
+    return copied if len(copied) == block else []
 
 
 def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
@@ -4543,6 +4549,17 @@ def _run_verify_cycle_chain(
         if procs is not None:
             prev_buf = gen_batch._token_context[0].tokens
         state.copy_drafts = False
+        # A block drafter's row may verify a copy of a repeated stretch of the
+        # context instead of its block; only a copy that fills the block does.
+        copied = []
+        if (
+            drafter is not None
+            and draft_jobs is None
+            and getattr(drafter, "context_copy", False)
+        ):
+            copied = _context_copy_drafts(
+                gen_batch, state, committed_ids, block=drafter.depth
+            )
         if drafter is not None and predrafted and m == m_gpu:
             drafter.adopt_predraft(state, m + 1)
         elif drafter is not None:
@@ -4550,7 +4567,9 @@ def _run_verify_cycle_chain(
                 drafter.discard_predraft()
             rows_hidden = [c[:, : m + 1] for c in captured]
             job = (gen_batch, state, rows_hidden, committed, prev_buf)
-            if draft_jobs is None:
+            if copied:
+                drafter.extend_context(state, rows_hidden)
+            elif draft_jobs is None:
                 drafter.draft([job])
             else:
                 draft_jobs.append(job)
@@ -4564,18 +4583,18 @@ def _run_verify_cycle_chain(
                 prev_buf,
                 depth=0 if copied else None,
             )
-            if copied:
-                state.drafts = mx.array(copied, dtype=mx.uint32)
-                state.draft_lps = []
-                # A copy is a deterministic proposer: q puts all its mass on
-                # the copied token, so acceptance is p(token) and the
-                # residual on rejection is p without it.
-                state.draft_accept_lps = (
-                    [] if is_greedy else _copy_draft_q(copied, combined_lp.shape[-1])
-                )
-                state.copy_drafts = True
         else:
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
+        if copied:
+            state.drafts = mx.array(copied, dtype=mx.uint32)
+            state.draft_lps = []
+            # A copy is a deterministic proposer: q puts all its mass on
+            # the copied token, so acceptance is p(token) and the
+            # residual on rejection is p without it.
+            state.draft_accept_lps = (
+                [] if is_greedy else _copy_draft_q(copied, combined_lp.shape[-1])
+            )
+            state.copy_drafts = True
         state.next_main = next_main
         state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
 

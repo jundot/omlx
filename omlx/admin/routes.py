@@ -1158,6 +1158,14 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     except Exception as e:
         return False, f"failed to read config: {e}"
     model_type = cfg.get("model_type")
+    if model_type in ("minimax_m3", "minimax_m3_vl"):
+        # MiniMax M3.1 ships its DSpark draft in a dspark/ folder instead of
+        # declaring MTP heads in the target config.
+        from ..patches.minimax_m3_dspark import bundled_dspark_path
+
+        if bundled_dspark_path(model_path) is not None:
+            return True, ""
+        return False, "MiniMax checkpoint has no bundled dspark/ draft"
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through

@@ -141,11 +141,18 @@ def progressive_sharded_load(
         if return_config:
             return model, tokenizer, metadata_config
         return model, tokenizer
+    load_kwargs = {}
+    if metadata_config.get("model_type") == "muse_spark":
+        # Ranks serve text only; oMLX's class also reads its earlier layout.
+        from ..patches.muse_spark.model import load_kwargs as muse_spark_kwargs
+
+        load_kwargs = muse_spark_kwargs(model_path, text_only=True)
     model, config = utils_module.load_model(
         model_path,
         lazy=True,
         strict=False,
         trust_remote_code=trust_remote_code,
+        **load_kwargs,
     )
     has_pipeline = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_native_tensor = callable(getattr(model, "shard", None))
@@ -202,6 +209,7 @@ def progressive_sharded_load(
         lazy=True,
         strict=False,
         trust_remote_code=trust_remote_code,
+        **load_kwargs,
     )
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)

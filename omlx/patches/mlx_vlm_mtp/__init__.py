@@ -104,6 +104,8 @@ _RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
     "inkling_mm_model": ("inkling_vlm_runtime",),
     "glm5_next": ("glm5_next_vlm_runtime",),
     "qwen4_exp": (),
+    "minimax_m3": (),
+    "minimax_m3_vl": (),
 }
 
 

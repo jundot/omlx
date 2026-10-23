@@ -92,6 +92,17 @@ def _think_end_token_ids(tokenizer) -> list[int] | None:
     return None
 
 
+def leading_thinking_only(tokenizer) -> bool:
+    """Whether the model only thinks in one block at the start of its output.
+
+    MiniMax M3 wraps the reasoning of a turn in one ``<mm:think>`` block
+    before the response and starts a new turn to think again, so a think tag
+    later in the output is text the model wrote (code that handles such tags,
+    for example), not a reasoning boundary.
+    """
+    return _safe_tokenizer_attr(tokenizer, "think_start") == _MINIMAX_OPEN_TAG
+
+
 def prompt_opens_thinking(
     tokenizer,
     prompt: str,
@@ -143,7 +154,11 @@ def prompt_opens_thinking(
 
 
 def extract_thinking(
-    text: str, *, truncated: bool = False, start_in_thinking: bool = False
+    text: str,
+    *,
+    truncated: bool = False,
+    start_in_thinking: bool = False,
+    leading_only: bool = False,
 ) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
@@ -167,10 +182,15 @@ def extract_thinking(
     fallback): when the model emits no thinking markers, surface the body
     as the answer so the response is never empty.
 
+    With ``leading_only=True`` (see ``leading_thinking_only``) only a block at
+    the start of ``text`` is thinking, up to its first close tag; every later
+    tag is content.
+
     Args:
         text: Complete model output text.
         truncated: Keep unfinished thinking in its channel on length termination.
         start_in_thinking: The prompt opened a think block before ``text``.
+        leading_only: Only a block at the start of ``text`` is thinking.
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -192,6 +212,9 @@ def extract_thinking(
         and _CLOSE_TAG not in text
     ):
         return (text.strip(), "")
+
+    if leading_only:
+        return _extract_leading_thinking(text, truncated, start_in_thinking)
 
     thinking_parts = []
     remaining = text
@@ -232,6 +255,22 @@ def extract_thinking(
     return ("", text)
 
 
+def _extract_leading_thinking(
+    text: str, truncated: bool, start_in_thinking: bool
+) -> Tuple[str, str]:
+    body = text.lstrip()
+    if body.startswith(_OPEN_TAG):
+        body = body[_OPEN_LEN:]
+    elif not start_in_thinking:
+        return ("", text)
+    end = body.find(_CLOSE_TAG)
+    if end < 0:
+        # Unclosed: thinking when cut off by the length limit, otherwise the
+        # same recovery as extract_thinking (the body is the answer).
+        return (body.strip(), "") if truncated else ("", body.strip())
+    return (body[:end].strip(), body[end + _CLOSE_LEN :].strip())
+
+
 class ThinkingParser:
     """Stateful streaming parser for separating <think>...</think> from content.
 
@@ -254,9 +293,14 @@ class ThinkingParser:
         t, c = parser.finish()
     """
 
-    def __init__(self, start_in_thinking: bool = False):
+    def __init__(self, start_in_thinking: bool = False, leading_only: bool = False):
         self._in_thinking: bool = start_in_thinking
         self._buffer: str = ""  # Buffer for potential partial tags
+        # Leading-only (see ``leading_thinking_only``): tags count until the
+        # leading block closes or the answer starts, then all text is content.
+        self._leading_only = leading_only
+        self._tags_done = False
+        self._text_seen = False
         # Recovery state for malformed thinking: when the prompt prepends
         # ``<think>`` and the model never emits ``</think>`` before EOS,
         # everything we streamed went out as thinking. The streamed events
@@ -288,31 +332,35 @@ class ThinkingParser:
 
         i = 0
         while i < len(text):
+            if self._tags_done:
+                content_out.append(text[i:])
+                break
             if text[i] == '<':
                 # Check if this could be a tag start
                 remaining = text[i:]
 
+                # Leading-only output opens its block only before any text,
+                # which also takes the scheduler's prefix of a prompt-opened block.
+                can_open = not self._leading_only or not self._text_seen
                 # Try to match <think>
-                if remaining.startswith(_OPEN_TAG):
+                if can_open and remaining.startswith(_OPEN_TAG):
                     self._in_thinking = True
                     i += _OPEN_LEN
                     continue
 
-                if remaining.startswith(_HY3_OPEN_TAG):
+                if can_open and remaining.startswith(_HY3_OPEN_TAG):
                     self._in_thinking = True
                     i += len(_HY3_OPEN_TAG)
                     continue
 
                 # Try to match </think>
                 if remaining.startswith(_CLOSE_TAG):
-                    self._in_thinking = False
-                    self._close_seen = True
+                    self._close_thinking()
                     i += _CLOSE_LEN
                     continue
 
                 if remaining.startswith(_HY3_CLOSE_TAG):
-                    self._in_thinking = False
-                    self._close_seen = True
+                    self._close_thinking()
                     i += len(_HY3_CLOSE_TAG)
                     continue
 
@@ -323,16 +371,23 @@ class ThinkingParser:
                     break
 
                 # Not a tag, emit the '<' as regular content
+                self._text_seen = True
                 if self._in_thinking:
                     thinking_out.append('<')
                 else:
                     content_out.append('<')
+                    if self._leading_only:
+                        self._tags_done = True
                 i += 1
             else:
+                if not text[i].isspace():
+                    self._text_seen = True
                 if self._in_thinking:
                     thinking_out.append(text[i])
                 else:
                     content_out.append(text[i])
+                    if self._leading_only and self._text_seen:
+                        self._tags_done = True
                 i += 1
 
         thinking_delta = "".join(thinking_out)
@@ -342,6 +397,12 @@ class ThinkingParser:
         if content_delta:
             self._content_emitted = True
         return (thinking_delta, content_delta)
+
+    def _close_thinking(self) -> None:
+        self._in_thinking = False
+        self._close_seen = True
+        if self._leading_only:
+            self._tags_done = True
 
     def finish(
         self, *, truncated: bool = False, has_tool_calls: bool = False

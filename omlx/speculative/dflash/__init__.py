@@ -70,6 +70,8 @@ def context_bytes_per_row(config: dict, window: int | None = None) -> int:
     while it decodes without drafting it queues up to a window of raw layer
     captures. bf16 throughout.
     """
+    # A draft bundled with a VLM checkpoint (MiniMax DSpark) nests its config.
+    config = config.get("text_config") or config
     hidden = int(config["hidden_size"])
     heads = int(config.get("num_attention_heads") or 1)
     head_dim = int(config.get("head_dim") or hidden // heads)

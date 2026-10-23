@@ -53,6 +53,7 @@ from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
+from ..patches.muse_spark import model as muse_spark_model
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
@@ -222,6 +223,10 @@ def _apply_minimax_m3_thinking_mode(
     if enable_thinking is True:
         template_kwargs["thinking_mode"] = "enabled"
     elif enable_thinking is False:
+        template_kwargs["thinking_mode"] = "disabled"
+    elif str(template_kwargs.get("reasoning_effort", "")).strip().lower() == "none":
+        # MiniMax renders the effort level verbatim; "none" also turns
+        # thinking off, as the reference server does.
         template_kwargs["thinking_mode"] = "disabled"
 
 
@@ -2179,6 +2184,13 @@ class VLMBatchedEngine(BaseEngine):
                                 "deepseek_v41_ced_prefill_enabled",
                                 False,
                             )
+                        ),
+                    )
+                if model_type == "muse_spark":
+                    return muse_spark_model.load(
+                        self._model_name,
+                        lazy=getattr(
+                            self._model_settings, "moe_expert_offload_enabled", False
                         ),
                     )
                 if model_type == COHERE2_MOE_MODEL_TYPE:
@@ -5237,11 +5249,11 @@ class VLMBatchedEngine(BaseEngine):
         _, text_messages, images, _, videos = self._extract_request_media(messages)
         if (
             images
-            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self.model_type in {"gemma4", "gemma4_unified", "muse_spark"}
             and self._vlm_model.config.vision_config is None
         ):
             raise InvalidRequestError(
-                "This text-only Gemma 4 model does not support image input.",
+                "This text-only model does not support image input.",
                 field="messages",
             )
         prompt = self._apply_chat_template(

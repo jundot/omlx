@@ -144,6 +144,12 @@ class DFlashDrafter:
         # running, so a plain forward can be attributed to rows.
         self.scope_uids: tuple | None = None
         self._predraft: _Predraft | None = None
+        # Sliding-window draft layers: block query j attends the context
+        # window ending at its own position instead of the block's start.
+        self.query_windows = False
+        # A context copy that fills the block may replace the drafted block
+        # (Lightning MTP's prompt lookup); the target still verifies it.
+        self.context_copy = False
 
     @property
     def window(self) -> int:
@@ -159,6 +165,30 @@ class DFlashDrafter:
     @property
     def kind(self) -> str:
         return "dflash2" if hasattr(self.model, "candidate_selector") else "dflash"
+
+    def _proposal_count(self, state) -> int:
+        """Drafts the row's depth controller asks to verify next."""
+        count = min(self.depth, int(getattr(state, "depth", 0) or self.depth))
+        controller = getattr(state, "controller", None)
+        if controller is not None:
+            count = max(0, min(count, int(controller.cur)))
+        return count
+
+    def _commit_proposals(self, state, tokens, accept_lps) -> None:
+        """Hand the row its drafts and their draft distributions."""
+        if isinstance(tokens, list):
+            # DSpark keeps one lazy token per position; only the prefix the
+            # row's depth controller verifies next is evaluated.
+            count = self._proposal_count(state)
+            tokens = (
+                mx.concatenate(tokens[:count])
+                if count
+                else mx.zeros((0,), dtype=mx.uint32)
+            )
+            accept_lps = accept_lps[:count]
+        state.drafts = tokens.reshape(-1).astype(mx.uint32)
+        state.draft_lps = []
+        state.draft_accept_lps = accept_lps
 
     def _row(self, uid: Any) -> _RowContext:
         row = self._rows.get(uid)
@@ -425,10 +455,8 @@ class DFlashDrafter:
         finally:
             set_verify_qmm_armed(False)
         for (state, *_), (tokens, accept_lps) in zip(rows, proposals):
-            state.drafts = tokens.reshape(-1).astype(mx.uint32)
+            self._commit_proposals(state, tokens, accept_lps)
             mx.async_eval(state.drafts)
-            state.draft_lps = []
-            state.draft_accept_lps = accept_lps
         # Dispatch time shared across the rows; the GPU work overlaps the
         # next verify like the MTP head's async draft.
         share = (time.perf_counter() - started) * 1000 / max(1, len(rows))
@@ -468,8 +496,18 @@ class DFlashDrafter:
             set_verify_qmm_armed(False)
         self._predraft.unfed = [unfed]
         tokens, accept_lps = proposals[0]
+        if isinstance(tokens, list):
+            # The controller picks the next depth after this cycle. Start the
+            # positions its current depth needs; adopting evaluates the rest
+            # only if it asks for more.
+            count = self._proposal_count(state)
+            tokens, accept_lps = tokens[:count], accept_lps[:count]
         mx.async_eval(tokens, *selection.q_arrays(accept_lps))
         return True
+
+    def extend_context(self, state, captured) -> None:
+        """Queue committed rows as context without drafting a block."""
+        self.seed(state.uid, captured)
 
     def adopt_predraft(self, state, count: int) -> None:
         """Commit the queued block: ``count`` verify rows entered the context."""
@@ -486,9 +524,7 @@ class DFlashDrafter:
             row.end += int(count)
         self._remember(row, pre.contexts[0][:, : pre.unfed[0] + int(count)])
         tokens, accept_lps = pre.proposals[0]
-        state.drafts = tokens.reshape(-1).astype(mx.uint32)
-        state.draft_lps = []
-        state.draft_accept_lps = accept_lps
+        self._commit_proposals(state, tokens, accept_lps)
 
     def discard_predraft(self) -> None:
         self._predraft = None
@@ -685,6 +721,16 @@ class DFlashDrafter:
                     ),
                 ],
                 axis=2,
+            )[:, None]
+        elif self.query_windows:
+            lower = totals[:, None] + mx.arange(block, dtype=mx.int32) - slots
+            windowed = (
+                (pos[:, None, :] >= 0)
+                & (pos[:, None, :] >= lower[:, :, None])
+                & (pos[:, None, :] < totals[:, None, None])
+            )
+            mask = mx.concatenate(
+                [windowed, mx.ones((batch, block, block), dtype=mx.bool_)], axis=2
             )[:, None]
         else:
             mask = mx.concatenate(

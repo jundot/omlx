@@ -124,6 +124,8 @@ def build_affine_plan(
         target_bpw=(target * total_params - 8 * fixed_bytes) / eligible_params,
         hard_cap_bpw=(cap * total_params - 8 * fixed_bytes) / eligible_params,
         supported_bits=(2, 3, 4, 6, 8),
+        # V4.1 keeps its own allocation, and its exporter writes group 64 only.
+        always_on_rules=False,
     )
     specs = {
         name: plan.boost_map.get(

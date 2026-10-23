@@ -190,3 +190,79 @@ def test_mimo_mxfp4_index_preserves_packed_experts_through_stack(tmp_path):
     assert mx.array_equal(actual_scales, scales).item()
     other = _LazyTensorIndex([path])
     assert other.source_quant_info("experts.0.weight") is None
+
+
+def test_minimax_nvfp4_experts_expose_real_weight_and_packed_source(tmp_path):
+    from omlx.oq import _discover_sanitize_plan, _DiscoveredPlan
+    from omlx.patches.mlx_vlm_minimax_m3_compat.virtual_nvfp4 import (
+        routed_expert_scale_tensors,
+    )
+
+    mx.random.seed(7)
+    prefix = "language_model.model.layers.0.block_sparse_moe"
+    tensors, packed, scales, globals_, real = {}, {}, {}, {}, {}
+    for expert in range(2):
+        for proj, shape in (("w1", (32, 64)), ("w2", (64, 32)), ("w3", (32, 64))):
+            w = mx.random.normal(shape) * 0.05
+            global_scale = 2688.0 / mx.abs(w).max()
+            wq, ws = mx.quantize(w * global_scale, group_size=16, bits=4, mode="nvfp4")
+            base = f"{prefix}.experts.{expert}.{proj}"
+            tensors[f"{base}.weight_packed"] = wq.view(mx.uint8)
+            tensors[f"{base}.weight_scale"] = ws
+            tensors[f"{base}.weight_global_scale"] = global_scale.reshape(())
+            tensors[f"{base}.input_global_scale"] = mx.array(1.0)
+            packed[base], scales[base], globals_[base] = wq, ws, global_scale
+            real[base] = (
+                mx.dequantize(wq, ws, group_size=16, bits=4, mode="nvfp4")
+                / global_scale
+            )
+    path = tmp_path / "model.safetensors"
+    mx.save_safetensors(str(path), tensors)
+    config = {
+        "model_type": "minimax_m3_vl",
+        "text_config": {"num_hidden_layers": 1, "num_local_experts": 2},
+        "quantization_config": {"quant_method": "mxfp8", "moe_quant_algo": "NVFP4"},
+    }
+
+    index = _LazyTensorIndex([path], config=config)
+
+    w1 = f"{prefix}.experts.0.w1.weight"
+    assert index.logical_metadata()[w1] == ((32, 64), "BF16")
+    assert f"{prefix}.experts.0.w1.weight_packed" not in index
+    assert f"{prefix}.experts.0.w1.weight_global_scale" not in index
+    assert f"{prefix}.experts.0.w1.input_global_scale" not in index
+    expected = real[f"{prefix}.experts.0.w1"].astype(mx.bfloat16)
+    assert mx.array_equal(index[w1], expected).item()
+    assert index.source_quant_info(w1)["mode"] == "nvfp4"
+
+    def sanitize(weights):
+        return {
+            f"{prefix}.switch_mlp.gate_proj.weight": mx.stack(
+                [weights[f"{prefix}.experts.{e}.w1.weight"] for e in range(2)]
+            )
+        }
+
+    plan = _DiscoveredPlan(_discover_sanitize_plan(sanitize, index), index)
+    gate = f"{prefix}.switch_mlp.gate_proj.weight"
+    assert plan.source_quant_info(gate)["group_size"] == 16
+    actual_weight, actual_scales = plan.pop_packed(gate)
+    bases = [f"{prefix}.experts.{e}.w1" for e in range(2)]
+    assert mx.array_equal(actual_weight, mx.stack([packed[b] for b in bases])).item()
+    assert mx.array_equal(actual_scales, mx.stack([scales[b] for b in bases])).item()
+
+    vectors = routed_expert_scale_tensors(
+        index,
+        config,
+        {f"{prefix}.switch_mlp.gate_proj": {"mode": "nvfp4"}},
+    )
+    # mlx-lm layout: only the NVFP4 projection gets a vector, 2688 / G.
+    assert set(vectors) == {f"{prefix}.switch_mlp.gate_proj.global_scale"}
+    expected_gate = mx.stack([2688.0 / globals_[b] for b in bases])
+    assert mx.array_equal(
+        vectors[f"{prefix}.switch_mlp.gate_proj.global_scale"], expected_gate
+    ).item()
+
+    # The same tensors without the NVFP4 declaration stay untouched.
+    plain = _LazyTensorIndex([path], config={"model_type": "minimax_m3_vl"})
+    assert f"{prefix}.experts.0.w1.weight_packed" in plain
+    assert w1 not in plain

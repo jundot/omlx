@@ -169,6 +169,37 @@ class TestGenerateModelCard:
         assert "| Language model |" in card
         assert "| Decision readout | 0.000B | 0.000 GB / 0.000 GiB |" in card
 
+    def test_bundled_dspark_draft_is_reported_with_the_model(self, tmp_path):
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {"language_model.model.embed.weight": mx.ones((1000, 1000), mx.bfloat16)},
+        )
+        draft = tmp_path / "dspark"
+        draft.mkdir()
+        (draft / "config.json").write_text(
+            json.dumps({"architectures": ["DSparkMiniMaxDraftModel"]})
+        )
+        mx.save_safetensors(
+            str(draft / "model-dspark-00001.safetensors"),
+            {"fc.weight": mx.ones((1000, 1000), dtype=mx.float32)},
+        )
+
+        card = _generate_model_card(
+            "MiniMax-oQ4e-mtp", tmp_path, {"model_type": "minimax_m3_vl"}
+        )
+
+        assert "- mtp" in card
+        # 1M BF16 weights alone, then 1M more F32 weights from the draft.
+        assert (
+            "The effective average is 16.000 bits/weight for the model weights, "
+            "or 24.000 bits/weight including the DSpark draft."
+        ) in card
+        assert "| DSpark draft (MTP) | 0.001B | 0.004 GB / 0.004 GiB |" in card
+        rows = [line for line in card.splitlines() if line.startswith("| **Total**")]
+        # The bit table covers the model weights; the storage total adds the draft.
+        assert rows[0].endswith("| **16.000** |")
+        assert rows[1] == "| **Total** | **0.002B** | **0.006 GB / 0.006 GiB** |"
+
     def test_lookup_tables_are_reported_apart_from_the_average(self, tmp_path):
         ple = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0"
         table = mx.ones((32, 160), dtype=mx.bfloat16)

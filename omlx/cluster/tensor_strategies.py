@@ -13,6 +13,7 @@ import inspect
 import textwrap
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -56,6 +57,21 @@ GLM5_NEXT = TensorStrategy(
     name="glm5_next",
     model_types=("glm5_next",),
     source="oMLX adapter for the vendored GLM-5.3 KDA, sparse MLA and MoE layers",
+)
+QWEN3_5 = TensorStrategy(
+    name="qwen3_5",
+    model_types=("qwen3_5", "qwen3_5_moe"),
+    source="MLX-LM's Qwen3.5 shard() per layer, with the lm_head kept whole",
+)
+MINISTRAL3 = TensorStrategy(
+    name="ministral3",
+    model_types=("ministral3",),
+    source="MLX-LM's Ministral 3 shard() per layer, with the lm_head split once",
+)
+MUSE_SPARK = TensorStrategy(
+    name="muse_spark",
+    model_types=("muse_spark",),
+    source="oMLX adapter for MLX-LM's Muse Spark attention and experts",
 )
 
 
@@ -745,6 +761,128 @@ def _shard_glm5_next(
         )
 
 
+def _shard_layers(
+    layers: list[Any],
+    shard_layer: Callable[[Any], None],
+    mx: Any,
+    progress: ProgressCallback | None,
+    strategy: TensorStrategy,
+) -> None:
+    total = len(layers)
+    for index, layer in enumerate(layers):
+        mx.eval(layer.parameters())
+        shard_layer(layer)
+        mx.eval(layer.parameters())
+        mx.clear_cache()
+        _emit(
+            progress,
+            strategy=strategy.name,
+            layer=index,
+            loaded=index + 1,
+            total=total,
+        )
+
+
+def _shard_vocab_head(
+    owner: Any,
+    vocab_size: int,
+    group: Any,
+    mx: Any,
+    shard_linear: Callable[..., Any] | None = None,
+) -> None:
+    """Split an untied lm_head over the vocabulary, as MLX-LM's shard() does.
+
+    The model's forward then gathers the logits over ``sharding_group``.
+    ``shard_linear`` is the model's own splitter, if it has one.
+    """
+    from mlx.nn.layers import distributed
+
+    split = shard_linear or distributed.shard_linear
+    _require_divisible(int(vocab_size), int(group.size()), "vocabulary")
+    mx.eval(owner.lm_head.parameters())
+    owner.lm_head = split(owner.lm_head, "all-to-sharded", group=group)
+    owner.sharding_group = group
+    mx.eval(owner.lm_head.parameters())
+
+
+@_register(QWEN3_5)
+def _shard_qwen3_5(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    # MLX-LM's shard() on a view with one layer and tied embeddings shards only
+    # that layer. The lm_head stays whole: Lightning MTP drafts on rank zero
+    # alone, and a vocabulary-split head needs every rank to gather its logits.
+    tied = SimpleNamespace(args=SimpleNamespace(tie_word_embeddings=True))
+
+    def shard_layer(layer: Any) -> None:
+        type(model).shard(SimpleNamespace(language_model=tied, layers=[layer]), group)
+
+    _shard_layers(list(model.layers), shard_layer, mx, progress, QWEN3_5)
+
+
+@_register(MINISTRAL3)
+def _shard_ministral3(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    # MLX-LM's shard() splits the lm_head once and then each layer, so the
+    # head is split here and each layer through a one-layer view. Its splitter
+    # also handles FP8 linears.
+    from mlx_lm.models.ministral3 import _shard_linear
+
+    if not model.args.tie_word_embeddings:
+        _shard_vocab_head(model, model.args.vocab_size, group, mx, _shard_linear)
+    tied = SimpleNamespace(tie_word_embeddings=True)
+
+    def shard_layer(layer: Any) -> None:
+        view = SimpleNamespace(args=tied, model=SimpleNamespace(layers=[layer]))
+        type(model).shard(view, group)
+
+    _shard_layers(list(model.model.layers), shard_layer, mx, progress, MINISTRAL3)
+
+
+@_register(MUSE_SPARK)
+def _shard_muse_spark(
+    model: Any,
+    group: Any,
+    mx: Any,
+    progress: ProgressCallback | None,
+) -> None:
+    from mlx.nn.layers.distributed import shard_linear
+    from mlx_lm.models.muse_spark import shard_experts_inplace
+
+    size = int(group.size())
+    _require_divisible(model.args.text.num_key_value_heads, size, "KV heads")
+    _shard_vocab_head(model, model.args.text.vocab_size, group, mx)
+
+    def shard_layer(layer: Any) -> None:
+        attention = layer.self_attn
+        q_dim = attention.n_heads * attention.head_dim
+        kv_dim = attention.n_kv_heads * attention.head_dim
+        attention.qkvg_proj = shard_linear(
+            attention.qkvg_proj,
+            "all-to-sharded",
+            segments=[q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim],
+            group=group,
+        )
+        attention.o_proj = shard_linear(attention.o_proj, "sharded-to-all", group=group)
+        attention.n_heads //= size
+        attention.n_kv_heads //= size
+        # The MoE sums the expert outputs over the group.
+        layer.mlp.sharding_group = group
+        experts = layer.mlp.experts
+        shard_experts_inplace(experts.gate_proj, "all-to-sharded", group)
+        shard_experts_inplace(experts.down_proj, "sharded-to-all", group)
+        shard_experts_inplace(experts.up_proj, "all-to-sharded", group)
+
+    _shard_layers(list(model.layers), shard_layer, mx, progress, MUSE_SPARK)
+
+
 def apply_tensor_strategy(
     model: Any,
     group: Any,
@@ -771,7 +909,10 @@ def apply_tensor_strategy(
 
 __all__ = [
     "GLM5_NEXT",
+    "MINISTRAL3",
+    "MUSE_SPARK",
     "NEMOTRON_H",
+    "QWEN3_5",
     "QWEN3_NEXT",
     "TensorStrategy",
     "apply_tensor_strategy",

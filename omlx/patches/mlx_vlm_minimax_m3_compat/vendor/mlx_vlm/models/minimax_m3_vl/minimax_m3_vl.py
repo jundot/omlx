@@ -4,6 +4,10 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from omlx.patches.mlx_vlm_minimax_m3_compat.virtual_nvfp4 import (
+    MLX_NVFP4_GLOBAL_SCALE,
+)
+
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
@@ -34,6 +38,60 @@ def _pack_uint8_weight(weight: mx.array) -> mx.array:
     return mx.sum(weight << shifts, axis=-1)
 
 
+def _convert_nvfp4_experts(weights: dict, prefix: str, num_experts: int) -> bool:
+    """Rename compressed-tensors NVFP4 experts to MLX nvfp4 tensors.
+
+    The real weight is fp4 * weight_scale / weight_global_scale. MLX nvfp4 has
+    no per-expert global scale, and folding it into the E4M3 block scales
+    re-rounds them, so the inverse global scale is kept as an F32 vector that
+    the MoE block applies to each expert's output. input_global_scale only
+    feeds activation quantization and is dropped.
+    """
+    if f"{prefix}.experts.0.w1.weight_packed" not in weights:
+        return False
+
+    for hf_name, mlx_name in (("w1", "gate"), ("w2", "down"), ("w3", "up")):
+        inverse_scales = []
+        for expert in range(num_experts):
+            base = f"{prefix}.experts.{expert}.{hf_name}"
+            packed = weights.pop(f"{base}.weight_packed")
+            weights[f"{base}.weight"] = packed.view(mx.uint32)
+            weights[f"{base}.scales"] = weights.pop(f"{base}.weight_scale")
+            global_scale = weights.pop(f"{base}.weight_global_scale")
+            inverse_scales.append(
+                mx.reciprocal(global_scale.astype(mx.float32).reshape(()))
+            )
+            weights.pop(f"{base}.input_global_scale", None)
+        weights[f"{prefix}.switch_mlp.{mlx_name}_scale"] = mx.stack(inverse_scales)
+    return True
+
+
+def _inverse_scales_from_global_scales(
+    weights: dict, prefix: str, num_experts: int
+) -> None:
+    """Turn mlx-lm ``global_scale`` vectors into the MoE block's inverse scales.
+
+    MLX dequantizes nvfp4 with ``global_scale / (6 * 448)``, which is the
+    inverse global scale. A projection without a vector already holds real
+    values, so its scale is one.
+    """
+    switch = f"{prefix}.switch_mlp"
+    # Only quantized MLX experts need this. oQ runs this sanitize on logical
+    # expert weights without .scales, and must not write the ones vectors.
+    if f"{switch}.gate_proj.scales" not in weights:
+        return
+    for name in ("gate", "up", "down"):
+        global_scale = weights.pop(f"{switch}.{name}_proj.global_scale", None)
+        if global_scale is not None:
+            weights[f"{switch}.{name}_scale"] = (
+                global_scale.astype(mx.float32) / MLX_NVFP4_GLOBAL_SCALE
+            )
+        elif f"{switch}.{name}_scale" not in weights:
+            weights[f"{switch}.{name}_scale"] = mx.ones(
+                (num_experts,), dtype=mx.float32
+            )
+
+
 def _sanitize_moe_weights(weights: dict, args):
     num_experts = args.num_local_experts
     pack_shared = (
@@ -59,6 +117,11 @@ def _sanitize_moe_weights(weights: dict, args):
 
     for layer_idx in range(args.num_hidden_layers):
         prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
+        if _convert_nvfp4_experts(weights, prefix, num_experts) and pack_shared:
+            raise ValueError(
+                "MiniMax NVFP4 routed experts cannot be packed with the shared "
+                "expert; set pack_shared_expert to false."
+            )
 
         for suffix in ("weight", "scales", "biases", "bias"):
             if pack_shared:
@@ -99,6 +162,9 @@ def _sanitize_moe_weights(weights: dict, args):
                     weights[f"{prefix}.switch_mlp.{mlx_name}.{suffix}"] = pop_stack(
                         keys
                     )
+
+        if getattr(args, "routed_expert_scales", False):
+            _inverse_scales_from_global_scales(weights, prefix, num_experts)
 
 
 class MiniMaxProjector(nn.Module):

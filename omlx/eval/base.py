@@ -120,6 +120,9 @@ class BaseBenchmark(ABC):
         1. Look for explicit "answer is X" / "answer: X" patterns (last match)
         2. Fall back to last valid letter in response
         3. Case-insensitive
+
+        A letter written straight against Chinese, Japanese or Korean text
+        ("答案是B", "정답은 B입니다") is used only when nothing else matched.
         """
         response_upper = response.strip().upper()
         pattern_letters = "".join(valid_letters)
@@ -145,6 +148,17 @@ class BaseBenchmark(ABC):
         # 3. Check first character
         if response.strip() and response.strip()[0].upper() in valid_letters:
             return response.strip()[0].upper()
+
+        # 4. \b treats Han, kana and Hangul as word characters, so step 2 never
+        # sees the letter in "答案是B", "正解はBです" or "정답은 B입니다".
+        # re.ASCII limits word characters to ASCII letters, digits and _.
+        ascii_matches = re.findall(
+            r"\b([" + pattern_letters + r"])\b",
+            response_upper,
+            re.ASCII,
+        )
+        if ascii_matches:
+            return ascii_matches[-1]
 
         return ""
 

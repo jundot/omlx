@@ -5,7 +5,6 @@ import pytest
 
 from omlx.api.thinking import ThinkingParser, extract_thinking
 
-
 class TestExtractThinking:
     """Tests for non-streaming extract_thinking()."""
 
@@ -452,3 +451,43 @@ def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
     assert parser.feed(prefix + "unfinished</thi") == ("unfinished", "")
     assert parser.finish(truncated=True) == ("</thi", "")
     assert parser.finish(truncated=True) == ("", "")
+
+
+@pytest.mark.parametrize(
+    "text, prompt_opened, expected",
+    [
+        # Thinking off: think tags inside the answer (code that handles them).
+        (
+            "```python\n# Strip ``<think>...</think>`` spans.\n```\nand <think> again",
+            False,
+            (
+                "",
+                "```python\n# Strip ``<think>...</think>`` spans.\n```\nand <think> again",
+            ),
+        ),
+        # The leading block is thinking; later tags are answer text.
+        (
+            "<think>\nplan\n</think>\n\nUse <think>x</think> here",
+            False,
+            ("plan", "Use <think>x</think> here"),
+        ),
+        # The prompt opened the block, with and without the scheduler prefix.
+        ("reason</think>answer <think>", True, ("reason", "answer <think>")),
+        ("<think>\nreason</think>answer", True, ("reason", "answer")),
+    ],
+)
+def test_leading_only_thinking_keeps_later_tags_in_the_answer(
+    text, prompt_opened, expected
+):
+    assert (
+        extract_thinking(text, start_in_thinking=prompt_opened, leading_only=True)
+        == expected
+    )
+    parser = ThinkingParser(start_in_thinking=prompt_opened, leading_only=True)
+    thinking = content = ""
+    for start in range(0, len(text), 3):
+        t, c = parser.feed(text[start : start + 3])
+        thinking += t
+        content += c
+    t, c = parser.finish()
+    assert ((thinking + t).strip(), (content + c).strip()) == expected

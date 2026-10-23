@@ -6,7 +6,15 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx_lm.models.cache import BatchKVCache, dynamic_roll
 from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.models.switch_layers import SwitchGLU, SwitchLinear
+from mlx_lm.models.switch_layers import (
+    SwitchGLU,
+    SwitchLinear,
+    _gather_sort,
+    _scatter_unsort,
+)
+
+from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
+from omlx.patches.qwen35_verify_sdpa_split import row_exact_causal_sdpa
 
 from ..base import (
     LanguageModelOutput,
@@ -15,15 +23,34 @@ from ..base import (
 )
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
+from .moe_rows import scaled_switch_glu
 from .msa import (
     build_grouped_msa_topk,
-    build_grouped_msa_topk_blockwise,
+    msa_prefill_supported,
     msa_sparse_attention_b1,
+    small_l_block_scores,
+    small_l_sparse_attention,
 )
+from .qmv_rows import mxfp8_rows_matmul, row_exact_linears, rows_linear
 
 _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY = 0.5
 _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN = 32768
 _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK = 2
+# Up to this many query tokens (decode, speculative verify) gather their
+# selected blocks; longer chunks use one sparse keep-mask per KV head.
+_SPARSE_COMPACT_MAX_QUERIES = 16
+# Query rows x GQA factor one MLX vector SDPA call holds.
+_VECTOR_SDPA_ROWS = 32
+# Projections of the attention input that short calls run as one matmul.
+_INPUT_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "index_q_proj", "index_k_proj")
+# MLX runs calls this short as matrix-vector products that compute every
+# output row on its own, so the fused matmul matches the separate projections
+# bit for bit. Longer calls tile the output and can round differently.
+_FUSED_PROJECTION_MAX_ROWS = 8
+# Short calls start encoding every this many layers while the rest of the
+# graph is still being built, so the GPU does not wait for the whole step's
+# Python graph. Scheduling only; the computed values are unchanged.
+_SHORT_CALL_EVAL_EVERY = 4
 
 
 def _is_bool_mask(mask: mx.array) -> bool:
@@ -52,21 +79,6 @@ def _is_empty_kv_state(state) -> bool:
     )
 
 
-def _switch_gather_sort(x: mx.array, indices: mx.array):
-    *_, num_selected = indices.shape
-    indices = indices.flatten()
-    order = mx.argsort(indices)
-    inv_order = mx.argsort(order)
-    return x.flatten(0, -3)[order // num_selected], indices[order], inv_order
-
-
-def _switch_scatter_unsort(x: mx.array, inv_order: mx.array, shape=None):
-    x = x[inv_order]
-    if shape is not None:
-        x = mx.unflatten(x, 0, shape)
-    return x
-
-
 @mx.compile
 def _minimax_moe_select(
     gates: mx.array,
@@ -88,102 +100,271 @@ def _minimax_moe_select(
     return inds, weights * routed_scaling_factor
 
 
-@mx.compile
-def _build_sparse_causal_mask_compiled(
+def _router_gates(gate: nn.Module, x: mx.array) -> mx.array:
+    """Router logits in float32; a row-exact verify computes them per row.
+
+    MLX runs a multi-row float32 matmul as a tiled GEMM that rounds differently
+    from the matrix-vector product of a one-token decode step. A batch of
+    ``weight @ row`` products (the weight broadcast, not copied) keeps that
+    matrix-vector kernel for every row; ``(rows, 1, K) @ weight.T`` does not,
+    because MLX folds the batch back into one GEMM.
+    """
+    x = x.astype(mx.float32)
+    rows = x.size // x.shape[-1]
+    exact = rows > 1 and is_row_exact_armed()
+    if exact and type(gate) is nn.Linear and "bias" not in gate:
+        weight = mx.broadcast_to(gate.weight, (rows, *gate.weight.shape))
+        y = weight @ x.reshape(rows, x.shape[-1], 1)
+        return y.reshape(*x.shape[:-1], -1)
+    return gate(x)
+
+
+def _row_left_padding(cache) -> Optional[mx.array]:
+    left_padding = getattr(cache, "left_padding", None)
+    return left_padding if isinstance(left_padding, mx.array) else None
+
+
+def _sparse_block_selection(
     idx_queries: mx.array,
     idx_keys: mx.array,
-    q_start: int,
-    scale: float,
+    qpos: mx.array,
+    left_padding: Optional[mx.array],
     block_size: int,
-    sparse_topk_blocks: int,
-    sparse_init_blocks: int,
-    sparse_local_blocks: int,
-):
+    topk_blocks: int,
+    init_blocks: int,
+    local_blocks: int,
+    score_type: str = "max",
+) -> mx.array:
+    """Select the top-k key blocks for every query token and index head.
+
+    Index head ``h`` selects the blocks KV head ``h`` attends to. Blocks,
+    scores and causality use each row's own token positions: with left
+    padding, storage column ``s`` of row ``b`` holds position
+    ``s - left_padding[b]``. ``qpos`` is [B, L] in the same coordinates.
+    Returns block ids of shape [B, H_idx, L, k].
+    """
     B, H_idx, L, _ = idx_queries.shape
     total_len = idx_keys.shape[2]
+    num_blocks = (total_len + block_size - 1) // block_size
+    k = min(topk_blocks, num_blocks)
+    if score_type == "max":
+        negated = small_l_block_scores(
+            idx_queries,
+            idx_keys,
+            qpos,
+            left_padding,
+            block_size,
+            init_blocks,
+            local_blocks,
+        )
+        if negated is not None:
+            return mx.argpartition(negated, kth=k - 1, axis=-1)[..., :k].astype(
+                mx.int32
+            )
     neg = mx.array(-float("inf"), dtype=mx.float32)
 
+    # The softmax scale is a positive constant and does not change the order.
     scores = mx.matmul(
         idx_queries.astype(mx.float32),
         idx_keys.astype(mx.float32).swapaxes(-1, -2),
     )
-    scores = scores * scale
-
-    qpos = mx.arange(q_start, q_start + L)
-    kpos = mx.arange(total_len)
-    causal = kpos[None, :] <= qpos[:, None]
-    scores = mx.where(causal[None, None], scores, neg)
-
-    num_blocks = (total_len + block_size - 1) // block_size
-    pad = num_blocks * block_size - total_len
-    if pad:
-        pad_values = mx.full(
-            (*scores.shape[:-1], pad), -float("inf"), dtype=scores.dtype
+    if left_padding is not None:
+        columns = mx.arange(total_len)[None, :] + left_padding[:, None].astype(
+            mx.int32
         )
-        scores = mx.concatenate([scores, pad_values], axis=-1)
+        in_range = columns < total_len
+        columns = mx.minimum(columns, total_len - 1)
+        scores = mx.take_along_axis(
+            scores, mx.broadcast_to(columns[:, None, None, :], scores.shape), axis=-1
+        )
+        scores = mx.where(in_range[:, None, None, :], scores, neg)
+    positions = mx.arange(total_len)
+    scores = mx.where(positions[None, None, None, :] <= qpos[:, None, :, None], scores, neg)
 
-    blocks = mx.arange(num_blocks)
-    cur_block = qpos // block_size
-    causal_block = blocks[None, :] <= cur_block[:, None]
-    valid_blocks = causal_block[None, None]
-
+    tail = num_blocks * block_size - total_len
+    if tail:
+        scores = mx.concatenate(
+            [scores, mx.full((B, H_idx, L, tail), -float("inf"), dtype=scores.dtype)],
+            axis=-1,
+        )
     scores = scores.reshape(B, H_idx, L, num_blocks, block_size)
-    block_scores = mx.max(scores, axis=-1)
-    block_scores = mx.max(block_scores, axis=1)
+    if score_type == "lse":
+        block_scores = mx.logsumexp(scores, axis=-1)
+    else:
+        block_scores = mx.max(scores, axis=-1)
     block_scores = mx.where(block_scores == block_scores, block_scores, neg)
 
-    init_blocks = blocks[None, :] < sparse_init_blocks
-    if sparse_local_blocks > 0:
-        local_start = mx.maximum(cur_block - sparse_local_blocks + 1, 0)
-        local_blocks = (blocks[None, :] >= local_start[:, None]) & (
-            blocks[None, :] <= cur_block[:, None]
+    blocks = mx.arange(num_blocks)
+    current = qpos // block_size
+    valid = blocks[None, None, None, :] <= current[:, None, :, None]
+    selected = mx.where(valid, block_scores, neg)
+    if init_blocks > 0:
+        forced = (blocks[None, None, None, :] < init_blocks) & valid
+        selected = mx.where(forced, mx.array(1e30, dtype=selected.dtype), selected)
+    if local_blocks > 0:
+        local_start = current - local_blocks + 1
+        forced = (blocks[None, None, None, :] >= local_start[:, None, :, None]) & valid
+        selected = mx.where(forced, mx.array(1e29, dtype=selected.dtype), selected)
+
+    return mx.argpartition(-selected, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
+
+
+def _attention_valid_keys(mask) -> Optional[mx.array]:
+    """Boolean [B, 1, L, S] keep-mask from a normalized attention mask."""
+    if mask is None or isinstance(mask, str):
+        return None
+    if not _is_bool_mask(mask):
+        mask = mask.astype(mx.float32) > mx.array(-1e20, dtype=mx.float32)
+    if mask.shape[1] != 1:
+        mask = mx.any(mask, axis=1, keepdims=True)
+    return mask
+
+
+def _compact_sparse_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    block_ids: mx.array,
+    qpos: mx.array,
+    left_padding: Optional[mx.array],
+    block_size: int,
+    scale: float,
+    valid_keys: Optional[mx.array] = None,
+) -> mx.array:
+    """Attend each query to the keys of its own selected blocks.
+
+    Every query token gathers its blocks and runs as its own SDPA row, so a
+    multi-token verify computes each row exactly like a one-token decode.
+    """
+    B, H, L, D = queries.shape
+    K, total_len = keys.shape[1], keys.shape[2]
+    if block_ids.shape[1] == 1 and K != 1:
+        block_ids = mx.broadcast_to(block_ids, (B, K, *block_ids.shape[2:]))
+    elif block_ids.shape[1] != K:
+        raise ValueError(
+            "MiniMax M3 sparse attention needs one index head per KV head: "
+            f"{block_ids.shape[1]} index heads, {K} KV heads."
         )
-    else:
-        local_blocks = mx.zeros((L, num_blocks), dtype=mx.bool_)
+    selected_len = block_ids.shape[-1] * block_size
 
-    valid_blocks = mx.broadcast_to(valid_blocks[:, 0], block_scores.shape)
-    selected_scores = mx.where(valid_blocks, block_scores, neg)
-    forced_init_blocks = (init_blocks & causal_block)[None] & valid_blocks
-    forced_local_blocks = (local_blocks & causal_block)[None] & valid_blocks
-    selected_scores = mx.where(
-        forced_init_blocks,
-        mx.array(1e30, dtype=selected_scores.dtype),
-        selected_scores,
+    # Sorted blocks give decode and verify the same key order.
+    block_ids = mx.sort(block_ids, axis=-1)
+    offsets = mx.arange(block_size, dtype=mx.int32)
+    positions = (block_ids[..., None] * block_size + offsets).reshape(
+        B, K, L, selected_len
     )
-    selected_scores = mx.where(
-        forced_local_blocks,
-        mx.array(1e29, dtype=selected_scores.dtype),
-        selected_scores,
+    valid = positions <= qpos[:, None, :, None]
+    columns = positions
+    if left_padding is not None:
+        columns = positions + left_padding[:, None, None, None].astype(mx.int32)
+    valid = valid & (columns < total_len)
+    columns = mx.minimum(columns, total_len - 1)
+    if valid_keys is not None:
+        valid = valid & mx.take_along_axis(
+            mx.broadcast_to(valid_keys, (B, 1, L, total_len)), columns, axis=-1
+        )
+
+    gather = mx.broadcast_to(
+        columns.reshape(B, K, L * selected_len)[..., None],
+        (B, K, L * selected_len, D),
     )
 
-    topk_idx = mx.argpartition(-selected_scores, kth=sparse_topk_blocks - 1, axis=-1)[
-        ..., :sparse_topk_blocks
-    ]
-    topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
+    def rows(x):
+        x = mx.take_along_axis(x, gather, axis=2)
+        x = x.reshape(B, K, L, selected_len, D).transpose(0, 2, 1, 3, 4)
+        return x.reshape(B * L, K, selected_len, D)
 
-    block_selected = mx.any(topk_idx[..., None] == blocks, axis=-2)
-    block_selected = block_selected & valid_blocks
+    row_mask = valid.transpose(0, 2, 1, 3).reshape(B * L, K, 1, selected_len)
+    output = scaled_dot_product_attention(
+        queries.transpose(0, 2, 1, 3).reshape(B * L, H, 1, D),
+        rows(keys),
+        rows(values),
+        cache=None,
+        scale=scale,
+        mask=mx.repeat(row_mask, H // K, axis=1),
+    )
+    return output.reshape(B, L, H, D).transpose(0, 2, 1, 3)
 
-    key_blocks = (kpos // block_size).astype(mx.int32)
-    key_blocks = mx.broadcast_to(key_blocks[None, None, :], (B, L, total_len))
-    key_selected = mx.take_along_axis(block_selected, key_blocks, axis=-1)
-    key_selected = key_selected & causal[None]
 
-    sparse_mask = key_selected[:, None]
-    return sparse_mask, topk_idx[:, None], topk_valid[:, None]
+def _sparse_token_mask(
+    block_ids: mx.array,
+    qpos: mx.array,
+    left_padding: Optional[mx.array],
+    total_len: int,
+    block_size: int,
+) -> mx.array:
+    """Per index head [B, H_idx, L, S] keep-mask in storage columns."""
+    num_blocks = (total_len + block_size - 1) // block_size
+    selected = mx.any(block_ids[..., None] == mx.arange(num_blocks), axis=-2)
+    selected = mx.repeat(selected, block_size, axis=-1)[..., :total_len]
+    positions = mx.arange(total_len)
+    selected = selected & (positions[None, None, None, :] <= qpos[:, None, :, None])
+    if left_padding is not None:
+        source = positions[None, :] - left_padding[:, None].astype(mx.int32)
+        in_row = source >= 0
+        source = mx.maximum(source, 0)
+        selected = mx.take_along_axis(
+            selected, mx.broadcast_to(source[:, None, None, :], selected.shape), axis=-1
+        )
+        selected = selected & in_row[:, None, None, :]
+    return selected
+
+
+def _masked_sparse_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    token_mask: mx.array,
+    scale: float,
+    valid_keys: Optional[mx.array] = None,
+) -> mx.array:
+    """Dense SDPA per KV head, each with its own sparse keep-mask."""
+    H, K = queries.shape[1], keys.shape[1]
+    n_rep = H // K
+    shared = token_mask.shape[1] == 1
+    outputs = []
+    for head in range(K):
+        mask = token_mask[:, 0 if shared else head][:, None]
+        if valid_keys is not None:
+            mask = mask & valid_keys
+        outputs.append(
+            scaled_dot_product_attention(
+                queries[:, head * n_rep : (head + 1) * n_rep],
+                keys[:, head : head + 1],
+                values[:, head : head + 1],
+                cache=None,
+                scale=scale,
+                mask=mask,
+            )
+        )
+    return mx.concatenate(outputs, axis=1)
 
 
 @partial(mx.compile, shapeless=True)
-def _swiglu_oai(
+def _combine_routed(y: mx.array, weights: mx.array) -> mx.array:
+    # Routing weights stay float32 and the expert outputs sum in float32.
+    weighted = y.astype(mx.float32) * weights.astype(mx.float32)[..., None]
+    return weighted.sum(axis=-2).astype(y.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _scaled_swiglu_oai(
     x_linear,
     x_glu,
+    linear_scale,
+    glu_scale,
     alpha: float = 1.702,
     limit: float = 7.0,
     beta: float = 1.0,
 ):
-    x_glu = mx.clip(x_glu, a_min=None, a_max=limit)
-    x_linear = mx.clip(x_linear, a_min=-limit, a_max=limit)
-    return x_glu * mx.sigmoid(alpha * x_glu) * (x_linear + beta)
+    # The scales restore real projection outputs before the clip, so the math
+    # runs in float32 and only the activation is rounded to the input dtype.
+    dtype = x_linear.dtype
+    x_glu = mx.clip(x_glu.astype(mx.float32) * glu_scale, a_min=None, a_max=limit)
+    x_linear = mx.clip(
+        x_linear.astype(mx.float32) * linear_scale, a_min=-limit, a_max=limit
+    )
+    return (x_glu * mx.sigmoid(alpha * x_glu) * (x_linear + beta)).astype(dtype)
 
 
 class MiniMaxSwiGLUOAI(nn.Module):
@@ -199,7 +380,7 @@ class MiniMaxSwiGLUOAI(nn.Module):
         self.beta = beta
 
     def __call__(self, x, gate):
-        return _swiglu_oai(x, gate, self.alpha, self.limit, self.beta)
+        return _scaled_swiglu_oai(x, gate, 1.0, 1.0, self.alpha, self.limit, self.beta)
 
 
 class MiniMaxRMSNorm(nn.Module):
@@ -209,9 +390,13 @@ class MiniMaxRMSNorm(nn.Module):
         self.eps = eps
         self.gemma = gemma
 
-    def __call__(self, x):
-        weight = self.weight + 1 if self.gemma else self.weight
-        return mx.fast.rms_norm(x, weight.astype(mx.float32), self.eps).astype(x.dtype)
+    def __call__(self, x, dtype=None):
+        # Form 1 + w in float32: adding 1 to a bf16 weight rounds every channel.
+        weight = self.weight.astype(mx.float32)
+        if self.gemma:
+            weight = weight + 1
+        output = mx.fast.rms_norm(x, weight, self.eps)
+        return output.astype(x.dtype if dtype is None else dtype)
 
 
 class MiniMaxM3KVCache:
@@ -350,6 +535,9 @@ class MiniMaxM3KVCache:
 
 
 class MiniMaxM3BatchKVCache:
+    # LanguageModel.rollback_speculative_cache keeps each row's accepted
+    # prefix in place, so a batch verify needs no per-row cache copies.
+    _omlx_mtp_batch_rollback_cache = True
     step = BatchKVCache.step
 
     def __init__(self, left_padding):
@@ -581,7 +769,9 @@ class MiniMaxMLP(nn.Module):
         self.act_fn = MiniMaxSwiGLUOAI(alpha, limit, beta)
 
     def __call__(self, x):
-        return self.down_proj(self.act_fn(self.up_proj(x), self.gate_proj(x)))
+        projected = _project(self, ("gate_proj", "up_proj"), x, rows_linear)
+        act = self.act_fn(projected["up_proj"], projected["gate_proj"])
+        return rows_linear(self.down_proj, act)
 
 
 class MiniMaxPackedSwitchGLU(nn.Module):
@@ -607,7 +797,7 @@ class MiniMaxPackedSwitchGLU(nn.Module):
         idx = indices
         inv_order = None
         if do_sort:
-            x, idx, inv_order = _switch_gather_sort(x, indices)
+            x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
 
@@ -620,9 +810,171 @@ class MiniMaxPackedSwitchGLU(nn.Module):
         )
 
         if do_sort:
-            x = _switch_scatter_unsort(x, inv_order, indices.shape)
+            x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+
+class MiniMaxScaledSwitchGLU(SwitchGLU):
+    """SwitchGLU for NVFP4 experts that carry a per-expert global scale.
+
+    gate_scale and up_scale are applied inside the activation. down_scale is
+    returned to the caller through the routing weights, so the down output
+    stays at its raw NVFP4 magnitude here.
+    """
+
+    def __init__(
+        self,
+        input_dims: int,
+        hidden_dims: int,
+        num_experts: int,
+        activation: MiniMaxSwiGLUOAI,
+    ):
+        super().__init__(input_dims, hidden_dims, num_experts, activation=activation)
+        self.gate_scale = mx.ones((num_experts,), dtype=mx.float32)
+        self.up_scale = mx.ones((num_experts,), dtype=mx.float32)
+        self.down_scale = mx.ones((num_experts,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        y = scaled_switch_glu(self, x, indices)
+        if y is not None:
+            return y
+        x = mx.expand_dims(x, (-2, -3))
+
+        indices = mx.stop_gradient(indices)
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+
+        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        act = self.activation
+        x = self.down_proj(
+            _scaled_swiglu_oai(
+                x_up,
+                x_gate,
+                self.up_scale[idx][..., None, None],
+                self.gate_scale[idx][..., None, None],
+                act.alpha,
+                act.limit,
+                act.beta,
+            ),
+            idx,
+            sorted_indices=do_sort,
+        )
+
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+
+        return x.squeeze(-2)
+
+
+class _FusedProjections:
+    """Same-format quantized projections concatenated along the output rows."""
+
+    __slots__ = ("names", "splits", "weight", "scales", "biases", "quant", "views")
+
+    def __init__(self, names, splits, weight, scales, biases, quant, views):
+        self.names = names
+        self.splits = splits
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.quant = quant
+        self.views = views
+
+    def current(self, module) -> bool:
+        # A later weight load replaces the row views, so the fusion is rebuilt.
+        return all(
+            module[name].get("weight") is view
+            for name, view in zip(self.names, self.views)
+        )
+
+    def __call__(self, x: mx.array):
+        y = mxfp8_rows_matmul(x, self.weight, self.scales, self.quant)
+        if y is None:
+            y = mx.quantized_matmul(
+                x, self.weight, self.scales, self.biases, transpose=True, **self.quant
+            )
+        return zip(self.names, mx.split(y, self.splits, axis=-1))
+
+
+def _fuse_projections(module, names) -> List[_FusedProjections]:
+    """Concatenate same-format projections once and rebind them to row views.
+
+    The projections keep working on slices of the fused buffers, so the
+    weights are not duplicated.
+    """
+    by_format = {}
+    for name in names:
+        proj = module[name]
+        # Sharded subclasses add collectives to the forward; keep them as is.
+        if type(proj) is not nn.QuantizedLinear or "bias" in proj:
+            continue
+        key = (proj.group_size, proj.bits, proj.mode, proj.get("biases") is not None)
+        by_format.setdefault(key, []).append(name)
+
+    fused = []
+    for (group_size, bits, mode, has_biases), members in by_format.items():
+        if len(members) < 2:
+            continue
+        projs = [module[name] for name in members]
+        keys = ("weight", "scales", "biases") if has_biases else ("weight", "scales")
+        buffers = {k: mx.concatenate([p[k] for p in projs], axis=0) for k in keys}
+        mx.eval(list(buffers.values()))
+        ends = []
+        start = 0
+        for proj in projs:
+            rows = proj["weight"].shape[0]
+            for k in keys:
+                proj[k] = buffers[k][start : start + rows]
+            start += rows
+            ends.append(start)
+        mx.eval([proj[k] for proj in projs for k in keys])
+        fused.append(
+            _FusedProjections(
+                tuple(members),
+                ends[:-1],
+                buffers["weight"],
+                buffers["scales"],
+                buffers.get("biases"),
+                {"group_size": group_size, "bits": bits, "mode": mode},
+                tuple(proj["weight"] for proj in projs),
+            )
+        )
+    return fused
+
+
+def _project(module, names, x: mx.array, unfused=None) -> dict:
+    """``{name: module[name](x)}``, same-format projections fused for short calls.
+
+    ``unfused(proj, x)`` applies a projection outside a fused group, ``proj(x)``
+    when None.
+    """
+    out = {}
+    rows = x.size // x.shape[-1]
+    if rows <= _FUSED_PROJECTION_MAX_ROWS:
+        fused = module.__dict__.get("_omlx_fused_projections")
+        if fused is None or not all(group.current(module) for group in fused):
+            fused = _fuse_projections(module, names)
+            module.__dict__["_omlx_fused_projections"] = fused
+        # A row-exact verify runs the MXFP8 group on the decode-exact rows
+        # kernel and an affine group on the row-exact affine tile.
+        exact = rows > 1 and is_row_exact_armed()
+        for group in fused:
+            if not exact or group.quant["mode"] == "mxfp8":
+                out.update(group(x))
+                continue
+            projected = row_exact_linears([module[n] for n in group.names], x)
+            if projected is not None:
+                out.update(zip(group.names, projected))
+    for name in names:
+        if name not in out:
+            proj = module[name]
+            out[name] = proj(x) if unfused is None else unfused(proj, x)
+    return out
 
 
 class MiniMaxAttention(nn.Module):
@@ -715,239 +1067,6 @@ class MiniMaxAttention(nn.Module):
             positions = positions.reshape(B, L)
         return positions
 
-    def _build_sparse_mask(
-        self,
-        idx_queries: mx.array,
-        idx_keys: mx.array,
-        q_start: int,
-        mask: Optional[mx.array] = None,
-        return_block_indices: bool = False,
-        build_token_mask: bool = True,
-        q_positions: Optional[mx.array] = None,
-    ):
-        B, H_idx, L, _ = idx_queries.shape
-        total_len = idx_keys.shape[2]
-        if (
-            build_token_mask
-            and q_positions is None
-            and (mask is None or isinstance(mask, str))
-            and self.sparse_score_type == "max"
-            and (total_len + self.sparse_block_size - 1) // self.sparse_block_size
-            >= self.sparse_topk_blocks
-        ):
-            if self.num_attention_heads % H_idx != 0:
-                raise ValueError(
-                    "MiniMax M3 sparse index heads must divide attention heads: "
-                    f"{H_idx} index heads, {self.num_attention_heads} attention heads."
-                )
-            sparse_mask, topk_idx, topk_valid = _build_sparse_causal_mask_compiled(
-                idx_queries,
-                idx_keys,
-                q_start,
-                self.scale,
-                self.sparse_block_size,
-                self.sparse_topk_blocks,
-                self.sparse_init_blocks,
-                self.sparse_local_blocks,
-            )
-            if return_block_indices:
-                return sparse_mask, topk_idx, topk_valid
-            return sparse_mask
-
-        scale = self.scale
-        neg = mx.array(-float("inf"), dtype=mx.float32)
-
-        scores = mx.matmul(
-            idx_queries.astype(mx.float32),
-            idx_keys.astype(mx.float32).swapaxes(-1, -2),
-        )
-        scores = scores * scale
-
-        qpos = self._sparse_query_positions(B, L, q_start, q_positions)
-        kpos = mx.arange(total_len)
-        causal = kpos[None, None, :] <= qpos[:, :, None]
-        scores = mx.where(causal[:, None], scores, neg)
-        valid = self._selection_valid_mask(mask, B, H_idx, L, total_len)
-        if valid is not None:
-            scores = mx.where(valid, scores, neg)
-
-        block_size = self.sparse_block_size
-        num_blocks = (total_len + block_size - 1) // block_size
-        pad = num_blocks * block_size - total_len
-        if pad:
-            pad_values = mx.full(
-                (*scores.shape[:-1], pad), -float("inf"), dtype=scores.dtype
-            )
-            scores = mx.concatenate([scores, pad_values], axis=-1)
-            if valid is not None:
-                valid_pad = mx.zeros((*valid.shape[:-1], pad), dtype=mx.bool_)
-                valid = mx.concatenate([valid, valid_pad], axis=-1)
-
-        blocks = mx.arange(num_blocks)
-        cur_block = qpos // block_size
-        causal_block = blocks[None, None, :] <= cur_block[:, :, None]
-
-        scores = scores.reshape(B, H_idx, L, num_blocks, block_size)
-        if valid is not None:
-            valid_blocks = mx.any(
-                valid.reshape(B, valid.shape[1], L, num_blocks, block_size),
-                axis=-1,
-            )
-        else:
-            valid_blocks = causal_block[:, None]
-
-        if self.sparse_score_type == "lse":
-            block_scores = mx.logsumexp(scores, axis=-1)
-        else:
-            block_scores = mx.max(scores, axis=-1)
-        block_scores = mx.max(block_scores, axis=1)
-        block_scores = mx.where(block_scores == block_scores, block_scores, neg)
-        if valid_blocks.shape[1] == 1:
-            valid_blocks = valid_blocks[:, 0]
-        else:
-            valid_blocks = mx.any(valid_blocks, axis=1)
-        valid_blocks = valid_blocks & causal_block
-
-        init_blocks = blocks[None, None, :] < self.sparse_init_blocks
-        if self.sparse_local_blocks > 0:
-            local_start = mx.maximum(cur_block - self.sparse_local_blocks + 1, 0)
-            local_blocks = (blocks[None, None, :] >= local_start[:, :, None]) & (
-                blocks[None, None, :] <= cur_block[:, :, None]
-            )
-        else:
-            local_blocks = mx.zeros((B, L, num_blocks), dtype=mx.bool_)
-
-        selected_scores = mx.where(valid_blocks, block_scores, neg)
-        forced_init_blocks = (init_blocks & causal_block) & valid_blocks
-        forced_local_blocks = (local_blocks & causal_block) & valid_blocks
-        selected_scores = mx.where(
-            forced_init_blocks,
-            mx.array(1e30, dtype=selected_scores.dtype),
-            selected_scores,
-        )
-        selected_scores = mx.where(
-            forced_local_blocks,
-            mx.array(1e29, dtype=selected_scores.dtype),
-            selected_scores,
-        )
-
-        k_eff = min(self.sparse_topk_blocks, num_blocks)
-        topk_idx = mx.argpartition(-selected_scores, kth=k_eff - 1, axis=-1)[
-            ..., :k_eff
-        ]
-        topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
-        if not build_token_mask:
-            return None, topk_idx[:, None], topk_valid[:, None]
-
-        block_selected = mx.any(topk_idx[..., None] == blocks, axis=-2)
-        block_selected = block_selected & valid_blocks
-
-        key_blocks = (kpos // block_size).astype(mx.int32)
-        key_blocks = mx.broadcast_to(key_blocks[None, None, :], (B, L, total_len))
-        key_selected = mx.take_along_axis(block_selected, key_blocks, axis=-1)
-        key_selected = key_selected & causal
-
-        sparse_mask = key_selected[:, None]
-        sparse_mask = self._merge_sparse_mask(sparse_mask, mask)
-        if return_block_indices:
-            return sparse_mask, topk_idx[:, None], topk_valid[:, None]
-        return sparse_mask
-
-    def _build_sparse_decode_indices(
-        self,
-        idx_queries: mx.array,
-        idx_keys: mx.array,
-        q_start: int,
-        q_positions: Optional[mx.array] = None,
-    ):
-        B, H_idx, L, _ = idx_queries.shape
-        total_len = idx_keys.shape[2]
-        if B != 1 or L != 1:
-            return None
-        explicit_positions = q_positions is not None
-        if not explicit_positions and q_start + 1 != total_len:
-            return None
-
-        block_size = self.sparse_block_size
-        num_blocks = (total_len + block_size - 1) // block_size
-        pad = num_blocks * block_size - total_len
-        neg = mx.array(-float("inf"), dtype=mx.float32)
-        qpos = None
-
-        scores = mx.matmul(
-            idx_queries.astype(mx.float32),
-            idx_keys.astype(mx.float32).swapaxes(-1, -2),
-        )
-        scores = scores * self.scale
-        if explicit_positions:
-            qpos = self._sparse_query_positions(B, L, q_start, q_positions)
-            kpos = mx.arange(total_len)
-            causal = kpos[None, None, None, :] <= qpos[:, None, :, None]
-            scores = mx.where(causal, scores, neg)
-        if pad:
-            pad_values = mx.full(
-                (*scores.shape[:-1], pad), -float("inf"), dtype=scores.dtype
-            )
-            scores = mx.concatenate([scores, pad_values], axis=-1)
-
-        scores = scores.reshape(B, H_idx, L, num_blocks, block_size)
-        if self.sparse_score_type == "lse":
-            block_scores = mx.logsumexp(scores, axis=-1)
-        else:
-            block_scores = mx.max(scores, axis=-1)
-        selected_scores = mx.where(block_scores == block_scores, block_scores, neg)
-
-        blocks = mx.arange(num_blocks)
-        if explicit_positions:
-            cur_block = qpos // block_size
-            valid_blocks = blocks[None, None, None, :] <= cur_block[:, None, :, None]
-            selected_scores = mx.where(valid_blocks, selected_scores, neg)
-        else:
-            valid_blocks = None
-
-        if self.sparse_init_blocks > 0:
-            init_blocks = blocks < self.sparse_init_blocks
-            if valid_blocks is not None:
-                init_blocks = init_blocks[None, None, None, :] & valid_blocks
-            else:
-                init_blocks = init_blocks[None, None, None, :]
-            selected_scores = mx.where(
-                init_blocks,
-                mx.array(1e30, dtype=selected_scores.dtype),
-                selected_scores,
-            )
-
-        if self.sparse_local_blocks > 0:
-            if explicit_positions:
-                cur_block = qpos // block_size
-                local_start = mx.maximum(cur_block - self.sparse_local_blocks + 1, 0)
-                local_blocks = (
-                    blocks[None, None, None, :] >= local_start[:, None, :, None]
-                ) & (blocks[None, None, None, :] <= cur_block[:, None, :, None])
-                if valid_blocks is not None:
-                    local_blocks = local_blocks & valid_blocks
-            else:
-                cur_block = q_start // block_size
-                local_start = max(cur_block - self.sparse_local_blocks + 1, 0)
-                local_blocks = (blocks >= local_start) & (blocks <= cur_block)
-                local_blocks = local_blocks[None, None, None, :]
-            selected_scores = mx.where(
-                local_blocks,
-                mx.array(1e29, dtype=selected_scores.dtype),
-                selected_scores,
-            )
-
-        k_eff = min(self.sparse_topk_blocks, num_blocks)
-        topk_idx = mx.argpartition(-selected_scores, kth=k_eff - 1, axis=-1)[
-            ..., :k_eff
-        ]
-        if valid_blocks is None:
-            topk_valid = mx.ones(topk_idx.shape, dtype=mx.bool_)
-        else:
-            valid_blocks = mx.broadcast_to(valid_blocks, selected_scores.shape)
-            topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
-        return topk_idx, topk_valid
-
     @staticmethod
     def _expand_2d_mask(mask: mx.array, B: int, L: int, total_len: int):
         if mask.shape[-1] != total_len:
@@ -1002,60 +1121,6 @@ class MiniMaxAttention(nn.Module):
         )
         return mask + causal_bias
 
-    @staticmethod
-    def _selection_valid_mask(
-        mask: Optional[mx.array], B: int, H_idx: int, L: int, total_len: int
-    ):
-        valid = MiniMaxAttention._normalize_attention_mask(mask, B, L, total_len)
-        if valid is None or isinstance(valid, str):
-            return None
-
-        if not _is_bool_mask(valid):
-            valid = valid.astype(mx.float32) > mx.array(-1e20, dtype=mx.float32)
-
-        if valid.shape[1] != 1 and valid.shape[1] != H_idx:
-            valid = mx.any(valid, axis=1, keepdims=True)
-
-        heads = H_idx if valid.shape[1] == H_idx else 1
-        valid = mx.broadcast_to(valid, (B, heads, L, total_len))
-        return valid
-
-    @staticmethod
-    def _merge_sparse_mask(sparse_mask: mx.array, mask: Optional[mx.array]):
-        B, _, L, total_len = sparse_mask.shape
-        mask = MiniMaxAttention._normalize_attention_mask(mask, B, L, total_len)
-        if mask is None or isinstance(mask, str):
-            return sparse_mask
-        if _is_bool_mask(mask):
-            return sparse_mask & mask
-        sparse_bias = mx.where(
-            sparse_mask,
-            mx.array(0.0, dtype=mask.dtype),
-            mx.array(-float("inf"), dtype=mask.dtype),
-        )
-        return sparse_bias + mask
-
-    def _can_use_sparse_decode_attention(
-        self,
-        queries: mx.array,
-        keys: mx.array,
-        original_mask: Optional[mx.array],
-    ) -> bool:
-        B, H, L, _ = queries.shape
-        _, K, total_len, _ = keys.shape
-        num_blocks = (total_len + self.sparse_block_size - 1) // self.sparse_block_size
-        selected_len = min(self.sparse_topk_blocks, num_blocks) * self.sparse_block_size
-        sparse_density = selected_len / total_len if total_len else 1.0
-        return (
-            original_mask is None
-            and B == 1
-            and L == 1
-            and self.index_heads == K
-            and H % K == 0
-            and selected_len < total_len
-            and sparse_density <= _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY
-        )
-
     def _can_use_msa_prefill_attention(
         self,
         queries: mx.array,
@@ -1072,12 +1137,12 @@ class MiniMaxAttention(nn.Module):
             mx.metal.is_available()
             and self.sparse_score_type == "max"
             and B == 1
-            and L > 1
+            and L >= 8
             and q_positions is None
             and (mask is None or isinstance(mask, str))
             and self.index_heads == K
             and H % K == 0
-            and D % 32 == 0
+            and msa_prefill_supported(D, self.sparse_block_size, H // K)
             and num_blocks >= self.sparse_topk_blocks
             and sparse_density < _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY
         )
@@ -1098,13 +1163,7 @@ class MiniMaxAttention(nn.Module):
         ):
             return None
 
-        topk_builder = build_grouped_msa_topk
-        builder_kwargs = {}
-        if idx_keys.shape[2] >= _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN:
-            topk_builder = build_grouped_msa_topk_blockwise
-            builder_kwargs["block_chunk_size"] = _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK
-
-        q2k = topk_builder(
+        q2k = build_grouped_msa_topk(
             idx_queries,
             idx_keys,
             q_start,
@@ -1113,7 +1172,11 @@ class MiniMaxAttention(nn.Module):
             self.sparse_topk_blocks,
             self.sparse_init_blocks,
             self.sparse_local_blocks,
-            **builder_kwargs,
+            block_chunk_size=(
+                _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK
+                if idx_keys.shape[2] >= _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN
+                else None
+            ),
         )[0]
         q = queries[0].transpose(1, 0, 2)
         k = keys[0].transpose(1, 0, 2)
@@ -1131,102 +1194,9 @@ class MiniMaxAttention(nn.Module):
         )
         return out.transpose(1, 0, 2)[None]
 
-    def _sparse_block_offsets(self, dtype):
-        cache = getattr(self, "_minimax_m3_sparse_block_offsets_cache", None)
-        if (
-            cache is None
-            or cache[0] != dtype
-            or cache[1].shape[0] != self.sparse_block_size
-        ):
-            offsets = mx.arange(self.sparse_block_size, dtype=dtype)
-            mx.eval(offsets)
-            object.__setattr__(
-                self, "_minimax_m3_sparse_block_offsets_cache", (dtype, offsets)
-            )
-            return offsets
-        return cache[1]
-
-    def _sparse_decode_attention(
-        self,
-        queries: mx.array,
-        keys: mx.array,
-        values: mx.array,
-        topk_idx: mx.array,
-        topk_valid: mx.array,
-        q_start: int,
-        *,
-        topk_all_valid: bool = False,
-        q_positions: Optional[mx.array] = None,
-    ):
-        B, H, L, D = queries.shape
-        _, K, total_len, _ = keys.shape
-        index_heads = topk_idx.shape[1]
-        if B != 1 or L != 1 or index_heads not in (1, K) or H % K != 0:
-            return None
-
-        selected_len = topk_idx.shape[-1] * self.sparse_block_size
-        if selected_len >= total_len:
-            return None
-
-        mask = None
-        use_maskless_compact = (
-            topk_all_valid
-            and q_positions is None
-            and q_start + L == total_len
-            and self.sparse_local_blocks > 0
-        )
-        if use_maskless_compact:
-            topk_idx = mx.sort(topk_idx, axis=-1)
-
-        block_offsets = self._sparse_block_offsets(topk_idx.dtype)
-        positions = topk_idx[..., None] * self.sparse_block_size + block_offsets
-        positions = positions.reshape(B, index_heads, L, selected_len)
-        if index_heads == 1 and K != 1:
-            positions = mx.broadcast_to(positions, (B, K, L, selected_len))
-
-        if use_maskless_compact:
-            num_blocks = (total_len + self.sparse_block_size - 1) // self.sparse_block_size
-            tail_pad = num_blocks * self.sparse_block_size - total_len
-            selected_len = selected_len - tail_pad
-            positions = positions[..., :selected_len]
-        else:
-            valid = mx.broadcast_to(
-                topk_valid[..., None],
-                topk_idx.shape + (self.sparse_block_size,),
-            )
-            valid = valid.reshape(B, index_heads, L, selected_len)
-            if index_heads == 1 and K != 1:
-                valid = mx.broadcast_to(valid, (B, K, L, selected_len))
-            qpos = self._sparse_query_positions(B, L, q_start, q_positions).astype(
-                positions.dtype
-            )
-            valid = (
-                valid
-                & (positions < total_len)
-                & (positions <= qpos[:, None, :, None])
-            )
-            positions = mx.where(
-                valid, positions, mx.array(total_len, dtype=positions.dtype)
-            )
-            valid = positions < total_len
-            positions = mx.minimum(
-                positions, mx.array(total_len - 1, dtype=positions.dtype)
-            )
-            mask = mx.repeat(valid, H // K, axis=1)
-
-        gather_idx = positions[:, :, 0, :, None]
-        gather_idx = mx.broadcast_to(gather_idx, (B, K, selected_len, D))
-        compact_keys = mx.take_along_axis(keys, gather_idx, axis=2)
-        compact_values = mx.take_along_axis(values, gather_idx, axis=2)
-
-        return scaled_dot_product_attention(
-            queries,
-            compact_keys,
-            compact_values,
-            cache=None,
-            scale=self.scale,
-            mask=mask,
-        )
+    def _input_projections(self, x: mx.array) -> dict:
+        names = _INPUT_PROJECTIONS if self.has_sparse_index else _INPUT_PROJECTIONS[:3]
+        return _project(self, names, x)
 
     def __call__(
         self,
@@ -1245,31 +1215,36 @@ class MiniMaxAttention(nn.Module):
                 rope_offset = position_ids[0] if position_ids.ndim > 0 else position_ids
         sparse_q_start = 0 if cache is None else getattr(cache, "index_offset", offset)
         sparse_q_positions = position_ids if position_ids is not None else None
-        original_mask = mask
         use_sparse_mask = self.has_sparse_index and (
             cache is None or hasattr(cache, "update_index_and_fetch")
         )
 
-        queries = self.q_proj(x)
-        keys = self.k_proj(x)
-        values = self.v_proj(x)
+        projected = self._input_projections(x)
+        queries = projected["q_proj"]
+        keys = projected["k_proj"]
+        values = projected["v_proj"]
         queries = queries.reshape(B, L, self.num_attention_heads, self.head_dim)
         keys = keys.reshape(B, L, self.num_key_value_heads, self.head_dim)
         values = values.reshape(B, L, self.num_key_value_heads, self.head_dim)
 
+        # q/k norms and RoPE run in float32 and round to the model dtype once.
         if self.use_qk_norm:
-            queries = self.q_norm(queries)
-            keys = self.k_norm(keys)
+            queries = self.q_norm(queries, dtype=mx.float32)
+            keys = self.k_norm(keys, dtype=mx.float32)
 
         if use_sparse_mask:
-            idx_queries = self.index_q_proj(x)
-            idx_keys = self.index_k_proj(x)
+            idx_queries = projected["index_q_proj"]
+            idx_keys = projected["index_k_proj"]
             idx_queries = idx_queries.reshape(B, L, self.index_heads, self.index_dim)
             idx_keys = idx_keys.reshape(B, L, 1, self.index_dim)
-            idx_queries = self.index_q_norm(idx_queries).transpose(0, 2, 1, 3)
-            idx_keys = self.index_k_norm(idx_keys).transpose(0, 2, 1, 3)
-            idx_queries = self.rope(idx_queries, offset=rope_offset)
-            idx_keys = self.rope(idx_keys, offset=rope_offset)
+            idx_queries = self.index_q_norm(idx_queries, dtype=mx.float32)
+            idx_keys = self.index_k_norm(idx_keys, dtype=mx.float32)
+            idx_queries = self.rope(
+                idx_queries.transpose(0, 2, 1, 3), offset=rope_offset
+            ).astype(x.dtype)
+            idx_keys = self.rope(
+                idx_keys.transpose(0, 2, 1, 3), offset=rope_offset
+            ).astype(x.dtype)
         else:
             idx_queries = None
             idx_keys = None
@@ -1278,13 +1253,10 @@ class MiniMaxAttention(nn.Module):
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
+        queries = self.rope(queries, offset=rope_offset).astype(x.dtype)
+        keys = self.rope(keys, offset=rope_offset).astype(x.dtype)
         if cache is not None:
-            queries = self.rope(queries, offset=rope_offset)
-            keys = self.rope(keys, offset=rope_offset)
             keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries, offset=rope_offset)
-            keys = self.rope(keys, offset=rope_offset)
 
         if use_sparse_mask:
             if cache is not None and hasattr(cache, "update_index_and_fetch"):
@@ -1292,12 +1264,19 @@ class MiniMaxAttention(nn.Module):
             mask = self._normalize_attention_mask(
                 mask, B, L, keys.shape[2], causal=sparse_q_positions is None
             )
-            if idx_keys.shape[2] > self.sparse_block_size * self.sparse_topk_blocks:
-                compact_candidate = self._can_use_sparse_decode_attention(
-                    queries, keys, original_mask
-                )
-                if self._can_use_msa_prefill_attention(
-                    queries, keys, mask, sparse_q_positions
+            # Up to topk blocks the selection keeps every block, so dense
+            # attention gives the same result faster.
+            dense_keys = self.sparse_block_size * self.sparse_topk_blocks
+            if idx_keys.shape[2] > dense_keys:
+                left_padding = _row_left_padding(cache)
+                # Short calls (decode, speculative verify) stay on the compact
+                # path so a verify row computes exactly like a decode step.
+                if (
+                    left_padding is None
+                    and L > _SPARSE_COMPACT_MAX_QUERIES
+                    and self._can_use_msa_prefill_attention(
+                        queries, keys, mask, sparse_q_positions
+                    )
                 ):
                     output = self._msa_prefill_attention(
                         queries,
@@ -1311,63 +1290,98 @@ class MiniMaxAttention(nn.Module):
                     )
                     if output is not None:
                         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                        return self.o_proj(output)
-                sparse_mask = None
-                decode_indices = None
-                if compact_candidate and mask is None:
-                    decode_indices = self._build_sparse_decode_indices(
-                        idx_queries,
-                        idx_keys,
-                        int(sparse_q_start),
-                        q_positions=sparse_q_positions,
-                    )
-                if decode_indices is None:
-                    sparse_mask, topk_idx, topk_valid = self._build_sparse_mask(
-                        idx_queries,
-                        idx_keys,
-                        int(sparse_q_start),
-                        mask,
-                        return_block_indices=True,
-                        build_token_mask=not compact_candidate,
-                        q_positions=sparse_q_positions,
-                    )
-                else:
-                    topk_idx, topk_valid = decode_indices
-                if compact_candidate:
-                    output = self._sparse_decode_attention(
+                        return rows_linear(self.o_proj, output)
+
+                qpos = self._sparse_query_positions(
+                    B, L, int(sparse_q_start), sparse_q_positions
+                ).astype(mx.int32)
+                if sparse_q_positions is None and left_padding is not None:
+                    qpos = qpos - left_padding[:, None].astype(mx.int32)
+                # Padding queries still need one visible key to stay finite.
+                qpos = mx.maximum(qpos, 0)
+                block_ids = _sparse_block_selection(
+                    idx_queries,
+                    idx_keys,
+                    qpos,
+                    left_padding,
+                    self.sparse_block_size,
+                    self.sparse_topk_blocks,
+                    self.sparse_init_blocks,
+                    self.sparse_local_blocks,
+                    self.sparse_score_type,
+                )
+                valid_keys = _attention_valid_keys(mask)
+                if L <= _SPARSE_COMPACT_MAX_QUERIES:
+                    sparse_args = (
                         queries,
                         keys,
                         values,
-                        topk_idx,
-                        topk_valid,
-                        int(sparse_q_start),
-                        topk_all_valid=(
-                            decode_indices is not None and sparse_q_positions is None
-                        ),
-                        q_positions=sparse_q_positions,
+                        block_ids,
+                        qpos,
+                        left_padding,
+                        self.sparse_block_size,
+                        self.scale,
+                        valid_keys,
                     )
-                    if output is not None:
-                        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                        return self.o_proj(output)
-                    if sparse_mask is None:
-                        sparse_mask = self._build_sparse_mask(
-                            idx_queries,
-                            idx_keys,
-                            int(sparse_q_start),
-                            mask,
-                            q_positions=sparse_q_positions,
+                    output = small_l_sparse_attention(*sparse_args)
+                    if output is None:
+                        output = _compact_sparse_attention(*sparse_args)
+                    # Leading verify rows whose decode step saw at most
+                    # dense_keys keys took the dense path there.
+                    dense_rows = dense_keys - (idx_keys.shape[2] - L)
+                    if dense_rows > 0 and is_row_exact_armed():
+                        dense = self._row_exact_attention(
+                            queries, keys, values, mask, dense_rows
                         )
-                mask = sparse_mask
+                        output = mx.concatenate(
+                            [dense, output[:, :, dense_rows:]], axis=2
+                        )
+                else:
+                    token_mask = _sparse_token_mask(
+                        block_ids,
+                        qpos,
+                        left_padding,
+                        keys.shape[2],
+                        self.sparse_block_size,
+                    )
+                    output = _masked_sparse_attention(
+                        queries, keys, values, token_mask, self.scale, valid_keys
+                    )
+                output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                return rows_linear(self.o_proj, output)
         else:
             mask = self._normalize_attention_mask(
                 mask, B, L, keys.shape[2], causal=True
             )
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+        if L > 1 and is_row_exact_armed():
+            output = self._row_exact_attention(queries, keys, values, mask, L)
+        else:
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return rows_linear(self.o_proj, output)
+
+    def _row_exact_attention(self, queries, keys, values, mask, rows: int):
+        """Dense attention of the first ``rows`` query rows, each computed like
+        its own one-row decode step.
+
+        MLX picks another kernel once a call holds more query rows than its
+        vector kernel takes, and that kernel rounds differently.
+        """
+        kv_len = keys.shape[2] - (queries.shape[2] - rows)
+        if isinstance(mask, mx.array):
+            mask = mask[..., :rows, :kv_len]
+        group = self.num_attention_heads // self.num_key_value_heads
+        return row_exact_causal_sdpa(
+            queries[:, :, :rows],
+            keys[:, :, :kv_len],
+            values[:, :, :kv_len],
+            self.scale,
+            max(1, _VECTOR_SDPA_ROWS // group),
+            mask=mask,
+        )
 
 
 class MiniMaxSparseMoeBlock(nn.Module):
@@ -1392,11 +1406,23 @@ class MiniMaxSparseMoeBlock(nn.Module):
             args.swiglu_limit,
             args.swiglu_beta,
         )
+        self.routed_expert_scales = bool(getattr(args, "routed_expert_scales", False))
+        if self.routed_expert_scales and self.pack_shared_expert:
+            raise ValueError(
+                "MiniMax routed expert scales require pack_shared_expert=False."
+            )
         if self.pack_shared_expert:
             self.switch_mlp = MiniMaxPackedSwitchGLU(
                 args.hidden_size,
                 args.intermediate_size,
                 args.num_local_experts + 1,
+                activation=activation,
+            )
+        elif self.routed_expert_scales:
+            self.switch_mlp = MiniMaxScaledSwitchGLU(
+                args.hidden_size,
+                args.intermediate_size,
+                args.num_local_experts,
                 activation=activation,
             )
         else:
@@ -1427,27 +1453,19 @@ class MiniMaxSparseMoeBlock(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        gates = self.gate(x.astype(mx.float32))
-        if self.e_score_correction_bias is not None:
-            inds, scores = _minimax_moe_select(
-                gates,
-                self.e_score_correction_bias,
-                self.num_experts_per_tok,
-                self.routed_scaling_factor,
-                self.scoring_func,
-            )
-            scores = scores.astype(x.dtype)
-        else:
-            if self.scoring_func == "sigmoid":
-                scores = mx.sigmoid(gates)
-            else:
-                scores = mx.softmax(gates, axis=-1, precise=True)
-
-            k = self.num_experts_per_tok
-            inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-            scores = mx.take_along_axis(scores, inds, axis=-1)
-            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-            scores = (scores * self.routed_scaling_factor).astype(x.dtype)
+        gates = _router_gates(self.gate, x)
+        bias = self.e_score_correction_bias
+        inds, scores = _minimax_moe_select(
+            gates,
+            mx.zeros((1,), dtype=mx.float32) if bias is None else bias,
+            self.num_experts_per_tok,
+            self.routed_scaling_factor,
+            self.scoring_func,
+        )
+        if self.routed_expert_scales:
+            # The down projection output is still scaled by the expert's
+            # NVFP4 global scale. Fold its inverse into the routing weight.
+            scores = scores * self.switch_mlp.down_scale[inds]
         if self.pack_shared_expert:
             shared_inds = mx.full(
                 (*inds.shape[:-1], 1), self.shared_expert_index, dtype=inds.dtype
@@ -1456,8 +1474,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
             inds = mx.concatenate([inds, shared_inds], axis=-1)
             scores = mx.concatenate([scores, shared_scores], axis=-1)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = _combine_routed(self.switch_mlp(x, inds), scores)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
@@ -1536,10 +1553,16 @@ class MiniMaxM3Model(nn.Module):
             )
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        eval_every = (
+            _SHORT_CALL_EVAL_EVERY if h.shape[1] <= _SPARSE_COMPACT_MAX_QUERIES else 0
+        )
+        n_layers = len(self.layers)
         for idx, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c, position_ids=position_ids)
             if hidden_sink is not None and idx in capture_set:
                 hidden_sink.append(h)
+            if eval_every and (idx + 1) % eval_every == 0 and idx + 1 < n_layers:
+                mx.async_eval(h)
 
         if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)
@@ -1547,7 +1570,30 @@ class MiniMaxM3Model(nn.Module):
         return self.norm(h)
 
 
+def cast_predicate(key: str) -> bool:
+    """Whether a weight may take the model dtype.
+
+    The router and the expert scales stay float32, as in the source checkpoint.
+    """
+    keep_fp32 = (
+        "e_score_correction_bias" in key
+        or key.endswith("block_sparse_moe.gate.weight")
+        or key.endswith(
+            (
+                "switch_mlp.gate_scale",
+                "switch_mlp.up_scale",
+                "switch_mlp.down_scale",
+            )
+        )
+    )
+    return not keep_fp32
+
+
 class LanguageModel(nn.Module):
+    # Single-row verify forwards reproduce one-token decode arithmetic, so
+    # greedy speculative output equals plain decode output.
+    _omlx_mtp_row_exact_verify = True
+
     def __init__(self, args: TextConfig, config: Optional[ModelConfig] = None):
         super().__init__()
         self.args = args
@@ -1635,6 +1681,19 @@ class LanguageModel(nn.Module):
         base = mx.arange(cache_offset, cache_offset + seq_length, dtype=mx.int32)
         return mx.broadcast_to(base[None, :], (batch_size, seq_length))
 
+    @staticmethod
+    def _restates_cache_offset(position_ids: mx.array, cache) -> bool:
+        """True for one-row prefill positions equal to cache offset + arange."""
+        if position_ids.ndim != 2 or position_ids.shape[0] != 1:
+            return False
+        length = position_ids.shape[1]
+        offset = getattr(LanguageModel._first_cache(cache), "offset", None)
+        # Short calls (decode, verify) keep their positions and skip the host read.
+        if length <= _SPARSE_COMPACT_MAX_QUERIES or not isinstance(offset, int):
+            return False
+        expected = mx.arange(offset, offset + length, dtype=position_ids.dtype)
+        return bool(mx.array_equal(position_ids[0], expected).item())
+
     def __call__(
         self,
         inputs: mx.array,
@@ -1653,6 +1712,13 @@ class LanguageModel(nn.Module):
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         kwargs.pop("visual_pos_masks", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
+        if position_ids is not None and self._restates_cache_offset(
+            position_ids, cache
+        ):
+            # The VLM adapter passes offset + arange positions with every text
+            # chunk. Explicit positions keep a long chunk off the MSA prefill
+            # kernels and on the dense masked path, so drop them here.
+            position_ids = None
         if (
             mask is None
             and attention_mask is not None
@@ -1736,9 +1802,28 @@ class LanguageModel(nn.Module):
                     position_ids = self._offset_position_ids(
                         delta, batch_size, seq_length
                     )
+        observing = None
+        if return_hidden:
+            # A verify forward returns the requested layer captures in request
+            # order, then the last layer's hidden state.
+            requested = list(capture_layer_ids or [])
+            last = len(self.model.layers) - 1
+            capture_layer_ids = sorted({*requested, last})
+        else:
+            # A one-token decode step inside a block drafter's scope captures
+            # the drafter layers so the committed token enters its context.
+            drafter = getattr(self, "_omlx_drafter", None)
+            scope = getattr(drafter, "scope_uids", None)
+            if (
+                scope
+                and capture_layer_ids is None
+                and inputs is not None
+                and inputs.shape == (len(scope), 1)
+            ):
+                capture_layer_ids = list(drafter.target_layer_ids)
+                observing = scope
         hidden_sink = kwargs.pop(
-            "hidden_sink",
-            [] if capture_layer_ids is not None or return_hidden else None,
+            "hidden_sink", [] if capture_layer_ids is not None else None
         )
 
         out = self.model(
@@ -1752,17 +1837,34 @@ class LanguageModel(nn.Module):
         )
 
         logits = self.logits_from_hidden(out) if skip_logits is False else None
+        hidden_states = hidden_sink
+        if return_hidden:
+            by_layer = dict(zip(capture_layer_ids, hidden_sink))
+            hidden_states = [by_layer[i] for i in requested] + [by_layer[last]]
+        elif observing is not None:
+            drafter.observe(observing, hidden_sink)
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=hidden_sink,
-            gdn_states=None,
+            hidden_states=hidden_states,
+            # No recurrent state to restore, but a verify forward is rolled
+            # back through rollback_speculative_cache, per row in a batch.
+            gdn_states=[] if return_hidden else None,
             shared_kv_states={} if return_shared_kv else None,
         )
+
+    def mtp_partial_rollback(self, prompt_cache, accepted: int, num_drafts: int):
+        """Trim the rejected draft positions from every layer cache."""
+        rejected = int(num_drafts) - int(accepted)
+        if rejected > 0:
+            for cache in prompt_cache:
+                if cache is not None:
+                    cache.trim(rejected)
+        return True
 
     def logits_from_hidden(self, hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
-        return self.lm_head(hidden)
+        return rows_linear(self.lm_head, hidden)
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         return self.logits_from_hidden(self.model.norm(hidden))
@@ -1774,55 +1876,31 @@ class LanguageModel(nn.Module):
         accepted: Any,
         block_size: int,
     ) -> int:
+        """Keep each row's accepted prefix of a ``block_size``-token verify.
+
+        Every layer drops the positions no row kept. A row that kept fewer
+        turns its rejected tail into left padding (the batch cache's
+        right-padding roll), so later attention never sees those keys; the
+        index keys roll with the KV.
+        """
         del gdn_states
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted])
-        elif not isinstance(accepted, mx.array):
-            accepted = mx.array(accepted)
-        if accepted.ndim == 0:
-            accepted = accepted.reshape(1)
-
-        max_a = int(accepted.max().item())
-        n = max_a + 1
-        trim = int(block_size) - n
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
-
+        if isinstance(accepted, mx.array):
+            accepted = accepted.reshape(-1).tolist()
+        elif isinstance(accepted, int):
+            accepted = [accepted]
+        kept = [int(a) + 1 for a in accepted]
+        max_kept = max(kept)
+        uniform = int(block_size) - max_kept
+        extra = [max_kept - k for k in kept]
         for cache in caches:
             if cache is None:
                 continue
-
-            if trim > 0 and hasattr(cache, "trim"):
-                cache.trim(trim)
-
-            if not is_batch or not hasattr(cache, "_idx"):
-                continue
-
-            kv_len = int(cache._idx)
-            verify_start = kv_len - n
-            if verify_start < 0:
-                continue
-            valid_ends_list = [int(v) for v in valid_ends.tolist()]
-
-            kv_cache = getattr(cache, "kv_cache", cache)
-            if getattr(kv_cache, "keys", None) is not None:
-                for bi, valid_end in enumerate(valid_ends_list):
-                    start = verify_start + valid_end
-                    if start < kv_len:
-                        kv_cache.keys[bi, :, start:kv_len, :] = 0
-                        kv_cache.values[bi, :, start:kv_len, :] = 0
-
-            index_keys = getattr(cache, "index_keys", None)
-            if index_keys is not None:
-                idx_len = int(getattr(cache, "index_offset", kv_len))
-                idx_verify_start = idx_len - n
-                if idx_verify_start < 0:
-                    continue
-                for bi, valid_end in enumerate(valid_ends_list):
-                    start = idx_verify_start + valid_end
-                    if start < idx_len:
-                        cache.index_keys[bi, :, start:idx_len, :] = 0
-        return max_a
+            if uniform > 0:
+                cache.trim(uniform)
+            if any(extra):
+                cache.prepare(right_padding=extra)
+                cache.finalize()
+        return max_kept - 1
 
     @property
     def layers(self):
@@ -1844,13 +1922,7 @@ class LanguageModel(nn.Module):
 
     @property
     def cast_predicate(self):
-        def predicate(k):
-            keep_fp32 = "e_score_correction_bias" in k or k.endswith(
-                "block_sparse_moe.gate.weight"
-            )
-            return not keep_fp32
-
-        return predicate
+        return cast_predicate
 
     @property
     def quant_predicate(self):

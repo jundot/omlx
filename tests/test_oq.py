@@ -56,6 +56,7 @@ from omlx.oq import (
     _is_audio_tensor,
     _is_moe_router,
     _LazyTensorIndex,
+    _mandatory_head_bits,
     _load_builtin_calibration,
     _measure_sensitivity,
     _measure_sensitivity_from_model,
@@ -302,6 +303,26 @@ class TestUniversalQuantPredicate:
         }
         result = universal_quant_predicate(path, module, config, 3.5)
         assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "language_model.model.layers.0.self_attn.index_q_proj",
+            "language_model.model.layers.59.self_attn.index_k_proj.weight",
+        ],
+    )
+    def test_minimax_sparse_indexer_is_mandatory_q8(self, path, module):
+        config = {
+            "model_type": "minimax_m3_vl",
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {path.removesuffix(".weight"): {"bits": 5}},
+        }
+        result = universal_quant_predicate(path, module, config, 3)
+        assert result == {"bits": 8, "group_size": 64, "mode": "affine"}
+        other = universal_quant_predicate(
+            "language_model.model.layers.0.self_attn.q_proj", module, config, 3
+        )
+        assert other != result
 
     @pytest.mark.parametrize("model_type", ["deepseek_v32", "deepseek_v4"])
     def test_glm_dsa_indexer_q8_rule_does_not_touch_deepseek(self, model_type, module):
@@ -1600,7 +1621,7 @@ class TestLevelBudgetPlan:
         assert plan.effective_bpw <= cap
 
     def test_build_quant_plan_mandatory_lm_head(self):
-        # lm_head gets mandatory 8-bit boost (consensus-critical)
+        # lm_head is boosted before anything else, three bits over a 4-bit base
         named_shapes = {"lm_head": (4096, 32000)}
         for i in range(32):
             named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
@@ -1613,7 +1634,89 @@ class TestLevelBudgetPlan:
             named_shapes, config, 4, target_bpw=4.6, hard_cap_bpw=4.7
         )
         assert "lm_head" in plan.boost_map
-        assert plan.boost_map["lm_head"]["bits"] == 8
+        assert plan.boost_map["lm_head"]["bits"] == 6
+
+    def test_mandatory_head_bits_track_the_base_width(self):
+        head = [
+            _mandatory_head_bits("lm_head", 1, 100, b, False, False)
+            for b in (2, 3, 4, 5, 6)
+        ]
+        assert head == [5, 6, 6, 8, 8]  # 7-bit is not a valid width
+        # A tied embedding is also the head, but too large for three bits.
+        assert _mandatory_head_bits("embed_tokens", 30, 100, 4, True, False) == 5
+        assert _mandatory_head_bits("embed_tokens", 1, 100, 6, True, True) == 6
+        # Large untied embeddings of dense models get one bit over the base.
+        assert _mandatory_head_bits("embed_tokens", 30, 100, 2, False, False) == 3
+        assert _mandatory_head_bits("embed_tokens", 30, 100, 6, False, False) == 6
+        # Small embeddings, and MoE embeddings, stay at 8-bit.
+        assert _mandatory_head_bits("embed_tokens", 1, 100, 4, False, False) == 8
+        assert _mandatory_head_bits("embed_tokens", 30, 100, 4, False, True) == 8
+
+    @staticmethod
+    def _dense_shapes():
+        shapes = {"lm_head": (2048, 4096)}
+        for i in range(8):
+            shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        return shapes
+
+    def test_dense_floor_lifts_two_bit_tensors_first(self):
+        shapes = self._dense_shapes()
+        config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            shapes, config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3
+        )
+        assert plan.effective_bpw <= 3.3
+        layers = [p for p in shapes if p != "lm_head"]
+        assert min(plan.boost_map.get(p, {"bits": 2})["bits"] for p in layers) >= 3
+
+    def test_dense_floor_uses_default_group_when_128_does_not_divide(self):
+        # Group 128 cannot split a 960-wide input, so it would export unquantized.
+        shapes = {"lm_head": (2048, 960)}
+        for i in range(8):
+            shapes[f"model.layers.{i}.self_attn.q_proj"] = (960, 960)
+            shapes[f"model.layers.{i}.mlp.down_proj"] = (960, 2560)
+        config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
+        plan = _build_quant_plan(
+            shapes, config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3
+        )
+        q = plan.boost_map["model.layers.0.self_attn.q_proj"]
+        down = plan.boost_map["model.layers.0.mlp.down_proj"]
+        assert (q["bits"], q["group_size"]) == (3, 64)
+        assert (down["bits"], down["group_size"]) == (3, 128)
+
+    def test_dense_floor_skips_models_with_passthrough_experts(self):
+        # Experts kept in source precision never reach the budget, but the
+        # config still marks the model as MoE.
+        config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
+        config["num_local_experts"] = 8
+        plan = _build_quant_plan(
+            self._dense_shapes(), config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3
+        )
+        assert all(b.get("group_size") != 128 for b in plan.boost_map.values())
+
+    def test_moe_always_on_tensors_climb_together(self):
+        shapes = {"lm_head": (2000, 2048)}
+        for i in range(8):
+            shapes[f"model.layers.{i}.self_attn.q_proj"] = (2048, 2048)
+            shapes[f"model.layers.{i}.self_attn.o_proj"] = (2048, 2048)
+            shapes[f"model.layers.{i}.mlp.switch_mlp.down_proj"] = (64, 2048, 1024)
+        config = {
+            "num_hidden_layers": 8,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {str(i): float(8 - i) for i in range(8)},
+        }
+        plan = _build_quant_plan(
+            shapes, config, 3, target_bpw=3.5, hard_cap_bpw=3.7
+        )
+        assert plan.effective_bpw <= 3.7
+        attention = [p for p in shapes if "self_attn" in p]
+        # Spread over every attention tensor, not 8-bit next to base 3-bit.
+        assert min(plan.boost_map.get(p, {"bits": 3})["bits"] for p in attention) > 3
+        experts = [p for p in shapes if "switch_mlp" in p]
+        assert all(p not in plan.boost_map for p in experts)
 
     def test_build_quant_plan_sensitivity_driven(self):
         # Sensitive layers get more bits, insensitive get fewer
@@ -2632,30 +2735,6 @@ class TestOQImatrixCollector:
         np.testing.assert_allclose(entry.in_sum2[1], np.array([25.0, 36.0, 49.0, 64.0]))
         np.testing.assert_allclose(entry.in_sum2[2], np.array([26.0, 40.0, 58.0, 80.0]))
 
-    @pytest.mark.skipif(not HAS_MLX, reason="MLX not installed")
-    def test_muse_spark_scaled_experts_are_captured_with_tensor_scales(self):
-        from omlx.patches.muse_spark.muse_spark_model import ScaledSwitchGLU
-
-        mx.random.seed(0)
-        glu = ScaledSwitchGLU(32, 16, 4)
-        for proj in (glu.gate_proj, glu.up_proj, glu.down_proj):
-            proj.global_scale = mx.random.uniform(1.0, 4.0, (4,))
-        x = mx.random.normal((1, 3, 32))
-        indices = mx.array([[[0, 2], [1, 3], [2, 0]]], dtype=mx.int32)
-        expected = glu(x, indices)
-
-        collector = OQImatrixCollector()
-        assert collector.install(glu, name_prefix="mlp.switch_mlp.") == 3
-        got = glu(x, indices)
-        collector.restore(glu)
-
-        # The wrapped projections still apply their NVFP4 tensor scales.
-        assert mx.array_equal(got, expected).item()
-        assert collector.switch_capture_modules == 3
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            counts = collector.entries[f"mlp.switch_mlp.{proj}"].counts
-            np.testing.assert_array_equal(counts, np.array([2, 1, 2, 1]))
-
 
 class TestOQECalibrationData:
     @staticmethod
@@ -3056,6 +3135,23 @@ class TestDiscoverSanitizePlan:
 
         result = _DiscoveredPlan(plan, idx).pop("shared_down.weight")
         np.testing.assert_array_equal(np.array(result), tensor[None, :, :])
+
+    def test_squeeze_sanitize_replays(self, tmp_path):
+        # ERNIE-4.5 MoE stores its correction bias as [1, E] and squeezes it.
+        path = tmp_path / "weights.safetensors"
+        tensor = np.arange(4, dtype=np.float16).reshape(1, 4)
+        _write_safetensors(str(path), {"moe_statics.bias": tensor})
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize(weights):
+            bias = weights["moe_statics.bias"]
+            return {"bias": bias.squeeze(0) if bias.ndim == 2 else bias}
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        assert plan["bias"]["shape"] == (4,)
+
+        result = _DiscoveredPlan(plan, idx).pop("bias")
+        np.testing.assert_array_equal(np.array(result), tensor[0])
 
     def test_minimax_shared_expert_sanitize_replays(self, tmp_path):
         path = tmp_path / "weights.safetensors"
@@ -4393,7 +4489,7 @@ class TestPreQuantizedSource:
         assert mx.array_equal(tid, mx.arange(8, dtype=mx.int32).reshape(2, 4)).item()
 
     def test_muse_spark_nvfp4_experts_pass_through(self, tmp_path):
-        from omlx.patches.muse_spark import muse_spark_model as msm
+        from omlx.patches.muse_spark.oq_layout import sanitize_experts
 
         prefix = "model.language_model.layers.0.mlp.experts."
         rng = np.random.default_rng(0)
@@ -4437,7 +4533,7 @@ class TestPreQuantizedSource:
         assert logical[prefix + "gate_up_proj"] == ((2, 32, 32), "BF16")
         assert prefix + "gate_up_proj_weight_scale" not in logical
 
-        dp = _DiscoveredPlan(_discover_sanitize_plan(msm.sanitize_experts, idx), idx)
+        dp = _DiscoveredPlan(_discover_sanitize_plan(sanitize_experts, idx), idx)
         switch = "model.language_model.layers.0.mlp.switch_mlp."
         # oQ3 requantizes gate/up and folds their tensor scales into the
         # weights; projections passed through as NVFP4 (all of them at oQ4)
@@ -6378,6 +6474,15 @@ class TestMiniMaxSharedExpertLayout:
         assert not _configure_minimax_shared_expert_layout(config, 8)
         assert "pack_shared_expert" not in config["text_config"]
 
+    def test_sanitizer_keeps_router_at_source_precision(self, config):
+        from omlx.oq import _build_model_sanitizer
+
+        predicate = _build_model_sanitizer(config)._omlx_cast_predicate
+        layer = "language_model.model.layers.3.block_sparse_moe"
+        assert predicate(f"{layer}.gate.weight") is False
+        assert predicate(f"{layer}.e_score_correction_bias") is False
+        assert predicate(f"{layer}.switch_mlp.gate_proj.weight") is True
+
     def test_non_minimax_model_is_unchanged(self):
         config = {
             "model_type": "qwen3_moe",
@@ -6385,6 +6490,25 @@ class TestMiniMaxSharedExpertLayout:
         }
         assert not _configure_minimax_shared_expert_layout(config, 4)
         assert "pack_shared_expert" not in config["text_config"]
+
+    def test_bundled_dspark_draft_is_copied_to_the_output(self, tmp_path):
+        from omlx.oq import _copy_bundled_drafts
+
+        source, output = tmp_path / "src", tmp_path / "out"
+        draft = source / "dspark"
+        draft.mkdir(parents=True)
+        output.mkdir()
+        (draft / "config.json").write_text(
+            json.dumps({"architectures": ["DSparkMiniMaxDraftModel"]})
+        )
+        (draft / "model-dspark-00001.safetensors").write_bytes(b"weights")
+
+        _copy_bundled_drafts(source, output)
+
+        assert (output / "dspark" / "config.json").is_file()
+        assert (output / "dspark" / "model-dspark-00001.safetensors").read_bytes() == (
+            b"weights"
+        )
 
     def test_mxfp8_scale_inv_passthrough_requires_minimax_source(self, config):
         config["quantization_config"] = {"quant_method": "mxfp8"}
@@ -7945,6 +8069,82 @@ class TestStreamedCalibration:
         plan = Plan({skipped: object(), kept: mx.ones((2, 2))})
         items = oq._streamed_layer_items(plan, 1, skip_key=oq._qwen4_exp_mmap_skip_key)
         assert [key for key, _ in items] == ["self_attn.q_proj.weight"]
+
+    @pytest.mark.parametrize("nvfp4", [False, True])
+    def test_muse_spark_collection_matches_resident(self, tmp_path, monkeypatch, nvfp4):
+        """Streamed layers of the HF checkpoint match mlx-lm's loaded model.
+
+        Both name the statistics after oQ's tensors. The NVFP4 experts stream
+        dequantized with their tensor scale folded into BF16 weights, so the
+        statistics after them agree to BF16 precision. At oQ4 both leave the
+        NVFP4 experts out of the sensitivity qdq.
+        """
+        from tests.test_mlx_vlm_muse_glimmer_compat import _spark_oq_source
+        import omlx.oq as oq
+
+        source = tmp_path / "source"
+        _spark_oq_source(source, nvfp4=nvfp4)
+        config = json.loads((source / "config.json").read_text())
+        tokens = mx.array([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]])
+        monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
+        monkeypatch.setattr(oq, "load_mlx_lm_tokenizer", lambda *a, **kw: object())
+        model, tokenizer = oq._load_muse_spark_calibration_model(source)
+        resident, _ = oq._collect_imatrix_from_model(
+            model,
+            tokenizer,
+            config,
+            calib_dataset=oq._OQE_CALIB_DATASET,
+            num_samples=2,
+            seq_length=6,
+        )
+        streamed, metadata = oq._collect_imatrix_streaming(
+            source,
+            tokenizer,
+            config,
+            num_samples=2,
+            seq_length=6,
+            calib_data=tokens,
+            measure_sensitivity=True,
+            sensitivity_oq_level=4,
+            sensitivity_num_samples=2,
+            sensitivity_seq_length=6,
+        )
+        attn = "language_model.model.layers.1.self_attn."
+        assert {attn + p for p in ("q_proj", "k_proj", "v_proj", "gate_proj")} <= set(
+            resident
+        )
+        assert "language_model.model.layers.1.mlp.switch_mlp.down_proj" in resident
+        assert resident.keys() == streamed.keys()
+        tolerance = 0.02 if nvfp4 else 1e-5
+        for key, entry in resident.items():
+            np.testing.assert_array_equal(streamed[key].counts, entry.counts)
+            error = np.linalg.norm(streamed[key].in_sum2 - entry.in_sum2)
+            assert error <= tolerance * np.linalg.norm(entry.in_sum2), key
+        reference = oq._measure_sensitivity_from_model(
+            model, tokenizer, config, 4, num_samples=2, seq_length=6
+        )
+        assert metadata["sensitivity_map"].keys() == reference.keys()
+        rel = 0.01 if nvfp4 else 1e-3
+        for key, value in reference.items():
+            assert metadata["sensitivity_map"][key] == pytest.approx(value, rel=rel)
+
+    def test_muse_spark_sensitivity_qdq_skips_passthrough_experts(self, tmp_path):
+        import omlx.oq as oq
+        from omlx.patches.muse_spark import oq_layout
+        from tests.test_mlx_vlm_muse_glimmer_compat import _spark_oq_source
+
+        _spark_oq_source(tmp_path, nvfp4=True)
+        config = json.loads((tmp_path / "config.json").read_text())
+        args = oq_layout.calibration_args(config)
+        # Layer 0 keeps BF16 experts, layer 1 has NVFP4 ones. oQ4 passes those
+        # through unchanged, oQ3 requantizes them.
+        for layer_idx, level, expected in ((0, 4, True), (1, 4, False), (1, 3, True)):
+            block = oq_layout.calibration_block(args, layer_idx)
+            saved = oq._temporary_quantize_block(
+                block, config, level, 64, layer_idx=layer_idx
+            )
+            assert "self_attn.qkvg_proj" in saved
+            assert any(".experts." in path for path in saved) == expected
 
     def test_minimax_collection_matches_resident(self, tmp_path, monkeypatch):
         from dataclasses import asdict

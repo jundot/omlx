@@ -1005,6 +1005,9 @@ def _resolve_store_view(
             return None, f"{proj} is not a QuantizedSwitchLinear"
         if "bias" in lin:
             return None, f"{proj} has per-expert bias (unsupported)"
+        if lin.get("global_scale") is not None:
+            # The slot matmul does not pass the NVFP4 tensor scale.
+            return None, f"{proj} has an NVFP4 global_scale (unsupported)"
         n = lin["weight"].shape[0] if n is None else n
         fields_of[proj] = ["weight", "scales"] + (
             ["biases"] if lin.get("biases") is not None else []
@@ -1122,6 +1125,11 @@ def apply_moe_expert_offload(
         total_bytes += layer_bytes
         resident_bytes += layer_bytes * capacity // n_experts
         new = OffloadSwitchGLU(glu, capacity, view, minimum)
+        # Keep children the model reads beside the projections (mlx-lm's Muse
+        # Spark holds its post-expert norm on the experts module).
+        for name, child in glu.children().items():
+            if name not in (*_PROJS, "activation"):
+                setattr(new, name, child)
         if staging_requested:
             for size, count in Counter(
                 p.nbytes for _, _, p in new.cache._plans(0)
@@ -1207,6 +1215,7 @@ def estimate_offload_admission_bytes(
         # modules wrapped).
         stacked: dict[str, dict] = {}
         per_expert: dict[str, dict] = {}
+        nvfp4: set[str] = set()
 
         for shard in sorted(Path(model_dir).glob("*.safetensors")):
             with open(shard, "rb") as f:
@@ -1233,7 +1242,10 @@ def estimate_offload_admission_bytes(
                     )
                     continue
                 shape = spec.get("shape", ())
-                if len(shape) == 3:
+                if name.endswith(".global_scale"):
+                    # NVFP4 experts stay resident (see _resolve_store_view).
+                    nvfp4.add(name.rsplit(".", 2)[0])
+                elif len(shape) == 3:
                     parts = name.rsplit(".", 2)
                     if len(parts) == 3 and parts[1] in _PROJS and parts[2] in (
                         "weight", "scales", "biases"
@@ -1247,9 +1259,9 @@ def estimate_offload_admission_bytes(
 
         required = {(p, f) for p in _PROJS for f in ("weight", "scales")}
         saved = 0.0
-        for b in stacked.values():
-            if not required <= b["fields"]:
-                continue  # unquantized or partial: wraps nothing
+        for container, b in stacked.items():
+            if not required <= b["fields"] or container in nvfp4:
+                continue  # unquantized, partial or NVFP4: wraps nothing
             if len(b["e"]) != 1:  # projections disagree on E
                 continue
             n = next(iter(b["e"]))

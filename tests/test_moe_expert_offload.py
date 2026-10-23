@@ -395,6 +395,36 @@ class TestApplyAndForward:
         )
         assert apply_moe_expert_offload(_MiniMoE([glu]), tmp_path, 0.25) == 0
 
+    def test_keeps_extra_children(self, tmp_path):
+        glu = _make_glu(seed=11)
+        glu.post_expert_norm = nn.RMSNorm(D)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        model = _MiniMoE([glu])
+        assert apply_moe_expert_offload(model, tmp_path, 0.25) == 1
+        wrapped = model.layers[0].experts.switch_glu
+        assert isinstance(wrapped, OffloadSwitchGLU)
+        assert wrapped.post_expert_norm is glu.post_expert_norm
+
+    def test_skips_nvfp4_global_scale(self, tmp_path):
+        from omlx.patches.moe_expert_offload import (
+            estimate_offload_admission_bytes,
+        )
+
+        mx.random.seed(10)
+        glu = SwitchGLU(D, INTER, E)
+        spec = {"group_size": 16, "bits": 4, "mode": "nvfp4", "global_scale": True}
+        nn.quantize(
+            glu, class_predicate=lambda _, m: hasattr(m, "to_quantized") and spec
+        )
+        prefix = "layers.0.experts.switch_glu"
+        tensors = _glu_tensors(glu, prefix)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            tensors[f"{prefix}.{proj}.global_scale"] = getattr(glu, proj).global_scale
+        _save_checkpoint(tmp_path, tensors)
+
+        assert apply_moe_expert_offload(_MiniMoE([glu]), tmp_path, 0.25) == 0
+        assert estimate_offload_admission_bytes(tmp_path, 10**9, 0.25) == 10**9
+
     def test_mixed_bit_projections(self, tmp_path):
         """oQ-style mixed quantization: 4-bit gate/up over an 8-bit down
         projection. Each projection must use its own group_size/bits/mode —

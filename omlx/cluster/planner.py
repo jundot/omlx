@@ -711,6 +711,14 @@ def _mlx_lm_accepts_config(config: dict[str, Any]) -> bool:
     return True
 
 
+# Model types whose tensor strategy splits an untied lm_head, with the default
+# of their ``tie_word_embeddings``. Muse Spark has no tied variant.
+_VOCAB_SPLIT_HEAD_DEFAULT_TIED = {
+    "ministral3": True,
+    "muse_spark": False,
+}
+
+
 def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
     """All model dimensions an architecture-specific TP strategy divides."""
 
@@ -727,6 +735,14 @@ def _tensor_parallel_divisors(config: dict[str, Any]) -> tuple[int, ...]:
                 _config_int(config, "linear_num_value_heads", 1),
             )
         )
+    if model_type in _VOCAB_SPLIT_HEAD_DEFAULT_TIED:
+        # These strategies split an untied lm_head over the vocabulary.
+        text = config.get("text_config")
+        tied = (text if isinstance(text, dict) else config).get(
+            "tie_word_embeddings", _VOCAB_SPLIT_HEAD_DEFAULT_TIED[model_type]
+        )
+        if not tied:
+            values.append(_config_int(config, "vocab_size", 1, maximum=10_000_000))
     if model_type == "glm5_next":
         # KDA heads, read the way the model's TextConfig reads them.
         linear_heads = _config_int(config, "linear_num_heads", 64)
@@ -931,8 +947,9 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
 # VLM-shaped checkpoints whose DISTRIBUTED load goes through mlx-lm: the cluster
 # worker never uses mlx-vlm and mlx-lm's ``sanitize`` drops the vision tower, so
 # the vision guard above is a false positive for them (oMLX #3662). Qwen3.5/3.6/3.8
-# dense ships its vision config next to the text weights.
-_MLX_LM_TEXT_PIPELINE_TYPES = frozenset({"qwen3_5"})
+# dense ships its vision config next to the text weights. Ranks load Muse Spark
+# without its vision config (``patches.muse_spark.model.load_kwargs``).
+_MLX_LM_TEXT_PIPELINE_TYPES = frozenset({"qwen3_5", "muse_spark"})
 
 # Only about seven of mlx-lm's ~120 architectures can be pipelined, so the
 # answer is nearly always no — worth knowing before staging a hundred

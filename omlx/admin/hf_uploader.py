@@ -27,6 +27,7 @@ from ..oq import (
     _is_qwen4_exp_ngram_embedding_tensor,
     _is_vision_tensor,
 )
+from ..patches.minimax_m3_dspark import bundled_dspark_path
 
 logger = logging.getLogger(__name__)
 
@@ -235,8 +236,18 @@ def _generate_model_card(
     total_w = max(sum(row[0] for row in formats.values()), 1)
     total_b = sum(row[1] for row in formats.values())
     gib = 1024**3
+    # A bundled DSpark draft keeps its own config and shards in a subfolder.
+    draft = bundled_dspark_path(model_path)
+    draft_w = draft_b = 0
+    if draft is not None:
+        draft_formats, _ = _storage_summary(
+            draft, json.loads((draft / "config.json").read_text())
+        )
+        draft_w = sum(row[0] for row in draft_formats.values())
+        draft_b = sum(row[1] for row in draft_formats.values())
 
-    tags = ["mlx", "oq", "quantized"] + (["mtp"] if "MTP head" in components else [])
+    has_mtp = "MTP head" in components or draft is not None
+    tags = ["mlx", "oq", "quantized"] + (["mtp"] if has_mtp else [])
     lines = ["---", "library_name: mlx", "tags:", *(f"- {tag}" for tag in tags)]
     lines += ["---", "", f"# {model_name}", ""]
     if redownload_notice:
@@ -254,6 +265,13 @@ def _generate_model_card(
     ]
 
     average = f"{8 * total_b / total_w:.3f} bits/weight"
+    scope = "the complete checkpoint" if draft is None else "the model weights"
+    with_draft = (
+        ""
+        if draft is None
+        else f", or {8 * (total_b + draft_b) / (total_w + draft_w):.3f} "
+        "bits/weight including the DSpark draft"
+    )
     tables = [name for name in _LOOKUP_TABLES if name in components]
     if tables:
         table_w = sum(components[name][0] for name in tables)
@@ -262,11 +280,11 @@ def _generate_model_card(
         lines.append(
             "The effective average is "
             f"{8 * (total_b - table_b) / max(total_w - table_w, 1):.3f} "
-            f"bits/weight excluding {excluded}, or {average} for the complete "
-            "checkpoint."
+            f"bits/weight excluding {excluded}, or {average} for {scope}"
+            f"{with_draft}."
         )
     else:
-        lines.append(f"The effective average is {average} for the complete checkpoint.")
+        lines.append(f"The effective average is {average} for {scope}{with_draft}.")
 
     lines += [
         "",
@@ -303,16 +321,20 @@ def _generate_model_card(
         "| Component | Logical weights | Storage |",
         "|---|---|---|",
     ]
-    for name in _COMPONENT_ORDER:
-        if name in components:
-            weights, stored = components[name]
-            lines.append(
-                f"| {name} | {weights / 1e9:.3f}B | "
-                f"{stored / 1e9:.3f} GB / {stored / gib:.3f} GiB |"
-            )
+    parts = [
+        (name, *components[name]) for name in _COMPONENT_ORDER if name in components
+    ]
+    if draft is not None:
+        parts.append(("DSpark draft (MTP)", draft_w, draft_b))
+    for name, weights, stored in parts:
+        lines.append(
+            f"| {name} | {weights / 1e9:.3f}B | "
+            f"{stored / 1e9:.3f} GB / {stored / gib:.3f} GiB |"
+        )
+    all_w, all_b = total_w + draft_w, total_b + draft_b
     lines.append(
-        f"| **Total** | **{total_w / 1e9:.3f}B** | "
-        f"**{total_b / 1e9:.3f} GB / {total_b / gib:.3f} GiB** |"
+        f"| **Total** | **{all_w / 1e9:.3f}B** | "
+        f"**{all_b / 1e9:.3f} GB / {all_b / gib:.3f} GiB** |"
     )
     return "\n".join(lines) + "\n"
 

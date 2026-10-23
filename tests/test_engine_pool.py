@@ -1763,6 +1763,55 @@ class TestEnginePoolAsync:
         )
 
     @pytest.mark.asyncio
+    async def test_minimax_bundled_dspark_is_charged_and_takes_the_mtp_depth(
+        self, pool_with_mock_engines, small_mock_model_dir
+    ):
+        pool = pool_with_mock_engines
+        pool._scheduler_config.max_num_seqs = 8
+        entry = pool.get_entry("model-a")
+        entry.config_model_type = "minimax_m3_vl"
+        draft_path = small_mock_model_dir / "model-a" / "dspark"
+        draft_path.mkdir()
+        text_config = {
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "num_hidden_layers": 2,
+            "sliding_window": 32,
+            "dflash_config": {"target_layer_ids": [1, 3]},
+        }
+        (draft_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["DSparkMiniMaxDraftModel"],
+                    "text_config": text_config,
+                }
+            )
+        )
+        (draft_path / "model-dspark-00001.safetensors").write_bytes(b"0" * 1000)
+        settings = ModelSettings(mtp_enabled=True, mtp_adaptive_max_depth=3)
+        # Per window token: two layers' K/V, the projected row and two captures.
+        row_bytes = 32 * 2 * (2 * 2 * 2 * 16 + 64 + 2 * 64)
+        assert pool._entry_runtime_resident_size(
+            entry, settings
+        ) - pool._entry_runtime_resident_size(entry, ModelSettings()) == (
+            1000 + 8 * row_bytes
+        )
+
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch("omlx.engine_pool.load_minimax_dspark_drafter") as load,
+        ):
+            await pool.get_engine("model-a", runtime_settings=settings)
+
+        assert load.call_args.args[0] == draft_path
+        assert load.call_args.args[2:] == (3, False)
+        engine.set_dflash_drafter.assert_called_once_with(load.return_value)
+
+    @pytest.mark.asyncio
     async def test_dflash_drafter_failure_reuses_requested_variant_while_leased(
         self, pool_with_mock_engines
     ):

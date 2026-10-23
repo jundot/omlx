@@ -101,8 +101,8 @@ def _gpu_class() -> str:
 
 
 def _vector_plan(key_len: int, gqa_factor: int, rows: int) -> tuple:
-    """MLX 0.32.2's vector-SDPA kernel plan for ``rows`` query rows over
-    ``key_len`` keys (head dim 256): one pass, or two passes with this many
+    """MLX 0.32's vector-SDPA kernel plan for ``rows`` query rows over
+    ``key_len`` keys (any head dim): one pass, or two passes with this many
     key partitions. A row's arithmetic depends on the plan, not on the rows
     sharing the call."""
     devc = _gpu_class()
@@ -134,14 +134,16 @@ def _vector_plan(key_len: int, gqa_factor: int, rows: int) -> tuple:
     return (2, blocks)
 
 
-def _row_exact_causal_sdpa(queries, keys, values, scale, limit: int):
+def row_exact_causal_sdpa(queries, keys, values, scale, limit: int, mask=None):
     """``_chunked_causal_sdpa`` whose chunks keep every row on the kernel plan
     of its own one-row decode call.
 
     A chunk runs MLX's plan for its last row's key count, while its earlier
     rows decode serially over fewer keys; where that crosses a plan boundary
     (one to two passes at 1024 keys, 128 to 512 partitions at 16384 on M5)
-    the chunk shrinks, down to the row alone.
+    the chunk shrinks, down to the row alone. An array ``mask`` is a
+    ``[..., q_len, kv_len]`` keep-mask that already holds causality; each
+    chunk passes its own rows of it.
     """
     q_len = queries.shape[-2]
     kv_len = keys.shape[-2]
@@ -166,7 +168,11 @@ def _row_exact_causal_sdpa(queries, keys, values, scale, limit: int):
                 keys[..., :kv_end, :],
                 values[..., :kv_end, :],
                 scale=scale,
-                mask="causal",
+                mask=(
+                    mask[..., c0:c1, :kv_end]
+                    if isinstance(mask, mx.array)
+                    else "causal"
+                ),
             )
         )
         c0 = c1
@@ -944,7 +950,7 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
                         # like a one-row decode call on the same kernel plan;
                         # the tile kernels below round probabilities
                         # differently.
-                        out = _row_exact_causal_sdpa(queries, keys, values, scale, limit)
+                        out = row_exact_causal_sdpa(queries, keys, values, scale, limit)
                     elif (
                         q_len <= _WIDE_MAX_ROWS
                         and keys.shape[-2] >= _GQA_MIN_KEYS

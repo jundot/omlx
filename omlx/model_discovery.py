@@ -92,6 +92,9 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     "deepseek_v41",
     "glm5_next",
     "minimax_m3",
+    # The VLM engine's loader also reads the earlier oMLX layout of text-only
+    # Muse Spark conversions.
+    "muse_spark",
 }
 
 # Multimodal checkpoints whose currently vendored mlx-lm implementation only

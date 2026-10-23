@@ -373,6 +373,21 @@ def _reset_decode_activity_registry():
 
 
 @pytest.fixture(autouse=True)
+def _reset_vlm_mtp_attach():
+    """Start each test with the process-global VLM MTP attach flag at its default.
+
+    VLM pre-load patches set it from each checkpoint, so a test that builds a
+    patched model directly would otherwise inherit an earlier test's value.
+    """
+    mtp = sys.modules.get("omlx.patches.mlx_vlm_mtp")
+    if mtp is not None:
+        mtp.set_mtp_attach_enabled(True)
+    yield
+    if mtp is not None:
+        mtp.set_mtp_attach_enabled(True)
+
+
+@pytest.fixture(autouse=True)
 def _reset_api_key_failures():
     """Keep the process-global wrong API key budget hermetic per test."""
     auth = sys.modules.get("omlx.admin.auth")

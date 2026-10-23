@@ -98,6 +98,9 @@ class TextConfig(BaseModelConfig):
     # intermediate_size). False forces the unpacked layout so the shared
     # expert can carry different (higher) quantization bits than the bank.
     pack_shared_expert: Optional[bool] = None
+    # True when routed experts are NVFP4 with a per-expert global scale. The
+    # inverse scales live on switch_mlp as gate_scale, up_scale and down_scale.
+    routed_expert_scales: bool = False
 
     def __post_init__(self):
         if self.num_key_value_heads is None:

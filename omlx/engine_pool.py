@@ -75,6 +75,7 @@ from .model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
@@ -691,6 +692,14 @@ class EnginePool:
             entry.config_model_type, entry.engine_type
         ):
             extra += self._dflash_drafter_estimated_bytes(drafter_id, runtime_settings)
+        elif getattr(runtime_settings, "mtp_enabled", False) and (
+            entry.config_model_type in ("minimax_m3", "minimax_m3_vl")
+        ):
+            # Lightning MTP loads MiniMax's bundled DSpark draft, which takes
+            # neither the DFlash quantization nor the window setting.
+            dspark_path = bundled_dspark_path(entry.model_path)
+            if dspark_path is not None:
+                extra += self._dflash_drafter_estimated_bytes(str(dspark_path), None)
         return base + extra
 
     def _dflash_drafter_estimated_bytes(
@@ -4246,6 +4255,35 @@ class EnginePool:
                     drafter = None
                 if drafter is not None:
                     engine.set_dflash_drafter(drafter)
+
+            # MiniMax M3.1 bundles its DSpark draft in dspark/; Lightning MTP
+            # runs it through the same block-drafter verify path.
+            if (
+                model_settings is not None
+                and getattr(model_settings, "mtp_enabled", False)
+                and entry.config_model_type in ("minimax_m3", "minimax_m3_vl")
+                and hasattr(engine, "set_dflash_drafter")
+            ):
+                dspark_path = bundled_dspark_path(entry.model_path)
+                fixed = getattr(model_settings, "mtp_fixed_depth", None)
+                depth = fixed or getattr(model_settings, "mtp_adaptive_max_depth", None)
+                if dspark_path is not None:
+                    try:
+                        drafter = await asyncio.get_running_loop().run_in_executor(
+                            get_mlx_executor(),
+                            load_minimax_dspark_drafter,
+                            dspark_path,
+                            engine.vlm_model,
+                            depth,
+                            bool(fixed),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"MiniMax DSpark drafter load raised for {model_id}: "
+                            f"{e} -- Lightning MTP stays off"
+                        )
+                    else:
+                        engine.set_dflash_drafter(drafter)
 
             # VLM MTP: load MTP drafter (gemma4_assistant or qwen3_5_mtp) and attach to engine.
             # Fail-soft -- drafter load issues never block the target engine.

@@ -344,7 +344,7 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
                 [],
             )
 
-        def remove(self, uids):
+        def remove(self, uids, return_prompt_caches=False):
             self.removed.extend(uids)
             return "removed"
 
@@ -422,7 +422,8 @@ def test_sequential_distributed_cancellation_exits_all_ranks_without_upstream_er
         def __init__(self):
             self._is_distributed = True
 
-        def _serve_single(self, _request):
+        def _serve_single(self, _request, stream):
+            observed.append(stream)
             ctx = mlx_server.GenerationContext(
                 has_tool_calling=False,
                 has_thinking=False,
@@ -446,11 +447,11 @@ def test_sequential_distributed_cancellation_exits_all_ranks_without_upstream_er
 
     with install_server_telemetry(_Marker()):
         generator = mlx_server.ResponseGenerator()
-        generator._serve_single(("queue", "request", "args"))
+        generator._serve_single(("queue", "request", "args"), "stream")
         assert generator._is_distributed is True
         assert mlx_server.GenerationContext is not original_context
 
-    assert observed == ["cancelled"]
+    assert observed == ["stream", "cancelled"]
     assert mlx_server.GenerationContext is original_context
 
 
@@ -859,8 +860,8 @@ def test_distributed_cancel_vote_drains_and_rendezvous_before_removal(monkeypatc
             raise AssertionError("patched sharing must own cancellation")
 
     class FakeBatchGenerator:
-        def remove(self, uids):
-            events.append(("remove", list(uids)))
+        def remove(self, uids, return_prompt_caches=False):
+            events.append(("remove", list(uids), return_prompt_caches))
             return "removed"
 
     monkeypatch.setattr(mx.distributed, "init", lambda: Group())
@@ -879,13 +880,17 @@ def test_distributed_cancel_vote_drains_and_rendezvous_before_removal(monkeypatc
             batch.remove([73])
         assert generator._share_object([73]) == [73]
         assert batch.remove([73]) == "removed"
+        # A stop-sequence finish is the same on every rank and takes no vote.
+        assert batch.remove([74], return_prompt_caches=True) == "removed"
 
     assert [event[0] for event in events] == [
         "broadcast",
         "drain",
         "barrier",
         "remove",
+        "remove",
     ]
+    assert events[-1] == ("remove", [74], True)
 
 
 def test_pipeline_cache_plan_requires_rank_agreement(monkeypatch):
