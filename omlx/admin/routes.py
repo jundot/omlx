@@ -2776,22 +2776,27 @@ async def update_model_settings(
     kv_bits = current_settings.turboquant_kv_bits
     if "turboquant_kv_scheme" in sent:
         kv_scheme = (
-            "turboquant" if request.turboquant_kv_scheme is None
+            "turboquant"
+            if request.turboquant_kv_scheme is None
             else request.turboquant_kv_scheme
         )
     if "turboquant_kv_bits" in sent:
-        kv_bits = 4 if request.turboquant_kv_bits is None else request.turboquant_kv_bits
+        kv_bits = (
+            4 if request.turboquant_kv_bits is None else request.turboquant_kv_bits
+        )
     try:
         if sent & {"turboquant_kv_scheme", "turboquant_kv_bits"}:
             validate_kv_compression_settings(kv_scheme, kv_bits)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     kv_enabled = (
-        bool(request.turboquant_kv_enabled) if "turboquant_kv_enabled" in sent
+        bool(request.turboquant_kv_enabled)
+        if "turboquant_kv_enabled" in sent
         else current_settings.turboquant_kv_enabled
     )
     vlm_mtp_enabled = (
-        bool(request.vlm_mtp_enabled) if "vlm_mtp_enabled" in sent
+        bool(request.vlm_mtp_enabled)
+        if "vlm_mtp_enabled" in sent
         else current_settings.vlm_mtp_enabled
     )
     if not _entry_is_diffusion_model(entry) and kv_enabled and vlm_mtp_enabled:
@@ -2804,6 +2809,13 @@ async def update_model_settings(
         model_id, current_settings
     )
     is_diffusion_model = _entry_is_diffusion_model(entry)
+    if entry.model_type == "image":
+        if request.is_default or request.model_type_override:
+            raise HTTPException(
+                status_code=400,
+                detail="Image pipelines cannot be chat defaults or use a model-type override",
+            )
+
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
         if alias_value == "":
@@ -2904,7 +2916,9 @@ async def update_model_settings(
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
     if "deepseek_v41_ced_prefill_enabled" in sent:
-        is_v41 = (entry.config_model_type or "").replace("-", "_").lower() == "deepseek_v41"
+        is_v41 = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "deepseek_v41"
         current_settings.deepseek_v41_ced_prefill_enabled = bool(
             request.deepseek_v41_ced_prefill_enabled and is_v41
         )
@@ -2978,7 +2992,8 @@ async def update_model_settings(
         # null = clear to the model default (True); bool(None) would flip it
         # to False and silently disable the skip-last corruption guard.
         current_settings.turboquant_skip_last = (
-            True if request.turboquant_skip_last is None
+            True
+            if request.turboquant_skip_last is None
             else bool(request.turboquant_skip_last)
         )
     # Shared load-time ANE controls. Model metadata selects limits and backend.
@@ -2993,10 +3008,7 @@ async def update_model_settings(
                 status_code=400, detail="ANE prompt block cannot be null."
             )
         current_settings.qwen35_ane_prefill_sequence_length = value
-        if (
-            current_settings.qwen35_ane_prefill_tail_padding_min_tokens
-            >= int(value)
-        ):
+        if current_settings.qwen35_ane_prefill_tail_padding_min_tokens >= int(value):
             # A crossover is calibrated for one fixed program width. Changing
             # that width invalidates it; disable padding until the next tune.
             current_settings.qwen35_ane_prefill_tail_padding_min_tokens = 0
@@ -3367,9 +3379,7 @@ async def update_model_settings(
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
     if "embedding_audio_enabled" in sent:
-        current_settings.embedding_audio_enabled = bool(
-            request.embedding_audio_enabled
-        )
+        current_settings.embedding_audio_enabled = bool(request.embedding_audio_enabled)
     if "embedding_audio_max_seconds" in sent:
         current_settings.embedding_audio_max_seconds = (
             request.embedding_audio_max_seconds
@@ -3684,6 +3694,11 @@ async def create_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
+    if entry.model_type == "image":
+        raise HTTPException(
+            status_code=400,
+            detail="Image pipelines use a fixed generation recipe and do not support chat profiles",
+        )
     _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
@@ -3729,6 +3744,11 @@ async def update_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
+    if entry.model_type == "image":
+        raise HTTPException(
+            status_code=400,
+            detail="Image pipelines use a fixed generation recipe and do not support chat profiles",
+        )
     _validate_model_settings(entry, request.settings or {})
     engine_pool = _get_engine_pool()
     try:
@@ -3787,7 +3807,13 @@ async def apply_model_profile(
 ):
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
+    if entry.model_type == "image":
+        raise HTTPException(
+            status_code=400,
+            detail="Image pipelines use a fixed generation recipe and do not support chat profiles",
+        )
     is_diffusion_model = _entry_is_diffusion_model(entry)
+
     def sanitizer(settings):
         if is_diffusion_model:
             _sanitize_diffusion_settings_dict(settings)
@@ -3813,6 +3839,11 @@ async def apply_model_template(
 ):
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
+    if entry.model_type == "image":
+        raise HTTPException(
+            status_code=400,
+            detail="Image pipelines use a fixed generation recipe and do not support chat profiles",
+        )
 
     def sanitizer(settings):
         if _entry_is_diffusion_model(entry):
@@ -8078,6 +8109,21 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
             }
         )
 
+    from ..image_bundle import image_boundary
+    from ..image_inspect import inspect_bundle
+
+    def _add_image(path, name, **source):
+        if not (path / "omlx-pipeline.json").exists():
+            return
+        _add_model(path, name, **source)
+        row = next(m for m in models if m["name"] == name)
+        report = inspect_bundle(path)
+        row.update(
+            model_type="image",
+            structural_status=report["structural_status"],
+            import_errors=report["errors"],
+        )
+
     models = []
     seen_names: set[str] = set()
     # (folder, row name, source type) of folders of GGUF models.
@@ -8085,10 +8131,16 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
     for model_dir in model_dirs:
         if not model_dir.exists():
             continue
+        if image_boundary(model_dir):
+            _add_image(model_dir, model_dir.name)
+            continue
         for subdir in sorted(model_dir.iterdir()):
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
 
+            if image_boundary(subdir):
+                _add_image(subdir, subdir.name)
+                continue
             if gguf.is_gguf_folder(subdir):
                 gguf_folders.append((subdir, subdir.name, "local"))
             elif (subdir / "config.json").exists():
@@ -8098,7 +8150,14 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 # HF Hub cache entry: models--Org--Name/snapshots/<hash>/
                 hf_resolved = _resolve_hf_cache_entry(subdir)
                 if hf_resolved is not None:
-                    if gguf.is_gguf_folder(hf_resolved.snapshot_path):
+                    if image_boundary(hf_resolved.snapshot_path):
+                        _add_image(
+                            hf_resolved.snapshot_path,
+                            hf_resolved.model_id,
+                            source_repo_id=hf_resolved.source_repo_id,
+                            source_type="hf_cache",
+                        )
+                    elif gguf.is_gguf_folder(hf_resolved.snapshot_path):
                         folder, name = hf_resolved.snapshot_path, hf_resolved.model_id
                         gguf_folders.append((folder, name, "hf_cache"))
                     elif _is_hf_cache_mlx_compatible(
@@ -8115,6 +8174,9 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                 # Level 2: organization folder — scan children
                 for child in sorted(subdir.iterdir()):
                     if not child.is_dir() or child.name.startswith("."):
+                        continue
+                    if image_boundary(child):
+                        _add_image(child, child.name)
                         continue
                     if gguf.is_gguf_folder(child):
                         gguf_folders.append((child, child.name, "local"))
@@ -8178,6 +8240,10 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
 def _is_listed_model_folder(path: Path) -> bool:
     """A folder /api/hf/models lists whole: a checkpoint or a GGUF folder."""
+    from ..image_bundle import image_boundary
+
+    if image_boundary(path):
+        return (path / "omlx-pipeline.json").is_file()
     return (path / "config.json").exists() or gguf.is_gguf_folder(path)
 
 
@@ -8212,7 +8278,11 @@ async def delete_hf_model(
             model_path = candidate
             parent_model_dir = model_dir
             break
+        from ..image_bundle import image_boundary
+
         for subdir in model_dir.iterdir():
+            if image_boundary(subdir):
+                continue
             if not subdir.is_dir() or subdir.name.startswith("."):
                 continue
             hf_resolved = _resolve_hf_cache_entry(subdir)
