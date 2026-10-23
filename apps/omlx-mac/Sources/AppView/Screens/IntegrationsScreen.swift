@@ -435,7 +435,8 @@ private struct OtherIntegrationsSection: View {
                 secondaryCommand: vm.codexAppCommand,
                 secondaryCommandLabel: String(localized: "integrations.codex.app",
                                              defaultValue: "Desktop App",
-                                             comment: "Label for the Codex desktop app launcher command")
+                                             comment: "Label for the Codex desktop app launcher command"),
+                directCommand: vm.codexDirectCommand
             )
             IntegrationRow(
                 name: String(localized: "integrations.tool.opencode",
@@ -529,11 +530,14 @@ private struct IntegrationRow: View {
     var commandLabel: String? = nil
     var secondaryCommand: String? = nil
     var secondaryCommandLabel: String? = nil
+    var directCommand: String? = nil
     var profileBinding: Binding<String>? = nil
     var profileSublabel: String? = nil
     var isLast: Bool = false
 
     @Environment(\.omlxTheme) private var theme
+
+    @State private var showDirectCommand = false
 
     var body: some View {
         FreeRow(isLast: isLast) {
@@ -591,6 +595,25 @@ private struct IntegrationRow: View {
                     }
                 } else {
                     CommandBlock(command: command, caption: commandLabel)
+                }
+                if let directCommand {
+                    DisclosureGroup(isExpanded: $showDirectCommand) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(String(localized: "integrations.codex.direct.help",
+                                        defaultValue: "Run Codex for this terminal session. Replace the API-key placeholder with your oMLX key (or omlx if authentication is disabled). The saved Codex configuration is unchanged.",
+                                        comment: "Instructions for the direct Codex recipe; never show the real API key"))
+                                .font(.omlxText(11.5))
+                                .foregroundStyle(theme.textSecondary)
+                            CommandBlock(command: directCommand)
+                        }
+                        .padding(.top, 6)
+                    } label: {
+                        Text(String(localized: "integrations.codex.direct.label",
+                                    defaultValue: "Advanced — run `codex` directly",
+                                    comment: "Disclosure label for the direct Codex CLI command"))
+                            .font(.omlxText(DesignTokens.FontSize.callout, weight: .medium))
+                            .foregroundStyle(theme.textSecondary)
+                    }
                 }
             }
         }

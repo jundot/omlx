@@ -182,6 +182,8 @@
   "status.api.host": "Hostitel",
   "status.integrations.app": "Aplikace",
   "status.integrations.codex": "Codex",
+  "status.integrations.codex_direct_label": "Advanced — run `codex` directly",
+  "status.integrations.codex_direct_help": "Run Codex for this terminal session. Replace the API-key placeholder with your oMLX key (or omlx if authentication is disabled). The saved Codex configuration is unchanged.",
   "status.integrations.openclaw": "OpenClaw",
   "status.integrations.opencode": "OpenCode",
   "status.integrations.pi": "Pi",

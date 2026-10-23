@@ -65,6 +65,23 @@
             </div>
         </div>
 
+        <div class="px-6 py-4">
+            <details class="text-xs text-neutral-500">
+                <summary class="cursor-pointer font-semibold">{{ t('status.integrations.codex_direct_label') }}</summary>
+                <p class="mt-2">{{ t('status.integrations.codex_direct_help') }}</p>
+                <div class="mt-2 bg-neutral-50 border border-neutral-200 rounded-lg p-3 relative group">
+                    <pre class="text-xs text-neutral-700 font-mono whitespace-pre-wrap break-all pr-8" x-text="codexDirectCommand"></pre>
+                    <button type="button" x-data="{ copied: false }"
+                            @click="copyToClipboard(codexDirectCommand); copied = true; setTimeout(() => copied = false, 2000)"
+                            class="absolute top-2 right-2 p-2 rounded-md text-neutral-500 hover:bg-neutral-100"
+                            :title="window.t('status.integrations.copy_command_tooltip')"
+                            :aria-label="window.t('status.integrations.copy_command_tooltip')">
+                        <span x-text="copied ? '✓' : '⧉'"></span>
+                    </button>
+                </div>
+            </details>
+        </div>
+
         <!-- OpenCode -->
         <div class="flex items-center gap-4 px-6 py-4 group">
             <div class="w-9 h-9 rounded-lg overflow-hidden flex-shrink-0">

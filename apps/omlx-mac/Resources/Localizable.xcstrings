@@ -1,6 +1,18 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "integrations.codex.direct.label" : {
+      "comment" : "Disclosure label for the direct Codex CLI command",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Advanced — run `codex` directly" } }
+      }
+    },
+    "integrations.codex.direct.help" : {
+      "comment" : "Instructions for the direct Codex recipe; never show the real API key",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Run Codex for this terminal session. Replace the API-key placeholder with your oMLX key (or omlx if authentication is disabled). The saved Codex configuration is unchanged." } }
+      }
+    },
     "settings.button.reset_defaults" : {
       "localizations" : {
         "en" : {

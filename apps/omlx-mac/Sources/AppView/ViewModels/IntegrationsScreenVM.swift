@@ -51,6 +51,7 @@ final class IntegrationsScreenVM {
     private(set) var mcpConfigLoaded: String = ""
 
     private(set) var availableModels: [String] = []
+    private(set) var modelContextWindows: [String: Int] = [:]
     var lastError: String?
 
     // Server-resolved fields used by the command builders. Populated from
@@ -120,6 +121,44 @@ final class IntegrationsScreenVM {
 
     var codexCommand: String    { "\(cliCommandPrefix) launch codex" }
     var codexAppCommand: String { "\(cliCommandPrefix) launch codex_app" }
+    var codexDirectCommand: String {
+        Self.codexDirectRecipe(model: codexModel, host: serverHost, port: serverPort,
+                               contextWindow: modelContextWindows[codexModel])
+    }
+
+    /// Keep the API key a placeholder, including when stats contains a real key.
+    /// JSON strings are also valid TOML strings; shell-quote the complete override.
+    static func codexDirectRecipe(model: String, host: String, port: Int,
+                                  contextWindow: Int? = nil) -> String {
+        let firstHost = String(host.split(separator: ",").first ?? "127.0.0.1")
+            .trimmingCharacters(in: .whitespaces)
+        let unwrapped = firstHost.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        let connectHost = ["", "0.0.0.0", "::"].contains(unwrapped) ? "127.0.0.1" : unwrapped
+        let displayHost = connectHost.contains(":") ? "[\(connectHost)]" : connectHost
+        func config(_ key: String, _ value: String) -> String {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.withoutEscapingSlashes]
+            // Encoding a String cannot fail.
+            let json = String(decoding: try! encoder.encode(value), as: UTF8.self)
+            return "-c \(shellQuote("\(key)=\(json)"))"
+        }
+        var parts = [
+            shellEnvAssign("OMLX_API_KEY", "your-omlx-api-key"),
+            "codex", "-m", shellQuote(model.isEmpty ? "select-a-model" : model),
+            config("model_provider", "omlx"),
+            config("model_providers.omlx.name", "oMLX"),
+            config("model_providers.omlx.base_url", "http://\(displayHost):\(port)/v1"),
+            config("model_providers.omlx.env_key", "OMLX_API_KEY"),
+            config("model_providers.omlx.wire_api", "responses"),
+            "-c 'model_providers.omlx.requires_openai_auth=false'",
+            "-c 'model_providers.omlx.supports_websockets=false'",
+            "-c 'model_providers.omlx.stream_idle_timeout_ms=3000000'",
+        ]
+        if let contextWindow, contextWindow > 0 {
+            parts.append("-c 'model_context_window=\(contextWindow)'")
+        }
+        return parts.joined(separator: " ")
+    }
     var opencodeCommand: String { "\(cliCommandPrefix) launch opencode" }
     var openclawCommand: String {
         let profile = openclawToolsProfile.isEmpty ? "coding" : openclawToolsProfile
@@ -221,6 +260,11 @@ final class IntegrationsScreenVM {
             // Available models
             let models = try await client.listModels().models
             self.availableModels = models.map { $0.id }
+            self.modelContextWindows = Dictionary(uniqueKeysWithValues: models.compactMap { model in
+                guard let window = model.settings?.maxContextWindow ?? model.modelContextLength,
+                      window > 0 else { return nil }
+                return (model.id, window)
+            })
 
             // Stats — host/port/api_key/cli_prefix for the command builders.
             // Failure here is non-fatal: the screen still works against the

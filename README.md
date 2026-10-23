@@ -248,6 +248,10 @@ Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, Mistral Vibe, and D
 
 Install [Mistral Vibe](https://github.com/mistralai/mistral-vibe) 2.26.0 or newer with `uv tool install mistral-vibe`, then run `omlx launch vibe` to select a local model, or `omlx launch vibe --model <model-id>`. Vibe's provider, model, API-key reference and context window are configured for that process through its `VIBE_*` environment overrides. Existing `config.toml`, `VIBE_HOME`, tool permissions and cloud configuration are preserved. Pass Vibe arguments after `--`, for example `omlx launch vibe --model <model-id> -- --resume`.
 
+For Codex CLI, expand **Advanced — run `codex` directly** in the Codex integration to copy a process-scoped command. It uses your selected model, the server's `/v1` Responses API and the model's known context limit. Replace the API-key placeholder with your own oMLX key; the displayed recipe never includes the server's real key. With authentication disabled, use `omlx` as the placeholder value. A model must be selected and the oMLX server must already be running.
+
+The direct command and `omlx launch codex` leave `~/.codex/config.toml` unchanged. `omlx launch codex_app` configures the desktop app by updating that shared file. Codex has one selected model rather than Claude Code's Opus/Sonnet/Haiku tiers; Claude-specific traffic and LSP flags do not apply. The direct command's `stream_idle_timeout_ms=3000000` allows 50 minutes without a streaming event, not a 50-minute total-request deadline. If no model context limit is available, set `-c model_context_window=<tokens>` to the model's configured limit before running. Launching a local model in Codex does not transfer a different Codex chat's conversation or guarantee that the model can use every enabled tool.
+
 ### Performance Benchmark
 
 One-click benchmarking from the admin panel. Measures prefill (PP) and text generation (TG) tokens per second, with partial prefix cache hit testing for realistic performance numbers.

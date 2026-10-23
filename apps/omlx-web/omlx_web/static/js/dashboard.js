@@ -4249,6 +4249,33 @@
                 return this._launchCmd('codex_app');
             },
 
+            get codexDirectCommand() {
+                const model = this.globalSettings.integrations.codex_model || 'select-a-model';
+                const rawHost = String(this.selectedAlias || this.stats.host || '127.0.0.1').split(',')[0].trim();
+                const host = rawHost.replace(/^\[|\]$/g, '');
+                const connectHost = ['', '0.0.0.0', '::'].includes(host) ? '127.0.0.1' : host;
+                const displayHost = connectHost.includes(':') ? `[${connectHost}]` : connectHost;
+                const config = (key, value) => `-c ${this.shellQuote(`${key}=${JSON.stringify(value)}`)}`;
+                const parts = [
+                    this.shellEnvAssign('OMLX_API_KEY', 'your-omlx-api-key'),
+                    'codex', '-m', this.shellQuote(model),
+                    config('model_provider', 'omlx'),
+                    config('model_providers.omlx.name', 'oMLX'),
+                    config('model_providers.omlx.base_url', `http://${displayHost}:${this.stats.port || 8000}/v1`),
+                    config('model_providers.omlx.env_key', 'OMLX_API_KEY'),
+                    config('model_providers.omlx.wire_api', 'responses'),
+                    "-c 'model_providers.omlx.requires_openai_auth=false'",
+                    "-c 'model_providers.omlx.supports_websockets=false'",
+                    "-c 'model_providers.omlx.stream_idle_timeout_ms=3000000'",
+                ];
+                const selected = this.models.find(m => m.id === model);
+                const window = selected?.settings?.max_context_window ?? selected?.model_context_length;
+                if (Number.isInteger(window) && window > 0) {
+                    parts.push(`-c 'model_context_window=${window}'`);
+                }
+                return parts.join(' ');
+            },
+
             get copilotCommand() {
                 return this._launchCmd('copilot');
             },
