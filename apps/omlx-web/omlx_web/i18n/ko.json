@@ -2273,5 +2273,9 @@
   "cluster.v2.join.cleanup_forgotten": "이 Mac에서 이전 정리가 삭제되었습니다. 원격 정리는 확인되지 않았습니다.",
   "cluster.v2.join.forget_cleanup_error": "이 정리 작업을 삭제할 수 없습니다.",
   "cluster.v2.membership.waiting_request": "이 Mac이 코드를 표시하고 페어링 요청을 보내기를 기다리는 중입니다.",
-  "cluster.v2.membership.add_device": "이 Mac 추가"
+  "cluster.v2.membership.add_device": "이 Mac 추가",
+  "models.image.title": "Image generation",
+  "models.image.recipe": "One 1024 × 1024 PNG per request. Fixed eight-step Turbo recipe; optional seed for replay.",
+  "models.image.lifecycle": "Uses the inference API key. One request at a time. Disconnecting cancels after current GPU work drains. Chat profiles and sampling settings do not apply.",
+  "models.image.invalid": "Image bundle needs repair"
 }

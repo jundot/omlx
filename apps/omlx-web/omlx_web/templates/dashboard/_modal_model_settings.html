@@ -20,7 +20,7 @@
                     </div>
                     <div class="flex items-start gap-2 flex-shrink-0">
                         <!-- Snapshot actions: reset / optimal (omlx.ai) / custom recipe -->
-                        <div class="flex flex-wrap items-center justify-end gap-2 pt-1">
+                        <div class="flex flex-wrap items-center justify-end gap-2 pt-1" x-show="selectedModel?.model_type !== 'image'">
                             <button type="button" @click="openSettingsApply('reset')"
                                     :disabled="savingModelSettings || settingsApply.phase === 'loading'"
                                     class="px-3 py-1.5 text-xs font-medium text-neutral-700 bg-neutral-100 hover:bg-neutral-200 rounded-full border border-neutral-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed">{{ t('modal.model_settings.actions.reset') }}</button>
@@ -44,7 +44,7 @@
                 {% set ms_llm = "!selectedModel?.model_type || selectedModel.model_type === 'llm' || selectedModel.model_type === 'vlm'" %}
                 {% set ms_llm_non_diffusion = "(" ~ ms_llm ~ ") && !modelSettings.is_diffusion_model" %}
                 {% set ms_rail = [
-                        ('ms-profiles', t('modal.model_settings.profiles.section_label'), "!modelSettings.is_diffusion_model"),
+                        ('ms-profiles', t('modal.model_settings.profiles.section_label'), "!modelSettings.is_diffusion_model && selectedModel?.model_type !== 'image'"),
                         ('ms-basic', t('modal.model_settings.basic_label'), "true"),
                         ('ms-generation', t('modal.model_settings.generation_label'), ms_llm),
                         ('ms-acceleration', t('modal.model_settings.acceleration_label'), ms_llm_non_diffusion),
@@ -52,6 +52,12 @@
                         ('ms-advanced', t('modal.model_settings.advanced_label'), ms_llm ~ " || selectedModel?.embedding_audio_supported"),
                         ('ms-experimental', t('modal.model_settings.experimental_label'), ms_llm_non_diffusion)
                 ] %}
+                <div x-show="selectedModel?.model_type === 'image'" x-cloak class="mb-6 p-4 rounded-xl bg-neutral-50 border border-neutral-200">
+                    <h3 class="text-sm font-semibold">{{ t('models.image.title') }}</h3>
+                    <p class="text-sm mt-2">{{ t('models.image.recipe') }}</p>
+                    <code class="block text-sm mt-2">POST /v1/images/generations</code>
+                    <p class="text-sm mt-2">{{ t('models.image.lifecycle') }}</p>
+                </div>
                 <div class="model-settings-layout">
                     <nav class="settings-rail" aria-label="{{ t('modal.model_settings.section_label') }}">
                         {%- for sid, title, visible in ms_rail %}
@@ -64,7 +70,7 @@
                 <div class="min-w-0">
                 <!-- Profiles / Templates / Presets section -->
                 <div id="ms-profiles" class="model-settings-section mb-6 p-4 bg-neutral-50 rounded-xl border border-neutral-200"
-                     x-show="!modelSettings.is_diffusion_model" x-cloak
+                     x-show="!modelSettings.is_diffusion_model && selectedModel?.model_type !== 'image'" x-cloak
                      @input.stop="computeDrift()"
                      @change.stop="computeDrift()">
                     <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
@@ -352,7 +358,7 @@
                                    :placeholder="selectedModel?.id"
                                    class="{{ ms_field }}">
                         </label>
-                        <label class="{{ ms_row }}" x-show="!isGgufModel()">
+                        <label class="{{ ms_row }}" x-show="!isGgufModel() && selectedModel?.model_type !== 'image'">
                             <span class="{{ ms_row_label }}">{{ t('modal.model_settings.model_type') }}</span>
                             <select x-model="modelSettings.model_type_override" class="{{ ms_field_short }}">
                                 <option value="">{{ t('modal.model_settings.model_type_auto') }}</option>

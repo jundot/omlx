@@ -2273,5 +2273,9 @@
   "cluster.v2.join.cleanup_forgotten": "Old cleanup forgotten on this Mac. Remote cleanup was not confirmed.",
   "cluster.v2.join.forget_cleanup_error": "Could not forget this cleanup.",
   "cluster.v2.membership.waiting_request": "Waiting for this Mac to show its code and send a pairing request.",
-  "cluster.v2.membership.add_device": "Add this Mac"
+  "cluster.v2.membership.add_device": "Add this Mac",
+  "models.image.title": "Image generation",
+  "models.image.recipe": "One 1024 × 1024 PNG per request. Fixed eight-step Turbo recipe; optional seed for replay.",
+  "models.image.lifecycle": "Uses the inference API key. One request at a time. Disconnecting cancels after current GPU work drains. Chat profiles and sampling settings do not apply.",
+  "models.image.invalid": "Image bundle needs repair"
 }
