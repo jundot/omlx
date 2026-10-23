@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import sys
 import types
@@ -282,6 +283,17 @@ def test_markitdown_stream_response_starts_before_conversion(monkeypatch):
         role_chunk = await iterator.__anext__()
         assert '"role":"assistant"' in role_chunk
         assert started is False
+
+        # The first frame is the chunk-mode keepalive; it must share the
+        # stream's id and model with the real chunks.
+        keepalive = json.loads(first.removeprefix("data: ").strip())
+        role = json.loads(role_chunk.removeprefix("data: ").strip())
+        assert keepalive["choices"][0]["delta"] == {
+            "role": "assistant",
+            "content": "",
+        }
+        assert keepalive["model"] == role["model"] == MARKITDOWN_MODEL_ID
+        assert keepalive["id"] == role["id"]
 
         content_chunk = await iterator.__anext__()
         assert "Converted markdown" in content_chunk

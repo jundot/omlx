@@ -4,8 +4,9 @@
 import asyncio
 import json
 import socket
+import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import anyio
 import pytest
@@ -317,7 +318,7 @@ class TestCompletionKeepaliveSharesStreamId:
     def test_frame_uses_given_response_id(self):
         from omlx.server import _completion_keepalive_chunk
 
-        frame = _completion_keepalive_chunk("cmpl-abc123")
+        frame = _completion_keepalive_chunk("cmpl-abc123", "test-model")
         assert frame.startswith("data: ")
         assert frame.endswith("\n\n")
         payload = json.loads(frame.removeprefix("data: ").strip())
@@ -330,7 +331,9 @@ class TestCompletionKeepaliveSharesStreamId:
         from omlx.server import _completion_keepalive_chunk
 
         payload = json.loads(
-            _completion_keepalive_chunk("cmpl-real").removeprefix("data: ").strip()
+            _completion_keepalive_chunk("cmpl-real", "test-model")
+            .removeprefix("data: ")
+            .strip()
         )
         assert payload["id"] != "cmpl-keepalive"
 
@@ -348,7 +351,7 @@ class TestChatKeepaliveSharesStreamId:
     def test_frame_uses_given_response_id(self):
         from omlx.server import _chat_keepalive_chunk
 
-        frame = _chat_keepalive_chunk("chatcmpl-abc123")
+        frame = _chat_keepalive_chunk("chatcmpl-abc123", "test-model")
         assert frame.startswith("data: ")
         assert frame.endswith("\n\n")
         payload = json.loads(frame.removeprefix("data: ").strip())
@@ -362,9 +365,159 @@ class TestChatKeepaliveSharesStreamId:
         from omlx.server import _chat_keepalive_chunk
 
         payload = json.loads(
-            _chat_keepalive_chunk("chatcmpl-real").removeprefix("data: ").strip()
+            _chat_keepalive_chunk("chatcmpl-real", "test-model")
+            .removeprefix("data: ")
+            .strip()
         )
         assert payload["id"] != "chatcmpl-keepalive"
+
+
+_KEEPALIVE_BUILDERS = ["_chat_keepalive_chunk", "_completion_keepalive_chunk"]
+
+
+class TestKeepaliveSharesModelAndCreated:
+    """Id-sharing keepalive frames carry the stream's model and creation time.
+
+    Every real chunk carries ``request.model``, and the keepalive is the first
+    frame of the stream, so clients that latch the model (or ``created``) from
+    the first chunk would otherwise report the sentinel ``"keepalive"`` model
+    (or epoch 0). The model string is client-supplied: it must be JSON-escaped
+    so a quote cannot break the frame and a newline cannot end the SSE data
+    line early.
+    """
+
+    @pytest.mark.parametrize("builder", _KEEPALIVE_BUILDERS)
+    @pytest.mark.parametrize(
+        "model",
+        [
+            'GLM-5.3-Flash-oQ4e "quoted"',
+            "back\\slash",
+            "a\nb\r\x00",
+            "unicode-é",
+            '","model":"injected',
+        ],
+    )
+    def test_frame_uses_given_model(self, builder, model):
+        import omlx.server as server
+
+        frame = getattr(server, builder)("stream-id", model)
+        assert frame.startswith("data: ")
+        assert frame.endswith("\n\n")
+        body = frame.removeprefix("data: ")[:-2]
+        assert "\n" not in body and "\r" not in body
+        payload = json.loads(body)
+        assert payload["id"] == "stream-id"
+        assert payload["model"] == model
+
+    @pytest.mark.parametrize("builder", _KEEPALIVE_BUILDERS)
+    def test_frame_stamps_creation_time(self, builder):
+        import omlx.server as server
+
+        before = int(time.time())
+        frame = getattr(server, builder)("stream-id", "test-model")
+        after = int(time.time())
+        payload = json.loads(frame.removeprefix("data: ").strip())
+        assert isinstance(payload["created"], int)
+        assert before <= payload["created"] <= after
+
+
+class TestStreamingRoutesShareKeepaliveIdentity:
+    """Every frame of a chunk-mode stream shares one id and ``request.model``.
+
+    The routes build the keepalive frame themselves, apart from the real
+    chunks, so the helper tests above cannot see a call site that skips the
+    rewrite (the static frame carries the sentinel id and model) or passes the
+    wrong model. The requested alias resolves to a different pool id here, as
+    an exposed profile alias does, so a call site that passes the resolved id
+    instead of ``request.model`` (which every real chunk carries) fails too.
+    """
+
+    REQUESTED = "test-alias:instruct"
+    RESOLVED = "test-model"
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+
+        from omlx.server import ServerState, app
+        from omlx.settings import GlobalSettings
+        from tests.integration.test_e2e_streaming import (
+            MockBaseEngine,
+            MockEnginePool,
+        )
+
+        requested, resolved = self.REQUESTED, self.RESOLVED
+
+        class AliasPool(MockEnginePool):
+            def resolve_model_id(self, model_id_or_alias, settings_manager=None):
+                if model_id_or_alias == requested:
+                    return resolved
+                return model_id_or_alias
+
+        state = ServerState()
+        state.engine_pool = AliasPool(MockBaseEngine(resolved))
+        state.default_model = resolved
+        state.global_settings = GlobalSettings()
+        state.global_settings.server.sse_keepalive_mode = "chunk"
+        with patch("omlx.server._server_state", state):
+            yield TestClient(app)
+
+    @staticmethod
+    def _events(response) -> list:
+        assert response.status_code == 200
+        frames = [
+            line.removeprefix("data: ")
+            for line in response.text.split("\n")
+            if line.startswith("data: ")
+        ]
+        assert frames[-1] == "[DONE]"
+        # Parse strictly: a frame that fails to parse must fail the test, not
+        # silently vanish from the identity check.
+        events = [json.loads(frame) for frame in frames[:-1]]
+        assert len(events) >= 2
+        return events
+
+    def _assert_one_identity(self, events, before, after):
+        assert len({event["id"] for event in events}) == 1
+        assert {event["model"] for event in events} == {self.REQUESTED}
+        assert before <= events[0]["created"] <= after
+
+    def test_chat_completion_stream(self, client):
+        before = int(time.time())
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": self.REQUESTED,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+        after = int(time.time())
+        events = self._events(response)
+        # The first frame is the chunk-mode keepalive, not the role chunk.
+        assert events[0]["choices"][0]["delta"] == {
+            "role": "assistant",
+            "content": "",
+        }
+        self._assert_one_identity(events, before, after)
+
+    def test_completion_stream(self, client):
+        before = int(time.time())
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": self.REQUESTED,
+                "prompt": "Once upon a time",
+                "stream": True,
+            },
+        )
+        after = int(time.time())
+        events = self._events(response)
+        # The first frame is the chunk-mode keepalive, not generated text.
+        assert events[0]["object"] == "text_completion"
+        assert events[0]["choices"][0]["text"] == ""
+        assert any(event["choices"][0]["text"] for event in events[1:])
+        self._assert_one_identity(events, before, after)
 
 
 class TestChatKeepaliveCarriesRole:
@@ -392,7 +545,8 @@ class TestChatKeepaliveCarriesRole:
         from omlx.server import _chat_keepalive_chunk
 
         assert (
-            self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x")) == "assistant"
+            self._first_chunk_role(_chat_keepalive_chunk("chatcmpl-x", "test-model"))
+            == "assistant"
         )
 
 
