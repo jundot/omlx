@@ -512,7 +512,7 @@ def test_small_l_block_score_kernel_matches_numpy(language, length):
                         assert abs(got - expected) <= 1e-3 * max(1.0, abs(expected))
 
 
-def test_small_l_sparse_attention_kernel_matches_reference(language):
+def test_small_l_sparse_attention_kernel_matches_reference(language, monkeypatch):
     import mlx_vlm.models.minimax_m3_vl.msa as msa
 
     batch, heads, kv_heads, length, dim = 2, 8, 2, 8, 128
@@ -553,6 +553,24 @@ def test_small_l_sparse_attention_kernel_matches_reference(language):
     np.testing.assert_allclose(
         np.array(out.astype(mx.float32)), expected, atol=2e-2, rtol=2e-2
     )
+
+    # Spreading the query heads over more threads changes no bit (here out
+    # has one thread per key for all four heads of a KV head).
+    for heads_per_thread in (1, 2):
+        monkeypatch.setattr(msa, "_SMALL_L_HEADS_PER_THREAD", heads_per_thread)
+        spread = msa.small_l_sparse_attention(
+            q,
+            k,
+            v,
+            block_ids,
+            mx.array(qpos),
+            mx.array(pad),
+            block,
+            scale,
+            mx.array(keep),
+        )
+        assert mx.array_equal(spread, out).item()
+    monkeypatch.undo()
 
     # A verify row computes exactly like a one-token decode step, whatever
     # order the selection returns the blocks in.

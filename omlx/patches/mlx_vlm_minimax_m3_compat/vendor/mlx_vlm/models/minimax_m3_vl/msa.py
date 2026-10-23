@@ -911,6 +911,12 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
     output_names=["part_o", "part_m", "part_l"],
     ensure_row_contiguous=False,
     source=r"""
+        // BLOCK * (G / HPT) threads: thread t scores key t % BLOCK for the HPT
+        // query heads of group t / BLOCK, and accumulates P @ V for the same
+        // heads at its dimensions. Every value is computed as with one thread
+        // per key for all G heads; HPT only spreads the work.
+        constexpr int HG = G / HPT;
+        constexpr int TG = BLOCK * HG;
         uint slot = threadgroup_position_in_grid.x;
         uint kl = threadgroup_position_in_grid.y;
         uint b = threadgroup_position_in_grid.z;
@@ -928,7 +934,7 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
         threadgroup float m_s[G];
         threadgroup float l_s[G];
 
-        for (uint i = t; i < uint(G * D / 4); i += BLOCK) {
+        for (uint i = t; i < uint(G * D / 4); i += TG) {
             int h = int(i) / (D / 4);
             int q_off = ((int(b) * H_KV * G + kv * G + h) * L + l) * D + (int(i) % (D / 4)) * 4;
             q_s[i] = float4(
@@ -937,7 +943,9 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
 
         int row = (int(b) * H_KV + kv) * L + l;
         int blk = block_ids[row * TOPK + int(slot)];
-        int pos = blk * BLOCK + int(t);
+        int key = int(t) % BLOCK;
+        int hg = int(t) / BLOCK;
+        int pos = blk * BLOCK + key;
         int col = pos + (HAS_PAD ? int(pad[b]) : 0);
         bool valid = blk >= 0 && pos <= qpos[int(b) * L + l] && col < total_len;
         if (HAS_MASK && valid) {
@@ -945,14 +953,16 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
         }
         // Skipped keys get probability 0 below; pointing them at column 0
         // keeps the value loads in bounds and branch-free.
-        col_s[t] = valid ? col : 0;
+        if (hg == 0) {
+            col_s[key] = valid ? col : 0;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float s[G];
-        for (int h = 0; h < G; ++h) {
+        float s[HPT];
+        for (int h = 0; h < HPT; ++h) {
             s[h] = 0.0f;
         }
-        int k_off = int(b) * k_strides[0] + kv * k_strides[1] + col_s[t] * k_strides[2];
+        int k_off = int(b) * k_strides[0] + kv * k_strides[1] + col_s[key] * k_strides[2];
         int ks = k_strides[3];
         for (int d0 = 0; d0 < D; d0 += 32) {
             float4 kc[8];
@@ -960,20 +970,20 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
                 int o = k_off + (d0 + 4 * j) * ks;
                 kc[j] = float4(float(k[o]), float(k[o + ks]), float(k[o + 2 * ks]), float(k[o + 3 * ks]));
             }
-            for (int h = 0; h < G; ++h) {
+            for (int h = 0; h < HPT; ++h) {
                 float acc = 0.0f;
                 for (int j = 0; j < 8; ++j) {
-                    acc += dot(q_s[(h * D + d0) / 4 + j], kc[j]);
+                    acc += dot(q_s[((hg * HPT + h) * D + d0) / 4 + j], kc[j]);
                 }
                 s[h] += acc;
             }
         }
-        for (int h = 0; h < G; ++h) {
-            p_s[h * BLOCK + int(t)] = valid ? s[h] : -INFINITY;
+        for (int h = 0; h < HPT; ++h) {
+            p_s[(hg * HPT + h) * BLOCK + key] = valid ? s[h] : -INFINITY;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (int h = int(simd); h < G; h += BLOCK / 32) {
+        for (int h = int(simd); h < G; h += TG / 32) {
             float m = -INFINITY;
             for (int j = int(lane); j < BLOCK; j += 32) {
                 m = max(m, p_s[h * BLOCK + j]);
@@ -1001,9 +1011,11 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
             rank += other < blk || (other == blk && r < int(slot));
         }
         int part = (row * TOPK + rank) * G;
-        for (int d = int(t); d < D; d += BLOCK) {
-            float acc[G];
-            for (int h = 0; h < G; ++h) {
+        for (int idx = int(t); idx < D * HG; idx += TG) {
+            int d = idx % D;
+            int g0 = (idx / D) * HPT;
+            float acc[HPT];
+            for (int h = 0; h < HPT; ++h) {
                 acc[h] = 0.0f;
             }
             int v_base = int(b) * v_strides[0] + kv * v_strides[1] + d * v_strides[3];
@@ -1013,13 +1025,13 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
                     vv[u] = float(v[v_base + col_s[j0 + u] * v_strides[2]]);
                 }
                 for (int u = 0; u < 8; ++u) {
-                    for (int h = 0; h < G; ++h) {
-                        acc[h] += p_s[h * BLOCK + j0 + u] * vv[u];
+                    for (int h = 0; h < HPT; ++h) {
+                        acc[h] += p_s[(g0 + h) * BLOCK + j0 + u] * vv[u];
                     }
                 }
             }
-            for (int h = 0; h < G; ++h) {
-                part_o[(part + h) * D + d] = acc[h];
+            for (int h = 0; h < HPT; ++h) {
+                part_o[(part + g0 + h) * D + d] = acc[h];
             }
         }
         if (t < uint(G)) {
@@ -1028,6 +1040,10 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
         }
     """,
 )
+
+# Query heads per thread of the partials kernel: fewer heads per thread mean
+# more threads per (row, block) to hide the key and value loads.
+_SMALL_L_HEADS_PER_THREAD = 4
 
 _MSA_SMALL_L_COMBINE = mx.fast.metal_kernel(
     name="minimax_m3_msa_small_l_combine",
@@ -1114,6 +1130,10 @@ def small_l_sparse_attention(
         ("HAS_MASK", valid_keys is not None),
         ("HAS_PAD", left_padding is not None),
     ]
+    hpt = _SMALL_L_HEADS_PER_THREAD
+    if G % hpt or block_size * (G // hpt) > 1024:
+        hpt = G
+    threads = block_size * (G // hpt)
     rows = B * H_kv * L * topk * G
     part_o, part_m, part_l = _MSA_SMALL_L_PARTIALS(
         inputs=[
@@ -1127,9 +1147,9 @@ def small_l_sparse_attention(
             mx.array([scale], dtype=mx.float32),
             qpos if valid_keys is None else valid_keys,
         ],
-        template=template,
-        grid=(topk * block_size, H_kv * L, B),
-        threadgroup=(block_size, 1, 1),
+        template=template + [("HPT", hpt)],
+        grid=(topk * threads, H_kv * L, B),
+        threadgroup=(threads, 1, 1),
         output_shapes=[(rows, D), (rows,), (rows,)],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
