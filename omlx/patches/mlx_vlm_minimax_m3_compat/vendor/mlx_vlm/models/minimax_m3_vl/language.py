@@ -23,6 +23,7 @@ from ..base import (
 )
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
+from . import decode_kernels
 from .moe_rows import scaled_switch_glu
 from .msa import (
     build_grouped_msa_topk,
@@ -389,14 +390,30 @@ class MiniMaxRMSNorm(nn.Module):
         self.weight = mx.zeros((dims,)) if gemma else mx.ones((dims,))
         self.eps = eps
         self.gemma = gemma
+        # Plain attribute, not a parameter: (weight the scale was built from, scale).
+        self._cached_scale = None
+
+    def _scale(self) -> mx.array:
+        # Form 1 + w in float32: adding 1 to a bf16 weight rounds every channel.
+        # Built once per weight array; a reloaded weight is a new array.
+        weight = self.weight
+        cached = self._cached_scale
+        if cached is None or cached[0] is not weight:
+            scale = weight.astype(mx.float32)
+            if self.gemma:
+                scale = scale + 1
+            cached = (weight, scale)
+            object.__setattr__(self, "_cached_scale", cached)
+        return cached[1]
 
     def __call__(self, x, dtype=None):
-        # Form 1 + w in float32: adding 1 to a bf16 weight rounds every channel.
-        weight = self.weight.astype(mx.float32)
-        if self.gemma:
-            weight = weight + 1
+        weight = self._scale()
+        dtype = x.dtype if dtype is None else dtype
+        output = decode_kernels.rms_norm(x, weight, self.eps, dtype)
+        if output is not None:
+            return output
         output = mx.fast.rms_norm(x, weight, self.eps)
-        return output.astype(x.dtype if dtype is None else dtype)
+        return output.astype(dtype)
 
 
 class MiniMaxM3KVCache:

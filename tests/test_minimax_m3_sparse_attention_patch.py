@@ -558,3 +558,44 @@ def test_small_l_sparse_attention_kernel_matches_reference(language):
         mx.array(keep[:, :, -1:]),
     )
     assert mx.array_equal(last, out[:, :, -1:]).item()
+
+
+@pytest.mark.parametrize(
+    "shape", [(1, 1, 6144), (1, 7, 6144), (8, 128), (2, 1, 4, 128), (5, 4100)]
+)
+@pytest.mark.parametrize("out", ["model", "float32"])
+def test_decode_rms_norm_matches_mlx(language, shape, out):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(11)
+    x = (mx.random.normal(shape) * 3).astype(mx.bfloat16)
+    scale = 1.0 + mx.random.normal((shape[-1],)) * 0.3
+    dtype = x.dtype if out == "model" else mx.float32
+    y = dk.rms_norm(x, scale, 1e-6, dtype)
+    assert y is not None
+    expected = mx.fast.rms_norm(x, scale, 1e-6).astype(dtype)
+    assert mx.array_equal(y, expected).item()
+
+
+def test_decode_rms_norm_leaves_longer_calls_to_mlx(language):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    x = mx.zeros((9, 128), dtype=mx.bfloat16)
+    assert dk.rms_norm(x, mx.ones((128,)), 1e-6, mx.bfloat16) is None
+
+
+def test_rms_norm_caches_its_fp32_scale(language):
+    from mlx.utils import tree_flatten
+
+    norm = language.MiniMaxRMSNorm(64, eps=1e-6)
+    norm.weight = (mx.random.normal((64,)) * 0.3).astype(mx.bfloat16)
+    x = (mx.random.normal((2, 64)) * 3).astype(mx.bfloat16)
+    expected = mx.fast.rms_norm(x, norm.weight.astype(mx.float32) + 1, 1e-6)
+    assert mx.array_equal(norm(x), expected.astype(mx.bfloat16)).item()
+    assert mx.array_equal(norm(x, dtype=mx.float32), expected).item()
+    scale = norm._scale()
+    assert norm._scale() is scale
+    assert set(dict(tree_flatten(norm.parameters()))) == {"weight"}
+    # Loading a new weight array rebuilds the scale.
+    norm.weight = mx.zeros((64,), dtype=mx.bfloat16)
+    assert mx.array_equal(norm._scale(), mx.ones((64,))).item()
