@@ -806,3 +806,74 @@ def test_short_calls_route_bit_exactly(language, monkeypatch, rows, armed):
     assert used == expected
     monkeypatch.setattr(dk, "moe_router_select", lambda *args: None)
     assert mx.array_equal(run(), fused).item()
+
+
+def _quantized_moe_block(language):
+    block = _moe_block(language, experts=16, inter=512)
+    for module, spec in (
+        (block.switch_mlp, {"group_size": 16, "bits": 4, "mode": "nvfp4"}),
+        (block.shared_experts, {"group_size": 32, "bits": 8, "mode": "mxfp8"}),
+    ):
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            linear = module[name]
+            linear.weight = mx.random.normal(linear.weight.shape) * 0.05
+            module[name] = linear.to_quantized(**spec)
+    return block
+
+
+def test_one_token_experts_match_the_ops(language, monkeypatch):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(29)
+    block = _quantized_moe_block(language)
+    # Larger inputs push the SwiGLU-OAI gate and up values past the clip.
+    xs = [
+        (mx.random.normal((1, 1, 1024)) * scale).astype(mx.bfloat16)
+        for scale in (0.5, 2.0, 8.0)
+        for _ in range(8)
+    ]
+    calls = []
+    moe_experts = dk.moe_experts
+
+    def spy(*args):
+        y = moe_experts(*args)
+        calls.append(y is not None)
+        return y
+
+    monkeypatch.setattr(dk, "moe_experts", spy)
+    fused = [block(x) for x in xs]
+    assert calls == [True] * len(xs)
+    monkeypatch.setattr(dk, "moe_experts", lambda *args: None)
+    separate = [block(x) for x in xs]
+    monkeypatch.setattr(dk, "moe_experts", spy)
+    # The shared projections are now row views of their fused buffer.
+    again = [block(x) for x in xs]
+    mx.eval(fused, separate, again)
+    for a, b, c in zip(fused, separate, again):
+        assert mx.array_equal(a, b).item()
+        assert mx.array_equal(c, b).item()
+
+
+def test_one_token_experts_combine_in_mlx_order(language):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(31)
+    block = _quantized_moe_block(language)
+    switch, shared = block.switch_mlp, block.shared_experts
+    # Expert 1 copies expert 0 and their large opposite weights cancel, so
+    # the order of the FP32 sum over the experts shows in the rounded output.
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        for key in ("weight", "scales"):
+            bank = switch[name][key]
+            switch[name][key] = mx.concatenate([bank[:1], bank[:1], bank[2:]])
+    for key in ("gate_scale", "up_scale"):
+        scale = switch[key]
+        switch[key] = mx.concatenate([scale[:1], scale[:1], scale[2:]])
+    inds = mx.array([[[0, 1, 2, 3]]], dtype=mx.uint32)
+    weights = mx.array([[[1000.37, -1000.29, 0.53, 0.0071]]])
+    for scale in (0.5, 2.0, 8.0):
+        x = (mx.random.normal((1, 1, 1024)) * scale).astype(mx.bfloat16)
+        expected = language._combine_routed(switch(x, inds), weights) + shared(x)
+        y = dk.moe_experts(x, inds, weights, switch, shared)
+        assert y is not None
+        assert mx.array_equal(y, expected).item()

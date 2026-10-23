@@ -22,6 +22,11 @@ arithmetic bit for bit:
   them (sigmoid, correction bias, the stable argpartition order, the FP32
   normalization with its 1e-20, the routed scaling and the down-scale fold)
   in two launches instead of ten.
+* ``moe_experts``: one token's routed NVFP4 experts and MXFP8 shared expert
+  in two launches instead of eleven, the weight rows of both read in the same
+  dispatch: fp4_expert_rows' and MLX's MXFP8 row arithmetic, moe_rows'
+  scaled SwiGLU-OAI epilogue, ``_combine_routed`` and the shared add, each
+  value rounded where the replaced kernels round it.
 
 Exactness rules: every reduction replays the order of the kernel it replaces,
 every intermediate is rounded where the replaced code materializes it, and a
@@ -39,6 +44,9 @@ from functools import cache
 import mlx.core as mx
 
 MAX_ROWS = 8
+# Rows per simdgroup of the one-token expert launches (fastest on an M3 Ultra).
+_GATE_UP_RPS = 2
+_DOWN_RPS = 1
 
 _RMS_N_READS = 4  # MLX RMS_N_READS
 _RMS_LOOPED_LIMIT = 4096  # MLX RMS_LOOPED_LIMIT
@@ -522,3 +530,331 @@ def moe_router_select(
             output_dtypes=[mx.uint32, mx.float32],
         )
     )
+
+
+# One token's rows of MLX fp_qmv_fast. NVFP4 as fp4_expert_rows reads them:
+# lane l takes values [512 b + 16 l, +16) of block b, fp4_qdot16 per block.
+# MXFP8 as MLX's qdot: lane l takes [256 b + 8 l, +8), an 8-term dot in order
+# times its 32-value group's E8M0 scale. An E4M3 code's bits placed in a
+# half's sign, exponent and mantissa give code * 2^-8 (two codes per mask and
+# shift); widened and times 256 that is exactly the value MLX decodes.
+_EXPERTS_HEADER = r"""
+inline void mm3_fp8x4(uint p, thread float* v) {
+    const float2 a = float2(as_type<half2>(((p & 0x00800080u) << 8) | ((p & 0x007F007Fu) << 7)));
+    const uint q = p >> 8;
+    const float2 b = float2(as_type<half2>(((q & 0x00800080u) << 8) | ((q & 0x007F007Fu) << 7)));
+    v[0] = a.x * 256.0f;
+    v[1] = b.x * 256.0f;
+    v[2] = a.y * 256.0f;
+    v[3] = b.y * 256.0f;
+}
+
+inline float mm3_mxfp8_dot8(uint2 w, thread const float* x, float scale) {
+    float v[8];
+    mm3_fp8x4(w.x, v);
+    mm3_fp8x4(w.y, v + 4);
+    float accum = 0;
+    for (int i = 0; i < 8; i++) {
+        accum += x[i] * v[i];
+    }
+    return scale * accum;
+}
+
+template <typename T>
+inline T mm3_scaled_swiglu_oai(float g, float u, float gate_scale, float up_scale,
+                               float alpha, float limit, float beta) {
+    float x_glu = float(static_cast<T>(g)) * gate_scale;
+    x_glu = fp4_minimum(x_glu, limit);
+    float x_linear = float(static_cast<T>(u)) * up_scale;
+    x_linear = fp4_minimum(fp4_maximum(x_linear, -limit), limit);
+    const float sig = fp4_sigmoid(alpha * x_glu);
+    return static_cast<T>(x_glu * sig * (x_linear + beta));
+}
+"""
+
+# Simdgroup s computes the gate and up rows [j, j + RPS) of slot t: slots
+# 0..TOPK-1 are the routed experts (NVFP4, with their gate and up scales),
+# slot TOPK is the shared expert (MXFP8, scale 1). Each row keeps its own
+# accumulator, updated block by block in order.
+_GATE_UP_SWIGLU_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const int s = int(threadgroup_position_in_grid.y) * 2 + int(simdgroup_index_in_threadgroup);
+    const int t = s / (I / RPS);
+    const int j = (s - t * (I / RPS)) * RPS;
+    if (t > TOPK) {
+        return;
+    }
+    float g[RPS];
+    float u[RPS];
+    for (int r = 0; r < RPS; r++) {
+        g[r] = 0;
+        u[r] = 0;
+    }
+    float gate_scale_t = 1.0f;
+    float up_scale_t = 1.0f;
+    if (t < TOPK) {
+        const uint e = inds[t];
+        const size_t row = size_t(e) * I + j;
+        const device uint32_t* gw = gate_w + row * (H / 8) + lane * 2;
+        const device uint32_t* uw = up_w + row * (H / 8) + lane * 2;
+        const device uint8_t* gs = gate_s + row * (H / 16) + lane;
+        const device uint8_t* us = up_s + row * (H / 16) + lane;
+        for (int b = 0; b < H / 512; b++) {
+            float xt[16];
+            for (int i = 0; i < 16; i++) {
+                xt[i] = float(x[b * 512 + lane * 16 + i]);
+            }
+            for (int r = 0; r < RPS; r++) {
+                const uint2 wg = *(const device uint2*)(gw + r * (H / 8) + b * 64);
+                const uint2 wu = *(const device uint2*)(uw + r * (H / 8) + b * 64);
+                g[r] += fp4_qdot16(wg, xt, fp4_scale_e4m3(gs[r * (H / 16) + b * 32]));
+                u[r] += fp4_qdot16(wu, xt, fp4_scale_e4m3(us[r * (H / 16) + b * 32]));
+            }
+        }
+        gate_scale_t = gate_scale[e];
+        up_scale_t = up_scale[e];
+    } else {
+        const device uint8_t* gw = (const device uint8_t*)sh_gate_w + size_t(j) * H + lane * 8;
+        const device uint8_t* uw = (const device uint8_t*)sh_up_w + size_t(j) * H + lane * 8;
+        const device uint8_t* gs = sh_gate_s + size_t(j) * (H / 32) + lane / 4;
+        const device uint8_t* us = sh_up_s + size_t(j) * (H / 32) + lane / 4;
+        for (int k = 0; k < H; k += 256) {
+            float xt[8];
+            for (int i = 0; i < 8; i++) {
+                xt[i] = float(x[k + lane * 8 + i]);
+            }
+            for (int r = 0; r < RPS; r++) {
+                const uint2 wg = *(const device uint2*)(gw + r * H + k);
+                const uint2 wu = *(const device uint2*)(uw + r * H + k);
+                g[r] += mm3_mxfp8_dot8(wg, xt, fp4_scale_e8m0(gs[r * (H / 32) + k / 32]));
+                u[r] += mm3_mxfp8_dot8(wu, xt, fp4_scale_e8m0(us[r * (H / 32) + k / 32]));
+            }
+        }
+    }
+    for (int r = 0; r < RPS; r++) {
+        const float gr = simd_sum(g[r]);
+        const float ur = simd_sum(u[r]);
+        if (lane == 0) {
+            act[t * I + j + r] = mm3_scaled_swiglu_oai<T>(
+                gr, ur, gate_scale_t, up_scale_t, params[0], params[1], params[2]);
+        }
+    }
+"""
+
+# Simdgroup s computes the output columns [j, j + RPS): every routed expert's
+# down row (rounded to T as fp4_expert_rows.down writes it) and the shared
+# expert's, then _combine_routed (FP32 products summed over the experts in
+# order, rounded) and the add of the rounded shared row.
+_DOWN_COMBINE_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const int j = (int(threadgroup_position_in_grid.y) * 2 + int(simdgroup_index_in_threadgroup)) * RPS;
+    if (j >= H) {
+        return;
+    }
+    uint e[TOPK];
+    for (int t = 0; t < TOPK; t++) {
+        e[t] = inds[t];
+    }
+    float y[TOPK][RPS];
+    float sh[RPS];
+    for (int r = 0; r < RPS; r++) {
+        for (int t = 0; t < TOPK; t++) {
+            y[t][r] = 0;
+        }
+        sh[r] = 0;
+    }
+    const device uint8_t* sw = (const device uint8_t*)sh_down_w + size_t(j) * I + lane * 8;
+    const device uint8_t* ss = sh_down_s + size_t(j) * (I / 32) + lane / 4;
+    for (int b = 0; b < I / 512; b++) {
+        for (int t = 0; t < TOPK; t++) {
+            float at[16];
+            for (int i = 0; i < 16; i++) {
+                at[i] = float(act[t * I + b * 512 + lane * 16 + i]);
+            }
+            const size_t row = size_t(e[t]) * H + j;
+            for (int r = 0; r < RPS; r++) {
+                const uint2 w = *(const device uint2*)(down_w + (row + r) * (I / 8) + lane * 2 + b * 64);
+                y[t][r] += fp4_qdot16(w, at, fp4_scale_e4m3(down_s[(row + r) * (I / 16) + lane + b * 32]));
+            }
+        }
+        for (int k = b * 512; k < b * 512 + 512; k += 256) {
+            float xt[8];
+            for (int i = 0; i < 8; i++) {
+                xt[i] = float(act[TOPK * I + k + lane * 8 + i]);
+            }
+            for (int r = 0; r < RPS; r++) {
+                const uint2 w = *(const device uint2*)(sw + r * I + k);
+                sh[r] += mm3_mxfp8_dot8(w, xt, fp4_scale_e8m0(ss[r * (I / 32) + k / 32]));
+            }
+        }
+    }
+    for (int r = 0; r < RPS; r++) {
+        float routed[TOPK];
+        for (int t = 0; t < TOPK; t++) {
+            routed[t] = simd_sum(y[t][r]);
+        }
+        const float shared_sum = simd_sum(sh[r]);
+        if (lane == 0) {
+            float total = 0.0f;
+            for (int t = 0; t < TOPK; t++) {
+                const float weighted = float(static_cast<T>(routed[t])) * weights[t];
+                total = total + weighted;
+            }
+            const float combined = float(static_cast<T>(total));
+            out[j + r] = static_cast<T>(combined + float(static_cast<T>(shared_sum)));
+        }
+    }
+"""
+
+
+@cache
+def _experts_header() -> str:
+    from omlx.patches import fp4_expert_rows
+
+    return fp4_expert_rows._HEADER + _EXPERTS_HEADER
+
+
+@cache
+def _gate_up_swiglu_kernel():
+    return mx.fast.metal_kernel(
+        name="minimax_m3_moe_gate_up_swiglu",
+        input_names=[
+            "x",
+            "inds",
+            "gate_w",
+            "gate_s",
+            "gate_scale",
+            "up_w",
+            "up_s",
+            "up_scale",
+            "sh_gate_w",
+            "sh_gate_s",
+            "sh_up_w",
+            "sh_up_s",
+            "params",
+        ],
+        output_names=["act"],
+        header=_experts_header(),
+        source=_GATE_UP_SWIGLU_SOURCE,
+    )
+
+
+@cache
+def _down_combine_kernel():
+    return mx.fast.metal_kernel(
+        name="minimax_m3_moe_down_combine",
+        input_names=[
+            "act",
+            "inds",
+            "weights",
+            "down_w",
+            "down_s",
+            "sh_down_w",
+            "sh_down_s",
+        ],
+        output_names=["out"],
+        header=_experts_header(),
+        source=_DOWN_COMBINE_SOURCE,
+    )
+
+
+@cache
+def _swiglu_params(alpha: float, limit: float, beta: float) -> mx.array:
+    return mx.array([alpha, limit, beta], dtype=mx.float32)
+
+
+def _mxfp8(linear, k: int) -> bool:
+    return (
+        getattr(linear, "mode", None) == "mxfp8"
+        and getattr(linear, "bits", None) == 8
+        and getattr(linear, "group_size", None) == 32
+        and linear.get("biases") is None
+        and linear.get("bias") is None
+        and linear.weight.dtype == mx.uint32
+        and linear.weight.shape[-1] * 4 == k
+        and k % 256 == 0
+    )
+
+
+def moe_experts(x, inds, weights, switch, shared) -> mx.array | None:
+    """One token's ``_combine_routed(switch(x, inds), weights) + shared(x)`` in
+    two launches, or None when not covered.
+
+    ``switch`` is a ``MiniMaxScaledSwitchGLU`` with NVFP4 banks, ``shared`` a
+    ``MiniMaxMLP`` with MXFP8 projections, ``weights`` the FP32 routing
+    weights with the down scales folded in. Every weight row of both is read
+    in the same dispatch: gate, up and the activation in the first, down, the
+    combine and the shared add in the second.
+    """
+    from .moe_rows import _nvfp4
+
+    hidden = x.shape[-1]
+    top_k = inds.size
+    if shared is None or getattr(switch, "gate_scale", None) is None:
+        return None
+    gate, up, down = switch.gate_proj, switch.up_proj, switch.down_proj
+    inter = down.weight.shape[-1] * 8
+    act_fn, shared_act = switch.activation, shared.act_fn
+    params = (act_fn.alpha, act_fn.limit, act_fn.beta)
+    if not (
+        x.size == hidden
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and inds.dtype == mx.uint32
+        and weights.dtype == mx.float32
+        and weights.size == top_k
+        # _combine_routed's sum is MLX's col_reduce_small, one expert per
+        # thread up to eight, so it adds the experts in order.
+        and 1 <= top_k <= 8
+        and _nvfp4(gate, hidden)
+        and _nvfp4(up, hidden)
+        and _nvfp4(down, inter)
+        and gate.weight.shape[1] == up.weight.shape[1] == inter
+        and down.weight.shape[1] == hidden
+        and _mxfp8(shared.gate_proj, hidden)
+        and _mxfp8(shared.up_proj, hidden)
+        and _mxfp8(shared.down_proj, inter)
+        and shared.gate_proj.weight.shape[0] == shared.up_proj.weight.shape[0] == inter
+        and shared.down_proj.weight.shape[0] == hidden
+        and (shared_act.alpha, shared_act.limit, shared_act.beta) == params
+        and mx.metal.is_available()
+    ):
+        return None
+    template = [("T", x.dtype), ("H", hidden), ("I", inter), ("TOPK", top_k)]
+    act = _gate_up_swiglu_kernel()(
+        inputs=[
+            x,
+            inds,
+            gate.weight,
+            gate.scales,
+            switch.gate_scale,
+            up.weight,
+            up.scales,
+            switch.up_scale,
+            shared.gate_proj.weight,
+            shared.gate_proj.scales,
+            shared.up_proj.weight,
+            shared.up_proj.scales,
+            _swiglu_params(*params),
+        ],
+        template=template + [("RPS", _GATE_UP_RPS)],
+        grid=(32, (top_k + 1) * inter // _GATE_UP_RPS, 1),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(top_k + 1, inter)],
+        output_dtypes=[x.dtype],
+    )[0]
+    return _down_combine_kernel()(
+        inputs=[
+            act,
+            inds,
+            weights,
+            down.weight,
+            down.scales,
+            shared.down_proj.weight,
+            shared.down_proj.scales,
+        ],
+        template=template + [("RPS", _DOWN_RPS)],
+        grid=(32, hidden // _DOWN_RPS, 1),
+        threadgroup=(32, 2, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[x.dtype],
+    )[0]
