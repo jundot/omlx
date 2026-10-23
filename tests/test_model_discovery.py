@@ -695,6 +695,38 @@ class TestDetectModelType:
         assert detect_model_type(mlx_copy) == "decision"
         assert detect_model_type(other_family) == "llm"
 
+    def test_detect_baselabs_from_protocol_metadata_after_renaming(self, tmp_path):
+        model_dir = tmp_path / "renamed-mlx-8bit"
+        model_dir.mkdir()
+        config = {
+            "model_type": "qwen3_5",
+            "vision_config": {"hidden_size": 1152},
+            "modeling_overrides": {
+                "attention": {
+                    "full_attention": "block_bidirectional",
+                    "linear_attention": "causal",
+                },
+                "readout": "slot_lm",
+                "n_slots": 256,
+            },
+        }
+        (model_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(model_dir) == "vlm"
+        (model_dir / "readout.json").write_text(
+            json.dumps({"readout": "slot_lm", "n_slots": 256})
+        )
+        assert decision_kind(model_dir) == "baselabs"
+        assert detect_model_type(model_dir) == "decision"
+        config["text_config"] = {"max_position_embeddings": 262144}
+        (model_dir / "config.json").write_text(json.dumps(config))
+        assert _read_model_context_length(model_dir) == 16384
+        config["text_config"]["max_position_embeddings"] = 8192
+        (model_dir / "config.json").write_text(json.dumps(config))
+        assert _read_model_context_length(model_dir) == 8192
+        config["modeling_overrides"]["attention"]["full_attention"] = "causal"
+        (model_dir / "config.json").write_text(json.dumps(config))
+        assert decision_kind(model_dir) is None
+
     def test_detect_qwen3_causal_lm_is_llm(self, tmp_path):
         """Qwen3 with CausalLM architecture should be LLM, not embedding."""
         config = {
