@@ -717,9 +717,9 @@ def test_native_glm_indexer_scores_match_mlx_reference_when_available():
     config.index_head_dim = 128
     indexer = Glm5NextIndexer(config)
     mx.random.seed(23)
-    q = mx.random.normal((1, 5, 32, 128), dtype=mx.float16)
+    q = mx.random.normal((1, 37, 32, 128), dtype=mx.float16)
     keys = mx.random.normal((1, 7, 128), dtype=mx.float16)
-    weights = mx.random.normal((1, 5, 32), dtype=mx.float16)
+    weights = mx.random.normal((1, 37, 32), dtype=mx.float16)
     actual = indexer._native_scores(q, keys, weights)
     if actual is None:
         pytest.skip("GLM DSA indexer kernel rejected the installed ABI")
@@ -4863,3 +4863,326 @@ def test_load_model_dequantizes_quantized_router_gate(monkeypatch):
 @pytest.fixture(autouse=True)
 def _pin_verify_router(monkeypatch):
     monkeypatch.setattr(dk, "moe_router", _stock_verify_router(dk.moe_router))
+
+
+def _indexer_reference(q, pool_keys, weights):
+    f32 = mx.float32
+    scores = q.astype(f32) @ pool_keys[:, None].astype(f32).swapaxes(-1, -2)
+    return mx.sum(weights.astype(f32)[..., None] * mx.maximum(scores, 0), axis=2)
+
+
+def _assert_matches_indexer_reference(actual, q, pool_keys, weights):
+    reference = _indexer_reference(q, pool_keys, weights)
+    mx.eval(actual, reference)
+    assert actual.shape == reference.shape
+    assert mx.allclose(
+        actual.astype(mx.float32), reference, atol=0.08, rtol=0.02
+    ).item()
+
+
+def _native_decode_indexer():
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    config = _tiny_config().text_config
+    config.index_n_heads = 32
+    config.index_head_dim = 128
+    config.index_kpool = 4
+    config.index_topk = 2048
+    indexer = Glm5NextIndexer(config)
+    indexer.set_dtype(mx.bfloat16)
+    return indexer, config
+
+
+def _pin_gpu_without_fused_decode(monkeypatch):
+    # A GPU where _fast_short_select never serves one sequence's short rows,
+    # so _native_scores routes them off the padded tile.
+    monkeypatch.setattr(dk, "fused_decode_supported", lambda: False)
+
+
+def _require_native_kernel(symbol):
+    from omlx.custom_kernels.sparse_index import fast
+
+    if not fast.has_symbol(symbol):
+        pytest.skip(f"GLM DSA native {symbol} kernel is not built")
+    return fast
+
+
+def _count_kernel_calls(monkeypatch, fast, symbol):
+    calls = []
+    kernel = getattr(fast, symbol)
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return kernel(*args, **kwargs)
+
+    monkeypatch.setattr(fast, symbol, counted)
+    return calls
+
+
+def _forbid_padded_tile(monkeypatch, fast):
+    monkeypatch.setattr(
+        fast,
+        "dsa_indexer_scores",
+        lambda *a, **k: pytest.fail("decode must not use the padded prefill tile"),
+    )
+
+
+@pytest.mark.parametrize("pool_len,native", [(4095, False), (4096, True), (8199, True)])
+def test_glm5_next_decode_indexer_uses_fused_decode_scan(pool_len, native, monkeypatch):
+    fast = _require_native_kernel("dsa_decode_scores")
+    indexer, _ = _native_decode_indexer()
+    calls = _count_kernel_calls(monkeypatch, fast, "dsa_decode_scores")
+    _forbid_padded_tile(monkeypatch, fast)
+    mx.random.seed(29)
+    q = (mx.random.normal((2, 1, 32, 128)) * 0.5).astype(mx.bfloat16)
+    keys = (mx.random.normal((2, pool_len, 128)) * 0.5).astype(mx.bfloat16)
+    weights = (mx.random.normal((2, 1, 32)) * 0.1).astype(mx.bfloat16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert (actual is not None) is native
+    assert len(calls) == int(native)
+    if actual is not None:
+        _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+@pytest.mark.parametrize("rows,native", [(2, False), (31, False), (32, True)])
+def test_glm5_next_indexer_pads_to_the_tile_only_from_32_query_rows(
+    rows, native, monkeypatch
+):
+    fast = _require_native_kernel("dsa_indexer_scores")
+    _pin_gpu_without_fused_decode(monkeypatch)
+    indexer, _ = _native_decode_indexer()
+    calls = _count_kernel_calls(monkeypatch, fast, "dsa_indexer_scores")
+    mx.random.seed(61)
+    q = (mx.random.normal((1, rows, 32, 128)) * 0.5).astype(mx.bfloat16)
+    keys = (mx.random.normal((1, 4100, 128)) * 0.5).astype(mx.bfloat16)
+    weights = (mx.random.normal((1, rows, 32)) * 0.1).astype(mx.bfloat16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert (actual is not None) is native
+    assert len(calls) == int(native)
+    if actual is not None:
+        _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+def test_glm5_next_decode_indexer_reads_non_row_contiguous_keys():
+    _require_native_kernel("dsa_decode_scores")
+    indexer, _ = _native_decode_indexer()
+    mx.random.seed(31)
+    q = (mx.random.normal((2, 1, 32, 128)) * 0.5).astype(mx.bfloat16)
+    transposed = (mx.random.normal((2, 128, 4099)) * 0.5).astype(mx.bfloat16)
+    mx.eval(transposed)
+    keys = transposed.swapaxes(1, 2)  # last-axis stride != 1
+    weights = (mx.random.normal((2, 1, 32)) * 0.1).astype(mx.bfloat16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert actual is not None
+    _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+def test_glm5_next_decode_scan_matches_reference_in_float16():
+    _require_native_kernel("dsa_decode_scores")
+    indexer, _ = _native_decode_indexer()
+    mx.random.seed(67)
+    q = (mx.random.normal((2, 1, 32, 128)) * 0.5).astype(mx.float16)
+    keys = (mx.random.normal((2, 4096, 128)) * 0.5).astype(mx.float16)
+    weights = (mx.random.normal((2, 1, 32)) * 0.1).astype(mx.float16)
+    actual = indexer._native_scores(q, keys, weights)
+    assert actual is not None
+    assert actual.dtype == mx.float16
+    _assert_matches_indexer_reference(actual, q, keys, weights)
+
+
+def _forbid_decode_scan(monkeypatch, fast):
+    monkeypatch.setattr(
+        fast,
+        "dsa_decode_scores",
+        lambda *a, **k: pytest.fail("the decode scan must not run here"),
+    )
+
+
+# The tests below replace the kernels with Python stand-ins, so they pin the
+# routing on every build, with or without the native extension or a GPU.
+
+
+@pytest.mark.parametrize("rows,pool_len", [(1, 8192), (1, 100), (2, 8192), (31, 8192)])
+def test_glm5_next_indexer_without_the_decode_scan_never_pads_short_queries(
+    rows, pool_len, monkeypatch
+):
+    from omlx.custom_kernels.sparse_index import fast
+
+    # Only the prefill tile is built: short queries still take the fallback.
+    _pin_gpu_without_fused_decode(monkeypatch)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: name == "dsa_indexer_scores")
+    _forbid_padded_tile(monkeypatch, fast)
+    _forbid_decode_scan(monkeypatch, fast)
+    indexer, _ = _native_decode_indexer()
+    q = mx.zeros((1, rows, 32, 128), dtype=mx.bfloat16)
+    keys = mx.zeros((1, pool_len, 128), dtype=mx.bfloat16)
+    weights = mx.zeros((1, rows, 32), dtype=mx.bfloat16)
+    assert indexer._native_scores(q, keys, weights) is None
+
+
+def test_glm5_next_decode_scan_receives_the_kernel_call_shapes(monkeypatch):
+    from omlx.custom_kernels.sparse_index import fast
+
+    seen = {}
+
+    def decode_scan(q, keys, weights):
+        seen.update(q=q.shape, keys=keys.shape, weights=weights.shape)
+        return mx.zeros((q.shape[0], 1, 1, keys.shape[2]), dtype=q.dtype)
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "dsa_decode_scores", decode_scan)
+    _forbid_padded_tile(monkeypatch, fast)
+    indexer, _ = _native_decode_indexer()
+    scores = indexer._native_scores(
+        mx.zeros((3, 1, 32, 128), dtype=mx.bfloat16),
+        mx.zeros((3, 5000, 128), dtype=mx.bfloat16),
+        mx.zeros((3, 1, 32), dtype=mx.bfloat16),
+    )
+    # q [B,H,1,D], keys [B,1,P,D], weights [B,H] in; scores [B,1,P] out.
+    assert seen == {"q": (3, 32, 1, 128), "keys": (3, 1, 5000, 128), "weights": (3, 32)}
+    assert scores.shape == (3, 1, 5000)
+
+
+@pytest.mark.parametrize(
+    "batch,rows,fused_gpu,route",
+    [
+        (1, 1, True, "tile"),
+        (1, 8, True, "tile"),
+        (1, 9, True, None),
+        (2, 1, True, "scan"),
+        (2, 4, True, None),
+        (1, 1, False, "scan"),
+        (1, 8, False, None),
+    ],
+)
+def test_glm5_next_indexer_keeps_the_tile_only_where_the_fused_selection_replays_it(
+    batch, rows, fused_gpu, route, monkeypatch
+):
+    from omlx.custom_kernels.sparse_index import fast
+
+    taken = []
+
+    def tile(qt, keys, weights, causal=True, **_kwargs):
+        taken.append("tile")
+        return mx.zeros((qt.shape[0], 1, qt.shape[2], keys.shape[2]), dtype=qt.dtype)
+
+    def scan(q, keys, weights, **_kwargs):
+        taken.append("scan")
+        return mx.zeros((q.shape[0], 1, 1, keys.shape[2]), dtype=q.dtype)
+
+    monkeypatch.setattr(dk, "fused_decode_supported", lambda: fused_gpu)
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    monkeypatch.setattr(fast, "dsa_indexer_scores", tile)
+    monkeypatch.setattr(fast, "dsa_decode_scores", scan)
+    indexer, _ = _native_decode_indexer()
+    scores = indexer._native_scores(
+        mx.zeros((batch, rows, 32, 128), dtype=mx.bfloat16),
+        mx.zeros((batch, 5000, 128), dtype=mx.bfloat16),
+        mx.zeros((batch, rows, 32), dtype=mx.bfloat16),
+    )
+    assert taken == ([route] if route else [])
+    assert (scores is None) is (route is None)
+    if scores is not None:
+        assert scores.shape == (batch, rows, 5000)
+
+
+@pytest.mark.parametrize("rows", [1, 37])
+def test_glm5_next_indexer_falls_back_when_the_pool_dtype_differs(rows, monkeypatch):
+    from omlx.custom_kernels.sparse_index import fast
+
+    monkeypatch.setattr(fast, "has_symbol", lambda name: True)
+    _forbid_padded_tile(monkeypatch, fast)
+    _forbid_decode_scan(monkeypatch, fast)
+    indexer, _ = _native_decode_indexer()
+    assert (
+        indexer._native_scores(
+            mx.zeros((1, rows, 32, 128), dtype=mx.bfloat16),
+            mx.zeros((1, 5000, 128), dtype=mx.float16),
+            mx.zeros((1, rows, 32), dtype=mx.bfloat16),
+        )
+        is None
+    )
+
+
+def _feed_indexer(indexer, config, cache, tokens, seed):
+    mx.random.seed(seed)
+    shape = (1, tokens)
+    x = mx.random.normal((*shape, config.hidden_size)) * 0.5
+    qr = mx.random.normal((*shape, config.q_lora_rank)) * 0.5
+    out = indexer(x.astype(mx.bfloat16), qr.astype(mx.bfloat16), None, cache=cache)
+    mx.eval(out)
+
+
+def _decode_step_matches_reference(indexer, config, cache, batch, monkeypatch):
+    from mlx_vlm.models.glm5_next import language
+    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
+
+    from omlx.custom_kernels.sparse_index import fast
+
+    # On M3 and newer GPUs a one-sequence decode step takes the fused decode
+    # selection (on M5 also the NAX indexer) instead of _native_scores, and
+    # _native_scores keeps the padded tile for those rows as that path's
+    # exact reference. Pin a GPU without the fused path, the route a batched
+    # step takes on every GPU, so these tests check the scan for one
+    # sequence too.
+    monkeypatch.setattr(language, "_DECODE_FUSION", False)
+    monkeypatch.setattr(language, "nax_indexer_available", lambda: False)
+    _pin_gpu_without_fused_decode(monkeypatch)
+    seen = []
+    original = Glm5NextIndexer._native_scores
+
+    def spy(self, q, pool_keys, weights):
+        out = original(self, q, pool_keys, weights)
+        seen.append((q, pool_keys, weights, out))
+        return out
+
+    monkeypatch.setattr(Glm5NextIndexer, "_native_scores", spy)
+    _forbid_padded_tile(monkeypatch, fast)
+    mx.random.seed(37)
+    x = mx.random.normal((batch, 1, config.hidden_size)) * 0.5
+    qr = mx.random.normal((batch, 1, config.q_lora_rank)) * 0.5
+    mx.eval(indexer(x.astype(mx.bfloat16), qr.astype(mx.bfloat16), None, cache=cache))
+    assert len(seen) == 1
+    q, pool_keys, weights, actual = seen[0]
+    assert q.shape[1] == 1 and pool_keys.shape[1] >= 4096
+    assert actual is not None, "decode must take the native scan at this depth"
+    _assert_matches_indexer_reference(actual, q, pool_keys, weights)
+
+
+def test_glm5_next_decode_scan_matches_reference_through_pooling_cache(monkeypatch):
+    from mlx_lm.models.cache import PoolingCache
+
+    _require_native_kernel("dsa_decode_scores")
+    indexer, config = _native_decode_indexer()
+    cache = PoolingCache(4)
+    # Two prefill chunks so the pool buffer grows past its first allocation.
+    _feed_indexer(indexer, config, cache, 8192, seed=41)
+    _feed_indexer(indexer, config, cache, 8210, seed=43)
+    _decode_step_matches_reference(indexer, config, cache, 1, monkeypatch)
+
+
+def test_glm5_next_decode_scan_matches_reference_after_state_restore(monkeypatch):
+    from mlx_lm.models.cache import PoolingCache
+
+    _require_native_kernel("dsa_decode_scores")
+    indexer, config = _native_decode_indexer()
+    source = PoolingCache(4)
+    _feed_indexer(indexer, config, source, 16410, seed=47)
+    restored = PoolingCache(4)
+    restored.state = source.state
+    restored.meta_state = source.meta_state
+    _decode_step_matches_reference(indexer, config, restored, 1, monkeypatch)
+
+
+def test_glm5_next_decode_scan_matches_reference_for_batched_unequal_pools(
+    monkeypatch,
+):
+    from mlx_lm.models.cache import BatchPoolingCache, PoolingCache
+
+    _require_native_kernel("dsa_decode_scores")
+    indexer, config = _native_decode_indexer()
+    first, second = PoolingCache(4), PoolingCache(4)
+    _feed_indexer(indexer, config, first, 16400, seed=53)
+    _feed_indexer(indexer, config, second, 17003, seed=59)
+    batch = BatchPoolingCache.merge([first, second])
+    _decode_step_matches_reference(indexer, config, batch, 2, monkeypatch)

@@ -58,6 +58,10 @@ from .sparse_mla_decode import (
 
 logger = logging.getLogger(__name__)
 _NATIVE_INDEXER_WARNED = False
+# Pooled-key count from which the fused single-query decode scan replaces
+# the MLX matmul, the same key-count gate the GLM-5.x deepseek_v32 decode
+# path applies to this kernel; below it the two measure at parity.
+_NATIVE_DECODE_MIN_POOL = 4096
 
 
 # Causal row blocks of the dense-prefix attention (1 = one call).
@@ -877,9 +881,37 @@ class Glm5NextIndexer(nn.Module):
         try:
             from omlx.custom_kernels.sparse_index import fast
 
+            qt = q.transpose(0, 2, 1, 3)
+            # On M3 and newer GPUs _fast_short_select serves one sequence's
+            # decode and verify rows (up to _DECODE_BLOCK) with scores that
+            # replay this padded tile bit for bit, so for those shapes the
+            # tile stays this general path's exact reference. Every other
+            # short query (batched decode and verify, or any GPU without the
+            # fused path) skips the padding below.
+            fused_reference = (
+                q.shape[0] == 1
+                and q.shape[1] <= _DECODE_BLOCK
+                and _decode_kernels.fused_decode_supported()
+            )
+            if q.shape[1] == 1 and not fused_reference:
+                # Decode should not pay for a 64-row prefill tile.
+                if pool_keys.shape[1] < _NATIVE_DECODE_MIN_POOL or not (
+                    fast.has_symbol("dsa_decode_scores")
+                ):
+                    return None
+                # The kernel assumes a unit-stride last axis at eval; its
+                # graph-time check cannot detect lazy transposed views. This
+                # guard can also copy capacity-backed and batched pool slices.
+                keys = mx.contiguous(pool_keys)[:, None]
+                return fast.dsa_decode_scores(
+                    qt, keys, weights.reshape(weights.shape[0], self.n_heads)
+                )[:, 0]
+            if q.shape[1] < 32 and not fused_reference:
+                # Short multi-query chunks: the 64-row tile loses to the MLX
+                # matmul below roughly 32-48 rows on M3 Ultra.
+                return None
             if not fast.has_symbol("dsa_indexer_scores"):
                 return None
-            qt = q.transpose(0, 2, 1, 3)
             keys = pool_keys[:, None]
             q_pad = (-qt.shape[2]) % _NATIVE_INDEXER_MATRIX_TILE_ROWS
             k_pad = (-keys.shape[2]) % _NATIVE_INDEXER_MATRIX_TILE_ROWS
