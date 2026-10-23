@@ -16,7 +16,11 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 
 from ..engine_core import get_mlx_executor
-from ..models.embedding import EmbeddingOutput, MLXEmbeddingModel
+from ..models.embedding import (
+    EmbeddingOutput,
+    MLXEmbeddingModel,
+    TokenEmbeddingOutput,
+)
 from .base import BaseNonStreamingEngine
 from .forward_fairness import ForwardFairnessGate
 
@@ -244,6 +248,101 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             return output
         finally:
             self._end_activity(activity_id)
+
+    async def embed_token_ids(
+        self,
+        ids_batch: List[List[int]],
+        max_length: int | None = None,
+    ) -> TokenEmbeddingOutput:
+        """Per-token vectors for explicit token ids (late interaction / MaxSim).
+
+        Mirrors :meth:`embed`: model work runs on the global MLX executor, the
+        activity is reported, the batch is length-grouped and the caller's order
+        is restored before returning. The caller owns the token window; the
+        returned rows are sliced to each sequence's own length.
+        """
+        if self._model is None:
+            raise RuntimeError("Engine not started. Call start() first.")
+
+        model = self._model
+        sequences = [list(ids) for ids in ids_batch]
+        if not sequences:
+            return TokenEmbeddingOutput(
+                token_embeddings=[], total_tokens=0, dimensions=0
+            )
+
+        batch_size = self._batch_size
+        activity_id = self._begin_activity(
+            "embedding",
+            detail="Token embeddings",
+            total_items=len(sequences),
+            metadata={"input_count": len(sequences), "batch_size": batch_size},
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            token_embeddings: List[List[List[float]]] = []
+            total_tokens = 0
+            dimensions = 0
+
+            order = sorted(range(len(sequences)), key=lambda i: len(sequences[i]))
+            ordered_sequences = [sequences[i] for i in order]
+
+            fairness = self._fairness
+            index = 0
+            while index < len(ordered_sequences):
+                # Limit each forward while another engine is decoding.
+                cap = fairness.chunk_cap()
+                size = batch_size if cap is None else max(1, min(batch_size, cap))
+                batch = ordered_sequences[index:index + size]
+                index += len(batch)
+
+                def _embed_sync(batch=batch):
+                    contended = fairness.wait_turn()
+                    start_ts = time.perf_counter()
+                    try:
+                        return model.embed_token_ids(
+                            batch, max_length=max_length
+                        )
+                    finally:
+                        mx.synchronize()
+                        fairness.settle(
+                            time.perf_counter() - start_ts, len(batch), contended
+                        )
+                        if fairness.should_clear_cache():
+                            mx.clear_cache()
+
+                output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+                token_embeddings.extend(output.token_embeddings)
+                total_tokens += output.total_tokens
+                if output.dimensions:
+                    dimensions = output.dimensions
+                self._update_activity(
+                    activity_id,
+                    completed_items=min(index, len(sequences)),
+                    token_count=total_tokens,
+                    dimensions=dimensions,
+                )
+
+            if len(token_embeddings) == len(order):
+                restored: List[List[List[float]]] = [[]] * len(order)
+                for position, original_index in enumerate(order):
+                    restored[original_index] = token_embeddings[position]
+                token_embeddings = restored
+
+            output = TokenEmbeddingOutput(
+                token_embeddings=token_embeddings,
+                total_tokens=total_tokens,
+                dimensions=dimensions,
+            )
+            self._update_activity(
+                activity_id,
+                token_count=output.total_tokens,
+                dimensions=output.dimensions,
+            )
+            return output
+        finally:
+            self._end_activity(activity_id)
+
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
