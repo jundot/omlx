@@ -98,6 +98,10 @@ Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_pref
 
 Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, exact SpecPrefill static-prefix sidecars, off-boundary completion, and unknown or inconsistent cache positions.
 
+# Prefix cache serving statistics
+
+Run `python -m pytest -q tests/test_prefix_cache_restore_stats.py tests/test_cache_observability.py tests/test_runtime_cache_observability.py` to check serving cache hit rates and saved-token counters. Serving lookups count only KV retained after reconstruction and prefix/kickoff guards. A stale index match with no restored KV is a miss; a partial restore counts only its reusable tokens. Memory requeues do not count the same external request again. These tests use real paged metadata, hot-cache tensor storage and KV/ArraysCache reconstruction with small arrays, without a model download.
+
 # Batch KV capacity tests
 
 Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `omlx/patches/vlm_batch_kv_capacity.py` or bumping the mlx-lm or mlx-vlm pin. The tests load the installed, unpatched cache module next to the patched one and compare cache state and attention output bit for bit through random appends, trims, rollbacks, merges, joins, filters and restores. They cover the mlx-vlm class, the mlx-lm class that prefix restore builds, and a batch that mixes both.

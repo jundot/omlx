@@ -10439,10 +10439,9 @@ class Scheduler:
                     request.request_id,
                     request.prompt_token_ids,
                     extra_keys=request.vlm_extra_keys_for_cache,
-                    extra_key_token_start=(
-                        request.vlm_extra_key_token_start_for_cache
-                    ),
+                    extra_key_token_start=(request.vlm_extra_key_token_start_for_cache),
                     extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                    record_stats=False,
                 )
             fetch_ms = (time.perf_counter() - fetch_started) * 1000.0
             # A split GDN sidecar represents state at a full block boundary.
@@ -10613,6 +10612,14 @@ class Scheduler:
                     )
             else:
                 request.remaining_tokens = request.prompt_token_ids
+            # Index matches can outlive their tensor payloads, and successful
+            # reconstruction can still be truncated or rejected above. Count
+            # only the final reusable KV, once per external request; memory
+            # requeues restore this request's own progress.
+            if not _request_count(request, "memory_requeues"):
+                self.block_aware_cache.record_cache_result(
+                    len(request.prompt_token_ids), request.cached_tokens
+                )
         else:
             # No paged SSD cache configured - process all tokens
             request.remaining_tokens = request.prompt_token_ids
