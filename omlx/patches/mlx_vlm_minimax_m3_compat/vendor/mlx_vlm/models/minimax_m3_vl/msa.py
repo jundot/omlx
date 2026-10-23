@@ -974,42 +974,47 @@ def small_l_block_scores(
 
 
 # Sparse attention for decode and short verify calls, split over the selected
-# blocks. Pass 1 runs one threadgroup per (row, KV head, query, selected
-# block): it scores the block's keys for the KV head's query heads, keeps the
-# block-local softmax max and sum, and accumulates P @ V. Pass 2 merges the
-# per-block partials with log-sum-exp. Every query row is computed the same
-# way whatever L is, so a verify row matches a one-token decode step.
+# blocks. Pass 1 runs one threadgroup per (row, KV head, query, group of GT
+# query heads, selected block): it scores the block's keys for the group's
+# query heads, keeps the block-local softmax max and sum, and accumulates
+# P @ V. Pass 2 merges the per-block partials with log-sum-exp. Every query
+# row is computed the same way whatever L is, so a verify row matches a
+# one-token decode step.
 _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
     name="minimax_m3_msa_small_l_partials",
     input_names=["q", "k", "v", "block_ids", "qpos", "pad", "meta", "scale", "vk"],
     output_names=["part_o", "part_m", "part_l"],
     ensure_row_contiguous=False,
     source=r"""
-        // BLOCK * (G / HPT) threads: thread t scores key t % BLOCK for the HPT
-        // query heads of group t / BLOCK, and accumulates P @ V for the same
-        // heads at its dimensions. Every value is computed as with one thread
-        // per key for all G heads; HPT only spreads the work.
-        constexpr int HG = G / HPT;
+        // BLOCK * (GT / HPT) threads for GT of the KV head's G query heads:
+        // thread t scores key t % BLOCK for the HPT query heads of group
+        // t / BLOCK, and accumulates P @ V for the same heads at its
+        // dimensions. Every value is computed as with one thread per key for
+        // all G heads; GT and HPT only spread the work.
+        constexpr int HG = GT / HPT;
         constexpr int TG = BLOCK * HG;
         uint slot = threadgroup_position_in_grid.x;
-        uint kl = threadgroup_position_in_grid.y;
+        uint klg = threadgroup_position_in_grid.y;
         uint b = threadgroup_position_in_grid.z;
         uint t = thread_index_in_threadgroup;
         uint simd = t / 32;
         uint lane = t % 32;
-        int kv = int(kl) / L;
-        int l = int(kl) % L;
+        int kl = int(klg) / (G / GT);
+        int gs = int(klg) % (G / GT);
+        int kv = kl / L;
+        int l = kl % L;
         int total_len = meta[0];
         float sm_scale = scale[0];
 
-        threadgroup float4 q_s[G * D / 4];
-        threadgroup float p_s[G * BLOCK];
+        threadgroup float4 q_s[GT * D / 4];
+        threadgroup float p_s[GT * BLOCK];
         threadgroup int col_s[BLOCK];
-        threadgroup float m_s[G];
-        threadgroup float l_s[G];
+        threadgroup float m_s[GT];
+        threadgroup float l_s[GT];
+        threadgroup uint4 v_s[STAGE_V ? CH * D / 8 : 1];
 
-        for (uint i = t; i < uint(G * D / 4); i += TG) {
-            int h = int(i) / (D / 4);
+        for (uint i = t; i < uint(GT * D / 4); i += TG) {
+            int h = gs * GT + int(i) / (D / 4);
             int q_off = ((int(b) * H_KV * G + kv * G + h) * L + l) * D + (int(i) % (D / 4)) * 4;
             q_s[i] = float4(
                 float(q[q_off]), float(q[q_off + 1]), float(q[q_off + 2]), float(q[q_off + 3])) * sm_scale;
@@ -1063,7 +1068,7 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (int h = int(simd); h < G; h += TG / 32) {
+        for (int h = int(simd); h < GT; h += TG / 32) {
             float m = -INFINITY;
             for (int j = int(lane); j < BLOCK; j += 32) {
                 m = max(m, p_s[h * BLOCK + j]);
@@ -1090,31 +1095,70 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
             int other = block_ids[row * TOPK + r];
             rank += other < blk || (other == blk && r < int(slot));
         }
-        int part = (row * TOPK + rank) * G;
-        for (int idx = int(t); idx < D * HG; idx += TG) {
-            int d = idx % D;
-            int g0 = (idx / D) * HPT;
+        int part = (row * TOPK + rank) * G + gs * GT;
+        bool v_vec = v_strides[3] == 1 && ((v_strides[0] | v_strides[1] | v_strides[2]) & 7) == 0;
+        if (STAGE_V && v_vec) {
+            // The block's values reach threadgroup memory CH keys at a time
+            // through coalesced 16-byte loads, all issued before the first
+            // chunk is summed. Thread t owns one (head group, dimension), and
+            // each (head, dimension) still sums P @ V over the keys in order.
+            constexpr int VPT = BLOCK * D / 8 / TG;
+            constexpr int CL = CH * D / 8 / TG;
+            uint4 vr[VPT > 0 ? VPT : 1];
+            int v_head = int(b) * v_strides[0] + kv * v_strides[1];
+            for (int i = 0; i < VPT; ++i) {
+                int e = int(t) + i * TG;
+                vr[i] = *(const device uint4*)(
+                    v + v_head + col_s[e / (D / 8)] * v_strides[2] + (e % (D / 8)) * 8);
+            }
+            int d = int(t) % D;
+            int g0 = (int(t) / D) * HPT;
             float acc[HPT];
             for (int h = 0; h < HPT; ++h) {
                 acc[h] = 0.0f;
             }
-            int v_base = int(b) * v_strides[0] + kv * v_strides[1] + d * v_strides[3];
-            for (int j0 = 0; j0 < BLOCK; j0 += 8) {
-                float vv[8];
-                for (int u = 0; u < 8; ++u) {
-                    vv[u] = float(v[v_base + col_s[j0 + u] * v_strides[2]]);
+            for (int c = 0; c < BLOCK / CH; ++c) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int i = 0; i < CL; ++i) {
+                    v_s[int(t) + i * TG] = vr[c * CL + i];
                 }
-                for (int u = 0; u < 8; ++u) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int u = 0; u < CH; ++u) {
+                    float vv = float(((threadgroup T*)v_s)[u * D + d]);
                     for (int h = 0; h < HPT; ++h) {
-                        acc[h] += p_s[(g0 + h) * BLOCK + j0 + u] * vv[u];
+                        acc[h] += p_s[(g0 + h) * BLOCK + c * CH + u] * vv;
                     }
                 }
             }
             for (int h = 0; h < HPT; ++h) {
                 part_o[(part + g0 + h) * D + d] = acc[h];
             }
+        } else {
+            for (int idx = int(t); idx < D * HG; idx += TG) {
+                int d = idx % D;
+                int g0 = (idx / D) * HPT;
+                float acc[HPT];
+                for (int h = 0; h < HPT; ++h) {
+                    acc[h] = 0.0f;
+                }
+                int v_base = int(b) * v_strides[0] + kv * v_strides[1] + d * v_strides[3];
+                for (int j0 = 0; j0 < BLOCK; j0 += 8) {
+                    float vv[8];
+                    for (int u = 0; u < 8; ++u) {
+                        vv[u] = float(v[v_base + col_s[j0 + u] * v_strides[2]]);
+                    }
+                    for (int u = 0; u < 8; ++u) {
+                        for (int h = 0; h < HPT; ++h) {
+                            acc[h] += p_s[(g0 + h) * BLOCK + j0 + u] * vv[u];
+                        }
+                    }
+                }
+                for (int h = 0; h < HPT; ++h) {
+                    part_o[(part + g0 + h) * D + d] = acc[h];
+                }
+            }
         }
-        if (t < uint(G)) {
+        if (t < uint(GT)) {
             part_m[part + int(t)] = m_s[t];
             part_l[part + int(t)] = l_s[t];
         }
@@ -1124,6 +1168,13 @@ _MSA_SMALL_L_PARTIALS = mx.fast.metal_kernel(
 # Query heads per thread of the partials kernel: fewer heads per thread mean
 # more threads per (row, block) to hide the key and value loads.
 _SMALL_L_HEADS_PER_THREAD = 4
+# Query heads per threadgroup of the partials kernel (when it divides the KV
+# head's query heads): more, smaller threadgroups spread a decode step's few
+# blocks over more of the GPU.
+_SMALL_L_HEADS_PER_THREADGROUP = 8
+# Keys per chunk when the partials kernel stages a block's values through
+# threadgroup memory.
+_SMALL_L_VALUE_CHUNK = 32
 
 _MSA_SMALL_L_COMBINE = mx.fast.metal_kernel(
     name="minimax_m3_msa_small_l_combine",
@@ -1210,10 +1261,24 @@ def small_l_sparse_attention(
         ("HAS_MASK", valid_keys is not None),
         ("HAS_PAD", left_padding is not None),
     ]
+    gt = min(G, _SMALL_L_HEADS_PER_THREADGROUP)
+    if G % gt:
+        gt = G
     hpt = _SMALL_L_HEADS_PER_THREAD
-    if G % hpt or block_size * (G // hpt) > 1024:
-        hpt = G
-    threads = block_size * (G // hpt)
+    if gt % hpt or block_size * (gt // hpt) > 1024:
+        hpt = gt
+    threads = block_size * (gt // hpt)
+    # Staging gives each thread one (head group, dimension) of P @ V and
+    # every thread the same share of each chunk's loads.
+    chunk = _SMALL_L_VALUE_CHUNK
+    stage = (
+        block_size == D
+        and values.dtype.size == 2
+        and block_size % chunk == 0
+        and (chunk * D // 8) % threads == 0
+        and gt * (D + block_size) * 4 + block_size * 4 + gt * 8 + chunk * D * 2
+        <= 32768
+    )
     rows = B * H_kv * L * topk * G
     part_o, part_m, part_l = _MSA_SMALL_L_PARTIALS(
         inputs=[
@@ -1227,8 +1292,9 @@ def small_l_sparse_attention(
             mx.array([scale], dtype=mx.float32),
             qpos if valid_keys is None else valid_keys,
         ],
-        template=template + [("HPT", hpt)],
-        grid=(topk * threads, H_kv * L, B),
+        template=template
+        + [("HPT", hpt), ("GT", gt), ("CH", chunk), ("STAGE_V", stage)],
+        grid=(topk * threads, H_kv * L * (G // gt), B),
         threadgroup=(threads, 1, 1),
         output_shapes=[(rows, D), (rows,), (rows,)],
         output_dtypes=[mx.float32, mx.float32, mx.float32],

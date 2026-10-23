@@ -971,3 +971,63 @@ def test_block_selection_kernel_matches_argpartition(language, blocks):
     selected = msa.small_l_select_blocks(negated, 16)
     assert selected is not None
     assert mx.array_equal(selected, expected).item()
+
+
+@pytest.mark.parametrize("length", [1, 5])
+def test_small_l_sparse_attention_staging_changes_no_bit(language, monkeypatch, length):
+    import mlx_vlm.models.minimax_m3_vl.msa as msa
+
+    # M3.1's layout: blocks as long as the head dimension, 16 query heads per
+    # KV head.
+    batch, heads, kv_heads, dim = 2, 32, 2, 128
+    total, block, topk = 1200, 128, 4
+    pad = np.array([45, 0], dtype=np.int32)
+    rng = np.random.default_rng(3)
+    q, k, v = (
+        mx.array(rng.standard_normal(shape).astype(np.float32)).astype(mx.bfloat16)
+        for shape in (
+            (batch, heads, length, dim),
+            (batch, kv_heads, total, dim),
+            (batch, kv_heads, total, dim),
+        )
+    )
+    keep = mx.array(rng.random((batch, 1, length, total)) > 0.1)
+    qpos = np.stack([np.arange(total - p - length, total - p) for p in pad]).astype(
+        np.int32
+    )
+    block_ids = mx.array(
+        np.stack(
+            [rng.permutation(qpos[b, -1] // block + 1)[:topk] for b in range(batch)]
+        )[:, None, None, :]
+        .repeat(kv_heads, 1)
+        .repeat(length, 2),
+        dtype=mx.int32,
+    )
+
+    def attend(values, mask, padding):
+        return msa.small_l_sparse_attention(
+            q, k, values, block_ids, mx.array(qpos), padding, block, dim**-0.5, mask
+        )
+
+    # Value rows 132 apart cannot take the 16-byte loads staging uses, so the
+    # kernel reads each value from device memory instead.
+    v_rows = mx.pad(v, [(0, 0), (0, 0), (0, 0), (0, 4)])[..., :dim]
+
+    kernel = msa._MSA_SMALL_L_PARTIALS
+    templates = []
+    monkeypatch.setattr(
+        msa,
+        "_MSA_SMALL_L_PARTIALS",
+        lambda **kw: templates.append(dict(kw["template"])) or kernel(**kw),
+    )
+    outs = [attend(v, keep, mx.array(pad)), attend(v, None, None)]
+    assert templates[0]["GT"] == 8 and templates[0]["STAGE_V"]
+
+    # Every grouping, chunk and value layout computes the same bits, including
+    # one threadgroup for all 16 heads reading values from device memory.
+    for heads_per_group, chunk in ((16, 32), (8, 32), (4, 32), (8, 64)):
+        monkeypatch.setattr(msa, "_SMALL_L_HEADS_PER_THREADGROUP", heads_per_group)
+        monkeypatch.setattr(msa, "_SMALL_L_VALUE_CHUNK", chunk)
+        for values in (v, v_rows):
+            assert mx.array_equal(attend(values, keep, mx.array(pad)), outs[0]).item()
+            assert mx.array_equal(attend(values, None, None), outs[1]).item()
