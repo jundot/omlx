@@ -34,7 +34,8 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev", "d3"]
+DecisionKind = Literal["clef", "openjev", "d3", "baselabs"]
+BASELABS_CONTEXT_LENGTH = 16_384
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -121,6 +122,8 @@ DECISION_SIDECAR_FILES = (
     *DECISION_SIDECAR_WEIGHTS,
     CLEF_HEAD_CONFIG,
     D3_DECISION_CONFIG,
+    "readout.json",  # Mammoth-1 / Elephant-1 slot readout metadata
+    "calibration.json",
 )
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)
@@ -505,6 +508,15 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
             return None
     if config.get("model_type") != "qwen3_5":
         return None
+    overrides = config.get("modeling_overrides")
+    if isinstance(overrides, dict):
+        attention = overrides.get("attention")
+        if (
+            isinstance(attention, dict)
+            and attention.get("full_attention") == "block_bidirectional"
+            and (model_path / "readout.json").is_file()
+        ):
+            return "baselabs"
     if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
         model_path
     ):
@@ -1002,6 +1014,17 @@ def _read_model_context_length(model_path: Path) -> int | None:
         except (OSError, json.JSONDecodeError) as e:
             logger.debug(f"Failed to read config.json for {model_path}: {e}")
             model_config = {}
+
+        # The decision models were trained for 16K, even though their Qwen
+        # backbone still declares its original 256K positional capacity.
+        if decision_kind(model_path, model_config) == "baselabs":
+            text_config = model_config.get("text_config") or model_config
+            value = text_config.get("max_position_embeddings")
+            return (
+                min(value, BASELABS_CONTEXT_LENGTH)
+                if isinstance(value, int) and value > 0
+                else BASELABS_CONTEXT_LENGTH
+            )
 
         for key in _CONTEXT_LENGTH_KEYS:
             value = model_config.get(key)
