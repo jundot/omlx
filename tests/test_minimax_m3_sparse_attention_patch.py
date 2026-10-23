@@ -902,3 +902,18 @@ def test_one_token_experts_combine_in_mlx_order(language):
         y = dk.moe_experts(x, inds, weights, switch, shared)
         assert y is not None
         assert mx.array_equal(y, expected).item()
+
+
+@pytest.mark.parametrize("k,n", [(512, 64), (1024, 512), (2048, 8192)])
+def test_one_row_mxfp8_kernel_matches_quantized_matmul(language, k, n):
+    import mlx_vlm.models.minimax_m3_vl.decode_kernels as dk
+
+    mx.random.seed(59)
+    proj = nn.QuantizedLinear.from_linear(
+        nn.Linear(k, n, bias=False), group_size=32, bits=8, mode="mxfp8"
+    )
+    for scale in (0.5, 4.0):
+        x = (mx.random.normal((1, 1, k)) * scale).astype(mx.bfloat16)
+        y = dk.mxfp8_one_row(x, proj.weight, proj.scales)
+        assert y is not None
+        assert mx.array_equal(y, proj(x)).item()

@@ -858,3 +858,79 @@ def moe_experts(x, inds, weights, switch, shared) -> mx.array | None:
         output_shapes=[x.shape],
         output_dtypes=[x.dtype],
     )[0]
+
+
+# MLX fp_qmv_fast for one MXFP8 row (lane l takes values [256 b + 8 l, +8) of
+# block b, an 8-term dot times its group's E8M0 scale, blocks summed in order,
+# then simd_sum), RPS output columns per simdgroup and NSG simdgroups per
+# threadgroup: the column arithmetic does not depend on the tiling, which
+# here keeps more weight loads in flight than MLX's 4 x 2.
+_MXFP8_ONE_ROW_SOURCE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const int n0 = (int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup)) * RPS;
+    if (n0 >= N) {
+        return;
+    }
+    const device uint8_t* wl = (const device uint8_t*)w + size_t(n0) * K + lane * 8;
+    const device uint8_t* sl = s + size_t(n0) * (K / 32) + lane / 4;
+    const device T* xl = x + lane * 8;
+    float acc[RPS];
+    for (int r = 0; r < RPS; r++) {
+        acc[r] = 0;
+    }
+    for (int k = 0; k < K; k += 256) {
+        float xt[8];
+        for (int i = 0; i < 8; i++) {
+            xt[i] = float(xl[k + i]);
+        }
+        for (int r = 0; r < RPS; r++) {
+            const uint2 wv = *(const device uint2*)(wl + r * K + k);
+            acc[r] += mm3_mxfp8_dot8(wv, xt, fp4_scale_e8m0(sl[r * (K / 32) + k / 32]));
+        }
+    }
+    for (int r = 0; r < RPS; r++) {
+        const float v = simd_sum(acc[r]);
+        if (lane == 0) {
+            y[n0 + r] = static_cast<T>(v);
+        }
+    }
+"""
+
+
+@cache
+def _mxfp8_one_row_kernel():
+    return mx.fast.metal_kernel(
+        name="minimax_m3_mxfp8_one_row",
+        input_names=["x", "w", "s"],
+        output_names=["y"],
+        header=_experts_header(),
+        source=_MXFP8_ONE_ROW_SOURCE,
+    )
+
+
+def mxfp8_one_row(x: mx.array, weight: mx.array, scales: mx.array) -> mx.array | None:
+    """``x @ dequantized(weight).T`` for one row of an MXFP8 projection with
+    MLX ``fp_qmv_fast``'s arithmetic, or None when not covered."""
+    k = x.shape[-1]
+    n = weight.shape[0]
+    nsg = 8 if n >= 8192 else 4
+    if not (
+        x.size == k
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and weight.dtype == mx.uint32
+        and weight.shape == (n, k // 4)
+        and scales.dtype == mx.uint8
+        and scales.shape == (n, k // 32)
+        and k % 256 == 0
+        and n % (4 * nsg) == 0
+        and mx.metal.is_available()
+    ):
+        return None
+    return _mxfp8_one_row_kernel()(
+        inputs=[x, weight, scales],
+        template=[("T", x.dtype), ("K", k), ("N", n), ("RPS", 4), ("NSG", nsg)],
+        grid=(32, n // 4, 1),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(*x.shape[:-1], n)],
+        output_dtypes=[x.dtype],
+    )[0]

@@ -5,9 +5,10 @@ a one-row decode step, and from three rows on they stream the weights again
 for every row. ``exact_rows_qmv`` keeps MLX ``fp_qmv_fast``'s per-row
 arithmetic and 32-lane reduction order but reads each weight once for all
 rows, so speculative verify rows and small decode batches match one-row decode
-bit for bit. The base checkpoint's BF16 vocabulary head runs through
-``exact_verify_gemv`` for the same reason: MLX's one-row GEMV with every row
-sharing a weight load.
+bit for bit. One-row MXFP8 calls run ``decode_kernels.mxfp8_one_row``, the
+same arithmetic with more weight loads in flight. The base checkpoint's BF16
+vocabulary head runs through ``exact_verify_gemv`` for the same reason as the
+rows: MLX's one-row GEMV with every row sharing a weight load.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from omlx.patches import row_exact_qmv
+
+from . import decode_kernels
 from omlx.patches.deepseek_v4.verify_qmv import (
     dense_eligible,
     exact_rows_qmv,
@@ -23,7 +26,6 @@ from omlx.patches.deepseek_v4.verify_qmv import (
 )
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
 
-MIN_ROWS = 2
 MAX_ROWS = 8
 # Up to this many rows keep their inputs in registers. Longer calls read them
 # from cache inside the row loop, which avoids register spills.
@@ -38,12 +40,13 @@ _WIDE_OUTPUT_COLUMNS = 65536
 def mxfp8_rows_matmul(
     x: mx.array, weight: mx.array, scales: mx.array, quant: dict
 ) -> mx.array | None:
-    """``x @ dequantized(weight).T`` for 2-8 rows, or None when not covered."""
+    """``x @ dequantized(weight).T`` for 1-8 rows, every row with one-row
+    decode arithmetic, or None when not covered."""
     k = x.shape[-1]
     rows = x.size // k
     n = weight.shape[0]
     if not (
-        MIN_ROWS <= rows <= MAX_ROWS
+        1 <= rows <= MAX_ROWS
         and quant.get("mode") == "mxfp8"
         and quant.get("bits") == 8
         and quant.get("group_size") == 32
@@ -56,6 +59,8 @@ def mxfp8_rows_matmul(
         and mx.metal.is_available()
     ):
         return None
+    if rows == 1:
+        return decode_kernels.mxfp8_one_row(x, weight, scales)
     held = rows <= _HELD_INPUT_MAX_ROWS
     y = exact_rows_qmv(
         x.reshape(rows, k),
