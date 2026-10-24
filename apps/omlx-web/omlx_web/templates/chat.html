@@ -2145,11 +2145,11 @@
 
                         <!-- Model picker -->
                         <div x-show="currentModel && availableModels.length > 0" x-cloak
-                            class="composer-menu min-w-0" x-data="{ open: false }"
+                            class="composer-menu min-w-0" style="max-width: 15rem;" x-data="{ open: false }"
                             @click.outside="open = false"
                             @keydown.escape="if (open) { open = false; $event.stopPropagation(); }">
                             <button @click="open = !open" class="composer-pill" :class="{ 'is-open': open }"
-                                :title="window.t('chat.switch_model')" :aria-expanded="open" style="max-width: 15rem;">
+                                :title="window.t('chat.switch_model')" :aria-expanded="open" style="max-width: 100%;">
                                 <i data-lucide="box" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
                                 <span class="truncate min-w-0" :title="(availableModels.find(m => m.id === currentModel)?.name) || currentModel" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
                                 <i data-lucide="chevron-down" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
