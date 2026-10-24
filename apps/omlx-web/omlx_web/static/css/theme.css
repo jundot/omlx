@@ -275,6 +275,51 @@
     --timeline-accent: rgb(var(--palette-blue-500));
     --focus-ring-color: rgb(var(--palette-neutral-900));
     color-scheme: light;
+
+    /* Named steps. Values match what the console draws today; the utility
+       layer starts resolving through them in the next steps. */
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+    --radius-pill: 9999px;
+    --shadow-raised: 0 1px 2px 0 rgb(var(--palette-black) / 0.05);
+    --shadow-overlay: 0 4px 12px 0 rgb(var(--palette-black) / 0.15);
+    --z-sticky: 30;
+    --z-dropdown: 40;
+    --z-overlay: 50;
+    --z-modal: 60;
+    --z-toast: 1000;
+    --layout-rail: 260px;
+    --layout-rail-wide: 320px;
+    --layout-measure: 768px;
+
+    /* Named surfaces. Opaque, so a text tier's contrast does not depend on
+       whatever happens to sit behind the surface. */
+    --surface-card: rgb(var(--palette-white));
+    --surface-strip: rgb(var(--palette-neutral-100));
+    --surface-control: rgb(var(--palette-neutral-200));
+    --surface-raised: rgb(var(--palette-white));
+    --surface-danger-soft: rgb(var(--palette-red-50));
+    --surface-warning-soft: rgb(var(--palette-amber-50));
+
+    /* Channel values for the neutral utilities (rgb, so /alpha still works).
+       The dashboard's dark values live in dashboard.css, next to the page that
+       loads it: the chat page has its own theme and must not inherit them. */
+    --text-scale-300: 212 212 212;
+    --text-scale-400: 115 115 115;
+    --text-scale-500: 115 115 115;
+    --text-scale-600: 82 82 82;
+    --text-scale-700: 64 64 64;
+    --text-scale-800: 38 38 38;
+    --text-scale-900: 23 23 23;
+    --surface-scale-white: 255 255 255;
+    --surface-scale-50: 250 250 250;
+    --surface-scale-100: 245 245 245;
+    --surface-scale-200: 229 229 229;
+    --border-scale-100: 245 245 245;
+    --border-scale-200: 229 229 229;
+    --border-scale-300: 212 212 212;
 }
 
 [data-theme="dark"] {
@@ -297,6 +342,14 @@
     --timeline-accent: rgb(var(--palette-blue-400));
     --focus-ring-color: rgb(var(--palette-night-50));
     color-scheme: dark;
+
+    --surface-card: rgb(var(--palette-night-800));
+    --surface-strip: rgb(var(--palette-night-700));
+    --surface-control: rgb(var(--palette-night-700));
+    --surface-raised: rgb(var(--palette-night-800));
+    --surface-danger-soft: rgb(67 42 45);
+    --surface-warning-soft: rgb(68 55 37);
+
 }
 
 /* === Native select controls ===

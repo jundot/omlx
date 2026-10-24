@@ -243,6 +243,12 @@ module.exports = {
           DEFAULT: 'var(--bg-primary)',
           alt: 'var(--bg-secondary)',
           muted: 'var(--bg-tertiary)',
+          card: 'var(--surface-card)',
+          strip: 'var(--surface-strip)',
+          control: 'var(--surface-control)',
+          raised: 'var(--surface-raised)',
+          'danger-soft': 'var(--surface-danger-soft)',
+          'warning-soft': 'var(--surface-warning-soft)',
         },
         fg: {
           DEFAULT: 'var(--text-primary)',
@@ -264,6 +270,30 @@ module.exports = {
           bg: 'var(--bg-danger-hover)',
         },
         code: 'var(--code-bg)',
+      },
+      // Named steps from theme.css. Values are additive: existing utilities
+      // keep their Tailwind scale until the consolidation step moves them.
+      borderRadius: {
+        card: 'var(--radius-lg)',
+        pill: 'var(--radius-pill)',
+      },
+      boxShadow: {
+        raised: 'var(--shadow-raised)',
+        overlay: 'var(--shadow-overlay)',
+      },
+      zIndex: {
+        sticky: 'var(--z-sticky)',
+        dropdown: 'var(--z-dropdown)',
+        overlay: 'var(--z-overlay)',
+        modal: 'var(--z-modal)',
+        toast: 'var(--z-toast)',
+      },
+      width: {
+        rail: 'var(--layout-rail)',
+        'rail-wide': 'var(--layout-rail-wide)',
+      },
+      maxWidth: {
+        measure: 'var(--layout-measure)',
       },
       animation: {
         'fade-in-up': 'fadeInUp 0.5s ease-out forwards',
