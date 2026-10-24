@@ -388,6 +388,10 @@ class ModelSettings:
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
     deepseek_v41_ced_prefill_enabled: bool = False
+    # Recast the checkpoint's bfloat16 leaves (scales, norms, embeddings) to
+    # float16 after load, so the forward runs on the GPU's native float16 path
+    # instead of the emulated bfloat16 one. Quantized payloads are untouched.
+    activation_fp16_enabled: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
