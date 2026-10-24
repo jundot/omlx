@@ -683,6 +683,36 @@ def test_flat_overhead_throttle_keeps_the_chunk_its_prediction_fits():
     assert _call(generic, 8192) <= Scheduler._PREFILL_STEP_TIERS[0]
 
 
+def test_qwen4_released_overhead_does_not_shrink_chunks_to_the_floor():
+    """Replay sequential 34K-token prompts on a 128 GB M5 Max. Every pool clear
+    re-armed the overhead an 8192-token chunk had shown, so each later chunk
+    was charged it and the prefill ran at 32 tokens, and admission priced the
+    32-token floor chunk at 2.9 GB. A chunk is charged what was measured up to
+    its width."""
+    ns = _throttle_ctx(current=0, hard=117.5 * _GB, monitor=_qwen4_monitor())
+    for n_tokens, kv_len, delta_mb in (
+        (8192, 0, 5130),
+        (2048, 8192, 1580),
+        (32, 10240, 148),
+    ):
+        Scheduler._record_chunk_transient(
+            ns,
+            n_tokens,
+            0,
+            delta_mb * 1024**2,
+            request_id="earlier",
+            loop_label="incident-replay",
+            kv_len=kv_len,
+            requested_step=8192,
+            gathered_core=True,
+        )
+    ns._prefill_transient_tracker.record_flat_reclaim(8 * _GB)
+    ns._fake_current = int(102.65 * _GB)
+
+    assert _call(ns, 7552, kv_len=17024, gathered_core=True) >= 2048
+    assert ns._admission_transient_bound(32, 34_000, gathered_core=True) < _GB / 2
+
+
 @pytest.mark.parametrize(
     ("markers", "predicted", "expected"),
     [([], True, True), ([True, True], False, True), ([True, False], True, False)],

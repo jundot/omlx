@@ -13,7 +13,7 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,8 @@ class _TransientHistory:
     observed_max_bytes: int = 0
     flat_overhead_bytes: int = 0
     reclaim_debt_bytes: int = 0
+    # Chunk width -> largest growth beyond the static profile at that width.
+    width_overhead_bytes: dict[int, int] = field(default_factory=dict)
 
 
 class PrefillTransientTracker:
@@ -188,6 +190,13 @@ class PrefillTransientTracker:
         # growth beyond both that repayment and the static profile is overhead.
         reallocated = min(history.reclaim_debt_bytes, max(0, delta_bytes))
         history.reclaim_debt_bytes -= reallocated
+        if representative and delta_bytes >= 0:
+            # Whatever it repaid, the chunk's growth past the static profile is
+            # what a chunk this wide allocates.
+            widths = history.width_overhead_bytes
+            widths[n_tokens] = max(
+                widths.get(n_tokens, 0), delta_bytes - max(0, static_bytes)
+            )
         residual = delta_bytes - reallocated - max(0, static_bytes)
         if residual <= noise or not representative:
             return
@@ -217,12 +226,25 @@ class PrefillTransientTracker:
                 history.reclaim_debt_bytes + int(reclaimed_bytes),
             )
 
-    def flat_overhead_charge_for(self, gathered_core: bool) -> int:
+    def flat_overhead_charge_for(self, gathered_core: bool, n_tokens: int = 0) -> int:
         history = self._history(gathered_core)
         # Retained pool growth is already present in the scheduler's current
         # physical-footprint reading. Charging it again double-counts it.
         # Only the portion actually reclaimed can be reallocated next chunk.
-        return min(history.flat_overhead_bytes, history.reclaim_debt_bytes)
+        charge = min(history.flat_overhead_bytes, history.reclaim_debt_bytes)
+        # A chunk's overhead grows with its width (Qwen3.8-Flash-Next: about
+        # 140 MB at 32 tokens, 1 GB at 2048, 2.9 GB at 8192), so a chunk is
+        # charged at most the largest overhead measured up to the nearest
+        # width at or above its own.
+        widths = history.width_overhead_bytes
+        wider = [width for width in widths if width >= n_tokens]
+        if n_tokens > 0 and wider:
+            nearest = min(wider)
+            charge = min(
+                charge,
+                max(bytes_ for width, bytes_ in widths.items() if width <= nearest),
+            )
+        return charge
 
     def predict(
         self,
