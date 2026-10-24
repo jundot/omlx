@@ -679,6 +679,52 @@ def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
     ).item()
 
 
+
+def test_qwen4_resident_ple_looks_up_shard_windows_on_device():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    mx.random.seed(44)
+    # 12 shards: the first two hold 11 rows, the rest 10.
+    embedding = ShardedEmbedding(122, 64, 12)
+    embedding.shards = [
+        nn.QuantizedEmbedding.from_embedding(
+            shard,
+            group_size=32,
+            bits=4,
+            mode="affine",
+        )
+        for shard in embedding.shards
+    ]
+    # Columns spanning 1, 2, 5 and 9 shards, each with its range's first and
+    # last rows and the rows on both sides of every shard boundary inside it.
+    ranges = ((3, 9), (5, 30), (20, 70), (11, 102))
+    columns = []
+    for low, high in ranges:
+        rows = [low, high - 1, *range(low, high, 7)]
+        for offset in embedding.shard_offsets:
+            rows += [r for r in (offset - 1, offset) if low <= r < high]
+        columns.append(rows)
+    count = max(len(rows) for rows in columns)
+    indices = mx.array(
+        [[rows[i % len(rows)] for rows in columns] for i in range(count)],
+        dtype=mx.int64,
+    )[None]
+    expected = embedding(indices)
+    gathered = embedding._windowed_lookup(indices, ranges)
+    actual = embedding(indices, ranges)
+    mx.eval(expected, actual)
+
+    assert gathered is not None
+    assert mx.array_equal(actual, expected).item()
+    # A column spanning more shards than one launch reads keeps the host
+    # dispatch, with the same rows.
+    wide = ((0, 122),) * 4
+    assert embedding._windowed_lookup(indices, wide) is None
+    assert mx.array_equal(embedding(indices, wide), expected).item()
+
+
 def test_qwen4_quantization_sanitize_keeps_mmap_ple_shards(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
