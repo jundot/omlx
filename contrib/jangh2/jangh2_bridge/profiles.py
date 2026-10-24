@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import subprocess
 import tempfile
+from ._shared import shared_source_root
 
 ENV_KEYS={
  'gate_rows':'OMLX_JANGH_METAL_GATE_ROWS','down_rows':'OMLX_JANGH_METAL_DOWN_ROWS',
@@ -31,8 +32,10 @@ def atomic_json(path,value):
 
 def source_fingerprint():
     root=Path(__file__).parent;digest=hashlib.sha256()
-    for p in sorted(root.rglob('*.py')):
-        digest.update(p.relative_to(root).as_posix().encode()+b'\0'+p.read_bytes())
+    for prefix, source_root in (('diagnostics',root),('runtime',shared_source_root())):
+        for p in sorted(source_root.rglob('*.py')):
+            name=f'{prefix}/{p.relative_to(source_root).as_posix()}'
+            digest.update(name.encode()+b'\0'+p.read_bytes())
     return digest.hexdigest()
 
 

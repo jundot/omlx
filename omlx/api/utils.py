@@ -14,6 +14,9 @@ from .openai_models import Message
 _NATIVE_REASONING_MODEL_TYPES = {
     "minimax_m3",
     "minimax_m3_vl",
+    # Qwen4 (including Allosaurus/JANGH2) renders historical reasoning_content
+    # itself. Keep it separate even when discovery has no template metadata.
+    "qwen4_exp",
     # Inkling's chat template renders history reasoning_content back into
     # <|content_thinking|> blocks.
     "inkling",

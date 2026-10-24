@@ -52,6 +52,11 @@ class TextConfig(BaseModelConfig):
     ngram_vocab_size_base: int = 20_000_000
     make_ngram_vocab_size_divisible_by: int = 128
     split_ngram_parts: int = 128
+    # Model-local storage overrides for strict custom-quantization loaders.
+    # Ordinary loads retain the configure_ple_runtime defaults when unset.
+    ple_storage_mode: Optional[str] = None
+    ple_model_path: Optional[str] = None
+    ple_tensor_prefixes: Optional[Dict[str, str]] = None
     seed: int = 1234
     indexer_n_heads: int = 4
     indexer_kv_heads: int = 1
@@ -79,6 +84,10 @@ class TextConfig(BaseModelConfig):
     )
 
     def __post_init__(self):
+        if self.ple_storage_mode not in (None, "resident", "mmap"):
+            raise ValueError("ple_storage_mode must be resident or mmap")
+        if self.ple_storage_mode == "mmap" and not self.ple_model_path:
+            raise ValueError("Explicit PLE mmap storage requires ple_model_path")
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
         if self.ple_embed_dim is None:
@@ -178,6 +187,9 @@ class ModelConfig(BaseModelConfig):
     eos_token_id: Optional[Union[int, List[int]]] = None
     quantization: Optional[Dict] = None
     quantization_config: Optional[Dict] = None
+    # None preserves the existing runtime setting; strict loaders may disable
+    # unsupported MTP without changing another loaded model's global defaults.
+    mtp_enabled: Optional[bool] = None
 
     def __post_init__(self):
         if self.image_token_index is None:

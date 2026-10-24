@@ -821,6 +821,18 @@ class EnginePool:
                 exc_info=True,
             )
             return False, False, None
+        # The packed JANGH2 loader always uses SSD-backed PLE, independently
+        # of a host's spare RAM or the generic Qwen4 resident-table setting.
+        # Price that actual storage mode and keep the engine reuse signature
+        # consistent with it. Ordinary Qwen4 checkpoints retain the policy below.
+        from .models.jangh2 import is_jangh2_config
+
+        try:
+            config = json.loads((Path(entry.model_path) / "config.json").read_text())
+        except (OSError, ValueError):
+            config = {}
+        if isinstance(config, dict) and is_jangh2_config(config):
+            return True, True, estimate if estimate.supported else None
         # Normal residency calls use the stable ceiling so a post-unload
         # vm_stat dip cannot pin the new engine to SSD. Pre-load admission may
         # pass its earlier live ceiling explicitly when only mmap fits.
@@ -858,17 +870,36 @@ class EnginePool:
         *,
         ceiling: int | None = None,
     ) -> object | None:
-        """Apply a forced mmap decision without mutating persisted settings."""
+        """Resolve native storage and capability limits on a runtime copy."""
 
+        effective = settings
+        # Older discovery auto-enabled MTP from the embedded tensor names.
+        # Packed JANGH2 heads are not executable yet; ignore that stale setting
+        # for this load while preserving the user's saved configuration.
+        if settings is not None and any(
+            getattr(settings, name, False)
+            for name in ("mtp_enabled", "vlm_mtp_enabled")
+        ):
+            from .models.jangh2 import is_jangh2_config
+
+            try:
+                config = json.loads((Path(entry.model_path) / "config.json").read_text())
+            except (OSError, ValueError):
+                config = {}
+            if isinstance(config, dict) and is_jangh2_config(config):
+                effective = copy.copy(settings)
+                effective.mtp_enabled = False
+                effective.vlm_mtp_enabled = False
         enabled, forced, _ = self._qwen4_ple_offload_status(
             entry,
             settings,
             ceiling=ceiling,
         )
         if not enabled or not forced or settings is None:
-            return settings
-        effective = copy.copy(settings)
-        setattr(effective, "qwen4_ple_ssd_offload", True)
+            return effective
+        if effective is settings:
+            effective = copy.copy(settings)
+        effective.qwen4_ple_ssd_offload = True
         return effective
 
     def _deepseek_v41_engram_offload_status(
@@ -1138,9 +1169,11 @@ class EnginePool:
         if settings is None:
             return None
 
+        entry = self._entries.get(model_id)
+        if entry is not None:
+            settings = self._effective_qwen4_model_settings(entry, settings)
         to_dict = getattr(settings, "to_dict", None)
         data = to_dict() if callable(to_dict) else {}
-        entry = self._entries.get(model_id)
         is_diffusion = bool(entry and self._entry_is_diffusion_model(entry))
 
         def has_value(key: str) -> bool:

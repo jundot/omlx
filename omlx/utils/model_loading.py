@@ -1476,6 +1476,10 @@ def lightning_mtp_supported(model_path: str | Path) -> bool:
         return False
     if not isinstance(config, dict):
         return False
+    from ..models.jangh2 import is_jangh2_config
+
+    if is_jangh2_config(config):
+        return False
     quantization = config.get("quantization_config") or {}
     if str(quantization.get("quant_method") or "").lower() == "paroquant":
         return False
@@ -1631,6 +1635,8 @@ def maybe_load_custom_quantization(
     model_name: str,
     *,
     is_vlm: bool,
+    model_settings: Any | None = None,
+    trust_remote_code: bool = False,
 ) -> tuple[Any, Any] | None:
     """Load models that require a custom upstream quantization loader.
 
@@ -1652,6 +1658,28 @@ def maybe_load_custom_quantization(
             e,
         )
         return None
+
+    from ..models.jangh2 import is_jangh2_config
+
+    if is_jangh2_config(config):
+        if not is_vlm:
+            raise ValueError(
+                "JANGH2 packed experts require the Qwen4 VLM engine; "
+                "the text-only affine loader cannot load this format"
+            )
+        if any(
+            getattr(model_settings, name, False)
+            for name in ("mtp_enabled", "vlm_mtp_enabled")
+        ):
+            raise ValueError(
+                "JANGH2 packed-expert MTP is not supported; disable Lightning MTP "
+                "for this checkpoint"
+            )
+        if getattr(model_settings, "moe_expert_offload_enabled", False):
+            raise ValueError("JANGH2 packed-expert offload is not supported")
+        from ..models.jangh2.loader import load as load_jangh2
+
+        return load_jangh2(model_name, trust_remote_code=trust_remote_code)
 
     quant_config = config.get("quantization_config")
     quant_method = quant_config.get("quant_method") if quant_config else None

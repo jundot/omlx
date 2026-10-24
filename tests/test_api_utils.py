@@ -639,6 +639,29 @@ class TestExtractTextContentNativeReasoningContent:
 
 
 class TestUsesNativeReasoningContent:
+    @pytest.mark.parametrize("type_field", ["config_model_type", "engine_model_type"])
+    @pytest.mark.parametrize(
+        "extractor", [extract_text_content, extract_multimodal_content]
+    )
+    def test_qwen4_history_stays_native_without_discovery_metadata(
+        self, type_field, extractor
+    ):
+        native = uses_native_reasoning_content(
+            "Allosaurus-v0.1-125B-A6B-JANGH2",
+            **{type_field: "qwen4_exp"},
+        )
+        assert native
+        messages = [
+            Message(role="user", content="What is two plus two?"),
+            Message(role="assistant", content="Four.", reasoning_content="Two pairs."),
+        ]
+        history = extractor(messages, native_reasoning_content=native)
+        assert history[1] == {
+            "role": "assistant",
+            "content": "Four.",
+            "reasoning_content": "Two pairs.",
+        }
+
     def test_detects_minimax_m3_by_config_type(self):
         assert uses_native_reasoning_content(
             "any-name",

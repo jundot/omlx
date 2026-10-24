@@ -2,11 +2,31 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
-from jangh2_bridge.profiles import launch_profile,require_qualification,atomic_json
+from jangh2_bridge.profiles import launch_profile,require_qualification,atomic_json,source_fingerprint
 
 class ProfileSafetyTests(unittest.TestCase):
+    def test_fingerprinting_does_not_initialize_gpu_in_legacy_runtime(self):
+        root=Path(__file__).resolve().parents[1]
+        code=('import sys; sys.path.insert(0, '+repr(str(root))+'); '
+              'from jangh2_bridge.profiles import source_fingerprint; '
+              'source_fingerprint(); assert "mlx.core" not in sys.modules')
+        with tempfile.TemporaryDirectory() as cwd:
+            result=subprocess.run([sys.executable,'-c',code],cwd=cwd,
+                                  capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_shared_runtime_edits_invalidate_diagnostic_profiles(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);source=root/'metal_ops.py';source.write_text('version = 1\n')
+            with patch('jangh2_bridge.profiles.shared_source_root',return_value=root):
+                before=source_fingerprint()
+                source.write_text('version = 2\n')
+                self.assertNotEqual(source_fingerprint(),before)
+
     def test_explicit_environment_wins_and_defaults_restore_after_exception(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'profile.json';p.write_text(json.dumps({'schema':1,'fingerprint':{'code':'x'},

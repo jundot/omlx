@@ -1,27 +1,24 @@
-# Experimental JANGH2 backend — upstream review package
+# JANGH2 diagnostics and legacy serving adapter
 
-This is an **additive RFC**, not a completed port to current oMLX `main`.
-It packages the tested local bridge, the subsequent diagnostic fixes,
-regression tests, qualification/tuning tools, and a reversible default-command
-installer. It deliberately does not edit current oMLX core files or dependency
-pins. Applying this patch alone does **not** teach current `omlx serve` to load
-JANGH2. The explicit launcher installs runtime compatibility hooks.
+Current oMLX loads JANGH2 Qwen4-Exp checkpoints through its ordinary VLM backend.
+Use `omlx serve --model-dir /path/to/models`; see [native support and optional
+thinking](../../docs/JANGH2.md). The production numerical implementation lives in
+`omlx/models/jangh2`. The bridge modules here import that same implementation so
+kernel qualification and native serving cannot silently diverge.
+
+This directory retains qualification, tuning, workload and full-model comparison
+tools, plus the legacy PR #364 serving adapter and reversible command installer.
+The adapter targets oMLX `0.3.0rc1`, MLX-LM `0.31.2` and MLX-VLM `0.7.8`.
+Its private scheduler hooks are unnecessary for current native serving. Do not
+install those legacy hooks into a current server.
 
 ## Compatibility boundary
 
-The real-serving reports came from the PR #364 checkout (`0.3.0rc1`) with local
-repairs and an upgraded virtual environment. Reference PR head:
-`a77d410f3f5948854bb42e5363239883282ac1d4`.
-
-The upstream review reference is
-`98de1482882fe22edd1310a0c428bddd94b9f006` (`0.7.3.dev1`). Its scheduler and
-MLX dependency interfaces differ from those used by this bridge. Current-main
-runtime integration must be reviewed and hardware-tested before merging as a
-normal server feature. See [UPSTREAM.md](UPSTREAM.md).
-
-Do not replace a working installation with upstream `main` just to submit this
-patch. The installer below retains the existing checkout, virtual environment,
-bridge sources, checkpoint, API key and settings. It does not install packages.
+The historical PR reference is `a77d410f3f5948854bb42e5363239883282ac1d4`.
+Native integration is based on oMLX `0.7.3.dev1` with the dependencies pinned by
+the root project. Both paths have separate hardware acceptance records in
+[VERIFICATION.md](VERIFICATION.md). The legacy installer retains its selected
+checkout, environment, API key and settings and does not install packages.
 
 ## Contents
 
@@ -57,7 +54,7 @@ python -m unittest discover -s tests -v
 These tests include CPU numerical checks, API doubles, temporary safetensors,
 resource-limit checks and local synthetic HTTP servers. They do not establish
 Apple Metal compilation, full-model equivalence, or support for new upstream
-APIs. See `VERIFICATION.md` for this packaging run's evidence.
+APIs. See `VERIFICATION.md` for the recorded test boundaries.
 
 ## Use with an existing known-good runtime
 
@@ -178,7 +175,7 @@ actual server settings, not just a free-form benchmark label.
 
 ## Licence and provenance
 
-The bridge remains under its included MIT licence. `NOTICE.md` describes the
+The shared numerical implementation is covered by its [MIT licence](../../omlx/models/jangh2/LICENSE). `NOTICE.md` describes the
 original implementation and upstream interfaces consulted. Referenced oMLX,
 MLX-LM, MLX-VLM and optional JANG components retain their original licences.
 No upstream JANG kernel implementation or model-weight licence is redistributed
