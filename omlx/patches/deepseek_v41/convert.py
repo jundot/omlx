@@ -11,6 +11,9 @@ import json
 import os
 import re
 import shutil
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import mlx.core as mx
@@ -188,6 +191,107 @@ def strip_draft_config(config):
             values["dspark_target_layer_ids"] = []
 
 
+# A source checkpoint stores one small tensor pair per expert, so the expert
+# walk is hundreds of synchronous preads per projection and dominates load
+# time. Four workers match the SSD concurrency peak measured on M3 Ultra; the
+# window bounds how many raw expert tensors may sit in memory at once.
+LOAD_IO_WORKERS = 4
+LOAD_READ_AHEAD = 16
+_PROJECTION_FIELDS = ("weight", "scales", "biases", "scale")
+
+
+def projection_keys(mapping, key):
+    """Sibling tensor keys that make up one projection, weight first."""
+    prefix = key.removesuffix(".weight")
+    return [
+        prefix + "." + field
+        for field in _PROJECTION_FIELDS
+        if prefix + "." + field in mapping
+    ]
+
+
+class ProjectionReadAhead:
+    """Fetch a projection's expert tensors ahead on worker threads.
+
+    Workers keep private TensorFile handles because TensorFile.read holds a
+    per-instance lock, and every handle is closed on exit -- before the caller
+    yields -- so the release-mappings-before-yield invariant still holds.
+    Workers=1 reads synchronously, which is the unmodified behaviour.
+    """
+
+    def __init__(self, source, mapping, keys, lookaside, workers, depth):
+        self._source = source
+        self._mapping = mapping
+        self._keys = list(keys)
+        self._lookaside = lookaside
+        self._depth = max(1, depth)
+        self._workers = max(1, workers)
+        self._pool = None
+        self._pending = deque()
+        self._next = 0
+        self._handles = []
+        self._handles_lock = threading.Lock()
+        self._local = threading.local()
+
+    def _read(self, key):
+        handles = getattr(self._local, "handles", None)
+        if handles is None:
+            handles = self._local.handles = {}
+        filename = self._mapping[key]
+        if filename not in handles:
+            handle = TensorFile(self._source / filename)
+            with self._handles_lock:
+                self._handles.append(handle)
+            handles[filename] = handle
+        return handles[filename].read(key)
+
+    def _fetch(self, key):
+        return {
+            sibling: self._read(sibling)
+            for sibling in projection_keys(self._mapping, key)
+        }
+
+    def __enter__(self):
+        if self._workers > 1 and len(self._keys) > 1:
+            self._pool = ThreadPoolExecutor(
+                max_workers=self._workers, thread_name_prefix="v41-load-io"
+            )
+            self._fill()
+        return self
+
+    def _fill(self):
+        while self._next < len(self._keys) and len(self._pending) < self._depth:
+            self._pending.append(self._pool.submit(self._fetch, self._keys[self._next]))
+            self._next += 1
+
+    def wait(self):
+        """Block until the next expert is fetched, then publish it.
+
+        The lookaside is keyed, so a caller that reads out of step with the
+        window falls back to a synchronous read instead of a wrong tensor.
+        """
+        if self._pool is None:
+            return
+        self._lookaside.update(self._pending.popleft().result())
+        self._fill()
+
+    def close(self):
+        try:
+            if self._pool is not None:
+                while self._pending:
+                    self._pending.popleft().cancel()
+                self._pool.shutdown(wait=True)
+        finally:
+            self._pool = None
+            for handle in self._handles:
+                handle.close()
+            self._handles.clear()
+
+    def __exit__(self, *_exc):
+        self.close()
+        return False
+
+
 def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
     """Repack one projection at a time for either direct loading or export."""
     source = Path(source)
@@ -197,8 +301,12 @@ def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
         {},
         {key for key in mapping if key.endswith((".scales", ".biases", ".scale"))},
     )
+    # Window of expert tensors already read by ProjectionReadAhead.
+    prefetched = {}
 
     def read(key):
+        if key in prefetched:
+            return prefetched.pop(key)
         filename = mapping[key]
         if filename not in readers:
             readers[filename] = TensorFile(source / filename)
@@ -256,13 +364,22 @@ def iter_source_weights(source, config, mapping, *, preserve_mtp=False):
                 count = text_config["n_routed_experts"]
                 if base.startswith("mtp."):
                     count = text_config.get("dspark_n_routed_experts") or count
+                keys = [
+                    f"{base}.{expert}.{projection}.weight" for expert in range(count)
+                ]
                 values, spec = [], None
-                for expert in range(count):
-                    parts, current = matrix(f"{base}.{expert}.{projection}.weight")
-                    if expert and current != spec:
-                        raise ValueError("Mixed expert formats within one projection")
-                    spec = current
-                    values.append(parts)
+                with ProjectionReadAhead(
+                    source, mapping, keys, prefetched, LOAD_IO_WORKERS, LOAD_READ_AHEAD
+                ) as ahead:
+                    for expert, key in enumerate(keys):
+                        ahead.wait()
+                        parts, current = matrix(key)
+                        if expert and current != spec:
+                            raise ValueError(
+                                "Mixed expert formats within one projection"
+                            )
+                        spec = current
+                        values.append(parts)
                 prefix = mapped(f"{base}.{projection}")
                 tensors = {
                     prefix + "." + name: mx.stack([v[name] for v in values])
