@@ -36,6 +36,37 @@ Toggling triggers an engine reload (it is a load-time transform).
 
 Missing experts are read by 12 threads, with at most 48 experts' reads in flight, which bounds the host memory the pipeline holds ahead of the slot writes. In decode, when a step's reads are slow, the GPU stays busy while they finish: it computes the resident routes, stays clocked for the rest of the read, and dispatches each layer's output as soon as it is built. Steps whose reads arrive within 0.5 ms keep the serial order: read, then compute. None of this changes what is computed.
 
+### Sizing a residency to your memory
+
+Under the residency field the dashboard offers the largest residency that
+admission accepts within the memory ceiling as **Fit to memory** (for
+example `41.4% resident · ~99.2 GB`); clicking it fills the field. It is a
+whole number of experts per layer, so it round-trips through the setting
+exactly. `GET /api/models` carries it per model, along with the admission
+size of the 12.5%, 25%, 50% and 75% residencies and whether each fits:
+
+```json
+{
+  "moe_expert_offload_presets": [
+    {"fraction": 0.125, "bytes": 3906250000, "fits": true},
+    {"fraction": 0.25, "bytes": 5312500000, "fits": true}
+  ],
+  "moe_expert_offload_fit_fraction": 0.4140625,
+  "moe_expert_offload_fit_bytes": 106500000000
+}
+```
+
+`moe_expert_offload_fit_fraction` is `null` when the ceiling is unknown or
+when even the routing floor exceeds it. Programmatically, the engine pool's
+`moe_offload_admission_bytes(entry, settings, fraction)` and
+`fit_moe_offload_fraction(entry, settings, budget_bytes)` run the same
+arithmetic admission runs, for every adapter; the common adapter's
+`fit_resident_fraction(model_path, full_size, budget_bytes)` in
+`omlx.patches.moe_expert_offload` answers the same question from the shard
+headers alone. The budget doubles as the ceiling the SSD fallbacks (Qwen4
+PLE, DeepSeek V4.1 Engram) decide against, so a table that stops fitting at
+some residency is priced at its mmap size from there on, as admission would.
+
 ## Performance
 
 `gemma-4-26b-a4b-it-4bit`, 585-token prompt, 256 generated tokens, warm
@@ -234,7 +265,8 @@ page cache share it. `admission_bytes(path, fraction)` and
 `fit_resident_fraction(path, budget_bytes)` in
 `omlx.patches.deepseek_v41.moe_offload` give the engine pool's admission
 estimate for a fraction and the largest fraction whose estimate fits a byte
-budget.
+budget; the dashboard's residency field offers the fit (see *Sizing a
+residency to your memory* above).
 
 For a 384-expert checkpoint, 12.5% keeps 48 experts per layer. The adapter
 preserves V4.1's activation quantization, clamped SwiGLU, and application of
