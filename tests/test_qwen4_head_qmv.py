@@ -128,3 +128,90 @@ def test_patch_only_routes_qwen4_heads():
     model = Plain()
     assert not qwen4_head_qmv.apply_qwen4_head_qmv_patch(model)
     assert type(model.lm_head) is nn.QuantizedLinear
+
+
+@pytest.mark.parametrize("bits, group_size", [(4, 64), (5, 128), (6, 64), (8, 64)])
+@pytest.mark.parametrize("rows", [1, 4, 6, 8, 11])
+def test_decoder_projection_rows_keep_their_own_bits(bits, group_size, rows):
+    """A routed decoder projection keeps its class's bits for every row count;
+    only multi-row widths that take fewer passes leave its own call."""
+    calls = []
+
+    class Projection(nn.QuantizedLinear):
+        def __call__(self, x):
+            calls.append(x.shape)
+            return super().__call__(x)
+
+    k, n = 2560, 10240
+    stock = _head(k, n, bits, group_size, seed=rows + bits)
+    projection = _routed(stock)
+    projection.__class__ = qwen4_head_qmv._wide_rows_class(Projection)
+    x = mx.random.normal((rows, 1, k)).astype(mx.bfloat16)
+    want, got = stock(x), projection(x)
+    assert want.shape == got.shape and want.dtype == got.dtype
+    assert mx.array_equal(_bits(want), _bits(got)).item()
+    routes = qwen4_head_qmv._rows_per_pass(rows, k, n, bits, "affine")
+    assert (not calls) == bool(routes)
+
+
+@pytest.mark.parametrize("row_exact", [True, False])
+def test_verify_forward_keeps_the_modules_own_call(monkeypatch, row_exact):
+    """Inside a verify forward every row count takes the module's own call,
+    where the verify routing behind nn.QuantizedLinear serves it."""
+    from omlx.patches import qwen35_verify_qmm
+
+    calls = []
+
+    class Projection(nn.QuantizedLinear):
+        def __call__(self, x):
+            calls.append(x.shape)
+            return super().__call__(x)
+
+    projection = _routed(_head(2560, 10240, 6, 64, seed=5))
+    projection.__class__ = qwen4_head_qmv._wide_rows_class(Projection)
+    x = mx.random.normal((8, 1, 2560)).astype(mx.bfloat16)
+    monkeypatch.setattr(
+        qwen35_verify_qmm._ROUTE_ARMED, "value", not row_exact, raising=False
+    )
+    monkeypatch.setattr(
+        qwen35_verify_qmm._ROUTE_ARMED, "row_exact", row_exact, raising=False
+    )
+    projection(x)
+    assert calls == [x.shape]
+
+
+def test_decoder_patch_routes_qwen4_attention_and_deltanet_projections():
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+    # The vendored Qwen4 modules replace mlx-vlm's before anything imports them.
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel
+
+    from tests.test_mlx_vlm_qwen4_exp_compat import _tiny_config
+
+    def quantizable(_, module):
+        return isinstance(module, nn.Linear) and module.weight.shape[-1] % 32 == 0
+
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    nn.quantize(model, group_size=32, bits=4, class_predicate=quantizable)
+    routed = qwen4_head_qmv.apply_qwen4_decoder_qmv_patch(model)
+    gdn = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")
+    attention = ("q_proj", "k_proj", "v_proj", "o_proj")
+    expected = []
+    for layer in model.model.layers:
+        if layer.is_linear:
+            expected += [layer.linear_attn[name] for name in gdn]
+        else:
+            expected += [layer.self_attn[name] for name in attention]
+            expected.append(layer.self_attn.indexer.index_qk_proj)
+    expected = [p for p in expected if isinstance(p, nn.QuantizedLinear)]
+    assert routed == len(expected) > 0
+    assert all(type(p) in qwen4_head_qmv._WIDE_ROWS_CLASSES.values() for p in expected)
+    # Applying it again leaves every projection on the same class.
+    assert qwen4_head_qmv.apply_qwen4_decoder_qmv_patch(model) == 0
+
+    class Plain(nn.Module):
+        pass
+
+    assert qwen4_head_qmv.apply_qwen4_decoder_qmv_patch(Plain()) == 0

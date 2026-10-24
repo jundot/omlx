@@ -18,6 +18,10 @@ The head is the largest single projection of a decode step (248320 x 2560,
   transcribed from MLX 0.32.4 -- serves up to 8 rows per weight pass with the
   stock bits.
 
+The decoder's attention and DeltaNet projections take the same launch in
+front of their own call for multi-row calls (batched decode), where stock
+``quantized_matmul`` runs ``qmv_wide`` in more passes.
+
 Every multi-row shape is checked once against stock ``quantized_matmul`` on
 this GPU before it serves; a shape that differs keeps the stock call.
 """
@@ -30,6 +34,7 @@ import re
 import mlx.core as mx
 import mlx.nn as nn
 
+from .qwen35_verify_qmm import is_verify_armed
 from .row_exact_qmv import one_row_qmv
 
 logger = logging.getLogger(__name__)
@@ -269,6 +274,31 @@ def _verified(linear, rows: int, k: int, per_pass: int, dtype) -> bool:
     return verdict
 
 
+def _wide_rows(linear, x: mx.array) -> mx.array | None:
+    """``linear(x)`` for a multi-row ``x`` in fewer weight passes with the
+    stock bits, or None where the module's own call stays. A verify forward
+    keeps it: its rows take the verify routing behind ``nn.QuantizedLinear``."""
+    k = x.shape[-1]
+    rows = x.size // k if k else 0
+    if (
+        rows < 2
+        or is_verify_armed()
+        or "bias" in linear
+        or linear.get("biases") is None
+        or x.dtype not in (mx.bfloat16, mx.float16)
+        or linear.scales.dtype != x.dtype
+        or linear.weight.ndim != 2
+    ):
+        return None
+    mode = getattr(linear, "mode", "affine")
+    per_pass = _rows_per_pass(
+        rows, k, int(linear.weight.shape[0]), int(linear.bits), mode
+    )
+    if per_pass and _verified(linear, rows, k, per_pass, x.dtype):
+        return _wide(linear, x.reshape(rows, k), per_pass).reshape(*x.shape[:-1], -1)
+    return None
+
+
 class _Qwen4HeadLinear(nn.QuantizedLinear):
     """The vocabulary head with the launches above (stock bits)."""
 
@@ -305,12 +335,8 @@ class _Qwen4HeadLinear(nn.QuantizedLinear):
             if plan[2] is not None:
                 return plan[2](x)
             return super().__call__(x)
-        per_pass = _rows_per_pass(
-            rows, k, int(self.weight.shape[0]), int(self.bits), mode
-        )
-        if per_pass and _verified(self, rows, k, per_pass, x.dtype):
-            return _wide(self, x.reshape(rows, k), per_pass).reshape(*x.shape[:-1], -1)
-        return super().__call__(x)
+        y = _wide_rows(self, x)
+        return super().__call__(x) if y is None else y
 
 
 def apply_qwen4_head_qmv_patch(model) -> bool:
@@ -326,4 +352,56 @@ def apply_qwen4_head_qmv_patch(model) -> bool:
     return True
 
 
-__all__ = ["apply_qwen4_head_qmv_patch", "stock_qmv_wide_passes"]
+# Decoder projection class -> the same class behind the fewer-pass launch.
+_WIDE_ROWS_CLASSES: dict[type, type] = {}
+
+
+def _wide_rows_class(base: type) -> type:
+    cls = _WIDE_ROWS_CLASSES.get(base)
+    if cls is None:
+
+        def __call__(self, x):
+            y = _wide_rows(self, x)
+            return base.__call__(self, x) if y is None else y
+
+        cls = type(f"_Qwen4WideRows{base.__name__}", (base,), {"__call__": __call__})
+        _WIDE_ROWS_CLASSES[base] = cls
+    return cls
+
+
+_DECODER_PROJECTIONS = {
+    "linear_attn": ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"),
+    "self_attn": ("q_proj", "k_proj", "v_proj", "o_proj"),
+}
+
+
+def apply_qwen4_decoder_qmv_patch(model) -> int:
+    """Put a loaded Qwen4-Exp language model's quantized attention, indexer
+    and DeltaNet projections behind the fewer-pass launch; returns how many."""
+    language = getattr(model, "language_model", model)
+    if not type(language).__module__.startswith("mlx_vlm.models.qwen4_exp."):
+        return 0
+    routed = 0
+    for layer in language.model.layers:
+        for mixer_name, names in _DECODER_PROJECTIONS.items():
+            mixer = layer.get(mixer_name)
+            if mixer is None:
+                continue
+            linears = [mixer.get(name) for name in names]
+            if mixer_name == "self_attn":
+                linears.append(mixer["indexer"].get("index_qk_proj"))
+            for linear in linears:
+                if (
+                    isinstance(linear, nn.QuantizedLinear)
+                    and type(linear) not in _WIDE_ROWS_CLASSES.values()
+                ):
+                    linear.__class__ = _wide_rows_class(type(linear))
+                    routed += 1
+    return routed
+
+
+__all__ = [
+    "apply_qwen4_decoder_qmv_patch",
+    "apply_qwen4_head_qmv_patch",
+    "stock_qmv_wide_passes",
+]

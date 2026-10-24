@@ -117,6 +117,11 @@ def is_row_exact_armed() -> bool:
     return getattr(_ROUTE_ARMED, "row_exact", False)
 
 
+def is_verify_armed() -> bool:
+    """True inside a verify forward in either routing mode."""
+    return _is_armed() or is_row_exact_armed()
+
+
 # ---------------------------------------------------------------------------
 # msg kernel — lm_head geometry.
 # ---------------------------------------------------------------------------
