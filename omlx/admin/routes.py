@@ -795,6 +795,9 @@ class GlobalSettingsRequest(BaseModel):
     skip_api_key_verification: bool | None = None
     allow_unauthenticated_inference: bool | None = None
 
+    # Cluster settings
+    cluster_auto_evict_competing_local_models: bool | None = None
+
     @field_validator("idle_timeout_seconds", mode="before")
     @classmethod
     def _normalize_idle_timeout(cls, v):
@@ -4772,6 +4775,11 @@ def _global_settings_response(global_settings):
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
         },
+        "cluster": {
+            "auto_evict_competing_local_models": (
+                global_settings.cluster.auto_evict_competing_local_models
+            ),
+        },
     }
 
 
@@ -5838,6 +5846,14 @@ async def update_global_settings(
             logger.info(f"Idle timeout set to: {request.idle_timeout_seconds}s")
         else:
             logger.info("Idle timeout disabled")
+
+    # Apply cluster settings (Live — read fresh on the next activation attempt,
+    # nothing to restart).
+    if request.cluster_auto_evict_competing_local_models is not None:
+        global_settings.cluster.auto_evict_competing_local_models = (
+            request.cluster_auto_evict_competing_local_models
+        )
+        runtime_applied.append("cluster_auto_evict_competing_local_models")
 
     # Apply auth settings (API key change)
     if request.api_key is not None:

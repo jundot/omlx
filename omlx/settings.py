@@ -1050,6 +1050,33 @@ class IntegrationSettings:
 
 
 @dataclass
+class ClusterSettings:
+    """Cluster-subsystem behavior toggles."""
+
+    # Off by default: a server-initiated kill of a model the user loaded
+    # locally on a peer Mac is a product decision the user opts into, not a
+    # default behavior. See
+    # docs/cluster-competing-model-eviction-redesign.md for the design this
+    # implements (reworked from a closed PR that shipped this always-on).
+    auto_evict_competing_local_models: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "auto_evict_competing_local_models": self.auto_evict_competing_local_models,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ClusterSettings:
+        """Create from dictionary."""
+        return cls(
+            auto_evict_competing_local_models=data.get(
+                "auto_evict_competing_local_models", False
+            ),
+        )
+
+
+@dataclass
 class GlobalSettings:
     """
     Global settings for oMLX.
@@ -1081,6 +1108,7 @@ class GlobalSettings:
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
+    cluster: ClusterSettings = field(default_factory=ClusterSettings)
 
     @classmethod
     def load(
@@ -1180,6 +1208,8 @@ class GlobalSettings:
                 self.idle_timeout = ModelIdleTimeoutSettings.from_dict(
                     data["idle_timeout"]
                 )
+            if "cluster" in data:
+                self.cluster = ClusterSettings.from_dict(data["cluster"])
 
         except json.JSONDecodeError as e:
             # A corrupt settings file silently reverting the server to
@@ -1556,6 +1586,7 @@ class GlobalSettings:
             "ui": self.ui.to_dict(),
             "usage": self.usage.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
+            "cluster": self.cluster.to_dict(),
         }
 
         self._save_data(data)
@@ -1986,6 +2017,7 @@ class GlobalSettings:
             "ui": self.ui.to_dict(),
             "usage": self.usage.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
+            "cluster": self.cluster.to_dict(),
         }
 
 
