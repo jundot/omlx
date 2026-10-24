@@ -4208,11 +4208,22 @@ def test_small_model_mtp_runtime_loop_defers_hc_bitwise():
 # ---------------------------------------------------------------------------
 
 
-def _kda_layer(heads=8, hidden=1024, gate_bits=8, seed=0, v_bits=8):
+def _kda_layer(heads=8, hidden=1024, gate_bits=8, seed=0, v_bits=8, float_proj=False):
+    """``float_proj``: BF16 projections (the FP8 checkpoint's KDA layers)."""
     from mlx_vlm.models import glm5_next
 
     language = _language()
     mx.random.seed(seed)
+
+    def proj(out_dims, in_dims, bits):
+        if not float_proj:
+            return _quantized_linear(out_dims, in_dims, bits)
+        layer = nn.Linear(in_dims, out_dims, bias=False)
+        layer.weight = mx.random.uniform(-0.3, 0.3, (out_dims, in_dims)).astype(
+            mx.bfloat16
+        )
+        return layer
+
     config = SimpleNamespace(
         hidden_size=hidden,
         linear_num_heads=heads,
@@ -4231,11 +4242,11 @@ def _kda_layer(heads=8, hidden=1024, gate_bits=8, seed=0, v_bits=8):
         "b_proj": (heads, hidden),
     }.items():
         bits = v_bits if name == "v_proj" else 8
-        setattr(layer, name, _quantized_linear(out_dims, in_dims, bits))
+        setattr(layer, name, proj(out_dims, in_dims, bits))
     fg = layer.forget_gate
-    fg.f_a_proj = _quantized_linear(128, hidden, 8)
-    fg.f_b_proj = _quantized_linear(qkv, 128, gate_bits)
-    layer.g_b_proj = _quantized_linear(qkv, 128, gate_bits)
+    fg.f_a_proj = proj(128, hidden, 8)
+    fg.f_b_proj = proj(qkv, 128, gate_bits)
+    layer.g_b_proj = proj(qkv, 128, gate_bits)
     fg.A_log = mx.random.normal((heads,)) * 0.5
     fg.dt_bias = mx.random.normal((qkv,)) * 0.5
     layer.conv1d.weight = (mx.random.normal((3 * qkv, 4, 1)) * 0.5).astype(mx.bfloat16)
@@ -4441,10 +4452,17 @@ def test_kda_affine_shared_weights_preserve_projections_and_serialization(
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
-@pytest.mark.parametrize("gate_bits", [8, 5])
-def test_kda_decode_step_is_bitwise_reference(gate_bits, monkeypatch):
+@pytest.mark.parametrize(
+    "gate_bits,float_proj",
+    # float: the FP8 checkpoint's BF16 projections (a float bank matmul, the
+    # gate projections outside the kernel).
+    [(8, False), (5, False), (8, True)],
+)
+def test_kda_decode_step_is_bitwise_reference(gate_bits, float_proj, monkeypatch):
     language = _language()
-    layer = _kda_layer(gate_bits=gate_bits, seed=gate_bits)
+    layer = _kda_layer(
+        gate_bits=gate_bits, seed=gate_bits + float_proj, float_proj=float_proj
+    )
     fused_cache, reference_cache = _arrays_cache(), _arrays_cache()
     prompt = (mx.random.normal((1, 12, 1024)) * 0.8).astype(mx.bfloat16)
     monkeypatch.setattr(language, "_DECODE_FUSION", False)

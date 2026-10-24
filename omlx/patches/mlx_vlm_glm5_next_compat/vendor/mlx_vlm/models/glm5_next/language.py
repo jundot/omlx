@@ -337,47 +337,6 @@ def _l2norm(x: mx.array, eps: float = 1e-6) -> mx.array:
     return x * mx.rsqrt((x * x).sum(axis=-1, keepdims=True) + eps)
 
 
-def recurrent_kimi_delta(
-    query: mx.array,
-    key: mx.array,
-    value: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: Optional[mx.array] = None,
-):
-    # Reference O(S) recurrence for Kimi Delta Attention, kept as the readable
-    # spec and the equivalence oracle for tests. The forward path runs this on
-    # the shared fused gated_delta kernel (see Glm5NextLinearAttention).
-    dt = query.dtype
-    query = _l2norm(query.astype(mx.float32))
-    key = _l2norm(key.astype(mx.float32))
-    value = value.astype(mx.float32)
-    g = g.astype(mx.float32)
-    beta = beta.astype(mx.float32)
-    B, S, H, Dk = key.shape
-    Dv = value.shape[-1]
-    query = query * (Dk**-0.5)
-    if state is None:
-        state = mx.zeros((B, H, Dk, Dv), dtype=mx.float32)
-    else:
-        state = state.astype(mx.float32)
-    outs = []
-    for i in range(S):
-        q_i = query[:, i]
-        k_i = key[:, i]
-        v_i = value[:, i]
-        g_i = mx.exp(g[:, i])[..., None]
-        b_i = beta[:, i][..., None]
-        state = state * g_i
-        kv_mem = (state * k_i[..., None]).sum(axis=-2)
-        delta = (v_i - kv_mem) * b_i
-        state = state + k_i[..., None] * delta[..., None, :]
-        out_i = (state * q_i[..., None]).sum(axis=-2)
-        outs.append(out_i)
-    out = mx.stack(outs, axis=1).astype(dt)
-    return out, state
-
-
 class KdaStepCapture:
     """A fused KDA verify block, kept so a speculative rollback is exact.
 
@@ -663,11 +622,17 @@ class Glm5NextLinearAttention(nn.Module):
             if proj is None:
                 return None
         elif self._fused_ready:
-            if not self._fq:
-                return None
-            proj = fused_quantized_matmul(
-                inputs, self._fw, self._fs, self._fb, bits=self._bits, group_size=self._gs
-            )
+            if self._fq:
+                proj = fused_quantized_matmul(
+                    inputs,
+                    self._fw,
+                    self._fs,
+                    self._fb,
+                    bits=self._bits,
+                    group_size=self._gs,
+                )
+            else:
+                proj = inputs @ self._fw.T
         else:
             proj = self._grouped_in_proj(inputs)
             if proj is None:
