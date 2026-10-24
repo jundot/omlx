@@ -7040,9 +7040,39 @@
             // HuggingFace Downloader Functions
             // =================================================================
 
+            // Convert Hugging Face and configured mirror model URLs to owner/repo ids.
+            // Leave plain repository IDs and other input unchanged for model lookup.
+            hfRepoIdFromInput(value) {
+                const raw = String(value ?? '').trim();
+                const officialLink = /^(?:(?:https?:)?\/\/)?(?:www\.)?(?:huggingface\.co|hf\.co)\/([^/?#\s]+\/[^/?#\s]+)/i;
+                const officialMatch = raw.match(officialLink);
+                if (officialMatch) return officialMatch[1];
+
+                const endpoint = String(this.globalSettings?.huggingface?.endpoint ?? '').trim();
+                if (endpoint) {
+                    try {
+                        const mirror = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(endpoint)
+                            ? endpoint : `https://${endpoint}`);
+                        const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        const prefix = mirror.pathname.split('/').filter(Boolean).map(escape).join('/');
+                        const pathPrefix = prefix ? `(?:${prefix}/)?` : '';
+                        const mirrorLink = new RegExp(
+                            `^(?:(?:https?:)?//)?(?:www\\.)?${escape(mirror.host)}/${pathPrefix}([^/?#\\s]+/[^/?#\\s]+)`,
+                            'i',
+                        );
+                        const mirrorMatch = raw.match(mirrorLink);
+                        if (mirrorMatch) return mirrorMatch[1];
+                    } catch {
+                        // Ignore invalid mirror settings and keep the official hosts.
+                    }
+                }
+                return raw;
+            },
+
             startHFDownload() {
-                const repoId = this.hfRepoId.trim();
+                const repoId = this.hfRepoIdFromInput(this.hfRepoId);
                 if (!repoId) return;
+                this.hfRepoId = repoId;
                 this.openModelDetail(repoId, 'files');
             },
 

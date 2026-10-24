@@ -54,6 +54,7 @@ jobs:
         run: >-
           node --test
           apps/omlx-web/tests/deepseek_v41_offload_ui.test.cjs
+          apps/omlx-web/tests/hf_repo_id_ui.test.cjs
           apps/omlx-web/tests/moe_expert_offload_ui.test.cjs
           apps/omlx-web/tests/qwen_oq_a8_ui.test.cjs
           apps/omlx-web/tests/usage_history_ui.test.cjs
