@@ -99,7 +99,7 @@ class TestSharedPipFlags:
     def test_shared_pip_install_array(self, formula):
         """All pip steps must share the --no-binary/--no-cache-dir flags."""
         assert (
-            'pip_install = [libexec/"bin/pip", "install", *pip_flags,'
+            'pip_install = [(libexec/"bin/pip").to_s, "install", *pip_flags,'
             ' "--no-binary", no_binary]' in formula
         )
         assert "system(*pip_install, install_spec)" in formula
@@ -109,8 +109,16 @@ class TestSharedPipFlags:
     def test_no_bare_pip_install_besides_spacy_wheel(self, formula):
         """The only direct pip invocation is the --no-deps local spaCy model
         wheel; any new bare `pip install` would bypass the shared flags."""
-        assert formula.count('bin/pip", "install"') == 2
-        assert 'system libexec/"bin/pip", "install", "--no-deps"' in formula
+        assert formula.count('bin/pip").to_s, "install"') == 2
+        assert 'system (libexec/"bin/pip").to_s, "install", "--no-deps"' in formula
+
+    def test_system_arguments_are_strings(self, formula):
+        """`system` accepts Pathname, but a failing call carrying one crashes
+        Homebrew's fork-child error reporter and hides the real error."""
+        assert 'pip_install = [(libexec/"bin/pip").to_s' in formula
+        assert 'system libexec/"bin/pip"' not in formula
+        assert 'system libexec/"bin/python"' not in formula
+        assert 'verify_custom_kernels(libexec/"bin/python")' not in formula
 
 
 class TestCustomKernelBuild:

@@ -83,7 +83,13 @@ class Omlx < Formula
     # Every pip step must share these flags; a later step without --no-binary
     # (e.g. mlx-audio) can clobber a source-built package with a prebuilt
     # wheel that fails dlopen on macOS 27 (#2110).
-    pip_install = [libexec/"bin/pip", "install", *pip_flags, "--no-binary", no_binary]
+    #
+    # `.to_s` is deliberate. `Formula#system` accepts Pathname, but when a call
+    # carrying one fails, Homebrew's fork-child error reporter cannot serialise
+    # it (`JSON::GeneratorError: Pathname not allowed in JSON`) and the real
+    # error is replaced by a Ruby backtrace. Passing strings keeps the pip
+    # failure visible.
+    pip_install = [(libexec/"bin/pip").to_s, "install", *pip_flags, "--no-binary", no_binary]
 
     if build.with?("custom-kernel")
       # Execute the compiler rather than looking for it. `xcrun -f metal` only
@@ -130,7 +136,7 @@ class Omlx < Formula
       # Run from libexec so buildpath's raw omlx/ source tree doesn't shadow
       # the compiled package in the venv's site-packages.
       Dir.chdir(libexec) do
-        verify_custom_kernels(libexec/"bin/python")
+        verify_custom_kernels((libexec/"bin/python").to_s)
       end
     end
 
@@ -145,9 +151,9 @@ class Omlx < Formula
     # as an invalid wheel filename. Copy it back to the canonical basename.
     spacy_model_wheel = buildpath/"en_core_web_sm-3.8.0-py3-none-any.whl"
     cp resource("en-core-web-sm").cached_download, spacy_model_wheel
-    system libexec/"bin/pip", "install", "--no-deps",
-           spacy_model_wheel
-    system libexec/"bin/python", "-c",
+    system (libexec/"bin/pip").to_s, "install", "--no-deps",
+           spacy_model_wheel.to_s
+    system (libexec/"bin/python").to_s, "-c",
            "import spacy; spacy.load('en_core_web_sm')"
 
     # python-multipart is declared in omlx's [audio] extra, not in mlx-audio
@@ -164,7 +170,7 @@ class Omlx < Formula
   def post_install
     return if build.without?("grammar") && build.without?("custom-kernel")
 
-    python = libexec/"bin/python"
+    python = (libexec/"bin/python").to_s
     site = Utils.safe_popen_read(python, "-c",
                                  "import site; print(site.getsitepackages()[0])").chomp
     patch_xgrammar(python, site) if build.with?("grammar")
@@ -266,11 +272,11 @@ class Omlx < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/omlx --version")
-    system libexec/"bin/python", "-c",
+    system (libexec/"bin/python").to_s, "-c",
            "import pathlib, omlx_web; " \
            "assert (pathlib.Path(omlx_web.__file__).parent / 'templates/dashboard.html').is_file()"
-    system libexec/"bin/python", "-c",
+    system (libexec/"bin/python").to_s, "-c",
            "import spacy; spacy.load('en_core_web_sm')"
-    verify_custom_kernels(libexec/"bin/python") if build.with?("custom-kernel")
+    verify_custom_kernels((libexec/"bin/python").to_s) if build.with?("custom-kernel")
   end
 end
