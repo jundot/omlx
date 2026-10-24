@@ -15,12 +15,14 @@ import gc
 import logging
 import threading
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..model_discovery import _decode_hf_cache_model_id
 from ..patches.mlx_audio_compat import ensure_qwen3_asr_audio_quantization
 from .base import BaseNonStreamingEngine
 
@@ -172,6 +174,20 @@ def _validate_stt_processor(model_name: str, model: Any) -> None:
     if model._processor is not None:
         return
     raise RuntimeError(_missing_processor_hint(model_name))
+
+
+def _hf_cache_repo_id(model_path: str) -> str | None:
+    """Return ``org/name`` when ``model_path`` is an HF Hub cache snapshot.
+
+    Snapshots live at ``models--Org--Name/snapshots/<commit>``. mlx-audio
+    reads the model type from the last segment of a string path when
+    config.json has none (Parakeet), which is the commit hash here.
+    """
+    path = Path(model_path)
+    if path.parent.name != "snapshots":
+        return None
+    decoded = _decode_hf_cache_model_id(path.parent.parent)
+    return decoded[1] if decoded is not None else None
 
 
 def _load_audio_samples(audio_path: str) -> np.ndarray:
@@ -651,11 +667,19 @@ class STTEngine(BaseNonStreamingEngine):
             ) from exc
 
         model_name = self._model_name
+        load_kwargs: dict[str, Any] = {}
+        repo_id = _hf_cache_repo_id(model_name)
+        if repo_id is not None:
+            from mlx_audio.utils import get_model_name_parts
+
+            # Name hints from the repo, as mlx-audio derives them when it
+            # loads by repo id, instead of from the snapshot hash.
+            load_kwargs["model_name_parts"] = get_model_name_parts(repo_id)
 
         def _load_sync():
             ensure_qwen3_asr_audio_quantization()
             # load_model returns a single nn.Module, not a tuple
-            return _load_model(model_name)
+            return _load_model(model_name, **load_kwargs)
 
         loop = asyncio.get_running_loop()
         try:
