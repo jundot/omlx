@@ -942,3 +942,198 @@ def test_slow_warm_gather_rearms_page_prefetch(tmp_path, monkeypatch):
         assert reader._seen_pages is not None
     finally:
         reader.close()
+
+
+def test_evicted_warm_reads_keep_wide_io_parallel_but_decode_mapped(
+    tmp_path, monkeypatch
+):
+    reader, raw = page_table(tmp_path)
+    rows = np.tile([0, 255, 256, 4095, 255], 3000).reshape(3, -1)
+    calls = []
+    original = storage.os.pread
+
+    def counted(fd, count, offset):
+        calls.append(offset)
+        return original(fd, count, offset)
+
+    monkeypatch.setattr(storage.os, "pread", counted)
+    try:
+        actual, _ = reader.read("w", rows)
+        np.testing.assert_array_equal(actual, raw[rows])
+        calls.clear()
+        monkeypatch.setattr(reader, "_pages_resident", lambda *args: False)
+        repeated, _ = reader.read("w", rows)
+        assert calls, "historical warm hits must still read absent pages"
+        np.testing.assert_array_equal(repeated, actual)
+        calls.clear()
+        monkeypatch.setattr(
+            reader, "_pages_resident", lambda *args: pytest.fail("probe after eviction")
+        )
+        repeated, _ = reader.read("w", rows)
+        assert calls, "later samples cannot prove that the working set fits"
+        np.testing.assert_array_equal(repeated, actual)
+        calls.clear()
+        monkeypatch.setattr(
+            reader, "_pages_resident", lambda *args: pytest.fail("decode probe")
+        )
+        repeated, _ = reader.read("w", rows[0, :24])
+        np.testing.assert_array_equal(repeated, raw[rows[0, :24]])
+        assert not calls
+        # A new reader must not inherit another model lifetime's fallback.
+        other = storage.TensorFile(reader._file.name)
+        try:
+            monkeypatch.setattr(other, "_pages_resident", lambda *args: True)
+            other.read("w", rows)
+            calls.clear()
+            repeated, _ = other.read("w", rows)
+            assert not calls
+            np.testing.assert_array_equal(repeated, actual)
+        finally:
+            other.close()
+    finally:
+        reader.close()
+
+
+def test_residency_probe_covers_row_end_and_fails_closed(tmp_path, monkeypatch):
+    path = tmp_path / "probe.safetensors"
+    raw = np.zeros((storage.PAGE_IO_WORKERS * 3, storage.PAGE_SIZE), dtype=np.uint8)
+    raw_safetensors(path, {"w": (raw, "U8")})
+    reader = storage.TensorFile(path)
+    calls = []
+
+    def resident(address, length, state):
+        calls.append((address, length))
+        state._obj.value = 1
+        return 0
+
+    try:
+        monkeypatch.setattr(storage, "_MINCORE", resident)
+        # An unaligned row can cross into a second page.
+        assert reader._pages_resident(np.array([0]), storage.PAGE_SIZE - 1, 2)
+        assert len(calls) == 2
+        assert calls[1][0] - calls[0][0] == storage.PAGE_SIZE
+        assert all(length == storage.PAGE_SIZE for _, length in calls)
+        calls.clear()
+        assert reader._pages_resident(np.arange(raw.shape[0]), 0, storage.PAGE_SIZE)
+        assert len(calls) == storage.PAGE_IO_WORKERS
+
+        def absent(address, length, state):
+            state._obj.value = 2  # Other flags do not establish residency.
+            return 0
+
+        monkeypatch.setattr(storage, "_MINCORE", absent)
+        assert not reader._pages_resident(np.array([0]), 0, 1)
+        monkeypatch.setattr(storage, "_MINCORE", lambda *args: -1)
+        assert reader._pages_resident(np.array([0]), 0, 1) is None
+        monkeypatch.setattr(storage, "_MINCORE", None)
+        assert reader._pages_resident(np.array([0]), 0, 1) is None
+    finally:
+        reader.close()
+
+
+def test_spurious_slow_resident_gather_does_not_disable_warm_path(
+    tmp_path, monkeypatch
+):
+    reader, raw = page_table(tmp_path)
+    rows = np.tile([0, 255, 256, 4095, 255], 3000)
+    calls = []
+    original = storage.os.pread
+
+    def counted(fd, count, offset):
+        calls.append(offset)
+        return original(fd, count, offset)
+
+    monkeypatch.setattr(storage.os, "pread", counted)
+    monkeypatch.setattr(reader, "_pages_resident", lambda *args: True, raising=False)
+    try:
+        reader.read("w", rows)
+        calls.clear()
+        ticks = iter([0.0, 1.0, 2.0, 2.001])
+        monkeypatch.setattr(storage.time, "perf_counter", lambda: next(ticks))
+        monkeypatch.setattr(storage.time, "monotonic", lambda: 100.0)
+        repeated, _ = reader.read("w", rows)
+        assert not calls
+        np.testing.assert_array_equal(repeated, raw[rows])
+        # The legacy slow-gather rearm can cause one cold read, then a
+        # resident wide lookup must return to mmap without a lifetime switch.
+        reader.read("w", rows)
+        assert calls
+        calls.clear()
+        repeated, _ = reader.read("w", rows)
+        assert not calls, "one spurious slow gather permanently disabled mmap"
+        np.testing.assert_array_equal(repeated, raw[rows])
+    finally:
+        reader.close()
+
+
+def test_transient_residency_query_error_does_not_disable_warm_path(
+    tmp_path, monkeypatch
+):
+    reader, raw = page_table(tmp_path)
+    rows = np.tile([0, 255, 256, 4095, 255], 3000)
+    calls = []
+    original = storage.os.pread
+
+    def counted(fd, count, offset):
+        calls.append(offset)
+        return original(fd, count, offset)
+
+    def resident(address, length, state):
+        state._obj.value = 1
+        return 0
+
+    monkeypatch.setattr(storage.os, "pread", counted)
+    try:
+        reader.read("w", rows)
+        calls.clear()
+        monkeypatch.setattr(storage, "_MINCORE", lambda *args: -1)
+        repeated, _ = reader.read("w", rows)
+        assert calls, "query errors require a conservative read for this lookup"
+        np.testing.assert_array_equal(repeated, raw[rows])
+        calls.clear()
+        monkeypatch.setattr(storage, "_MINCORE", resident)
+        repeated, _ = reader.read("w", rows)
+        assert not calls, "a transient syscall failure permanently disabled mmap"
+        np.testing.assert_array_equal(repeated, raw[rows])
+    finally:
+        reader.close()
+
+
+def test_wide_read_fallback_rechecks_and_recovers_after_cooldown(tmp_path, monkeypatch):
+    reader, raw = page_table(tmp_path)
+    rows = np.tile([0, 255, 256, 4095, 255], 3000)
+    calls = []
+    original = storage.os.pread
+    clock = [100.0]
+    state = [0]
+
+    def counted(fd, count, offset):
+        calls.append(offset)
+        return original(fd, count, offset)
+
+    def mincore(address, length, target):
+        target._obj.value = state[0]
+        return 0
+
+    monkeypatch.setattr(storage.os, "pread", counted)
+    monkeypatch.setattr(storage, "_MINCORE", mincore)
+    monkeypatch.setattr(storage.time, "monotonic", lambda: clock[0])
+    try:
+        reader.read("w", rows)
+        calls.clear()
+        reader.read("w", rows)
+        assert calls
+        calls.clear()
+        # Persistent absence after the cooldown must keep reads parallel.
+        clock[0] = 161.0
+        reader.read("w", rows)
+        assert calls
+        calls.clear()
+        # A healthy working set can recover after the next cooldown.
+        state[0] = 1
+        clock[0] = 222.0
+        repeated, _ = reader.read("w", rows)
+        assert not calls, "recovered residency never restored the mapped path"
+        np.testing.assert_array_equal(repeated, raw[rows])
+    finally:
+        reader.close()
