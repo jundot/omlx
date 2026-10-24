@@ -307,7 +307,9 @@ class BlockAwarePrefixCache(CacheManager):
         self._arrays_state_arities = self._get_arrays_state_arities(model)
 
         # Hash table for quick prefix lookup
-        # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks)
+        # Maps chain-hash(prefix) -> (prefix_len, block_ids, num_blocks).
+        # Entries from one store share an immutable block-id snapshot; only
+        # the first num_blocks ids belong to each entry's prefix.
         self._prefix_index: dict[bytes, tuple[int, tuple[int, ...], int]] = {}
 
         # Tie the index lifecycle to the paged cache's hash associations.
@@ -5384,7 +5386,13 @@ class BlockAwarePrefixCache(CacheManager):
 
         if best_match is None:
             return None
-        return (*best_match, chain_hashes[: best_match[2]])
+        prefix_len, block_ids, num_blocks = best_match
+        return (
+            prefix_len,
+            block_ids[:num_blocks],
+            num_blocks,
+            chain_hashes[:num_blocks],
+        )
 
     def _update_prefix_index(
         self,
@@ -5396,8 +5404,11 @@ class BlockAwarePrefixCache(CacheManager):
         # Index prefixes using chain hashes (avoid O(n^2) full-prefix hashing).
         parent_hash = b""
         prefix_len = 0
+        # Copy once, not once per prefix depth (O(n^2) retained ID slots).
+        # The caller's mutable table may later change during copy-on-write.
+        block_ids_snapshot = tuple(block_ids)
 
-        for i, block_id in enumerate(block_ids):
+        for i, block_id in enumerate(block_ids_snapshot):
             start = i * self.block_size
             end = min(start + self.block_size, len(tokens))
             block_tokens = tokens[start:end]
@@ -5424,7 +5435,7 @@ class BlockAwarePrefixCache(CacheManager):
             prefix_len += len(block_tokens)
             self._prefix_index[block_hash] = (
                 prefix_len,
-                tuple(block_ids[: i + 1]),
+                block_ids_snapshot,
                 i + 1,
             )
 
