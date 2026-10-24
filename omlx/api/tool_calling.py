@@ -368,8 +368,6 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
             return val if matches is False else decoded
         # Undeclared params and untyped unions keep best-effort JSON parsing.
         return decoded
-    if val.strip().lower() == "null":
-        return None
     ptype = raw_type.strip().lower()
     if ptype in _SCHEMA_STRING_TYPES:
         # A JSON-quoted string literal (e.g. MiniMax emits "SF" for a string
@@ -385,7 +383,13 @@ def _coerce_param_value(val: str, key: str, props: dict, func_name: str) -> Any:
                 decoded = None
             if isinstance(decoded, str):
                 return decoded
+        # A string parameter keeps the text "null" verbatim, unless the schema
+        # declares it nullable (then "null" is the missing value).
+        if val.strip().lower() == "null" and spec.get("nullable") is True:
+            return None
         return val
+    if val.strip().lower() == "null":
+        return None
     if ptype in _SCHEMA_BOOL_TYPES:
         lowered = val.strip().lower()
         if lowered in ("true", "false"):
