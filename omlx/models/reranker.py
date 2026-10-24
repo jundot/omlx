@@ -993,11 +993,7 @@ class MLXRerankerModel:
             return RerankOutput(scores=[], indices=[], total_tokens=0)
 
         if self._is_vl_reranker:
-            effective_max_length = (
-                max_length
-                if max_length is not None
-                else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
-            )
+            effective_max_length = self._resolve_causal_max_length(max_length)
             return self._rerank_vl(
                 query, documents, effective_max_length, instruction=instruction
             )
@@ -1008,18 +1004,10 @@ class MLXRerankerModel:
         docs_str = [_coerce_item_to_text(d) for d in documents]
 
         if self._is_jina_reranker:
-            effective_max_length = (
-                max_length
-                if max_length is not None
-                else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
-            )
+            effective_max_length = self._resolve_causal_max_length(max_length)
             return self._rerank_jina(query_str, docs_str, effective_max_length)
         elif self._is_causal_lm:
-            effective_max_length = (
-                max_length
-                if max_length is not None
-                else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
-            )
+            effective_max_length = self._resolve_causal_max_length(max_length)
             return self._rerank_causal_lm(
                 query_str, docs_str, effective_max_length, instruction=instruction
             )
@@ -1221,6 +1209,7 @@ class MLXRerankerModel:
             return best_doc, best_ids
 
         sanitized_query = self._sanitize_jina_text(query)
+        sanitized_query = self._fit_query_to_prompt(sanitized_query, max_length)
         sanitized_docs = [self._sanitize_jina_text(doc) for doc in documents]
 
         scores = [0.0] * len(documents)
@@ -1369,6 +1358,93 @@ class MLXRerankerModel:
         if isinstance(limit, int) and 0 < limit < _TOKENIZER_MAX_LENGTH_SENTINEL:
             return limit
         return self._DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION
+
+    def _active_tokenizer(self) -> Any:
+        """Return the underlying tokenizer, unwrapping mlx-lm's wrapper."""
+        processor = self.processor
+        if type(processor).__name__ == "TokenizerWrapper" and hasattr(
+            processor, "_tokenizer"
+        ):
+            return processor._tokenizer
+        return processor
+
+    def _declared_rerank_max_length(self) -> int | None:
+        """The context length the loaded reranker declares, if any.
+
+        Long-context rerankers such as Jina v3.5 declare a large tokenizer
+        ``model_max_length``. Reading it here aligns the causal-LM, Jina and VL
+        paths with the embedding path (#1687) instead of silently capping them
+        at ``_DEFAULT_MAX_LENGTH_CAUSAL_LM``.
+        """
+        limit = getattr(self._active_tokenizer(), "model_max_length", None)
+        if isinstance(limit, int) and 0 < limit < _TOKENIZER_MAX_LENGTH_SENTINEL:
+            return limit
+        return None
+
+    def _resolve_causal_max_length(self, max_length: int | None) -> int:
+        """Per-pair token window for causal-LM / Jina / VL rerankers.
+
+        Precedence mirrors the embedding path: an explicit request value wins,
+        lowered to the model's declared context; an unset value uses the model's
+        own ``model_max_length`` so a long-context reranker is not silently
+        capped at the 8192 fallback. When the model declares no usable limit
+        (for example the transformers ``int(1e30)`` sentinel) the 8192 fallback
+        still applies.
+        """
+        declared = self._declared_rerank_max_length()
+        if max_length is not None:
+            return min(max_length, declared) if declared is not None else max_length
+        return declared if declared is not None else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
+
+    def _fit_query_to_prompt(self, query: str, max_length: int) -> str:
+        """Truncate a Jina query so its empty-document prompt still fits.
+
+        The Jina prompt embeds the query in both the header and the trailer, so
+        an oversized query can fill the whole window before any document is
+        added. Documents are already truncated to fit; the query was not, which
+        made ``_truncate_doc_to_fit`` raise and surface as HTTP 500. This keeps
+        the longest head prefix whose single-empty-doc prompt still fits
+        ``max_length``, and returns the query unchanged when it already fits.
+        """
+        tokenizer = self.processor
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(encode):
+            return query
+
+        def _ids(text: str) -> list[int]:
+            encoded = encode(text, add_special_tokens=False)
+            return list(encoded.ids) if hasattr(encoded, "ids") else list(encoded)
+
+        if len(_ids(self._format_jina_prompt(query, [""]))) <= max_length:
+            return query
+
+        query_ids = _ids(query)
+        if not query_ids:
+            return query
+
+        decode = getattr(tokenizer, "decode", None)
+        best = ""
+        lo = 0
+        hi = len(query_ids)
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if callable(decode):
+                candidate = decode(query_ids[:mid], skip_special_tokens=False)
+            else:
+                candidate = query[:mid]
+            if len(_ids(self._format_jina_prompt(candidate, [""]))) <= max_length:
+                best = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        logger.warning(
+            "Rerank query truncated from %d to %d characters to fit "
+            "max_length=%d; rerank quality may drop for such oversized queries.",
+            len(query),
+            len(best),
+            max_length,
+        )
+        return best
 
     def _seq_classification_logits(
         self, input_ids: mx.array, attention_mask: mx.array

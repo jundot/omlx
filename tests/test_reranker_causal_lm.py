@@ -1516,3 +1516,66 @@ class TestCausalLMSharedPrefix:
 
         assert (result.scores, result.indices, result.total_tokens) == ([], [], 0)
         assert model.runs == []
+
+
+class TestCausalRerankMaxLengthResolution:
+    """Causal-LM / Jina rerankers must honor the model's declared context,
+    mirroring the encoder behavior and the embedding #1687 fix, and must
+    truncate an over-long query instead of raising."""
+
+    def _jina_model(self, model_max_length):
+        model = MLXRerankerModel("unused")
+        model._loaded = True
+        model._is_jina_reranker = True
+        model.processor = MagicMock(model_max_length=model_max_length)
+        return model
+
+    def test_jina_defaults_to_declared_not_hardcoded_8192(self):
+        model = self._jina_model(131072)
+        result = RerankOutput(scores=[0.9], indices=[0], total_tokens=10)
+        with patch.object(model, "_rerank_jina", return_value=result) as m:
+            model.rerank("q", ["doc"])                 # default -> declared
+            model.rerank("q", ["doc"], max_length=1024)  # request honored
+            model.rerank("q", ["doc"], max_length=999999)  # clamped to ceiling
+        lengths = [c.args[2] for c in m.call_args_list]
+        assert lengths == [131072, 1024, 131072]
+
+    def test_jina_no_cap_sentinel_falls_back_to_default(self):
+        model = self._jina_model(int(1e30))
+        result = RerankOutput(scores=[0.9], indices=[0], total_tokens=10)
+        with patch.object(model, "_rerank_jina", return_value=result) as m:
+            model.rerank("q", ["doc"])
+        assert m.call_args.args[2] == 8192
+
+    def test_overlong_query_is_truncated_not_raised(self):
+        from types import SimpleNamespace
+
+        w2i: dict = {}
+        i2w: list = []
+
+        class Tok:
+            model_max_length = 131072
+
+            def encode(self, text, add_special_tokens=False):
+                ids = []
+                for word in text.split():
+                    if word not in w2i:
+                        w2i[word] = len(i2w)
+                        i2w.append(word)
+                    ids.append(w2i[word])
+                return SimpleNamespace(ids=ids)
+
+            def decode(self, ids, skip_special_tokens=False):
+                return " ".join(i2w[i] for i in ids)
+
+        model = MLXRerankerModel("unused")
+        model._is_jina_v35 = True
+        model.processor = Tok()
+
+        big = " ".join(f"w{i}" for i in range(200000))
+        fitted = model._fit_query_to_prompt(model._sanitize_jina_text(big), 8192)
+        base = model.processor.encode(model._format_jina_prompt(fitted, [""])).ids
+        assert len(base) <= 8192, "empty-doc prompt must fit the window"
+        assert fitted.split()[0] == "w0", "head of the query is preserved"
+        # a query that already fits is returned untouched
+        assert model._fit_query_to_prompt("hello world", 8192) == "hello world"
