@@ -491,3 +491,25 @@ def test_leading_only_thinking_keeps_later_tags_in_the_answer(
         content += c
     t, c = parser.finish()
     assert ((thinking + t).strip(), (content + c).strip()) == expected
+
+@pytest.mark.parametrize("prompt_opened", [False, True])
+def test_truncated_logprob_stream_preserves_thinking_channel(prompt_opened):
+    parser = ThinkingParser(start_in_thinking=prompt_opened)
+    text = "reasoning</thi" if prompt_opened else "<think>reasoning</thi"
+    parser.feed_with_logprob(text, None)
+    assert parser.finish_with_logprob(truncated=True) == ("</thi", "", [])
+    assert parser.finish_with_logprob(truncated=True) == ("", "", [])
+
+
+@pytest.mark.parametrize("track_logprobs", [False, True])
+def test_tool_call_finish_keeps_unclosed_reasoning_out_of_content(track_logprobs):
+    parser = ThinkingParser(start_in_thinking=True)
+    if track_logprobs:
+        parser.feed_with_logprob("Calling a tool", object())
+        thinking, content, logprobs = parser.finish_with_logprob(has_tool_calls=True)
+        assert logprobs == []
+    else:
+        parser.feed("Calling a tool")
+        thinking, content = parser.finish(has_tool_calls=True)
+    assert thinking == ""
+    assert content == ""
