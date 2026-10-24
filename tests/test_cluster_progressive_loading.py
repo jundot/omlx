@@ -307,6 +307,145 @@ def test_native_tensor_strategy_refuses_fixed_weight_mutation_outside_layer_loop
     assert model.output == "unsharded"
 
 
+def _qwen3_5_moe_model():
+    from mlx_lm.models import qwen3_5_moe
+
+    text = dict(
+        hidden_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        vocab_size=128,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        full_attention_interval=2,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+    )
+    config = {"model_type": "qwen3_5_moe", "text_config": text}
+    return qwen3_5_moe.Model(qwen3_5_moe.ModelArgs.from_dict(config))
+
+
+def _ministral3_model():
+    from mlx_lm.models import ministral3
+
+    args = ministral3.ModelArgs.from_dict(
+        dict(
+            model_type="ministral3",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            tie_word_embeddings=False,
+            rope_parameters={
+                "rope_theta": 10000.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 128,
+            },
+        )
+    )
+    return ministral3.Model(args)
+
+
+def _ministral3_fp8_head_model():
+    import mlx.core as mx
+    from mlx_lm.models import ministral3
+
+    model = _ministral3_model()
+    model.lm_head = ministral3.Fp8Linear(64, 128)
+    model.lm_head.output_scale = mx.array(2.0)
+    return model
+
+
+def _muse_spark_model():
+    from mlx_lm.models import muse_spark
+
+    text = dict(
+        hidden_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=2,
+        vocab_size=128,
+        rms_norm_eps=1e-5,
+        post_norm_eps=1e-8,
+        rope_parameters={"rope_theta": 10000.0},
+        layer_rope_theta=[10000.0, 0],
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=8,
+        final_logit_softcapping=20.0,
+        output_multiplier=0.18,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        moe_hidden_size=32,
+        moe_intermediate_size=32,
+    )
+    config = {"model_type": "muse_spark", "text_config": text}
+    return muse_spark.Model(muse_spark.ModelArgs.from_dict(config))
+
+
+@pytest.mark.parametrize(
+    ("make_model", "strategy", "head_owner", "split_head"),
+    [
+        (_qwen3_5_moe_model, "qwen3_5", lambda model: model.language_model, False),
+        (_ministral3_model, "ministral3", lambda model: model, True),
+        (_ministral3_fp8_head_model, "ministral3", lambda model: model, True),
+        (_muse_spark_model, "muse_spark", lambda model: model, True),
+    ],
+)
+@pytest.mark.parametrize("rank", [0, 1])
+def test_layerwise_strategy_matches_mlx_lm_shard(
+    make_model, strategy, head_owner, split_head, rank
+):
+    """These shard() methods also split the lm_head, outside their layer loop.
+
+    The strategy shards each layer as MLX-LM does, so the result equals
+    MLX-LM's own shard() of the whole model. Qwen3.5 keeps its lm_head whole
+    for the Lightning MTP head, which drafts on rank zero alone.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    group = SimpleNamespace(rank=lambda: rank, size=lambda: 2)
+    mx.random.seed(0)
+    expected = make_model()
+    mx.random.seed(0)
+    actual = make_model()
+    head = head_owner(expected).lm_head
+    expected.shard(group)
+    if not split_head:
+        head_owner(expected).lm_head = head
+        head_owner(expected).sharding_group = None
+
+    assert native_shard_is_layer_local(type(actual).shard)[0] is False
+    assert apply_tensor_strategy(actual, group, mx_module=mx) == strategy
+    flat = tree_flatten(actual.parameters())
+    expected_flat = tree_flatten(expected.parameters())
+    assert [k for k, _ in flat] == [k for k, _ in expected_flat]
+    for (_, value), (_, reference) in zip(flat, expected_flat, strict=True):
+        assert mx.array_equal(value, reference).item()
+    assert {path: type(m) for path, m in actual.named_modules()} == {
+        path: type(m) for path, m in expected.named_modules()
+    }
+    assert head_owner(actual).sharding_group is (group if split_head else None)
+    attention = actual.layers[-1].self_attn
+    reference = expected.layers[-1].self_attn
+    assert vars(attention).keys() == vars(reference).keys()
+    assert {k: v for k, v in vars(attention).items() if isinstance(v, int)} == {
+        k: v for k, v in vars(reference).items() if isinstance(v, int)
+    }
+    assert _supports_tensor_parallel({"model_type": strategy}) is True
+
+
 def test_progressive_loader_patch_is_scoped_and_restored(monkeypatch):
     def original(*args, **kwargs):
         return "original", args, kwargs

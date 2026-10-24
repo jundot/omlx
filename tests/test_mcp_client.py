@@ -723,6 +723,80 @@ class TestMCPClientCallTool:
         assert result.content == {"key": "value"}
 
     @pytest.mark.asyncio
+    async def test_call_tool_image_content_keeps_mime_type(
+        self, connected_client: MCPClient
+    ):
+        """An image block keeps its media type instead of flattening to base64."""
+        mock_result = SimpleNamespace(
+            content=[
+                SimpleNamespace(type="image", data="aGVsbG8=", mimeType="image/png")
+            ],
+            isError=False,
+        )
+        connected_client._session.call_tool.return_value = mock_result
+
+        result = await connected_client.call_tool("screenshot", {})
+
+        assert result.content == {
+            "type": "image",
+            "mime_type": "image/png",
+            "data": "aGVsbG8=",
+        }
+
+    @pytest.mark.asyncio
+    async def test_call_tool_blob_content_snake_case_mime(
+        self, connected_client: MCPClient
+    ):
+        """SDK 2.x spells the field mime_type; both spellings are read."""
+        mock_result = SimpleNamespace(
+            content=[SimpleNamespace(type="audio", data="QUJD", mime_type="audio/wav")],
+            isError=False,
+        )
+        connected_client._session.call_tool.return_value = mock_result
+
+        result = await connected_client.call_tool("record", {})
+
+        assert result.content == {
+            "type": "audio",
+            "mime_type": "audio/wav",
+            "data": "QUJD",
+        }
+
+    @pytest.mark.asyncio
+    async def test_call_tool_image_and_text_content(self, connected_client: MCPClient):
+        """A tool returning an image plus a caption keeps both, in order."""
+        mock_result = SimpleNamespace(
+            content=[
+                SimpleNamespace(type="image", data="aGVsbG8=", mimeType="image/png"),
+                SimpleNamespace(text="768x768, seed 1234"),
+            ],
+            isError=False,
+        )
+        connected_client._session.call_tool.return_value = mock_result
+
+        result = await connected_client.call_tool("generate_image", {})
+
+        assert result.content == [
+            {"type": "image", "mime_type": "image/png", "data": "aGVsbG8="},
+            "768x768, seed 1234",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_call_tool_data_content_without_mime_type(
+        self, connected_client: MCPClient
+    ):
+        """A data block carrying no media type still comes back bare."""
+        mock_result = SimpleNamespace(
+            content=[SimpleNamespace(data="cGxhaW4=")],
+            isError=False,
+        )
+        connected_client._session.call_tool.return_value = mock_result
+
+        result = await connected_client.call_tool("blob_tool", {})
+
+        assert result.content == "cGxhaW4="
+
+    @pytest.mark.asyncio
     async def test_call_tool_structured_content(self, connected_client: MCPClient):
         """Test tool call with structuredContent fallback."""
         mock_result = SimpleNamespace(

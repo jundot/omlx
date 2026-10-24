@@ -8,6 +8,8 @@ reduction order.  It only changes the outer schedule: a simdgroup reuses each
 weight byte across all verify rows before advancing K.  That makes M=2..6
 bitwise equivalent to M independent decode calls without streaming the weight
 matrix M times.  Six rows cover DSpark's five-draft verification block.
+MiniMax M3 runs MXFP8 verify blocks of up to eight rows through
+``exact_rows_qmv`` and its BF16 vocabulary head through ``exact_verify_gemv``.
 """
 
 from __future__ import annotations
@@ -68,11 +70,11 @@ inline float omlx_mxfp8_dot(
 
 _SOURCE = r"""
     // Matches MLX qmv_fast for 8-bit modes: two uint32 packs (8 values)
-    // per lane, 32 lanes, two simdgroups, four output rows per simdgroup.
+    // per lane, 32 lanes, two simdgroups, RPS output rows per simdgroup.
     constexpr int VALUES_PER_THREAD = 8;
     constexpr int BLOCK_SIZE = VALUES_PER_THREAD * 32;
-    constexpr int RESULTS_PER_SIMDGROUP = 4;
-    constexpr int OUTPUTS_PER_THREADGROUP = 8;
+    constexpr int RESULTS_PER_SIMDGROUP = RPS;
+    constexpr int OUTPUTS_PER_THREADGROUP = 2 * RPS;
 
     const uint simd_group = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
@@ -97,10 +99,14 @@ _SOURCE = r"""
             + int(lane) / (GS / VALUES_PER_THREAD);
 
         for (int k = 0; k < K; k += BLOCK_SIZE) {
-            float input_values[M][VALUES_PER_THREAD];
-            for (int row = 0; row < M; ++row) {
-                for (int idx = 0; idx < VALUES_PER_THREAD; ++idx) {
-                    input_values[row][idx] = float(input_ptr[row * K + idx]);
+            // HELD keeps every row's inputs in registers; longer blocks read
+            // them inside the row loop instead of spilling.
+            float input_values[HELD ? M : 1][VALUES_PER_THREAD];
+            if constexpr (HELD) {
+                for (int row = 0; row < M; ++row) {
+                    for (int idx = 0; idx < VALUES_PER_THREAD; ++idx) {
+                        input_values[row][idx] = float(input_ptr[row * K + idx]);
+                    }
                 }
             }
             for (int result = 0; result < RESULTS_PER_SIMDGROUP; ++result) {
@@ -108,9 +114,26 @@ _SOURCE = r"""
                 const device uint8_t* row_scale =
                     scale_ptr + result * (K / GS);
                 const float scale = omlx_fp8_scale(row_scale[0]);
+                // One 8-byte load per lane, converted once for every row.
+                const uint2 packed = *(const device uint2*)row_weight;
+                float weights[VALUES_PER_THREAD];
+                for (int idx = 0; idx < 4; ++idx) {
+                    weights[idx] = omlx_fp8_weight(uint8_t(packed.x >> (8 * idx)));
+                    weights[4 + idx] =
+                        omlx_fp8_weight(uint8_t(packed.y >> (8 * idx)));
+                }
                 for (int row = 0; row < M; ++row) {
-                    accum[row][result] += omlx_mxfp8_dot<VALUES_PER_THREAD>(
-                        row_weight, input_values[row], scale);
+                    float dot = 0.0f;
+                    if constexpr (HELD) {
+                        for (int idx = 0; idx < VALUES_PER_THREAD; ++idx) {
+                            dot += input_values[row][idx] * weights[idx];
+                        }
+                    } else {
+                        for (int idx = 0; idx < VALUES_PER_THREAD; ++idx) {
+                            dot += float(input_ptr[row * K + idx]) * weights[idx];
+                        }
+                    }
+                    accum[row][result] += scale * dot;
                 }
             }
             weight_ptr += BLOCK_SIZE;
@@ -361,35 +384,59 @@ def eligible(module, inputs: mx.array) -> bool:
     )
 
 
+def exact_rows_qmv(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array | None,
+    *,
+    group_size: int,
+    mxfp8: bool,
+    rps: int = 4,
+    held: bool = True,
+) -> mx.array:
+    """``x [rows, K]`` through an 8-bit weight with decode-identical rows.
+
+    Each simdgroup owns ``rps`` output rows. ``held`` keeps the inputs of
+    every row in registers; affine weights always hold them.
+    """
+    rows, input_dims = (int(d) for d in x.shape)
+    output_dims = int(scales.shape[0])
+    (output,) = _kernel()(
+        inputs=[x, weight, scales, scales if biases is None else biases],
+        template=[
+            ("T", x.dtype),
+            ("M", rows),
+            ("K", input_dims),
+            ("N", output_dims),
+            ("GS", int(group_size)),
+            ("MXFP8", bool(mxfp8)),
+            ("RPS", int(rps)),
+            ("HELD", bool(held) or not mxfp8),
+        ],
+        # mx.fast uses thread-grid dimensions: one (32, 2, 1) threadgroup
+        # for each 2 * rps output rows.
+        grid=(32, output_dims // rps, 1),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(rows, output_dims)],
+        output_dtypes=[x.dtype],
+    )
+    return output
+
+
 def exact_verify_qmv(module, inputs: mx.array) -> mx.array:
     """Apply an eligible quantized linear with decode-identical reductions."""
     input_dims = int(inputs.shape[-1])
     rows = int(inputs.size) // input_dims
-    output_dims = int(module.scales.shape[0])
-    flat = inputs.reshape(rows, input_dims)
-    mode = getattr(module, "mode", "affine")
-    biases = module.get("biases")
-    if biases is None:
-        biases = module.scales
-
-    (output,) = _kernel()(
-        inputs=[flat, module.weight, module.scales, biases],
-        template=[
-            ("T", inputs.dtype),
-            ("M", rows),
-            ("K", input_dims),
-            ("N", output_dims),
-            ("GS", int(module.group_size)),
-            ("MXFP8", mode == "mxfp8"),
-        ],
-        # mx.fast uses thread-grid dimensions. This is one (32, 2, 1)
-        # threadgroup for each eight output rows.
-        grid=(32, output_dims // 4, 1),
-        threadgroup=(32, 2, 1),
-        output_shapes=[(rows, output_dims)],
-        output_dtypes=[inputs.dtype],
+    output = exact_rows_qmv(
+        inputs.reshape(rows, input_dims),
+        module.weight,
+        module.scales,
+        module.get("biases"),
+        group_size=int(module.group_size),
+        mxfp8=getattr(module, "mode", "affine") == "mxfp8",
     )
-    output = output.reshape((*inputs.shape[:-1], output_dims))
+    output = output.reshape((*inputs.shape[:-1], int(module.scales.shape[0])))
     if "bias" in module:
         output = output + module.bias
     return output
@@ -498,7 +545,7 @@ def exact_verify_multi_qmv(module, inputs: mx.array) -> mx.array:
     return output
 
 
-def dense_eligible(module, inputs: mx.array) -> bool:
+def dense_eligible(module, inputs: mx.array, max_rows: int = 6) -> bool:
     """Return whether a dense linear has MLX's large-output GEMV geometry."""
     if inputs.ndim < 2 or module.weight.ndim != 2:
         return False
@@ -506,7 +553,7 @@ def dense_eligible(module, inputs: mx.array) -> bool:
     rows = int(inputs.size) // input_dims
     output_dims = int(module.weight.shape[0])
     return (
-        2 <= rows <= 6
+        2 <= rows <= max_rows
         and inputs.dtype in (mx.bfloat16, mx.float16)
         and module.weight.dtype == inputs.dtype
         and input_dims % 128 == 0

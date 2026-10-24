@@ -1760,6 +1760,87 @@ def test_a_thunderbolt_pair_without_rdma_falls_back_to_the_ring_out_loud(monkeyp
     assert "studio.local" in body["backend_reason"]
     assert "ring" in body["backend_reason"]
     assert all(host["rdma"] == [] for host in body["hosts"])
+    (warning,) = body["warnings"]
+    assert warning.startswith("The cluster uses the TCP ring instead of JACCL")
+    assert "studio.local reports no RDMA device" in warning
+
+
+_RDMA_MAC_PORTS = """\
+Hardware Port: Wi-Fi
+Device: en1
+
+Hardware Port: Thunderbolt 1
+Device: en2
+
+Hardware Port: Thunderbolt Bridge
+Device: bridge0
+"""
+_IBV_DEVICES = """\
+    device                 node GUID
+    ------              ----------------
+    rdma_en2            0000000000000000
+"""
+
+
+def _rdma_mac_ifconfig(index, *, on_bridge):
+    """ifconfig -a of a Mac with RDMA on and a Thunderbolt cable in en2."""
+
+    port = "" if on_bridge else f"\tinet 192.168.0.{index} netmask 0xfffffffc\n"
+    bridge = f"\tinet 10.10.0.{index} netmask 0xffffff00\n" if on_bridge else ""
+    flags = "8863<UP,BROADCAST,RUNNING,MULTICAST>" if on_bridge else "8822<BROADCAST>"
+    return (
+        "en2: flags=8963<UP,BROADCAST,SMART,RUNNING,PROMISC,SIMPLEX,MULTICAST>\n"
+        f"\tstatus: active\n{port}"
+        f"bridge0: flags={flags} mtu 1500\n"
+        f"\tmember: en2 flags=3<LEARNING,DISCOVER>\n{bridge}"
+    )
+
+
+@pytest.mark.parametrize("on_bridge", [True, False])
+def test_rdma_needs_the_thunderbolt_port_addressed_not_the_bridge(
+    monkeypatch, on_bridge
+):
+    """The reporter's layout falls back out loud; MLX's own layout runs JACCL."""
+
+    from omlx.cluster import transport
+
+    readings = {
+        host: _rdma_mac_ifconfig(index, on_bridge=on_bridge)
+        for index, host in enumerate(("127.0.0.1", "studio.local"), start=1)
+    }
+    monkeypatch.setattr(
+        transport,
+        "_read",
+        lambda host, command: (
+            readings[host] if command[0] == "ifconfig" else _RDMA_MAC_PORTS
+        ),
+    )
+    # Only the RDMA device probe still runs a command.
+    monkeypatch.setattr(
+        transport.subprocess,
+        "run",
+        lambda command, **_: SimpleNamespace(
+            returncode=0, stdout=_IBV_DEVICES, stderr=""
+        ),
+    )
+    monkeypatch.setattr(
+        routes, "verify_link_reachability", lambda link: (True, link.reason)
+    )
+
+    body = (
+        _client()
+        .get("/admin/api/cluster/fabric", params={"hosts": "127.0.0.1,studio.local"})
+        .json()
+    )
+
+    if on_bridge:
+        assert body["backend"] == "ring" and body["fell_back"] is True
+        (warning,) = body["warnings"]
+        assert "over bridge0, which is not an RDMA device" in warning
+        assert "Turn the Thunderbolt Bridge off" in warning
+    else:
+        assert body["backend"] == "jaccl" and body["warnings"] == []
+        assert body["rdma"]["rows"] == [[None, "rdma_en2"], ["rdma_en2", None]]
 
 
 def test_macs_that_share_no_subnet_get_no_address_and_a_reason(monkeypatch):

@@ -72,6 +72,8 @@ from __future__ import annotations
 import logging
 import threading
 
+from . import m1_verify_mma, m1_verify_qmv
+
 logger = logging.getLogger(__name__)
 
 _KERNEL_CACHE: dict = {}
@@ -775,6 +777,10 @@ def _sg8_geometry(K: int, N: int) -> tuple[int, int]:
 def sg8_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
     import mlx.core as mx
 
+    # On M1-class GPUs the M1 kernels beat sg8 inside their row windows; the
+    # fused swiglu path keys off this check, so it falls back per-linear.
+    if _m1_route(M, K, N, bits, group_size, dtype):
+        return False
     nsg, ct = _sg8_geometry(int(K), int(N))
     return (
         int(bits) in (4, 5)
@@ -1164,6 +1170,15 @@ def sg8_group_eligible(linears, x) -> bool:
     rows = x.shape[0] * x.shape[1]
     K = x.shape[2]
     first = linears[0]
+    if any(
+        isinstance(linear, nn.QuantizedLinear)
+        and _m1_route(
+            rows, K, linear.scales.shape[0], linear.bits, linear.group_size, x.dtype
+        )
+        for linear in linears
+    ):
+        # Per-linear calls let the M1 route take the large projections.
+        return False
     for linear in linears:
         if not (
             isinstance(linear, nn.QuantizedLinear)
@@ -1485,9 +1500,21 @@ def _patch_verify_layer_flush() -> None:
     Qwen3_5BatchInvariantForward._model = _model
 
 
+def _m1_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
+    """M1-class kernel for a verify projection ("m1", "m1_mma") or None."""
+    if m1_verify_qmv.eligible(rows, K, N, bits, group_size, dtype):
+        return "m1"
+    if m1_verify_mma.eligible(rows, K, N, bits, group_size, dtype):
+        return "m1_mma"
+    return None
+
+
 def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
-    """Kernel an armed verify projection runs ("sg8", "mma" or "vk"), or None
-    for the stock qmm."""
+    """Kernel an armed verify projection runs ("m1", "m1_mma", "sg8", "mma" or
+    "vk"), or None for the stock qmm."""
+    m1 = _m1_route(rows, K, N, bits, group_size, dtype)
+    if m1:
+        return m1
     if sg8_eligible(rows, K, N, bits, group_size, dtype):
         return "sg8"
     if mma_eligible(rows, K, N, bits, group_size, dtype):
@@ -1554,7 +1581,27 @@ def apply_verify_qmm_patch() -> bool:
         try:
             # Batched verify rows (requests x block) share one weight pass.
             x2 = x.reshape(rows, K)
-            if route == "sg8":
+            if route in ("m1", "m1_mma") and self.scales.dtype != x.dtype:
+                return orig_call(self, x)
+            if route == "m1":
+                y = m1_verify_qmv.m1_qmm(
+                    x2,
+                    self.weight,
+                    self.scales,
+                    self.biases,
+                    bits=self.bits,
+                    group_size=self.group_size,
+                )
+            elif route == "m1_mma":
+                y = m1_verify_mma.m1_mma_qmm(
+                    x2,
+                    self.weight,
+                    self.scales,
+                    self.biases,
+                    bits=self.bits,
+                    group_size=self.group_size,
+                )
+            elif route == "sg8":
                 y = vk_qmm_sg8(
                     x2,
                     self.weight,
@@ -1595,5 +1642,8 @@ def apply_verify_qmm_patch() -> bool:
     _patch_verify_grouped_linears()
     _patch_verify_layer_flush()
     _QL_PATCHED = True
-    logger.info("MTP verify qmm patch applied (rows 2..6 split-K, 7..8 sg8, 9..24 mma)")
+    logger.info(
+        "MTP verify qmm patch applied (rows 2..6 split-K, 7..8 sg8, 9..24 mma%s)",
+        "; M1: qmv 2..4, mma 5..16" if m1_verify_qmv.enabled() else "",
+    )
     return True

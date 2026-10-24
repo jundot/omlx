@@ -16,9 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx_lm.utils as lm_utils
-import mlx_vlm.utils as vlm_utils
 from mlx_lm.models.rope_utils import initialize_rope
-from mlx_vlm.models.qwen3_5 import language as q35
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +106,19 @@ def apply_qwen35_yarn_patch() -> None:
     if _APPLIED:
         return
 
+    # mlx-vlm is imported here, not at module scope: a CUDA cluster worker's
+    # venv ships without it, and model_loading imports this module on every
+    # load (#4739). mlx-lm models still get YaRN from the config hook alone.
+    try:
+        import mlx_vlm.utils as vlm_utils
+        from mlx_vlm.models.qwen3_5 import language as q35
+    except ImportError:
+        vlm_utils = q35 = None
+        logger.debug("mlx-vlm not installed; YaRN applies to mlx-lm models only")
+
     for utils in (lm_utils, vlm_utils):
+        if utils is None:
+            continue
         original_load_config = utils.load_config
 
         def load_config(model_path, *args, _original=original_load_config, **kwargs):
@@ -116,6 +126,10 @@ def apply_qwen35_yarn_patch() -> None:
             return add_yarn_to_config(config, model_path)
 
         utils.load_config = load_config
+
+    if q35 is None:
+        _APPLIED = True
+        return
 
     original_init = q35.Qwen3_5Attention.__init__
 

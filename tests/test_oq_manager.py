@@ -864,3 +864,41 @@ async def test_v41_rejects_unsupported_settings_before_queueing(
         await manager.start_quantization(str(source), **settings)
     assert not manager._active_tasks
     assert list(tmp_path.iterdir()) == [source]
+
+
+@pytest.mark.asyncio
+async def test_v41_preserve_ngram_table_names_output_and_reaches_export(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "DeepSeek-V4.1"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    (source / "model.safetensors").write_bytes(bytes(64))
+    calls = []
+
+    def _fake_quantize(model_path, output_path, *args, **kwargs):
+        calls.append(kwargs)
+        Path(output_path).mkdir(parents=True)
+
+    monkeypatch.setattr("omlx.oq.quantize_oq_streaming", _fake_quantize)
+    manager = OQManager(model_dirs=[str(tmp_path)])
+    task = await manager.start_quantization(
+        str(source), 4, enhanced=True, preserve_ngram_table=True
+    )
+    await manager._active_tasks[task.task_id]
+
+    assert task.status is QuantStatus.COMPLETED
+    assert task.output_name == "DeepSeek-V4.1-oQ4e-ngram"
+    assert [call["preserve_ngram_table"] for call in calls] == [True]
+
+
+@pytest.mark.asyncio
+async def test_preserve_ngram_table_is_rejected_outside_v41(tmp_path):
+    source = tmp_path / "Llama"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (source / "model.safetensors").write_bytes(bytes(64))
+    manager = OQManager(model_dirs=[str(tmp_path)])
+    with pytest.raises(ValueError, match="only available for DeepSeek V4.1"):
+        await manager.start_quantization(str(source), 4, preserve_ngram_table=True)
+    assert not manager._active_tasks

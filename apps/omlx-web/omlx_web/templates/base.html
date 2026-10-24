@@ -45,9 +45,9 @@
     </script>
 
     <script>
-        // Apply Enhanced Readability immediately so non-chat pages (dashboard,
-        // status) honor the saved toggle on first paint. The chat page also
-        // syncs this in Alpine (setEnhancedReadability).
+        // Apply Enhanced Readability immediately so every page honors the saved
+        // setting on first paint. The dashboard settings page and theme menu
+        // update it in Alpine (setEnhancedReadability).
         (function() {
             if (localStorage.getItem('omlx-enhanced-readability') === 'on') {
                 document.documentElement.setAttribute('data-enhanced-readability', '');

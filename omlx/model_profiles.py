@@ -107,6 +107,8 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_engram_ssd_offload",
         # Architecture-level prefill strategy; explicit per model.
         "deepseek_v41_ced_prefill_enabled",
+        # Hardware-specific kernel choice (M5 tensor units); explicit per model.
+        "deepseek_v4_sparse_attention_nax",
         # Gain and memory cost depend on the checkpoint's GDN recipe.
         "qwen4_gdn_decode_wide_proj",
         # Which engine serves the model depends on what this Mac has installed.

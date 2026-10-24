@@ -7,9 +7,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from omlx.eval.base import BaseBenchmark
+from omlx.eval.cmmlu import CMMLUBenchmark
 from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
+from omlx.eval.jmmlu import JMMLUBenchmark
+from omlx.eval.kmmlu import KMMLUBenchmark
 from omlx.eval.livecodebench import LiveCodeBenchBenchmark, _extract_code
 from omlx.eval.mmlu import MMLUBenchmark, _parse_choices
 from omlx.eval.truthfulqa import TruthfulQABenchmark
@@ -150,6 +153,41 @@ class TestTruthfulQA:
         assert self.bench.check_answer("A", {"answer": 0}) is True
         assert self.bench.check_answer("B", {"answer": 0}) is False
         assert self.bench.check_answer("C", {"answer": 2}) is True
+
+
+# --- CMMLU / JMMLU / KMMLU Tests ---
+
+
+class TestCJKMultipleChoice:
+    @pytest.mark.parametrize(
+        ("bench_cls", "response", "expected"),
+        [
+            (CMMLUBenchmark, "答案是B", "B"),
+            (CMMLUBenchmark, "因此，正确答案是C。", "C"),
+            (CMMLUBenchmark, "根据题意，应选D", "D"),
+            (JMMLUBenchmark, "正解はBです。", "B"),
+            (JMMLUBenchmark, "答えはC", "C"),
+            (KMMLUBenchmark, "정답은 B입니다.", "B"),
+            (KMMLUBenchmark, "따라서 정답은 D입니다", "D"),
+        ],
+    )
+    def test_extract_answer_letter_against_cjk_text(
+        self, bench_cls, response, expected
+    ):
+        """A letter written straight against CJK text is still the answer."""
+        assert bench_cls().extract_answer(response, {}) == expected
+
+    @pytest.mark.parametrize(
+        ("response", "expected"),
+        [
+            ("答案：B。A选项错误", "B"),
+            ("B是正确的，A是错误的", "B"),
+            ("我不知道", ""),
+        ],
+    )
+    def test_extract_answer_earlier_steps_still_win(self, response, expected):
+        """A letter the existing steps find beats one that touches CJK text."""
+        assert CMMLUBenchmark().extract_answer(response, {}) == expected
 
 
 # --- GSM8K Tests ---

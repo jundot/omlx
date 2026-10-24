@@ -288,7 +288,7 @@ Supports all function calling formats available in mlx-lm, JSON schema validatio
 | Model Family | Format |
 |---|---|
 | Llama, Qwen, DeepSeek, etc. | JSON `<tool_call>` |
-| Qwen3.5 Series | XML `<function=...>` |
+| Qwen3.5 Series, Raon-1 mini | XML `<function=...>` |
 | Gemma | `<start_function_call>` |
 | GLM (4.7, 5) | `<arg_key>/<arg_value>` XML |
 | MiniMax | Namespaced `<minimax:tool_call>` |

@@ -36,6 +36,9 @@ def register_virtual_tensors(index, config) -> int:
     quantized silently.
     """
     from .mimo_v2.virtual_qkv import register as register_mimo_v2_qkv
+    from .mlx_vlm_minimax_m3_compat.virtual_nvfp4 import (
+        register as register_minimax_nvfp4,
+    )
     from .mlx_vlm_qwen4_exp_compat.virtual_ple import (
         register as register_qwen4_exp_ple,
     )
@@ -44,4 +47,8 @@ def register_virtual_tensors(index, config) -> int:
     # load leaves its checkpoint in the layout the quantizer cannot read, so
     # swallowing that would turn a packaging fault into a silently wrong
     # quantization.
-    return register_mimo_v2_qkv(index, config) + register_qwen4_exp_ple(index, config)
+    return (
+        register_mimo_v2_qkv(index, config)
+        + register_qwen4_exp_ple(index, config)
+        + register_minimax_nvfp4(index, config)
+    )

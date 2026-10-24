@@ -138,6 +138,7 @@ def test_distributed_minimax_protocol_replaces_generic_tool_and_thinking_markers
         _think_end = "</think>"
         _think_start_tokens = (54,)
         _think_end_tokens = (55,)
+        chat_template = "{%- set think_begin_token = '<mm:think>' -%}"
 
         @staticmethod
         def encode(text, add_special_tokens=False):
@@ -151,6 +152,7 @@ def test_distributed_minimax_protocol_replaces_generic_tool_and_thinking_markers
 
     tokenizer = Tokenizer()
     assert _install_distributed_model_protocol(tokenizer, model) == "minimax_m3"
+    assert "thinking_mode == 'disabled'" in tokenizer.chat_template
     assert tokenizer._tool_call_start == "]<]minimax[>[<tool_call>"
     assert tokenizer._tool_call_end == "]<]minimax[>[</tool_call>"
     assert tokenizer._tool_call_start_tokens == (58, 52)

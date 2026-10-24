@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Register the oMLX Muse Spark VLM ahead of upstream model discovery.
+"""Register the Muse Spark processor and chat prompt format with mlx-vlm.
 
-The package reuses the vendored Muse Glimmer vision tower and processor, and
-the oMLX Muse Spark text model (``omlx.patches.muse_spark``).
+The vendored package holds only the processor, built on the vendored Muse
+Glimmer one. The model is mlx-lm's (``omlx.patches.muse_spark.model``).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ _APPLIED = False
 
 
 def apply_mlx_vlm_muse_spark_compat_patch() -> bool:
-    """Install the vendored muse_spark module and mlx-vlm discovery hooks."""
+    """Install the vendored muse_spark processor and the prompt format."""
     global _APPLIED
     if _APPLIED:
         return False

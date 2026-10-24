@@ -158,6 +158,8 @@ class Request:
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
+    # Ordinary prefix reuse awaiting scheduling validation; None once recorded.
+    pending_prefix_cache_tokens: int | None = None
 
     # Memory-pressure requeue. The first ``requeued_output_tokens`` outputs
     # are folded into ``prompt_token_ids`` so re-admission prefills them;

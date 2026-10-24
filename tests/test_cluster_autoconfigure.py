@@ -1450,7 +1450,7 @@ def test_a_mac_without_rdma_is_named_so_the_fallback_to_ring_is_explainable():
     assert not matrix.ok
     assert matrix.rows == ()
     assert "studio.local" in matrix.reason
-    assert "Recovery" in matrix.reason
+    assert "rdma_ctl status" in matrix.reason
 
 
 def test_hosts_that_only_share_the_lan_do_not_get_a_silent_rdma_matrix():

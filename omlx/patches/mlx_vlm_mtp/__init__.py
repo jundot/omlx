@@ -98,12 +98,15 @@ _RUNTIME_PATCHES: tuple[str, ...] = (
 _RUNTIME_PATCHES_BY_TYPE: dict[str, tuple[str, ...]] = {
     "qwen3_5": ("qwen35_vlm_runtime",),
     "qwen3_5_moe": ("qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"),
+    "minicpmv4_7": ("qwen35_moe_vlm_runtime", "qwen35_vlm_runtime"),
     "gemma4": ("gemma4_vlm_runtime",),
     "gemma4_unified": ("gemma4_vlm_runtime",),
     "inkling": ("inkling_vlm_runtime",),
     "inkling_mm_model": ("inkling_vlm_runtime",),
     "glm5_next": ("glm5_next_vlm_runtime",),
     "qwen4_exp": (),
+    "minimax_m3": (),
+    "minimax_m3_vl": (),
 }
 
 

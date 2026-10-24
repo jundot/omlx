@@ -39,7 +39,7 @@ WORKER_REQUIREMENTS = (
     "numpy>=1.24.0,<2.4",
     "mlx==0.32.4",
     "mlx-cuda-13==0.32.4",
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d",
     "transformers>=5.12.1,<5.18",
     "mistral-common>=1.10",
     "tokenizers>=0.19.0",

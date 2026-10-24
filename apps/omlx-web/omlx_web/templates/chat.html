@@ -1209,7 +1209,7 @@
         document.documentElement.setAttribute('data-theme', theme);
     })();
 </script>
-<div class="chat-shell flex overflow-hidden" x-data="chatApp()" x-init="init()"
+<div class="chat-shell flex overflow-hidden" x-data="chatApp()"
     @keydown.window="handleGlobalKeydown($event)">
     <!-- API Key Modal -->
     <div class="api-key-modal fixed inset-0 bg-black/50 flex items-center justify-center z-[1000]"
@@ -1644,6 +1644,24 @@
                                 </div>
                                 <div x-show="msg._web && !msg._web.ok" class="mt-1.5 text-xs"
                                     style="color: var(--text-danger);" x-text="msg._web?.error"></div>
+                            </div>
+                        </div>
+
+                        <!-- Images returned by an MCP tool. Same plain container as
+                             the web card above: the tool message itself stays out of
+                             the transcript, but renderable content it carried does not. -->
+                        <div x-show="msg.role === 'tool' && (msg._images?.length || msg._imagesStripped)"
+                            class="max-w-3xl">
+                            <div x-show="msg._images?.length" class="my-1 flex flex-wrap gap-2">
+                                <template x-for="(imgUrl, ii) in (msg._images || [])" :key="ii">
+                                    <img :src="imgUrl" @click="openImageModal(imgUrl)"
+                                        class="max-w-48 max-h-48 object-cover rounded-lg cursor-pointer">
+                                </template>
+                            </div>
+                            <div x-show="!msg._images?.length && msg._imagesStripped"
+                                class="my-1 rounded-xl border border-line bg-surface-muted px-3.5 py-2.5 text-xs"
+                                style="color: var(--text-tertiary);"
+                                x-text="window.t('chat.tool_images_stripped').replace('{count}', msg._imagesStripped)">
                             </div>
                         </div>
 
@@ -2133,14 +2151,14 @@
                             <button @click="open = !open" class="composer-pill" :class="{ 'is-open': open }"
                                 :title="window.t('chat.switch_model')" :aria-expanded="open" style="max-width: 15rem;">
                                 <i data-lucide="box" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
-                                <span class="truncate min-w-0" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
+                                <span class="truncate min-w-0" :title="(availableModels.find(m => m.id === currentModel)?.name) || currentModel" x-text="(availableModels.find(m => m.id === currentModel)?.name) || currentModel"></span>
                                 <i data-lucide="chevron-down" class="w-3.5 h-3.5 flex-shrink-0" style="color: var(--text-tertiary);"></i>
                             </button>
                             <div x-show="open" x-transition.opacity x-cloak
                                 class="composer-popover right-0 p-1.5 overflow-y-auto"
                                 style="--popover-w: 17rem; max-height: 20rem;">
                                 <template x-for="model in availableModels" :key="model.id">
-                                    <button @click="selectModel(model.id); open = false"
+                                    <button @click="selectModel(model.id); open = false" :title="model.name"
                                         class="composer-menu-item" :class="model.id === currentModel ? 'font-semibold' : ''">
                                         <span class="w-3.5 h-3.5 flex-shrink-0 flex items-center justify-center"
                                             :style="'color: var(--timeline-accent); visibility:' + (model.id === currentModel ? 'visible' : 'hidden')">
@@ -2678,25 +2696,6 @@
                         <option value="dark">{{ t('navbar.theme.dark_mode') }}</option>
                     </select>
                 </div>
-                <div class="mb-6">
-                    <label class="block text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.enhanced_readability') }}</label>
-                    <div class="p-3 bg-surface-muted rounded-xl border border-line">
-                        <div class="svg-allow-row">
-                            <div class="svg-allow-label">
-                                <i data-lucide="eye" class="w-4 h-4 shrink-0" style="color: var(--text-tertiary);"></i>
-                                <span class="text-xs font-medium truncate" style="color: var(--text-primary);">{{ t('chat.enhanced_readability') }}</span>
-                            </div>
-                            <button type="button" role="switch" class="svg-allow-switch"
-                                :class="{ 'is-on': enhancedReadability }"
-                                :aria-checked="enhancedReadability ? 'true' : 'false'"
-                                :aria-label="window.t('chat.enhanced_readability')"
-                                @click="setEnhancedReadability(!enhancedReadability)">
-                                <span class="svg-allow-switch-knob" aria-hidden="true"></span>
-                            </button>
-                        </div>
-                        <p class="svg-allow-warning mt-2" x-text="window.t('chat.enhanced_readability_desc')"></p>
-                    </div>
-                </div>
                 <div class="pt-4 border-t border-line">
                     <h4 class="text-xs font-bold uppercase tracking-wider text-fg-tertiary mb-2">{{ t('chat.chat_history_label') }}</h4>
                     <div class="space-y-1">
@@ -2784,7 +2783,6 @@
     const API_KEY_STORAGE_KEY = 'omlx_chat_api_key';
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ALLOW_SVG_STORAGE_KEY = 'omlx-chat-allow-svg';
-    const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
     const SYSTEM_PROMPT_STORAGE_KEY = 'omlx_chat_system_prompt';
     const PROMPT_PROFILES_STORAGE_KEY = 'omlx_chat_prompt_profiles';
     const CUSTOM_PROFILE_OPTION = '__custom__';
@@ -2817,7 +2815,6 @@
             sidebarOpen: window.innerWidth >= 768,
             showLeftToggle: window.innerWidth < 768,
             showChatSettingsModal: false,
-            enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
             theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
             allowSvg: localStorage.getItem(ALLOW_SVG_STORAGE_KEY) === 'true',
             chatSettings: (() => {
@@ -3507,7 +3504,8 @@
                 // Tool-round turns and web tool cards are _ui:false for the
                 // API/variant machinery but still render, following their
                 // segment's final assistant variant.
-                if (msg._toolRound || (msg.role === 'tool' && msg._web)) {
+                if (msg._toolRound
+                    || (msg.role === 'tool' && (msg._web || msg._images || msg._imagesStripped))) {
                     return this.isToolFlowVisible(index);
                 }
                 if (msg._ui === false) return false;
@@ -4509,6 +4507,46 @@
         ];
     },
 
+    // MCP tool results can carry rendered media (image blocks) alongside
+    // their text. Those belong in the transcript, not in the model's context:
+    // one 768x768 PNG is ~1MB of base64, which the model cannot read and which
+    // is large enough to evict the rest of the chat from a small context
+    // window. So images are split out for display and the model gets a note.
+    splitToolContent(content) {
+        const parts = Array.isArray(content) ? content : [content];
+        const images = [];
+        const text = [];
+        let blobs = 0;
+        for (const part of parts) {
+            const blob = this.toolBlobPart(part);
+            if (blob && blob.mime.startsWith('image/')) {
+                images.push(`data:${blob.mime};base64,${blob.data}`);
+            } else if (blob) {
+                blobs++;
+            } else if (typeof part === 'string') {
+                text.push(part);
+            } else if (part !== null && part !== undefined) {
+                text.push(JSON.stringify(part));
+            }
+        }
+        if (blobs) {
+            text.unshift(window.t('chat.tool_binary_note').replace('{count}', blobs));
+        }
+        if (images.length) {
+            text.unshift(window.t('chat.tool_images_note').replace('{count}', images.length));
+        }
+        return { content: text.join('\n'), images };
+    },
+
+    // A non-text content block from an MCP tool: { type, mime_type, data }.
+    toolBlobPart(part) {
+        if (!part || typeof part !== 'object') return null;
+        const mime = part.mime_type || part.mimeType;
+        if (typeof mime !== 'string' || !mime) return null;
+        if (typeof part.data !== 'string' || !part.data) return null;
+        return { mime, data: part.data };
+    },
+
     // Parsed summary of a built-in web tool result, rendered as an
     // inline source card in the transcript.
     buildWebCard(toolName, args, payload) {
@@ -5176,7 +5214,6 @@
                     searxngUrlSet: Boolean(integrations.web_search_searxng_url),
                     ddgsBackendsSet: Boolean(integrations.web_search_ddgs_backends),
                 };
-                this._globalMaxContextWindow = settingsData.sampling?.max_context_window || 32768;
             }
             this._mirrorAliasModelTypes();
 
@@ -5199,7 +5236,8 @@
                     id: this.aliasToGateway[m.id] || m.id, // gateway id for API calls
                     name: m.id, // original name (alias or directory name) for display
                     owned_by: m.owned_by,
-                    is_favorite: favoriteIds.has(this.aliasToGateway[m.id] || m.id)
+                    is_favorite: favoriteIds.has(this.aliasToGateway[m.id] || m.id),
+                    max_context_window: m.max_model_len
                 }))
             );
 
@@ -5862,6 +5900,37 @@
         this.sidebarOpen = window.innerWidth >= 768;
     },
 
+    // Payloads too large for localStorage: base64 uploads inside content
+    // arrays, and images an MCP tool returned (~1MB each as a data URL). The
+    // image count survives so a reloaded chat can say one was there.
+    messageForStorage(msg) {
+        let out = msg;
+        if (out._images?.length) {
+            const { _images, ...rest } = out;
+            out = { ...rest, _imagesStripped: _images.length };
+        }
+        if (!Array.isArray(out.content)) return out;
+        return {
+            ...out,
+            content: out.content.map(part => {
+                if (part.type === 'image_url') {
+                    return { type: 'image_url', image_url: { url: '' } };
+                }
+                if (part.type === 'file') {
+                    return {
+                        type: 'file',
+                        file: {
+                            filename: part.file?.filename || '',
+                            mime_type: part.file?.mime_type || '',
+                            data: '',
+                        },
+                    };
+                }
+                return part;
+            })
+        };
+    },
+
     saveCurrentChat(
         chatId = this.currentChatId,
         messages = null,
@@ -5876,29 +5945,7 @@
         const existingIndex = this.chatHistory.findIndex(c => c.id === chatId);
         const existingChat = existingIndex >= 0 ? this.chatHistory[existingIndex] : null;
 
-        // Strip base64 image data from content arrays to avoid localStorage quota issues
-        const messagesForStorage = messagesToSave.map(msg => {
-            if (!Array.isArray(msg.content)) return msg;
-            return {
-                ...msg,
-                content: msg.content.map(part => {
-                    if (part.type === 'image_url') {
-                        return { type: 'image_url', image_url: { url: '' } };
-                    }
-                    if (part.type === 'file') {
-                        return {
-                            type: 'file',
-                            file: {
-                                filename: part.file?.filename || '',
-                                mime_type: part.file?.mime_type || '',
-                                data: '',
-                            },
-                        };
-                    }
-                    return part;
-                })
-            };
-        });
+        const messagesForStorage = messagesToSave.map(msg => this.messageForStorage(msg));
 
         const title = this.resolveAutoChatTitle(messagesToSave, existingChat);
 
@@ -6898,13 +6945,11 @@
                         }
                         const execData = await execResp.json();
                         // /v1/web endpoints return the whole payload; MCP wraps it in .content
-                        const content = webRoute
-                            ? JSON.stringify(execData)
-                            : (typeof execData.content === 'string'
-                                ? execData.content
-                                : JSON.stringify(execData.content ?? execData));
+                        const { content, images } = webRoute
+                            ? { content: JSON.stringify(execData), images: [] }
+                            : this.splitToolContent(execData.content ?? execData);
                         const web = webRoute ? this.buildWebCard(toolName, args, execData) : null;
-                        return { content, error: false, toolName, elapsed, web };
+                        return { content, error: false, toolName, elapsed, web, images };
                     } catch (e) {
                         const elapsed = ((Date.now() - (stream._toolTimers[toolName] || Date.now())) / 1000).toFixed(2);
                         const isTimeout = e.name === 'TimeoutError';
@@ -6936,6 +6981,7 @@
                         content: results[i].content,
                         _ui: false,
                         ...(results[i].web ? { _web: results[i].web } : {}),
+                        ...(results[i].images?.length ? { _images: results[i].images } : {}),
                     });
                 });
 
@@ -7343,28 +7389,7 @@
         };
         this.chatSessions[branchId] = branchSession;
 
-        const messagesForStorage = branchMessages.map(msg => {
-            if (!Array.isArray(msg.content)) return msg;
-            return {
-                ...msg,
-                content: msg.content.map(part => {
-                    if (part.type === 'image_url') {
-                        return { type: 'image_url', image_url: { url: '' } };
-                    }
-                    if (part.type === 'file') {
-                        return {
-                            type: 'file',
-                            file: {
-                                filename: part.file?.filename || '',
-                                mime_type: part.file?.mime_type || '',
-                                data: '',
-                            },
-                        };
-                    }
-                    return part;
-                })
-            };
-        });
+        const messagesForStorage = branchMessages.map(msg => this.messageForStorage(msg));
 
         const branchData = {
             id: branchId,
@@ -7953,15 +7978,10 @@
     },
 
     contextWindowForCurrentModel() {
-        // Per-model max_context_window from admin settings, then global fallback, then 32768.
-        try {
-            const list = this._adminModelsList || [];
-            const gw = this.aliasToGateway?.[this.currentModel] || this.currentModel;
-            const m = list.find(x => x.id === gw || x.id === this.currentModel);
-            const perModel = m?.settings?.max_context_window ?? m?.max_context_window;
-            if (perModel) return perModel;
-        } catch (e) { /* ignore */ }
-        return this._globalMaxContextWindow || 32768;
+        // Get the value already obtained from the backend || 32768.
+        const id = this.resolveGatewayModelId(this.currentModel);
+        const m = (this.availableModels || []).find(x => x.id === id);
+        return m?.max_context_window || 32768;
     },
 
     // Cache the latest known context-token count on the conversation so the meter
@@ -8310,16 +8330,6 @@
         this.theme = theme;
         localStorage.setItem(THEME_STORAGE_KEY, this.theme);
         this.applyTheme();
-    },
-
-    setEnhancedReadability(enabled) {
-        this.enhancedReadability = enabled;
-        localStorage.setItem(ENHANCED_READABILITY_KEY, enabled ? 'on' : 'off');
-        if (enabled) {
-            document.documentElement.setAttribute('data-enhanced-readability', '');
-        } else {
-            document.documentElement.removeAttribute('data-enhanced-readability');
-        }
     },
 
     async checkForUpdate() {

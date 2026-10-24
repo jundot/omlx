@@ -5901,7 +5901,6 @@ def test_native_union_parameter_keeps_correct_python_literal_values(
     assert json.loads(calls[0].function.arguments)["v"] == expected
 
 
-
 def test_stream_filter_suppresses_envelope_with_long_tool_name():
     name = "t" * 120
     f = ToolCallStreamFilter(_make_tokenizer(), tools={name})
@@ -5933,3 +5932,20 @@ def test_qwen_missing_outer_close_does_not_merge_next_call():
     decoded = [(c.function.name, c.function.arguments) for c in calls]
     assert decoded == [("f", '{"a": "one"}'), ("f", '{"a": "two"}')]
     assert errors == ()
+
+
+@pytest.mark.parametrize(
+    "think_start, expected",
+    [
+        ("<think>", "Strip ```` spans."),
+        ("<mm:think>", "Strip ``<think>...</think>`` spans."),
+    ],
+)
+def test_think_tags_in_the_answer_survive_for_leading_thinking_models(
+    think_start, expected
+):
+    tok = _make_tokenizer()
+    tok.think_start = think_start
+    cleaned, calls = parse_tool_calls("Strip ``<think>...</think>`` spans.", tok, None)
+    assert calls is None
+    assert cleaned == expected

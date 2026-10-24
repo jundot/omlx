@@ -198,7 +198,7 @@ class AnthropicTool(BaseModel):
 class ToolChoice(BaseModel):
     """Tool choice specification."""
 
-    type: Literal["auto", "any", "tool"]
+    type: Literal["auto", "any", "tool", "none"]
     name: str | None = None  # Required when type="tool"
 
 

@@ -24,7 +24,13 @@ def gated_mlp(mlp, x: mx.array) -> mx.array:
     """Gated MLP; eight-row verify shapes fuse gate, up and swiglu."""
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
-    if gate is not None and qwen35_verify_qmm.sg8_swiglu_eligible(gate, up, x):
+    # The fused kernel computes SiLU gating; MLPs with their own activation
+    # (MiniMax SwiGLU-OAI) run their module.
+    if (
+        gate is not None
+        and not hasattr(mlp, "act_fn")
+        and qwen35_verify_qmm.sg8_swiglu_eligible(gate, up, x)
+    ):
         batch, length, width = x.shape
         hidden = qwen35_verify_qmm.vk_swiglu_sg8(
             x.reshape(batch * length, width), gate, up

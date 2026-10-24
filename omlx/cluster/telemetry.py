@@ -1362,9 +1362,12 @@ def install_server_telemetry(
                         self._omlx_tokens[uid] = prefix + body
             return uids
 
-        def remove(self, uids: Any) -> Any:
+        def remove(self, uids: Any, return_prompt_caches: bool = False) -> Any:
             uid_values = list(uids)
-            if world_size > 1:
+            # MLX-LM asks for the prompt caches only when a stop sequence ended
+            # the requests. Every rank decides that from the same tokens, as
+            # with an EOS token, so that removal needs no cancel vote.
+            if world_size > 1 and not return_prompt_caches:
                 prepared = self._omlx_prepared_cancel_vote
                 if prepared is None or prepared[1] != tuple(uid_values):
                     raise RuntimeError(
@@ -1375,7 +1378,9 @@ def install_server_telemetry(
             # Mutate the MLX-LM batch first. Only then publish cancellation and
             # wake the HTTP collector; an exception during cache filtering must
             # not advertise a request as safely removed when its graph remains.
-            result = super().remove(uid_values)
+            result = super().remove(
+                uid_values, return_prompt_caches=return_prompt_caches
+            )
             for uid in uid_values:
                 self._omlx_tokens.pop(uid, None)
             telemetry.cancel_uids(uid_values)
@@ -1688,7 +1693,7 @@ def install_server_telemetry(
                 raise
             return tokenized
 
-        def _serve_single(self, request: Any) -> Any:
+        def _serve_single(self, request: Any, stream: Any) -> Any:
             # The coordinated context above makes every rank observe the same
             # cancellation. Suppress only MLX-LM's obsolete distributed guard,
             # whose entire behavior is to raise NotImplementedError after that
@@ -1698,7 +1703,7 @@ def install_server_telemetry(
             cancellation_state.sequential = was_distributed
             self._is_distributed = False
             try:
-                return super()._serve_single(request)
+                return super()._serve_single(request, stream)
             finally:
                 self._is_distributed = was_distributed
                 cancellation_state.sequential = previous

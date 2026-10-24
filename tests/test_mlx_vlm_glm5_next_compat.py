@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 import numpy as np
 import pytest
 from PIL import Image
@@ -4130,6 +4131,193 @@ def _arrays_cache():
     from mlx_vlm.models.cache import ArraysCache
 
     return ArraysCache(size=2)
+
+
+@pytest.mark.skipif(
+    not mx.metal.is_available(), reason="needs Metal allocation accounting"
+)
+def test_kda_affine_fusion_does_not_retain_a_second_weight_bank():
+    """After lazy fusion, the six public projections share the fused bank."""
+    layer = _kda_layer()
+    x = mx.zeros((1, 1, 1024), dtype=mx.bfloat16)
+    mx.eval(x)
+    mx.synchronize()
+    gc.collect()
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    out = layer._fused_in_proj(x)
+    mx.eval(out)
+    del out
+    mx.synchronize()
+    gc.collect()
+    mx.clear_cache()
+    # Metal rounds buffers larger than one VM page up to a whole page. The
+    # fused metadata banks can need padding even when their sources did not,
+    # and how much of it shows up depends on earlier allocations, so the
+    # padding is only an upper bound. A second bank would add sum(sizes).
+    page = os.sysconf("SC_PAGE_SIZE")
+    sizes = [layer[name].nbytes for name in ("_fw", "_fs", "_fb")]
+    padding = sum((-size) % page if size > page else 0 for size in sizes)
+    assert padding < sum(sizes)
+    assert mx.get_active_memory() - before <= padding
+    # Dropping and rebuilding the bank keeps the public projections usable.
+    for name in ("_fw", "_fs", "_fb"):
+        del layer[name]
+    layer._fused_ready = False
+    layer._decode_groups = None
+    out = layer._fused_in_proj(x)
+    mx.eval(out)
+    del out
+    mx.synchronize()
+    gc.collect()
+    mx.clear_cache()
+    assert mx.get_active_memory() - before <= padding
+
+
+@pytest.mark.parametrize("promoted_field", ["scales", "biases"])
+def test_kda_shared_bank_keeps_mixed_metadata_dtypes(promoted_field):
+    layer = _kda_layer()
+    mods = [
+        layer.q_proj,
+        layer.k_proj,
+        layer.v_proj,
+        layer.forget_gate.f_a_proj,
+        layer.g_a_proj,
+        layer.b_proj,
+    ]
+    for m in mods:
+        m.scales = m.scales.astype(mx.bfloat16)
+        m.biases = m.biases.astype(mx.bfloat16)
+    layer.q_proj[promoted_field] = layer.q_proj[promoted_field].astype(mx.float32)
+    x = mx.random.normal((1, 4, 1024)).astype(mx.bfloat16)
+    before_outputs = [m(x) for m in mods]
+    mx.eval(before_outputs)
+    before = [
+        {
+            k: (m[k].dtype, m[k].shape, np.array(m[k].view(mx.uint8)).tobytes())
+            for k in ("weight", "scales", "biases")
+        }
+        for m in mods
+    ]
+    out = layer._fused_in_proj(x)
+    mx.eval(out)
+    for m, saved in zip(mods, before):
+        for field, (dtype, shape, data) in saved.items():
+            assert m[field].dtype == dtype
+            assert m[field].shape == shape
+            assert np.array(m[field].view(mx.uint8)).tobytes() == data
+    for m, expected in zip(mods, before_outputs):
+        actual = m(x)
+        mx.eval(actual)
+        assert actual.dtype == expected.dtype
+        assert (
+            np.array(actual.view(mx.uint8)).tobytes()
+            == np.array(expected.view(mx.uint8)).tobytes()
+        )
+
+
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+def test_kda_affine_shared_weights_preserve_projections_and_serialization(
+    bits, dtype, tmp_path
+):
+
+    def host(a):
+        return np.array(a.astype(mx.float32) if a.dtype == mx.bfloat16 else a)
+
+    layer = _kda_layer()
+    mods = [
+        layer.q_proj,
+        layer.k_proj,
+        layer.v_proj,
+        layer.forget_gate.f_a_proj,
+        layer.g_a_proj,
+        layer.b_proj,
+    ]
+    for m in mods:
+        w = mx.random.normal((m.weight.shape[0], 1024)).astype(dtype)
+        m.weight, m.scales, m.biases = mx.quantize(w, group_size=64, bits=bits)
+        m.bits, m.group_size = bits, 64
+    mx.eval(layer.parameters())
+    # Host snapshots do not keep the original device buffers alive.
+    original = [{k: host(m[k]) for k in ("weight", "scales", "biases")} for m in mods]
+    parameters = {
+        k: np.array(v.view(mx.uint8)).tobytes()
+        for k, v in tree_flatten(layer.parameters())
+    }
+    parameter_meta = {
+        k: (v.shape, v.dtype) for k, v in tree_flatten(layer.parameters())
+    }
+    x = mx.random.normal((2, 256, 1024)).astype(dtype)
+    mx.eval(x)
+    for rows in (1, 4, 256):
+        out = layer._fused_in_proj(x[:, :rows])
+        mx.eval(out)
+        # The shared bank must give the fused result of an unshared bank.
+        reference = mx.split(
+            _language().fused_quantized_matmul(
+                x[:, :rows],
+                *[
+                    mx.concatenate(
+                        [
+                            mx.array(saved[k]).astype(m[k].dtype)
+                            for m, saved in zip(mods, original)
+                        ],
+                        axis=0,
+                    )
+                    for k in ("weight", "scales", "biases")
+                ],
+                bits=bits,
+                group_size=64,
+            ),
+            layer._split_pts,
+            axis=-1,
+        )
+        mx.eval(reference)
+        for fused, expected in zip(out, reference):
+            assert (
+                np.array(fused.view(mx.uint8)).tobytes()
+                == np.array(expected.view(mx.uint8)).tobytes()
+            )
+        for m, saved in zip(mods, original):
+            for field, expected in saved.items():
+                actual = host(m[field])
+                assert actual.dtype == expected.dtype
+                assert actual.tobytes() == expected.tobytes()
+            old = mx.quantized_matmul(
+                x[:, :rows],
+                *[
+                    mx.array(saved[k]).astype(m[k].dtype)
+                    for k in ("weight", "scales", "biases")
+                ],
+                transpose=True,
+                bits=bits,
+                group_size=64,
+            )
+            new = m(x[:, :rows])
+            mx.eval(old, new)
+            assert (
+                np.array(old.view(mx.uint8)).tobytes()
+                == np.array(new.view(mx.uint8)).tobytes()
+            )
+
+    for key, value in tree_flatten(layer.parameters()):
+        assert key in parameters
+        assert (value.shape, value.dtype) == parameter_meta[key]
+        assert np.array(value.view(mx.uint8)).tobytes() == parameters[key]
+    path = tmp_path / "layer.safetensors"
+    layer.save_weights(str(path))
+    saved_parameters = mx.load(str(path))
+    assert set(saved_parameters) == set(parameters)
+    for key, value in saved_parameters.items():
+        assert (value.shape, value.dtype) == parameter_meta[key]
+        assert np.array(value.view(mx.uint8)).tobytes() == parameters[key]
+    # Rebuilding the bank must leave the public projections intact.
+    layer._fused_ready = False
+    out = layer._fused_in_proj(x[:, :1])
+    mx.eval(out)
+    for m, saved in zip(mods, original):
+        assert np.array(m.weight).tobytes() == saved["weight"].tobytes()
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")

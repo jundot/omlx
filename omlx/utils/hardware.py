@@ -271,6 +271,30 @@ def get_gpu_core_count() -> Optional[int]:
     return None
 
 
+_GPU_GENERATION: Optional[int] = None
+
+
+def get_apple_gpu_generation() -> int:
+    """Apple GPU family generation from MLX's architecture string.
+
+    ``applegpu_g13s`` -> 13 (M1 class, no native bf16), 14 (M2), 15 (M3),
+    16 (M4), 17 (M5). Returns 0 when Metal or the string is unavailable.
+    """
+    global _GPU_GENERATION
+    if _GPU_GENERATION is None:
+        gen = 0
+        if HAS_MLX:
+            try:
+                arch = str(mx.device_info().get("architecture", ""))
+                match = re.search(r"applegpu_g(\d+)", arch.lower())
+                if match:
+                    gen = int(match.group(1))
+            except Exception:
+                pass
+        _GPU_GENERATION = gen
+    return _GPU_GENERATION
+
+
 def get_io_platform_uuid() -> Optional[str]:
     """Get IOPlatformUUID from ioreg (unique per device)."""
     try:

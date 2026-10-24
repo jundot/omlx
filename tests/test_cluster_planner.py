@@ -820,6 +820,23 @@ def test_nemotron_h_head_dim_falls_back_to_hidden_over_heads():
     assert 64 in divisors  # (32 * 128) / 64 via the fallback head_dim
 
 
+def test_vocab_split_heads_constrain_the_degree():
+    """These strategies split an untied lm_head over the vocabulary."""
+
+    from omlx.cluster.planner import _tensor_parallel_divisors
+
+    text = {"num_attention_heads": 8, "num_key_value_heads": 2, "vocab_size": 1001}
+    assert 1001 in _tensor_parallel_divisors(
+        {"model_type": "muse_spark", "text_config": text}
+    )
+    # Qwen3.5 keeps its lm_head whole for the rank-zero Lightning MTP head.
+    assert 1001 not in _tensor_parallel_divisors(
+        {"model_type": "qwen3_5", "text_config": text}
+    )
+    # Ministral 3 ties its embeddings unless the config says otherwise.
+    assert 1001 not in _tensor_parallel_divisors({"model_type": "ministral3", **text})
+
+
 def test_supports_pipeline_false_for_vision_config_vlm(monkeypatch):
     # The text backbone declares a pipeline() in mlx-lm source, but the on-disk
     # checkpoint carries a vision sub-config, so it is served by mlx-vlm and has

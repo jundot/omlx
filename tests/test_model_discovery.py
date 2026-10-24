@@ -375,12 +375,13 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 
-    def test_detect_cohere2_moe_as_vlm_without_vision_config(self, tmp_path):
-        """Cohere2 MoE is text-only but implemented by mlx-vlm."""
-        config = {
-            "model_type": "cohere2_moe",
-            "architectures": ["Cohere2MoeForCausalLM"],
-        }
+    @pytest.mark.parametrize(
+        "model_type,architecture",
+        [("cohere2_moe", "Cohere2MoeForCausalLM"), ("flint", "FlintForCausalLM")],
+    )
+    def test_detect_native_text_model_as_vlm(self, tmp_path, model_type, architecture):
+        """Text-only families implemented by mlx-vlm route to the VLM engine."""
+        config = {"model_type": model_type, "architectures": [architecture]}
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
 

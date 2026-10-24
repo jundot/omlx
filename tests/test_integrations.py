@@ -2134,6 +2134,37 @@ class TestClaudeDesktopConfigWriter:
         assert "appliedId" not in self._read(paths["meta"])
         assert self._read(paths["profile"]) == {"disableDeploymentModeChooser": False}
 
+    def test_repeated_restore_preserves_previous_gateway(self, tmp_path):
+        paths = claude_desktop._paths(tmp_path)
+        self._write(paths["claude_config"], {"deploymentMode": "3p"})
+        self._write(
+            paths["meta"],
+            {"entries": [{"id": "other", "name": "Other"}], "appliedId": "other"},
+        )
+        configure_omlx_gateway(8000, "test-key", home=tmp_path)
+        assert restore(home=tmp_path) is True
+        restored = {name: path.read_bytes() for name, path in paths.items()}
+
+        assert restore(home=tmp_path) is True
+
+        assert {name: path.read_bytes() for name, path in paths.items()} == restored
+
+    def test_restore_before_configuration_leaves_files_untouched(self, tmp_path):
+        paths = claude_desktop._paths(tmp_path)
+        self._write(paths["claude_config"], {"deploymentMode": "3p", "theme": "dark"})
+        before = paths["claude_config"].read_bytes()
+
+        assert restore(home=tmp_path) is True
+
+        assert paths["claude_config"].read_bytes() == before
+        assert not paths["claude3p_config"].exists()
+        assert not paths["meta"].exists()
+        assert not paths["profile"].exists()
+
+    def test_restore_without_any_files_is_noop(self, tmp_path):
+        assert restore(home=tmp_path) is True
+        assert not (tmp_path / "Library").exists()
+
     def test_non_macos_is_noop(self, tmp_path, monkeypatch):
         monkeypatch.setattr(claude_desktop, "_is_macos", lambda: False)
         assert configure_omlx_gateway(8000, "k", home=tmp_path) is False

@@ -48,7 +48,8 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def test_pipelined_qwen35_forward_matches_single_process(tmp_path):
+@pytest.mark.parametrize("split", ["pipeline", "tensor"])
+def test_split_qwen35_forward_matches_single_process(tmp_path, split):
     pytest.importorskip("mlx_lm.models.qwen3_5")
     hostfile = tmp_path / "ring.json"
     hostfile.write_text(
@@ -60,7 +61,7 @@ def test_pipelined_qwen35_forward_matches_single_process(tmp_path):
         env = dict(os.environ, MLX_RANK=str(rank), MLX_HOSTFILE=str(hostfile))
         procs.append(
             subprocess.Popen(
-                [sys.executable, str(worker)],
+                [sys.executable, str(worker), split],
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

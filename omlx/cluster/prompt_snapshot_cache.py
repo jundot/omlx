@@ -62,7 +62,9 @@ _MAX_ENTRIES_DEFAULT = 512
 
 # Bump when stored states stop matching a fresh prefill; older manifests then
 # reset on load. 2: mlx-lm 94cdcae changed the Qwen3.5 GDN q/k norm eps.
-_MANIFEST_VERSION = 2
+# 3: mlx-lm 0d4d3d04 changed gpt-oss, ERNIE-4.5, PhiMoE, PLaMo3 and FP8
+# Ministral 3, and ranks now run mlx-lm's own Muse Spark model.
+_MANIFEST_VERSION = 3
 
 
 def _wire_state(entry: Any) -> tuple[Any, Any]:

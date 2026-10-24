@@ -43,9 +43,8 @@ dependencies = [
     # binaries are ABI-coupled to this exact mlx version — bumping the pin
     # requires rebuilding them (OMLX_WITH_CUSTOM_KERNEL=1 setup.py build_ext).
     "mlx==0.32.4",
-    # mlx-lm main after 0.32.0. setuptools-scm derives the version from the
-    # v0.31.3 tag, so it reports 0.31.4.devN; the 0.32.0 features are present.
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
+    # mlx-lm main after 0.32.2. setuptools-scm reports it as 0.32.3.devN.
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
     # mlx-embeddings from latest commit (32981fa)
@@ -110,9 +109,9 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit 9790231 (v0.7.8). oMLX model implementations remain registered
+    # mlx-vlm from commit 4319ef2 (v0.7.10). oMLX model implementations remain registered
     # by their pre-load patches.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@9790231827a890eade1a626643a6bc94a1317c72",
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@4319ef2c837b7226b758c3dd69edda51b7079785",
     # mlx-vlm requires mlx-audio>=0.5.2 in the shared runtime.
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
     "Pillow>=9.0.0",
@@ -140,7 +139,7 @@ cluster = [
     "zeroconf>=0.131.0",
 ]
 modelscope = [
-    "modelscope>=1.10.0",
+    "modelscope>=1.28.0",
 ]
 audio = [
     # mlx-audio from commit (94c7716, v0.5.7) with tts/stt/sts extras
@@ -175,7 +174,7 @@ paroquant = [
 # separately with --no-deps after the shared layer resolves.
 bundle = [
     "mcp>=2.0.0,<3",
-    "modelscope>=1.10.0",
+    "modelscope>=1.28.0",
     # mlx-audio[tts,stt,sts] transitives:
     "scipy>=1.11.0",
     "librosa>=0.10.0",
@@ -258,7 +257,7 @@ include = ["omlx*"]
 # so dependency resolution retains the selected runtime versions.
 override-dependencies = [
     "mlx==0.32.4",
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@94cdcae13b266c337bcaca09b97b9c5a9c0e2cde",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d",
 ]
 
 [tool.black]

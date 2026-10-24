@@ -11,6 +11,19 @@ from unittest.mock import MagicMock
 import mlx.core as mx
 import pytest
 
+import omlx.patches.qwen35_fa256_attention as patch
+
+_needs_metal = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+# The real gate, kept before the fixture below replaces it on the module.
+_m1_gate = patch._m1_sdpa_enabled
+
+
+@pytest.fixture(autouse=True)
+def _steel_route_only(monkeypatch):
+    # These tests exercise the steel-kernel route; on M1 hosts the chunked
+    # MLX SDPA route (M1 section at the end of this file) would intercept first.
+    monkeypatch.setattr(patch, "_m1_sdpa_enabled", lambda: False)
+
 
 def _qkv(q_len=128, kv_len=None, dtype=mx.bfloat16):
     kv_len = q_len if kv_len is None else kv_len
@@ -306,3 +319,120 @@ def test_native_fa256_chunked_matches_single_dispatch(q_len, kv_len):
     diff = mx.max(mx.abs(single.astype(mx.float32) - chunked.astype(mx.float32))).item()
     assert not mx.isnan(chunked.astype(mx.float32)).any().item()
     assert diff < 5e-3
+
+
+# --- M1 route: query-chunked MLX SDPA ---------------------------------------
+
+
+def _reference(q, k, v, scale):
+    """Dense end-aligned causal attention in fp32 (GQA by head repeat)."""
+    q32, k32, v32 = (t.astype(mx.float32) for t in (q, k, v))
+    rep = q.shape[1] // k.shape[1]
+    k32 = mx.repeat(k32, rep, axis=1)
+    v32 = mx.repeat(v32, rep, axis=1)
+    scores = (q32 * scale) @ k32.transpose(0, 1, 3, 2)
+    q_len, kv_len = q.shape[2], k.shape[2]
+    rows = mx.arange(q_len)[:, None] + (kv_len - q_len)
+    cols = mx.arange(kv_len)[None, :]
+    scores = mx.where(cols <= rows, scores, -mx.inf)
+    return mx.softmax(scores, axis=-1) @ v32
+
+
+@_needs_metal
+@pytest.mark.parametrize(
+    "q_len,kv_len,rows",
+    [(256, 1024, 64), (200, 777, 64), (128, 128, 32), (96, 2048, 96)],
+)
+@pytest.mark.parametrize("heads", [(8, 2), (6, 1)])
+def test_chunked_sdpa_matches_dense_causal(q_len, kv_len, rows, heads):
+    hq, hkv = heads
+    mx.random.seed(0)
+    q = mx.random.normal((1, hq, q_len, 256)).astype(mx.float16)
+    k = mx.random.normal((1, hkv, kv_len, 256)).astype(mx.float16)
+    v = mx.random.normal((1, hkv, kv_len, 256)).astype(mx.float16)
+    scale = 256**-0.5
+    out = patch._m1_chunked_sdpa(q, k, v, scale, rows)
+    ref = _reference(q, k, v, scale)
+    assert out.shape == q.shape
+    assert mx.max(mx.abs(out.astype(mx.float32) - ref)).item() < 2e-2
+
+
+def test_query_rows_respect_work_budget_and_floor():
+    # 2048-row chunk, 24 q heads: shrinks with depth, never below 64 rows
+    assert patch._m1_query_rows(24, 2048, 16384) == 256
+    assert patch._m1_query_rows(24, 2048, 32768) == 128
+    assert patch._m1_query_rows(24, 2048, 65536) == 64
+    assert patch._m1_query_rows(24, 2048, 98304) == 64
+    # ~128k keys: even 64 rows exceed the max dispatch work -> steel kernel
+    assert patch._m1_query_rows(24, 2048, 131072) == 0
+    # 16-head MoE layout keeps the M1 route a little deeper
+    assert patch._m1_query_rows(16, 2048, 131072) == 64
+    # short calls run in one dispatch
+    assert patch._m1_query_rows(24, 512, 4096) == 512
+
+
+def test_route_follows_the_gpu_generation(monkeypatch):
+    from omlx.utils import hardware
+
+    gate = _m1_gate.__wrapped__
+    monkeypatch.setattr(hardware, "get_apple_gpu_generation", lambda: 13)
+    assert gate()
+    monkeypatch.setattr(hardware, "get_apple_gpu_generation", lambda: 15)
+    assert not gate()
+
+
+@_needs_metal
+def test_d512_route_shape_gates(monkeypatch):
+    monkeypatch.setattr(patch, "_m1_sdpa_enabled", lambda: True)
+    q = mx.zeros((1, 16, 64, 512), dtype=mx.float16)
+    short = mx.zeros((1, 2, 1024, 512), dtype=mx.float16)
+    # below the key threshold, wrong head_dim, array mask, sinks: not routed
+    assert patch._m1_d512_attention(q, short, short, None, 0.04, "causal", None) is None
+    q256 = mx.zeros((1, 16, 64, 256), dtype=mx.float16)
+    k256 = mx.zeros((1, 2, 40000, 256), dtype=mx.float16)
+    assert (
+        patch._m1_d512_attention(q256, k256, k256, None, 0.04, "causal", None) is None
+    )
+    monkeypatch.setattr(patch, "_M1_D512_MIN_KV", 256)
+    k = mx.zeros((1, 2, 300, 512), dtype=mx.float16)
+    assert (
+        patch._m1_d512_attention(q, k, k, None, 0.04, mx.zeros((64, 300)), None) is None
+    )
+    assert (
+        patch._m1_d512_attention(q, k, k, None, 0.04, "causal", mx.zeros((16,))) is None
+    )
+    monkeypatch.setattr(patch, "_m1_sdpa_enabled", lambda: False)
+    assert patch._m1_d512_attention(q, k, k, None, 0.04, "causal", None) is None
+
+
+@_needs_metal
+def test_d512_route_matches_dense_causal(monkeypatch):
+    monkeypatch.setattr(patch, "_m1_sdpa_enabled", lambda: True)
+    monkeypatch.setattr(patch, "_M1_D512_MIN_KV", 256)
+    monkeypatch.setattr(patch, "_M1_SDPA_WORK", 16 * 32 * 300)  # force several blocks
+    mx.random.seed(3)
+    q = mx.random.normal((1, 16, 96, 512)).astype(mx.float16)
+    k = mx.random.normal((1, 2, 300, 512)).astype(mx.float16)
+    out = patch._m1_d512_attention(q, k, k, None, 512**-0.5, "causal", None)
+    assert out is not None and out.shape == q.shape
+    ref = _reference(q, k, k, 512**-0.5)
+    assert mx.max(mx.abs(out.astype(mx.float32) - ref)).item() < 2e-2
+
+
+@_needs_metal
+def test_chunked_sdpa_blocks_share_one_scratch_size(monkeypatch):
+    # Blocks of different sizes leave MLX's buffer cache holding GBs of
+    # scratch it cannot reuse; every block must see the same key length.
+    seen = []
+    real = mx.fast.scaled_dot_product_attention
+
+    def spy(q, k, v, **kwargs):
+        seen.append((k.shape, kwargs["mask"].shape if hasattr(kwargs["mask"], "shape") else None))
+        return real(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", spy)
+    q = mx.random.normal((1, 8, 256, 64)).astype(mx.float16)
+    k = mx.random.normal((1, 2, 4096, 64)).astype(mx.float16)
+    patch._m1_chunked_sdpa(q, k, k, 0.125, 64)
+    assert len(seen) == 4
+    assert len(set(seen)) == 1

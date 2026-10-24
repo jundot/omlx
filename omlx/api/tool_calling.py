@@ -30,6 +30,7 @@ from jsonschema import Draft202012Validator, SchemaError, ValidationError, valid
 from jsonschema.exceptions import UndefinedTypeCheck
 
 from .openai_models import FunctionCall, ResponseFormat, ToolCall
+from .thinking import extract_thinking, leading_thinking_only
 
 logger = logging.getLogger(__name__)
 
@@ -2045,9 +2046,13 @@ def _parse_tool_calls_impl(
     cleaned_text = text
 
     # Remove thinking tags if present (reasoning models)
-    cleaned_text = re.sub(
-        r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
-    ).strip()
+    if leading_thinking_only(tokenizer):
+        # Only a leading block is thinking; later tags are answer text.
+        cleaned_text = extract_thinking(cleaned_text, leading_only=True)[1].strip()
+    else:
+        cleaned_text = re.sub(
+            r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
+        ).strip()
 
     if tools and _ATTR_FUNCTION_OPEN_RE.search(cleaned_text):
         # Select outer envelopes before inspecting markers inside CDATA values.

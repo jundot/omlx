@@ -412,6 +412,7 @@ def install_minimax_m3_tokenizer_protocol(
 
     from ..patches.mlx_vlm_minimax_m3_compat import (
         apply_mlx_vlm_minimax_m3_compat_patch,
+        minimax_thinking_mode_template,
     )
 
     apply_mlx_vlm_minimax_m3_compat_patch()
@@ -466,6 +467,11 @@ def install_minimax_m3_tokenizer_protocol(
     for name in ("has_tool_calling", "has_thinking"):
         with suppress(AttributeError, TypeError):
             setattr(tokenizer, name, True)
+    # mlx_lm's TokenizerWrapper forwards this to the tokenizer it renders with.
+    with suppress(AttributeError, TypeError):
+        tokenizer.chat_template = minimax_thinking_mode_template(
+            getattr(tokenizer, "chat_template", None)
+        )
     return True
 
 

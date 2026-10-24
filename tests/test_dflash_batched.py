@@ -678,6 +678,8 @@ def test_short_context_matches_reference_draft_block(make_drafter, longest):
         got = drafter._draft_batched(
             [(SimpleNamespace(uid=0), row, context, anchor, None)]
         )[0][0]
+        if isinstance(got, list):
+            got = mx.concatenate(got)[None]
         assert got.tolist() == expected.tolist()
 
 
@@ -884,3 +886,273 @@ def test_verify_mode_selects_adaptive_depth():
         dd.resolve_verify_mode("tree")
     # Settings saved before ddtree was removed load as adaptive.
     assert ModelSettings(dflash_verify_mode="ddtree").dflash_verify_mode == "adaptive"
+
+
+def _tiny_minimax_dspark(seed=0, depth=None, fixed=False):
+    from omlx.patches.minimax_m3_dspark import (
+        MiniMaxDSparkConfig,
+        MiniMaxDSparkDraftModel,
+        wrap_minimax_dspark,
+    )
+
+    config = MiniMaxDSparkConfig(
+        hidden_size=HIDDEN,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=8,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        rotary_dim=4,
+        vocab_size=VOCAB,
+        ffn_hidden_size=48,
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        swiglu_beta=1.0,
+        block_size=BLOCK,
+        mask_token_id=VOCAB - 1,
+        target_layer_ids=TARGET_LAYER_IDS,
+        sliding_window=WINDOW,
+        markov_rank=8,
+    )
+    mx.random.seed(seed)
+    model = MiniMaxDSparkDraftModel(config)
+    params = {
+        key: mx.random.normal(value.shape) * 0.2
+        for key, value in nn.utils.tree_flatten(model.parameters())
+    }
+    model.load_weights(list(params.items()), strict=True)
+    model.bind(_tiny_target())
+    mx.eval(model.parameters())
+    return wrap_minimax_dspark(model, "tiny", depth, fixed)
+
+
+def _reference_minimax_dspark(model, context, anchor):
+    """Greedy DSpark block straight from the definition.
+
+    Context positions are 0..n-1 and the block sits at n..n+B-1. Query j
+    sees context positions >= n + j - (window - 1) and the whole block; every
+    block position proposes, each with the Markov bias of the previous token.
+    """
+    config = model.config
+    n, block = context.shape[1], config.block_size
+    slots = config.sliding_window - 1
+    ctx = model.hidden_norm(model.fc(context))
+    inputs = mx.array([[anchor] + [config.mask_token_id] * (block - 1)])
+    h = model._embed_input_tokens(inputs)
+    visible = mx.arange(n)[None, :] >= (n + mx.arange(block))[:, None] - slots
+    mask = mx.concatenate([visible, mx.ones((block, block), dtype=mx.bool_)], axis=1)
+    for layer in model.layers:
+        attn = layer.self_attn
+
+        def heads(x, count, length, head_dim=attn.head_dim):
+            return x.reshape(1, length, count, head_dim).transpose(0, 2, 1, 3)
+
+        x = layer.input_layernorm(h)
+        q = model.rope(
+            attn.q_norm(heads(attn.q_proj(x), attn.n_heads, block)), offset=n
+        )
+        kb = model.rope(
+            attn.k_norm(heads(attn.k_proj(x), attn.n_kv_heads, block)), offset=n
+        )
+        kc = model.rope(
+            attn.k_norm(heads(attn.k_proj(ctx), attn.n_kv_heads, n)), offset=0
+        )
+        vb = heads(attn.v_proj(x), attn.n_kv_heads, block)
+        vc = heads(attn.v_proj(ctx), attn.n_kv_heads, n)
+        out = mx.fast.scaled_dot_product_attention(
+            q,
+            mx.concatenate([kc, kb], axis=2),
+            mx.concatenate([vc, vb], axis=2),
+            scale=attn.scale,
+            mask=mask[None, None],
+        )
+        h = h + attn.o_proj(out.transpose(0, 2, 1, 3).reshape(1, block, -1))
+        h = h + layer.mlp(layer.post_attention_layernorm(h))
+    logits = model._logits(model.norm(h))[0]
+    proposals, previous = [], anchor
+    for position in range(block):
+        bias = model.markov_head.markov_w2(
+            model.markov_head.markov_w1(mx.array([previous]))
+        )[0]
+        previous = int(mx.argmax(logits[position] + bias).item())
+        proposals.append(previous)
+    return proposals
+
+
+def test_minimax_dspark_block_matches_reference_definition():
+    drafter = _tiny_minimax_dspark()
+    assert drafter.depth == BLOCK
+    contexts, anchors = [], [5, 17, 30]
+    # 15 then 4 then 6 context tokens: the window (11 slots) drops old ones.
+    for cycle, (n, anchor) in enumerate(zip((15, 4, 6), anchors)):
+        captured = _captured(n, seed=50 + cycle)
+        contexts.append(mx.concatenate(captured, axis=-1))
+        state = SimpleNamespace(
+            uid=0, drafts=None, draft_lps=None, draft_accept_lps=None
+        )
+        drafter.draft(
+            [(None, state, captured, mx.array([anchor], dtype=mx.uint32), None)]
+        )
+        expected = _reference_minimax_dspark(
+            drafter.model, mx.concatenate(contexts, axis=1), anchor
+        )
+        assert state.drafts.tolist() == expected
+
+
+def test_minimax_dspark_batched_rows_match_rows_drafted_alone():
+    plan = [
+        {0: (5, 3), 1: (14, 9)},
+        {0: (2, 11), 1: (3, 4), 2: (7, 5)},
+        {0: (4, 8), 2: (13, 6)},
+    ]
+    expected = [{} for _ in plan]
+    for uid in (0, 1, 2):
+        alone = _tiny_minimax_dspark()
+        for cycle, rows in enumerate(plan):
+            if uid in rows:
+                expected[cycle].update(
+                    _run_cycles(alone, [{uid: rows[uid]}], cycle_offset=cycle)[0]
+                )
+    assert _run_cycles(_tiny_minimax_dspark(), plan) == expected
+
+
+def test_minimax_dspark_sanitize_maps_checkpoint_layout():
+    from omlx.patches.minimax_m3_dspark import sanitize_dspark_weights
+
+    prefix = "language_model.model.dspark."
+    raw = mx.zeros((4, 64), dtype=mx.uint8)
+    weights = {
+        f"{prefix}fc.weight": mx.zeros((8, 16)),
+        f"{prefix}hidden_norm.weight": mx.zeros((8,)),
+        f"{prefix}final_norm.weight": mx.zeros((8,)),
+        f"{prefix}layers.0.decoder_layer.self_attn.q_proj.weight": raw,
+        f"{prefix}layers.0.decoder_layer.self_attn.q_proj.weight_scale_inv": mx.zeros(
+            (4, 2), dtype=mx.uint8
+        ),
+        f"{prefix}markov_head.markov_w1.weight": mx.zeros((10, 2)),
+        f"{prefix}confidence_head.proj.weight": mx.zeros((1, 10)),
+        f"{prefix}confidence_head.proj.bias": mx.zeros((1,)),
+    }
+
+    sanitized = sanitize_dspark_weights(weights)
+
+    assert set(sanitized) == {
+        "fc.weight",
+        "hidden_norm.weight",
+        "norm.weight",
+        "layers.0.self_attn.q_proj.weight",
+        "layers.0.self_attn.q_proj.scales",
+        "markov_head.markov_w1.weight",
+    }
+    assert sanitized["layers.0.self_attn.q_proj.weight"].dtype == mx.uint32
+    assert sanitized["layers.0.self_attn.q_proj.weight"].shape == (4, 16)
+
+
+def test_dspark_context_only_cycle_keeps_the_next_block():
+    first, second = _captured(5, seed=31), _captured(4, seed=32)
+    anchors = (mx.array([7], dtype=mx.uint32), mx.array([12], dtype=mx.uint32))
+
+    drafting = _tiny_minimax_dspark()
+    every_cycle = SimpleNamespace(uid=0, depth=BLOCK, controller=None)
+    drafting.draft([(None, every_cycle, first, anchors[0], None)])
+    drafting.draft([(None, every_cycle, second, anchors[1], None)])
+
+    copying = _tiny_minimax_dspark()
+    after_copy = SimpleNamespace(uid=0, depth=BLOCK, controller=None)
+    copying.extend_context(after_copy, first)
+    copying.draft([(None, after_copy, second, anchors[1], None)])
+
+    assert after_copy.drafts.tolist() == every_cycle.drafts.tolist()
+
+
+def test_minimax_dspark_depth_verifies_a_prefix_of_the_trained_block():
+    captured, anchor = _captured(5, seed=33), mx.array([7], dtype=mx.uint32)
+    full = _tiny_minimax_dspark()
+    capped = _tiny_minimax_dspark(depth=2, fixed=True)
+    assert capped.block_size == full.block_size and not capped.adaptive
+
+    states = []
+    for drafter in (full, capped):
+        state = SimpleNamespace(uid=0, depth=BLOCK, controller=None)
+        drafter.draft([(None, state, captured, anchor, None)])
+        states.append(state)
+    assert states[1].drafts.tolist() == states[0].drafts.tolist()[:2]
+
+
+def test_dspark_context_only_cycles_queue_at_most_one_ring():
+    drafter = _tiny_minimax_dspark()
+    state = SimpleNamespace(uid=0, depth=BLOCK, controller=None)
+    for cycle in range(6):
+        drafter.extend_context(state, _captured(5, seed=40 + cycle))
+    row = drafter._rows[0]
+    assert row.pending_len == drafter.ring_slots
+    assert row.pending_len + row.fed == 30
+
+
+class _Embed(nn.Module):
+    def __init__(self, dtype):
+        super().__init__()
+        self.weight = mx.zeros((8, 4), dtype=dtype)
+
+
+def _target(dtype):
+    target = nn.Module()
+    target.language_model = nn.Module()
+    target.language_model.model = nn.Module()
+    target.language_model.model.embed_tokens = _Embed(dtype)
+    return target
+
+
+def _bf16_drafter(scale=1.0):
+    model = nn.Linear(4, 4)
+    model.update({"weight": (mx.ones((4, 4)) * scale).astype(mx.bfloat16)})
+    model.update({"bias": mx.ones((4,), dtype=mx.bfloat16)})
+    return model
+
+
+def test_drafter_cast_to_fp16_target():
+    model = _bf16_drafter()
+    assert dd.match_target_dtype(model, _target(mx.float16)) == 2
+    assert model.weight.dtype == mx.float16 and model.bias.dtype == mx.float16
+
+
+def test_drafter_kept_for_bf16_target_or_out_of_range_weights():
+    model = _bf16_drafter()
+    assert dd.match_target_dtype(model, _target(mx.bfloat16)) == 0
+    assert model.weight.dtype == mx.bfloat16
+    big = _bf16_drafter(scale=1e5)
+    assert dd.match_target_dtype(big, _target(mx.float16)) == 0
+    assert big.weight.dtype == mx.bfloat16
+
+
+def _as_dtype(drafter, dtype):
+    drafter.model.update(
+        nn.utils.tree_map(
+            lambda p: p.astype(dtype)
+            if isinstance(p, mx.array) and mx.issubdtype(p.dtype, mx.floating)
+            else p,
+            drafter.model.parameters(),
+        )
+    )
+    mx.eval(drafter.model.parameters())
+    return drafter
+
+
+def test_fp16_drafter_survives_activations_past_fp16_range():
+    """DFlash2 residuals and output convolutions exceed 65504 on real drafters."""
+    plan = [{0: (5, 3), 1: (2, 9)}, {0: (1, 11), 1: (3, 4)}, {0: (2, 8), 1: (1, 1)}]
+
+    def widened(dtype):
+        drafter = _tiny_drafter(seed=3)
+        # The real drafter's MLP output stays inside fp16 and its output
+        # convolution widens it past 65504 (2e4 -> 1.5e5 on the Qwen3.8
+        # DFlash2 drafter); scale both the same way here.
+        for layer in drafter.model.layers:
+            layer.mlp.down_proj.weight = layer.mlp.down_proj.weight * 5000.0
+            layer.mlp_conv.base_kernel = layer.mlp_conv.base_kernel * 16.0
+        return _as_dtype(drafter, dtype)
+
+    reference = _run_cycles(widened(mx.float32), plan)
+    got = _run_cycles(widened(mx.float16), plan)
+    assert got == reference

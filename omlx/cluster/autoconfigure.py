@@ -407,11 +407,12 @@ def build_rdma_matrix(interfaces: Sequence[Any]) -> RDMAMatrix:
 
     without_devices = [host.host for host in interfaces if not host.rdma_interfaces]
     if without_devices:
+        verb = "reports" if len(without_devices) == 1 else "report"
         return RDMAMatrix(
             reason=(
-                f"{', '.join(without_devices)} reports no RDMA device. RDMA is "
-                f"off by default and can only be enabled from macOS Recovery, so "
-                f"this cluster cannot use jaccl yet."
+                f"{', '.join(without_devices)} {verb} no RDMA device, so this "
+                f"cluster cannot use JACCL. Turn RDMA on in macOS until rdma_ctl "
+                f"status reports enabled and ibv_devices lists an rdma_en device."
             )
         )
 
@@ -427,12 +428,19 @@ def build_rdma_matrix(interfaces: Sequence[Any]) -> RDMAMatrix:
             if endpoint is None:
                 return RDMAMatrix(reason=link.reason)
             if link.kind != "rdma":
+                # RDMA devices sit on the Thunderbolt ports; MLX's own setup turns
+                # the bridge off and addresses each port.
+                fix = (
+                    "Turn the Thunderbolt Bridge off and give the Thunderbolt "
+                    "port itself the address"
+                    if endpoint.interface.startswith("bridge")
+                    else "Give the Thunderbolt ports between them an address"
+                )
                 return RDMAMatrix(
                     reason=(
                         f"{source.host} reaches {peer.host} over "
                         f"{endpoint.interface}, which is not an RDMA device. "
-                        f"Give the Thunderbolt ports between them an address so "
-                        f"the RDMA path is the one they share."
+                        f"{fix}, so the RDMA path is the one they share."
                     )
                 )
             row.append(f"rdma_{endpoint.interface}")

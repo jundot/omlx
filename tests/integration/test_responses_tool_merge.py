@@ -19,6 +19,10 @@ omlx/server.py's create_response():
 
 Both are small, independently-mergeable fixes.
 
+The same ``tool_choice`` suppression is covered for /v1/messages and
+/v1/messages/count_tokens, where Anthropic's ``{"type": "none"}`` was
+accepted and then never read.
+
 Uses a self-contained mock engine/pool (does not import from
 test_server_endpoints.py to keep this file independent) with a
 FastAPI TestClient, mirroring the mocking conventions used elsewhere in
@@ -31,7 +35,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omlx.engine.base import BaseEngine
-from omlx.mcp.tools import merge_tools
+from omlx.mcp.tools import mcp_tools_to_openai, merge_tools
 from omlx.mcp.types import MCPTool
 
 
@@ -191,6 +195,10 @@ class FakeMCPManager:
 
     def get_merged_tools(self, user_tools=None):
         return merge_tools(self._mcp_tools, user_tools)
+
+    def get_all_tools_openai(self):
+        # /v1/messages merges MCP tools through this instead of get_merged_tools.
+        return mcp_tools_to_openai(self._mcp_tools)
 
 
 MCP_WEATHER_TOOL = MCPTool(
@@ -362,3 +370,103 @@ class TestToolChoiceNoneSuppressesTemplateExposure:
         assert tools is None, (
             f"MCP tools leaked to the template despite tool_choice='none': {tools!r}"
         )
+
+
+ANTHROPIC_STOCK_TOOL = {
+    "name": "get_stock_price",
+    "description": "Get the current stock price",
+    "input_schema": {
+        "type": "object",
+        "properties": {"ticker": {"type": "string"}},
+    },
+}
+
+
+def _anthropic_tool_names(engine) -> set:
+    assert engine.recorded_chat_kwargs, "engine.chat was never called"
+    tools = engine.recorded_chat_kwargs[-1].get("tools") or []
+    return {t["function"]["name"] for t in tools}
+
+
+class TestAnthropicToolChoiceNone:
+    """/v1/messages accepted tool_choice {"type": "none"} and never read it,
+    so the client's tools and any MCP tools still reached the template."""
+
+    def _post(self, client, **body):
+        return client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "What's the weather?"}],
+                **body,
+            },
+        )
+
+    def test_auto_exposes_client_and_mcp_tools(self, client_with_mcp, engine):
+        # Control: without "none" both tool sources reach the engine, so the
+        # assertions below are checking a path that really carries tools.
+        resp = self._post(
+            client_with_mcp,
+            tools=[ANTHROPIC_STOCK_TOOL],
+            tool_choice={"type": "auto"},
+        )
+        assert resp.status_code == 200
+        assert _anthropic_tool_names(engine) == {
+            "get_stock_price",
+            "weather__get_weather",
+        }
+
+    def test_none_hides_client_and_mcp_tools(self, client_with_mcp, engine):
+        resp = self._post(
+            client_with_mcp,
+            tools=[ANTHROPIC_STOCK_TOOL],
+            tool_choice={"type": "none"},
+        )
+        assert resp.status_code == 200
+        assert _anthropic_tool_names(engine) == set()
+
+    def test_none_hides_mcp_tools_without_client_tools(
+        self, client_with_mcp, engine
+    ):
+        resp = self._post(client_with_mcp, tool_choice={"type": "none"})
+        assert resp.status_code == 200
+        assert _anthropic_tool_names(engine) == set()
+
+
+class TestAnthropicCountTokensToolChoiceNone:
+    """count_tokens must count the prompt the model would see: no tools
+    when tool_choice is {"type": "none"}."""
+
+    @pytest.fixture()
+    def template_calls(self, engine, monkeypatch):
+        calls = []
+        tokenizer = engine.tokenizer
+        render = tokenizer.apply_chat_template
+
+        def recording_render(messages, **kwargs):
+            calls.append(kwargs)
+            return render(messages, **kwargs)
+
+        monkeypatch.setattr(tokenizer, "apply_chat_template", recording_render)
+        return calls
+
+    @pytest.mark.parametrize(
+        ("tool_choice", "expected"),
+        [({"type": "auto"}, True), ({"type": "none"}, False)],
+    )
+    def test_tools_rendered_only_when_allowed(
+        self, client_with_mcp, template_calls, tool_choice, expected
+    ):
+        resp = client_with_mcp.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "What's the weather?"}],
+                "tools": [ANTHROPIC_STOCK_TOOL],
+                "tool_choice": tool_choice,
+            },
+        )
+        assert resp.status_code == 200
+        assert template_calls, "chat template was never rendered"
+        assert ("tools" in template_calls[-1]) is expected

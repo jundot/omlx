@@ -2,6 +2,15 @@
 
 Server tests live in `tests/` and must not depend on `apps/`: after the full run, CI deletes `apps/`, collects the server tests again, and starts `omlx serve` to check the API-only fallback. Web UI tests live in `apps/omlx-web/tests/` and the macOS app's Python tests in `apps/omlx-mac/Tests/python/`. A plain `pytest` runs all three through `testpaths`. The standalone dashboard script tests are the `apps/omlx-web/tests/*.test.cjs` files except `network_auth_ui.test.cjs`, which `test_admin_network_auth_ui.py` runs with its input.
 
+# Qwen3.5 text-only checkpoint tests
+
+Run `python -m pytest -q tests/test_oq.py -k Qwen35TextCheckpoint` to check
+loading, oQe calibration, and sensitivity proxies for text-only Qwen3.5
+checkpoints. Small local dense and MoE models, with and without an MTP head,
+cover the Hugging Face `_text` names and the existing mlx-lm name, including
+strict loading of quantized output.
+No model download is required.
+
 # Qwen3-ASR audio quantization tests
 
 Run `python -m pytest -q tests/test_audio_stt.py -k Qwen3ASRAudioQuantization` to check Qwen3-ASR audio quantization through the STT loader. Small local checkpoints cover mixed 4-bit text and 8-bit audio weights and floating-point audio layers. No model download is required.
@@ -97,6 +106,10 @@ Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_pref
 # Prefix cache completion tests
 
 Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, exact SpecPrefill static-prefix sidecars, off-boundary completion, and unknown or inconsistent cache positions.
+
+# Prefix cache serving statistics
+
+Run `python -m pytest -q tests/test_prefix_cache_restore_stats.py tests/test_cache_observability.py tests/test_runtime_cache_observability.py` to check serving cache hit rates and saved-token counters. Serving lookups count only KV retained after reconstruction, prefix/kickoff guards, scheduling validation and sparse-prefill fallback. A stale index match with no restored KV is a miss; a partial restore counts only its reusable tokens. Deferred admissions count once, and memory requeues do not count the same external request again. These tests use real paged metadata, hot-cache tensor storage and KV/ArraysCache reconstruction with small arrays, without a model download.
 
 # Batch KV capacity tests
 

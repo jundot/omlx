@@ -3704,6 +3704,10 @@ class TableDrafter:
             )
             self.jobs += 1
 
+    def extend_context(self, state, captured):
+        assert len(captured) == len(self.target_layer_ids)
+        self.fed[state.uid] = self.fed.get(state.uid, 0) + int(captured[0].shape[1])
+
     def observe(self, uids, captured):
         assert len(captured) == len(self.target_layer_ids)
         for uid in uids:
@@ -3752,6 +3756,41 @@ def test_block_drafter_matches_standard_and_feeds_committed_context(
         assert drafter.fed[uid] - len(output[uid]) in ((0, 1) if adaptive else (0,))
     # Finished rows leave the drafter registry.
     assert sorted(drafter.released) == sorted(terminal)
+
+
+@pytest.mark.parametrize("wrong", [None, 0, 3])
+def test_block_drafter_copies_keep_output_and_context(monkeypatch, wrong):
+    from omlx.patches.mlx_lm_mtp import context_copy
+
+    prompt, limit = [1, 2], 30
+    standard = CapturingCountingModel()
+    standard._omlx_mtp_decode_enabled = False
+    expected, _ = generate(standard, [prompt], [limit])
+
+    model = _drafted_counting_model(5)
+    drafter = model._omlx_drafter
+    drafter.context_copy = True
+    copies = []
+
+    def propose(self, limit):
+        done = len(self._ids) - len(prompt)
+        copied = list(expected[0][done : done + limit])
+        if wrong is not None and wrong < len(copied):
+            copied[wrong] = (copied[wrong] + 7) % 64
+        return copied
+
+    monkeypatch.setattr(context_copy.ContextCopy, "propose", propose)
+    monkeypatch.setattr(
+        context_copy.ContextCopy,
+        "observe",
+        lambda self, accepted, drafted: copies.append(accepted),
+    )
+    output, terminal = generate(model, [prompt], [limit])
+    assert output == expected
+    assert copies
+    # Copy cycles feed their committed rows without drafting a block.
+    for uid in terminal:
+        assert drafter.fed[uid] == len(output[uid])
 
 
 def test_block_drafter_serves_sampled_rows_with_draft_distribution():
@@ -6412,6 +6451,43 @@ def test_batch_park_expires_while_cohorts_come_and_go():
     assert first_mtp is not None and first_mtp <= 128 + 150 + 5
     assert mtp_cycles > 0.9 * (6000 - first_mtp) - 5 * 6000 / 50
 
+
+
+def test_batch_park_backoff_survives_cohort_changes():
+    """A cohort that starts after a park ended measures MTP again, and when
+    MTP loses again it parks for the doubled cooldown although the cohort that
+    lost first is gone. A cohort where MTP holds up resets the backoff."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    first = BatchPolicy(range(4), 3)
+    first.park()
+    memory.parked(first)
+    for _ in range(128):
+        memory.tick()
+    later = BatchPolicy(range(4), 3)
+    memory.seed(later)
+    assert later.remaining == 0 and later.needs_standard()
+    later.park()
+    assert later.remaining == 256 and later.cooldown == 512
+    memory.parked(later)
+    for _ in range(256):
+        memory.tick()
+    wider, narrower = BatchPolicy(range(8), 3), BatchPolicy(range(2), 3)
+    memory.seed(wider)
+    memory.seed(narrower)
+    wider.park()
+    narrower.park()
+    # Only cohorts of at least the row count that lost inherit the backoff.
+    assert wider.remaining == 512 and narrower.remaining == 128
+
+    held = BatchPolicy(range(8), 3)
+    held.decisions = 32
+    memory.retired(held)
+    fresh = BatchPolicy(range(4), 3)
+    memory.seed(fresh)
+    fresh.park()
+    assert fresh.remaining == 128
 
 def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
     """A fallback rebuilds rows that draft deeper than the lowered policy depth."""

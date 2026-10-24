@@ -1151,6 +1151,41 @@ def _pool(tmp_path, with_draft=True) -> tuple[EnginePool, EngineEntry]:
 
 
 class TestEnginePool:
+
+    async def test_cancelled_start_stops_splash_without_waiting_for_readiness(
+        self, tmp_path, lifecycle, monkeypatch
+    ):
+        engine = lifecycle("exec sleep 60\n")
+        pool, entry = _pool(tmp_path / "pool")
+        pool._get_final_ceiling = lambda: 0
+        monkeypatch.setattr(pool, "_external_engine_for", lambda *args: engine)
+        waiting = asyncio.Event()
+        finish_readiness = asyncio.Event()
+
+        async def wait_until_ready():
+            waiting.set()
+            await finish_readiness.wait()
+
+        monkeypatch.setattr(engine, "_wait_until_ready", wait_until_ready)
+        loading = asyncio.create_task(pool.get_engine(entry.model_id))
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=5)
+            group = engine._process.pid
+            loading.cancel()
+            done, _ = await asyncio.wait({loading}, timeout=5)
+            assert loading in done
+            with pytest.raises(asyncio.CancelledError):
+                await loading
+            assert not _group_alive(group)
+            assert not pool._lock.locked()
+            assert not entry.is_loading
+            assert entry.engine is None
+            assert entry.model_id not in pool._starting_external
+        finally:
+            finish_readiness.set()
+            await asyncio.gather(loading, return_exceptions=True)
+            await engine.stop()
+
     def test_models_without_the_setting_stay_in_process(self, tmp_path):
         pool, entry = _pool(tmp_path)
 

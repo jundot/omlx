@@ -354,7 +354,7 @@ class ModelSettingsRequest(BaseModel):
     model_alias: str | None = None
     model_type_override: str | None = None
     max_context_window: int | None = None
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, ge=1)
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
@@ -733,7 +733,7 @@ class GlobalSettingsRequest(BaseModel):
     # Sampling defaults
     sampling_max_context_window: int | None = None
     sampling_max_context_window_policy: int | None = Field(default=None, ge=1)
-    sampling_max_tokens: int | None = None
+    sampling_max_tokens: int | None = Field(default=None, ge=1)
     sampling_temperature: float | None = None
     sampling_top_p: float | None = None
     sampling_top_k: int | None = None
@@ -850,6 +850,7 @@ class OQStartRequest(BaseModel):
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
     mtp_assistant_model_path: str = ""
+    preserve_ngram_table: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -1157,6 +1158,14 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     except Exception as e:
         return False, f"failed to read config: {e}"
     model_type = cfg.get("model_type")
+    if model_type in ("minimax_m3", "minimax_m3_vl"):
+        # MiniMax M3.1 ships its DSpark draft in a dspark/ folder instead of
+        # declaring MTP heads in the target config.
+        from ..patches.minimax_m3_dspark import bundled_dspark_path
+
+        if bundled_dspark_path(model_path) is not None:
+            return True, ""
+        return False, "MiniMax checkpoint has no bundled dspark/ draft"
     if not _has_mtp_heads(cfg):
         return False, "model has no MTP heads in config"
     # qwen4_exp (Qwen3.8 Flash Next) attaches its Lightning MTP head through
@@ -9551,6 +9560,7 @@ async def estimate_oq(
     model_path: str,
     oq_level: float,
     preserve_mtp: bool = False,
+    preserve_ngram_table: bool = False,
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -9563,6 +9573,7 @@ async def estimate_oq(
             oq_level,
             64,  # group_size (default)
             preserve_mtp,
+            preserve_ngram_table,
         )
         return result
     except Exception as e:
@@ -9626,6 +9637,7 @@ async def start_oq_quantization(
             imatrix_num_samples=request.imatrix_num_samples,
             imatrix_seq_length=request.imatrix_seq_length,
             mtp_assistant_model_path=request.mtp_assistant_model_path,
+            preserve_ngram_table=request.preserve_ngram_table,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

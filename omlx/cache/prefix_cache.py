@@ -814,6 +814,8 @@ class BlockAwarePrefixCache(CacheManager):
         extra_keys: tuple[Any, ...] | None = None,
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+        *,
+        record_stats: bool = True,
     ) -> tuple[BlockTable | None, list[int]]:
         """
         Find cached prefix blocks for the given tokens.
@@ -822,6 +824,9 @@ class BlockAwarePrefixCache(CacheManager):
             request_id: Unique request identifier
             tokens: Input token sequence
             extra_keys: Additional keys for hash (e.g., VLM image hash)
+            record_stats: Count the index match immediately. Serving callers
+                pass False and call record_cache_result after restoring KV and
+                applying any generation-kickoff or minimum-prefix guards.
 
         Returns:
             Tuple of (block_table, remaining_tokens)
@@ -863,12 +868,8 @@ class BlockAwarePrefixCache(CacheManager):
             if block_table.block_ids:
                 num_prefix_tokens = block_table.num_tokens
                 remaining = tokens[num_prefix_tokens:]
-                self._hits += 1
-                if num_prefix_tokens % self.block_size != 0:
-                    self._tail_block_hits += 1
-                self._tokens_saved += num_prefix_tokens
-                self._tokens_matched_total += num_prefix_tokens
-                self._tokens_requested_total += len(tokens)
+                if record_stats:
+                    self.record_cache_result(len(tokens), num_prefix_tokens)
 
                 logger.debug(
                     f"Cache hit for {request_id}: "
@@ -915,10 +916,8 @@ class BlockAwarePrefixCache(CacheManager):
 
                 matched_tokens = block_table.num_tokens
                 remaining = tokens[matched_tokens:]
-                self._hits += 1
-                self._tokens_saved += matched_tokens
-                self._tokens_matched_total += matched_tokens
-                self._tokens_requested_total += len(tokens)
+                if record_stats:
+                    self.record_cache_result(len(tokens), matched_tokens)
 
                 logger.debug(
                     f"Prefix index hit for {request_id}: "
@@ -928,10 +927,24 @@ class BlockAwarePrefixCache(CacheManager):
                 return block_table, remaining
 
         # No cache hit
-        self._misses += 1
-        self._tokens_requested_total += len(tokens)
+        if record_stats:
+            self.record_cache_result(len(tokens), 0)
         logger.debug(f"Cache miss for {request_id}")
         return None, tokens
+
+    def record_cache_result(self, num_tokens: int, cached_tokens: int) -> None:
+        """Record one lookup using the tokens the caller can actually reuse."""
+        if not num_tokens:
+            return
+        self._tokens_requested_total += num_tokens
+        if cached_tokens > 0:
+            self._hits += 1
+            self._tokens_saved += cached_tokens
+            self._tokens_matched_total += cached_tokens
+            if cached_tokens % self.block_size:
+                self._tail_block_hits += 1
+        else:
+            self._misses += 1
 
     def store_cache(
         self,

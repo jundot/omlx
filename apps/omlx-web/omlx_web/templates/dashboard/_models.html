@@ -1348,7 +1348,7 @@
 
                     <!-- ==================== QUANTIZER TAB ==================== -->
                     <div x-show="modelsTab === 'quantizer'" x-cloak
-                         x-effect="oqSelectedModelPath; oqLevel; oqApplyModelPolicy(); oqRefreshEstimate()">
+                         x-effect="oqSelectedModelPath; oqLevel; oqPreserveNgram; oqApplyModelPolicy(); oqRefreshEstimate()">
                         <!-- Header -->
                         <div class="mb-8">
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('models.oq.section_label') }}</h2>
@@ -1522,6 +1522,22 @@
                                                     ]"
                                                     class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
                                                 <span :class="oqPreserveMtp ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
+                                        <!-- Keep the original DeepSeek V4.1 Engram tables (-ngram) -->
+                                        <div x-show="oqSelectedModelType() === 'deepseek_v41'" x-cloak class="flex items-center justify-between">
+                                            <div class="flex-1 min-w-0 pr-3">
+                                                <span class="text-sm text-neutral-600">{{ t('models.oq.preserve_ngram') }}</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">{{ t('models.oq.preserve_ngram_help') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    role="switch"
+                                                    :aria-checked="oqPreserveNgram"
+                                                    @click="oqPreserveNgram = !oqPreserveNgram"
+                                                    :class="oqPreserveNgram ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative flex-shrink-0 w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                                <span :class="oqPreserveNgram ? 'translate-x-5' : 'translate-x-0'"
                                                       class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                             </button>
                                         </div>

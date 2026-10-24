@@ -6,6 +6,8 @@ with directory-size-based progress polling.
 """
 
 import asyncio
+import contextlib
+import functools
 import logging
 import os
 import shutil
@@ -376,6 +378,29 @@ async def _fetch_ms_models_rest(
     except Exception as e:
         logger.warning(f"ModelScope REST API fetch failed: {e}")
     return []
+
+
+class _DownloadAborted(BaseException):
+    """Stops a cancelled transfer. The SDK retries on any Exception."""
+
+
+class _AbortCallback:
+    """ModelScope progress callback that stops a cancelled transfer.
+
+    The SDK creates one per file and calls ``update()`` per chunk.
+    """
+
+    def __init__(self, should_abort: Callable[[], bool], filename: str, file_size: int):
+        self._should_abort = should_abort
+        if should_abort():
+            raise _DownloadAborted()
+
+    def update(self, size: int) -> None:
+        if self._should_abort():
+            raise _DownloadAborted()
+
+    def end(self) -> None:
+        pass
 
 
 class MSDownloader(_QueuePersistenceMixin):
@@ -752,9 +777,8 @@ class MSDownloader(_QueuePersistenceMixin):
     async def cancel_download(self, task_id: str) -> bool:
         """Cancel an active download.
 
-        Note: Due to Python threading limitations, the actual download thread
-        cannot be interrupted immediately. The download will be marked as
-        cancelled and files will be cleaned up when the thread completes.
+        The SDK thread stops at its next chunk. Partial files stay so a
+        retry can resume them.
 
         Args:
             task_id: The task ID to cancel.
@@ -780,8 +804,8 @@ class MSDownloader(_QueuePersistenceMixin):
         if progress_task and not progress_task.done():
             progress_task.cancel()
 
-        # Cancel the download task
-        active_task = self._active_tasks.pop(task_id, None)
+        # The task stays in _active_tasks until its worker stops writing.
+        active_task = self._active_tasks.get(task_id)
         if active_task and not active_task.done():
             active_task.cancel()
 
@@ -930,12 +954,29 @@ class MSDownloader(_QueuePersistenceMixin):
                 if ms_token:
                     dl_kwargs["token"] = ms_token
 
-                # Run snapshot_download in a thread (blocking call)
-                # Note: Thread cannot be interrupted, cancellation is checked after completion
-                await asyncio.to_thread(
-                    ms_snapshot_download,
-                    **dl_kwargs,
+                # Cancel, stall and shutdown all move the task out of DOWNLOADING.
+                abort = functools.partial(
+                    _AbortCallback,
+                    lambda: task.status != DownloadStatus.DOWNLOADING,
                 )
+                payload = asyncio.get_running_loop().run_in_executor(
+                    None,
+                    functools.partial(
+                        ms_snapshot_download,
+                        **dl_kwargs,
+                        progress_callbacks=[abort],
+                    ),
+                )
+                try:
+                    await asyncio.shield(payload)
+                except asyncio.CancelledError:
+                    # A retry must not overlap this writer. Hold the semaphore
+                    # until the SDK thread stops, even if cancelled again.
+                    while not payload.done():
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await asyncio.wait({payload})
+                    payload.exception()  # Retrieved, so asyncio does not log it.
+                    raise
 
                 # Check if cancelled while downloading - clean up downloaded files
                 if task_id in self._cancelled:

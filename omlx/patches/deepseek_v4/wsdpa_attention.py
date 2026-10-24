@@ -18,6 +18,8 @@ import logging
 
 import mlx.core as mx
 
+from .sparse_attention_nax import sparse_topk_attention_nax
+
 logger = logging.getLogger(__name__)
 
 _kernel = None
@@ -339,6 +341,13 @@ def wsdpa_topk_prefill(
     native/stock path whenever shapes or dtypes are not the exact prefill case.
     """
     global _broken, _topk_ready
+    if not isinstance(offset, mx.array):
+        # Opt-in tensor-unit kernel (M5); None keeps the kernel below.
+        out = sparse_topk_attention_nax(
+            q, kv, pooled, topk, sinks, scale, offset, window, ratio
+        )
+        if out is not None:
+            return out
     if isinstance(offset, mx.array) or _broken:
         return None
     if (

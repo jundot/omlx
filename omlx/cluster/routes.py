@@ -1133,6 +1133,9 @@ def _resolve_fabric(
     fell_back = bool(blocker) and proposed != "ring"
     if fell_back:
         reason = f"{reason}; falling back to the TCP ring because {blocker}"
+        warnings.append(
+            f"The cluster uses the TCP ring instead of JACCL, because {blocker}"
+        )
     elif blocker:
         reason = blocker
     backend = "ring" if blocker else proposed
@@ -1334,8 +1337,6 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         warnings.append(f"Transport detection failed: {transport_error}")
     if fabric_error:
         warnings.append(f"Address discovery failed: {fabric_error}")
-    if fabric is not None:
-        warnings.extend(fabric.get("warnings", ()))
 
     # Place tensor-parallel groups on the fastest links: TP all-reduces once
     # per layer per token, while a pipeline boundary sends one tensor per
@@ -1426,6 +1427,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     activation_hosts = [host.model_dump() for host in ordered_hosts]
     if fabric is not None:
         backend, backend_reason = fabric["backend"], fabric["backend_reason"]
+        warnings.extend(fabric.get("warnings", ()))
         if fabric["ok"]:
             for host, discovered in zip(activation_hosts, fabric["hosts"]):
                 host["ips"] = discovered["ips"]

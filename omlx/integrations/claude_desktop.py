@@ -241,12 +241,24 @@ def restore(home: Path | None = None) -> bool:
     paths = _paths(resolved)
 
     profile = _read_json(paths["profile"])
+    meta = _read_json(paths["meta"])
+    managed_keys = (
+        *_GATEWAY_KEYS,
+        _PREVIOUS_APPLIED_ID_KEY,
+        _PREVIOUS_DEPLOYMENT_MODE_KEY,
+    )
+    if (
+        not any(key in profile for key in managed_keys)
+        and meta.get("appliedId") != PROFILE_ID
+    ):
+        # A previous restore removed our ownership markers. Do not replace
+        # the restored gateway mode, or create files before the first setup.
+        return True
     previous_mode = profile.get(_PREVIOUS_DEPLOYMENT_MODE_KEY) or "1p"
 
     _set_deployment_mode(paths["claude_config"], previous_mode)
     _set_deployment_mode(paths["claude3p_config"], previous_mode)
 
-    meta = _read_json(paths["meta"])
     previous_applied_id = profile.get(_PREVIOUS_APPLIED_ID_KEY)
 
     if meta:

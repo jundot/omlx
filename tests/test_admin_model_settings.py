@@ -6,6 +6,7 @@ import copy
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pydantic
 import pytest
 from fastapi import HTTPException
 
@@ -774,6 +775,15 @@ async def test_mtp_depth_rejects_out_of_range_values(field, value):
             ModelSettings(),
             admin_routes.ModelSettingsRequest(**{field: value}),
         )
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_output_token_caps_below_one_are_rejected(value):
+    # The global route applies the runtime copy before validate().
+    with pytest.raises(pydantic.ValidationError, match="max_tokens"):
+        admin_routes.ModelSettingsRequest(max_tokens=value)
+    with pytest.raises(pydantic.ValidationError, match="sampling_max_tokens"):
+        admin_routes.GlobalSettingsRequest(sampling_max_tokens=value)
 
 
 def test_unknown_settings_fields_are_rejected_loudly():

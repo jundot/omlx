@@ -90,6 +90,7 @@ from .api.anthropic_utils import (
     create_text_delta_event,
     create_thinking_delta_event,
     is_auto_mode_classifier_request,
+    tool_choice_is_none,
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
@@ -183,7 +184,12 @@ from .api.decisions import (
 )
 from .api.decisions_models import DecisionRequest
 from .api.systemone_models import SystemOneRequest
-from .api.thinking import ThinkingParser, extract_thinking, prompt_opens_thinking
+from .api.thinking import (
+    ThinkingParser,
+    extract_thinking,
+    leading_thinking_only,
+    prompt_opens_thinking,
+)
 from .api.tool_calling import (
     ToolCallExtraction,
     ToolCallStreamSegment,
@@ -2697,13 +2703,19 @@ _KEEPALIVE_COMPLETION_CHUNK = (
 )
 
 
-def _completion_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id."""
+def _completion_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive with the stream's id/model and a current creation timestamp.
+
+    See ``_chat_keepalive_chunk`` for why each identity field must match.
+    """
     return (
-        'data: {"id":"' + response_id + '","object":"text_completion","created":0,'
-        '"model":"keepalive",'
+        'data: {"id":"' + response_id + '","object":"text_completion",'
+        '"created":' + str(int(time.time())) + ","
+        '"model":' + json.dumps(model) + ","
         '"choices":[{"index":0,"text":"","logprobs":null,"finish_reason":null}]}\n\n'
     )
+
+
 _KEEPALIVE_ANTHROPIC_PING = 'event: ping\ndata: {"type":"ping"}\n\n'
 
 
@@ -2765,8 +2777,8 @@ def _resolve_keepalive(
     return None
 
 
-def _chat_keepalive_chunk(response_id: str) -> str:
-    """Keepalive frame that shares the stream's completion id.
+def _chat_keepalive_chunk(response_id: str, model: str) -> str:
+    """Keepalive with the stream's id/model and a current creation timestamp.
 
     The static ``_KEEPALIVE_CHAT_CHUNK`` carries a sentinel id
     (``chatcmpl-keepalive``) that differs from the real completion chunks.
@@ -2778,13 +2790,20 @@ def _chat_keepalive_chunk(response_id: str) -> str:
     those clients while remaining a parseable data event for clients that can't
     handle SSE comment lines.
 
+    Callers pass ``request.model`` because every real chunk carries it: clients
+    that latch the stream's model and ``created`` from the first chunk would
+    otherwise report the sentinel ``"keepalive"`` model and epoch 0. The frame
+    is built when the stream is set up, so ``created`` is stamped then, just as
+    each real chunk stamps its own creation time.
+
     The delta must also carry ``"role":"assistant"`` — see the comment on
     ``_KEEPALIVE_CHAT_CHUNK`` (accumulators that type the stream from the
     first chunk's role drop tool_call_chunks without it, #2074).
     """
     return (
         'data: {"id":"' + response_id + '","object":"chat.completion.chunk",'
-        '"created":0,"model":"keepalive",'
+        '"created":' + str(int(time.time())) + ","
+        '"model":' + json.dumps(model) + ","
         '"choices":[{"index":0,"delta":{"role":"assistant","content":""},'
         '"finish_reason":null}]}\n\n'
     )
@@ -3603,7 +3622,7 @@ async def _create_markitdown_chat_completion(
         response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         keepalive = _resolve_keepalive("openai_chat")
         if keepalive == _KEEPALIVE_CHAT_CHUNK:
-            keepalive = _chat_keepalive_chunk(response_id)
+            keepalive = _chat_keepalive_chunk(response_id, request.model)
         markdown_chunks = stream_messages_to_markdown_async(
             request.messages,
             global_settings=_server_state.global_settings,
@@ -4508,7 +4527,7 @@ async def create_completion(
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_completion")
             if keepalive == _KEEPALIVE_COMPLETION_CHUNK:
-                keepalive = _completion_keepalive_chunk(response_id)
+                keepalive = _completion_keepalive_chunk(response_id, request.model)
             return StreamingResponse(
                 _release_after_stream(
                     _with_request_disconnect_abort(
@@ -5164,7 +5183,7 @@ async def create_chat_completion(
             response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             keepalive = _resolve_keepalive("openai_chat")
             if keepalive == _KEEPALIVE_CHAT_CHUNK:
-                keepalive = _chat_keepalive_chunk(response_id)
+                keepalive = _chat_keepalive_chunk(response_id, request.model)
             sse_headers = {
                 "X-Accel-Buffering": "no",
                 "Cache-Control": "no-cache",
@@ -5251,10 +5270,10 @@ async def create_chat_completion(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
                 raw_text,
+                leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
-                start_in_thinking=(
-                    output.finish_reason == "length"
-                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                start_in_thinking=_chat_prompt_opens_thinking(
+                    engine, messages, chat_kwargs
                 ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
@@ -6165,6 +6184,10 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _leading_thinking_only(engine: BaseEngine) -> bool:
+    return leading_thinking_only(getattr(engine, "tokenizer", None))
+
+
 def _chat_prompt_opens_thinking(
     engine: BaseEngine,
     messages: list,
@@ -6253,7 +6276,9 @@ def _nonstream_recovery_text(
     # Judge the text the stream filter would see, before special tokens are
     # cleaned out of it.
     _, generated = extract_thinking(
-        output.text or "", truncated=output.finish_reason == "length"
+        output.text or "",
+        truncated=output.finish_reason == "length",
+        leading_only=leading_thinking_only(tokenizer),
     )
     probe = ToolCallStreamFilter(tokenizer, tools=tools)
     probe.feed(generated)
@@ -6387,7 +6412,10 @@ async def stream_chat_completion(
             )
     except Exception as exc:
         logger.debug("Could not detect chat stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    leading_only = _leading_thinking_only(engine)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking, leading_only=leading_only
+    )
 
     def mark_visible_delta() -> None:
         nonlocal first_visible_time
@@ -6733,6 +6761,7 @@ async def stream_chat_completion(
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         extraction = extract_tool_calls_with_thinking(
@@ -7097,7 +7126,10 @@ async def stream_anthropic_messages(
             )
     except Exception as exc:
         logger.debug("Could not detect Anthropic stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    leading_only = _leading_thinking_only(engine)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking, leading_only=leading_only
+    )
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -7341,6 +7373,7 @@ async def stream_anthropic_messages(
         # (falls back to thinking content for small models)
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         extraction = extract_tool_calls_with_thinking(
@@ -7717,8 +7750,15 @@ async def create_anthropic_message(
         ):
             merged_ct_kwargs["preserve_thinking"] = True
 
-        # Merge MCP tools with user-provided Anthropic tools
-        user_internal = convert_anthropic_tools_to_internal(request.tools)
+        # Merge MCP tools with user-provided Anthropic tools. tool_choice
+        # {"type": "none"} keeps every tool out of the prompt, matching
+        # tool_choice="none" on /v1/chat/completions.
+        tools_disabled = tool_choice_is_none(request.tool_choice)
+        user_internal = (
+            None
+            if tools_disabled
+            else convert_anthropic_tools_to_internal(request.tools)
+        )
         if getattr(engine, "is_diffusion_model", False) and not getattr(
             engine, "supports_tool_calling", False
         ):
@@ -7729,7 +7769,11 @@ async def create_anthropic_message(
                     field="tools",
                 )
             internal_tools = None
-        elif _server_state.mcp_manager and mcp_tools_exposed():
+        elif (
+            not tools_disabled
+            and _server_state.mcp_manager
+            and mcp_tools_exposed()
+        ):
             mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
             combined = (mcp_openai_tools or []) + (user_internal or [])
             # Deduplicate by function name (user tools take precedence)
@@ -7877,10 +7921,10 @@ async def create_anthropic_message(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
                 raw_text,
+                leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
-                start_in_thinking=(
-                    output.finish_reason == "length"
-                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                start_in_thinking=_chat_prompt_opens_thinking(
+                    engine, messages, chat_kwargs
                 ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
@@ -7989,8 +8033,12 @@ async def count_anthropic_tokens(
         )
         messages = convert_anthropic_to_internal(temp_request)
 
-        # Convert tools if present
-        internal_tools = convert_anthropic_tools_to_internal(request.tools)
+        # Convert tools if present; count them only when the model sees them.
+        internal_tools = (
+            None
+            if tool_choice_is_none(request.tool_choice)
+            else convert_anthropic_tools_to_internal(request.tools)
+        )
 
         # Apply chat template to get prompt
         tokenizer = engine.tokenizer
@@ -8598,7 +8646,6 @@ async def create_response(
                                 model_load_duration=model_load_duration,
                                 resolved_model=resolved_model,
                                 response_format=response_format,
-                                native_reasoning=native_reasoning,
                                 namespace_aliases=namespace_aliases,
                                 stream_state=stream_state,
                                 **chat_kwargs,
@@ -8658,10 +8705,10 @@ async def create_response(
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
                 raw_text,
+                leading_only=_leading_thinking_only(engine),
                 truncated=output.finish_reason == "length",
-                start_in_thinking=(
-                    output.finish_reason == "length"
-                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                start_in_thinking=_chat_prompt_opens_thinking(
+                    engine, messages, chat_kwargs
                 ),
             )
 
@@ -8806,7 +8853,6 @@ async def stream_responses_api(
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     response_format=None,
-    native_reasoning: bool = False,
     namespace_aliases: Optional[dict] = None,
     stream_state: _ResponsesStreamState | None = None,
     **kwargs,
@@ -8823,20 +8869,23 @@ async def stream_responses_api(
     has_tools = bool(kwargs.get("tools"))
     # Some templates open the thinking block in the prompt itself, so the
     # generated text starts with reasoning body and only later emits </think>.
-    start_in_thinking = native_reasoning
-    if not start_in_thinking:
-        try:
-            tokenizer = getattr(engine, "tokenizer", None)
-            if tokenizer is not None:
-                prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
-                    engine, messages, kwargs
-                )
-                start_in_thinking, _ = prompt_opens_thinking(
-                    tokenizer, prompt, prompt_token_ids=prompt_token_ids
-                )
-        except Exception as exc:
-            logger.debug("Could not detect Responses stream thinking state: %s", exc)
-    thinking_parser = ThinkingParser(start_in_thinking=start_in_thinking)
+    # Template-level preserve_thinking does not imply this prompt leaves it open.
+    start_in_thinking = False
+    try:
+        tokenizer = getattr(engine, "tokenizer", None)
+        if tokenizer is not None:
+            prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+                engine, messages, kwargs
+            )
+            start_in_thinking, _ = prompt_opens_thinking(
+                tokenizer, prompt, prompt_token_ids=prompt_token_ids
+            )
+    except Exception as exc:
+        logger.debug("Could not detect Responses stream thinking state: %s", exc)
+    leading_only = _leading_thinking_only(engine)
+    thinking_parser = ThinkingParser(
+        start_in_thinking=start_in_thinking, leading_only=leading_only
+    )
     stream_state = stream_state or _ResponsesStreamState()
     seq = 0
 
@@ -9227,6 +9276,7 @@ async def stream_responses_api(
     elif has_tools and accumulated_text:
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         extraction = extract_tool_calls_with_thinking(
@@ -9267,6 +9317,7 @@ async def stream_responses_api(
         # No tools — use raw accumulated text minus thinking.
         thinking_content, regular_content = extract_thinking(
             accumulated_text,
+            leading_only=leading_only,
             truncated=last_output is not None and last_output.finish_reason == "length",
         )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""

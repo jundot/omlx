@@ -982,3 +982,14 @@ assert.equal(app.statsNumberScale, 'exact');
         timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_model_settings_header_wraps_only_below_sm():
+    header = _section(_model_settings_template(), "<!-- Title bar;", "</h4>")
+    actions = _section(
+        _model_settings_template(), "</h4>", '<i data-lucide="x"'
+    )
+    assert "max-sm:flex-wrap" in header
+    assert "flex-shrink-0 max-sm:flex-shrink" in actions
+    assert "max-sm:justify-end max-sm:ml-auto" in actions
+    assert "max-sm:absolute max-sm:right-2" in actions

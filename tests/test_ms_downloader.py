@@ -17,6 +17,7 @@ from omlx.admin.hf_downloader import (
 )
 from omlx.admin.ms_downloader import (
     MSDownloader,
+    _DownloadAborted,
     _ENRICH_CACHE,
     _enrich_cache_get,
     _enrich_cache_put,
@@ -313,6 +314,58 @@ class TestMSDownloader:
                 await downloader.shutdown()
                 if started.is_set():
                     await _wait_for(finished.is_set)
+
+    @pytest.mark.asyncio
+    async def test_cancel_stops_writer_before_retry_starts(self, downloader):
+        started = threading.Event()
+        release = threading.Event()
+        events = []
+
+        def download(**kwargs):
+            (callback,) = kwargs["progress_callbacks"]
+            if events:
+                events.append("retry")
+                return kwargs["local_dir"]
+            progress = callback("model.safetensors", 3)
+            started.set()
+            try:
+                for _ in range(3):
+                    release.wait(5)
+                    try:
+                        progress.update(1)
+                    except Exception:  # The SDK retries on any Exception.
+                        continue
+            except _DownloadAborted:
+                events.append("aborted")
+                raise
+            events.append("finished")
+
+        with (
+            patch("omlx.admin.ms_downloader.MS_SDK_AVAILABLE", True),
+            patch("omlx.admin.ms_downloader._get_ms_api", return_value=None),
+            patch(
+                "omlx.admin.ms_downloader.ms_snapshot_download",
+                side_effect=download,
+            ),
+        ):
+            try:
+                first = await downloader.start_download("owner/model")
+                worker = downloader._active_tasks[first.task_id]
+                await _wait_for(started.is_set)
+                assert await downloader.cancel_download(first.task_id)
+                retry = await downloader.retry_download(first.task_id)
+                worker.cancel()  # Shutdown cancels again.
+                await asyncio.sleep(0.05)
+                assert downloader._active_tasks[first.task_id] is worker
+                assert retry.status == DownloadStatus.PENDING
+
+                release.set()
+                await _wait_for(lambda: retry.status == DownloadStatus.COMPLETED)
+                assert events == ["aborted", "retry"]
+                assert worker.done()
+            finally:
+                release.set()
+                await downloader.shutdown()
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_task(self, downloader):

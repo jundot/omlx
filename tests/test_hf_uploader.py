@@ -169,6 +169,37 @@ class TestGenerateModelCard:
         assert "| Language model |" in card
         assert "| Decision readout | 0.000B | 0.000 GB / 0.000 GiB |" in card
 
+    def test_bundled_dspark_draft_is_reported_with_the_model(self, tmp_path):
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {"language_model.model.embed.weight": mx.ones((1000, 1000), mx.bfloat16)},
+        )
+        draft = tmp_path / "dspark"
+        draft.mkdir()
+        (draft / "config.json").write_text(
+            json.dumps({"architectures": ["DSparkMiniMaxDraftModel"]})
+        )
+        mx.save_safetensors(
+            str(draft / "model-dspark-00001.safetensors"),
+            {"fc.weight": mx.ones((1000, 1000), dtype=mx.float32)},
+        )
+
+        card = _generate_model_card(
+            "MiniMax-oQ4e-mtp", tmp_path, {"model_type": "minimax_m3_vl"}
+        )
+
+        assert "- mtp" in card
+        # 1M BF16 weights alone, then 1M more F32 weights from the draft.
+        assert (
+            "The effective average is 16.000 bits/weight for the model weights, "
+            "or 24.000 bits/weight including the DSpark draft."
+        ) in card
+        assert "| DSpark draft (MTP) | 0.001B | 0.004 GB / 0.004 GiB |" in card
+        rows = [line for line in card.splitlines() if line.startswith("| **Total**")]
+        # The bit table covers the model weights; the storage total adds the draft.
+        assert rows[0].endswith("| **16.000** |")
+        assert rows[1] == "| **Total** | **0.002B** | **0.006 GB / 0.006 GiB** |"
+
     def test_lookup_tables_are_reported_apart_from_the_average(self, tmp_path):
         ple = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0"
         table = mx.ones((32, 160), dtype=mx.bfloat16)
@@ -202,6 +233,57 @@ class TestGenerateModelCard:
             "The effective average is 16.000 bits/weight excluding the N-gram "
             "embedding table, or"
         ) in card
+
+    def test_v41_fp8_engram_tables_keep_source_storage(self, tmp_path):
+        engram = "language_model.layers.1.engram.embed"
+        rows, width = 32, 256
+        tensors = {
+            f"{engram}.weight": ("F8_E4M3", [rows, width], rows * width),
+            f"{engram}.scales": ("F8_E8M0", [rows, width // 32], rows * width // 32),
+            "language_model.norm.weight": ("BF16", [width], 2 * width),
+        }
+        header, offset = {}, 0
+        for key, (dtype, shape, size) in tensors.items():
+            header[key] = {
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [offset, offset + size],
+            }
+            offset += size
+        encoded = json.dumps(header).encode()
+        encoded += b" " * (-len(encoded) % 8)
+        (tmp_path / "model.safetensors").write_bytes(
+            struct.pack("<Q", len(encoded)) + encoded + bytes(offset)
+        )
+        config = {
+            "model_type": "deepseek_v41",
+            "omlx_deepseek_v41": {
+                "quantized_modules": {},
+                "engram_tables": {
+                    engram: {
+                        "weight_key": f"{engram}.weight",
+                        "scale_key": f"{engram}.scales",
+                        "group_size": 32,
+                        "mode": "mxfp8",
+                    }
+                },
+            },
+        }
+
+        card = _generate_model_card(
+            "DeepSeek-V4.1-Flash-oQ4e-ngram-mtp", tmp_path, config
+        )
+
+        lines = card.splitlines()
+        assert lines[lines.index("# DeepSeek-V4.1-Flash-oQ4e-ngram-mtp") + 2] == (
+            "N-gram (Engram) tables are kept at the original FP8 precision."
+        )
+        rows_by_label = {line.split(" | ")[0]: line for line in lines}
+        # One E4M3 byte per weight plus one E8M0 byte per 32 weights.
+        assert rows_by_label["| Engram MXFP8, group 32"] == (
+            "| Engram MXFP8, group 32 | 0.000B | 96.970% | 0.000 GiB | 8.25 |"
+        )
+        assert "excluding the Engram tables" in card
 
 
 # =============================================================================
@@ -643,9 +725,8 @@ class TestHFUploaderReadme:
         """Frontmatter-only README should be treated as empty and auto-generated."""
         oq_path = Path(model_dirs[0]) / "Llama-3B-oQ4"
         # Write a frontmatter-only stub (like mlx-lm default)
-        (oq_path / "README.md").write_text(
-            "---\nlanguage: en\nlibrary_name: mlx\ntags:\n- mlx\n---\n"
-        )
+        original_readme = "---\nlanguage: en\nlibrary_name: mlx\ntags:\n- mlx\n---\n"
+        (oq_path / "README.md").write_text(original_readme)
         uploader = HFUploader(model_dirs=model_dirs)
 
         with patch("huggingface_hub.HfApi") as MockApi:
@@ -673,3 +754,94 @@ class TestHFUploaderReadme:
             # Should contain auto-generated content, not the stub
             assert "# Llama-3B-oQ4" in readme_contents[0]
             assert "oQ" in readme_contents[0]
+            assert (oq_path / "README.md").read_text() == original_readme
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("readme_mode", ["source", "generated"])
+    @pytest.mark.parametrize("fail_upload", [False, True])
+    async def test_existing_readme_restored(self, model_dirs, readme_mode, fail_upload):
+        model_path = Path(model_dirs[0]) / "Llama-3B-oQ4"
+        readme = model_path / "README.md"
+        original = (
+            b"Original local card\r\n"
+            if readme_mode == "source"
+            else b"---\nlibrary_name: mlx\n---\n"
+        )
+        readme.write_bytes(original)
+        readme.chmod(0o640)
+        os.utime(readme, ns=(1_700_000_000_000_000_000,) * 2)
+        original_stat = readme.stat()
+        uploaded = []
+
+        def upload(**kwargs):
+            uploaded.append((Path(kwargs["folder_path"]) / "README.md").read_bytes())
+            if fail_upload:
+                raise RuntimeError("Upload failed")
+
+        uploader = HFUploader(model_dirs)
+        source = Path(model_dirs[0]) / "Llama-3B-Instruct"
+        (source / "README.md").chmod(0o444)
+        with patch("huggingface_hub.HfApi") as api:
+            api.return_value.upload_folder.side_effect = upload
+            task = await uploader.start_upload(
+                str(model_path),
+                "user/model",
+                "hf_token",
+                readme_source_path=str(source) if readme_mode == "source" else "",
+            )
+            await uploader._active_tasks[task.task_id]
+
+        assert task.status == (
+            UploadStatus.FAILED if fail_upload else UploadStatus.COMPLETED
+        )
+        assert len(uploaded) == 1
+        assert uploaded[0] != original
+        assert readme.read_bytes() == original
+        assert readme.stat().st_mode == original_stat.st_mode
+        assert readme.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+    @pytest.mark.asyncio
+    async def test_existing_readme_symlink_and_target_are_preserved(self, model_dirs):
+        root = Path(model_dirs[0])
+        model_path = root / "Llama-3B-oQ4"
+        original = root / "local-card.md"
+        original.write_text("Original local card")
+        readme = model_path / "README.md"
+        readme.symlink_to(original)
+        uploader = HFUploader(model_dirs)
+
+        def upload(**kwargs):
+            assert original.read_text() == "Original local card"
+            assert "Llama 3B Instruct" in readme.read_text()
+
+        with patch("huggingface_hub.HfApi") as api:
+            api.return_value.upload_folder.side_effect = upload
+            task = await uploader.start_upload(
+                str(model_path),
+                "user/model",
+                "hf_token",
+                readme_source_path=str(root / "Llama-3B-Instruct"),
+            )
+            await uploader._active_tasks[task.task_id]
+        assert task.status == UploadStatus.COMPLETED
+        assert readme.is_symlink()
+        assert readme.resolve() == original
+        assert original.read_text() == "Original local card"
+
+    @pytest.mark.asyncio
+    async def test_readme_source_is_upload_directory(self, model_dirs):
+        model_path = Path(model_dirs[0]) / "Llama-3B-Instruct"
+        readme = model_path / "README.md"
+        original = readme.read_bytes()
+        uploader = HFUploader(model_dirs)
+        with patch("huggingface_hub.HfApi") as api:
+            task = await uploader.start_upload(
+                str(model_path),
+                "user/model",
+                "hf_token",
+                readme_source_path=str(model_path),
+            )
+            await uploader._active_tasks[task.task_id]
+        assert task.status == UploadStatus.COMPLETED
+        api.return_value.upload_folder.assert_called_once()
+        assert readme.read_bytes() == original

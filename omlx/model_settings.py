@@ -388,6 +388,10 @@ class ModelSettings:
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
     deepseek_v41_ced_prefill_enabled: bool = False
+    # DeepSeek V4 ratio-4 prefill attention on the M5 tensor units (NAX):
+    # window + indexer-top-k kernel in sparse_attention_nax.py. Off keeps the
+    # runtime dsv4_wsdpa_topk kernel. No effect on other GPUs.
+    deepseek_v4_sparse_attention_nax: bool = False
     preserve_thinking: Optional[bool] = (
         None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
