@@ -335,13 +335,13 @@ private struct StatTilesRow: View {
                 label: String(localized: "status.tile.total",
                               defaultValue: "Total Prefill Tokens",
                               comment: "Stat tile label for total prefill tokens processed"),
-                value: stats.map { CountFormat.compact($0.totalPromptTokens) } ?? "—"
+                value: stats.map { CountFormat.count($0.totalPromptTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cached",
                               defaultValue: "Cached Tokens",
                               comment: "Stat tile label for cached tokens"),
-                value: stats.map { CountFormat.compact($0.totalCachedTokens) } ?? "—"
+                value: stats.map { CountFormat.count($0.totalCachedTokens) } ?? "—"
             )
             StatTile(
                 label: String(localized: "status.tile.cache_efficiency",

@@ -89,8 +89,8 @@ struct UsageHistoryView: View {
                         Row(label: row.modelId ?? "", sublabel: detail(row)) {
                             VStack(alignment: .trailing, spacing: 3) {
                                 Text(String(localized: "status.usage.row.tokens",
-                                            defaultValue: "\(CountFormat.compact(row.totalTokens)) tokens",
-                                            comment: "Per-model total token count; placeholder is a compact number"))
+                                            defaultValue: "\(CountFormat.count(row.totalTokens)) tokens",
+                                            comment: "Per-model total token count; placeholder is a formatted count"))
                                 Text(String(localized: "status.usage.row.requests_speed",
                                             defaultValue: "\(row.requests) requests · \(speed(row.generationTps)) tok/s",
                                             comment: "Per-model request count and output speed; placeholders are a count and a formatted tokens-per-second value"))
@@ -166,7 +166,8 @@ struct UsageHistoryView: View {
     private func tile(_ label: String, _ value: Int) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label).font(.omlxText(DesignTokens.FontSize.subheadline)).foregroundStyle(.secondary)
-            Text(CountFormat.compact(value)).font(.omlxMono(20))
+            Text(CountFormat.count(value)).font(.omlxMono(20))
+                .lineLimit(1).minimumScaleFactor(0.6)
         }
         .frame(maxWidth: .infinity, alignment: .leading).padding(12)
         .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 10))
@@ -225,7 +226,7 @@ struct UsageHistoryView: View {
 
     private func detail(_ row: UsageHistoryDTO.UsageTotalsDTO) -> String {
         String(localized: "status.usage.row.detail",
-               defaultValue: "Prompt \(CountFormat.compact(row.promptTokens)) · output \(CountFormat.compact(row.completionTokens)) · cached \(CountFormat.compact(row.cachedTokens))",
-               comment: "Per-model breakdown sublabel; placeholders are compact prompt, output, and cached token counts")
+               defaultValue: "Prompt \(CountFormat.count(row.promptTokens)) · output \(CountFormat.count(row.completionTokens)) · cached \(CountFormat.count(row.cachedTokens))",
+               comment: "Per-model breakdown sublabel; placeholders are formatted prompt, output, and cached token counts")
     }
 }
