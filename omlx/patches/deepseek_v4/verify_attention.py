@@ -19,21 +19,38 @@ from typing import Sequence
 import mlx.core as mx
 
 
-def rowwise_gemm(lhs: mx.array, rhs: mx.array, transpose_rhs: bool) -> mx.array:
-    """Dispatch independent M=64 Steel GEMMs in one grid when available."""
+def steel_rowwise_available() -> bool:
+    """True when the native Steel rowwise GEMM is bitwise-safe here.
+
+    The Steel rowwise kernel reproduces stock ``@`` bits on the GPU
+    generations the suffix gate names (``d``/``g``/``p``), but not on
+    newer matrix-math routes (e.g. applegpu_g17s, where MLX bf16 matmul
+    accumulates in a different order).  Every kernel that promises bitwise
+    parity with the materialized rowwise path — the DSpark ring GEMM
+    included — must stay off wherever this returns False, or verify rows
+    drift from decode bits by one ULP.
+    """
     try:
         architecture = str(mx.device_info().get("architecture", ""))
-        if architecture.endswith(("d", "g", "p")):
-            from omlx.custom_kernels.attention import fast
+        if not architecture.endswith(("d", "g", "p")):
+            return False
+        from omlx.custom_kernels.attention import fast
 
-            if fast.has_symbol("rowwise_gemm"):
-                return fast.rowwise_gemm(
-                    mx.contiguous(lhs),
-                    mx.contiguous(rhs),
-                    transpose_rhs,
-                )
+        return fast.has_symbol("rowwise_gemm")
     except Exception:
-        pass
+        return False
+
+
+def rowwise_gemm(lhs: mx.array, rhs: mx.array, transpose_rhs: bool) -> mx.array:
+    """Dispatch independent M=64 Steel GEMMs in one grid when available."""
+    if steel_rowwise_available():
+        from omlx.custom_kernels.attention import fast
+
+        return fast.rowwise_gemm(
+            mx.contiguous(lhs),
+            mx.contiguous(rhs),
+            transpose_rhs,
+        )
     return mx.concatenate(
         [
             lhs[idx : idx + 1]
