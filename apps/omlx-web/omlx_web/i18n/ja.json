@@ -257,6 +257,8 @@
   "models.downloader.hf_token": "HFトークン",
   "models.downloader.hf_token_optional": "（任意）",
   "models.downloader.hf_token_placeholder": "hf_...",
+  "models.downloader.exclude_patterns": "除外パターン",
+  "models.downloader.exclude_patterns_hint": "任意。カンマ区切りの glob（例: *.gguf）。リポジトリ内のそれ以外のファイルは引き続きダウンロードされます。",
   "models.downloader.download_button": "ダウンロード",
   "models.downloader.token_warning": "Your stored Hugging Face token was rejected, so results are shown without authentication. Run 'hf auth logout' or set a valid HF_TOKEN to clear this warning.",
   "models.downloader.ms_download_section": "ModelScopeからダウンロード",

@@ -811,6 +811,7 @@ class HFDownloadRequest(BaseModel):
     repo_id: str
     hf_token: str = ""
     files: list[str] | None = None
+    ignore_patterns: list[str] = Field(default_factory=list)
 
 
 class HFRetryRequest(BaseModel):
@@ -7793,7 +7794,10 @@ async def start_hf_download(
 
     try:
         task = await _hf_downloader.start_download(
-            request.repo_id, request.hf_token, files=request.files
+            request.repo_id,
+            request.hf_token,
+            files=request.files,
+            ignore_patterns=request.ignore_patterns,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

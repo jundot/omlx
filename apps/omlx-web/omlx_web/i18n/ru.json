@@ -257,6 +257,8 @@
   "models.downloader.hf_token": "HF-токен",
   "models.downloader.hf_token_optional": "(необязательно)",
   "models.downloader.hf_token_placeholder": "hf_...",
+  "models.downloader.exclude_patterns": "Шаблоны исключений",
+  "models.downloader.exclude_patterns_hint": "Необязательно: glob-шаблоны через запятую (например, *.gguf). Остальные файлы репозитория скачиваются как обычно.",
   "models.downloader.download_button": "Скачать",
   "models.downloader.token_warning": "Сохранённый токен Hugging Face отклонён, поэтому результаты показаны без аутентификации. Выполните 'hf auth logout' или задайте действительный HF_TOKEN, чтобы убрать это предупреждение.",
   "models.downloader.ms_download_section": "Скачать из ModelScope",
