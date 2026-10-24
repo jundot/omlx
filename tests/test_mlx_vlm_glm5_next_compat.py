@@ -3596,6 +3596,110 @@ def test_decode_moe_declines_offloaded_experts(length, monkeypatch):
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize(
+    "out_dims,in_dims",
+    # gemv's 4- and 8-simdgroup tiles; the split-K tile of K >= 16 N (the
+    # indexer pool gate), with a partial last K block and a shifted tail
+    # tile; a partial K block and a shifted tail on the 8-simdgroup tile.
+    [(1536, 4096), (8192, 4096), (128, 4096), (38, 1536), (4102, 1000)],
+)
+def test_rows_gemv_rows_match_their_one_row_gemv(out_dims, in_dims):
+    """A multi-row float matmul (gemv_wide or a GEMM tile) sums in another
+    order than the one-row gemv; rows_gemv gives each row the latter."""
+    w = (
+        mx.random.normal((out_dims, in_dims), key=mx.random.key(out_dims)) * 0.05
+    ).astype(mx.bfloat16)
+    for rows in (2, 5, 8):
+        x = (
+            mx.random.normal((1, rows, in_dims), key=mx.random.key(rows)) * 0.7
+        ).astype(mx.bfloat16)
+        out = dk.rows_gemv(x, w)
+        reference = mx.concatenate([x[:, r : r + 1] @ w.T for r in range(rows)], axis=1)
+        assert out.shape == reference.shape
+        assert _mismatches(out, reference) == 0, rows
+
+
+def _row_exact_block(model, block, cache):
+    """``model(block)`` as a row-exact MTP verify forward runs it."""
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    try:
+        logits = model(block, cache=cache).logits
+        mx.eval(logits)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    return logits
+
+
+@pytest.mark.usefixtures("glm5_fused_decode", "verify_router")
+@pytest.mark.parametrize("batch_cache", [False, True])
+@pytest.mark.parametrize(
+    "prompt_len,width",
+    # Dense attention; a block whose first rows stay at or below index_topk
+    # (their decode steps skip selection); sparse selection, with 8 rows x
+    # top-8 routes reaching SwitchGLU's sort threshold.
+    [(300, 5), (2045, 4), (2101, 2), (2101, 8)],
+)
+def test_row_exact_verify_rows_match_their_decode_steps(prompt_len, width, batch_cache):
+    """Also on a one-row batch cache (the server's layout): its decode steps
+    take the masked one-token path."""
+    if not _native_indexer_available():
+        pytest.skip("GLM DSA native indexer extension is not built")
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    decoded = _fused_shape_model(51)
+    verified = _fused_shape_model(51)
+    prompt = mx.random.randint(0, 256, (1, prompt_len), key=mx.random.key(7)).astype(
+        mx.int32
+    )
+    caches = []
+    for model in (decoded, verified):
+        cache = model.make_cache()
+        for start in range(0, prompt_len, 512):
+            mx.eval(model(prompt[:, start : start + 512], cache=cache).logits)
+        caches.append(bg._merge_row_caches([cache]) if batch_cache else cache)
+    for block_index in range(2):
+        block = mx.random.randint(
+            0, 256, (1, width), key=mx.random.key(11 + block_index)
+        ).astype(mx.int32)
+        steps = [
+            decoded(block[:, r : r + 1], cache=caches[0]).logits for r in range(width)
+        ]
+        rows = _row_exact_block(verified, block, caches[1])
+        mx.eval(steps)
+        for r, step in enumerate(steps):
+            assert _mismatches(rows[:, r : r + 1], step) == 0, (block_index, r)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("width", [2, 8])
+def test_row_exact_verify_kda_rows_with_mixed_projection_bits(width):
+    """A row-exact verify block of a mixed-quantization KDA layer (GLM-5.3's
+    layer 40) runs its grouped projections with one-row arithmetic: every
+    row and the final states equal the serial decode steps'."""
+    layer = _kda_layer(seed=33, v_bits=5)
+    decoded, verified = _arrays_cache(), _arrays_cache()
+    prompt = (mx.random.normal((1, 12, 1024)) * 0.8).astype(mx.bfloat16)
+    for cache in (decoded, verified):
+        mx.eval(layer(prompt, cache=cache))
+    x = (mx.random.normal((1, width, 1024)) * 0.7).astype(mx.bfloat16)
+    steps = [layer(x[:, r : r + 1], cache=decoded) for r in range(width)]
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    try:
+        rows = layer(x, cache=verified)
+        mx.eval(rows, verified.cache)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    mx.eval(steps, decoded.cache)
+    for r, step in enumerate(steps):
+        assert _mismatches(rows[:, r : r + 1], step) == 0, r
+    assert _mismatches(verified[0], decoded[0]) == 0
+    assert _mismatches(verified[1], decoded[1]) == 0
+    assert not layer._fused_ready and layer._rows_in_proj
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
 def test_multi_linear_declines_armed_verify_routes():
     """Armed MTP verify routes replace the reference multi-row qmm, which the
     fused projections replay, so multi-row blocks keep the reference call."""

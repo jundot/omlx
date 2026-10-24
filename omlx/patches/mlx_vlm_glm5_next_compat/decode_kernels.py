@@ -17,7 +17,9 @@ stock MLX arithmetic bit for bit:
   (routed + shared experts, clamped SwiGLU, routing-weighted sum);
 * KDA linear attention: ``kda_decode_step`` (short conv, SiLU, l2norm,
   gate projections, vector-gated delta rule, RMSNormGated);
-* DSA indexer: ``dsa_decode_scores`` and ``dsa_expand_topk``.
+* DSA indexer: ``dsa_decode_scores`` and ``dsa_expand_topk``;
+* row-exact verify: ``rows_gemv`` (float projections of a verify block,
+  every row with the one-token gemv arithmetic).
 
 Exactness rules: every reduction replays the order of the MLX kernel it
 replaces (qmv/qmv_quad lane mapping, gemv shuffle ladders, row_reduce
@@ -3084,3 +3086,165 @@ def multi_qmv(x: mx.array, layers) -> Optional[list]:
         output_shapes=[(T, n) for n in rows],
         output_dtypes=[x.dtype] * len(rows),
     ))
+
+
+# ---------------------------------------------------------------------------
+# Row-exact verify GEMV: rows of x @ W.T with the one-row gemv arithmetic
+# ---------------------------------------------------------------------------
+#
+# A row-exact MTP verify gives every row of a block the arithmetic of its
+# one-token decode step. For a float weight that step is MLX's
+# non-transposed gemv (gemv_axbpy with M == 1; SM = 1, SN = 32, TM = 4,
+# TN = 4): BM simdgroups of 4 output rows each (BN = 1; BM = 8 when
+# N >= 4096, else 4) or, when K >= 16 * N, one 4-row tile split along K
+# over BN = 8 simdgroups whose partial sums simdgroup 0 adds in order
+# through threadgroup memory. Lane l of K slice s accumulates inputs
+# (32 s + l) * 4 .. + 3 of every BN * 128-wide block (the last block
+# zero-filled past K), then the shuffle-down ladder; the tail tile shifts
+# inwards to N - 4. A multi-row matmul instead runs gemv_wide or a GEMM
+# tile, which sum in other orders. Here every row replays the one-row
+# kernel, all rows sharing each weight load.
+_ROWS_GEMV_SOURCE = r"""
+  const uint lane = thread_index_in_simdgroup;
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const int sgN = sg % BN;
+  constexpr int BLOCK_N = BN * 128;
+  constexpr int N_ITER = K / BLOCK_N;
+  constexpr int LEFTOVER = K - N_ITER * BLOCK_N;
+  threadgroup float partials[BN > 1 ? BM * BN * ROWS * 4 : 1];
+  int out_row = int(threadgroup_position_in_grid.x) * (BM * 4) + (sg / BN) * 4;
+  if (out_row >= N) {
+    return;
+  }
+  out_row = out_row + 4 <= N ? out_row : N - 4;
+  const device T* mat = w + size_t(out_row) * K;
+  float result[ROWS][4];
+  for (int r = 0; r < ROWS; r++) {
+    for (int tm = 0; tm < 4; tm++) {
+      result[r][tm] = 0.0f;
+    }
+  }
+  int bn = (32 * sgN + int(lane)) * 4;
+  for (int i = 0; i < N_ITER; ++i) {
+    T inter[4][4];
+    for (int tm = 0; tm < 4; tm++) {
+      for (int tn = 0; tn < 4; tn++) {
+        inter[tm][tn] = mat[tm * K + bn + tn];
+      }
+    }
+    for (int r = 0; r < ROWS; r++) {
+      float v_coeff[4];
+      for (int tn = 0; tn < 4; tn++) {
+        v_coeff[tn] = static_cast<float>(x[r * K + bn + tn]);
+      }
+      for (int tm = 0; tm < 4; tm++) {
+        for (int tn = 0; tn < 4; tn++) {
+          result[r][tm] += inter[tm][tn] * v_coeff[tn];
+        }
+      }
+    }
+    bn += BLOCK_N;
+  }
+  if (LEFTOVER > 0) {
+    T inter[4][4];
+    for (int tm = 0; tm < 4; tm++) {
+      for (int tn = 0; tn < 4; tn++) {
+        inter[tm][tn] = bn + tn < K ? mat[tm * K + bn + tn] : T(0);
+      }
+    }
+    for (int r = 0; r < ROWS; r++) {
+      float v_coeff[4];
+      for (int tn = 0; tn < 4; tn++) {
+        v_coeff[tn] = bn + tn < K ? static_cast<float>(x[r * K + bn + tn]) : 0.0f;
+      }
+      for (int tm = 0; tm < 4; tm++) {
+        for (int tn = 0; tn < 4; tn++) {
+          result[r][tm] += inter[tm][tn] * v_coeff[tn];
+        }
+      }
+    }
+  }
+  for (int r = 0; r < ROWS; r++) {
+    for (int tm = 0; tm < 4; tm++) {
+      for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        result[r][tm] += simd_shuffle_down(result[r][tm], sn);
+      }
+    }
+  }
+  if (BN > 1) {
+    threadgroup float* tile = partials + (sg / BN) * BN * ROWS * 4;
+    if (lane == 0) {
+      for (int r = 0; r < ROWS; r++) {
+        for (int tm = 0; tm < 4; tm++) {
+          tile[(sgN * ROWS + r) * 4 + tm] = result[r][tm];
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgN == 0 && lane == 0) {
+      for (int s = 1; s < BN; s++) {
+        for (int r = 0; r < ROWS; r++) {
+          for (int tm = 0; tm < 4; tm++) {
+            result[r][tm] += tile[(s * ROWS + r) * 4 + tm];
+          }
+        }
+      }
+    }
+  }
+  if (sgN == 0 && lane == 0) {
+    for (int r = 0; r < ROWS; r++) {
+      for (int tm = 0; tm < 4; tm++) {
+        y[size_t(r) * N + out_row + tm] = static_cast<T>(result[r][tm]);
+      }
+    }
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _rows_gemv_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_rows_gemv",
+        input_names=["x", "w"],
+        output_names=["y"],
+        source=_ROWS_GEMV_SOURCE,
+    )
+
+
+def rows_gemv(x: mx.array, weight: mx.array) -> Optional[mx.array]:
+    """``x @ weight.T`` with every row as the one-row gemv computes it.
+
+    ``x`` [..., K] (2..16 rows), ``weight`` [N, K] of x's dtype (bf16/fp16).
+    Returns [..., N] or None when not covered (one row, or the gemv
+    configurations for K <= 64 or N < 4).
+    """
+    if (
+        weight.ndim != 2
+        or x.dtype != weight.dtype
+        or x.dtype not in (mx.bfloat16, mx.float16)
+    ):
+        return None
+    N, K = weight.shape
+    if x.ndim < 2 or x.shape[-1] != K or K <= 64 or N < 4:
+        return None
+    rows = x.size // K
+    if not 2 <= rows <= 16:
+        return None
+    bm, bn = (1, 8) if K >= 16 * N else ((8 if N >= 4096 else 4), 1)
+    STATS["rows_gemv"] += 1
+    y = _rows_gemv_kernel()(
+        inputs=[mx.contiguous(x).reshape(rows, K), weight],
+        template=[
+            ("T", x.dtype),
+            ("K", K),
+            ("N", N),
+            ("ROWS", rows),
+            ("BM", bm),
+            ("BN", bn),
+        ],
+        grid=(32 * ((N + 4 * bm - 1) // (4 * bm)), bm * bn, 1),
+        threadgroup=(32, bm * bn, 1),
+        output_shapes=[(rows, N)],
+        output_dtypes=[x.dtype],
+    )[0]
+    return y.reshape(*x.shape[:-1], N)

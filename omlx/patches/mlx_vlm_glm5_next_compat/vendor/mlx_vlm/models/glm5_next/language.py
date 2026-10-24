@@ -32,6 +32,7 @@ from omlx.patches.glm_moe_dsa.sparse_mla import (
     q8_vup_flat,
     sparse_mla_attention,
 )
+from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import _is_armed as _verify_qmm_armed
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed as _row_exact_armed
 from omlx.patches.qwen35_verify_qmm import takes_verify_route as _takes_verify_route
@@ -141,6 +142,12 @@ def verify_qmm_routed(rows: int) -> bool:
         and getattr(nn.QuantizedLinear, "_omlx_verify_qmm_patched", False)
         and (_verify_qmm_armed() or _row_exact_armed())
     )
+
+
+def _row_exact_tile(rows: int):
+    """``row_exact_qmv.RowsQmv`` geometry for a verify block: 4 output
+    columns per simdgroup, each decoded weight tile applied to up to 4 rows."""
+    return 4, next(d for d in (4, 3, 2, 1) if rows % d == 0)
 
 
 def _multi_linear(x, layers):
@@ -587,6 +594,40 @@ class Glm5NextLinearAttention(nn.Module):
         ]
         return mx.concatenate([outs[g][..., a:b] for g, a, b in runs], axis=-1)
 
+    def _row_exact_in_proj(self, inputs):
+        """The fused (or grouped) input projection of a verify block with every
+        row's one-row decode arithmetic (``row_exact_qmv``), so a row-exact
+        verify row gets the projection its decode step gets. None when a
+        bank is not on a one-row ``qmv_fast`` layout."""
+        rows = getattr(self, "_rows_in_proj", None)
+        if rows is None:
+            if self._fused_ready:
+                banks = (
+                    [(self._bits, self._gs, self._fw, self._fs, self._fb)]
+                    if self._fq
+                    else []
+                )
+            else:
+                groups = self._decode_groups[0] if self._decode_groups else ()
+                banks = [(b, g, w, s, bi) for b, g, _, w, s, bi in groups]
+            rows = [
+                row_exact_qmv.rows_qmv(
+                    w, s, b, bits, gs, "affine", inputs.dtype, _row_exact_tile
+                )
+                for bits, gs, w, s, b in banks
+            ]
+            if not rows or any(r is None for r in rows):
+                rows = False
+            self._rows_in_proj = rows
+        if not rows:
+            return None
+        x = mx.contiguous(inputs)
+        outs = [r(x) for r in rows]
+        if self._fused_ready:
+            return outs[0]
+        _, runs = self._decode_groups
+        return mx.concatenate([outs[g][..., a:b] for g, a, b in runs], axis=-1)
+
     def _decode_step(self, inputs, mask, cache, capture=None):
         """Fused layer body for one sequence and S <= 8 tokens (bit-identical).
 
@@ -617,7 +658,11 @@ class Glm5NextLinearAttention(nn.Module):
             self._fused_in_proj(inputs)
             if not self._fused_ready:
                 self._decode_groups = self._build_decode_groups()
-        if self._fused_ready:
+        if S > 1 and _row_exact_armed():
+            proj = self._row_exact_in_proj(inputs)
+            if proj is None:
+                return None
+        elif self._fused_ready:
             if not self._fq:
                 return None
             proj = fused_quantized_matmul(
@@ -1026,6 +1071,17 @@ class Glm5NextIndexer(nn.Module):
             output_width,
         )
 
+    def _gate_scores(self, x):
+        """Pool gate scores ``x @ index_kpool_compress_gate.T``. A row-exact
+        verify block gives every row its one-token gemv arithmetic (a
+        multi-row matmul sums in another order)."""
+        gate = self.index_kpool_compress_gate
+        if _row_exact_armed():
+            scores = _decode_kernels.rows_gemv(x, gate)
+            if scores is not None:
+                return scores
+        return x @ gate.swapaxes(-1, -2)
+
     def small_windows(self, x, qr, cache, projected=None):
         """Advance the pool and select top-k windows for one sequence.
         Returns (windows [S, 512], tokens before, pooled windows), or None
@@ -1038,7 +1094,7 @@ class Glm5NextIndexer(nn.Module):
             k_raw = linear_forward(self.wk, x)
         q = q_raw.reshape(batch_size, query_rows, self.n_heads, self.head_dim)
         k = self.k_norm(k_raw).reshape(batch_size, query_rows, self.head_dim)
-        gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
+        gate_scores = self._gate_scores(x)
         before = self._processed(cache)
         ready_k, ready_gate, _ = cache.accumulate_windows(k, gate_scores, before)
         pool_keys = cache.update_and_fetch(self._compress_windows(ready_k, ready_gate))
@@ -1063,7 +1119,7 @@ class Glm5NextIndexer(nn.Module):
             k_raw = linear_forward(self.wk, x)
         q = q_raw.reshape(batch_size, query_rows, self.n_heads, self.head_dim)
         k = self.k_norm(k_raw).reshape(batch_size, query_rows, self.head_dim)
-        gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
+        gate_scores = self._gate_scores(x)
         before = self._processed(cache)
         offset = (
             mx.array(before, dtype=mx.int32) if isinstance(before, list) else before
@@ -1115,7 +1171,7 @@ class Glm5NextIndexer(nn.Module):
             k_raw = linear_forward(self.wk, x)
         q = q_raw.reshape(B, S, self.n_heads, self.head_dim)
         k = self.k_norm(k_raw).reshape(B, S, self.head_dim)
-        gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
+        gate_scores = self._gate_scores(x)
 
         if cache is not None:
             before = self._processed(cache)
@@ -1716,6 +1772,15 @@ class Glm5NextSparseAttention(nn.Module):
                 mask = mask[..., dense_rows:, :]
         attn_mask = mask
         q_latent = q_latent_early
+        if (
+            1 < L <= _DECODE_BLOCK
+            and B == 1
+            and out_dense is None
+            and _row_exact_armed()
+        ):
+            return self._finish(
+                self._rows_attention(q, kv_latent, topk_indices, cache, mask), None
+            )
         if topk_indices is not None:
             Kv = kv_latent.shape[2]
             valid_sel = topk_indices >= 0
@@ -1878,6 +1943,64 @@ class Glm5NextSparseAttention(nn.Module):
             outs[3] if selecting else None,
         )
         return qr, qr_outs[0], outs[1], indexer_projected
+
+    def _rows_attention(self, q, kv_latent, topk_indices, cache, mask):
+        """A row-exact verify block's attention (pre-o_proj flat): each row
+        runs its one-token decode step's operations on the keys that step
+        held (the selected windows gathered from, or the whole of, the cache
+        prefix up to the row) with that step's mask, so it matches the step
+        bit for bit. A plain cache's step has no mask; a batch cache's step
+        has its row of this block's mask over the keys it held."""
+        B, H, L, _ = q.shape
+        Kv = kv_latent.shape[2]
+        indexer = self.indexer
+        after = indexer._processed(cache[1]) if topk_indices is not None else 0
+        if isinstance(after, list):
+            after = after[0]
+        plain = getattr(cache[0], "left_padding", None) is None
+        rows = []
+        for r in range(L):
+            kv_len = Kv - L + r + 1
+            kv = kv_latent[:, :, :kv_len]
+            attn_mask = None if plain or mask is None else mask[..., r : r + 1, :kv_len]
+            # The row's own decode step skipped selection up to index_topk.
+            selects = topk_indices is not None and not (
+                getattr(indexer, "bypass_short", True)
+                and after - L + r + 1 <= indexer.index_topk
+            )
+            if selects:
+                idx = topk_indices[:, :, r, :]
+                gathered = None
+                if attn_mask is None and _DECODE_FUSION:
+                    gathered = _decode_kernels.dsa_gather_selected(kv, idx)
+                if gathered is None:
+                    clamped = mx.clip(idx, 0, kv_len - 1)
+                    take = clamped[..., None]
+                    kv = mx.take_along_axis(
+                        kv,
+                        mx.broadcast_to(take, take.shape[:-1] + (kv.shape[-1],)),
+                        axis=2,
+                    )
+                    sel_mask = (idx >= 0)[:, :, None, :]
+                    if attn_mask is not None and attn_mask.dtype == mx.bool_:
+                        mkeys = attn_mask.reshape(B, -1, kv_len)[:, 0, :]
+                        keep = mx.take_along_axis(
+                            mx.broadcast_to(
+                                mkeys[:, None, :], (B, clamped.shape[1], kv_len)
+                            ),
+                            clamped,
+                            axis=-1,
+                        )
+                        sel_mask = sel_mask & keep[:, :, None, :]
+                    gathered = kv, sel_mask
+                kv, attn_mask = gathered
+            q_r = _mla_head_proj(self.embed_q, q[:, :, r : r + 1])
+            out = scaled_dot_product_attention(
+                q_r, kv, kv, cache=cache, scale=self.scale, mask=attn_mask
+            )
+            rows.append(_mla_head_proj(self.unembed_out, out))
+        output = mx.concatenate(rows, axis=2)
+        return output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
     def _gathered_attention(self, q, kv_latent, topk_indices):
         """Short-block sparse attention, with a gather fallback; pre-o_proj flat."""
@@ -2106,7 +2229,11 @@ class Glm5NextMoE(nn.Module):
             or x.shape[0] != 1
             or indices.shape[:2] != x.shape[:2]
             or not isinstance(sw, SwitchGLU)
-            or indices.size >= _sort_threshold(*_switch_projections(sw))
+            or (
+                # A row-exact verify routes every token like its decode step.
+                indices.size >= _sort_threshold(*_switch_projections(sw))
+                and not _row_exact_armed()
+            )
         ):
             return None
         # Separate gate/up projections, or one fused [gate; up] gate_up_proj
@@ -2401,6 +2528,10 @@ def _dequantize_router_gates(weights, hidden_size):
 
 
 class LanguageModel(nn.Module):
+    # MTP verify rows run with their one-token decode step's arithmetic, so
+    # greedy MTP output equals MTP-off output (batch_generator._row_exact_verify).
+    _omlx_mtp_row_exact_verify = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args

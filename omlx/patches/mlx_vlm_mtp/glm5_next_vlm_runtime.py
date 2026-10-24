@@ -352,8 +352,10 @@ def _verify_qmm_may_route(g5_lang: Any, attn: Any, inputs: mx.array) -> bool:
     then runs them one by one, e.g. GLM-5.3's layer 40 with a 5-bit v_proj),
     while the fused step's grouped matmuls are never routed. Those blocks
     keep the reference body, so the verify values do not depend on the path.
+    A row-exact verify keeps the fused step, whose grouped projections then
+    run every row with its decode step's arithmetic.
     """
-    if getattr(attn, "_fused_ready", False):
+    if getattr(attn, "_fused_ready", False) or g5_lang._row_exact_armed():
         return False
     return g5_lang.verify_qmm_routed(inputs.shape[0] * inputs.shape[1])
 
