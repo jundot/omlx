@@ -1127,6 +1127,15 @@ def estimate_model_size(model_path: Path) -> int:
                 continue
             total_size += f.stat().st_size
 
+    if total_size:
+        from .utils.model_loading import _checkpoint_qwen4_mtp_sidecar
+
+        # Like embedded heads, recognized standalone heads are always charged,
+        # even when MTP is off. Recursive fallback below already includes them.
+        sidecar = _checkpoint_qwen4_mtp_sidecar(model_path)
+        if sidecar is not None:
+            total_size += sidecar.stat().st_size
+
     # Also check in subdirectories (some models store weights in subfolders)
     if total_size == 0:
         for f in model_path.glob("**/*.safetensors"):

@@ -143,11 +143,27 @@ class Model(Qwen3_5Model):
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
-        if get_mtp_runtime().enabled:
+        mtp_runtime = get_mtp_runtime()
+        if mtp_runtime.enabled:
             self.mtp = Qwen4ExpMTPModule(config.text_config)
+            self._mtp_sidecar_path = mtp_runtime.sidecar_path
             self.language_model.bind_mtp_owner(self)
 
     def sanitize(self, weights):
+        mtp_runtime = get_mtp_runtime()
+        sidecar_path = getattr(self, "_mtp_sidecar_path", None)
+        if (
+            mtp_runtime.enabled
+            and sidecar_path is not None
+            and not any(key.startswith(_MTP_PREFIXES) for key in weights)
+        ):
+            # Merge before the common sanitizer so the base checkpoint decides
+            # RMSNorm centering for both trunk and head. Dense sidecar tensors
+            # have no scales, so the loader leaves them unquantized.
+            weights.update(
+                ("mtp." + key, value)
+                for key, value in mx.load(str(sidecar_path)).items()
+            )
         if get_ple_runtime_mode() == "mmap" and not getattr(
             self, "_omlx_preserve_qwen4_ple_for_quantization", False
         ):
@@ -172,7 +188,7 @@ class Model(Qwen3_5Model):
                 and runtime_scale_key not in weights
             ):
                 weights[source_scale_key] = mx.ones((1,), dtype=mx.bfloat16)
-        mtp_enabled = get_mtp_runtime().enabled
+        mtp_enabled = mtp_runtime.enabled
 
         normalized = {}
         for key, value in weights.items():

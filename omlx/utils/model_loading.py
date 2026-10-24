@@ -843,11 +843,14 @@ def maybe_apply_pre_load_patches(
         mtp_requested = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
-        has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+        has_mtp_weights = (
+            _checkpoint_has_mtp_weights(model_name)
+            or _checkpoint_qwen4_mtp_sidecar(model_name) is not None
+        )
         mtp_active = mtp_requested and has_mtp_weights
         if mtp_requested and not has_mtp_weights:
             logger.warning(
-                "Qwen4-Exp Lightning MTP was requested for %s, but no embedded "
+                "Qwen4-Exp Lightning MTP was requested for %s, but no compatible "
                 "MTP tensors were found",
                 model_name,
             )
@@ -1259,8 +1262,8 @@ def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
         return ()
     if config.get("model_type") == "qwen4_exp":
         # The dedicated Qwen4 runtime constructs a root-level MTP module and
-        # can bind only the embedded mtp.* layouts. Extra nextn decoder layers
-        # must not make generic callers report this checkpoint as compatible.
+        # binds embedded mtp.* layouts or a standalone head, not nextn layers.
+        # Extra nextn layers must not make generic callers report compatibility.
         return ()
     return _nextn_weight_prefixes_from_config(config)
 
@@ -1310,6 +1313,33 @@ def _checkpoint_weight_prefix(
 def _checkpoint_qwen4_mtp_weight_prefix(model_path: str | Path) -> str | None:
     """Return the embedded MTP prefix supported by the Qwen4 runtime."""
     return _checkpoint_weight_prefix(model_path, _MTP_WEIGHT_PREFIXES)
+
+
+def _checkpoint_qwen4_mtp_sidecar(model_path: str | Path) -> Path | None:
+    """Recognize a standalone Qwen4 head; strict loading validates its tensors."""
+    model_path = Path(model_path)
+    sidecar = model_path / "mtp" / "model.safetensors"
+    if not sidecar.is_file():
+        return None
+    try:
+        config = json.loads((model_path / "config.json").read_text())
+        mtp_config = json.loads((sidecar.parent / "config.json").read_text())
+        if (
+            config.get("model_type") != "qwen4_exp"
+            or mtp_config.get("model_type") != "qwen4_exp_mtp"
+            or not isinstance(config.get("text_config"), dict)
+            or not config["text_config"]
+            or mtp_config.get("text_config") != config["text_config"]
+        ):
+            return None
+        import safetensors
+
+        with safetensors.safe_open(str(sidecar), framework="numpy") as f:
+            if f.keys():
+                return sidecar
+    except Exception as exc:
+        logger.debug("Failed to inspect Qwen4 MTP sidecar %s: %s", sidecar, exc)
+    return None
 
 
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
@@ -1460,7 +1490,10 @@ def lightning_mtp_supported(model_path: str | Path) -> bool:
             return False
     elif not _is_mtp_compatible(config, model_type):
         return False
-    return _checkpoint_has_mtp_weights(model_path)
+    return (
+        _checkpoint_has_mtp_weights(model_path)
+        or _checkpoint_qwen4_mtp_sidecar(model_path) is not None
+    )
 
 
 def mimo_mtp_sidecar_config(model_name: str | Path) -> dict[str, str] | None:

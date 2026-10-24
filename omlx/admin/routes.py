@@ -1131,14 +1131,16 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     ``_checkpoint_has_mtp_weights`` so native nextn layouts
     (``model.layers.<num_hidden_layers + i>.*``, e.g. GLM-5.2) count as
     present (issue #2326). Qwen4-Exp uses its narrower runtime detector,
-    which accepts only embedded ``mtp.*`` tensors. Default mlx-lm converters
-    strip ``mtp.*``; PR 990 ships a separate path that keeps them.
+    which accepts embedded ``mtp.*`` tensors or a matching standalone head.
+    Default mlx-lm converters strip ``mtp.*``; PR 990's conversion path
+    preserves them inside the main checkpoint.
     """
     import json
     from pathlib import Path
 
     from ..utils.model_loading import (
         _checkpoint_has_mtp_weights,
+        _checkpoint_qwen4_mtp_sidecar,
         _has_mtp_heads,
         _is_mtp_compatible,
     )
@@ -1173,7 +1175,7 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     # qwen4_exp model + mlx_lm_mtp dispatch patch) and never goes through the
     # mlx-lm ``_is_mtp_compatible`` whitelist, which gates the generic
     # text-model patch. Mirroring the runtime, the admin gate accepts
-    # qwen4_exp and relies on the embedded ``mtp.*`` weight check below —
+    # qwen4_exp and relies on the embedded/standalone weight check below —
     # the same condition the runtime path uses.
     if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
         return False, (
@@ -1181,7 +1183,10 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
             "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
             "gemma4, gemma4_unified)"
         )
-    if not _checkpoint_has_mtp_weights(model_path):
+    if not (
+        _checkpoint_has_mtp_weights(model_path)
+        or _checkpoint_qwen4_mtp_sidecar(model_path) is not None
+    ):
         from ..oq import _resolve_mtplx_sidecar
 
         if _resolve_mtplx_sidecar(Path(model_path), cfg) is not None:
@@ -1193,7 +1198,8 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
             )
         if model_type == "qwen4_exp":
             return False, (
-                "Qwen4-Exp Lightning MTP requires embedded mtp.* tensors; "
+                "Qwen4-Exp Lightning MTP requires embedded mtp.* tensors or a "
+                "matching qwen4_exp_mtp sidecar; "
                 "native nextn layers are not supported by its dedicated runtime."
             )
         return False, (
@@ -3231,6 +3237,7 @@ async def update_model_settings(
 
             from ..utils.model_loading import (
                 _checkpoint_has_mtp_weights,
+                _checkpoint_qwen4_mtp_sidecar,
                 _is_mtp_compatible,
             )
 
@@ -3253,7 +3260,7 @@ async def update_model_settings(
             model_type = cfg.get("model_type")
             # qwen4_exp routes through the dedicated VLM Lightning MTP path
             # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
-            # keep the mtp.* weight check below.
+            # keep the embedded/standalone weight check below.
             if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
                 raise HTTPException(
                     status_code=400,
@@ -3265,14 +3272,18 @@ async def update_model_settings(
                         "MTP heads."
                     ),
                 )
-            if not _checkpoint_has_mtp_weights(entry.model_path):
+            if not (
+                _checkpoint_has_mtp_weights(entry.model_path)
+                or _checkpoint_qwen4_mtp_sidecar(entry.model_path) is not None
+            ):
                 if model_type == "qwen4_exp":
                     raise HTTPException(
                         status_code=400,
                         detail=(
                             "Qwen4-Exp Lightning MTP requires embedded mtp.* "
-                            "tensors; native nextn layers are not supported by "
-                            "its dedicated runtime."
+                            "tensors or a matching qwen4_exp_mtp sidecar; "
+                            "native nextn layers are not supported by its "
+                            "dedicated runtime."
                         ),
                     )
                 raise HTTPException(

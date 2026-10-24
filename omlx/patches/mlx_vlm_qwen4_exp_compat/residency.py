@@ -96,8 +96,13 @@ def qwen4_exp_residency_estimate(
 ) -> Qwen4ExpResidencyEstimate:
     """Inspect Qwen4 checkpoint headers without materializing tensor data."""
 
+    from ...utils.model_loading import _checkpoint_qwen4_mtp_sidecar
+
     ple_path = Path(model_path).expanduser().resolve()
     checkpoint_files = {path.resolve() for path in ple_path.glob("*.safetensors")}
+    sidecar = _checkpoint_qwen4_mtp_sidecar(ple_path)
+    if sidecar is not None:
+        checkpoint_files.add(sidecar.resolve())
     signature = tuple(
         sorted(
             (str(path), stat.st_size, stat.st_mtime_ns)
