@@ -1494,7 +1494,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.saveError = Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
+                        this.saveError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
                     }
@@ -1543,7 +1543,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.subKeyError = data.detail || window.t('js.error.save_settings_failed');
+                        this.subKeyError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                     }
                 } catch (err) {
                     this.subKeyError = window.t('js.error.save_settings_failed');
@@ -1638,7 +1638,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.update_model_setting_failed'));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.update_model_setting_failed'));
                         await this.loadModels();
                     }
                 } catch (err) {
@@ -2074,6 +2074,30 @@
                     if (Number.isFinite(numeric)) return numeric;
                 }
                 return v;
+            },
+
+            // The admin API answers a pydantic validation error with an array
+            // of {loc, msg} objects. alert() on that array prints
+            // "[object Object]" and hides which field the server refused, so
+            // the settings endpoints that can return one render it here.
+            formatApiError(detail) {
+                if (!detail) return '';
+                if (Array.isArray(detail)) {
+                    return detail.map(item => {
+                        if (!item || typeof item !== 'object') return String(item);
+                        const path = (Array.isArray(item.loc) ? item.loc : [])
+                            .filter(part => !['body', 'query', 'path', 'header'].includes(part))
+                            .join('.');
+                        const message = String(item.msg || item.message || '')
+                            .replace(/^Value error, /, '');
+                        const text = message || JSON.stringify(item);
+                        return path ? `${path}: ${text}` : text;
+                    }).filter(Boolean).join('; ');
+                }
+                if (typeof detail === 'object') {
+                    return String(detail.message || detail.msg || JSON.stringify(detail));
+                }
+                return String(detail);
             },
 
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
@@ -3400,7 +3424,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.save_model_settings_failed'));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_model_settings_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
@@ -7027,7 +7051,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_failed')));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
