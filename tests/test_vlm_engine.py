@@ -3551,14 +3551,88 @@ class TestNativeVideo:
         assert text == [{"role": "user", "content": "Describe"}]
         assert (images, audio, videos) == ([], [], [_VIDEO_URI])
 
-    def test_video_mixed_with_image_is_rejected(self):
-        from omlx.exceptions import InvalidRequestError
-
+    def test_video_and_image_are_extracted_together(self):
         engine = self._engine()
         messages = [{"role": "user", "content": [_image_part(32, 32), _video_part()]}]
 
+        _, _, images, audio, videos = engine._extract_request_media(messages)
+
+        assert len(images) == 1 and audio == [] and videos == [_VIDEO_URI]
+
+    def test_video_mixed_with_audio_is_rejected(self):
+        from omlx.exceptions import InvalidRequestError
+
+        engine = self._engine()
+        audio = {
+            "type": "input_audio",
+            "input_audio": {"data": "UklGRg==", "format": "wav"},
+        }
+        messages = [{"role": "user", "content": [audio, _video_part()]}]
+
         with pytest.raises(InvalidRequestError, match="cannot be combined"):
             engine._extract_request_media(messages)
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_mixed_visual_features_follow_token_order(self):
+        engine = self._engine()
+        engine._vlm_model.config.image_token_id = 5
+        engine._vlm_model.config.video_token_id = 7
+        engine._processor = SimpleNamespace(video_processor=None)
+        engine._vision_cache = _DictVisionCache()
+        engine._vision_cache_enabled = True
+        image = mx.array([[1.0], [2.0], [3.0]])
+        video = mx.array([[10.0], [20.0]])
+        engine._compute_vision_features = MagicMock(return_value=video)
+        # text, video (one temporal patch), image, text, image
+        token_ids = [1, 9, 7, 7, 8, 5, 5, 2, 5, 3]
+        input_ids = mx.array([token_ids])
+        extra = {
+            "pixel_values_videos": mx.zeros((8, 4)),
+            "video_grid_thw": mx.array([[1, 2, 4]]),
+        }
+
+        for _ in range(2):
+            features, ranges = engine._mixed_visual_features(
+                token_ids, input_ids, None, extra, image, ["clip"]
+            )
+            assert features[:, 0].tolist() == [10.0, 20.0, 1.0, 2.0, 3.0]
+
+        # The clip is encoded once and comes from the vision cache afterwards.
+        engine._compute_vision_features.assert_called_once()
+        assert ranges == [(2, engine._video_cache_identity(["clip"]))]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_mixed_visual_features_reject_mismatched_counts(self):
+        engine = self._engine()
+        engine._vlm_model.config.image_token_id = 5
+        engine._vlm_model.config.video_token_id = 7
+        engine._processor = SimpleNamespace(video_processor=None)
+        engine._compute_vision_features = MagicMock(return_value=mx.ones((3, 1)))
+        token_ids = [1, 7, 7, 5, 2]
+        extra = {"pixel_values_videos": mx.zeros((8, 4)), "video_grid_thw": None}
+
+        assert (
+            engine._mixed_visual_features(
+                token_ids, mx.array([token_ids]), None, extra, mx.ones((1, 1)), ["c"]
+            )
+            is None
+        )
+
+    def test_video_and_image_cache_key_ranges_cover_earlier_media(self):
+        from omlx.engine.vlm import _video_and_image_cache_key_ranges
+
+        ranges = _video_and_image_cache_key_ranges(
+            [(3, "img1"), (20, "img1+img2")], [(10, "clipA")]
+        )
+
+        assert [start for start, _ in ranges] == [3, 10, 20]
+        assert ranges[0][1] == "img1"
+        # Keys after the clip depend on the clip and on every earlier image.
+        assert len({key for _, key in ranges}) == 3
+        other = _video_and_image_cache_key_ranges(
+            [(3, "img1"), (20, "img1+img2")], [(10, "clipB")]
+        )
+        assert other[0] == ranges[0] and other[1:] != ranges[1:]
 
     def test_format_places_video_where_the_user_put_it(self):
         engine = self._engine()
@@ -3589,6 +3663,36 @@ class TestNativeVideo:
         }
         assert all("video" not in str(msg["content"]) for msg in formatted[1:])
         assert image_ranges == []
+
+    def test_format_keeps_images_next_to_a_clip(self):
+        engine = self._engine()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    _image_part(32, 32),
+                    {"type": "text", "text": "and"},
+                    _video_part(),
+                ],
+            },
+            {"role": "assistant", "content": "Seen."},
+            {
+                "role": "user",
+                "content": [_image_part(32, 32), {"type": "text", "text": "Now?"}],
+            },
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=2, num_videos=1
+        )
+
+        assert formatted[0]["content"] == [
+            {"type": "image"},
+            {"type": "text", "text": "and"},
+            {"type": "video"},
+        ]
+        assert "image" in str(formatted[2]["content"])
+        assert image_ranges == [(0, 1), (2, 1)]
 
     def test_video_cache_identity_covers_content_and_sampling(self):
         engine = self._engine()
