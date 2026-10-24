@@ -279,6 +279,7 @@ class BlockAwarePrefixCache(CacheManager):
         paged_cache_manager: PagedCacheManager,
         paged_ssd_cache_manager: PagedSSDCacheManager | None = None,
         gdn_ssd_split_enabled: bool = False,
+        system_prefix_max_bytes: int = 0,
     ):
         """
         Initialize block-aware prefix cache.
@@ -287,6 +288,8 @@ class BlockAwarePrefixCache(CacheManager):
             model: The MLX model (used for identification)
             paged_cache_manager: The PagedCacheManager instance for block management
             paged_ssd_cache_manager: The PagedSSDCacheManager for SSD storage (required for paged SSD-only mode)
+            system_prefix_max_bytes: Byte budget of protected system-prefix
+                snapshots (see protect_system_prefix); 0 protects none.
         """
         self.model = model
         self.model_key = id(model)
@@ -342,6 +345,12 @@ class BlockAwarePrefixCache(CacheManager):
         # Tails stored this session. A superseded tail is deleted, not
         # stripped: a stripped tail is only walked back over on restore.
         self._tail_hashes: set[bytes] = set()
+
+        # Protected system-prefix tails, least recently used first: tail hash
+        # -> hashes of its chain. Many conversations share one, so it never
+        # supersedes as a tip, and the SSD tier evicts it last.
+        self._system_prefixes: OrderedDict[bytes, list[bytes]] = OrderedDict()
+        self.system_prefix_max_bytes = max(0, int(system_prefix_max_bytes))
 
         self._seed_tail_index(paged_ssd_cache_manager)
 
@@ -1705,7 +1714,11 @@ class BlockAwarePrefixCache(CacheManager):
                     and prev_tip_hash in self._store_tip_hashes
                 ):
                     superseded = self._tip_lineage.pop(prev_tip_hash, None)
-                    if superseded is not None:
+                    # Other conversations still restore a system prefix.
+                    if (
+                        superseded is not None
+                        and superseded not in self._system_prefixes
+                    ):
                         if superseded in self._tail_hashes:
                             self._discard_tail_block(superseded, layer_cache_types)
                         elif rotating_layout:
@@ -2127,6 +2140,55 @@ class BlockAwarePrefixCache(CacheManager):
                             return seq_len
 
         return 0
+
+    def protect_system_prefix(self, block_ids: list[int]) -> bool:
+        """Protect a stored system prefix that ends on a tail block.
+
+        The tail stays in the tail index, never supersedes as a tip, and its
+        chain is pinned in the SSD tier. Protecting it again refreshes it; the
+        least recently used ones go back to plain LRU while the protected
+        bytes exceed ``system_prefix_max_bytes``.
+        """
+        blocks = [self.paged_cache.allocated_blocks.get(b) for b in block_ids]
+        if not blocks or any(b is None or b.block_hash is None for b in blocks):
+            return False
+        tail = blocks[-1]
+        if not 0 < tail.token_count < self.block_size:
+            return False
+        with self.paged_cache._lock:
+            if tail.block_hash in self._system_prefixes:
+                self._system_prefixes.move_to_end(tail.block_hash)
+                return True
+            ssd = self.paged_ssd_cache
+            if ssd is None or self.system_prefix_max_bytes <= 0:
+                return False
+            hashes = [b.block_hash for b in blocks]
+            self._system_prefixes[tail.block_hash] = hashes
+            self.paged_cache.set_tail_protected(tail.block_hash, True)
+            ssd.set_blocks_pinned(hashes, True)
+            while (
+                self._system_prefixes
+                and self.system_prefix_bytes() > self.system_prefix_max_bytes
+            ):
+                self._unprotect_oldest_system_prefix()
+            return tail.block_hash in self._system_prefixes
+
+    def system_prefix_bytes(self) -> int:
+        """Bytes the protected system prefixes hold in the SSD tiers."""
+        if self.paged_ssd_cache is None:
+            return 0
+        with self.paged_cache._lock:
+            hashes = [h for chain in self._system_prefixes.values() for h in chain]
+        return self.paged_ssd_cache.blocks_footprint(hashes)
+
+    def _unprotect_oldest_system_prefix(self) -> None:
+        """Return the least recently used system prefix to plain LRU."""
+        tail_hash, hashes = self._system_prefixes.popitem(last=False)
+        self.paged_cache.set_tail_protected(tail_hash, False)
+        still_pinned = {h for chain in self._system_prefixes.values() for h in chain}
+        self.paged_ssd_cache.set_blocks_pinned(
+            [h for h in hashes if h not in still_pinned], False
+        )
 
     def _discard_tail_block(
         self,
@@ -5665,6 +5727,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._store_tip_hashes.clear()
         self._backfill_checked_hashes.clear()
         self._tail_hashes.clear()
+        while self._system_prefixes:
+            self._unprotect_oldest_system_prefix()
         self.paged_cache.clear()
         self.reset_stats()
         return cleared_count

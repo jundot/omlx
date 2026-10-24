@@ -579,6 +579,10 @@ class PagedCacheManager(CacheManager):
         # Tail blocks by chain parent (None for a root). A tail is shorter
         # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
+        # Protected system-prefix tails (see
+        # BlockAwarePrefixCache.protect_system_prefix): the per-parent and
+        # parent-count bounds never drop these.
+        self._protected_tails: set[BlockHash] = set()
 
         logger.info(
             f"PagedCacheManager initialized: block_size={block_size}, "
@@ -1197,12 +1201,33 @@ class PagedCacheManager(CacheManager):
                 parent_hash not in self._tail_index
                 and len(self._tail_index) >= _TAIL_INDEX_MAX_PARENTS
             ):
-                self._tail_index.clear()
+                kept: dict[BlockHash | None, OrderedDict[BlockHash, int]] = {}
+                for parent, tails in self._tail_index.items():
+                    protected = OrderedDict(
+                        (h, n) for h, n in tails.items() if h in self._protected_tails
+                    )
+                    if protected:
+                        kept[parent] = protected
+                self._tail_index = kept
             tails = self._tail_index.setdefault(parent_hash, OrderedDict())
             tails.pop(tail_hash, None)
             tails[tail_hash] = token_count
-            while len(tails) > _TAIL_INDEX_PER_PARENT:
-                tails.popitem(last=False)
+            # Protected tails sit beside the per-parent bound, not inside it.
+            evictable = [h for h in tails if h not in self._protected_tails]
+            for victim in evictable[: max(0, len(evictable) - _TAIL_INDEX_PER_PARENT)]:
+                del tails[victim]
+
+    def set_tail_protected(self, tail_hash: BlockHash, protected: bool) -> None:
+        """Keep (or stop keeping) a tail in the index regardless of its bounds."""
+        with self._lock:
+            if protected:
+                self._protected_tails.add(tail_hash)
+            else:
+                self._protected_tails.discard(tail_hash)
+
+    def is_tail_protected(self, tail_hash: BlockHash | None) -> bool:
+        with self._lock:
+            return tail_hash in self._protected_tails
 
     def seed_tail_blocks(
         self, entries: Iterable[Tuple[Optional[BlockHash], BlockHash, int]]
@@ -1520,6 +1545,7 @@ class PagedCacheManager(CacheManager):
 
             self.cached_block_hash_to_block.clear()
             self._tail_index.clear()
+            self._protected_tails.clear()
             if self.on_hash_map_cleared is not None:
                 self.on_hash_map_cleared()
             self.request_tables.clear()

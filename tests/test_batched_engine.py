@@ -1111,6 +1111,71 @@ class TestBatchedEngineSpecPrefillForwarding:
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert "generation_prompt_text" not in call_kwargs
 
+    @pytest.mark.asyncio
+    async def test_chat_injects_system_prefix_text(self):
+        """The text in front of the first user message's content reaches the
+        engine, rendered once per system prefix; tools are part of it."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model_settings = SimpleNamespace(specprefill_enabled=False)
+        engine._preprocess_messages = lambda m: m
+        engine._tokenizer = MagicMock()
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+        renders = []
+
+        def fake_template(msgs, tools=None, **kwargs):
+            renders.append(msgs)
+            text = f"<tools>{len(tools)}</tools>" if tools else ""
+            for m in msgs:
+                text += f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+            if kwargs.get("add_generation_prompt") is not False:
+                text += "<|im_start|>assistant\n"
+            return text
+
+        engine._apply_chat_template = fake_template
+        rules = "Classify the document. " * 8
+        system = {"role": "system", "content": rules}
+
+        await engine.chat([system, {"role": "user", "content": "doc one"}])
+        call_kwargs = engine._engine.generate.call_args.kwargs
+        assert call_kwargs["system_prefix_text"] == (
+            f"<|im_start|>system\n{rules}<|im_end|>\n<|im_start|>user\n"
+        )
+
+        # Same system prefix: only the prompt itself is rendered.
+        renders.clear()
+        await engine.chat([system, {"role": "user", "content": "doc two"}])
+        assert len(renders) == 1
+        assert (
+            engine._engine.generate.call_args.kwargs["system_prefix_text"]
+            == call_kwargs["system_prefix_text"]
+        )
+
+        tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+        await engine.chat([system, {"role": "user", "content": "doc"}], tools=tools)
+        assert engine._engine.generate.call_args.kwargs[
+            "system_prefix_text"
+        ].startswith("<tools>1</tools><|im_start|>system\n")
+
+        # No user message after the system messages, no system message, or a
+        # system message too short to snapshot: nothing is probed.
+        for messages in (
+            [system, {"role": "assistant", "content": "ok"}],
+            [{"role": "user", "content": "doc"}],
+            [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "doc"},
+            ],
+        ):
+            renders.clear()
+            await engine.chat(messages)
+            assert len(renders) == 1
+            assert "system_prefix_text" not in engine._engine.generate.call_args.kwargs
+
 
 class _TemplateTokenizer:
     """Renders a readable prompt and encodes one id per character."""

@@ -74,6 +74,7 @@ from .prefill.packed import (
     run_packed_prefill,
 )
 from .prefill_boundaries import (
+    SYSTEM_PREFIX_MIN_TOKENS,
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
 )
@@ -630,6 +631,8 @@ class _PrefillState:
     # Tail snapshot plan, see _prefill_tail_plan.
     tail_at: int | None = None
     end_tail: bool = False
+    # System prefix snapshot position, see _prefill_system_stop.
+    system_at: int | None = None
 
 
 @dataclass
@@ -1914,6 +1917,10 @@ class SchedulerConfig:
     gdn_ssd_split_enabled: bool = False
     gdn_ssd_pending_max_bytes: int = 512 * 1024 * 1024
     gdn_sidecar_state_dtype: str = "fp32"
+    # Snapshot stateful models at the end of a chat request's system messages
+    # and tools, and keep up to this many bytes of those snapshots out of LRU.
+    system_prefix_snapshots: bool = True
+    system_prefix_snapshot_max_size: int = 2 * 1024 * 1024 * 1024
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -2549,6 +2556,7 @@ class Scheduler:
                 model=model,
                 paged_cache_manager=self.paged_cache_manager,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
+                system_prefix_max_bytes=self.config.system_prefix_snapshot_max_size,
             )
 
             # Initialize paged SSD cache. If the backing directory is not
@@ -2821,8 +2829,12 @@ class Scheduler:
         extra_key_token_start: int | None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
         hot_cache_write_back: bool = True,
+        system_store: tuple[list[int], list[Any], Any, Any] | None = None,
     ) -> None:
         """Run store_cache + paged_cache cleanup off the inference thread.
+
+        ``system_store`` (see _system_prefix_store_payload) is stored after
+        the request's own blocks as a protected tail.
 
         Pre-conditions enforced by the caller (_cleanup_finished):
         - mx.eval() (a FULL, blocking eval — NOT async_eval) was called on
@@ -2887,8 +2899,60 @@ class Scheduler:
                 self.paged_cache_manager.release_for_eviction(block_table.block_ids)
             if self.block_aware_cache is not None:
                 self.block_aware_cache.clear_request_entry(request_id)
+            if system_store is not None:
+                self._store_system_prefix(
+                    request_id,
+                    system_store,
+                    extra_keys,
+                    extra_key_token_start,
+                    extra_key_ranges,
+                    hot_cache_write_back,
+                )
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
+
+    def _store_system_prefix(
+        self,
+        request_id: str,
+        system_store: tuple[list[int], list[Any], Any, Any],
+        extra_keys: tuple[Any, ...] | None,
+        extra_key_token_start: int | None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None,
+        hot_cache_write_back: bool,
+    ) -> None:
+        """Store a request's system prefix as a protected tail block."""
+        tokens, cache, model_cache_config, snapshots = system_store
+        store_id = f"{request_id}#system"
+        with _mx_buffer_access_lock:
+            table = self.block_aware_cache.store_cache(
+                store_id,
+                tokens,
+                cache,
+                model_cache_config=model_cache_config,
+                boundary_snapshots=snapshots,
+                extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
+                hot_cache_write_back=hot_cache_write_back,
+                _store_tail_terminal=True,
+            )
+        if table is None and self.paged_cache_manager is not None:
+            table = self.paged_cache_manager.get_block_table(store_id)
+        if table and self.paged_cache_manager is not None:
+            protected = table.num_tokens == len(tokens) and (
+                self.block_aware_cache.protect_system_prefix(table.block_ids)
+            )
+            logger.info(
+                "System prefix snapshot store for %s: %d tokens, %s "
+                "(protected total %s of %s)",
+                request_id,
+                table.num_tokens,
+                "protected" if protected else "unprotected",
+                format_bytes(self.block_aware_cache.system_prefix_bytes()),
+                format_bytes(self.block_aware_cache.system_prefix_max_bytes),
+            )
+            self.paged_cache_manager.release_for_eviction(table.block_ids)
+        self.block_aware_cache.clear_request_entry(store_id)
 
     def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
@@ -4345,6 +4409,9 @@ class Scheduler:
         tail_at, end_tail = self._prefill_tail_plan(
             request, base_size, n_tokens, boundary_enabled
         )
+        system_at = self._prefill_system_stop(
+            request, base_size, n_tokens, boundary_enabled
+        )
 
         # The full prompt length is known here; hand it to the QSA indexer so
         # its arrays are sized once instead of doubling mid-prefill.
@@ -4390,9 +4457,13 @@ class Scheduler:
                     cache_tokens=base_size + processed_tokens,
                     block_size=block_size,
                 )
-            # Stop once more at the tail position so its state is captured.
-            if tail_at is not None and base_size + processed_tokens < tail_at:
-                n_to_process = min(n_to_process, tail_at - base_size - processed_tokens)
+            # Stop once more at the system prefix end and at the tail position
+            # so their states are captured.
+            for stop_at in (system_at, tail_at):
+                if stop_at is not None and base_size + processed_tokens < stop_at:
+                    n_to_process = min(
+                        n_to_process, stop_at - base_size - processed_tokens
+                    )
 
             atomic_prefix = minimum_prefix if processed_tokens == 0 else 0
             if atomic_prefix:
@@ -4576,7 +4647,7 @@ class Scheduler:
                         request, prompt_cache, total_tokens
                     )
                     emitted_boundaries[request.request_id] = total_tokens
-                elif tail_at is not None and total_tokens == tail_at:
+                elif total_tokens in (system_at, tail_at):
                     self._emit_prefill_tail_snapshot(
                         request, prompt_cache, total_tokens
                     )
@@ -6541,6 +6612,9 @@ class Scheduler:
         state.tail_at, state.end_tail = self._prefill_tail_plan(
             request, base_size, len(tokens), boundary_enabled
         )
+        state.system_at = self._prefill_system_stop(
+            request, base_size, len(tokens), boundary_enabled
+        )
         return state
 
     def _announce_first_prefill_chunk(self, tokens, base_size, boundary_enabled, block_size, embeds_array) -> None:
@@ -6634,10 +6708,12 @@ class Scheduler:
                 cache_tokens=state.base_size + state.tokens_processed,
                 block_size=state.block_size,
             )
-        # Stop once more at the tail position so its state is captured.
+        # Stop once more at the system prefix end and at the tail position so
+        # their states are captured.
         cache_tokens = state.base_size + state.tokens_processed
-        if state.tail_at is not None and cache_tokens < state.tail_at:
-            n = min(n, state.tail_at - cache_tokens)
+        for stop_at in (state.system_at, state.tail_at):
+            if stop_at is not None and cache_tokens < stop_at:
+                n = min(n, stop_at - cache_tokens)
 
         # Adaptive throttle — see _adaptive_chunk_size docstring. Raises
         # if even prefill_min_chunk_tokens would exceed the cap; #1405
@@ -6928,7 +7004,7 @@ class Scheduler:
                     state.request, state.cache, total_tokens
                 )
                 state.emitted_boundaries[rid] = total_tokens
-            elif state.tail_at is not None and total_tokens == state.tail_at:
+            elif total_tokens in (state.system_at, state.tail_at):
                 self._emit_prefill_tail_snapshot(
                     state.request, state.cache, total_tokens
                 )
@@ -7815,6 +7891,33 @@ class Scheduler:
         if 0 < n < len(token_ids) and list(token_ids[-n:]) == list(suffix_ids):
             request.generation_prompt_start = len(token_ids) - n
 
+    def _resolve_system_prefix_end(self, request: "Request") -> None:
+        """Locate the system prefix; accept it only if the prompt starts with it.
+
+        Its last token may merge with the text that follows, so the shared
+        prefix can stop one token short of the encoded text.
+        """
+        text = getattr(request, "system_prefix_text", None)
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if (
+            not text
+            or not token_ids
+            or not self.config.system_prefix_snapshots
+            or self.block_aware_cache is None
+            or not self._detect_boundary_snapshot_need()
+        ):
+            return
+        try:
+            prefix_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            prefix_ids = self.tokenizer.encode(text)
+        limit = min(len(prefix_ids), len(token_ids) - 1)
+        n = 0
+        while n < limit and prefix_ids[n] == token_ids[n]:
+            n += 1
+        if n >= max(len(prefix_ids) - 1, SYSTEM_PREFIX_MIN_TOKENS):
+            request.system_prefix_end = n
+
     def _minimum_prefill_prefix(self, request: "Request") -> int:
         prompt_token_ids = getattr(request, "prompt_token_ids", None)
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)
@@ -7848,6 +7951,28 @@ class Scheduler:
                 return None, False
             return gen_start, False
         return None, False
+
+    def _prefill_system_stop(
+        self,
+        request: "Request",
+        base_size: int,
+        n_tokens: int,
+        boundary_enabled: bool,
+    ) -> int | None:
+        """Return the uncached system prefix end, off the block grid, if any.
+
+        Prefill stops there once more so the snapshot shared by every request
+        with this system prefix is captured (see _system_prefix_store_payload).
+        """
+        end = getattr(request, "system_prefix_end", 0) or 0
+        block_size = self.config.paged_cache_block_size
+        if not boundary_enabled or block_size <= 0 or end % block_size == 0:
+            return None
+        if not base_size < end < base_size + n_tokens - 1:
+            return None
+        if end < self._minimum_prefill_prefix(request):
+            return None
+        return end
 
     def _emit_prefill_tail_snapshot(
         self,
@@ -9164,6 +9289,38 @@ class Scheduler:
             extracted_cache,
             model_cache_config,
             intermediate_snapshots,
+        )
+
+    def _system_prefix_store_payload(
+        self,
+        request: "Request",
+        full_cache: list[dict[str, Any]] | None,
+        model_cache_config: Optional["ModelCacheConfig"],
+    ) -> tuple[list[int], list[dict[str, Any]], Any, Any] | None:
+        """Payload storing the system prefix as a tail of its own.
+
+        Only a prefill that stopped at the system prefix end has its snapshot.
+        The KV layers come from ``full_cache``, as for the request's own store.
+        """
+        end = getattr(request, "system_prefix_end", 0) or 0
+        snapshots = self._boundary_cache_snapshots.get(request.request_id) or {}
+        if end not in snapshots or not full_cache:
+            return None
+        override = self._get_boundary_store_override(
+            request.request_id,
+            list(request.prompt_token_ids[:end]),
+            stop_at_generation_prompt=False,
+        )
+        if override is None:
+            return None
+        tokens, boundary_cache, boundary_config, provider = override
+        if getattr(provider, "tail_terminal_token_count", None) != end:
+            return None
+        return (
+            tokens,
+            self._merge_boundary_with_full_cache(boundary_cache, full_cache),
+            boundary_config or model_cache_config,
+            provider,
         )
 
     @staticmethod
@@ -10590,6 +10747,21 @@ class Scheduler:
                             f"{request.cached_tokens} tokens in {request.shared_prefix_blocks} blocks, "
                             f"{len(request.remaining_tokens)} tokens remaining, cache reconstructed"
                         )
+                    # A hit on the system prefix refreshes its protection, and
+                    # protects one stored before a restart or by another prompt.
+                    if (
+                        0
+                        < request.cached_tokens
+                        == getattr(request, "system_prefix_end", 0)
+                    ):
+                        self.block_aware_cache.protect_system_prefix(
+                            block_table.block_ids
+                        )
+                        logger.debug(
+                            "System prefix snapshot restore for %s: %d tokens",
+                            request.request_id,
+                            request.cached_tokens,
+                        )
                     logger.info(
                         "Prefix cache restore for %s: source=paged cached=%d "
                         "suffix=%d blocks=%d lookup=%.3fms reconstruct=%.3fms "
@@ -10691,6 +10863,7 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
         self._resolve_generation_prompt_start(request)
+        self._resolve_system_prefix_end(request)
         if self.moe_offload_stats is not None:
             request.moe_offload_start = self.moe_offload_stats()
 
@@ -14028,6 +14201,9 @@ class Scheduler:
                                                 f"{len(intermediate_snapshots) if intermediate_snapshots else 0} "
                                                 f"intermediate snapshots)"
                                             )
+                                    system_store = self._system_prefix_store_payload(
+                                        request, cache_to_store, model_cache_config
+                                    )
                                 # Divergence probe (issues #1003, #2333):
                                 # record the exact token sequence submitted to
                                 # store_cache, including boundary truncation.
@@ -14058,6 +14234,12 @@ class Scheduler:
                                                     snapshot_cache
                                                 )
                                             )
+                                    if system_store is not None:
+                                        pre_eval_arrays.extend(
+                                            self._collect_arrays_from_extracted_cache(
+                                                system_store[1]
+                                            )
+                                        )
                                 with self._phase_timer("store_cache_main_dispatch"):
                                     if pre_eval_arrays:
                                         # FULL eval (not async_eval) on the owner
@@ -14120,6 +14302,7 @@ class Scheduler:
                                         request.vlm_extra_key_token_start_for_cache,
                                         request.vlm_extra_key_ranges_for_cache,
                                         hot_cache_write_back,
+                                        system_store,
                                     )
                                 except BaseException:
                                     if gate is not None:
@@ -14150,6 +14333,7 @@ class Scheduler:
                                     request.vlm_extra_key_token_start_for_cache,
                                     request.vlm_extra_key_ranges_for_cache,
                                     hot_cache_write_back,
+                                    system_store,
                                 )
                             logger.debug(
                                 f"Submitted async store_cache for {request_id} "

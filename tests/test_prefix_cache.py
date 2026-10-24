@@ -2163,6 +2163,51 @@ class TestArraysCacheLastBlockOnly:
         )
         assert table.num_tokens == 11 and remaining == [90, 91]
 
+    def test_system_prefix_budget_keeps_most_recently_used(self, mx):
+        """Protected system prefixes stay within their byte budget: the least
+        recently used one goes back to plain LRU; a hit refreshes one."""
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        mock_ssd.blocks_footprint.side_effect = lambda hashes: 10 * len(hashes)
+        cache.system_prefix_max_bytes = 25
+
+        def protect(tokens):
+            n = len(tokens)
+            table = cache.store_cache(
+                f"store-{tokens[0]}",
+                tokens,
+                self._hybrid_state(mx, n, float(n)),
+                model_cache_config=config,
+                boundary_snapshots={n: self._hybrid_state(mx, n, float(n))},
+                _store_tail_terminal=True,
+            )
+            assert cache.protect_system_prefix(table.block_ids) is True
+            paged_cache.release_for_eviction(table.block_ids)
+            return paged_cache.allocated_blocks[table.block_ids[-1]].block_hash
+
+        a = protect([1, 2, 3])
+        b = protect([5, 6, 7])
+        assert paged_cache.is_tail_protected(a) and paged_cache.is_tail_protected(b)
+        c = protect([8, 9, 10])
+        assert list(cache._system_prefixes) == [b, c]
+        assert not paged_cache.is_tail_protected(a)
+        mock_ssd.set_blocks_pinned.assert_any_call([a], False)
+
+        assert protect([5, 6, 7]) == b  # a hit on b refreshes it
+        protect([11, 12, 13])
+        assert list(cache._system_prefixes)[0] == b
+        assert not paged_cache.is_tail_protected(c)
+
+        cache.system_prefix_max_bytes = 0
+        table = cache.store_cache(
+            "store-unprotected",
+            [14, 15, 16],
+            self._hybrid_state(mx, 3, 3.0),
+            model_cache_config=config,
+            boundary_snapshots={3: self._hybrid_state(mx, 3, 3.0)},
+            _store_tail_terminal=True,
+        )
+        assert cache.protect_system_prefix(table.block_ids) is False
+
     def test_store_cache_tail_dedup_reuses_existing_block(self, mx):
         """An identical tail under the same parent is reused, not re-saved."""
         cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)

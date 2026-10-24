@@ -1303,19 +1303,26 @@ class PagedSSDCacheIndex:
                 self._lru.move_to_end(block_hash)
                 self._lru[block_hash] = self._index[block_hash].last_access
 
-    def get_lru_entries(self, count: int) -> list[PagedSSDBlockMetadata]:
+    def get_lru_entries(
+        self, count: int, skip: set[bytes] | None = None
+    ) -> list[PagedSSDBlockMetadata]:
         """
         Get least recently used entries.
 
         Args:
             count: Maximum number of entries to return.
+            skip: Block hashes to pass over (pinned blocks).
 
         Returns:
             List of LRU metadata entries.
         """
         with self._lock:
             result = []
-            for block_hash in list(self._lru.keys())[:count]:
+            for block_hash in self._lru:
+                if len(result) >= count:
+                    break
+                if skip and block_hash in skip:
+                    continue
                 if block_hash in self._index:
                     result.append(self._index[block_hash])
             return result
@@ -1508,14 +1515,30 @@ class GDNCheckpointIndex:
             self._lru.move_to_end(key)
             self._lru[key] = metadata.last_access
 
-    def get_lru_entries(self, count: int) -> list[GDNCheckpointMetadata]:
+    def get_lru_entries(
+        self, count: int, skip: set[bytes] | None = None
+    ) -> list[GDNCheckpointMetadata]:
+        """Oldest sidecars first, passing over those whose source is in ``skip``."""
         with self._lock:
             result = []
-            for key in list(self._lru)[:count]:
+            for key in self._lru:
+                if len(result) >= count:
+                    break
+                if skip and key[1] in skip:
+                    continue
                 metadata = self._index.get(key)
                 if metadata is not None:
                     result.append(metadata)
             return result
+
+    def size_for_sources(self, source_block_hashes: set[bytes]) -> int:
+        """Bytes of the sidecars recorded for ``source_block_hashes``."""
+        with self._lock:
+            return sum(
+                metadata.file_size
+                for (_, source), metadata in self._index.items()
+                if source in source_block_hashes
+            )
 
     def sort_lru_by_last_access(self) -> None:
         with self._lock:
@@ -1912,6 +1935,10 @@ class PagedSSDCacheManager(CacheManager):
         # Track which block hashes are queued for background write
         self._pending_write_hashes: set = set()
         self._pending_write_hashes_lock = threading.Lock()
+
+        # Blocks the SSD size limit evicts last (system-prefix snapshots, see
+        # BlockAwarePrefixCache.protect_system_prefix). The caller bounds them.
+        self._pinned_blocks: set[bytes] = set()
         # Set by bounded_pending_writes(): save_block waits for the writer
         # before serializing another block once this many are queued.
         self._pending_write_limit: int | None = None
@@ -4567,6 +4594,23 @@ class PagedSSDCacheManager(CacheManager):
                     return metadata
         return self._index.get(block_hash)
 
+    def set_blocks_pinned(self, block_hashes: list[bytes], pinned: bool) -> None:
+        """Make the SSD size limit evict these blocks and their sidecars last."""
+        if pinned:
+            self._pinned_blocks.update(block_hashes)
+        else:
+            self._pinned_blocks.difference_update(block_hashes)
+
+    def blocks_footprint(self, block_hashes: list[bytes]) -> int:
+        """Bytes stored for these blocks, GDN sidecars included."""
+        hashes = set(block_hashes)
+        total = self._gdn_sidecar_index.size_for_sources(hashes)
+        for block_hash in hashes:
+            metadata = self.get_block_metadata(block_hash)
+            if metadata is not None:
+                total += metadata.file_size
+        return total
+
     def has_block(self, block_hash: bytes) -> bool:
         """
         Check if a block exists in cache (hot cache, pending writes, or SSD storage).
@@ -5029,9 +5073,10 @@ class PagedSSDCacheManager(CacheManager):
             if max_count is not None and len(evicted) >= max_count:
                 break
 
-            compatible = self._index.get_lru_entries(1)
+            pinned = self._pinned_blocks
+            compatible = self._index.get_lru_entries(1, skip=pinned)
             incompatible = self._incompatible_index.get_lru_entries(1)
-            sidecars = self._gdn_sidecar_index.get_lru_entries(1)
+            sidecars = self._gdn_sidecar_index.get_lru_entries(1, skip=pinned)
             candidates: list[tuple[float, int, Any, Any]] = []
             if compatible:
                 candidates.append((compatible[0].last_access, 0, self._index, compatible[0]))

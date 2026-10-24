@@ -15,12 +15,16 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import mlx.core as mx
 
 from omlx.engine_core import get_mlx_executor
+from omlx.prefill_boundaries import SYSTEM_PREFIX_MIN_TOKENS
 
 logger = logging.getLogger(__name__)
 _preflight_logger = logging.getLogger("omlx.engine.preflight")
 
 _PREFLIGHT_CLEANUP_WAIT_TIMEOUT_S = 4.0
 _PREFLIGHT_CLEANUP_POLL_INTERVAL_S = 0.05
+
+# Stands in for the first user message's content to find what precedes it.
+_SYSTEM_PREFIX_PROBE = "OMLX_SYSTEM_PREFIX_PROBE"
 
 # Per-process record of (engine_class_name, method) pairs that have
 # already logged a "scheduler unreachable" warning. The warning marks a
@@ -312,6 +316,68 @@ class BaseEngine(ABC):
             cache.clear()
         cache[key] = (suffix, persists)
         return suffix, persists
+
+    def _inject_system_prefix_text(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Any,
+        chat_template_kwargs: dict[str, Any] | None,
+        kwargs: dict[str, Any],
+    ) -> None:
+        """Add the rendered system prefix to ``kwargs`` as ``system_prefix_text``.
+
+        The system prefix is the text every conversation that starts with the
+        same system messages and tools renders before the first user message's
+        content. The scheduler checks that the prompt really starts with it.
+        Memoized per system prefix.
+        """
+        render = getattr(self, "_apply_chat_template", None)
+        head = 0
+        while head < len(messages) and messages[head].get("role") in (
+            "system",
+            "developer",
+        ):
+            head += 1
+        if (
+            not callable(render)
+            or head == 0
+            or head == len(messages)
+            or messages[head].get("role") != "user"
+        ):
+            return
+        # A token spans at least one character: shorter text cannot reach the
+        # scheduler's minimum, so it is not worth a render.
+        chars = sum(len(str(m.get("content") or "")) for m in messages[:head])
+        if chars + len(repr(tools or "")) < SYSTEM_PREFIX_MIN_TOKENS:
+            return
+        key = repr(
+            (
+                messages[:head],
+                tools,
+                sorted((chat_template_kwargs or {}).items(), key=repr),
+            )
+        )
+        cache = self.__dict__.setdefault("_system_prefix_cache", {})
+        if key not in cache:
+            prefix: str | None = None
+            try:
+                text = render(
+                    [dict(m) for m in messages[:head]]
+                    + [{"role": "user", "content": _SYSTEM_PREFIX_PROBE}],
+                    tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                    is_partial=False,
+                    add_generation_prompt=False,
+                )
+                if isinstance(text, str) and _SYSTEM_PREFIX_PROBE in text:
+                    prefix = text[: text.index(_SYSTEM_PREFIX_PROBE)] or None
+            except Exception as e:
+                logger.debug(f"System prefix calc failed: {e}")
+            if len(cache) >= 16:
+                cache.clear()
+            cache[key] = prefix
+        if cache[key]:
+            kwargs["system_prefix_text"] = cache[key]
 
     @property
     @abstractmethod

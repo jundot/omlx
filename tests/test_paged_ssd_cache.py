@@ -3957,6 +3957,63 @@ class TestInlineLRUUnlinks:
         finally:
             mgr.close()
 
+    def test_size_limit_evicts_pinned_blocks_last(self, tmp_path):
+        """The LRU walk passes over pinned blocks and their GDN sidecars."""
+        from omlx.cache.paged_ssd_cache import GDNCheckpointMetadata
+
+        mgr = PagedSSDCacheManager(
+            cache_dir=tmp_path / "pinned",
+            max_size_bytes=1024**2 + 20,
+            hot_cache_only=True,
+        )
+        try:
+            for i in range(6):
+                block_hash = f"lru_{i}".encode()
+                mgr._index.add(
+                    PagedSSDBlockMetadata(
+                        block_hash=block_hash,
+                        file_path=tmp_path / f"{block_hash.hex()}.safetensors",
+                        file_size=10,
+                        token_count=1,
+                        created_at=float(i),
+                        last_access=float(i),
+                        num_layers=1,
+                    )
+                )
+            mgr._gdn_sidecar_index.add(
+                GDNCheckpointMetadata(
+                    source_block_hash=b"lru_1",
+                    cache_signature_digest="sig",
+                    file_path=tmp_path / "sidecar.safetensors",
+                    file_size=5,
+                    token_count=1,
+                    model_name="",
+                    block_size=1,
+                    created_at=0.0,
+                    last_access=0.0,
+                )
+            )
+            mgr.set_blocks_pinned([b"lru_0", b"lru_1"], True)
+            mgr._get_effective_max_size = (  # type: ignore[method-assign]
+                lambda: 1024**2 + 20
+            )
+            mgr._enforce_size_limit_for_new_block()
+
+            def remaining():
+                return [
+                    m.block_hash for m in mgr._index.get_lru_entries(mgr._index.count)
+                ]
+
+            assert remaining() == [b"lru_0", b"lru_1"]
+            assert mgr._gdn_sidecar_index.contains(b"lru_1", "sig")
+            assert mgr.blocks_footprint([b"lru_0", b"lru_1"]) == 25
+
+            mgr.set_blocks_pinned([b"lru_0"], False)
+            mgr._enforce_size_limit_for_new_block()
+            assert remaining() == [b"lru_1"]
+        finally:
+            mgr.close()
+
     def test_unlink_failure_increments_counter(self, tmp_path, mx):
         """When ``Path.unlink`` raises ``OSError``, the eviction loop
         records the failure in ``evict_unlink_failures`` instead of

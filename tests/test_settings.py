@@ -500,6 +500,8 @@ class TestCacheSettings:
             "hot_cache_write_through": False,
             "ane_compile_cache": False,
             "initial_cache_blocks": 256,
+            "system_prefix_snapshots": True,
+            "system_prefix_snapshot_max_size": "2GB",
         }
 
     def test_from_dict(self):
@@ -647,6 +649,23 @@ class TestCacheSettings:
         }
         settings = CacheSettings.from_dict(data)
         assert settings.initial_cache_blocks == 16384
+
+    def test_system_prefix_snapshot_settings_reach_scheduler(self, tmp_path):
+        """System prefix snapshots are on by default and configurable."""
+        settings = GlobalSettings(base_path=tmp_path)
+        config = settings.to_scheduler_config()
+        assert config.system_prefix_snapshots is True
+        assert config.system_prefix_snapshot_max_size == 2 * 1024**3
+
+        settings.cache = CacheSettings.from_dict(
+            {
+                "system_prefix_snapshots": False,
+                "system_prefix_snapshot_max_size": "512MB",
+            }
+        )
+        config = settings.to_scheduler_config()
+        assert config.system_prefix_snapshots is False
+        assert config.system_prefix_snapshot_max_size == 512 * 1024**2
 
     def test_from_dict_migrates_hot_cache_auto_to_disabled(self):
         """Legacy hot_cache_max_size=auto should load as disabled."""

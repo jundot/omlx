@@ -25,3 +25,7 @@ def should_emit_prefill_boundary(
         and total_tokens % block_size == 0
         and last_emitted_tokens < total_tokens
     )
+
+
+# Shorter system prefixes get no snapshot of their own.
+SYSTEM_PREFIX_MIN_TOKENS = 128
