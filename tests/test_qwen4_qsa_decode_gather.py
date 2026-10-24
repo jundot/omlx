@@ -898,8 +898,11 @@ def _require_selection(result):
 @pytest.mark.parametrize(
     "key_len",
     [
-        2052,  # 513 blocks: one above the budget
+        2052,  # 513 blocks: one above the budget, 1 per thread
         2055,  # three-token tail
+        4096,  # 1024 blocks: largest bank held 1 per thread
+        4100,  # 1025 blocks: 2 per thread
+        8197,  # 2049 blocks, one-token tail: 4 per thread
         24003,  # 24K decode
         32768,  # 8192 blocks: largest bank held 8 per thread
         32773,  # 8193 blocks, one-token tail: 16 per thread
@@ -970,7 +973,7 @@ def test_pipeline_limit_keeps_the_kernel_for_smaller_banks(monkeypatch):
     actual, scores = select(2055)
     assert actual is not None
     assert mx.array_equal(actual, _official_mask(scores, 2055)).item()
-    assert launches == [16, 8]
+    assert launches == [16, 1]
 
 
 def test_block_scores_round_like_maximum_sum_divide():
@@ -1168,7 +1171,7 @@ def _official_gathered_tokens(head_scores: mx.array, key_len: int) -> mx.array:
     return tokens
 
 
-@pytest.mark.parametrize("key_len", [2052, 32770, 65539])
+@pytest.mark.parametrize("key_len", [2052, 4100, 8197, 32770, 65539])
 @pytest.mark.parametrize("kind", ["normal", "cutoff_ties", "specials"])
 def test_gathered_decode_tokens_match_the_argpartition_path(key_len, kind):
     blocks = key_len // RATIO

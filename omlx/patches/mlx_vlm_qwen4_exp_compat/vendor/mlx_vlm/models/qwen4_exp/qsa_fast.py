@@ -300,7 +300,9 @@ def _decode_block_selection(
         or not 0 < block_topk < blocks
     ):
         return None
-    per_thread = 8
+    # As few keys per thread as the bank needs: each slot costs every radix
+    # pass a loop step and every tie-ranking chunk its barriers.
+    per_thread = 1
     while per_thread * _DECODE_SELECT_THREADS < blocks:
         per_thread *= 2
     if per_thread > _DECODE_SELECT_MAX_PER_THREAD:
