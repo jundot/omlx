@@ -28,6 +28,7 @@ _LEADING_THOUGHT_RE = re.compile(
 # Matches the STRAY bare-token spellings (<|tool_call> and <tool_call|>),
 # not the template's well-formed closing form (</tool_call|> with slash).
 _PROTOCOL_MARKER_RE = re.compile(r"<\|tool_call>|<tool_call\|>")
+_THOUGHT_MARKER_RE = re.compile(r"</?think>|<\|channel>(?:thought)?|<channel\|>")
 
 
 def _strip_protocol_markers(text: Any) -> Any:
@@ -68,6 +69,16 @@ def _strip_thinking(text: Any) -> Any:
     if not isinstance(text, str) or not text:
         return text
     return _LEADING_THOUGHT_RE.sub("", text, count=1)
+
+
+def _leading_thought(text: Any) -> str | None:
+    """Return the leading thought block's text without its markers, or None."""
+    if not isinstance(text, str) or not text:
+        return None
+    lead = _LEADING_THOUGHT_RE.match(text)
+    if not lead:
+        return None
+    return _THOUGHT_MARKER_RE.sub("", lead.group(0)).strip() or None
 
 
 def extract_gemma4_messages(
@@ -185,12 +196,22 @@ def extract_gemma4_messages(
             content = msg.get("content", "")
             if isinstance(content, list):
                 content = _extract_text_from_content_list(content)
+            # When the harness hands a turn back to the model after a tool-call
+            # step, tool_thought extracts the content between <think> and </think>
+            # and attaches it to reasoning_content for each tool-call step in
+            # sequence, in line with Gemma 4's thinking in multi-turn conversation
+            # best practice.
+            tool_thought = None
+            if tool_calls_raw:
+                tool_thought = msg.get("reasoning_content") or _leading_thought(content)
             # Per Gemma 4's multi-turn rule, prior thought blocks must not
-            # be fed back into the next turn. Strip them before rendering.
+            # be fed back into the next user turn. Strip them before rendering.
             content = _strip_thinking(content)
             content = _strip_protocol_markers(content)
 
             out_msg: dict = {"role": "assistant", "content": content or ""}
+            if tool_thought:
+                out_msg["reasoning_content"] = tool_thought
 
             # Preserve tool_calls for template rendering
             if tool_calls_raw:
