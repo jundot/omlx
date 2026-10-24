@@ -2136,6 +2136,7 @@ class Scheduler:
         tokenizer: Any,
         config: SchedulerConfig | None = None,
         stream: Any | None = None,
+        wake_callback: Callable[[], None] | None = None,
     ):
         """
         Initialize the scheduler.
@@ -2146,8 +2147,11 @@ class Scheduler:
             config: Scheduler configuration
             stream: Optional mx.Stream for this engine. Falls back to the
                 module-level _default_generation_stream when not provided.
+            wake_callback: Thread-safe notification that async cache cleanup
+                is ready for an inference-thread step.
         """
         self.model = model
+        self._wake_callback = wake_callback
         # Deep-copy the tokenizer so the scheduler owns an independent Rust
         # tokenizer backend.  Without this, concurrent access from the asyncio
         # event loop (encode/apply_chat_template in engine handlers) and the
@@ -2889,6 +2893,16 @@ class Scheduler:
                 self.block_aware_cache.clear_request_entry(request_id)
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
+
+    def _defer_async_remove(self, uid, request_id, future) -> None:
+        """Wake the engine when a deferred cache store completes."""
+        self._pending_async_removes.append((uid, request_id, future))
+        callback = self._wake_callback
+        if callback is not None:
+            # Only notify here; MLX synchronization, row removal and gate
+            # accounting stay on the owner inference thread. Enqueue first:
+            # an already completed Future invokes its callback immediately.
+            future.add_done_callback(lambda _future: callback())
 
     def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
@@ -11906,7 +11920,7 @@ class Scheduler:
             extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
         )
         # No batch row: the drain only waits for the store, then cleans up.
-        self._pending_async_removes.append((None, request_id, future))
+        self._defer_async_remove(None, request_id, future)
         return future
 
     def has_requests(self) -> bool:
@@ -14253,7 +14267,7 @@ class Scheduler:
             if request_id in self.request_id_to_uid:
                 uid = self.request_id_to_uid[request_id]
                 if store_future is not None:
-                    self._pending_async_removes.append((uid, request_id, store_future))
+                    self._defer_async_remove(uid, request_id, store_future)
                 else:
                     # Synchronize in-flight GPU work before modifying batch state.
                     # batch_generator.remove() triggers lazy KV cache array slicing

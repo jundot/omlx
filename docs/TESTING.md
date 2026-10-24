@@ -38,6 +38,14 @@ fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
 `tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
 speculative routes remain intact.
 
+# Cache-store completion wakeups
+
+Run `python -m pytest -q tests/test_cache_store_wakeup.py tests/test_engine_core.py tests/test_scheduler.py` to check completion notifications, inference-thread cleanup, and notifications arriving during a scheduler step. Successful, failed, and cancelled stores must wake throttled admission; completed requests keep their row and gate slot until the inference thread drains them.
+
+Run `python tests/bench_cache_store_wakeup.py --baseline <main-revision>` for an interleaved CPU-stage comparison against the actual baseline engine loop and store-enqueue method. It uses a synthetic future, mocked MLX synchronization, four discarded warmups and 28 ABBA trials across the default 50 ms polling interval. Report its completion-to-admission delay separately from prefill, decode and HTTP first-text latency.
+
+For real-model validation, issue immediate same-prefix followups using equivalent checkpoints, sampling and cache settings on main and the branch. Record actual cache-store completion, drain and request-admission timestamps to establish whether the followup encountered this wait. Requests that do not wait for cache persistence need not benefit.
+
 # First-token burst release
 
 Run `python -m pytest -q tests/test_engine_core.py tests/test_output_collector.py`
