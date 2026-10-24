@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -2049,6 +2049,28 @@ class TestSystemOneEndpoint:
             "billing": None,
             "tech": None,
         }
+
+    def test_systemone_records_reused_prefix_tokens(
+        self, client, mock_decision_engine, monkeypatch
+    ):
+        import omlx.server as server
+
+        metrics = SimpleNamespace(record_request_complete=MagicMock())
+        monkeypatch.setattr(server, "get_server_metrics", lambda: metrics)
+        mock_decision_engine.systemone = AsyncMock(
+            return_value={
+                "answers": {"urgent": {"type": "noul", "noul": 0.5}},
+                "input_tokens": 42,
+                "cached_tokens": 30,
+            }
+        )
+
+        response = client.post("/v1/systemone", json=self._BODY)
+
+        assert response.status_code == 200
+        assert response.json()["usage"] == {"input_tokens": 42, "output_tokens": 0}
+        kwargs = metrics.record_request_complete.call_args.kwargs
+        assert (kwargs["prompt_tokens"], kwargs["cached_tokens"]) == (42, 30)
 
     def test_systemone_leases_model_before_encode(
         self, client, mock_engine_pool, mock_decision_engine

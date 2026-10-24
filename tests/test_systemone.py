@@ -5,6 +5,7 @@ import copy
 import inspect
 import json
 import math
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -395,6 +396,222 @@ def test_prefix_cache_copy_matches_full_prefill(tiny_backbone):
         assert np.allclose(np.array(last), np.array(full_last), atol=1e-4)
 
 
+class _ClefTokenizer:
+    """Character tokenizer that keeps the vision tokens whole."""
+
+    special = {
+        "<|vision_start|>": _VISION_START,
+        "<|image_pad|>": _IMAGE,
+        "<|vision_end|>": _VISION_END,
+    }
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        for part in re.split(r"(<\|[a-z_]+\|>)", text):
+            if part in self.special:
+                ids.append(self.special[part])
+            else:
+                ids += [ord(c) % 250 + 1 for c in part]
+        return ids
+
+
+class _SeededImages:
+    """Image processor whose pixels depend only on the decoded image value."""
+
+    merge_size = 2
+
+    def __call__(self, images):
+        pixels = [
+            np.random.default_rng(sum(map(ord, image))).normal(size=(16, 96))
+            for image in images
+        ]
+        return {
+            "pixel_values": np.concatenate(pixels).astype(np.float32),
+            "image_grid_thw": np.array([[1, 4, 4]] * len(images)),
+        }
+
+
+@pytest.fixture
+def tiny_clef(tiny_backbone, monkeypatch):
+    monkeypatch.setattr(tiny_backbone, "tokenizer", _ClefTokenizer())
+    monkeypatch.setattr(tiny_backbone, "image_processor", _SeededImages())
+    monkeypatch.setattr(clef, "decode_images", lambda urls: list(urls or []))
+    mx.random.seed(3)
+    head = clef.JointSchemaHead(
+        hidden_size=64, width=8, routing_layers=1, layers=1, heads=2, feedforward=16
+    )
+    mx.eval(head.parameters())
+    model = clef.ClefModel("tiny")
+    model.backbone = tiny_backbone
+    model.head = head
+    return model
+
+
+_PHOTO_QUESTIONS = {
+    "sharp": {"type": "noul", "instructions": "Is the photo sharp?"},
+    "subject": {
+        "type": "choice",
+        "instructions": "Main subject?",
+        "criteria": {"person": None, "landscape": None, "object": "A thing"},
+    },
+}
+_CROP_QUESTIONS = {
+    "cut": {"type": "noul", "instructions": "Is the subject cut off?"},
+    "overall": {
+        "type": "score",
+        "instructions": "How good is the crop?",
+        "criteria": ["poor", "okay", "good"],
+    },
+}
+
+
+def _probabilities(answers: dict) -> dict:
+    flat = {}
+    for question_id, answer in answers.items():
+        if answer["type"] == "noul":
+            flat[question_id] = answer["noul"]
+        else:
+            for option, p in answer["probabilities"].items():
+                flat[f"{question_id}={option}"] = p
+    return flat
+
+
+def test_clef_prefix_ends_before_the_schema(tiny_clef):
+    request = {"state": "s", "questions": _CROP_QUESTIONS, "images": ["a"]}
+    plan = tiny_clef.encode(request)
+    prefix = _text(plan.input_ids[: plan.prefix_length])
+
+    assert plan.images is None  # computed only when the prefix cache is on
+    assert prefix.endswith(_text(tiny_clef.backbone.tokenize("s")))
+    assert list(plan.input_ids[: plan.prefix_length]).count(_IMAGE) == 4
+    assert plan.prefix_length < min(span[0] for span in plan.question_spans)
+    assert _text(plan.input_ids[plan.prefix_length :]).startswith(
+        _text(tiny_clef.backbone.tokenize("\n\nSCHEMA FIELDS:\n"))
+    )
+
+
+def test_clef_prefix_cache_reuses_the_state_across_question_sets(
+    tiny_clef, monkeypatch
+):
+    model = tiny_clef
+
+    def answer(questions, image="a"):
+        request = {
+            "state": {"caption": "a lake at dawn"},
+            "questions": questions,
+            "images": [image],
+        }
+        return _drain(model.run(model.encode(request), lambda: 16))
+
+    plain = {"photo": answer(_PHOTO_QUESTIONS), "crop": answer(_CROP_QUESTIONS)}
+    assert all(result["cached_tokens"] == 0 for result in plain.values())
+
+    store = decision.PrefixCache(1 << 30)
+    monkeypatch.setattr(model.backbone, "prefix_cache", store)
+    first = answer(_PHOTO_QUESTIONS)
+    second = answer(_CROP_QUESTIONS)
+    again = answer(_PHOTO_QUESTIONS)
+    prefix_length = model.encode(
+        {
+            "state": {"caption": "a lake at dawn"},
+            "questions": _CROP_QUESTIONS,
+            "images": ["a"],
+        }
+    ).prefix_length
+
+    assert first["cached_tokens"] == 0
+    assert second["cached_tokens"] == again["cached_tokens"] == prefix_length > 0
+    assert (len(store), store.hits, store.misses) == (1, 2, 1)
+    # A request gets the same answers whether its prefix was prefilled or reused.
+    assert again["answers"] == first["answers"]
+    # Splitting the prompt before the schema only changes rounding.
+    for result, plain_result in ((first, plain["photo"]), (second, plain["crop"])):
+        a = _probabilities(result["answers"])
+        b = _probabilities(plain_result["answers"])
+        assert a.keys() == b.keys()
+        assert np.allclose(list(a.values()), list(b.values()), atol=2e-4)
+        assert result["input_tokens"] == plain_result["input_tokens"]
+    # Other pixels behind the same image tokens make another prefix.
+    other = answer(_CROP_QUESTIONS, image="b")
+    assert other["cached_tokens"] == 0
+    assert len(store) == 2
+
+
+def test_prefix_cache_evicts_least_recently_used_entries_by_size():
+    def entry(nbytes):
+        return decision._PrefixEntry([], None, None, nbytes)
+
+    store = decision.PrefixCache(100)
+    store.put("a", entry(40))
+    store.put("b", entry(40))
+    assert store.get("a") is not None
+    store.put("c", entry(40))
+    assert store.get("b") is None
+    assert (len(store), store.nbytes) == (2, 80)
+    store.put("big", entry(101))
+    assert store.get("big") is None
+    store.put("a", entry(30))
+    assert store.stats() == {
+        "entries": 2,
+        "bytes": 70,
+        "max_bytes": 100,
+        "hits": 1,
+        "misses": 2,
+    }
+
+
+async def test_decision_engine_keeps_a_prefix_cache_while_caching_is_enabled(
+    monkeypatch, tmp_path
+):
+    from omlx.engine import decision as engine_module
+    from omlx.scheduler import SchedulerConfig
+
+    class FakeModel:
+        def __init__(self, model_path, trust_remote_code=False):
+            self.backbone = DecisionBackbone(model_path)
+
+        def load(self):
+            pass
+
+        def close(self):
+            self.backbone.close()
+
+    class FakeClef(FakeModel):
+        prefix_reuse = True
+
+    monkeypatch.setattr(engine_module, "decision_kind", lambda path: "clef")
+    monkeypatch.setitem(engine_module._MODEL_CLASSES, "clef", FakeClef)
+    cached = SchedulerConfig(paged_ssd_cache_dir=str(tmp_path / "cache"))
+    # Like the other oMLX caches, it is off while caching is disabled
+    # (--no-cache or the cache switch leave paged_ssd_cache_dir unset).
+    off = engine_module.DecisionEngine(
+        str(tmp_path), scheduler_config=SchedulerConfig()
+    )
+    on = engine_module.DecisionEngine(str(tmp_path), scheduler_config=cached)
+    await off.start()
+    await on.start()
+
+    assert off._model.backbone.prefix_cache is None
+    assert "prefix_cache" not in off.get_stats()
+    assert on.get_stats()["prefix_cache"] == {
+        "entries": 0,
+        "bytes": 0,
+        "max_bytes": engine_module.DECISION_PREFIX_CACHE_BYTES,
+        "hits": 0,
+        "misses": 0,
+    }
+    backbone = on._model.backbone
+    await on.stop()
+    assert backbone.prefix_cache is None
+
+    # A model that reads its prompt non-causally (d3) never gets one.
+    monkeypatch.setitem(engine_module._MODEL_CLASSES, "clef", FakeModel)
+    plain = engine_module.DecisionEngine(str(tmp_path), scheduler_config=cached)
+    await plain.start()
+    assert plain._model.backbone.prefix_cache is None
+    assert "prefix_cache" not in plain.get_stats()
+
+
 class _CharTokenizer:
     """Character tokenizer with a minimal chat template for OpenJev runs."""
 
@@ -446,6 +663,61 @@ def test_openjev_shared_prefix_matches_independent_readouts(tiny_backbone, monke
         independent["answers"]["angry"]["noul"], abs=2e-4
     )
     json.dumps(shared)
+
+
+def test_openjev_prefix_cache_reuses_the_state_across_requests(
+    tiny_backbone, monkeypatch
+):
+    monkeypatch.setattr(tiny_backbone, "tokenizer", _CharTokenizer())
+    model = openjev.OpenJevModel("tiny")
+    model.backbone = tiny_backbone
+    model._letter_ids = [tiny_backbone.tokenize(c)[0] for c in openjev.LETTERS]
+    state = {"ticket": "charged twice, nobody replied"}
+    first_questions = {
+        "angry": {"type": "noul", "instructions": "Is the customer angry?"},
+        "urgency": {
+            "type": "score",
+            "instructions": "How urgent?",
+            "criteria": ["later", "today", "now"],
+        },
+    }
+    # One question: no shared prefix inside the request, but one across requests.
+    second_questions = {
+        "team": {
+            "type": "choice",
+            "instructions": "Which team?",
+            "criteria": {"billing": None, "tech": None},
+        }
+    }
+
+    def answer(questions):
+        request = {"state": state, "questions": questions}
+        return _drain(model.run(model.encode(request), lambda: 16))
+
+    plain = [answer(first_questions), answer(second_questions)]
+    store = decision.PrefixCache(1 << 30)
+    monkeypatch.setattr(tiny_backbone, "prefix_cache", store)
+    first, second, again = (
+        answer(first_questions),
+        answer(second_questions),
+        answer(first_questions),
+    )
+
+    assert first["cached_tokens"] == 0
+    assert second["cached_tokens"] == again["cached_tokens"] > 0
+    assert (len(store), store.hits, store.misses) == (1, 2, 1)
+    # The reused prefix holds the state and stops where the question starts.
+    plan = model.encode({"state": state, "questions": second_questions})
+    ids = plan.items[0].group_ids[0][: second["cached_tokens"]]
+    prefix = "".join(chr(i - 1) for i in ids)  # _CharTokenizer: ord(c) + 1
+    assert "charged twice, nobody replied" in prefix
+    assert prefix.endswith("\n\nQuestion: ")
+    assert again["answers"] == first["answers"]
+    for result, plain_result in zip((first, second), plain, strict=True):
+        a = _probabilities(result["answers"])
+        b = _probabilities(plain_result["answers"])
+        assert a.keys() == b.keys()
+        assert np.allclose(list(a.values()), list(b.values()), atol=2e-4)
 
 
 def test_text_backbone_matches_patched_mlx_lm_logits():

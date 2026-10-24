@@ -22,6 +22,7 @@ from ..engine_core import get_mlx_executor
 from ..model_discovery import decision_kind
 from ..models.clef import ClefModel
 from ..models.d3 import D3Model
+from ..models.decision import PrefixCache
 from ..models.openjev import OpenJevModel
 from ..scheduler import _CONTENDED_CHUNK_FLOOR, SchedulerConfig
 from .base import BaseNonStreamingEngine
@@ -30,6 +31,11 @@ from .forward_fairness import ForwardFairnessGate
 logger = logging.getLogger(__name__)
 
 _MODEL_CLASSES = {"clef": ClefModel, "openjev": OpenJevModel, "d3": D3Model}
+
+# Memory bound of each decision model's prefix cache, the same as the VLM
+# vision feature cache. A Clef-Flash prefix of about 1.2K tokens takes about
+# 100 MB, so this keeps about ten.
+DECISION_PREFIX_CACHE_BYTES = 1024**3
 
 
 class DecisionEngine(BaseNonStreamingEngine):
@@ -46,6 +52,11 @@ class DecisionEngine(BaseNonStreamingEngine):
         self._trust_remote_code = trust_remote_code
         self._prefill_step = max(
             1, int(getattr(scheduler_config, "prefill_step_size", 0) or 2048)
+        )
+        # Like the prefix cache of LLMs and VLMs, prefix reuse is on while the
+        # oMLX cache is enabled (paged_ssd_cache_dir is set).
+        self._prefix_cache_enabled = bool(
+            getattr(scheduler_config, "paged_ssd_cache_dir", None)
         )
         self._model: ClefModel | OpenJevModel | D3Model | None = None
         self._kind: str | None = None
@@ -83,6 +94,10 @@ class DecisionEngine(BaseNonStreamingEngine):
         )
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(get_mlx_executor(), model.load)
+        # Only models that continue requests from cached prefixes get one (Clef
+        # and OpenJev; d3 reads its prompt with non-causal attention).
+        if self._prefix_cache_enabled and getattr(model, "prefix_reuse", False):
+            model.backbone.prefix_cache = PrefixCache(DECISION_PREFIX_CACHE_BYTES)
         self._model = model
         self._kind = kind
         logger.info(f"Decision engine started: {self._model_name}")
@@ -164,11 +179,17 @@ class DecisionEngine(BaseNonStreamingEngine):
             self._fairness.settle(time.perf_counter() - start, tokens, contended)
 
     def get_stats(self) -> dict[str, Any]:
-        return {
+        stats: dict[str, Any] = {
             "model_name": self._model_name,
             "loaded": self._model is not None,
             "decision_kind": self._kind,
         }
+        prefix_cache = (
+            None if self._model is None else self._model.backbone.prefix_cache
+        )
+        if prefix_cache is not None:
+            stats["prefix_cache"] = prefix_cache.stats()
+        return stats
 
     def get_model_info(self) -> dict[str, Any]:
         info: dict[str, Any] = {

@@ -4245,7 +4245,7 @@ async def create_systemone(
                 return (
                     result["answers"],
                     result["input_tokens"],
-                    0,
+                    result.get("cached_tokens", 0),
                     time.perf_counter() - start_time,
                 )
 
@@ -4357,7 +4357,7 @@ async def create_decisions(
                 return (
                     from_systemone(request, result["answers"]),
                     result["input_tokens"],
-                    0,
+                    result.get("cached_tokens", 0),
                     time.perf_counter() - start_time,
                 )
 
