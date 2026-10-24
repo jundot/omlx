@@ -2184,6 +2184,7 @@
   "js.error.oq_a8_min_tokens_positive": "Minimální počet prompt tokenů oQ A8 musí být kladné celé číslo.",
   "js.error.read_ane_tuning_progress_failed": "Načtení průběhu ladění ANE se nezdařilo.",
   "js.error.retry_failed": "Opakování se nezdařilo",
+  "js.error.clear_ssd_cache_failed": "Failed to delete SSD cache",
   "js.error.save_failed": "Uložení se nezdařilo",
   "js.error.save_profile_failed": "Uložení profilu se nezdařilo",
   "js.error.save_template_failed": "Uložení šablony se nezdařilo",

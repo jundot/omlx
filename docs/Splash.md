@@ -60,6 +60,8 @@ oMLX unloads idle models itself, so Splash starts with `--idle-release off`.
 
 ## Memory
 
+The dashboard's SSD cache Delete button also clears Splash's persistent cache, including cache left by unloaded models. Idle Splash models unload first so their cache files can be removed safely; the next request loads them again. If a Splash model is serving a request, wait for it to finish before deleting the cache.
+
 Splash spends whatever memory budget it gets beyond the weights on KV pages, and keeps the pages it no longer needs as a prefix cache. Its context window is the whole KV pool, and concurrent requests that outgrow the pool wait for pages. With the memory limit empty, oMLX sizes the budget for the model's context window: the weights, the draft, scratch and one window of KV pages (about 29 GB for Qwen3.8-27B at 256K with int8 KV). A larger limit gives the prefix cache more room.
 
 When the memory left under the oMLX limit cannot hold the full window (a 32 GB Mac, say), Splash fits a shorter context to it, and oMLX takes that as the model's context limit: longer prompts get the usual context overflow error, and `/v1/models` reports the shorter `max_model_len`. Below the memory Splash needs for the weights and one request (about 18 GiB for Qwen3.8-27B), Splash cannot start.

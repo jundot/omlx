@@ -4568,11 +4568,15 @@
             async clearSsdCache() {
                 try {
                     const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
+                    if (!resp.ok) {
+                        const data = await resp.json();
+                        throw new Error(data.detail || window.t('js.error.clear_ssd_cache_failed'));
+                    }
                     this.showClearSsdCacheConfirm = false;
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear SSD cache:', err);
+                    alert(err.message || window.t('js.error.clear_ssd_cache_failed'));
                     this.showClearSsdCacheConfirm = false;
                 }
             },

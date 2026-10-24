@@ -2184,6 +2184,7 @@
   "js.error.oq_a8_min_tokens_positive": "oQ A8 minimum prompt tokens must be a positive integer.",
   "js.error.read_ane_tuning_progress_failed": "Failed to read ANE tuning progress.",
   "js.error.retry_failed": "Retry failed",
+  "js.error.clear_ssd_cache_failed": "Failed to delete SSD cache",
   "js.error.save_failed": "Failed to save",
   "js.error.save_profile_failed": "Failed to save profile",
   "js.error.save_template_failed": "Failed to save template",

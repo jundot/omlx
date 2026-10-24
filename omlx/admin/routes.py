@@ -51,6 +51,10 @@ from ..engine.splash import (
     find_splash_binary,
     inspect_splash_binary,
 )
+from ..engine.splash import (
+    scan_ssd_cache as scan_splash_ssd_cache,
+)
+from ..exceptions import ModelBusyError
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
@@ -6500,6 +6504,7 @@ def _build_runtime_cache_observability(
         return payload
 
     block_sizes = set()
+    live_splash_dirs = set()
 
     for model_info in engine_pool.get_status().get("models", []):
         model_id = model_info.get("id")
@@ -6726,6 +6731,8 @@ def _build_runtime_cache_observability(
         if isinstance(splash_cache, dict):
             model_payload["cache_tier"] = "splash"
             model_payload["splash_cache"] = splash_cache
+            if isinstance(entry.engine, SplashEngine) and entry.engine.ssd_cache_dir:
+                live_splash_dirs.add(entry.engine.ssd_cache_dir)
 
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
@@ -6781,6 +6788,14 @@ def _build_runtime_cache_observability(
         except Exception as exc:
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
+    try:
+        files, size = scan_splash_ssd_cache(
+            cache_dir / "splash", exclude=live_splash_dirs
+        )
+        payload["total_num_files"] += files
+        payload["total_size_bytes"] += size
+    except OSError as exc:
+        logger.warning("Failed to scan Splash SSD cache: %s", exc)
     return payload
 
 
@@ -7303,6 +7318,26 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     total_deleted = 0
     distributed_ranks = 0
     distributed_failures = []
+
+    global_settings = _get_global_settings()
+    if global_settings is not None:
+        cache_root = (
+            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+            / "splash"
+        )
+        pool = _get_engine_pool()
+        clear_splash = getattr(pool, "clear_splash_ssd_cache", None)
+        try:
+            if callable(clear_splash):
+                total_deleted += await clear_splash(cache_root)
+            else:
+                total_deleted += scan_splash_ssd_cache(cache_root, clear=True)[0]
+        except ModelBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=503, detail=f"Could not delete Splash SSD cache: {exc}"
+            ) from exc
 
     for model_id, scheduler, core in _iter_loaded_engine_records():
         distributed_clear = getattr(core, "clear_prompt_caches", None)

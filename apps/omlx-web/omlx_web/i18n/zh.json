@@ -2184,6 +2184,7 @@
   "js.error.oq_a8_min_tokens_positive": "oQ A8 最小提示词 Token 数必须为正整数。",
   "js.error.read_ane_tuning_progress_failed": "读取 ANE 调优进度失败。",
   "js.error.retry_failed": "重试失败",
+  "js.error.clear_ssd_cache_failed": "Failed to delete SSD cache",
   "js.error.save_failed": "保存失败",
   "js.error.save_profile_failed": "保存配置档案失败",
   "js.error.save_template_failed": "保存模板失败",

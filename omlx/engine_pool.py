@@ -48,6 +48,9 @@ from .engine.splash import (
     splash_memory_estimate,
     splash_repo_id,
 )
+from .engine.splash import (
+    scan_ssd_cache as scan_splash_ssd_cache,
+)
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
@@ -2941,6 +2944,36 @@ class EnginePool:
         self._lease_release_tasks.add(task)
         task.add_done_callback(self._finish_lease_release_task)
         await asyncio.shield(task)
+
+    async def clear_splash_ssd_cache(self, cache_root: Path) -> int:
+        """Stop idle Splash writers before deleting their persistent cache."""
+        async with self._lock:
+            entries = [
+                entry
+                for entry in self._entries.values()
+                if isinstance(entry.engine, SplashEngine) and entry.engine.ssd_cache_dir
+            ]
+            for entry in entries:
+                if (
+                    entry.is_loading
+                    or entry.pending_unload_reason
+                    or not self._entry_is_quiescent(entry)
+                ):
+                    raise ModelBusyError(entry.model_id, "delete Splash SSD cache")
+            roots = {cache_root}
+            reason = "delete Splash SSD cache"
+            for entry in entries:
+                roots.add(entry.engine.ssd_cache_dir.parent)
+                # The ready-engine fast path bypasses the pool lock.
+                entry.pending_unload_reason = reason
+            try:
+                for entry in entries:
+                    await self._unload_engine(entry.model_id)
+                return sum(scan_splash_ssd_cache(root, clear=True)[0] for root in roots)
+            finally:
+                for entry in entries:
+                    if entry.pending_unload_reason == reason:
+                        entry.pending_unload_reason = None
 
     async def unload_if_idle_unpinned(self, model_id: str) -> bool:
         """Unload a loaded engine only when it is idle and not pinned."""
