@@ -90,6 +90,7 @@ from .api.anthropic_utils import (
     create_text_delta_event,
     create_thinking_delta_event,
     is_auto_mode_classifier_request,
+    tool_choice_is_none,
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
@@ -7733,8 +7734,15 @@ async def create_anthropic_message(
         ):
             merged_ct_kwargs["preserve_thinking"] = True
 
-        # Merge MCP tools with user-provided Anthropic tools
-        user_internal = convert_anthropic_tools_to_internal(request.tools)
+        # Merge MCP tools with user-provided Anthropic tools. tool_choice
+        # {"type": "none"} keeps every tool out of the prompt, matching
+        # tool_choice="none" on /v1/chat/completions.
+        tools_disabled = tool_choice_is_none(request.tool_choice)
+        user_internal = (
+            None
+            if tools_disabled
+            else convert_anthropic_tools_to_internal(request.tools)
+        )
         if getattr(engine, "is_diffusion_model", False) and not getattr(
             engine, "supports_tool_calling", False
         ):
@@ -7745,7 +7753,11 @@ async def create_anthropic_message(
                     field="tools",
                 )
             internal_tools = None
-        elif _server_state.mcp_manager and mcp_tools_exposed():
+        elif (
+            not tools_disabled
+            and _server_state.mcp_manager
+            and mcp_tools_exposed()
+        ):
             mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
             combined = (mcp_openai_tools or []) + (user_internal or [])
             # Deduplicate by function name (user tools take precedence)
@@ -8005,8 +8017,12 @@ async def count_anthropic_tokens(
         )
         messages = convert_anthropic_to_internal(temp_request)
 
-        # Convert tools if present
-        internal_tools = convert_anthropic_tools_to_internal(request.tools)
+        # Convert tools if present; count them only when the model sees them.
+        internal_tools = (
+            None
+            if tool_choice_is_none(request.tool_choice)
+            else convert_anthropic_tools_to_internal(request.tools)
+        )
 
         # Apply chat template to get prompt
         tokenizer = engine.tokenizer

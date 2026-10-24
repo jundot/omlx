@@ -21,6 +21,7 @@ from .anthropic_models import (
     MessagesRequest,
     MessagesResponse,
     SystemContent,
+    ToolChoice,
 )
 from .openai_models import ToolCall
 from .utils import _strip_client_budget_markers
@@ -722,6 +723,16 @@ def is_auto_mode_classifier_request(request: MessagesRequest) -> bool:
         return False
     system_text = _extract_system_text(request.system).lower()
     return _AUTO_MODE_CLASSIFIER_MARKER in system_text
+
+
+def tool_choice_is_none(tool_choice: ToolChoice | dict | None) -> bool:
+    """Whether the request forbids tool use (``{"type": "none"}``).
+
+    The field also accepts a raw dict, so read ``type`` from either form.
+    """
+    if isinstance(tool_choice, dict):
+        return tool_choice.get("type") == "none"
+    return getattr(tool_choice, "type", None) == "none"
 
 
 def _normalize_in_messages_system(
