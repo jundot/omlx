@@ -68,6 +68,7 @@ struct HFTaskDTO: Codable, Equatable, Sendable, Identifiable {
               let split = components[1].wholeMatch(of: /(.+)-\d{5}-of-\d{5}\.gguf/)
         else { return false }
         return split.1.hasSuffix("-\(components[0])")
+            || components[0].wholeMatch(of: /(?:ud-)?[a-z0-9_]+-ple\d+/) != nil
     }
 
     enum Status: String {

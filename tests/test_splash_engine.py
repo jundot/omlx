@@ -386,7 +386,7 @@ def _qwen38_gguf(vocab: list[str]) -> dict:
 
 class TestGguf:
 
-    @pytest.mark.parametrize("layout", ["single", "split", "variant"])
+    @pytest.mark.parametrize("layout", ["single", "split", "variant", "table"])
     def test_flash_next_gguf_discovery_draft_and_engine(
         self, tmp_path, monkeypatch, launchers, write_gguf, global_settings, layout
     ):
@@ -417,10 +417,18 @@ class TestGguf:
         )
         name = "Flash-Next-Q2_0"
         source_folder = repo / "Q2_0" if layout == "variant" else repo
-        first = f"{name}.gguf" if layout == "single" else f"{name}-00001-of-00002.gguf"
+        prefix = name
+        if layout == "table":
+            source_folder = repo / "Q4-PLE8"
+            prefix = "Flash-Next-UD-Q4_K_XL"
+            name = f"{prefix}-Q4-PLE8"
+        first = (
+            f"{prefix}.gguf" if layout == "single" else f"{prefix}-00001-of-00002.gguf"
+        )
         write_gguf(source_folder / first, metadata)
         if layout != "single":
-            write_gguf(source_folder / f"{name}-00002-of-00002.gguf", {})
+            last = "Flash-Next-ple8-table" if layout == "table" else prefix
+            write_gguf(source_folder / f"{last}-00002-of-00002.gguf", {})
         models = discover_models(tmp_path / "models", tmp_path / "gguf")
         model = models[name]
         text = {**FLASH_NEXT_TEXT, "vocab_size": len(vocab)}

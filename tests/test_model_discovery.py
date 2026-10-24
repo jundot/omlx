@@ -2484,6 +2484,81 @@ PROJECTOR_GGUF = {
 class TestGgufDiscovery:
 
     @pytest.mark.parametrize(
+        "variant, body, count",
+        [
+            ("Q4-PLE4", "Q4-body", 5),
+            ("Q4-PLE8", "UD-Q4_K_XL", 5),
+            ("Q5-PLE4", "Q5-body", 8),
+            ("Q5-PLE8", "Splash-Q5_K_M", 8),
+        ],
+    )
+    def test_split_variant_with_separately_named_table(
+        self, tmp_path, write_gguf, variant, body, count
+    ):
+        from omlx import gguf
+
+        repo = tmp_path / "models" / "Vardaan97" / "Flash-Next-Splash-GGUF"
+        prefix = f"Qwen3.8-Flash-Next-{body}"
+        names = [
+            f"{prefix}-{index:05d}-of-{count:05d}.gguf" for index in range(1, count)
+        ]
+        names.append(
+            f"Qwen3.8-Flash-Next-ple{variant[-1]}-table-{count:05d}-of-{count:05d}.gguf"
+        )
+        for name in reversed(names):
+            write_gguf(repo / variant / name, {"general.architecture": "qwen4exp"})
+        write_gguf(repo / "mmproj-BF16.gguf", PROJECTOR_GGUF)
+
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+
+        assert set(models) == {f"{prefix}-{variant}"}
+        model = models[f"{prefix}-{variant}"]
+        info = gguf.source_info(model.model_path)
+        assert info["source_parts"] == [f"{variant}/{name}" for name in names]
+        assert info["parts"] == [f"split/{name}" for name in names]
+        assert info["projectors"] == ["mmproj-BF16.gguf"]
+        for name in names:
+            assert (
+                Path(model.model_path) / "split" / name
+            ).resolve() == repo / variant / name
+
+    @pytest.mark.parametrize("problem", ["missing", "duplicate", "count", "draft"])
+    def test_mixed_prefix_split_rejects_incomplete_or_ambiguous_folders(
+        self, tmp_path, write_gguf, problem
+    ):
+        from omlx import gguf
+
+        repo = tmp_path / "models" / "repo"
+        variant = "MTP" if problem == "draft" else "Q4-PLE8"
+        names = [
+            "Flash-Next-body-00001-of-00002.gguf",
+            "Flash-Next-ple8-table-00002-of-00002.gguf",
+        ]
+        if problem == "missing":
+            names.pop()
+        elif problem == "duplicate":
+            names.append("Other-body-00001-of-00002.gguf")
+        elif problem == "count":
+            names[1] = "Flash-Next-ple8-table-00002-of-00003.gguf"
+        for name in names:
+            write_gguf(repo / variant / name, {"general.architecture": "qwen4exp"})
+        assert gguf.find_models(repo) == []
+        assert discover_models(tmp_path / "models", tmp_path / "gguf") == {}
+
+    def test_repository_name_ending_in_ple_is_not_a_variant(self, tmp_path, write_gguf):
+        from omlx import gguf
+
+        repo = tmp_path / "models" / "owner" / "Qwen3.8-Flash-Next-PLE8"
+        for part in (1, 2):
+            write_gguf(repo / f"Flash-Next-Q4-{part:05d}-of-00002.gguf", QWEN_GGUF)
+        write_gguf(repo / "mmproj-BF16.gguf", PROJECTOR_GGUF)
+        models = discover_models(tmp_path / "models", tmp_path / "gguf")
+        assert set(models) == {"Flash-Next-Q4"}
+        info = gguf.source_info(models["Flash-Next-Q4"].model_path)
+        assert info["directory"] == str(repo)
+        assert info["projectors"] == ["mmproj-BF16.gguf"]
+
+    @pytest.mark.parametrize(
         "parts, complete",
         [
             ([(1, 2), (2, 2)], True),

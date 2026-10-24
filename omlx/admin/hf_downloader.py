@@ -730,6 +730,7 @@ def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
     """
     names = [row["name"] for row in files]
     layout = _repo_layout(names)
+    split_groups = gguf.split_file_groups(names)
     projectors = _default_mmproj(names)
     # A selection starts from what downloading the whole repo would fetch.
     preselected = (
@@ -742,11 +743,10 @@ def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
         lower = name.lower()
         row["group"] = None
         row["mmproj"] = None
-        if lower.endswith(".gguf") and ("/" not in name or gguf.is_split_variant(name)):
+        if lower.endswith(".gguf") and ("/" not in name or name in split_groups):
             row["kind"] = gguf.file_kind(name)
             if row["kind"] == "gguf":
-                split = gguf.SPLIT_RE.match(name)
-                row["group"] = split["prefix"] if split else None
+                row["group"] = split_groups.get(name)
                 # Discovery pairs every GGUF with a root projector.
                 row["mmproj"] = projectors.get("")
         elif lower.endswith(".safetensors"):
