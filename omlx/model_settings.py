@@ -298,6 +298,9 @@ class ModelSettings:
             projection stay on the A16 path.
             Mutually exclusive with qwen35_ane_prefill_enabled.
         qwen35_oq_a8_min_tokens: Shortest sequence routed to the kernels.
+        qwen4_qsa_shared_prefix_enabled: Share immutable QSA prefix state
+            between compatible concurrent Qwen4-Exp requests. Experimental,
+            default off, and applied when the model is loaded.
         moe_expert_offload_enabled: Stream MoE expert weights from the
             checkpoint on demand instead of keeping them all resident (fits
             models larger than memory; costs decode speed). Requires reload.
@@ -383,6 +386,11 @@ class ModelSettings:
     # Qwen4-Exp only: admit any canonical affine GDN projection recipe to the
     # fused one-row decode route, not only the oQe allow-list.
     qwen4_gdn_decode_wide_proj: bool = False
+    # Qwen4-Exp only: retain one immutable QSA prefix for compatible rows and
+    # keep each request's writable decode/speculative suffix private.
+    # Experimental and default-off because activation compares prefix state
+    # exactly and the memory/latency tradeoff is workload-dependent.
+    qwen4_qsa_shared_prefix_enabled: bool = False
     deepseek_v41_engram_ssd_offload: bool = False
     # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
     # last window-size tokens; decoder global KV is the encoder-final

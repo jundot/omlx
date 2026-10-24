@@ -2087,6 +2087,13 @@ class VLMBatchedEngine(BaseEngine):
         if self._loaded:
             return
 
+        shared_qsa_enabled = bool(
+            getattr(
+                self._model_settings,
+                "qwen4_qsa_shared_prefix_enabled",
+                False,
+            )
+        )
         from mlx_vlm.utils import load as vlm_load
 
         from ..engine_core import AsyncEngineCore, EngineConfig
@@ -2568,6 +2575,13 @@ class VLMBatchedEngine(BaseEngine):
             logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
             return
 
+        language_model = getattr(self._vlm_model, "language_model", None)
+        configure_shared_qsa = getattr(
+            language_model, "configure_qsa_shared_prefix", None
+        )
+        if callable(configure_shared_qsa):
+            configure_shared_qsa(shared_qsa_enabled)
+
         # Create VLM model adapter wrapping language_model.
         # mlx-vlm models now handle per-sequence mx.array offsets natively
         # and batched decode is fixed, so no separate mlx-lm decode model needed.
@@ -2580,6 +2594,7 @@ class VLMBatchedEngine(BaseEngine):
             else SchedulerConfig()
         )
         scheduler_config.moe_offload_active = bool(moe_offload_wrapped)
+        scheduler_config.qwen4_qsa_shared_prefix_enabled = shared_qsa_enabled
         if (
             self._adapter.model_type == "deepseek_v41"
             and self._adapter.config.ced_prefill

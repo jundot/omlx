@@ -374,6 +374,7 @@ class ModelSettingsRequest(BaseModel):
     cache_reasoning_output: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
     qwen4_gdn_decode_wide_proj: bool | None = None
+    qwen4_qsa_shared_prefix_enabled: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
@@ -2929,6 +2930,13 @@ async def update_model_settings(
         ).lower() == "qwen4_exp"
         current_settings.qwen4_gdn_decode_wide_proj = bool(
             request.qwen4_gdn_decode_wide_proj and is_qwen4_exp
+        )
+    if "qwen4_qsa_shared_prefix_enabled" in sent:
+        is_qwen4_exp = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "qwen4_exp"
+        current_settings.qwen4_qsa_shared_prefix_enabled = bool(
+            request.qwen4_qsa_shared_prefix_enabled and is_qwen4_exp
         )
     if "deepseek_v41_engram_ssd_offload" in sent:
         is_deepseek_v41 = (entry.config_model_type or "").replace(

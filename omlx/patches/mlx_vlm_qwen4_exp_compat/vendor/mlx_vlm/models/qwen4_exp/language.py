@@ -491,9 +491,26 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     step = 8192
     geometric_growth = True
 
-    def __init__(self):
+    def __init__(self, *, shared_serving: bool = False):
         super().__init__()
         self._init_indexer_cache()
+        self._shared_serving = bool(shared_serving)
+
+    def set_shared_serving(self, enabled: bool) -> None:
+        self._shared_serving = bool(enabled)
+
+    def bind_cache_scope(self, scope):
+        previous = getattr(self, "_shared_cache_scope", scope)
+        if previous != scope:
+            raise ValueError("QSA cache scope cannot be rebound")
+        self._shared_cache_scope = scope
+
+    def prepare_serving_cache(self):
+        if self._shared_serving:
+            from .shared_suffix import SharedBatchQSAKVCache
+
+            return SharedBatchQSAKVCache.merge([self])
+        return self
 
     @property
     def state(self):
@@ -541,6 +558,9 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
                     self.index_position_ids[idx : idx + 1]
                 )
             cache._restore_indexer_state(index_keys, index_position_ids)
+        for field in ("_shared_loaded_owner", "_shared_serving", "_shared_cache_scope"):
+            if hasattr(self, field):
+                setattr(cache, field, getattr(self, field))
         return cache
 
     def filter(self, batch_indices):
@@ -557,6 +577,13 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     def to_batch(self, left_padding):
         """Convert a singleton QSA cache without dropping indexer state."""
 
+        if self._shared_serving:
+            from .shared_suffix import SharedBatchQSAKVCache
+
+            batch = SharedBatchQSAKVCache.merge([self])
+            if any(left_padding):
+                batch.prepare(left_padding=left_padding)
+            return batch
         batch = BatchQSAKVCache(left_padding)
         padding = mx.array(left_padding)
         if self.empty() and self.index_keys is None:
@@ -598,6 +625,10 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
 
     @classmethod
     def merge(cls, caches):
+        if any(getattr(cache, "_shared_serving", False) for cache in caches):
+            from .shared_suffix import SharedBatchQSAKVCache
+
+            return SharedBatchQSAKVCache.merge(caches)
         return BatchQSAKVCache.merge(caches)
 
     def _kv_bytes_per_token(self) -> int:
@@ -2675,6 +2706,46 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
+        if getattr(cache, "_omlx_qsa_shared_suffix", False):
+            from .shared_suffix import (
+                SharedBatchQSAKVCache,
+                SharedSuffixQSAKVCache,
+                shared_suffix_attention,
+            )
+
+            if isinstance(cache, SharedBatchQSAKVCache):
+                return cache.attend(
+                    self,
+                    x,
+                    mask=mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    target_verify=target_verify,
+                )
+            if not isinstance(cache, SharedSuffixQSAKVCache):
+                raise TypeError("unknown shared QSA cache implementation")
+            ordinary_positions = mx.arange(cache.offset, cache.offset + x.shape[1])[
+                None
+            ]
+            if (
+                position_embeddings is not None
+                or (
+                    position_ids is not None
+                    and (
+                        position_ids.ndim != 2
+                        or not mx.array_equal(position_ids, ordinary_positions).item()
+                    )
+                )
+                or not (mask is None or (isinstance(mask, str) and mask == "causal"))
+            ):
+                raise ValueError(
+                    "shared QSA probe supports ordinary causal text positions"
+                )
+            return shared_suffix_attention(self, x, cache, target_verify=target_verify)
+        if type(cache) is QSAKVCache and getattr(cache, "_shared_serving", False):
+            from .shared_suffix import bind_loaded_owner
+
+            bind_loaded_owner(cache, self)
         if self._gathered_text_decode_eligible(
             x,
             mask,
@@ -4768,6 +4839,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         self.model._omlx_mtp_prime_host = weakref.ref(self)
         self._position_ids = None
         self._rope_deltas = None
+        self._qsa_shared_prefix_enabled = False
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
@@ -4775,6 +4847,10 @@ class LanguageModel(Qwen3_5LanguageModel):
         """Reference a root-level Lightning MTP head without double registration."""
         self._omlx_qwen4_mtp_owner = weakref.ref(owner)
         self._enable_mtp_decode_markers()
+
+    def configure_qsa_shared_prefix(self, enabled: bool) -> None:
+        """Select the experimental shared-prefix cache for new/restored rows."""
+        self._qsa_shared_prefix_enabled = bool(enabled)
 
     def _enable_mtp_decode_markers(self) -> None:
         from omlx.patches.mlx_lm_mtp import get_mtp_depth, is_mtp_depth_fixed
@@ -4892,7 +4968,14 @@ class LanguageModel(Qwen3_5LanguageModel):
 
     def make_mtp_cache(self):
         mtp = self.get_mtp_module()
-        return [QSAKVCache() for _ in mtp.layers] if mtp is not None else []
+        return (
+            [
+                QSAKVCache(shared_serving=self._qsa_shared_prefix_enabled)
+                for _ in mtp.layers
+            ]
+            if mtp is not None
+            else []
+        )
 
     def make_cache(self):
         caches = []
@@ -4900,7 +4983,9 @@ class LanguageModel(Qwen3_5LanguageModel):
             if layer.is_linear:
                 caches.append(ArraysCache(size=4 if "ple" in layer else 2))
             else:
-                caches.append(QSAKVCache())
+                caches.append(
+                    QSAKVCache(shared_serving=self._qsa_shared_prefix_enabled)
+                )
         return caches
 
     @staticmethod
