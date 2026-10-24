@@ -124,8 +124,10 @@ def _map_stt_prompt_kwargs(model: Any, prompt: str | None) -> dict[str, str]:
     Qwen3-ASR-style backends expose ``generate(..., system_prompt=...)`` —
     a trained context-injection mechanism with strong biasing. Whisper-family
     backends expose ``generate(..., initial_prompt=...)`` — a decoder-prefix
-    soft prior (~224-token window). Backends with neither hook ignore the
-    field; a request must never fail because of ``prompt``.
+    soft prior (~224-token window). Prompt-driven audio-text backends expose
+    ``generate(..., prompt=...)``, where the text is the task instruction.
+    Backends with none of these ignore the field; a request must never fail
+    because of ``prompt``.
     """
     if prompt is None or not prompt.strip():
         return {}
@@ -141,6 +143,10 @@ def _map_stt_prompt_kwargs(model: Any, prompt: str | None) -> dict[str, str]:
         return {"system_prompt": prompt}
     if "initial_prompt" in params:
         return {"initial_prompt": prompt}
+    # Prompt-driven audio-text models (MOSS-Music, Qwen2-Audio, Granite
+    # Speech, ...) take the task instruction itself as ``prompt``.
+    if "prompt" in params:
+        return {"prompt": prompt}
 
     logger.debug(
         "STT backend %s has no prompt-biasing hook; ignoring 'prompt'",

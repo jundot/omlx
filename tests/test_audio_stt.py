@@ -672,6 +672,35 @@ class TestSTTEnginePromptBiasing:
         assert "system_prompt" not in generate_kwargs
 
     @pytest.mark.asyncio
+    async def test_prompt_passed_as_instruction_for_prompt_driven_models(
+        self, tmp_path
+    ):
+        """Prompt-driven audio-text backends (MOSS-Music) take it as prompt."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, *, prompt=None, **kwargs):
+                generate_kwargs["prompt"] = prompt
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="C major", language=None, segments=[], total_time=0.1,
+                )
+
+        engine = STTEngine("moss-music")
+        engine._model = FakeModel()
+
+        result = await engine.transcribe(
+            self._wav(tmp_path), prompt="What is the key of this music?"
+        )
+
+        assert result["text"] == "C major"
+        assert generate_kwargs["prompt"] == "What is the key of this music?"
+        assert "system_prompt" not in generate_kwargs
+        assert "initial_prompt" not in generate_kwargs
+
+    @pytest.mark.asyncio
     async def test_prompt_dropped_for_backends_without_hook(self, tmp_path):
         """Backends with no biasing hook never see the field and never fail."""
         from omlx.engine.stt import STTEngine
