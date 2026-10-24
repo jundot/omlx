@@ -5363,8 +5363,16 @@ class Scheduler:
         # 60k and 70k tokens, because the chunks spent at 512/256/128 while
         # already over the target pushed usage past the abort watermark before
         # the ladder reached the floor.
+        # Flat-overhead profiles never read the EWMA: they size from the static
+        # profile plus measured pool overhead, so a tier would only discard the
+        # chunk that prediction fits. Weights alone above the watermark
+        # (Qwen3.8-Flash-Next on 128 GB) cut every throttled chunk to 512.
         band_ratio = -1.0
-        if current >= soft_watermark and hard_cap > soft_watermark:
+        if (
+            current >= soft_watermark
+            and hard_cap > soft_watermark
+            and not Scheduler._prefill_flat_overhead_enabled(self)
+        ):
             band = hard_cap - soft_watermark
             band_ratio = max(0.0, min(1.0, (current - soft_watermark) / band))
             if band_ratio < 0.50:

@@ -659,6 +659,30 @@ def test_qwen4_measured_excess_is_flat_not_scaled_to_the_next_chunk():
     assert predicted < 20 * _GB / measured_tokens * candidate
 
 
+def test_flat_overhead_throttle_keeps_the_chunk_its_prediction_fits():
+    """Weights above the soft watermark put every chunk in a tier. Flat-overhead
+    profiles size from their static profile and measured overhead, so a
+    throttled chunk keeps the largest size that fits instead of a tier."""
+    hard = 114 * _GB
+    ns = _throttle_ctx(current=0, hard=hard, monitor=_qwen4_monitor())
+    target = Scheduler._prefill_peak_target(ns)
+    ns._fake_current = int(
+        target - ns._predicted_chunk_transient(4096, 0, gathered_core=True)
+    )
+    assert ns._fake_current > ns._memory_limit_bytes * ns._prefill_safe_zone_ratio
+    fits = Scheduler._largest_fitting_prefill_chunk(
+        ns, 8192, 32, target - ns._fake_current, 0, gathered_core=True
+    )
+    assert 4096 <= fits < 8192
+    assert _call(ns, 8192, gathered_core=True) == fits
+
+    # A model sized by its EWMA keeps the tier at the same usage.
+    per_token = (target - ns._fake_current) / 4096 / Scheduler._PREFILL_TRANSIENT_SAFETY
+    generic = _throttle_ctx(current=0, hard=hard, samples_bpt=per_token)
+    generic._fake_current = ns._fake_current
+    assert _call(generic, 8192) <= Scheduler._PREFILL_STEP_TIERS[0]
+
+
 @pytest.mark.parametrize(
     ("markers", "predicted", "expected"),
     [([], True, True), ([True, True], False, True), ([True, False], True, False)],
