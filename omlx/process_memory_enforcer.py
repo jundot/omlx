@@ -191,6 +191,26 @@ def get_iogpu_wired_limit_bytes() -> int:
         return 0
 
 
+def wired_collector_enabled() -> bool:
+    """Read the kernel's `iogpu.disable_wired_collector` sysctl.
+
+    macOS unwires GPU memory that sits idle for a couple of seconds, so the
+    first command that reads it pays ~12-22 ms per GB to make it resident
+    again (#4040). True means that collector is active, which is the
+    default. False on non-macOS or when the read fails.
+    """
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "iogpu.disable_wired_collector"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return int(out.stdout.strip()) == 0
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return False
+
+
 def _get_max_metal_working_set_bytes() -> int:
     """Apple's default Metal cap as reported by MLX (~75% of RAM).
 
@@ -628,6 +648,16 @@ class ProcessMemoryEnforcer:
                     _format_gb(applied),
                     _format_gb(static_ceiling),
                     _format_gb(get_iogpu_wired_limit_bytes()),
+                )
+            if wired_collector_enabled():
+                logger.warning(
+                    "macOS unwires GPU memory after a couple of seconds "
+                    "without GPU work, so the first request after an idle "
+                    "gap pays ~12-22 ms per GB to make the weights resident "
+                    "again. Disable the collector with: sudo sysctl "
+                    "iogpu.disable_wired_collector=1 (pinned pages are then "
+                    "only released when this process exits, and the setting "
+                    "resets on reboot)"
                 )
 
         self._task = asyncio.create_task(self._enforcement_loop())
