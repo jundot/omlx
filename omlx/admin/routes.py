@@ -381,6 +381,8 @@ class ModelSettingsRequest(BaseModel):
     mtp_adaptive_max_depth: int | None = None
     # Fixed Lightning MTP draft depth (None = adaptive).
     mtp_fixed_depth: int | None = None
+    # Recast the checkpoint's bfloat16 leaves to float16 after load
+    activation_fp16_enabled: bool | None = None
     # KV cache compression
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_scheme: str | None = None
@@ -2408,6 +2410,14 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         moe_offload_supported, _ = moe_offload_compatibility(
             model_info.get("model_path") or ""
         )
+        try:
+            from ..utils.model_loading import checkpoint_has_bf16_leaves
+
+            activation_fp16_supported = checkpoint_has_bf16_leaves(
+                model_info.get("model_path", "") or ""
+            )
+        except (OSError, TypeError, ValueError):
+            activation_fp16_supported = False
         qwen4_ple_ssd_offload_supported = False
         qwen4_ple_ssd_offload_forced = False
         qwen4_resident_bytes = 0
@@ -2550,6 +2560,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "deepseek_v41_engram_mmap_bytes": v41_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
+            "activation_fp16_supported": activation_fp16_supported,
         }
 
         model_data.update(_model_options(model_data, settings))
@@ -2976,6 +2987,11 @@ async def update_model_settings(
             request.index_cache_freq
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
+        )
+    # Load-time activation dtype recast
+    if "activation_fp16_enabled" in sent:
+        current_settings.activation_fp16_enabled = (
+            request.activation_fp16_enabled or False
         )
     # KV cache compression settings
     if "turboquant_kv_enabled" in sent:
