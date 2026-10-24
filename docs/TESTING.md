@@ -15,6 +15,16 @@ No model download is required.
 
 Run `python -m pytest -q tests/test_audio_stt.py -k Qwen3ASRAudioQuantization` to check Qwen3-ASR audio quantization through the STT loader. Small local checkpoints cover mixed 4-bit text and 8-bit audio weights and floating-point audio layers. No model download is required.
 
+# SSD cache LRU peeks
+
+Run `python -m pytest -q tests/test_ssd_lru_peek.py tests/test_paged_ssd_cache.py tests/test_prefix_cache_gdn_split.py`
+to check bounded victim lookups in the main-block and GDN-sidecar indexes.
+The regression counts iterator visits through production code rather than
+asserting elapsed time, and covers non-consuming peeks, touch/remove ordering,
+slice bounds, missing metadata and global eviction tie-breaking/size accounting.
+CPU victim-selection timings exclude file unlinking, tensor work and HTTP
+latency; they are not a model throughput or retained-memory measurement.
+
 # Cluster test filesystem isolation
 
 The autouse `cluster_home` fixture gives each test a temporary directory for cluster interpreter shims and SSH files. It preserves explicit shim `home` arguments and leaves `HOME` unchanged so model discovery paths still work. The shim unit tests import the original function directly and provide their own temporary paths or patch `HOME` to verify the real default-path behavior.
