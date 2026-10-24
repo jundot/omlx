@@ -2019,31 +2019,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 projection(x) for projection in (self.q_proj, self.k_proj, self.v_proj)
             )
         )
-        queries, gate = mx.split(
-            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
-            2,
-            axis=-1,
-        )
-        gate = gate.reshape(batch, length, -1)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        keys = self.k_norm(
-            keys.reshape(batch, length, self.num_key_value_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        values = values.reshape(
-            batch, length, self.num_key_value_heads, self.head_dim
-        ).transpose(0, 2, 1, 3)
-
         past_len = cache.offset
         text_position_ids, rotary_position_ids = _split_text_mrope_positions(
             position_ids, batch, length, past_len
         )
-        queries, keys = self.rotary_emb.apply_rotary(
-            queries,
-            keys,
-            rotary_position_ids,
-            unsqueeze_dim=1,
+        queries, keys, values, gate, _ = self._prepare_projected_qkv(
+            q_proj_output, keys, values, cache, rotary_position_ids, None, None
         )
-        keys, values = cache.update_and_fetch(keys, values)
 
         projected = (
             _target_verify_linear(self.indexer.index_qk_proj, x)
@@ -2133,39 +2115,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             self.k_proj(x),
             self.v_proj(x),
         )
-        queries, gate = mx.split(
-            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
-            2,
-            axis=-1,
-        )
-        gate = gate.reshape(batch, length, -1)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        new_keys = self.k_norm(
-            new_keys.reshape(
-                batch,
-                length,
-                self.num_key_value_heads,
-                self.head_dim,
-            )
-        ).transpose(0, 2, 1, 3)
-        new_values = new_values.reshape(
-            batch,
-            length,
-            self.num_key_value_heads,
-            self.head_dim,
-        ).transpose(0, 2, 1, 3)
-
         past_len = cache.offset
         text_position_ids, rotary_position_ids = _split_text_mrope_positions(
             position_ids, batch, length, past_len
         )
-        queries, new_keys = self.rotary_emb.apply_rotary(
-            queries,
-            new_keys,
-            rotary_position_ids,
-            unsqueeze_dim=1,
+        queries, keys, values, gate, _ = self._prepare_projected_qkv(
+            q_proj_output, new_keys, new_values, cache, rotary_position_ids, None, None
         )
-        keys, values = cache.update_and_fetch(new_keys, new_values)
 
         projected = self.indexer.index_qk_proj(x).reshape(
             batch,
@@ -2260,31 +2216,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         q_proj_output, new_keys, new_values = _target_verify_linears(
             (self.q_proj, self.k_proj, self.v_proj), x
         )
-        queries, gate = mx.split(
-            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
-            2,
-            axis=-1,
-        )
-        gate = gate.reshape(batch, length, -1)
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        new_keys = self.k_norm(
-            new_keys.reshape(batch, length, self.num_key_value_heads, self.head_dim)
-        ).transpose(0, 2, 1, 3)
-        new_values = new_values.reshape(
-            batch, length, self.num_key_value_heads, self.head_dim
-        ).transpose(0, 2, 1, 3)
-
         past_len = cache.offset
         text_position_ids, rotary_position_ids = _split_text_mrope_positions(
             position_ids, batch, length, past_len
         )
-        queries, new_keys = self.rotary_emb.apply_rotary(
-            queries,
-            new_keys,
-            rotary_position_ids,
-            unsqueeze_dim=1,
+        queries, keys, values, gate, _ = self._prepare_projected_qkv(
+            q_proj_output, new_keys, new_values, cache, rotary_position_ids, None, None
         )
-        keys, values = cache.update_and_fetch(new_keys, new_values)
 
         projected = _target_verify_linear(self.indexer.index_qk_proj, x).reshape(
             batch,
@@ -2834,9 +2772,8 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             return 0
         return rows
 
-    def _fused_projections_ready(self, x: mx.array, position_ids: Optional[mx.array]) -> bool:
-        """Whether ``_fused_prologue`` runs these rows: the grouped projection
-        launch takes the four projections and the kernels this layout."""
+    def _prep_ready(self, x: mx.array, pos_ndim: int) -> bool:
+        """Whether ``attn_fused.prep_qk`` computes these q/k norms and MRoPE."""
         rotary = self.rotary_emb
         return (
             rotary.position_selector is not None
@@ -2844,6 +2781,99 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and self.q_norm.group_size is None
             and self.k_norm.group_size is None
             and self.q_norm.eps == self.k_norm.eps
+            and attn_fused.prep_ready(
+                x.dtype,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                rotary.dim,
+                pos_ndim,
+            )
+        )
+
+    def _prepare_projected_qkv(
+        self,
+        q_proj_output,
+        keys,
+        values,
+        cache,
+        position_ids,
+        position_embeddings,
+        mask,
+    ):
+        """``Qwen3_5Attention._prepare_projected_qkv`` with the q/k norms and
+        MRoPE of a batch-one call in one ``attn_fused.prep_qk`` launch (same
+        bits); other calls take the base."""
+        batch, length, _ = q_proj_output.shape
+        offset = getattr(cache, "offset", None)
+        rope_positions = position_ids
+        if rope_positions is None and isinstance(offset, int):
+            # The base's positions for an integer cache offset.
+            rope_positions = mx.tile(
+                mx.expand_dims(mx.arange(offset, offset + length), axis=0), (3, 1, 1)
+            )
+        if not (
+            batch == 1
+            and position_embeddings is None
+            and isinstance(offset, int)
+            and rope_positions is not None
+            and self._prep_ready(q_proj_output, rope_positions.ndim)
+        ):
+            return super()._prepare_projected_qkv(
+                q_proj_output,
+                keys,
+                values,
+                cache,
+                position_ids,
+                position_embeddings,
+                mask,
+            )
+        _, gate = mx.split(
+            q_proj_output.reshape(batch, length, self.num_attention_heads, -1),
+            2,
+            axis=-1,
+        )
+        gate = gate.reshape(batch, length, -1)
+        values = values.reshape(batch, length, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
+        queries, keys = self._prep_qk(
+            q_proj_output.reshape(length, -1), keys.reshape(length, -1), rope_positions
+        )
+        if isinstance(mask, mx.array):
+            # The base trims an array mask to the keys this call sees.
+            if hasattr(cache, "_idx") and hasattr(cache, "left_padding"):
+                kv_seq_len = int(cache._idx) + length
+            else:
+                kv_seq_len = length + offset + 1
+            mask = mask[..., :kv_seq_len]
+        keys, values = cache.update_and_fetch(keys, values)
+        return queries, keys, values, gate, mask
+
+    def _prep_qk(self, q_out: mx.array, k_out: mx.array, rope_positions: mx.array):
+        """``attn_fused.prep_qk`` of projected rows [R, ...]: (queries, keys)."""
+        rotary = self.rotary_emb
+        return attn_fused.prep_qk(
+            q_out,
+            k_out,
+            self.q_norm._scale(),
+            self.k_norm._scale(),
+            self.q_norm.eps,
+            rope_positions,
+            rotary.inv_freq,
+            rotary.position_selector,
+            heads=self.num_attention_heads,
+            kv_heads=self.num_key_value_heads,
+            rotary_dim=rotary.dim,
+            rope_scale=rotary.attention_scaling,
+        )
+
+    def _fused_projections_ready(self, x: mx.array, position_ids: Optional[mx.array]) -> bool:
+        """Whether ``_fused_prologue`` runs these rows: the grouped projection
+        launch takes the four projections and the kernels this layout."""
+        rotary = self.rotary_emb
+        return (
+            self._prep_ready(x, 3 if position_ids is None else position_ids.ndim)
             and attn_fused.ready(
                 x.dtype,
                 self.num_attention_heads,
@@ -2886,21 +2916,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         else:
             index_positions = rope_positions = position_ids
         q_out = q_out.reshape(rows, -1)
-        rotary = self.rotary_emb
-        queries, keys = attn_fused.prep_qk(
-            q_out,
-            k_out.reshape(rows, -1),
-            self.q_norm._scale(),
-            self.k_norm._scale(),
-            self.q_norm.eps,
-            rope_positions,
-            rotary.inv_freq,
-            rotary.position_selector,
-            heads=self.num_attention_heads,
-            kv_heads=self.num_key_value_heads,
-            rotary_dim=rotary.dim,
-            rope_scale=rotary.attention_scaling,
-        )
+        queries, keys = self._prep_qk(q_out, k_out.reshape(rows, -1), rope_positions)
         return q_out, index_out, v_out, queries, keys, index_positions
 
     def _fused_output(self, output: mx.array, rows: int) -> mx.array:
