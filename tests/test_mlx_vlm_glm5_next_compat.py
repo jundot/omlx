@@ -3323,9 +3323,17 @@ def _run_with_tf32(snippet: str) -> str:
 @pytest.mark.usefixtures("glm5_fused_decode")
 @pytest.mark.parametrize("hidden", [4096, 1024])
 def test_one_token_hc_expand_declines_without_nax_tf32(hidden):
-    if dk.nax_relaxed_fp32_matmul():
-        pytest.skip("TF32 NAX matmuls are enabled in this session")
+    if dk.hc_comb_product() is not None:
+        pytest.skip("a kernel here replays this GPU's fp32 comb product")
     assert _check_one_token_hc_expand(hidden) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("hidden", [4096, 1024])
+def test_one_token_hc_expand_is_bitwise_reference_on_simdgroup_mma(hidden):
+    if dk.hc_comb_product() != "simd":
+        pytest.skip("this GPU runs fp32 GEMMs on NAX")
+    assert _check_one_token_hc_expand(hidden) == 8
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
@@ -3380,10 +3388,18 @@ def _check_hc_deferred_chain(hidden):
 
 @pytest.mark.usefixtures("glm5_fused_decode")
 def test_hc_deferred_chain_declines_without_nax_tf32():
-    if dk.nax_relaxed_fp32_matmul():
-        pytest.skip("TF32 NAX matmuls are enabled in this session")
+    if dk.hc_comb_product() is not None:
+        pytest.skip("a kernel here replays this GPU's fp32 comb product")
     hc, norm = _hyper_connection(1024)
     assert not dk.hc_defer_supported(hc, norm, mx.bfloat16, 1024)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("hidden", [4096, 1024, 2048])
+def test_hc_deferred_chain_is_bitwise_reference_on_simdgroup_mma(hidden):
+    if dk.hc_comb_product() != "simd":
+        pytest.skip("this GPU runs fp32 GEMMs on NAX")
+    assert _check_hc_deferred_chain(hidden) == 24
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
@@ -4075,7 +4091,7 @@ def test_small_model_mtp_runtime_loop_defers_hc_bitwise():
         "assert g5.Glm5NextLinearAttention._omlx_mtp_capture_patched\n"
         "from omlx.patches.mlx_vlm_glm5_next_compat import decode_kernels as dk\n"
         "used = t._check_small_model(43, 300) | t._check_small_model()\n"
-        "print(dk.nax_relaxed_fp32_matmul(), sorted(used))\n"
+        "print(dk.hc_comb_product() is not None, sorted(used))\n"
     )
     last = out.strip().splitlines()[-1]
     assert "'kda'" in last and "'hc_mix'" in last, last

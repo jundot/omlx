@@ -191,7 +191,7 @@ class _HCDeferred:
     The next half-layer's ``_decode_hc_pre_deferred`` recomputes h exactly
     while it loads it (and stores it, the next residual) instead of a
     separate expand dispatch; ``materialize`` runs the expand itself. ``mm``
-    is hc_expand_one's NAX comb product of ``residual`` ([HC * D] fp32).
+    is hc_expand_one's comb product of ``residual`` ([HC * D] fp32).
     """
 
     __slots__ = ("y", "residual", "post", "comb", "mm")

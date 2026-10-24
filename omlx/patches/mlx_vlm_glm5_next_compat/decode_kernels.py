@@ -7,10 +7,11 @@ encode time. The kernels here fuse chains of them while reproducing the
 stock MLX arithmetic bit for bit:
 
 * hyper-connections: ``hc_mix`` (fp32 RMS + mix GEMV), ``hc_expand_one``
-  (the one-token NAX relaxed-precision comb product + epilogue), and for one
-  token ``hc_pre_fused`` (mix + collapse + RMSNorm in one dispatch, with the
-  previous expand's epilogue folded in) plus ``hc_post_mm`` (post, sinkhorn
-  comb and the comb product, off the dependent chain);
+  (the one-token comb product, NAX matmul2d or simdgroup MMA, + epilogue),
+  and for one token ``hc_pre_fused`` (mix + collapse + RMSNorm in one
+  dispatch, with the previous expand's epilogue folded in) plus
+  ``hc_post_mm`` (post, sinkhorn comb and the comb product, off the
+  dependent chain);
 * MoE: ``moe_router`` (logits GEMV + sigmoid/bias, top-k select with the
   stable-sort tie order), ``moe_gate_up_swiglu`` and ``moe_down_combine``
   (routed + shared experts, clamped SwiGLU, routing-weighted sum);
@@ -2192,11 +2193,12 @@ def moe_router(
 # The one-token reference (``hyper_connection._hc_expand_op``) computes
 #   bf16(post * float(x) + comb^T @ float(residual))
 # where the [HC, HC] x [HC, D] fp32 product runs on MLX's NAX steel GEMM,
-# i.e. an MPP matmul2d with relaxed precision. This kernel issues the same
-# 16x32x16 relaxed matmul2d on the same zero-padded fragments (bit-identical
-# to mx.matmul for this shape) and applies the compiled epilogue with its
-# separate multiply/add roundings: one dispatch instead of cast + GEMM +
-# elementwise.
+# i.e. an MPP matmul2d with relaxed precision, and on GPUs without NAX on
+# the steel GEMM's 8x8 simdgroup MMAs. These kernels issue the same matmul2d
+# (16x32x16, relaxed) or simdgroup MMA on the same zero-padded fragments
+# (bit-identical to mx.matmul for this shape) and apply the compiled epilogue
+# with its separate multiply/add roundings: one dispatch instead of cast +
+# GEMM + elementwise.
 _NAX_HEADER = r"""
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -2250,6 +2252,67 @@ _HC_EXPAND1_SOURCE = r"""
   }
 """
 
+# The comb product of one 32-column tile on 8x8 simdgroup MMAs, as the steel
+# GEMM computes it without NAX: A = comb^T and B = residual rows zero padded
+# to 8x8 fragments, one multiply-accumulate into zero per 8 columns. A lane
+# holds steel's BaseMMAFrag elements: row ``fm``, columns ``fn`` and ``fn +
+# 1`` of each fragment, i.e. ``mm[t][j]`` is output row fm, column
+# tile * 32 + t * 8 + fn + j (a real element when fm < HC).
+_SIMD_COMB_HEADER = r"""
+#include <metal_simdgroup>
+#include <metal_stdlib>
+using namespace metal;
+
+template <int HC, int D, typename CombPtr, typename T>
+inline void glm_hc_comb_simd_mma(
+    CombPtr comb, const device T* residual, int tile, ushort lane,
+    thread short& fm, thread short& fn, thread float (&mm)[4][2]) {
+  const short qid = lane / 4;
+  fm = (qid & 4) + ((lane / 2) % 4);
+  fn = (qid & 2) * 2 + (lane % 2) * 2;
+  simdgroup_matrix<float, 8, 8> a;
+  for (short j = 0; j < 2; j++) {
+    const short c = fn + j;
+    a.thread_elements()[j] = (fm < HC && c < HC) ? float(comb[c * HC + fm]) : 0.0f;
+  }
+  for (short t = 0; t < 4; t++) {
+    const int col0 = tile * 32 + t * 8;
+    simdgroup_matrix<float, 8, 8> b;
+    simdgroup_matrix<float, 8, 8> c = simdgroup_matrix<float, 8, 8>(0.0f);
+    for (short j = 0; j < 2; j++) {
+      b.thread_elements()[j] =
+          fm < HC ? static_cast<float>(residual[fm * D + col0 + fn + j]) : 0.0f;
+    }
+    simdgroup_multiply_accumulate(c, a, b, c);
+    for (short j = 0; j < 2; j++) {
+      mm[t][j] = c.thread_elements()[j];
+    }
+  }
+}
+"""
+
+_HC_EXPAND1_SIMD_SOURCE = r"""
+  const ushort lane = thread_index_in_simdgroup;
+  const int tile = int(threadgroup_position_in_grid.x) * SIMDS + int(simdgroup_index_in_threadgroup);
+  if (tile * 32 >= D) {
+    return;
+  }
+  short fm, fn;
+  float mm[4][2];
+  glm_hc_comb_simd_mma<HC, D>(comb, residual, tile, lane, fm, fn, mm);
+  if (fm < HC) {
+    for (short t = 0; t < 4; t++) {
+      for (short j = 0; j < 2; j++) {
+        const int col = tile * 32 + t * 8 + fn + j;
+        // Separate roundings, as in the compiled reference epilogue.
+        volatile float prod = post[fm] * static_cast<float>(x[col]);
+        float sum = prod + mm[t][j];
+        out[fm * D + col] = static_cast<T>(sum);
+      }
+    }
+  }
+"""
+
 
 def _atoi(text: str) -> int:
     """C ``atoi`` (how MLX parses its integer environment switches)."""
@@ -2280,30 +2343,28 @@ def nax_relaxed_fp32_matmul() -> bool:
     return is_nax_available()
 
 
-def _steel_nax_partition(M: int, N: int, K: int) -> int:
-    """K partition width MLX's steel_matmul uses for a NAX GEMM (K itself
-    when it does not split K): steel_matmul_axpby case 2 and
-    steel_gemm_splitk_axpby_nax."""
-    mn = max(M, N)
-    if not (K >= 3 * mn or (mn <= 1024 and K > 2 * mn)):
-        return K
-    if K <= 1024:
-        return K // 2
-    if K <= 2048:
-        return 1024
-    if K <= 4096:
-        return 2048
-    return 4096
+@lru_cache(maxsize=None)
+def hc_comb_product() -> Optional[str]:
+    """How MLX runs the one-token fp32 comb product of the HC expand
+    ([HC, HC] x [HC, D]): ``"nax"`` (relaxed matmul2d), ``"simd"`` (8x8
+    simdgroup MMAs, GPUs without NAX) or None when no kernel here replays it
+    (NAX without TF32)."""
+    if nax_relaxed_fp32_matmul():
+        return "nax"
+    if not is_nax_available():
+        return "simd"
+    return None
 
 
 @lru_cache(maxsize=None)
-def _hc_expand1_kernel():
+def _hc_expand1_kernel(product: str):
+    simd = product == "simd"
     return mx.fast.metal_kernel(
-        name="glm5_hc_expand_one_token",
+        name="glm5_hc_expand_one_token" + ("_simd" if simd else ""),
         input_names=["x", "residual", "post", "comb"],
         output_names=["out"],
-        header=_NAX_HEADER,
-        source=_HC_EXPAND1_SOURCE,
+        header=_SIMD_COMB_HEADER if simd else _NAX_HEADER,
+        source=_HC_EXPAND1_SIMD_SOURCE if simd else _HC_EXPAND1_SOURCE,
     )
 
 
@@ -2328,12 +2389,13 @@ def hc_expand_one(
         return None
     if post.dtype != mx.float32 or comb.dtype != mx.float32:
         return None
-    if not nax_relaxed_fp32_matmul():
+    product = hc_comb_product()
+    if product is None:
         return None
     simds = 8
     tiles = D // 32
     STATS["hc_expand"] += 1
-    return _hc_expand1_kernel()(
+    return _hc_expand1_kernel(product)(
         inputs=[x, residual, post, comb],
         template=[("T", x.dtype), ("HC", hc), ("D", D), ("SIMDS", simds)],
         grid=(32 * simds * ((tiles + simds - 1) // simds), 1, 1),
@@ -2354,7 +2416,7 @@ def hc_expand_one(
 # threadgroup (hc_mix's multi-row layout) and threadgroup 0, which owns the
 # pre rows, finishes exact_hc_norm's collapse and RMSNorm itself. The post
 # and comb rows only feed the next expand: ``hc_post_mm`` (sinkhorn plus the
-# NAX comb product of hc_expand_one) runs beside the branch, and the next
+# comb product of hc_expand_one) runs beside the branch, and the next
 # ``hc_pre_fused`` applies hc_expand_one's epilogue to the branch output as it
 # loads h (threadgroup 0 also stores h, the next residual). Every value is
 # computed with the reference kernels' arithmetic and order.
@@ -2550,8 +2612,8 @@ _HC_PRE_SOURCE = r"""
 """
 
 # exact_hc_norm's post/sinkhorn code, defined before the MPP include (so it
-# compiles exactly as in that kernel), then hc_expand_one's NAX comb product.
-_HC_POST_HEADER = r"""
+# compiles exactly as in that kernel), then hc_expand_one's comb product.
+_HC_POST_COMB_HEADER = r"""
 #include <metal_simdgroup>
 #include <metal_stdlib>
 using namespace metal;
@@ -2599,11 +2661,14 @@ inline void glm_hc_post_comb(
   }
 }
 
+"""
+
+_HC_POST_HEADER = _HC_POST_COMB_HEADER + r"""
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
 """
 
-_HC_POST_SOURCE = r"""
+_HC_POST_PROLOGUE = r"""
   const ushort lane = thread_index_in_simdgroup;
   const uint sg = simdgroup_index_in_threadgroup;
   static_assert(HC == 4, "one float4 comb row per lane");
@@ -2626,6 +2691,9 @@ _HC_POST_SOURCE = r"""
     return;
   }
   const threadgroup float* comb = (const threadgroup float*)comb_rows;
+"""
+
+_HC_POST_SOURCE = _HC_POST_PROLOGUE + r"""
   const short qid = lane >> 2;
   const short fm = ((qid & 4) | ((lane >> 1) & 3));
   const short fn = ((qid & 2) | (lane & 1)) * 4;
@@ -2661,6 +2729,19 @@ _HC_POST_SOURCE = r"""
   }
 """
 
+_HC_POST_SIMD_SOURCE = _HC_POST_PROLOGUE + r"""
+  short fm, fn;
+  float vals[4][2];
+  glm_hc_comb_simd_mma<HC, D>(comb, residual, tile, lane, fm, fn, vals);
+  if (fm < HC) {
+    for (short t = 0; t < 4; t++) {
+      for (short j = 0; j < 2; j++) {
+        mm[fm * D + tile * 32 + t * 8 + fn + j] = vals[t][j];
+      }
+    }
+  }
+"""
+
 
 @lru_cache(maxsize=None)
 def _hc_pre_fused_kernel(deferred: bool):
@@ -2677,13 +2758,14 @@ def _hc_pre_fused_kernel(deferred: bool):
 
 
 @lru_cache(maxsize=None)
-def _hc_post_mm_kernel():
+def _hc_post_mm_kernel(product: str):
+    simd = product == "simd"
     return mx.fast.metal_kernel(
-        name="glm5_hc_post_comb_mm",
+        name="glm5_hc_post_comb_mm" + ("_simd" if simd else ""),
         input_names=["mixes", "scale", "base", "residual"],
         output_names=["post_out", "comb_out", "mm"],
-        header=_HC_POST_HEADER,
-        source=_HC_POST_SOURCE,
+        header=(_HC_POST_COMB_HEADER + _SIMD_COMB_HEADER) if simd else _HC_POST_HEADER,
+        source=_HC_POST_SIMD_SOURCE if simd else _HC_POST_SOURCE,
     )
 
 
@@ -2703,7 +2785,7 @@ def hc_defer_supported(connection, norm, dtype, width: int) -> bool:
         return False
     if connection.scale.dtype != mx.float32 or connection.base.dtype != mx.float32:
         return False
-    return nax_relaxed_fp32_matmul()
+    return hc_comb_product() is not None
 
 
 def hc_pre_fused(connection, norm, x=None, deferred=None):
@@ -2751,14 +2833,14 @@ def hc_pre_fused(connection, norm, x=None, deferred=None):
 
 def hc_post_mm(connection, mixes: mx.array, residual: mx.array):
     """The post weights, sinkhorn comb [1, 1, HC, HC] (fp32, as exact_hc_norm)
-    and hc_expand_one's NAX comb product ``mm`` [HC * D] fp32 of ``residual``
+    and hc_expand_one's comb product ``mm`` [HC * D] fp32 of ``residual``
     [1, 1, HC, D] for one token."""
     D = residual.shape[-1]
     simds = 8
     tiles = D // 32
     STATS["hc_post_mm"] += 1
     return tuple(
-        _hc_post_mm_kernel()(
+        _hc_post_mm_kernel(hc_comb_product())(
             inputs=[mixes, connection.scale, connection.base, residual],
             template=[
                 ("T", residual.dtype), ("HC", 4), ("D", D),
