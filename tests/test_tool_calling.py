@@ -4027,6 +4027,27 @@ class TestSchemaAwareFallbackCoercion:
         assert _coerce_param_value("true", "flag", props, "t") is True
         assert _coerce_param_value("null", "count", props, "t") is None
 
+    def test_string_type_keeps_literal_null(self):
+        # A string parameter whose value is the text "null" (file content, a
+        # search term, a JSON snippet) must reach the tool unchanged. Mapping it
+        # to None drops the argument and the tool call fails validation.
+        props = {"content": {"type": "string"}}
+        assert _coerce_param_value("null", "content", props, "write") == "null"
+        assert _coerce_param_value("NULL", "content", props, "write") == "NULL"
+
+    def test_nullable_string_maps_null_to_none(self):
+        props = {"content": {"type": "string", "nullable": True}}
+        assert _coerce_param_value("null", "content", props, "write") is None
+        assert _coerce_param_value("text", "content", props, "write") == "text"
+
+    def test_non_string_types_still_map_null_to_none(self):
+        for schema in ({"type": "integer"}, {"type": "object"}, {"type": "boolean"}):
+            assert _coerce_param_value("null", "x", {"x": schema}, "f") is None
+        # Untyped and union parameters keep the best-effort JSON decode.
+        assert _coerce_param_value("null", "x", {"x": {}}, "f") is None
+        union = {"x": {"type": ["string", "null"]}}
+        assert _coerce_param_value("null", "x", union, "f") is None
+
     def test_string_type_decodes_json_quoted_literal(self):
         """A JSON-quoted value for a string param decodes to the bare string."""
         props = {"city": {"type": "string"}}
