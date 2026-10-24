@@ -3204,3 +3204,104 @@ def test_nonstream_thinking_length_channels(
         )
     assert content == ""
     assert reasoning == "unfinished"
+
+
+class TestCacheStoreHeader:
+    """X-oMLX-Cache-Store: off forwards skip_cache_store to the engine."""
+
+    @staticmethod
+    def _record(mock_llm_engine):
+        recorded: list[dict[str, Any]] = []
+
+        async def chat(messages, **kwargs):
+            recorded.append(kwargs)
+            return MockGenerationOutput(text="Chat response.")
+
+        async def stream_chat(messages, **kwargs):
+            recorded.append(kwargs)
+            yield MockGenerationOutput(
+                text="Hi", new_text="Hi", finished=True, finish_reason="stop"
+            )
+
+        async def generate(prompt, **kwargs):
+            recorded.append(kwargs)
+            return MockGenerationOutput(text="Generated response.")
+
+        async def stream_generate(prompt, **kwargs):
+            recorded.append(kwargs)
+            yield MockGenerationOutput(
+                text="Hi", new_text="Hi", finished=True, finish_reason="stop"
+            )
+
+        mock_llm_engine.chat = chat
+        mock_llm_engine.stream_chat = stream_chat
+        mock_llm_engine.generate = generate
+        mock_llm_engine.stream_generate = stream_generate
+        return recorded
+
+    @pytest.mark.parametrize("value", ["off", "OFF", " off "])
+    def test_off_skips_cache_store(self, value):
+        from starlette.datastructures import Headers
+
+        from omlx.server import _cache_store_kwargs
+
+        request = SimpleNamespace(headers=Headers({"x-omlx-cache-store": value}))
+        assert _cache_store_kwargs(request) == {"skip_cache_store": True}
+
+    @pytest.mark.parametrize(
+        "headers", [{}, {"x-omlx-cache-store": "on"}, {"x-omlx-cache-store": "false"}]
+    )
+    def test_other_values_keep_default(self, headers):
+        from starlette.datastructures import Headers
+
+        from omlx.server import _cache_store_kwargs
+
+        request = SimpleNamespace(headers=Headers(headers))
+        assert _cache_store_kwargs(request) == {}
+        assert _cache_store_kwargs(None) == {}
+
+    @pytest.mark.parametrize(
+        "path,body",
+        [
+            (
+                "/v1/chat/completions",
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            ),
+            (
+                "/v1/chat/completions",
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "stream": True,
+                },
+            ),
+            (
+                "/v1/messages",
+                {
+                    "model": "test-model",
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            ),
+            ("/v1/responses", {"model": "test-model", "input": "Hi"}),
+            ("/v1/completions", {"model": "test-model", "prompt": "Hi"}),
+            (
+                "/v1/completions",
+                {"model": "test-model", "prompt": "Hi", "stream": True},
+            ),
+        ],
+    )
+    def test_header_reaches_engine(self, client, mock_llm_engine, path, body):
+        recorded = self._record(mock_llm_engine)
+
+        response = client.post(path, json=body, headers={"X-oMLX-Cache-Store": "off"})
+        assert response.status_code == 200
+        assert recorded and recorded[-1].get("skip_cache_store") is True
+
+        recorded.clear()
+        response = client.post(path, json=body)
+        assert response.status_code == 200
+        assert recorded and "skip_cache_store" not in recorded[-1]

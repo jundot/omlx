@@ -2031,6 +2031,17 @@ def _no_repeat_ngram_kwargs(request) -> dict[str, int]:
     return {"no_repeat_ngram_size": size, "ngram_window": window}
 
 
+# `off` keeps a one-shot request out of the prefix cache; lookups still run.
+_CACHE_STORE_HEADER = "X-oMLX-Cache-Store"
+
+
+def _cache_store_kwargs(http_request: FastAPIRequest | None) -> dict[str, bool]:
+    if http_request is None:
+        return {}
+    value = http_request.headers.get(_CACHE_STORE_HEADER, "").strip().lower()
+    return {"skip_cache_store": True} if value == "off" else {}
+
+
 def get_model_settings_for_request(model_id: str | None):
     """Return settings for the requested API model name via ModelSettingsManager."""
     sm = _server_state.settings_manager
@@ -4511,6 +4522,7 @@ async def create_completion(
                                 resolved_model=resolved_model,
                                 response_id=response_id,
                                 inference_request_id=inference_request_id,
+                                skip_cache_store=bool(_cache_store_kwargs(http_request)),
                             ),
                             http_request=http_request,
                             keepalive_chunk=keepalive,
@@ -4578,6 +4590,7 @@ async def create_completion(
             if repetition_context_size is not None:
                 gen_kwargs["repetition_context_size"] = repetition_context_size
             gen_kwargs.update(_no_repeat_ngram_kwargs(request))
+            gen_kwargs.update(_cache_store_kwargs(http_request))
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -5067,6 +5080,7 @@ async def create_chat_completion(
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
         chat_kwargs.update(_no_repeat_ngram_kwargs(request))
+        chat_kwargs.update(_cache_store_kwargs(http_request))
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -5880,6 +5894,7 @@ async def stream_completion(
     resolved_model: str | None = None,
     response_id: str | None = None,
     inference_request_id: str | None = None,
+    skip_cache_store: bool = False,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -5935,6 +5950,8 @@ async def stream_completion(
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
     gen_kwargs.update(_no_repeat_ngram_kwargs(request))
+    if skip_cache_store:
+        gen_kwargs["skip_cache_store"] = True
     outputs = engine.stream_generate(
         prompt=prompt,
         max_tokens=max_tokens,
@@ -7741,6 +7758,7 @@ async def create_anthropic_message(
         chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
             ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
         )
+        chat_kwargs.update(_cache_store_kwargs(http_request))
 
         await _ensure_tokenizer_for_system_probe(engine, messages)
         messages = prepare_system_messages_for_template(
@@ -8544,6 +8562,7 @@ async def create_response(
             ),
             chat_template_kwargs=merged_ct_kwargs,
         )
+        chat_kwargs.update(_cache_store_kwargs(http_request))
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
