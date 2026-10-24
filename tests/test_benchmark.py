@@ -2244,7 +2244,7 @@ class TestRunExternalBenchmark:
             await task
 
         assert run.status == "cancelled"
-        assert run.events[-1]["type"] == "error"
+        assert run.events[-1]["type"] == "cancelled"
         assert "cancelled" in run.events[-1]["message"].lower()
         client.aclose.assert_awaited()
 
