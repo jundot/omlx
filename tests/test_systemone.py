@@ -16,7 +16,7 @@ import mlx.nn as nn  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 
 from omlx.exceptions import InvalidRequestError  # noqa: E402
-from omlx.models import clef, d3, decision, openjev  # noqa: E402
+from omlx.models import baselabs, clef, d3, decision, openjev  # noqa: E402
 from omlx.models.decision import (  # noqa: E402
     DecisionBackbone,
     DecisionContextLengthError,
@@ -964,3 +964,310 @@ def test_base_layout_weights_sanitize_once():
     twice = model.sanitize(dict(once))
     assert set(twice) == set(once)
     assert twice["language_model.model.norm.weight"].tolist() == [1.0] * 64
+
+
+# Mammoth-1 / Elephant-1: the state and each question are independent blocks.
+
+
+def test_baselabs_release_prompt_and_answers():
+    question = baselabs.normalize_question(
+        "private-correlation-id",
+        {
+            "type": "choice",
+            "instructions": " Which team? ",
+            "criteria": {"billing": " Payments ", "other": None},
+        },
+    )
+    assert question.suffix == (
+        "Question: Which team?\n\nOptions:\nA. billing: Payments\nB. other\n\n"
+        "Answer with one letter: A, B."
+    )
+    assert question.question_id not in question.suffix
+    assert baselabs.format_answer(question, [0.75, 0.25]) == {
+        "type": "choice",
+        "choice": "billing",
+        "confidence": 0.5,
+        "probabilities": {"billing": 0.75, "other": 0.25},
+    }
+    noul = baselabs.normalize_question("n", {"type": "noul"})
+    assert "A. yes: the statement is true / the answer is yes" in noul.suffix
+    assert baselabs.format_answer(noul, [0.2, 0.8]) == {"type": "noul", "noul": 0.2}
+    score = baselabs.normalize_question(
+        "s", {"type": "score", "criteria": ["low", {"high": 2}]}
+    )
+    assert "Rate the state: Which level describes the state?" in score.suffix
+    assert baselabs.format_answer(score, [0.3, 0.7])["score"] == 0.7
+    assert baselabs.format_answer(score, [0.3, 0.7])["legend"] == {
+        "0": "low",
+        "1": {"high": 2},
+    }
+    wide = baselabs.normalize_question(
+        "wide", {"type": "choice", "criteria": {f"x{i}": None for i in range(255)}}
+    )
+    assert "AA. x26" in wide.suffix and "BQ." not in wide.suffix
+    assert "Answer with one label: A, B," in wide.suffix
+    assert len(baselabs.SLOT_LABELS) == len(set(baselabs.SLOT_LABELS)) == 256
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        {"type": "choice", "criteria": {}},
+        {"type": "choice", "criteria": {str(i): None for i in range(256)}},
+        {"type": "score", "criteria": []},
+        {"type": "score", "criteria": [None] * 11},
+        {"type": "noul", "criteria": []},
+        {"type": "noul", "instructions": 1},
+        {"type": "choice", "criteria": {"x": {"not_finite": float("nan")}}},
+    ],
+)
+def test_baselabs_rejects_invalid_questions(question):
+    with pytest.raises(DecisionRequestError):
+        baselabs.normalize_question("q", question)
+
+
+@pytest.fixture(params=["text", "vision"])
+def block_backbone(request, tiny_backbone):
+    if request.param == "vision":
+        return copy.copy(tiny_backbone)
+    from mlx_lm.models.qwen3_5 import Model, ModelArgs
+
+    model = Model(
+        ModelArgs.from_dict({"model_type": "qwen3_5", "text_config": _TEXT_CONFIG})
+    )
+    mx.eval(model.parameters())
+    backbone = DecisionBackbone("tiny-text")
+    backbone.model = model
+    backbone.config = {"text_config": _TEXT_CONFIG}
+    backbone._text_model = model.language_model.model
+    backbone._lm_head = model.language_model.lm_head
+    return backbone
+
+
+def _full_block_readout(backbone, ids, boundary, pixels=None, grid=None):
+    """Independent full-record forward with the release's two-block mask."""
+    hidden, positions = backbone.embed(ids, pixels, grid)
+    block = np.asarray([0] * boundary + [1] * (len(ids) - boundary))
+    mask = mx.array(block[:, None] >= block[None, :])[None, None]
+    positional = {}
+    if backbone.has_vision:
+        rotary = next(
+            layer.self_attn.rotary_emb
+            for layer in backbone._text_model.layers
+            if not layer.is_linear
+        )
+        positional = {
+            "position_ids": positions,
+            "position_embeddings": (
+                None if rotary.fused_apply else rotary(hidden, positions)
+            ),
+        }
+    for layer in backbone._text_model.layers:
+        hidden = layer(
+            hidden, mask=None if layer.is_linear else mask, cache=None, **positional
+        )
+    return backbone._text_model.norm(hidden[0, -1])
+
+
+@pytest.mark.parametrize("chunk", [1, 4096])
+def test_block_prefill_matches_full_masked_forward(block_backbone, chunk):
+    backbone = block_backbone
+    model = baselabs.BaseLabsModel("tiny")
+    model.backbone = backbone
+    ids = np.arange(5, 35, dtype=np.int32)
+    pixels = grid = None
+    if backbone.has_vision:
+        ids, pixels, grid = _image_prompt(20)
+    split = 14
+    expected = _full_block_readout(backbone, ids, split, pixels, grid)
+    prefix_embeds, positions = backbone.embed(ids[:split], pixels, grid)
+    prefix_cache = backbone.make_cache()
+    steps = model._prefill_block(prefix_embeds, positions, prefix_cache, lambda: chunk)
+    assert sum(steps) == split
+    last_position = None if positions is None else positions[:, :, -1]
+    for _ in range(2):
+        embeds, tail_positions = backbone.embed_continuation(ids[split:], last_position)
+        actual = _drain(
+            model._prefill_block(
+                embeds, tail_positions, copy.deepcopy(prefix_cache), lambda: chunk
+            )
+        )
+        assert np.allclose(np.array(actual), np.array(expected), atol=2e-4)
+
+
+class _BaseLabsTokenizer(_CharTokenizer):
+    def apply_chat_template(self, messages, **kwargs):
+        return f"<s>{messages[0]['content']}</s><u>{messages[1]['content']}</u><a>"
+
+    def __call__(self, text, **kwargs):
+        return {
+            "input_ids": self.encode(text),
+            "offset_mapping": [(i, i + 1) for i in range(len(text))],
+        }
+
+
+def test_baselabs_questions_are_isolated_and_share_only_the_state(block_backbone):
+    backbone = block_backbone
+    backbone.tokenizer = _BaseLabsTokenizer()
+    model = baselabs.BaseLabsModel("tiny")
+    model.backbone = backbone
+    model._slot_weights = backbone.output_rows(mx.arange(20, 276)).astype(mx.float32)
+    request = {
+        "state": {"message": "charged twice"},
+        "questions": {
+            "route": {
+                "type": "choice",
+                "criteria": {"billing": "Payments", "tech": "Bugs"},
+            },
+            "refund": {"type": "noul", "instructions": "Refund requested?"},
+            "urgency": {"type": "score", "criteria": ["later", "today", "now"]},
+        },
+    }
+    plan = model.encode(request)
+    shared = _drain(model.run(plan, lambda: 128))
+    for item, suffix in zip(plan.items, plan.suffix_ids):
+        independent = _drain(
+            model.run(
+                model.encode(
+                    {
+                        **request,
+                        "questions": {
+                            item.question_id: request["questions"][item.question_id]
+                        },
+                    }
+                ),
+                lambda: 4096,
+            )
+        )
+        assert (
+            shared["answers"][item.question_id]
+            == independent["answers"][item.question_id]
+        )
+        ids = np.concatenate([plan.prefix_ids, suffix])
+        hidden = _full_block_readout(backbone, ids, len(plan.prefix_ids))
+        z = (model._slot_weights[: len(item.labels)] @ hidden).tolist()
+        probabilities = np.exp(np.asarray(z) - max(z))
+        probabilities /= probabilities.sum()
+        assert shared["answers"][item.question_id] == baselabs.format_answer(
+            item, probabilities.tolist()
+        )
+    reversed_plan = model.encode(
+        {**request, "questions": dict(reversed(list(request["questions"].items())))}
+    )
+    assert _drain(model.run(reversed_plan, lambda: 128))["answers"] == shared["answers"]
+    assert shared["input_tokens"] == len(plan.prefix_ids) + sum(
+        map(len, plan.suffix_ids)
+    )
+    json.dumps(shared)
+
+
+def test_baselabs_refuses_truncation_and_missing_vision(monkeypatch):
+    model = baselabs.BaseLabsModel("tiny")
+    model.backbone.tokenizer = _BaseLabsTokenizer()
+    request = {"state": "long evidence " * 20, "questions": {"q": {"type": "noul"}}}
+    monkeypatch.setattr(baselabs, "MAX_BRANCH_TOKENS", 100)
+    for truncate in (True, False):
+        with pytest.raises(DecisionContextLengthError):
+            model.encode(request, truncate)
+    with pytest.raises(DecisionRequestError, match="no vision tower"):
+        model.encode({**request, "images": ["data:image/png;base64,AA"]})
+    with pytest.raises(DecisionRequestError, match="videos"):
+        model.encode({**request, "videos": ["data:video/mp4;base64,AA"]})
+
+
+def test_baselabs_state_cannot_collide_with_a_prefix_sentinel():
+    model = baselabs.BaseLabsModel("tiny")
+    tokenizer = _BaseLabsTokenizer()
+    model.backbone.tokenizer = tokenizer
+    state = "before QEV_PREFIX_MARK decisive evidence after the marker"
+    plan = model.encode({"state": state, "questions": {"q": {"type": "noul"}}})
+    expected = tokenizer.encode(
+        f"<s>{baselabs.SYSTEM_PROMPT}</s><u><state>\n{state}\n</state>\n\n"
+    )
+    assert np.array_equal(plan.prefix_ids, expected)
+
+
+def test_baselabs_image_plan_matches_full_multimodal_block(tiny_backbone, monkeypatch):
+    class ImageTokenizer(_BaseLabsTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            content = messages[1]["content"]
+            if isinstance(content, list):
+                content = "".join(
+                    (
+                        chr(_VISION_START) + chr(_IMAGE) + chr(_VISION_END)
+                        if part["type"] == "image"
+                        else part["text"]
+                    )
+                    for part in content
+                )
+            return super().apply_chat_template(
+                [messages[0], {"content": content}], **kwargs
+            )
+
+        def encode(self, text, **kwargs):
+            return [
+                (
+                    ord(c)
+                    if ord(c) in (_VISION_START, _VISION_END, _IMAGE)
+                    else ord(c) % 250 + 1
+                )
+                for c in text
+            ]
+
+    backbone = tiny_backbone
+    monkeypatch.setattr(backbone, "tokenizer", ImageTokenizer())
+    monkeypatch.setattr(
+        backbone, "config", {**backbone.config, "image_token_id": _IMAGE}
+    )
+    pixels = np.random.default_rng(9).normal(size=(16, 96)).astype(np.float32)
+    grid = np.array([[1, 4, 4]])
+    monkeypatch.setattr(backbone, "preprocess_images", lambda images: (pixels, grid))
+    monkeypatch.setattr(baselabs, "decode_images", lambda urls: [object()] * len(urls))
+    model = baselabs.BaseLabsModel("tiny")
+    model.backbone = backbone
+    model._slot_weights = backbone.output_rows(mx.arange(20, 276)).astype(mx.float32)
+    request = {
+        "state": "Inspect <image:1>.",
+        "images": ["unused"],
+        "questions": {"q": {"type": "noul"}},
+    }
+    plan = model.encode(request)
+    assert list(plan.prefix_ids).count(_IMAGE) == 4
+    actual = _drain(model.run(plan, lambda: 32))["answers"]["q"]["noul"]
+    all_ids = np.concatenate([plan.prefix_ids, plan.suffix_ids[0]])
+    hidden = _full_block_readout(backbone, all_ids, len(plan.prefix_ids), pixels, grid)
+    logits = (model._slot_weights[:2] @ hidden).tolist()
+    expected = np.exp(np.asarray(logits) - max(logits))
+    expected /= expected.sum()
+    assert actual == pytest.approx(expected[0], abs=2e-4)
+    with pytest.raises(DecisionRequestError, match="once, in order"):
+        model.encode({**request, "state": "Inspect <image:2>."})
+    with pytest.raises(DecisionRequestError, match="not questions"):
+        model.encode(
+            {
+                **request,
+                "questions": {
+                    "q": {"type": "noul", "instructions": "Inspect <image:1>"}
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize("readout", ["head", "unknown"])
+def test_baselabs_rejects_unsupported_readout_before_loading_weights(tmp_path, readout):
+    config = {
+        "modeling_overrides": {
+            "attention": {
+                "full_attention": "block_bidirectional",
+                "linear_attention": "causal",
+            },
+            "readout": "slot_lm",
+            "n_slots": 256,
+        }
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "readout.json").write_text(
+        json.dumps({"readout": readout, "n_slots": 256})
+    )
+    with pytest.raises(ValueError, match="slot_lm"):
+        baselabs.BaseLabsModel(str(tmp_path)).load()
