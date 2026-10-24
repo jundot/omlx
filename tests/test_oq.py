@@ -8571,3 +8571,35 @@ class TestStreamedCalibration:
         for key, entry in resident.items():
             np.testing.assert_array_equal(streamed[key].counts, entry.counts)
             np.testing.assert_array_equal(streamed[key].in_sum2, entry.in_sum2)
+
+
+class TestGemma4AudioConfigSanitize:
+    """Gemma 4 E2B/E4B sanitize reads audio_config.subsampling_conv_channels.
+
+    oQ converted vision_config/text_config to dataclasses but left
+    audio_config as a dict, so sanitize raised AttributeError and oQ fell back
+    to raw checkpoint names (no imatrix entry matched; see #4114).
+    """
+
+    CONFIG = {
+        "model_type": "gemma4",
+        "architectures": ["Gemma4ForConditionalGeneration"],
+        "text_config": {"model_type": "gemma4_text"},
+        "vision_config": {"model_type": "gemma4_vision"},
+        "audio_config": {
+            "model_type": "gemma4_audio",
+            "subsampling_conv_channels": [128, 32],
+        },
+    }
+
+    def test_audio_sanitize_renames_and_transposes(self):
+        pytest.importorskip("mlx_vlm.models.gemma4")
+        import mlx.core as mx
+
+        from omlx.oq import _build_model_sanitizer
+
+        sanitize = _build_model_sanitizer(self.CONFIG, text_only=False)
+        key = "audio_tower.subsample_conv_projection.layer1.conv.weight"
+        out = sanitize({"model." + key: mx.zeros((32, 128, 3, 3))})
+        assert list(out) == [key]
+        assert out[key].shape == (32, 3, 3, 128)

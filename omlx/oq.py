@@ -4641,6 +4641,14 @@ def _build_model_sanitizer(
 
             model_config.vision_config = vision_config
             model_config.text_config = text_config
+            # Gemma 4 E2B/E4B carry an audio tower; their sanitize reads
+            # audio_config.subsampling_conv_channels, so leaving the dict in
+            # place made sanitize raise and the build fall back to raw names.
+            audio_config = getattr(model_config, "audio_config", None)
+            if isinstance(audio_config, dict) and hasattr(model_module, "AudioConfig"):
+                model_config.audio_config = model_module.AudioConfig.from_dict(
+                    audio_config
+                )
 
             # Some VLM Model.sanitize implementations (e.g. Gemma 4) drop
             # `audio_tower.*` / `embed_audio.*` weights when `self.audio_tower`
