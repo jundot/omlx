@@ -111,7 +111,14 @@ def _patch_prompt_utils(prompt_utils: Any) -> None:
             content = prompt_utils.extract_text_from_content(prompt)
             # Unlimited-OCR uses a single literal <image> token for one or many
             # pages, matching upstream infer_multi (MessageFormat.SINGLE_IMAGE_TOKEN).
-            if role == "user" and not skip_image_token and num_images > 0:
+            # The model card's prompt already starts with <image>; adding a second
+            # one fails the processor's token count check.
+            if (
+                role == "user"
+                and not skip_image_token
+                and num_images > 0
+                and "<image>" not in content
+            ):
                 content = f"<image>{content}"
             return {"role": role, "content": content}
         return original(

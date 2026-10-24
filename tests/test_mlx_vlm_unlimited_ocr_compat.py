@@ -74,6 +74,10 @@ def test_unlimited_ocr_prompt_uses_single_image_token():
     listed = get_message_json("unlimited-ocr", parts, num_images=1)
     assert listed == {"role": "user", "content": "<image>document parsing."}
 
+    # The model card's own prompt already carries the token: keep just that one.
+    card = get_message_json("unlimited-ocr", "<image>document parsing.", num_images=1)
+    assert card == {"role": "user", "content": "<image>document parsing."}
+
 
 def test_unlimited_ocr_prompt_leaves_other_models_untouched():
     from omlx.patches.mlx_vlm_unlimited_ocr_compat import (
