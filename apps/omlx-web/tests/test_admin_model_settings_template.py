@@ -993,3 +993,26 @@ def test_model_settings_header_wraps_only_below_sm():
     assert "flex-shrink-0 max-sm:flex-shrink" in actions
     assert "max-sm:justify-end max-sm:ml-auto" in actions
     assert "max-sm:absolute max-sm:right-2" in actions
+
+
+def test_reranker_context_window_is_in_basic_settings():
+    """Reranker requests use max_context_window as their default max_length,
+    the same knob embeddings already expose."""
+    basic = _section(
+        _model_settings_template(),
+        '<section id="ms-basic"',
+        "<!-- Generation defaults (LLM/VLM only) -->",
+    )
+    row = _section(basic, "<!-- Reranker context window -->", "</label>")
+    assert "x-show=\"selectedModel?.model_type === 'reranker'\"" in row
+    assert 'x-model.number="modelSettings.max_context_window"' in row
+    assert "t('modal.model_settings.reranker_context_window_hint')" in row
+
+
+def test_reranker_context_window_i18n_key_exists_in_every_locale():
+    root = Path(__file__).resolve().parents[1]
+    i18n_dir = root / "omlx_web/i18n"
+    key = "modal.model_settings.reranker_context_window_hint"
+    for path in sorted(i18n_dir.glob("*.json")):
+        catalog = json.loads(path.read_text())
+        assert key in catalog, f"{path.name} is missing {key}"

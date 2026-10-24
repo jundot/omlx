@@ -1273,6 +1273,7 @@
   "modal.model_settings.max_context_window": "Контекстное окно",
   "modal.model_settings.max_context_window_hint": "Задаёт общий размер контекста, который может обработать модель. Более длинные запросы отклоняются.",
   "modal.model_settings.embedding_context_window_hint": "Если в запросе не задан max_length, более длинные входные данные обрезаются до этой длины.",
+  "modal.model_settings.reranker_context_window_hint": "Caps the per query-document window when a request does not set max_length. Longer content is truncated.",
   "modal.model_settings.max_tokens": "Макс. токены",
   "modal.model_settings.max_tokens_hint": "Ограничивает число токенов, которые модель генерирует за один ход, если в запросе не задан max_tokens.",
   "modal.model_settings.temperature": "Температура",

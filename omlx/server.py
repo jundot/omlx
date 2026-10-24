@@ -2316,6 +2316,30 @@ def get_embedding_max_length(
     return get_max_context_window(model_id)
 
 
+def get_rerank_max_length(
+    model_id: str | None = None,
+    request_max_length: int | None = None,
+) -> int | None:
+    """Get max token length for a rerank query-document pair.
+
+    Mirrors ``get_embedding_max_length`` (#1687). An explicit request value
+    wins; otherwise a per-model ``max_context_window`` override (set in the
+    admin model settings, the same field LLM/VLM and embedding models use)
+    applies. When neither is set it returns ``None`` so the reranker resolves
+    its own declared ``model_max_length`` instead of being capped at the
+    legacy 8192 default. The global sampling default is deliberately not
+    consulted here: it is tuned for chat models and would under- or over-cap a
+    reranker whose ceiling is a property of the weights, not the session.
+    """
+    if request_max_length is not None:
+        return request_max_length
+
+    settings = get_model_settings_for_request(model_id)
+    if settings is not None and settings.max_context_window is not None:
+        return settings.max_context_window
+    return None
+
+
 def _prepare_chat_prompt_for_request(
     engine: BaseEngine,
     messages: list,
@@ -4167,12 +4191,14 @@ async def create_rerank(
     # Perform reranking
     start_time = time.perf_counter()
 
+    max_length = get_rerank_max_length(request.model, request.max_length)
+
     async with acquire_reranker_engine(request.model) as engine:
         output = await engine.rerank(
             query=request.query,
             documents=documents_raw,
             top_n=request.top_n,
-            max_length=request.max_length,
+            max_length=max_length,
             instruction=request.instruction,
         )
 

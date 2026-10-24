@@ -1273,6 +1273,7 @@
   "modal.model_settings.max_context_window": "Janela de Contexto",
   "modal.model_settings.max_context_window_hint": "Define o tamanho total de contexto que o modelo consegue processar. Prompts mais longos são rejeitados.",
   "modal.model_settings.embedding_context_window_hint": "Se a requisição não definir max_length, entradas mais longas são truncadas para esse tamanho.",
+  "modal.model_settings.reranker_context_window_hint": "Caps the per query-document window when a request does not set max_length. Longer content is truncated.",
   "modal.model_settings.max_tokens": "Máx. de Tokens",
   "modal.model_settings.max_tokens_hint": "Limita quantos tokens o modelo gera em um turno quando a requisição não define max_tokens.",
   "modal.model_settings.temperature": "Temperatura",

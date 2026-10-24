@@ -1273,6 +1273,7 @@
   "modal.model_settings.max_context_window": "컨텍스트 윈도우",
   "modal.model_settings.max_context_window_hint": "모델이 다룰 수 있는 전체 컨텍스트 크기를 정합니다. 이보다 긴 프롬프트는 거부됩니다.",
   "modal.model_settings.embedding_context_window_hint": "요청에 max_length가 없으면 이보다 긴 입력은 이 길이로 잘립니다.",
+  "modal.model_settings.reranker_context_window_hint": "Caps the per query-document window when a request does not set max_length. Longer content is truncated.",
   "modal.model_settings.max_tokens": "최대 토큰 수",
   "modal.model_settings.max_tokens_hint": "요청에 max_tokens가 없을 때 모델이 한 턴에 생성하는 토큰 수를 제한합니다.",
   "modal.model_settings.temperature": "Temperature",

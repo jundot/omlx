@@ -1273,6 +1273,7 @@
   "modal.model_settings.max_context_window": "コンテキストウィンドウ",
   "modal.model_settings.max_context_window_hint": "モデルが扱えるコンテキスト全体のサイズを設定します。これより長いプロンプトは拒否されます。",
   "modal.model_settings.embedding_context_window_hint": "リクエストで max_length を指定しない場合、これより長い入力はこの長さで切り詰められます。",
+  "modal.model_settings.reranker_context_window_hint": "Caps the per query-document window when a request does not set max_length. Longer content is truncated.",
   "modal.model_settings.max_tokens": "最大トークン数",
   "modal.model_settings.max_tokens_hint": "リクエストで max_tokens が指定されていない場合に、1 ターンで生成するトークン数を制限します。",
   "modal.model_settings.temperature": "温度",

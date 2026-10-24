@@ -1273,6 +1273,7 @@
   "modal.model_settings.max_context_window": "Fenêtre de contexte",
   "modal.model_settings.max_context_window_hint": "Définit la taille totale du contexte que le modèle peut gérer. Les prompts plus longs sont refusés.",
   "modal.model_settings.embedding_context_window_hint": "Si la requête ne définit pas max_length, les entrées plus longues sont tronquées à cette longueur.",
+  "modal.model_settings.reranker_context_window_hint": "Caps the per query-document window when a request does not set max_length. Longer content is truncated.",
   "modal.model_settings.max_tokens": "Tokens max",
   "modal.model_settings.max_tokens_hint": "Limite le nombre de tokens générés par le modèle en un tour lorsque la requête ne définit pas max_tokens.",
   "modal.model_settings.temperature": "Température",
