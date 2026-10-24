@@ -395,15 +395,15 @@ def test_fp32_sdpa_gate_matches_mlx(keys, rows, spread):
     assert _bit_equal(got, want)
 
 
-@requires_kernels
-@pytest.mark.parametrize("rows", [1, 4, 8, 16])
+@pytest.mark.parametrize("rows", [1, 4, 8, 16, 300])
 @pytest.mark.parametrize("pos_ndim", [2, 3])
 @pytest.mark.parametrize("config", [_CONFIG, _YARN_CONFIG], ids=["default", "yarn"])
-def test_fp32_prep_matches_norms_and_mrope(rows, pos_ndim, config):
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16], ids=["fp32", "bf16"])
+def test_prep_matches_norms_and_mrope(rows, pos_ndim, config, dtype):
     attn = _attention(seed=9, config=config)
     mx.random.seed(rows + pos_ndim)
-    q_proj = mx.random.normal((rows, 24 * 512)) * 4
-    k_proj = mx.random.normal((rows, 2 * 256)) * 4
+    q_proj = (mx.random.normal((rows, 24 * 512)) * 4).astype(dtype)
+    k_proj = (mx.random.normal((rows, 2 * 256)) * 4).astype(dtype)
     start = 40000 + rows
     positions = _positions(start, rows) if pos_ndim == 3 else _positions(start, rows)[0]
     rotary = attn.rotary_emb
@@ -412,7 +412,7 @@ def test_fp32_prep_matches_norms_and_mrope(rows, pos_ndim, config):
     keys = attn.k_norm(k_proj.reshape(1, rows, 2, 256)).transpose(0, 2, 1, 3)
     want_q, want_k = rotary.apply_rotary(queries, keys, positions, unsqueeze_dim=1)
 
-    assert attn_fused.ready(mx.float32, 24, 2, 256, rotary.dim, pos_ndim)
+    assert attn_fused.prep_ready(dtype, 24, 2, 256, rotary.dim, pos_ndim)
     got_q, got_k = attn_fused.prep_qk(
         q_proj,
         k_proj,
@@ -429,3 +429,72 @@ def test_fp32_prep_matches_norms_and_mrope(rows, pos_ndim, config):
     )
     assert _bit_equal(got_q, want_q)
     assert _bit_equal(got_k, want_k)
+
+
+@pytest.mark.parametrize("config", [_CONFIG, _YARN_CONFIG], ids=["default", "yarn"])
+def test_gathered_prefill_prep_matches_mlx_path(monkeypatch, config):
+    """Prefill chunks before, across and past the QSA budget take the q/k
+    norms and MRoPE from ``prep_qk``: outputs and cache equal the MLX ops'."""
+    attn = _attention(seed=5, config=config)
+    rows = []
+    prep = attn._prep_qk
+
+    def counting(*args):
+        rows.append(args[0].shape[0])
+        return prep(*args)
+
+    monkeypatch.setattr(attn, "_prep_qk", counting)
+
+    def prefill():
+        cache = language.QSAKVCache()
+        mx.random.seed(21)
+        outs, done = [], 0
+        for size in (1500, 1500, 700):
+            x = (mx.random.normal((1, size, config.hidden_size)) * 0.5).astype(
+                mx.bfloat16
+            )
+            out = attn(
+                x, mask="causal", cache=cache, position_ids=_positions(done, size)
+            )
+            mx.eval(out)
+            outs.append(out)
+            done += size
+        return outs, _state(cache)
+
+    got, got_state = prefill()
+    assert rows == [1500, 1500, 700]
+    monkeypatch.setattr(attn_fused, "_DISABLED", True)
+    want, want_state = prefill()
+    assert all(_bit_equal(g, w) for g, w in zip(got, want))
+    assert all(_bit_equal(g, w) for g, w in zip(got_state, want_state))
+
+
+@pytest.mark.parametrize("context", [100, 3000], ids=["dense", "past-budget"])
+@pytest.mark.parametrize("positions", ["mrope", "none"])
+def test_decode_prep_matches_mlx_path(monkeypatch, context, positions):
+    """A decode row below and past the QSA budget, with text MRoPE positions
+    (the masked path past the budget) or none (gathered QSA decode): output and
+    cache equal the MLX path's."""
+    attn = _attention(seed=7)
+    cache = _prefill_chunked(attn, context, seed=3)
+
+    def step(x):
+        if positions == "mrope":
+            return _step(attn, cache, x)
+        out = attn(x, mask=None, cache=cache, position_ids=None)
+        mx.eval(out)
+        return out
+
+    for seed in range(3):
+        mx.random.seed(seed)
+        x = (mx.random.normal((1, 1, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
+        got = step(x)
+        got_state = _state(cache)
+        cache.trim(1)
+        monkeypatch.setattr(attn_fused, "_DISABLED", True)
+        want = step(x)
+        want_state = _state(cache)
+        cache.trim(1)
+        monkeypatch.setattr(attn_fused, "_DISABLED", False)
+        assert _bit_equal(got, want)
+        assert all(_bit_equal(g, w) for g, w in zip(got_state, want_state))
