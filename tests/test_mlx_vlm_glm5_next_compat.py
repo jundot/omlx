@@ -3643,12 +3643,28 @@ def _row_exact_block(model, block, cache):
 def test_row_exact_verify_rows_match_their_decode_steps(prompt_len, width, batch_cache):
     """Also on a one-row batch cache (the server's layout): its decode steps
     take the masked one-token path."""
+    _check_row_exact_verify(prompt_len, width, batch_cache)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode", "verify_router")
+@pytest.mark.parametrize("batch_cache", [False, True])
+@pytest.mark.parametrize("prompt_len,width", [(300, 5), (2101, 8)])
+def test_row_exact_verify_rows_of_the_fp8_checkpoint_match_their_decode_steps(
+    prompt_len, width, batch_cache
+):
+    """BF16 projections (multi-row: gemv_wide or GEMM tiles; the KDA input
+    bank and gate projections, the indexer, lm_head) beside MXFP8 MLPs,
+    experts and MLA projections."""
+    _check_row_exact_verify(prompt_len, width, batch_cache, fp8_checkpoint=True)
+
+
+def _check_row_exact_verify(prompt_len, width, batch_cache, **model_kwargs):
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     from omlx.patches.mlx_lm_mtp import batch_generator as bg
 
-    decoded = _fused_shape_model(51)
-    verified = _fused_shape_model(51)
+    decoded = _fused_shape_model(51, **model_kwargs)
+    verified = _fused_shape_model(51, **model_kwargs)
     prompt = mx.random.randint(0, 256, (1, prompt_len), key=mx.random.key(7)).astype(
         mx.int32
     )
@@ -4011,11 +4027,16 @@ def test_indexer_fast_selection_matches_general_path(monkeypatch, native_topk):
 # ---------------------------------------------------------------------------
 
 
-def _fused_shape_model(seed, heads=16, quantize_mla=False):
+def _fused_shape_model(seed, heads=16, quantize_mla=False, fp8_checkpoint=False):
+    """``fp8_checkpoint``: the FP8 checkpoint's layout instead of oQ's. mlx-vlm
+    requantizes its block-FP8 tensors (MLPs and experts, MLA q_a/q_b/kv_a and
+    o_proj) to MXFP8 at load and the engine fuses the experts' gate/up; the
+    KDA, indexer, kv_b and lm_head weights stay BF16."""
     from mlx_lm.models.mla import MultiLinear
     from mlx_vlm.models import glm5_next
 
     from omlx.patches.deepseek_v4.switch_layers import SwitchLinear
+    from omlx.patches.moe_gate_up_fusion import apply_switch_glu_gate_up_fusion
 
     quantized = (nn.Linear, SwitchLinear) + ((MultiLinear,) if quantize_mla else ())
 
@@ -4063,15 +4084,31 @@ def _fused_shape_model(seed, heads=16, quantize_mla=False):
     )
     mx.random.seed(seed)
     model = language.LanguageModel(text)
-    nn.quantize(
-        model,
-        group_size=64,
-        bits=4,
-        class_predicate=lambda _, m: isinstance(m, quantized),
-    )
+
+    def block_fp8(path, m):
+        parts = path.split(".")
+        mla = parts[-1] in (
+            "q_a_proj",
+            "q_b_proj",
+            "kv_a_proj_with_mqa",
+            "o_proj",
+        ) and (text.layer_types[int(parts[2])] == "deepseek_sparse_attention")
+        return isinstance(m, (nn.Linear, SwitchLinear)) and (".mlp." in path or mla)
+
+    if fp8_checkpoint:
+        nn.quantize(
+            model, group_size=32, bits=8, mode="mxfp8", class_predicate=block_fp8
+        )
+    else:
+        nn.quantize(
+            model,
+            group_size=64,
+            bits=4,
+            class_predicate=lambda _, m: isinstance(m, quantized),
+        )
     params = []
     for name, value in nn.utils.tree_flatten(model.parameters()):
-        if value.dtype == mx.uint32:
+        if value.dtype in (mx.uint32, mx.uint8):
             continue
         if language.glm5_next_cast_predicate(name):
             value = (mx.random.normal(value.shape) * 0.05).astype(mx.bfloat16)
@@ -4085,6 +4122,8 @@ def _fused_shape_model(seed, heads=16, quantize_mla=False):
                 value = value * 10
         params.append((name, value))
     model.load_weights(params, strict=False)
+    if fp8_checkpoint:
+        assert apply_switch_glu_gate_up_fusion(model) == 3
     model.eval()
     mx.eval(model.parameters())
     return model

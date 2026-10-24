@@ -555,9 +555,12 @@ class Glm5NextLinearAttention(nn.Module):
 
     def _row_exact_in_proj(self, inputs):
         """The fused (or grouped) input projection of a verify block with every
-        row's one-row decode arithmetic (``row_exact_qmv``), so a row-exact
-        verify row gets the projection its decode step gets. None when a
-        bank is not on a one-row ``qmv_fast`` layout."""
+        row's one-row decode arithmetic (``row_exact_qmv``; a float bank
+        ``rows_gemv``), so a row-exact verify row gets the projection its
+        decode step gets. None when a bank is not on a one-row ``qmv_fast``
+        layout."""
+        if self._fused_ready and not self._fq:
+            return _decode_kernels.rows_gemv(inputs, self._fw)
         rows = getattr(self, "_rows_in_proj", None)
         if rows is None:
             if self._fused_ready:
@@ -2128,7 +2131,11 @@ class Glm5NextMoE(nn.Module):
         y = self._decode_experts(x, indices, scores)
         if y is not None:
             return y
-        y = self.switch_mlp(x, indices, scores=scores, weighted_sum=True)
+        # A row-exact verify block combines its tokens' routes as their decode
+        # steps do (below), not with the sorted routes' weighted-sum kernel.
+        y = self.switch_mlp(
+            x, indices, scores=scores, weighted_sum=not _row_exact_armed()
+        )
         if y.ndim == x.ndim + 1:
             y = (y * scores[..., None]).sum(axis=-2).astype(x.dtype)
         if self.shared_experts is not None:

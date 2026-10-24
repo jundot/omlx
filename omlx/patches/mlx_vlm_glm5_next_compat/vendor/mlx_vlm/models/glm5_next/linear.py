@@ -5,6 +5,9 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
+from omlx.patches.mlx_vlm_glm5_next_compat.decode_kernels import rows_gemv
+from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
+
 
 def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
     bits = int(getattr(linear, "bits", 0) or 0)
@@ -40,8 +43,15 @@ def _native_qmm(linear: nn.QuantizedLinear, x: mx.array):
 
 
 def linear_forward(linear: nn.Module, x: mx.array) -> mx.array:
-    """Use oMLX's affine prefill tile when it is supported and profitable."""
-    if isinstance(linear, nn.QuantizedLinear):
+    """Use oMLX's affine prefill tile when it is supported and profitable.
+    A row-exact verify block runs a float projection's rows with the
+    one-row gemv arithmetic of their decode steps."""
+    if type(linear) is nn.Linear:
+        if "bias" not in linear and is_row_exact_armed():
+            out = rows_gemv(x, linear.weight)
+            if out is not None:
+                return out
+    elif isinstance(linear, nn.QuantizedLinear):
         if (
             "bias" in linear
             and getattr(linear, "mode", None) == "affine"
