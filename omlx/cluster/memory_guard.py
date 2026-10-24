@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import _thread
 import logging
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -134,6 +135,30 @@ def _operator_memory_settings() -> tuple[str, float, bool]:
         return ("balanced", 0.0, True)
 
 
+def _unified_host_available(physical: int, free: int | None) -> int | None:
+    """Raise ``free`` to MemAvailable on a unified-memory Linux device."""
+
+    if free is None or not sys.platform.startswith("linux"):
+        return free
+    try:
+        fields: dict[str, int] = {}
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                if key in ("MemTotal", "MemAvailable"):
+                    fields[key] = int(rest.split()[0]) * 1024
+        total = fields.get("MemTotal", 0)
+        available = fields.get("MemAvailable", 0)
+    except (OSError, ValueError, IndexError):
+        return free
+    if total <= 0 or available <= 0:
+        return free
+    # Unified memory: the device's "total" is the host's RAM.
+    if abs(total - physical) > physical * 0.15:
+        return free
+    return max(free, available)
+
+
 def _cuda_ceiling_breakdown(
     tier: str,
     *,
@@ -164,6 +189,14 @@ def _cuda_ceiling_breakdown(
         return None
     if physical <= 0:
         return None
+    # On a unified-memory CUDA device (DGX Spark GB10) ``free_memory`` tracks
+    # the host's MemFree, which reclaimable page cache depresses. Reading a
+    # model's own mmap'd safetensors is enough to drive it to ~0, so a rank
+    # that has just loaded is judged against a ceiling its own file-backed
+    # pages created. MemAvailable is the figure that answers "will this fit":
+    # the kernel evicts clean cache on demand. Only applied when device total
+    # matches host RAM, so a discrete GPU still reports VRAM.
+    free = _unified_host_available(physical, free)
     normalized = tier if tier in _CUDA_CEILING_FRACTION else "balanced"
     if normalized == "custom" and custom_ceiling_gb > 0:
         budget = min(physical, int(custom_ceiling_gb * 1024**3))
