@@ -24,7 +24,8 @@ module.exports = {
       // Dark mode maps the class to --text-muted in dashboard.css.
       textColor: {
         neutral: {
-          400: 'rgb(var(--palette-neutral-500) / <alpha-value>)',
+          400: 'rgb(var(--palette-neutral-550) / <alpha-value>)',
+          500: 'rgb(var(--palette-neutral-550) / <alpha-value>)',
         },
       },
       // Tailwind's palette resolves through the tokens in static/css/theme.css.

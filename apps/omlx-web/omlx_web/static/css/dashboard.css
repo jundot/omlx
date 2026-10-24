@@ -1465,7 +1465,7 @@
     }
     .log-level--debug { color: rgb(var(--palette-teal-700)); background-color: rgb(var(--palette-teal-500) / 0.14); }
     .log-level--info { color: rgb(var(--palette-blue-700)); background-color: rgb(var(--palette-blue-500) / 0.14); }
-    .log-level--warning { color: rgb(var(--palette-amber-700)); background-color: rgb(var(--palette-amber-500) / 0.16); }
+    .log-level--warning { color: rgb(var(--palette-amber-800)); background-color: rgb(var(--palette-amber-500) / 0.16); }
     .log-level--error { color: rgb(var(--palette-red-700)); background-color: rgb(var(--palette-red-500) / 0.14); }
     .log-level--critical { color: rgb(var(--palette-purple-700)); background-color: rgb(var(--palette-purple-500) / 0.16); }
     [data-theme="dark"] .log-level--debug { color: rgb(var(--palette-teal-300)); }
