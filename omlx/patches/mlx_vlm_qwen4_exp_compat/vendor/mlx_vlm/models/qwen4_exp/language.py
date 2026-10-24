@@ -3942,6 +3942,28 @@ def _shard_gather_kernel(window: int):
     return kernel
 
 
+def _buffer_address(a: mx.array) -> int:
+    return np.frombuffer(memoryview(a), dtype=np.uint8).ctypes.data
+
+
+def _bound_rows(a: mx.array) -> mx.array:
+    """The leading rows of ``a`` for a launch that indexes all of ``a`` from
+    the bound pointer, or ``a`` itself when that view would not alias it.
+
+    MLX adds each newly bound array's whole data size to a per-command-buffer
+    count and commits the buffer past its cap (50 Mi elements on Max and Ultra
+    GPUs), so a gather over whole PLE shards (50M elements each) ends a command
+    buffer. A view of the first rows at the same address reads the same bytes
+    and counts only itself; eight or more elements keep it a device buffer
+    (MLX passes smaller inputs by value).
+    """
+    view = a[: max(1, -(-8 // a.shape[-1]))]
+    mx.eval(view)
+    if memoryview(view).c_contiguous and _buffer_address(view) == _buffer_address(a):
+        return view
+    return a
+
+
 class ShardedEmbedding(nn.Module):
     """Embedding kept in checkpoint-sized row shards to avoid a 100 GB join."""
 
@@ -4042,9 +4064,23 @@ class ShardedEmbedding(nn.Module):
             indices.reshape(rows, len(column_ranges)).astype(mx.int64).T
         )
         offset_arrays = self._window_offsets
+        # Shard index -> (weight, then the weight, scales and biases views the
+        # launches bind); a replaced shard is bound anew.
+        bound = getattr(self, "_bound_shards", None)
+        if bound is None:
+            bound = self._bound_shards = {}
         packed, scales, biases = [], [], []
         for column, (start, stop) in enumerate(windows):
-            part = self.shards[start:stop]
+            views = []
+            for index in range(start, stop):
+                shard = self.shards[index]
+                entry = bound.get(index)
+                if entry is None or entry[0] is not shard.weight:
+                    entry = bound[index] = (
+                        shard.weight,
+                        *(_bound_rows(a) for a in (shard.weight, shard.scales, shard.biases)),
+                    )
+                views.append(entry[1:])
             offsets = offset_arrays.get((start, stop))
             if offsets is None:
                 offsets = offset_arrays[start, stop] = mx.array(
@@ -4054,9 +4090,9 @@ class ShardedEmbedding(nn.Module):
                 inputs=[
                     columns[column],
                     offsets,
-                    *(shard.weight for shard in part),
-                    *(shard.scales for shard in part),
-                    *(shard.biases for shard in part),
+                    *(view[0] for view in views),
+                    *(view[1] for view in views),
+                    *(view[2] for view in views),
                 ],
                 template=[
                     ("T", first.scales.dtype),

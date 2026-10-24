@@ -725,6 +725,46 @@ def test_qwen4_resident_ple_looks_up_shard_windows_on_device():
     assert mx.array_equal(embedding(indices, wide), expected).item()
 
 
+def test_qwen4_shard_window_launches_bind_leading_rows(monkeypatch):
+    """The gather launches bind views of each shard's first rows (MLX counts a
+    bound array whole toward its command-buffer cap); a replaced shard is
+    bound anew."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen4_exp import language
+
+    mx.random.seed(45)
+
+    def quantized(size):
+        return nn.QuantizedEmbedding.from_embedding(
+            nn.Embedding(size, 64), group_size=32, bits=4, mode="affine"
+        )
+
+    embedding = language.ShardedEmbedding(122, 64, 12)
+    embedding.shards = [quantized(size) for size in embedding.shard_sizes]
+    ranges = ((3, 9), (20, 70), (11, 102))
+    indices = mx.array([[4, 21, 11], [8, 69, 101], [5, 40, 55]], dtype=mx.int64)[None]
+
+    sizes = []
+    gather = language._shard_gather_kernel
+
+    def recording(window):
+        kernel = gather(window)
+
+        def launch(*, inputs, **kwargs):
+            sizes.extend(a.size for a in inputs[2:])
+            return kernel(inputs=inputs, **kwargs)
+
+        return launch
+
+    monkeypatch.setattr(language, "_shard_gather_kernel", recording)
+    assert mx.array_equal(embedding(indices, ranges), embedding(indices)).item()
+    assert sizes and max(sizes) == 8
+
+    embedding.shards[4] = quantized(embedding.shard_sizes[4])
+    assert mx.array_equal(embedding(indices, ranges), embedding(indices)).item()
+
+
 def test_qwen4_quantization_sanitize_keeps_mmap_ple_shards(tmp_path):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import configure_ple_runtime
