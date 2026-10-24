@@ -9,6 +9,8 @@ Scores may differ from the composed sum/divide by reduction-order ulp.
 
 from __future__ import annotations
 
+import logging
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -313,6 +315,55 @@ def test_softmax_topk_row_declines_layouts_it_does_not_reproduce():
     assert softmax_topk_row(mx.zeros((1, 1, 320), mx.bfloat16), 10) is None
     assert softmax_topk_row(mx.zeros((1, 2, 512), mx.bfloat16), 10) is None
     assert softmax_topk_row(mx.zeros((1, 1, 512), mx.float32), 10) is None
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("experts,top_k", [(512, 10), (256, 8), (128, 8)])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_prefill_router_topk_matches_composed_routing(experts, top_k, normalize):
+    """Indices in argpartition's order and scores bit for bit, over rows of
+    tied and one-ulp-apart probabilities."""
+    from omlx.patches.qwen35_moe_router import prefill_router_topk
+
+    for kind in ("random", "duplicates", "adjacent", "two_values"):
+        logits = mx.concatenate(
+            [_near_tie_logits(kind, experts, seed) for seed in range(48)], axis=1
+        )
+        probs = mx.softmax(logits, axis=-1, precise=True)
+        ref_i = mx.argpartition(probs, kth=-top_k, axis=-1)[..., -top_k:]
+        ref_s = mx.take_along_axis(probs, ref_i, axis=-1)
+        if normalize:
+            ref_s = ref_s / ref_s.sum(axis=-1, keepdims=True)
+        out_i, out_s = prefill_router_topk(logits, top_k, normalize)
+        assert out_i.dtype == ref_i.dtype
+        assert mx.array_equal(out_i, ref_i).item()
+        assert mx.array_equal(out_s.view(mx.uint16), ref_s.view(mx.uint16)).item()
+
+
+def test_prefill_router_topk_declines_layouts_it_does_not_reproduce():
+    from omlx.patches.qwen35_moe_router import prefill_router_topk
+
+    # MLX's softmax ends 320 experts in a partial simdgroup; fp16 rows keep
+    # the composed chain.
+    assert prefill_router_topk(mx.zeros((1, 4, 320), mx.bfloat16), 10, True) is None
+    assert prefill_router_topk(mx.zeros((1, 4, 512), mx.float16), 10, True) is None
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_prefill_router_topk_logs_once_when_a_chunk_takes_it(monkeypatch, caplog):
+    """One INFO line when the first chunk takes the one-launch routing; a
+    declined layout logs nothing."""
+    from omlx.patches import qwen35_moe_router as router
+
+    monkeypatch.setattr(router, "_PREFILL_TOPK_KERNEL", None)
+    logits = (mx.random.normal((1, 64, 256)) * 2).astype(mx.bfloat16)
+    with caplog.at_level(logging.INFO, logger=router.__name__):
+        assert router.prefill_router_topk(logits.astype(mx.float16), 8, True) is None
+        for _ in range(2):
+            mx.eval(*router.prefill_router_topk(logits, 8, True))
+    assert [r.getMessage() for r in caplog.records if r.name == router.__name__] == [
+        "Qwen MoE fused prefill router top-k engaged (256 experts, top-8)"
+    ]
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")

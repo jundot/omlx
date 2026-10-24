@@ -20,6 +20,7 @@ import mlx.core as mx
 from .m5_gather_qmm import fused_gate_up_activation
 from .m5_gather_qmm_a8 import try_routed_a8
 from .moe_routes import sort_routes
+from .qwen35_moe_router import prefill_router_topk
 
 logger = logging.getLogger(__name__)
 
@@ -145,14 +146,18 @@ def _fast_moe(self: Any, x: mx.array, target_verify: bool) -> mx.array:
     if weighted_sum is None:
         raise RuntimeError("moe_weighted_sum native kernel is unavailable")
 
-    gates = self.gate(x)
-    gates = mx.softmax(gates, axis=-1, precise=True)
-
+    logits = self.gate(x)
     k = self.top_k
-    inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-    scores = mx.take_along_axis(gates, inds, axis=-1)
-    if getattr(self, "norm_topk_prob", True):
-        scores = scores / scores.sum(axis=-1, keepdims=True)
+    normalize = getattr(self, "norm_topk_prob", True)
+    routed = prefill_router_topk(logits, k, normalize)
+    if routed is not None:
+        inds, scores = routed
+    else:
+        gates = mx.softmax(logits, axis=-1, precise=True)
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if normalize:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
 
     y = _native_switch_weighted_sum(self.switch_mlp, x, inds, scores, weighted_sum)
 

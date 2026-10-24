@@ -16,8 +16,10 @@ and renormalizes over the selected k in fp32 with one final rounding.
 Scores can differ from the composed sum/divide chain by reduction-order
 ulp; the routed expert set never differs.
 
-Only short rows route here (decode and spec-verify widths); prefill keeps
-the composed chain, whose cost amortizes over the chunk.
+Only short rows route here (decode and spec-verify widths).
+``prefill_router_topk`` routes a prefill chunk in one launch, one
+simdgroup per row, with the composed chain's indices and scores bit for
+bit.
 
 One-row decode also folds the combine ``(y * scores).sum(-2) +
 sigmoid(shared_gate) * shared`` (five launches) into one bit-identical launch.
@@ -605,6 +607,93 @@ def softmax_topk_rows(logits, top_k: int, max_rows: int = _MAX_ROWS):
         threadgroup=(32, 1, 1),
         output_shapes=[(*lead, top_k), (*lead, top_k)],
         output_dtypes=[mx.uint32, logits.dtype],
+    )
+
+
+# Prefill routing in one launch, one simdgroup per row: the composed chain's
+# softmax (MLX's block softmax, above), argpartition's last K (the K largest
+# in ascending order; equal probabilities put the lower expert first, so the
+# descending key selection is stored reversed), and the normalization over
+# them as bf16 ops in that order (MLX's row sum adds them one by one in bf16).
+_PREFILL_TOPK_SOURCE = """
+    using R = omlx_router_topk<bfloat16_t, NE>;
+    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.x * SG + simdgroup_index_in_threadgroup;
+    uint key[R::PER];
+    R::keys(logits + row * uint(NE), lane, key);
+    uint head[3];
+    R::top3(key, 0xffffffffu, head);
+    int left = 3;
+    uint sel[K];
+    for (int j = 0; j < K; ++j) {
+        sel[j] = R::step(key, head, left);
+    }
+    if (lane == 0) {
+        bfloat16_t value[K];
+        bfloat16_t total = 0;
+        for (int p = 0; p < K; ++p) {
+            const uint s = sel[K - 1 - p];
+            value[p] = bfloat16_t(as_type<float>(((s >> 16) - 1u) << 16));
+            total = total + value[p];
+            indices[row * uint(K) + p] = s & 0xffffu;
+        }
+        for (int p = 0; p < K; ++p) {
+            scores[row * uint(K) + p] = NORMALIZE ? value[p] / total : value[p];
+        }
+    }
+"""
+_PREFILL_TOPK_KERNEL = None
+# Rows (one simdgroup each) per threadgroup of the prefill routing launch.
+_PREFILL_TOPK_ROWS_PER_GROUP = 8
+
+
+def prefill_router_topk(logits, top_k: int, normalize: bool):
+    """The composed prefill routing over bf16 gate ``logits`` ``[..., NE]``
+    in one launch: ``mx.softmax(logits, axis=-1, precise=True)``,
+    ``argpartition(kth=-top_k)[..., -top_k:]``, ``take_along_axis`` and, with
+    ``normalize``, ``scores / scores.sum(-1, keepdims=True)``.
+
+    Returns (indices uint32, scores bf16) as those ops do, or None outside
+    the layout this reproduces.
+    """
+    global _PREFILL_TOPK_KERNEL
+    ne = logits.shape[-1]
+    if (
+        logits.dtype != mx.bfloat16
+        or ne % 128
+        or ne > 4096
+        or not 1 <= top_k <= ne
+        or not logits.size
+    ):
+        return None
+    if _PREFILL_TOPK_KERNEL is None:
+        _PREFILL_TOPK_KERNEL = mx.fast.metal_kernel(
+            name="omlx_qwen35_moe_router_prefill_topk",
+            input_names=["logits"],
+            output_names=["indices", "scores"],
+            header=TOPK_HEADER,
+            source=_PREFILL_TOPK_SOURCE,
+        )
+        logger.info(
+            "Qwen MoE fused prefill router top-k engaged (%d experts, top-%d)",
+            ne,
+            top_k,
+        )
+    rows = logits.size // ne
+    group = _PREFILL_TOPK_ROWS_PER_GROUP
+    lead = logits.shape[:-1]
+    return _PREFILL_TOPK_KERNEL(
+        inputs=[logits],
+        template=[
+            ("NE", ne),
+            ("K", top_k),
+            ("NORMALIZE", bool(normalize)),
+            ("SG", group),
+        ],
+        grid=(rows * 32, 1, 1),
+        threadgroup=(min(rows, group) * 32, 1, 1),
+        output_shapes=[(*lead, top_k), (*lead, top_k)],
+        output_dtypes=[mx.uint32, mx.bfloat16],
     )
 
 
