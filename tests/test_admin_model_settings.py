@@ -938,3 +938,40 @@ async def test_paroquant_dflash_allows_only_qwen_targets(
             await _update_settings(pool, settings, request)
         assert exc.value.status_code == 400
         assert exc.value.detail == admin_routes._PAROQUANT_REASON
+
+
+def test_jangh2_mtp_toggle_reports_unsupported_packed_heads(tmp_path):
+    _write_qwen4_mtp_checkpoint(tmp_path, embedded_mtp=True)
+    path = tmp_path / "config.json"
+    config = json.loads(path.read_text())
+    config["jangtq"] = {"version": 2}
+    path.write_text(json.dumps(config))
+
+    compatible, reason = admin_routes._mtp_compat_for_model(
+        {"model_path": str(tmp_path)}
+    )
+
+    assert compatible is False
+    assert reason == "JANGH2 packed-expert MTP is not supported"
+
+
+@pytest.mark.asyncio
+async def test_jangh2_mtp_setting_rejects_embedded_packed_head(tmp_path):
+    _write_qwen4_mtp_checkpoint(tmp_path, embedded_mtp=True)
+    path = tmp_path / "config.json"
+    config = json.loads(path.read_text())
+    config["jangtq"] = {"version": 2}
+    path.write_text(json.dumps(config))
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.config_model_type = "qwen4_exp"
+    settings = ModelSettings()
+
+    with pytest.raises(HTTPException) as error:
+        await _update_settings(
+            pool, settings, admin_routes.ModelSettingsRequest(mtp_enabled=True)
+        )
+
+    assert error.value.status_code == 400
+    assert error.value.detail == "JANGH2 packed-expert MTP is not supported"
+    assert settings.mtp_enabled is False

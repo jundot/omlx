@@ -320,6 +320,7 @@ Models are auto-detected by type. You can also download models directly from the
 |------|--------|
 | LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |
 | VLM | Qwen3.5 Series, GLM-4V, Pixtral, and other [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) models |
+| Packed JANGH2 | [Qwen4-Exp / Allosaurus](docs/JANGH2.md), with SSD-backed PLE and optional thinking |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |

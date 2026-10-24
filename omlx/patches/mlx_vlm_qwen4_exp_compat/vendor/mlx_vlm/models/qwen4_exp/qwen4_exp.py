@@ -143,12 +143,21 @@ class Model(Qwen3_5Model):
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
-        if get_mtp_runtime().enabled:
+        self._mtp_enabled = (
+            get_mtp_runtime().enabled
+            if config.mtp_enabled is None
+            else config.mtp_enabled
+        )
+        if self._mtp_enabled:
             self.mtp = Qwen4ExpMTPModule(config.text_config)
             self.language_model.bind_mtp_owner(self)
 
     def sanitize(self, weights):
-        if get_ple_runtime_mode() == "mmap" and not getattr(
+        ple_mode = (
+            getattr(self.config.text_config, "ple_storage_mode", None)
+            or get_ple_runtime_mode()
+        )
+        if ple_mode == "mmap" and not getattr(
             self, "_omlx_preserve_qwen4_ple_for_quantization", False
         ):
             for key in [key for key in weights if _NGRAM_STORAGE_RE.search(key)]:
@@ -172,7 +181,7 @@ class Model(Qwen3_5Model):
                 and runtime_scale_key not in weights
             ):
                 weights[source_scale_key] = mx.ones((1,), dtype=mx.bfloat16)
-        mtp_enabled = get_mtp_runtime().enabled
+        mtp_enabled = getattr(self, "_mtp_enabled", get_mtp_runtime().enabled)
 
         normalized = {}
         for key, value in weights.items():
@@ -264,12 +273,13 @@ class Model(Qwen3_5Model):
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
             sanitized[key] = value
-        _normalize_ones_centered_rmsnorm_weights(self, sanitized)
+        if not getattr(self, "_omlx_explicit_rmsnorm_residual", False):
+            _normalize_ones_centered_rmsnorm_weights(self, sanitized)
         return sanitized
 
     def load_weights(self, weights, strict=True):
         result = super().load_weights(weights, strict=strict)
-        mtp_enabled = get_mtp_runtime().enabled
+        mtp_enabled = getattr(self, "_mtp_enabled", get_mtp_runtime().enabled)
         hybrid = 0 if mtp_enabled else fuse_hyper_connection_projections(self)
         fused_ple = fuse_resident_ple_embeddings(self)
         compiled = compile_hyper_connections(self)

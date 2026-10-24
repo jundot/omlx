@@ -4128,15 +4128,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embedding_dim // self.ngram_heads,
             config.split_ngram_parts,
         )
-        if _PLE_RUNTIME_MODE == "mmap":
-            if _PLE_RUNTIME_MODEL_PATH is None:
+        ple_mode = getattr(config, "ple_storage_mode", None) or _PLE_RUNTIME_MODE
+        ple_model_path = (
+            getattr(config, "ple_model_path", None) or _PLE_RUNTIME_MODEL_PATH
+        )
+        if ple_mode == "mmap":
+            if ple_model_path is None:
                 raise RuntimeError("SSD-backed PLE has no configured model path")
             prefix = (
                 f"model.language_model.layers.{layer_idx}.ple.ple_embedding."
                 "ngram_embedding"
             )
+            prefix = (getattr(config, "ple_tensor_prefixes", None) or {}).get(
+                str(layer_idx), prefix
+            )
             self.ngram_embedding = DiskBackedShardedEmbedding(
-                _PLE_RUNTIME_MODEL_PATH,
+                ple_model_path,
                 prefix,
                 *embedding_args,
             )

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omlx-jangh2-bridge"
+version = "0.1.0"
+description = "Opt-in JANGH2 MLX backend and scoped oMLX compatibility bridge"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = ["numpy>=1.26,<3"]
+
+[project.scripts]
+jangh2-bridge = "jangh2_bridge.cli:main"
+
+[tool.setuptools]
+packages = ["jangh2_bridge", "jangh2_bridge._tools"]

@@ -4,6 +4,8 @@
 import json
 import logging
 import struct
+from pathlib import Path
+from types import SimpleNamespace
 
 from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
@@ -58,8 +60,7 @@ def test_estimate_subtracts_only_mmap_backed_ngram_tensors(tmp_path):
     model.mkdir()
     (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
     ple_key = (
-        "model.language_model.layers.1.ple.ple_embedding."
-        "ngram_embedding.shard_0.weight"
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
     )
     compute_key = "model.language_model.layers.0.self_attn.q_proj.weight"
     _write_safetensors(model / "model.safetensors", {ple_key: 100, compute_key: 40})
@@ -151,3 +152,35 @@ def test_forced_status_logs_again_after_a_transition(tmp_path, caplog):
         pool._qwen4_ple_offload_status(entry, None)
 
     assert _forced_warnings(caplog) == 2
+
+
+def test_jangh2_prices_its_guaranteed_mmap_mode_even_with_spare_ram(tmp_path):
+    pool, entry, estimate = _qwen4_pool(tmp_path)
+    (Path(entry.model_path) / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "jangtq": {"version": 2}})
+    )
+    pool._get_residency_ceiling = lambda: estimate.resident_bytes * 2
+    settings = SimpleNamespace(qwen4_ple_ssd_offload=False)
+
+    enabled, forced, priced = pool._qwen4_ple_offload_status(entry, settings)
+    assert enabled is True
+    assert forced is True
+    assert priced.mmap_bytes < priced.resident_bytes
+    effective = pool._effective_qwen4_model_settings(entry, settings)
+    assert effective.qwen4_ple_ssd_offload is True
+    assert settings.qwen4_ple_ssd_offload is False
+
+
+def test_ordinary_qwen4_is_not_forced_to_mmap_by_model_name(tmp_path):
+    pool, entry, estimate = _qwen4_pool(tmp_path)
+    entry.model_id = "anything-JANGH2"
+    (Path(entry.model_path) / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "quantization": {"bits": 4}})
+    )
+    pool._get_residency_ceiling = lambda: estimate.resident_bytes * 2
+    settings = SimpleNamespace(qwen4_ple_ssd_offload=False)
+
+    enabled, forced, _ = pool._qwen4_ple_offload_status(entry, settings)
+    assert enabled is False
+    assert forced is False
+    assert pool._effective_qwen4_model_settings(entry, settings) is settings

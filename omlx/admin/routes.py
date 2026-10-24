@@ -1157,6 +1157,10 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
         cfg = json.loads(cfg_path.read_text())
     except Exception as e:
         return False, f"failed to read config: {e}"
+    from ..models.jangh2 import MTP_UNSUPPORTED_REASON, is_jangh2_config
+
+    if is_jangh2_config(cfg):
+        return False, MTP_UNSUPPORTED_REASON
     model_type = cfg.get("model_type")
     if model_type in ("minimax_m3", "minimax_m3_vl"):
         # MiniMax M3.1 ships its DSpark draft in a dspark/ folder instead of
@@ -3250,6 +3254,10 @@ async def update_model_settings(
                     status_code=400,
                     detail=f"MTP enabled but failed to read model config: {e}",
                 )
+            from ..models.jangh2 import MTP_UNSUPPORTED_REASON, is_jangh2_config
+
+            if is_jangh2_config(cfg):
+                raise HTTPException(status_code=400, detail=MTP_UNSUPPORTED_REASON)
             model_type = cfg.get("model_type")
             # qwen4_exp routes through the dedicated VLM Lightning MTP path
             # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
