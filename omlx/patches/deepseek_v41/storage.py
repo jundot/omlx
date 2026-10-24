@@ -147,8 +147,7 @@ class TensorFile:
             self._file_size = os.fstat(self._file.fileno()).st_size
             self._seen_pages = None
             self._last_rearm = 0.0
-            self._prefer_row_reads = False
-            self._row_reads_until = 0.0
+            self._row_reads_until = {}
             # Engram hashes select sparse rows throughout the table. Whole-tensor
             # resident reads use readinto below and do not use this mapping.
             if hasattr(self._mapping, "madvise"):
@@ -223,24 +222,23 @@ class TensorFile:
                     # evicted. Keep wide reads parallel for a bounded interval
                     # before probing again, rather than switching every read
                     # or disabling warm gathers for the file lifetime.
+                    # Weight eviction must not disable resident scale/bias
+                    # gathers when those tensors share the same file.
                     wide = rows.size > PAGE_IO_WORKERS * ROW_BATCH_ROWS
-                    if (
-                        wide
-                        and self._prefer_row_reads
-                        and time.monotonic() >= self._row_reads_until
-                    ):
-                        self._prefer_row_reads = False
+                    prefer_rows = wide and time.monotonic() < self._row_reads_until.get(
+                        key, 0.0
+                    )
                     resident = True
-                    if wide and not self._prefer_row_reads and not cold.all():
+                    if wide and not prefer_rows and not cold.all():
                         resident = self._pages_resident(flat[~cold], base, row_bytes)
                         if resident is False:
-                            self._prefer_row_reads = True
-                            self._row_reads_until = (
+                            prefer_rows = True
+                            self._row_reads_until[key] = (
                                 time.monotonic() + ROW_READ_RETRY_SECONDS
                             )
                     # A query error warrants a conservative read now, but is
                     # not evidence for a permanent scheduling change.
-                    read_all = wide and (self._prefer_row_reads or resident is None)
+                    read_all = wide and (prefer_rows or resident is None)
                     if fresh.size or read_all:
                         exact = (
                             _read_row_runs(
@@ -325,6 +323,7 @@ class TensorFile:
     def close(self):
         with self._lock:
             self._seen_pages = None
+            self._row_reads_until.clear()
             if self._mapping is not None:
                 self._mapping.close()
                 self._mapping = None

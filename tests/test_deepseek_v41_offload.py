@@ -1137,3 +1137,49 @@ def test_wide_read_fallback_rechecks_and_recovers_after_cooldown(tmp_path, monke
         np.testing.assert_array_equal(repeated, raw[rows])
     finally:
         reader.close()
+
+
+def test_evicted_weights_do_not_disable_resident_scale_and_bias(tmp_path, monkeypatch):
+    path = tmp_path / "mixed-tensors.safetensors"
+    weights = np.arange(8192 * 64, dtype=np.uint8).reshape(8192, 64)
+    scales = np.arange(8192, dtype=np.float16).reshape(8192, 1)
+    biases = -scales
+    raw_safetensors(
+        path, {"w": (weights, "U8"), "s": (scales, "F16"), "b": (biases, "F16")}
+    )
+    reader = storage.TensorFile(path)
+    rows = np.tile([0, 255, 256, 4095], 4096)
+    calls = []
+    original = storage.os.pread
+    address = np.frombuffer(reader._mapping, dtype=np.uint8, count=1).ctypes.data
+    data_start = 8 + int.from_bytes(path.read_bytes()[:8], "little")
+    scale_start = (
+        address
+        + ((data_start + weights.nbytes) // storage.PAGE_SIZE) * storage.PAGE_SIZE
+    )
+
+    def counted(fd, count, offset):
+        calls.append(offset)
+        return original(fd, count, offset)
+
+    def residency(page, length, target):
+        target._obj.value = int(page >= scale_start)
+        return 0
+
+    monkeypatch.setattr(storage.os, "pread", counted)
+    monkeypatch.setattr(storage, "_MINCORE", residency)
+    try:
+        for key, raw in (("w", weights), ("s", scales), ("b", biases)):
+            actual, _ = reader.read(key, rows)
+            np.testing.assert_array_equal(actual, raw[rows])
+        calls.clear()
+        actual, _ = reader.read("w", rows)
+        assert calls
+        np.testing.assert_array_equal(actual, weights[rows])
+        calls.clear()
+        for key, raw in (("s", scales), ("b", biases)):
+            actual, _ = reader.read(key, rows)
+            np.testing.assert_array_equal(actual, raw[rows])
+        assert not calls, "weight eviction disabled unrelated resident tensor gathers"
+    finally:
+        reader.close()
