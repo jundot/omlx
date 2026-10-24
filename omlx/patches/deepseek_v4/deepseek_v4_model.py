@@ -26,6 +26,7 @@ from omlx.patches.deepseek_v4.verify_attention import (
     exact_attention,
     exact_local_scores,
     exact_local_values,
+    ring_kernel_is_exact,
     rowwise_gemm,
 )
 from omlx.patches.deepseek_v4.wsdpa_attention import wsdpa_prefill, wsdpa_topk_prefill
@@ -97,6 +98,31 @@ def _batched_m1_attention(
 ) -> mx.array:
     """Attend independent cache views with one decode-consistent kernel."""
     return exact_attention(queries, key_rows, scale, sinks)
+
+
+# Lightning MTP hosts (num_nextn_predict_layers > 0, MTP active at load) run their
+# one-row decode through the same decode-consistent attention paths as embedded
+# DSpark models, so the exact verify forward reproduces decode bitwise. Switch off
+# with set_lightning_decode_consistent(False) to keep stock decode kernels.
+_LIGHTNING_DECODE_CONSISTENT = True
+
+
+def set_lightning_decode_consistent(flag: bool) -> None:
+    global _LIGHTNING_DECODE_CONSISTENT
+    _LIGHTNING_DECODE_CONSISTENT = bool(flag)
+
+
+def _lightning_decode_consistent(config: Any) -> bool:
+    """True when this load attaches a Lightning MTP head whose verify is decode-exact."""
+    if not _LIGHTNING_DECODE_CONSISTENT or _is_dspark_model(config):
+        return False
+    if int(getattr(config, "num_nextn_predict_layers", 0) or 0) <= 0:
+        return False
+    try:
+        from omlx.patches.mlx_lm_mtp import is_mtp_active
+    except Exception:
+        return False
+    return bool(is_mtp_active())
 
 
 def _is_dspark_model(config: Any) -> bool:
@@ -645,6 +671,26 @@ def _sparse_pooled_ring_attention(
     batch, _, length, head_dim = q.shape
     if length != 1:
         raise ValueError("DSpark physical-ring attention requires L=1 rows.")
+    try:
+        from omlx.custom_kernels.attention import fast
+
+        ring_exact = ring_kernel_is_exact(fast)
+    except Exception:
+        ring_exact = False
+    if not ring_exact:
+        # The packed ring kernel is not bitwise equal to one-row decode on this GPU:
+        # materialize the snapshots and take the exact rowwise path.
+        return _sparse_pooled_attention(
+            q,
+            mx.take(local_source, local_indices, axis=0)[:, None],
+            pooled,
+            topk,
+            None,
+            None,
+            scale,
+            sinks,
+            decode_consistent=True,
+        )
     idx = topk[:, None, :, :, None]
     pooled = mx.take_along_axis(
         mx.broadcast_to(
@@ -1575,6 +1621,7 @@ class LocalAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self.decode_consistent = self.dspark or _lightning_decode_consistent(config)
         self.layer_idx = layer_idx
         self.compress_ratio = 0
         self.hidden_size = config.hidden_size
@@ -1643,7 +1690,7 @@ class LocalAttention(nn.Module):
         if cache is not None:
             kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
 
-        if self.dspark and B == 1 and L == 1:
+        if self.decode_consistent and B == 1 and L == 1:
             out = exact_attention(q, [kv], self.scale, sinks)
         else:
             out = None
@@ -1683,6 +1730,7 @@ class CompressedAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self.decode_consistent = self.dspark or _lightning_decode_consistent(config)
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
         self.hidden_size = config.hidden_size
@@ -1798,7 +1846,7 @@ class CompressedAttention(nn.Module):
             and _standard_mask
             and pooled.shape[1] > 0
             and L > 4
-            and not (self.dspark and B == 1 and L == 1)
+            and not (self.decode_consistent and B == 1 and L == 1)
             and _native_sparse_attention_available()
         ):
             pooled_indices = mx.broadcast_to(
@@ -1817,7 +1865,7 @@ class CompressedAttention(nn.Module):
                 q_offset=offset,
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
-                decode_consistent=self.dspark,
+                decode_consistent=self.decode_consistent,
                 native_only=True,
                 _standard_mask=_standard_mask,
             )
@@ -1825,7 +1873,7 @@ class CompressedAttention(nn.Module):
             if pooled.shape[1] > 0:
                 kv = mx.concatenate([kv, pooled[:, None]], axis=2)
             mask = _extend_mask(mask, pooled_mask, kv.shape[2])
-            if self.dspark and B == 1 and L == 1:
+            if self.decode_consistent and B == 1 and L == 1:
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = scaled_dot_product_attention(
@@ -1852,6 +1900,7 @@ class SparseCompressedAttention(nn.Module):
         super().__init__()
         self.config = config
         self.dspark = _is_dspark_model(config)
+        self.decode_consistent = self.dspark or _lightning_decode_consistent(config)
         self.layer_idx = layer_idx
         self.compress_ratio = config.compress_ratios[layer_idx]
         self.hidden_size = config.hidden_size
@@ -1989,6 +2038,7 @@ class SparseCompressedAttention(nn.Module):
                         use_ring_kernel = (
                             fast.is_native_available()
                             and fast.has_symbol("ring_gemm")
+                            and ring_kernel_is_exact(fast)
                         )
                     except Exception:
                         use_ring_kernel = False
@@ -2017,7 +2067,7 @@ class SparseCompressedAttention(nn.Module):
                             None,
                             self.scale,
                             sinks,
-                            decode_consistent=self.dspark,
+                            decode_consistent=self.decode_consistent,
                         )
                 finally:
                     set_dspark_verify_armed(True)
@@ -2053,7 +2103,7 @@ class SparseCompressedAttention(nn.Module):
             )[:, None]
 
         if pooled.shape[1] == 0:
-            if self.dspark and B == 1 and L == 1:
+            if self.decode_consistent and B == 1 and L == 1:
                 out = exact_attention(q, [kv], self.scale, sinks)
             else:
                 out = None
@@ -2079,7 +2129,7 @@ class SparseCompressedAttention(nn.Module):
                         sinks=sinks,
                     )
         elif pooled.shape[1] <= self.indexer.index_topk:
-            if self.dspark and B == 1 and L == 1:
+            if self.decode_consistent and B == 1 and L == 1:
                 full_kv = mx.concatenate([kv, pooled[:, None]], axis=2)
                 out = exact_attention(q, [full_kv], self.scale, sinks)
             else:
@@ -2120,7 +2170,7 @@ class SparseCompressedAttention(nn.Module):
                 q_offset=offset,
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
-                decode_consistent=self.dspark,
+                decode_consistent=self.decode_consistent,
                 _standard_mask=_standard_mask,
             )
 

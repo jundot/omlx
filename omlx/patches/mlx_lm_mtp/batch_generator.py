@@ -68,11 +68,39 @@ def _row_exact_verify(model: Any) -> bool:
     return False
 
 
+def _exact_verify_host(model: Any) -> Optional[Any]:
+    """Return the model object whose verify forward must be decode-exact.
+
+    Embedded DSpark hosts always qualify. A Lightning MTP head on a model
+    whose module ships the DeepSeek exact-verify kernels (``set_dspark_verify_armed``,
+    i.e. ``deepseek_v4``) qualifies too: its multi-row verify would otherwise
+    run MLX's M>1 kernels, whose reduction order differs from one-row decode
+    at rounding level and flips greedy argmax at exact ties.
+    """
+    host = _dspark_host(model)
+    if host is not None:
+        return host
+    import sys
+
+    candidates = [model]
+    for attr in ("language_model", "_language_model"):
+        inner = getattr(model, attr, None)
+        if inner is not None and inner is not model:
+            candidates.append(inner)
+    for candidate in candidates:
+        if not getattr(candidate, "_omlx_mtp_decode_enabled", False):
+            continue
+        module = sys.modules.get(type(candidate).__module__)
+        if getattr(module, "set_dspark_verify_armed", None) is not None:
+            return candidate
+    return None
+
+
 def _set_dspark_target_verify(model: Any, flag: bool) -> None:
     try:
         import sys
 
-        host = _dspark_host(model)
+        host = _exact_verify_host(model)
         if host is None:
             return
         module = sys.modules.get(type(host).__module__)
@@ -2212,21 +2240,24 @@ def _call_backbone_impl(
         kwargs["n_confirmed"] = n_confirmed
     if capture_layer_ids:
         kwargs["capture_layer_ids"] = list(capture_layer_ids)
-    dspark_verify = bool(n_confirmed and _dspark_host(model) is not None)
+    # Decode-exact verify: embedded DSpark hosts and Lightning heads on
+    # deepseek_v4 (see _exact_verify_host) run every projection and attention
+    # row with one-row decode arithmetic, so greedy MTP output equals MTP-off.
+    exact_verify = bool(n_confirmed and _exact_verify_host(model) is not None)
     _rollback_mod.set_undo_armed(True)
     # The affine verify qmm kernel is a Qwen-specific optimization. Keep the
     # DeepSeek target on its architecture-native quantized linear path.
     # Row-exact runs each row as a one-row matvec. Batched decode has no
     # one-row baseline, so B > 1 verify keeps the multi-row kernels.
     _set_verify_qmm_armed(
-        not dspark_verify,
+        not exact_verify,
         row_exact=inputs.shape[0] == 1 and _row_exact_verify(model),
     )
-    _set_dspark_target_verify(model, dspark_verify)
+    _set_dspark_target_verify(model, exact_verify)
     try:
         result = model(inputs, **kwargs)
     finally:
-        if dspark_verify:
+        if exact_verify:
             _set_dspark_target_verify(model, False)
         _set_verify_qmm_armed(False)
         _rollback_mod.set_undo_armed(False)
