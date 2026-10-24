@@ -43,6 +43,7 @@ from omlx.request import Request, SamplingParams
 # GPU timeout. Every other test file stays on a single worker.
 _GPU_SERIAL_TEST_FILES = (
     "test_deepseek_v4*",
+    "test_fused_projection_storage.py",
     "test_glm5_*",
     "test_glm_moe_*",
     "test_mlx_lm_mtp_patch.py",

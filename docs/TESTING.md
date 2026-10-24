@@ -107,6 +107,12 @@ Run `python -m pytest -q tests/test_prefill_transient_tracker.py tests/test_pref
 
 Run `python -m pytest -q tests/test_scheduler.py tests/test_scheduler_boundary_completion.py tests/test_prefix_cache_gdn_split.py` to check cache-freshness admission and completed boundary recovery. The completion tests use a small initialized Qwen3.5 hybrid model and the real BatchGenerator, then compare restored-prefix logits with a fresh forward pass. They cover embedded snapshots, GDN sidecars, exact SpecPrefill static-prefix sidecars, off-boundary completion, and unknown or inconsistent cache positions.
 
+# Fused GDN projection storage
+
+Run `python -m pytest -q tests/test_fused_projection_storage.py tests/test_qwen35_gdn_prework.py` after changing the shared GDN in-projection cache. The allocation regressions exercise both oMLX's operand builder and pinned mlx-vlm's production decode path at 27B geometry. They reject a retained second projection bank. Numerical checks compare decode and 64-row prefill bit for bit across 2/3/4/5/6/8-bit affine storage and FP16/BF16/FP32 scale metadata, and cover cache reuse, weight replacement and unsupported groups.
+
+Run `python tests/bench_fused_projection_storage.py --baseline <main-revision>` for three interleaved ABBA blocks per consumer, three discarded warmups and 20 evaluated warm calls per sample. Report retained allocations, first-fusion peak and warm peak separately. Projection-stage timings do not establish an engine throughput gain. For a real target-MTP model, measure after an initial short request has built the fused banks, then compare an equivalent cold prompt, prefix reuse and decode. Confirm that source projections share the cached operands, and distinguish the initial fusion transient from subsequent request peaks.
+
 # Batch KV capacity tests
 
 Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `omlx/patches/vlm_batch_kv_capacity.py` or bumping the mlx-lm or mlx-vlm pin. The tests load the installed, unpatched cache module next to the patched one and compare cache state and attention output bit for bit through random appends, trims, rollbacks, merges, joins, filters and restores. They cover the mlx-vlm class, the mlx-lm class that prefix restore builds, and a batch that mixes both.
