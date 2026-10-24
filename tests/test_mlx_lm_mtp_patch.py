@@ -6452,6 +6452,43 @@ def test_batch_park_expires_while_cohorts_come_and_go():
     assert mtp_cycles > 0.9 * (6000 - first_mtp) - 5 * 6000 / 50
 
 
+
+def test_batch_park_backoff_survives_cohort_changes():
+    """A cohort that starts after a park ended measures MTP again, and when
+    MTP loses again it parks for the doubled cooldown although the cohort that
+    lost first is gone. A cohort where MTP holds up resets the backoff."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    first = BatchPolicy(range(4), 3)
+    first.park()
+    memory.parked(first)
+    for _ in range(128):
+        memory.tick()
+    later = BatchPolicy(range(4), 3)
+    memory.seed(later)
+    assert later.remaining == 0 and later.needs_standard()
+    later.park()
+    assert later.remaining == 256 and later.cooldown == 512
+    memory.parked(later)
+    for _ in range(256):
+        memory.tick()
+    wider, narrower = BatchPolicy(range(8), 3), BatchPolicy(range(2), 3)
+    memory.seed(wider)
+    memory.seed(narrower)
+    wider.park()
+    narrower.park()
+    # Only cohorts of at least the row count that lost inherit the backoff.
+    assert wider.remaining == 512 and narrower.remaining == 128
+
+    held = BatchPolicy(range(8), 3)
+    held.decisions = 32
+    memory.retired(held)
+    fresh = BatchPolicy(range(4), 3)
+    memory.seed(fresh)
+    fresh.park()
+    assert fresh.remaining == 128
+
 def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
     """A fallback rebuilds rows that draft deeper than the lowered policy depth."""
     advance = fused_batch.advance
