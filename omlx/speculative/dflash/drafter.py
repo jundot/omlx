@@ -70,6 +70,9 @@ class _Cohort:
     keys: list[mx.array]
     values: list[mx.array]
     pos: mx.array
+    # Pending row selection into the current banks. Coalesce removals before
+    # the next draft instead of chaining lazy gathers for every removal.
+    ring_rows: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -375,12 +378,35 @@ class DFlashDrafter:
             row = self._rows.pop(uid, None)
             if row is None:
                 continue
-            self._detach_cohort()
             # Keep the context only while its request can still claim it.
             if row.history and uid in self._uid_requests:
                 self._released[uid] = (row.history, row.history_end)
                 while len(self._released) > _RELEASED_ROWS:
                     self._released.popitem(last=False)
+        cohort = self._cohort
+        if cohort is None:
+            return
+        keep = [i for i, uid in enumerate(cohort.uids) if uid in self._rows]
+        if len(keep) == len(cohort.uids):
+            return
+        if not keep:
+            self._cohort = None
+            return
+        # Keep the survivors batched. Coalesce pending removals as metadata;
+        # the next assembly gathers once on its owning stream. Chained lazy
+        # gathers would allocate every intermediate cohort at the next eval.
+        ring_rows = cohort.ring_rows or tuple(range(len(cohort.uids)))
+        uids = tuple(cohort.uids[i] for i in keep)
+        self._cohort = _Cohort(
+            uids=uids,
+            keys=cohort.keys,
+            values=cohort.values,
+            pos=cohort.pos,
+            ring_rows=tuple(ring_rows[i] for i in keep),
+        )
+        for uid in uids:
+            row = self._rows[uid]
+            row.keys = row.values = row.pos = None
 
     def reset_rows(self) -> None:
         """Forget every row after the batch generator was replaced.
@@ -538,15 +564,25 @@ class DFlashDrafter:
         for index, uid in enumerate(cohort.uids):
             row = self._rows.get(uid)
             if row is not None:
-                row.keys = [layer[index] for layer in cohort.keys]
-                row.values = [layer[index] for layer in cohort.values]
-                row.pos = cohort.pos[index]
+                ring_row = (
+                    index if cohort.ring_rows is None else cohort.ring_rows[index]
+                )
+                row.keys = [layer[ring_row] for layer in cohort.keys]
+                row.values = [layer[ring_row] for layer in cohort.values]
+                row.pos = cohort.pos[ring_row]
         self._cohort = None
 
     def _assemble_cohort(self, uids: Sequence[Any], dtype) -> _Cohort:
         uids = tuple(uids)
         cohort = self._cohort
         if cohort is not None and cohort.uids == uids:
+            if cohort.ring_rows is not None:
+                indices = mx.array(cohort.ring_rows, dtype=mx.uint32)
+                keys = [mx.take(x, indices, axis=0) for x in cohort.keys]
+                values = [mx.take(x, indices, axis=0) for x in cohort.values]
+                pos = mx.take(cohort.pos, indices, axis=0)
+                cohort.keys, cohort.values, cohort.pos = keys, values, pos
+                cohort.ring_rows = None
             return cohort
         self._detach_cohort()
         layers = self.model.layers
@@ -586,6 +622,11 @@ class DFlashDrafter:
             ]
         )
         self._cohort = _Cohort(uids=uids, keys=keys, values=values, pos=pos)
+        # The cohort now owns these rings; stale row copies retain the
+        # previous batch's buffers after the next ring write.
+        for uid in uids:
+            row = self._rows[uid]
+            row.keys = row.values = row.pos = None
         return self._cohort
 
     def _draft_batched(self, rows: Sequence[tuple], counts=None, commit=True):
