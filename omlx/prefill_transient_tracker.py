@@ -13,9 +13,30 @@ from the global PrefillProgressTracker which feeds the admin dashboard.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+# Chunk-size classes for the measured per-token transient rate. A chunk's
+# bytes-per-token is dominated by a near size-invariant per-chunk cost
+# (prefill scratch, ANE buffers, Metal pool churn), so a rate read off a small
+# or throttled chunk must never decide a far larger chunk's prediction
+# (#4057: n=256 chunks read ~5.2MB/token and extrapolated a 4096-token chunk
+# to 27-34GB where the real transient was ~3.5GB; one 118-token tail read
+# 17.9MB/token and predicted 90GB for a 3985-token suffix). The first
+# boundary is the default throttle floor — sub-floor chunks are only sampled
+# once an operator lowers ``_prefill_min_chunk_tokens`` — and the rest keep
+# throttled probe sizes (<=1024) apart from the normal step-range chunks
+# (<=4096) that the throttle actually extrapolates between.
+_SIZE_BUCKET_BOUNDS = (256, 1024, 4096)
+
+
+def _size_bucket_index(n_tokens: int) -> int:
+    """Size class of a chunk: 0 (<=256), 1 (<=1024), 2 (<=4096), 3 (above)."""
+    for index, bound in enumerate(_SIZE_BUCKET_BOUNDS):
+        if n_tokens <= bound:
+            return index
+    return len(_SIZE_BUCKET_BOUNDS)
 
 
 @dataclass
@@ -27,6 +48,12 @@ class _TransientHistory:
     observed_max_bytes: int = 0
     flat_overhead_bytes: int = 0
     reclaim_debt_bytes: int = 0
+    # Size-bucketed rates, keyed by _size_bucket_index(n_tokens). The
+    # size-blind ewma_per_token above stays for reporting/predict(); these
+    # exist so a rate is only reused at a comparable chunk size.
+    bucket_ewma_per_token: dict[int, float] = field(default_factory=dict)
+    bucket_last_delta_bytes: dict[int, int] = field(default_factory=dict)
+    bucket_last_n_tokens: dict[int, int] = field(default_factory=dict)
 
 
 class PrefillTransientTracker:
@@ -34,6 +61,10 @@ class PrefillTransientTracker:
 
     Generic models use token-linear EWMA estimates. Qwen4 uses its static
     profile plus observed allocator overhead that must return after a pool release.
+
+    Measured rates are also kept per chunk-size class
+    (:meth:`bytes_per_token_for_size`) so a small chunk's
+    fixed-cost-dominated rate is never extrapolated to a much larger chunk.
     """
 
     _EWMA_ALPHA = 0.3  # weight on the most recent chunk
@@ -109,9 +140,14 @@ class PrefillTransientTracker:
         A sample whose per-token rate exceeds the current EWMA by more than
         ``_EWMA_OUTLIER_RATIO`` is excluded from the EWMA blend (see that
         constant's docstring) — it still counts toward ``samples`` and
-        still updates ``last_delta_bytes``/``last_n_tokens`` raw, so a
+        still records ``last_delta_bytes``/``last_n_tokens`` raw, so a
         genuine regime change remains visible via those fields even while
         the accumulated EWMA is protected from a single noisy reading.
+
+        The same observation is bucketed by chunk size, and
+        :meth:`bytes_per_token_for_size` re-applies the outlier ratio within
+        its own bucket, so a raw tail reading cannot leak into a prediction
+        even at a matching size class.
         """
         if n_tokens <= 0:
             return
@@ -165,6 +201,22 @@ class PrefillTransientTracker:
         history.samples += 1
         history.last_delta_bytes = transient_bytes
         history.last_n_tokens = n_tokens
+
+        # Same blend, bucketed by chunk size: the size-blind EWMA above
+        # reports one rate per regime, while this one is what the throttle
+        # reuses for chunks of a comparable size (bytes_per_token_for_size).
+        bucket = _size_bucket_index(n_tokens)
+        bucketed = history.bucket_ewma_per_token.get(bucket)
+        if bucketed is None:
+            history.bucket_ewma_per_token[bucket] = per_token
+        elif per_token <= bucketed * self._EWMA_OUTLIER_RATIO:
+            history.bucket_ewma_per_token[bucket] = (
+                self._EWMA_ALPHA * per_token + (1.0 - self._EWMA_ALPHA) * bucketed
+            )
+        # Recorded raw for diagnostics; the reader re-applies the outlier
+        # ratio so a tail cannot bypass the EWMA blend's protection.
+        history.bucket_last_delta_bytes[bucket] = transient_bytes
+        history.bucket_last_n_tokens[bucket] = n_tokens
 
     def observe_flat_overhead(
         self,
@@ -244,6 +296,44 @@ class PrefillTransientTracker:
     def bytes_per_token_for(self, gathered_core: bool) -> float:
         """Return the EWMA for the selected execution regime."""
         return self._history(gathered_core).ewma_per_token
+
+    def bytes_per_token_for_size(self, n_tokens: int, gathered_core: bool) -> float:
+        """Size-bucketed per-token transient rate for a chunk of ``n_tokens``.
+
+        A chunk costs at least as many bytes per token as a larger one: the
+        near size-invariant per-chunk cost amortizes over fewer tokens. An
+        unobserved size class therefore borrows the rate of the smallest
+        observed class above it, the tightest lower bound available, so a
+        chunk the throttle shrinks to still gets priced from measurement
+        instead of the static profile alone. Extrapolating a smaller chunk's
+        rate upward stays forbidden (#4057); the static fallback only applies
+        when nothing larger has been observed.
+
+        The latest raw delta of a measured class is adopted only while it
+        stays inside ``_EWMA_OUTLIER_RATIO`` of that class's EWMA — the
+        protection the EWMA blend applies, which the size-blind
+        ``last_delta/last_n`` term used to bypass.
+        """
+        if n_tokens <= 0:
+            return 0.0
+        history = self._history(gathered_core)
+        bucket = _size_bucket_index(n_tokens)
+        for candidate in range(bucket, len(_SIZE_BUCKET_BOUNDS) + 1):
+            rate = self._bucket_rate(history, candidate)
+            if rate > 0.0:
+                return rate
+        return 0.0
+
+    def _bucket_rate(self, history: _TransientHistory, bucket: int) -> float:
+        """Return the rate measured for one size class, or 0.0 if unobserved."""
+        rate = history.bucket_ewma_per_token.get(bucket, 0.0)
+        last_n = history.bucket_last_n_tokens.get(bucket, 0)
+        last_delta = history.bucket_last_delta_bytes.get(bucket, 0)
+        if last_n > 0 and last_delta > 0:
+            measured = last_delta / last_n
+            if rate <= 0.0 or measured <= rate * self._EWMA_OUTLIER_RATIO:
+                rate = max(rate, measured)
+        return rate
 
     def samples_for(self, gathered_core: bool) -> int:
         """Return the sample count for the selected execution regime."""

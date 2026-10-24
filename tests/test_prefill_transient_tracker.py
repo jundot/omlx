@@ -359,3 +359,80 @@ class TestPoolReleaseAccounting:
         )
         assert tracker.flat_overhead_charge_for(True) == 0
         assert tracker.flat_overhead_charge_for(False) == 3 * 1024**3
+
+
+class TestSizeBucketedRate:
+    """#4057: a per-token rate read off a small or throttled chunk is dominated
+    by a near size-invariant per-chunk cost, so it must only price a chunk of a
+    comparable size."""
+
+    def test_sub_floor_rate_does_not_price_a_step_range_chunk(self):
+        t = PrefillTransientTracker()
+        for transient in (1.28 * 1024**3, 1.32 * 1024**3, 1.33 * 1024**3):
+            t.update(256, int(transient))
+        assert t.bytes_per_token_for_size(256, False) > 0
+        # No 4096-token chunk observed yet: the caller must fall back to its
+        # static estimator instead of extrapolating the 256-token rate.
+        assert t.bytes_per_token_for_size(4096, False) == 0.0
+
+    def test_completion_tail_does_not_pollute_the_step_range_class(self):
+        t = PrefillTransientTracker()
+        for _ in range(4):
+            t.update(2048, 2048 * 1024 * 1024)
+        healthy = t.bytes_per_token_for_size(3985, False)
+        assert healthy > 0
+        t.update(118, 2107 * 1024 * 1024)  # 17.9MB/token completion tail
+        assert t.bytes_per_token_for_size(3985, False) == healthy
+        # The tail stays visible on its own class.
+        assert t.bytes_per_token_for_size(118, False) > healthy
+
+    def test_each_size_class_keeps_its_own_rate(self):
+        t = PrefillTransientTracker()
+        t.update(256, 256 * 1000)
+        t.update(512, 512 * 5000)
+        t.update(2048, 2048 * 9000)
+        assert t.bytes_per_token_for_size(200, False) == 1000
+        assert t.bytes_per_token_for_size(512, False) == 5000
+        assert t.bytes_per_token_for_size(4096, False) == 9000
+        assert t.bytes_per_token_for_size(8192, False) == 0.0
+
+    def test_smaller_chunk_borrows_a_larger_class_rate(self):
+        """Only 2048-token chunks measured: the throttle walking down to
+        1024/512/256 must keep pricing them from that rate. A smaller chunk
+        costs at least as much per token, so falling back to static alone
+        under-predicts and lets a chunk main used to split slip near the cap.
+        """
+        t = PrefillTransientTracker()
+        for _ in range(4):
+            t.update(2048, 2048 * 1024 * 1024)
+        step_rate = t.bytes_per_token_for_size(2048, False)
+        assert step_rate > 0
+        for smaller in (1024, 512, 256, 32):
+            assert t.bytes_per_token_for_size(smaller, False) == step_rate
+
+    def test_static_fallback_only_when_nothing_larger_was_observed(self):
+        t = PrefillTransientTracker()
+        t.update(256, 256 * 1000)
+        # Nothing above the queried class: the caller keeps its static bound.
+        assert t.bytes_per_token_for_size(4096, False) == 0.0
+        t.update(8192, 8192 * 500)
+        # A larger observation is a valid lower bound for 4096.
+        assert t.bytes_per_token_for_size(4096, False) == 500
+
+    def test_outlier_tail_within_a_class_is_still_rejected(self):
+        t = PrefillTransientTracker()
+        t.update(2048, 2048 * 1000)
+        t.update(2048, 2048 * 1000 * 20)  # 20x the class EWMA
+        assert t.bytes_per_token_for_size(2048, False) == 1000
+
+    def test_gathered_and_dense_size_classes_are_independent(self):
+        t = PrefillTransientTracker()
+        t.update(2048, 2048 * 1000, gathered_core=False)
+        t.update(2048, 2048 * 4000, gathered_core=True)
+        assert t.bytes_per_token_for_size(2048, False) == 1000
+        assert t.bytes_per_token_for_size(2048, True) == 4000
+
+    def test_non_positive_size_returns_zero(self):
+        t = PrefillTransientTracker()
+        t.update(2048, 2048 * 1000)
+        assert t.bytes_per_token_for_size(0, False) == 0.0

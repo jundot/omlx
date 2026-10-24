@@ -4736,11 +4736,11 @@ class Scheduler:
     ) -> float:
         """Predict additional memory needed for the next prefill chunk.
 
-        Generic models use the largest static, EWMA, or last-chunk estimate,
-        including recent reclaim. Flat-overhead profiles (Qwen4 QSA, GLM-5.x
-        DSA) use their nonlinear static profile plus observed overhead
-        released from the pool. Retained overhead is already included in
-        current footprint and must not be charged again.
+        Generic models use the largest static estimate, the measured rate for
+        the chunk's own size class, or recent reclaim. Flat-overhead profiles
+        (Qwen4 QSA, GLM-5.x DSA) use their nonlinear static profile plus
+        observed overhead released from the pool. Retained overhead is
+        already included in current footprint and must not be charged again.
         """
         if n_tokens <= 0:
             return 0.0
@@ -4769,17 +4769,17 @@ class Scheduler:
             # Dense SDPA and gathered QSA have different cost curves. The
             # tracker keeps their measured histories separate, so switching
             # paths cannot reintroduce a stale dense charge after the first
-            # gathered sample.
-            ewma = tracker.bytes_per_token_for(gathered_core)
+            # gathered sample. The rate is also bucketed by chunk size: a
+            # per-token rate read off a small or throttled chunk is dominated
+            # by a near size-invariant per-chunk cost, so it is only reused
+            # for a chunk of a comparable size (#4057). A smaller chunk borrows
+            # the nearest larger measurement, because it costs at least as much
+            # per token; only when nothing larger was observed does the static
+            # profile stand alone.
             recent_reclaim = tracker.recent_reclaim_bytes
-            if ewma > 0:
-                per_token = max(per_token, ewma)
-            last_n_tokens = tracker.last_n_tokens_for(gathered_core)
-            last_delta_bytes = tracker.last_delta_bytes_for(gathered_core)
-            if last_n_tokens > 0 and last_delta_bytes > 0:
-                measured = last_delta_bytes / last_n_tokens
-                if measured > 0:
-                    per_token = max(per_token, measured)
+            measured_rate = tracker.bytes_per_token_for_size(n_tokens, gathered_core)
+            if measured_rate > 0:
+                per_token = max(per_token, measured_rate)
         base_prediction = per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
         reallocation_prediction = (
             static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY

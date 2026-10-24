@@ -138,8 +138,12 @@ def _throttle_ctx(
     reclaim drops `current` to."""
     tracker = PrefillTransientTracker()
     if samples_bpt is not None:
-        # Seed with one observation: sets last_delta/last_n AND the EWMA.
-        tracker.update(1, int(samples_bpt))
+        # Seed one step-range observation: sets last_delta/last_n AND the
+        # EWMA for the 1024-4096 class. The predictor is size-bucketed
+        # (#4057), and a smaller chunk borrows that rate because it costs at
+        # least as much per token, so shrinking below the step range stays
+        # priced while a larger chunk still falls back to static.
+        tracker.update(2048, int(samples_bpt * 2048))
     ns = SimpleNamespace(
         _memory_limit_bytes=int(hard * 0.85),  # soft = ceiling*0.85
         _memory_hard_limit_bytes=int(hard),
@@ -657,6 +661,84 @@ def test_qwen4_measured_excess_is_flat_not_scaled_to_the_next_chunk():
         + tracker.flat_overhead_charge_for(True)
     )
     assert predicted < 20 * _GB / measured_tokens * candidate
+
+
+def test_throttled_down_chunk_borrows_the_step_range_rate():
+    """Review on #4681: with only 2048-token chunks measured, the throttle
+    walking down to 1024/512/256 must keep pricing them from that rate. A
+    smaller chunk costs at least as much per token, so static alone
+    under-predicts and a chunk main used to split could be submitted near
+    the cap."""
+    monitor = _monitor(head_dim=192)
+    tracker = PrefillTransientTracker()
+    step_rate = 2 * 1024**2
+    for _ in range(4):
+        tracker.update(2048, int(step_rate * 2048))
+    ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+
+    for smaller in (1024, 512, 256, 32):
+        static = monitor.estimate_chunk_transient_bytes(smaller, smaller)
+        static += monitor.estimate_prompt_kv_bytes(smaller)
+        predicted = ns._predicted_chunk_transient(smaller, 0)
+        assert predicted == pytest.approx(
+            step_rate * smaller * Scheduler._PREFILL_TRANSIENT_SAFETY,
+            rel=1e-6,
+        )
+        assert predicted > static
+
+
+def test_small_chunk_rate_is_not_extrapolated_to_a_large_chunk():
+    """#4057 Case 1: three 256-token chunks each cost ~1.3GB whatever their
+    token count. Extrapolating that ~5.2MB/token rate priced the next
+    4096-token chunk at 27-34GB — its real transient was ~3.5GB — so the
+    throttle shrank the chunk and released ANE banks for nothing."""
+    monitor = _monitor(head_dim=192)
+    tracker = PrefillTransientTracker()
+    for transient_gb in (1.28002, 1.31700, 1.33000):
+        tracker.update(256, int(transient_gb * _GB))
+    ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+
+    candidate = 4096
+    predicted = ns._predicted_chunk_transient(candidate, 0)
+    # No 4096-class observation yet, and a sub-floor rate says nothing about a
+    # 4096-token chunk, so the static profile is the only signal left.
+    assert predicted == pytest.approx(
+        (
+            monitor.estimate_chunk_transient_bytes(candidate, candidate)
+            + monitor.estimate_prompt_kv_bytes(candidate)
+        )
+        * Scheduler._PREFILL_TRANSIENT_SAFETY,
+        rel=1e-6,
+    )
+    assert predicted < 8 * _GB  # was ~27.7GB before the fix
+
+
+def test_completion_tail_does_not_extrapolate_to_the_suffix():
+    """#4057 Case 2: a 118-token completion tail cost 2107.55MB (17.9MB/token)
+    and priced the next 3985-token suffix at 90GB. The healthy 2048-token
+    chunks observed before it must price that suffix instead, so adding the
+    tail must not move the suffix prediction at all."""
+    monitor = _monitor(head_dim=192)
+    tracker = PrefillTransientTracker()
+    for _ in range(4):
+        tracker.update(2048, int(1.1 * 1024**2 * 2048))
+    ns = _throttle_ctx(current=0, hard=240 * _GB, samples_bpt=None, monitor=monitor)
+    ns._prefill_transient_tracker = tracker
+
+    suffix = 3985
+    healthy_prediction = ns._predicted_chunk_transient(suffix, 16384)
+
+    tracker.update(118, int(2107.55 * 1024**2))  # 17.9MB/token tail
+    # The tail is a different size class than the suffix (the 118-token chunk
+    # is sub-floor, 2048 and 3985 are both in the 1024-4096 class), so it must
+    # not leak into the suffix rate.
+    assert ns._predicted_chunk_transient(suffix, 16384) == healthy_prediction
+    assert tracker.bytes_per_token_for_size(3985, False) == (
+        tracker.bytes_per_token_for_size(2048, False)
+    )
+    assert healthy_prediction < 15 * _GB  # was ~90GB before the fix
 
 
 @pytest.mark.parametrize(
