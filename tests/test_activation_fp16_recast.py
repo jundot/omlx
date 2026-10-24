@@ -119,3 +119,21 @@ def test_cast_is_all_or_nothing_when_a_chunk_fails(monkeypatch):
     except RuntimeError:
         pass
     assert model.a.dtype == mx.bfloat16 and model.b.dtype == mx.bfloat16
+
+
+def test_cast_keeps_bf16_when_a_value_exceeds_the_float16_range():
+    model = _toy_quantized_model()
+    norm = model.layers[1]
+    norm.weight = mx.full(norm.weight.shape, 70000.0).astype(mx.bfloat16)
+    mx.eval(norm.weight)
+    before = {key: value.dtype for key, value in tree_flatten(model.parameters())}
+
+    try:
+        cast_bf16_params_to_fp16(model)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an out-of-range bfloat16 tensor must abort the cast")
+
+    after = {key: value.dtype for key, value in tree_flatten(model.parameters())}
+    assert after == before

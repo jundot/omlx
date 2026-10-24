@@ -1625,7 +1625,8 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
     Conversion is evaluated in the same bounded chunks materialize_lazy_state
     uses (one command buffer per chunk). The cast is all-or-nothing: the model
     tree is updated only after every chunk converted, so a failure part-way
-    leaves the model entirely in bfloat16 (never mixed). Peak memory is the
+    leaves the model entirely in bfloat16 (never mixed). A tensor with a finite
+    value outside the float16 range (> 65504) aborts the whole cast the same way. Peak memory is the
     bfloat16 originals plus the float16 copies of the NON-quantized leaves
     only (scales, biases, norms, embeddings) — a small fraction of an
     oQ checkpoint; the originals are freed when this function returns.
@@ -1641,8 +1642,13 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
     ]
     converted = []
     for start in range(0, len(pending), _MATERIALIZE_EVAL_CHUNK):
-        chunk = [(key, value.astype(mx.float16)) for key, value in pending[start : start + _MATERIALIZE_EVAL_CHUNK]]
-        mx.eval([value for _, value in chunk])
+        originals = pending[start : start + _MATERIALIZE_EVAL_CHUNK]
+        chunk = [(key, value.astype(mx.float16)) for key, value in originals]
+        # A finite bfloat16 value above 65504 would become inf in float16.
+        overflow = [mx.any(mx.isinf(new) & mx.isfinite(old)) for (_, old), (_, new) in zip(originals, chunk)]
+        mx.eval([value for _, value in chunk] + overflow)
+        if any(bool(flag.item()) for flag in overflow):
+            raise ValueError("a bfloat16 tensor exceeds the float16 range")
         converted.extend(chunk)
     if converted:
         model.update(tree_unflatten(converted))
