@@ -4812,7 +4812,7 @@ class Scheduler:
                 # overhead only after the pool releases it for reallocation.
                 return (
                     static_per_token * n_tokens * self._PREFILL_TRANSIENT_SAFETY
-                    + tracker.flat_overhead_charge_for(gathered_core)
+                    + tracker.flat_overhead_charge_for(gathered_core, n_tokens)
                 )
             # Dense SDPA and gathered QSA have different cost curves. The
             # tracker keeps their measured histories separate, so switching
