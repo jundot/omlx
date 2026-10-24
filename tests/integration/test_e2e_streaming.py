@@ -4991,6 +4991,60 @@ async def test_withheld_prose_after_delivered_call_is_not_recovered():
     assert len(_recovery_calls(events, "chat")) == 1
 
 
+def _recovery_filter(raw):
+    """Feed a whole response through a live content filter with early envelope
+    capture on, the way a streamed chat turn does."""
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+    from omlx.api.tool_calling import ToolCallStreamFilter
+
+    tokenizer = MockTokenizer()
+    tokenizer.has_tool_calling = True
+    tokenizer.tool_call_start = "<tool_call>"
+    tokenizer.tool_call_end = "</tool_call>"
+    tokenizer.tool_parser = parse_tool_call
+    filt = ToolCallStreamFilter(
+        tokenizer, tools=_RECOVERY_TOOLS, capture_ordered_segments=True
+    )
+    filt.feed(raw)
+    filt.finish()
+    return filt
+
+
+def test_streamed_call_does_not_block_prose_recovery_without_terminal_call():
+    # The streaming state of the logged request: the filter already streamed
+    # a complete envelope, then withheld a quoted-marker tail, and the
+    # terminal parser produced no call for the response. Recovery used to
+    # refuse on the streamed calls alone, failing the leg where the
+    # non-streaming twin of the same output recovered the prose.
+    from omlx.server import _take_recoverable_withheld_text
+
+    filt = _recovery_filter(_RECOVERY_CALL + " then " + _RECOVERY_PROSE)
+    assert any(s.kind == "envelope" for s in filt.take_ordered_segments())
+
+    thinking, content = _take_recoverable_withheld_text(
+        filt, None, None, ("incomplete",)
+    )
+
+    assert thinking == ""
+    assert "This sentence must survive. END" in content
+
+
+def test_streamed_call_does_not_launder_a_withheld_payload():
+    # A streamed call must not open the gate for a payload-shaped tail: a
+    # genuinely truncated sibling call stays a failure.
+    from omlx.server import _take_recoverable_withheld_text
+
+    filt = _recovery_filter(_RECOVERY_CALL + " then " + _RECOVERY_TRUNCATED_JSON)
+    assert any(s.kind == "envelope" for s in filt.take_ordered_segments())
+
+    thinking, content = _take_recoverable_withheld_text(
+        filt, None, None, ("incomplete",)
+    )
+
+    assert (thinking, content) == ("", "")
+
+
 @pytest.mark.asyncio
 async def test_recovered_prose_reaches_responses_final_text():
     events = await _recovery_stream(_RECOVERY_PROSE, "responses")

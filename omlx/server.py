@@ -6207,24 +6207,24 @@ def _take_recoverable_withheld_text(
     thinking_filter: ToolCallStreamFilter | None,
     tool_calls: object,
     parse_errors: tuple,
-    streamed_tool_calls: list | None = None,
 ) -> tuple[str, str]:
     """Drain withheld envelope text and return the (thinking, content) to emit.
 
     A marker quoted in prose fails parsing as "incomplete" like a truncated
-    call. Recover the text only when no call was produced, every error is
-    "incomplete" and no withheld opener in either channel starts a payload.
+    call. Recover the text only when the terminal parser produced no call,
+    every error is "incomplete" and no withheld opener in either channel
+    starts a payload. Calls the stream already delivered don't block recovery:
+    their envelope closed and validated at stream time, so they are not the
+    failed call this failure is about, and the prose after them is exactly the
+    text the non-streaming twin of the same request would return.
     """
     is_payload = any(
         f.recovery_candidate_is_payload() for f in (tool_filter, thinking_filter) if f
     )
     thinking = thinking_filter.take_recovery_candidate() if thinking_filter else ""
     content = tool_filter.take_recovery_candidate() if tool_filter else ""
-    if (
-        tool_calls
-        or streamed_tool_calls
-        or any(error != "incomplete" for error in parse_errors)
-        or (parse_errors and is_payload)
+    if tool_calls or any(error != "incomplete" for error in parse_errors) or (
+        parse_errors and is_payload
     ):
         return "", ""
     return thinking, content
@@ -6791,7 +6791,7 @@ async def stream_chat_completion(
     # recover a structured tool call. The candidate begins at the opening marker,
     # so prose already streamed before it is never duplicated.
     recovered_thinking, recovered_content = _take_recoverable_withheld_text(
-        tool_filter, thinking_filter, tool_calls, parse_errors, streamed_tool_calls
+        tool_filter, thinking_filter, tool_calls, parse_errors
     )
     if recovered_thinking or recovered_content:
         # The marker was quoted in prose, so this is not a failed tool call.
