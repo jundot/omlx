@@ -1690,15 +1690,14 @@ class HFDownloader(_QueuePersistenceMixin):
         repo_id = old_task.repo_id
         old_retry_count = old_task.retry_count
 
-        # Remove old task entry
-        del self._tasks[task_id]
-        self._cancelled.discard(task_id)
-
         # Start fresh download (snapshot_download resumes from existing files).
-        # An empty retry token keeps the stored one.
+        # An empty retry token keeps the stored one. If it raises, the old
+        # row stays so the user can retry later.
         new_task = await self.start_download(
             repo_id, hf_token or old_task.token, files=old_task.files
         )
+        del self._tasks[task_id]
+        self._cancelled.discard(task_id)
         new_task.retry_count = old_retry_count + 1
         self._persist()
         return new_task

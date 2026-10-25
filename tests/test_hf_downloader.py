@@ -3631,6 +3631,37 @@ class TestRetryDownload:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
+    async def test_retry_refused_keeps_the_old_row(self, downloader, blocked_worker):
+        """A retry refused because the repo is already downloading must not
+        drop the failed or cancelled row it was asked to retry."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=blocked_worker.call,
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            old = DownloadTask(
+                task_id="t-old",
+                repo_id="owner/model",
+                status=DownloadStatus.CANCELLED,
+            )
+            downloader._tasks[old.task_id] = old
+            await downloader.start_download("owner/model")
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
+
+            with pytest.raises(ValueError, match="already in progress"):
+                await downloader.retry_download(old.task_id)
+
+            assert downloader._tasks.get(old.task_id) is old
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
     async def test_retry_nonexistent_raises(self, downloader):
         """Retrying a nonexistent task should raise ValueError."""
         with pytest.raises(ValueError, match="not found"):
