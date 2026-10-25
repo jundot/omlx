@@ -95,7 +95,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -1287,6 +1287,14 @@ def _get_kernel(kind: str):
         return kernel
 
 
+@cache
+def _gpu_class() -> str:
+    try:
+        return str(mx.device_info().get("architecture", ""))[-1:]
+    except Exception:
+        return ""
+
+
 def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
     """Kernel configuration for a call (mean rows per expert and K).
 
@@ -1295,7 +1303,9 @@ def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
 
     - fewer than 36 rows per expert, or K < 1024 (a short down projection)
       below 120 rows: weight streaming dominates; 64-row db tiles in mlx's
-      (column, tile) layout;
+      (column, tile) layout. On a 40-core M5 Max (GPU class 's') the short
+      down projection takes the tile-on-x layout instead (4-15% faster from
+      5 to 60 rows per expert, Qwen3.8);
     - 36-47 rows: 64-row db tiles, tile-on-x layout (+10%);
     - 48-95 rows: 96-row db tiles, tile-on-x layout (+3-26%);
     - 96+ rows (K >= 1024): 128-row seg tiles with 128-deep K steps and 8 KB
@@ -1308,7 +1318,9 @@ def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
     if K % 64 or N % 64:
         return Plan(_SCHED_SEG, 64, 64, 0, 0)
     per_expert = rows / max(1, experts)
-    if per_expert < 36 or (K < 1024 and per_expert < 120):
+    if K < 1024 and per_expert < 120:
+        return Plan(_SCHED_DB, 64, 64, _GX if _gpu_class() == "s" else 0, 0)
+    if per_expert < 36:
         return Plan(_SCHED_DB, 64, 64, 0, 0)
     if K < 1024:
         return Plan(_SCHED_SEG, 96, 128, _GX, 0)

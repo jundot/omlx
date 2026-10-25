@@ -199,6 +199,20 @@ def _plan_id(plan):
     return plan.describe().replace(" ", "-")
 
 
+@pytest.mark.parametrize("gpu_class", ["d", "s"])
+def test_plan_layout_of_the_short_down_projection(gpu_class, monkeypatch):
+    """A 40-core M5 Max ('s') runs the short down projection (K < 1024) below
+    120 rows per expert in the tile-on-x layout; other shapes and GPU classes
+    keep their plans."""
+    monkeypatch.setattr(nax, "_gpu_class", lambda: gpu_class)
+    gx = nax._GX if gpu_class == "s" else 0
+    for rows in (512 * 5, 512 * 40, 512 * 119):
+        assert nax._plan(rows, 512, 640, 2560) == P(DB, 64, 64, gx, 0)
+    assert nax._plan(512 * 120, 512, 640, 2560) == P(SEG, 96, 128, nax._GX, 0)
+    assert nax._plan(512 * 20, 512, 2560, 1280) == P(DB, 64, 64, 0, 0)
+    assert nax._plan(512 * 80, 512, 2560, 1280) == P(DB, 96, 64, nax._GX, 0)
+
+
 @pytest.fixture(params=_PLANS, ids=_plan_id)
 def forced_plan(request, monkeypatch):
     """Run a test with every configuration pinned in place of ``_plan``."""
