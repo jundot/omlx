@@ -4480,6 +4480,43 @@ class TestDownloadSpeed:
         assert observed > 0, "wire traffic must show while the disk is idle"
         assert task.speed_bps == 0.0  # terminal tasks publish 0
 
+    @pytest.mark.asyncio
+    async def test_block_allocation_ahead_of_writes_does_not_spike(
+        self, model_dir, monkeypatch
+    ):
+        """APFS can allocate a file's blocks well ahead of the bytes written:
+        the readout must follow the reported bytes, not the allocation."""
+        downloader, task = _downloading_task(
+            model_dir, task_id="t-alloc", total_size=10_000_000_000
+        )
+        state = {"logical": 0, "allocated": 0}
+
+        def scan(_path, _only=None):
+            state["logical"] += 100_000
+            state["allocated"] += 100_000_000
+            return _DownloadActivity(
+                file_count=1,
+                logical_size=state["logical"],
+                allocated_size=state["allocated"],
+                latest_mtime_ns=1,
+                files={"payload": state["allocated"]},
+            )
+
+        with patch.object(downloader, "_get_download_activity", side_effect=scan):
+            poll = start_poll(monkeypatch, downloader, task, model_dir)
+            started_at, started_bytes = time.monotonic(), state["logical"]
+            observed = 0.0
+            for _ in range(10):
+                await asyncio.sleep(0.02)
+                observed = max(observed, task.speed_bps)
+            reported_bps = (state["logical"] - started_bytes) / (
+                time.monotonic() - started_at
+            )
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert 0 < observed < 2 * reported_bps
+
 # =============================================================================
 # Progress Reads Both Pipeline Stages (fetch = wire, reconstruction = disk)
 # =============================================================================

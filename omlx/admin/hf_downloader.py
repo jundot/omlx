@@ -2129,6 +2129,9 @@ class HFDownloader(_QueuePersistenceMixin):
         speed_meter.add(last_activity.files, now=last_activity_at)
         wire_meter = _WireSpeedMeter()
         wire_meter.add(wire.value, now=last_activity_at)
+        # Allocated blocks can jump ahead of the bytes written, so the readout
+        # never exceeds how fast the reported bytes move.
+        reported_meter = _WireSpeedMeter()
         # Rate of the reported bytes, so a disk flush of fetched bytes does not
         # count twice. Fed from the first moving tick to skip startup idle time.
         eta_meter = _WireSpeedMeter(window=_ETA_WINDOW)
@@ -2164,8 +2167,9 @@ class HFDownloader(_QueuePersistenceMixin):
 
                 disk_bps = speed_meter.add(activity.files)
                 wire_bps = wire_meter.add(wire_now)
+                reported_bps = reported_meter.add(task.downloaded_size)
                 # Both meters see the same payload, so never sum them.
-                task.speed_bps = max(disk_bps, wire_bps)
+                task.speed_bps = min(max(disk_bps, wire_bps), reported_bps)
                 if eta_started_at is None and task.speed_bps > 0:
                     eta_started_at = time.monotonic()
                 if eta_started_at is not None:
