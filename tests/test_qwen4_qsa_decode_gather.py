@@ -1101,8 +1101,7 @@ def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch, key_len):
         mx.eval(fast, ops)
         assert mx.array_equal(fast.view(mx.uint16), ops.view(mx.uint16)).item(), step
     assert ran["mask"] == 6
-    if qsa_fast._gpu_class() == "d":
-        assert ran["sdpa"] == 6
+    assert ran["sdpa"] == (6 if qsa_fast._two_pass_blocks(12, key_len + 1) else 0)
     for fast_state, ops_state in zip(fast_cache.state, ops_cache.state):
         assert mx.array_equal(fast_state, ops_state).item()
     pooled = fast_cache._pooled_index_offset
@@ -1112,21 +1111,27 @@ def test_decode_steps_match_the_ops_path_bit_for_bit(monkeypatch, key_len):
     ).item()
 
 
-@pytest.mark.skipif(
-    qsa_fast._gpu_class() != "d",
-    reason="MLX's two-pass partition count is transcribed for 'd'-class GPUs only",
-)
 @pytest.mark.parametrize(
     "key_len",
     [
         2052,
-        16383,  # last 128-partition length
-        16384,  # first 512-partition length
-        65536,  # first 1024-partition length
+        8192,  # 's': MLX's own kernel through 8192 keys
+        8193,  # 's': first 256-partition length
+        16383,  # 'd': last 128-partition length
+        16384,  # 'd': first 512-partition length
+        32768,  # 's': last 256-partition length
+        32769,  # 's': first 512-partition length
+        65536,  # 'd': first 1024-partition length; 's': last 512
+        65537,  # 's': first 1024-partition length
     ],
 )
 @pytest.mark.parametrize("kind", ["qsa", "sparse_head", "all"])
 def test_masked_decode_sdpa_matches_mlx_bit_for_bit(key_len, kind):
+    if qsa_fast._two_pass_blocks(12, key_len) is None:
+        assert qsa_fast._gpu_class() != "d" and not (
+            qsa_fast._gpu_class() == "s" and key_len > 8192
+        )
+        pytest.skip("MLX's own kernel runs this length on this GPU class")
     rng = np.random.default_rng(key_len)
     capacity = key_len + 777
     # Cache-shaped views: a prefix of a larger buffer, as update_and_fetch returns.

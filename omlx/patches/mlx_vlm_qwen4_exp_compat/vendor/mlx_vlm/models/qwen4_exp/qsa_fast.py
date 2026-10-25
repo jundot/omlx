@@ -386,8 +386,9 @@ def decode_block_selection_tokens(
 # transcribed, except that a partition first ballots its mask bytes 32 at a
 # time and then visits only the selected keys, in the same increasing order:
 # same partitions, same visiting order, same float operations, same bits.
-# The partition count is MLX's rule for the GPU class; only the 'd' class is
-# transcribed (and verified), other GPUs keep MLX.
+# The partition count is MLX's rule for the GPU class, transcribed (and
+# verified) for the 'd' class and, above 8192 keys, the 's' class (below that
+# MLX's own kernel is as fast there); other GPUs keep MLX.
 _DECODE_SDPA_DISABLED = False
 _DECODE_SDPA_KERNELS: list = []
 _DECODE_SDPA_VALIDATED: set[tuple] = set()
@@ -534,15 +535,22 @@ def _gpu_class() -> str:
 
 
 def _two_pass_blocks(n_simds: int, keys: int) -> int | None:
-    """MLX 0.32.2's sdpa_vector_2pass partition count; None where not transcribed."""
+    """MLX 0.32's sdpa_vector_2pass partition count; None where not transcribed."""
 
-    if _gpu_class() != "d" or n_simds < 6:
-        return None
-    if keys < 16384:
-        return 128
-    if keys < 65536:
-        return 512
-    return 1024
+    gpu = _gpu_class()
+    if gpu == "d" and n_simds >= 6:
+        if keys < 16384:
+            return 128
+        if keys < 65536:
+            return 512
+        return 1024
+    if gpu == "s" and n_simds > 4 and keys > 8192:
+        if keys <= 32768:
+            return 256
+        if keys <= 65536:
+            return 512
+        return 1024
+    return None
 
 
 def masked_decode_sdpa(
