@@ -219,6 +219,60 @@ def test_qsa_ephemeral_pool_rebuilds_after_restore_extract_and_trim():
     assert mx.array_equal(rebuilt, expected).item()
 
 
+def _pools(cache, tag):
+    args = (4, lambda x: x, _identity_rope)
+    return (
+        cache.pooled_indexer_keys(*args, cache_tag=tag),
+        cache.pooled_indexer_keys_f32(*args, cache_tag=tag),
+    )
+
+
+def _assert_fp32_bank(bank, fp32):
+    mx.eval(bank, fp32)
+    assert fp32.dtype == mx.float32 and fp32.shape == bank.shape
+    assert mx.array_equal(fp32, bank.astype(mx.float32)).item()
+
+
+def test_fp32_bank_follows_the_pool_through_growth_trim_and_invalidation():
+    """The FP32 bank holds the pooled bank's values while blocks complete, past
+    a capacity growth, after a trim re-pools the tail, and after the pool is
+    rebuilt for another tag."""
+    cache = language.QSAKVCache()
+    raw = mx.sin(mx.arange(8300 * 8, dtype=mx.float32)).reshape(1, 8300, 8)
+    raw = raw.astype(mx.bfloat16)
+    start = 0
+    for stop in (13, 4000, 8195, 8300):  # 2048 blocks fill the first capacity
+        _append(cache, raw, start, stop)
+        _assert_fp32_bank(*_pools(cache, cache))
+        start = stop
+    assert cache._pooled_index_keys_f32.shape == cache._pooled_index_keys.shape
+
+    assert cache.trim(110) == 110  # 8190 tokens: 2047 complete blocks
+    assert cache._pooled_index_f32_offset == 2047
+    replacement = mx.cos(mx.arange(110 * 8, dtype=mx.float32)).reshape(1, 110, 8)
+    replaced = mx.concatenate([raw[:, :8190], replacement.astype(mx.bfloat16)], axis=1)
+    _append(cache, replaced, 8190, 8300)
+    _assert_fp32_bank(*_pools(cache, cache))
+
+    _assert_fp32_bank(*_pools(cache, object()))
+
+
+def test_portable_scores_from_the_fp32_bank_keep_their_bits():
+    """Decode's portable head scores read the FP32 bank with the bits they had
+    when they cast the pooled bank on every call."""
+    mx.random.seed(911)
+    cache = language.QSAKVCache()
+    raw = mx.random.normal((1, 6003, 128)).astype(mx.bfloat16)
+    _append(cache, raw, 0, 6003)
+    bank, fp32 = _pools(cache, cache)
+    queries = mx.random.normal((1, 1, 4, 128)).astype(mx.bfloat16)
+    expected = qsa_fast._portable_indexer_head_scores(queries, bank, 128)
+    actual = qsa_fast._portable_indexer_head_scores(queries, fp32, 128)
+    mx.eval(expected, actual)
+    assert actual.shape == expected.shape == (1, 1, 4, 6003 // 4)
+    assert mx.array_equal(actual.view(mx.uint32), expected.view(mx.uint32)).item()
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_portable_qsa_flattened_gemm_is_exactly_the_broadcast_reference(dtype):
     mx.random.seed(909)

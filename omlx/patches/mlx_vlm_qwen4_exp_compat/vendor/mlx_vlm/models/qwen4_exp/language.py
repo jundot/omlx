@@ -387,6 +387,8 @@ class _QSAIndexerCache:
         self._pooled_index_offset = 0
         self._pooled_index_ratio = None
         self._pooled_index_tag = None
+        self._pooled_index_keys_f32 = None
+        self._pooled_index_f32_offset = 0
 
     def pooled_indexer_keys(
         self,
@@ -454,6 +456,36 @@ class _QSAIndexerCache:
             )
         return self._pooled_index_keys[:, : self._pooled_index_offset]
 
+    def pooled_indexer_keys_f32(
+        self,
+        compress_ratio: int,
+        index_key_norm,
+        apply_index_rope,
+        *,
+        cache_tag=None,
+    ) -> mx.array:
+        """The completed block bank in FP32, the portable score GEMM's operand:
+        each block is cast once, as it completes, instead of the whole bank on
+        every decode step. The values are the bank's, exactly."""
+
+        pooled = self.pooled_indexer_keys(
+            compress_ratio, index_key_norm, apply_index_rope, cache_tag=cache_tag
+        )
+        bank = self._pooled_index_keys
+        if bank is None:
+            return pooled.astype(mx.float32)
+        offset = self._pooled_index_offset
+        mirror = self._pooled_index_keys_f32
+        start = self._pooled_index_f32_offset
+        if mirror is None or mirror.shape != bank.shape:
+            mirror = mx.zeros(bank.shape, dtype=mx.float32)
+            start = 0
+        if start < offset:
+            mirror[:, start:offset] = bank[:, start:offset].astype(mx.float32)
+        self._pooled_index_keys_f32 = mirror
+        self._pooled_index_f32_offset = offset
+        return mirror[:, :offset]
+
     def _trim_indexer(self, length: int):
         self._index_offset = min(self._index_offset, max(0, int(length)))
         # Trim leaves completed prefix blocks intact; only re-pool the new tail.
@@ -461,6 +493,9 @@ class _QSAIndexerCache:
             self._pooled_index_offset = min(
                 self._pooled_index_offset,
                 self._index_offset // self._pooled_index_ratio,
+            )
+            self._pooled_index_f32_offset = min(
+                self._pooled_index_f32_offset, self._pooled_index_offset
             )
         else:
             self._invalidate_pooled_indexer()
@@ -472,6 +507,7 @@ class _QSAIndexerCache:
             self._index_keys,
             self._index_position_ids,
             self._pooled_index_keys,
+            self._pooled_index_keys_f32,
         ):
             if array is not None:
                 size += array.nbytes
@@ -2132,7 +2168,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ).transpose(0, 2, 1, 3)
         raw_index_keys = projected[:, :, self.indexer.n_heads :].squeeze(2)
         cache.update_indexer(raw_index_keys, text_position_ids)
-        pooled_index_keys = cache.pooled_indexer_keys(
+        pooled_index_keys = cache.pooled_indexer_keys_f32(
             self.indexer.compress_ratio,
             self.indexer.k_layernorm,
             self.indexer._apply_rope,
@@ -2250,7 +2286,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             row_keys = keys[..., :key_tokens, :]
             row_values = values[..., :key_tokens, :]
             if key_tokens // self.indexer.compress_ratio > self.indexer.block_topk:
-                pooled_index_keys = cache.pooled_indexer_keys(
+                pooled_index_keys = cache.pooled_indexer_keys_f32(
                     self.indexer.compress_ratio,
                     self.indexer.k_layernorm,
                     self.indexer._apply_rope,
