@@ -2427,8 +2427,7 @@ def init_server(
     response_state_dir = None
     if global_settings:
         response_state_dir = (
-            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
-            / "response-state"
+            global_settings.get_active_ssd_cache_dir() / "response-state"
         )
     _server_state.responses_store = ResponseStore(state_dir=response_state_dir)
 

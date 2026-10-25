@@ -1081,6 +1081,7 @@ class GlobalSettings:
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
+    _active_ssd_cache_dir: Path | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def load(
@@ -1607,14 +1608,55 @@ class GlobalSettings:
         persisted._apply_cli_overrides(args, include_api_key=False)
         persisted.save()
 
+    def get_active_ssd_cache_dir(self) -> Path:
+        """Return the cache directory selected during directory initialization."""
+        return self._active_ssd_cache_dir or self.cache.get_ssd_cache_dir(
+            self.base_path
+        )
+
     def ensure_directories(self) -> None:
         """Create necessary directories if they don't exist."""
         from .model_discovery import model_directory_access_error
 
+        configured_cache = self.cache.get_ssd_cache_dir(self.base_path)
+        fallback_cache = (resolve_default_base_path() / "cache").resolve()
+        first_directory_check = self._active_ssd_cache_dir is None
+        self._active_ssd_cache_dir = configured_cache
+
+        try:
+            configured_cache.mkdir(parents=True, exist_ok=True)
+            if (
+                first_directory_check
+                and configured_cache != fallback_cache
+                and fallback_cache.exists()
+            ):
+                try:
+                    import shutil
+
+                    shutil.rmtree(fallback_cache)
+                    logger.info("Removed fallback SSD cache at %s", fallback_cache)
+                except OSError as e:
+                    logger.warning(
+                        "Failed to remove fallback SSD cache %s: %s",
+                        fallback_cache,
+                        e,
+                    )
+        except OSError as e:
+            if configured_cache.resolve() == fallback_cache:
+                logger.error(f"Failed to create directory {configured_cache}: {e}")
+                raise
+            logger.warning(
+                "Configured SSD cache unavailable at %s; using fallback %s: %s",
+                configured_cache,
+                fallback_cache,
+                e,
+            )
+            fallback_cache.mkdir(parents=True, exist_ok=True)
+            self._active_ssd_cache_dir = fallback_cache
+
         # Required directories - fatal if creation fails
         required = [
             self.base_path,
-            self.cache.get_ssd_cache_dir(self.base_path),
             self.logging.get_log_dir(self.base_path),
         ]
 
@@ -1937,8 +1979,20 @@ class GlobalSettings:
         # Always resolve ssd_dir so the scheduler can initialize PagedSSDCacheManager.
         # When hot_cache_only=True, PagedSSDCacheManager skips directory init and
         # the writer thread internally — the dir is not used for disk I/O.
-        ssd_dir = (
-            self.cache.get_ssd_cache_dir(self.base_path) if self.cache.enabled else None
+        ssd_dir = self.get_active_ssd_cache_dir() if self.cache.enabled else None
+        configured_ssd_dir = self.cache.get_ssd_cache_dir(self.base_path)
+        using_fallback_ssd_dir = (
+            ssd_dir is not None
+            and ssd_dir.resolve() != configured_ssd_dir.resolve()
+        )
+        ssd_cache_auto_size = (
+            using_fallback_ssd_dir
+            or self.cache.ssd_cache_max_size.lower() == "auto"
+        )
+        ssd_cache_max_size = (
+            get_auto_ssd_cache_size(ssd_dir)
+            if using_fallback_ssd_dir
+            else self.cache.get_ssd_cache_max_size_bytes(self.base_path)
         )
 
         return SchedulerConfig(
@@ -1951,10 +2005,8 @@ class GlobalSettings:
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
-            paged_ssd_cache_max_size=self.cache.get_ssd_cache_max_size_bytes(
-                self.base_path
-            ),
-            paged_ssd_cache_auto_size=self.cache.ssd_cache_max_size.lower() == "auto",
+            paged_ssd_cache_max_size=ssd_cache_max_size,
+            paged_ssd_cache_auto_size=ssd_cache_auto_size,
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),

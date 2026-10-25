@@ -5,18 +5,83 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from omlx.admin import routes as admin_routes
+from omlx import settings as settings_module
 
 
 def _global_settings(tmp_path):
     cache_dir = tmp_path / "ssd_cache"
     return SimpleNamespace(
         base_path=tmp_path,
+        get_active_ssd_cache_dir=lambda: cache_dir,
         cache=SimpleNamespace(
             ssd_cache_max_size="auto",
             get_ssd_cache_dir=lambda base_path: cache_dir,
             get_ssd_cache_max_size_bytes=lambda base_path: 0,
         ),
     )
+
+
+def test_paths_report_active_fallback_cache(tmp_path):
+    active_cache_dir = tmp_path / ".omlx" / "cache"
+    settings = _global_settings(tmp_path)
+    settings.get_active_ssd_cache_dir = lambda: active_cache_dir
+
+    with patch.object(admin_routes, "_get_engine_pool", return_value=None):
+        payload = admin_routes._build_runtime_cache_observability(settings)
+
+    assert payload["ssd_cache_dir"] == str(active_cache_dir)
+    assert payload["response_state_dir"] == str(active_cache_dir / "response-state")
+
+
+def test_fallback_directory_uses_auto_size_in_runtime_observability(tmp_path):
+    configured_cache_dir = tmp_path / "external" / "cache"
+    active_cache_dir = tmp_path / "fallback" / "cache"
+    settings = _global_settings(tmp_path)
+    settings.get_active_ssd_cache_dir = lambda: active_cache_dir
+    settings.cache.ssd_cache_max_size = "180GB"
+    settings.cache.get_ssd_cache_dir = lambda base_path: configured_cache_dir
+
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=None),
+        patch.object(
+            settings_module, "get_auto_ssd_cache_size", return_value=9876
+        ),
+    ):
+        payload = admin_routes._build_runtime_cache_observability(settings)
+
+    assert payload["disk_max_bytes"] == 9876
+
+
+def test_startup_scan_fills_missing_stats_and_auto_limit(tmp_path):
+    cache_dir = tmp_path / "ssd_cache"
+    shard = cache_dir / "a"
+    shard.mkdir(parents=True)
+    (shard / "existing.safetensors").write_bytes(b"x" * 123)
+
+    class Engine:
+        scheduler = None
+
+        def get_runtime_cache_stats(self):
+            return {
+                "ssd_cache": {
+                    "num_files": 0,
+                    "total_size_bytes": 0,
+                    "max_size_bytes": 0,
+                }
+            }
+
+    settings = _global_settings(tmp_path)
+    settings.get_active_ssd_cache_dir = lambda: cache_dir
+    pool = _Pool(Engine())
+    with (
+        patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+        patch.object(settings_module, "get_auto_ssd_cache_size", return_value=9876),
+    ):
+        payload = admin_routes._build_runtime_cache_observability(settings)
+
+    assert payload["total_num_files"] == 1
+    assert payload["total_size_bytes"] == 123
+    assert payload["disk_max_bytes"] == 9876
 
 
 class _Pool:

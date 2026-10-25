@@ -36,6 +36,7 @@ from omlx.settings import (
     reset_settings,
     resolve_default_base_path,
 )
+import omlx.settings as settings_module
 
 
 class TestServerSettings:
@@ -1516,6 +1517,74 @@ class TestGlobalSettings:
             assert custom_models.exists()
             assert custom_cache.exists()
             assert custom_logs.exists()
+
+    def test_unavailable_ssd_cache_falls_back_and_scheduler_uses_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        fallback = tmp_path / "base" / "cache"
+        configured = tmp_path / "external" / "omlx-cache"
+        monkeypatch.setattr(
+            settings_module, "resolve_default_base_path", lambda: tmp_path / "base"
+        )
+        settings = GlobalSettings(base_path=tmp_path / "base")
+        settings.cache.ssd_cache_dir = str(configured)
+        settings.cache.ssd_cache_max_size = "180GB"
+        original_mkdir = Path.mkdir
+
+        def mkdir(path, *args, **kwargs):
+            if path == configured:
+                raise PermissionError("cache unavailable")
+            return original_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", mkdir)
+        settings.ensure_directories()
+
+        assert fallback.is_dir()
+        assert settings.cache.ssd_cache_dir == str(configured)
+        with patch.object(
+            settings_module, "get_auto_ssd_cache_size", return_value=1234
+        ) as auto_size:
+            config = settings.to_scheduler_config()
+
+        assert config.paged_ssd_cache_dir == str(fallback)
+        assert config.paged_ssd_cache_max_size == 1234
+        assert config.paged_ssd_cache_auto_size is True
+        assert auto_size.call_args.args == (fallback,)
+        assert settings.cache.ssd_cache_max_size == "180GB"
+
+    def test_available_configured_cache_removes_fallback_on_startup(
+        self, tmp_path, monkeypatch
+    ):
+        fallback = tmp_path / "base" / "cache"
+        fallback.mkdir(parents=True)
+        (fallback / "stale-entry").write_text("stale")
+        monkeypatch.setattr(
+            settings_module, "resolve_default_base_path", lambda: tmp_path / "base"
+        )
+        settings = GlobalSettings(base_path=tmp_path / "base")
+        configured = tmp_path / "external" / "omlx-cache"
+        settings.cache.ssd_cache_dir = str(configured)
+
+        settings.ensure_directories()
+
+        assert configured.is_dir()
+        assert not fallback.exists()
+        assert settings.to_scheduler_config().paged_ssd_cache_dir == str(configured)
+
+    def test_fallback_path_is_not_removed_when_it_is_configured(
+        self, tmp_path, monkeypatch
+    ):
+        fallback = tmp_path / ".omlx" / "cache"
+        fallback.mkdir(parents=True)
+        marker = fallback / "keep"
+        marker.write_text("cache")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        settings = GlobalSettings(base_path=tmp_path / "base")
+        settings.cache.ssd_cache_dir = str(fallback)
+
+        settings.ensure_directories()
+
+        assert marker.read_text() == "cache"
 
     def test_ensure_directories_unavailable_model_dir(self):
         """Test that unavailable model dirs are skipped instead of crashing."""

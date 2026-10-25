@@ -179,7 +179,7 @@ def serve_command(args):
     from ._version import __version__
     from . import process_title
     from .integrations.base import bracket_host
-    from .settings import burst_decode_env, init_settings
+    from .settings import burst_decode_env, get_auto_ssd_cache_size, init_settings
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
 
     process_title.set_process_title()
@@ -382,9 +382,7 @@ def serve_command(args):
             paged_ssd_cache_dir = args.paged_ssd_cache_dir
         elif settings.cache.enabled:
             # Use settings file value (resolved path or default)
-            paged_ssd_cache_dir = str(
-                settings.cache.get_ssd_cache_dir(settings.base_path)
-            )
+            paged_ssd_cache_dir = str(settings.get_active_ssd_cache_dir())
         else:
             # Cache explicitly disabled in settings
             paged_ssd_cache_dir = None
@@ -401,15 +399,25 @@ def serve_command(args):
             ):
                 # CLI argument specified explicitly
                 cache_max_size_bytes = parse_size(args.paged_ssd_cache_max_size)
+                scheduler_config.paged_ssd_cache_auto_size = False
             else:
-                # Resolve the initial automatic budget from disk space and existing cache.
-                cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(
-                    settings.base_path
+                auto_size = (
+                    args.paged_ssd_cache_max_size is not None
+                    or scheduler_config.paged_ssd_cache_auto_size
                 )
+                if auto_size:
+                    # Resolve against the directory the cache will actually use.
+                    from pathlib import Path
+
+                    cache_max_size_bytes = get_auto_ssd_cache_size(
+                        Path(paged_ssd_cache_dir)
+                    )
+                else:
+                    cache_max_size_bytes = settings.cache.get_ssd_cache_max_size_bytes(
+                        settings.base_path
+                    )
+                scheduler_config.paged_ssd_cache_auto_size = auto_size
             scheduler_config.paged_ssd_cache_max_size = cache_max_size_bytes
-            scheduler_config.paged_ssd_cache_auto_size = (
-                args.paged_ssd_cache_max_size or settings.cache.ssd_cache_max_size
-            ).lower() == "auto"
         else:
             scheduler_config.paged_ssd_cache_max_size = 0
             cache_max_size_bytes = 0
