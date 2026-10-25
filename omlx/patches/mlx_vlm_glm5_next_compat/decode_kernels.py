@@ -1542,6 +1542,142 @@ def dsa_gather_selected(kv_latent: mx.array, indices: mx.array):
     return out, valid
 
 
+# One-token sparse attention without NAX: dsa_gather_selected feeds the
+# unfused SDPA fallback (64 query heads share the latent head, so GQA x L >
+# 32): qs = bf16(q * bf16(scale)); scores = qs @ g^T, a steel GEMM collapsed
+# to M = heads (bf16 out, 65 threadgroups each running 16 staged K blocks);
+# where(valid, scores, bf16 lowest); precise softmax; p @ g. Each score is a
+# chain of fp32 8 x 8 simdgroup MMAs over D in order whatever the tiling, so
+# one kernel gathers the selected rows by index (staging each threadgroup's
+# TK rows once, and writing them out for the P x V GEMM as the gather did),
+# scales the queries and computes the masked scores: gather, GEMM and where
+# become one dispatch with one staging round trip per threadgroup.
+_DSA_DECODE_ATTN_SOURCE = r"""
+  constexpr int NSG = H / 8;          // one simdgroup per 8 heads
+  constexpr int LDK = D + 8;
+  constexpr int PER = TK * (D / 8) / (NSG * 32);
+  const uint lane = thread_index_in_simdgroup;
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const int tid = int(thread_index_in_threadgroup);
+  const int k0 = int(threadgroup_position_in_grid.x) * TK;
+  const int kv_len = int(kv_shape[2]);
+  threadgroup T ks[TK * LDK];
+  // This threadgroup's TK selected rows (clamped as dsa_gather_selected).
+  int slot[PER];
+  int src[PER];
+  for (int u = 0; u < PER; u++) {
+    slot[u] = k0 + (tid + u * NSG * 32) / (D / 8);
+    const int raw = slot[u] < W ? idx[slot[u]] : 0;
+    src[u] = metal::min(metal::max(raw, 0), kv_len - 1);
+  }
+  uint4 rows[PER];
+  for (int u = 0; u < PER; u++) {
+    const int d = ((tid + u * NSG * 32) % (D / 8)) * 8;
+    rows[u] = *reinterpret_cast<const device uint4*>(kv + size_t(src[u]) * D + d);
+  }
+  for (int u = 0; u < PER; u++) {
+    const int c = tid + u * NSG * 32;
+    const int d = (c % (D / 8)) * 8;
+    *reinterpret_cast<threadgroup uint4*>(ks + (c / (D / 8)) * LDK + d) = rows[u];
+    if (slot[u] < W) {
+      *reinterpret_cast<device uint4*>(gathered + size_t(slot[u]) * D + d) = rows[u];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float sbf = static_cast<float>(scale[0]);
+  const short qid = short(lane / 4);
+  const short fm = (qid & 4) + short((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + short(lane % 2) * 2;
+  const device T* qh = q + size_t(sg * 8 + fm) * D + fn;
+  simdgroup_matrix<float, 8, 8> acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  #pragma unroll(8)
+  for (int kk = 0; kk < D; kk += 8) {
+    simdgroup_matrix<float, 8, 8> a;
+    simdgroup_matrix<float, 8, 8> b;
+    // qs = bf16(q * bf16(scale)), the fallback's scaled queries.
+    a.thread_elements()[0] =
+        static_cast<float>(static_cast<T>(static_cast<float>(qh[kk]) * sbf));
+    a.thread_elements()[1] =
+        static_cast<float>(static_cast<T>(static_cast<float>(qh[kk + 1]) * sbf));
+    b.thread_elements()[0] = static_cast<float>(ks[fn * LDK + kk + fm]);
+    b.thread_elements()[1] = static_cast<float>(ks[(fn + 1) * LDK + kk + fm]);
+    simdgroup_multiply_accumulate(acc, a, b, acc);
+  }
+  const T lowest = lowest_in[0];
+  const int h = sg * 8 + fm;
+  for (int e = 0; e < 2; e++) {
+    const int k = k0 + fn + e;
+    if (k < W) {
+      const T v = static_cast<T>(acc.thread_elements()[e]);
+      scores[size_t(h) * W + k] = idx[k] >= 0 ? v : lowest;
+    }
+  }
+"""
+
+_DSA_DECODE_ATTN_ROWS = 8  # TK: selected rows per threadgroup
+
+
+@lru_cache(maxsize=None)
+def _dsa_decode_attn_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_dsa_decode_attention_scores",
+        input_names=["q", "kv", "idx", "scale", "lowest_in"],
+        output_names=["scores", "gathered"],
+        header=_QMV_HEADER,
+        source=_DSA_DECODE_ATTN_SOURCE,
+    )
+
+
+def dsa_decode_attention_supported(heads: int, dim: int, dtype) -> bool:
+    """Whether ``dsa_decode_attention`` covers these shapes on this GPU."""
+    return (
+        heads % 8 == 0
+        and dim % (4 * heads) == 0
+        and dtype in (mx.bfloat16, mx.float16)
+        and not is_nax_available()
+    )
+
+
+def dsa_decode_attention(
+    q_lat: mx.array, kv_latent: mx.array, indices: mx.array, scale: float
+) -> Optional[mx.array]:
+    """``dsa_gather_selected`` + ``mx.fast.scaled_dot_product_attention`` of
+    one token: ``q_lat`` [1, H, 1, D] embedded queries, ``kv_latent`` [1, 1,
+    Kv, D], ``indices`` [1, 1, W] int32 (-1 = unused). Returns [1, H, 1, D],
+    or None when not covered."""
+    if q_lat.ndim != 4 or q_lat.shape[0] != 1 or q_lat.shape[2] != 1:
+        return None
+    if kv_latent.ndim != 4 or kv_latent.shape[:2] != (1, 1) or kv_latent.shape[2] < 1:
+        return None
+    if indices.ndim != 3 or indices.shape[:2] != (1, 1) or indices.dtype != mx.int32:
+        return None
+    _, H, _, D = q_lat.shape
+    W = indices.shape[2]
+    # One selected row makes the reference scores product a GEMV.
+    if kv_latent.shape[3] != D or kv_latent.dtype != q_lat.dtype or W < 2:
+        return None
+    if not dsa_decode_attention_supported(H, D, q_lat.dtype):
+        return None
+    tk = _DSA_DECODE_ATTN_ROWS
+    STATS["dsa_decode_attention"] += 1
+    scores, gathered = _dsa_decode_attn_kernel()(
+        inputs=[
+            q_lat,
+            kv_latent,
+            indices,
+            mx.array([scale], dtype=q_lat.dtype),
+            mx.array([mx.finfo(q_lat.dtype).min], dtype=q_lat.dtype),
+        ],
+        template=[("T", q_lat.dtype), ("H", H), ("D", D), ("W", W), ("TK", tk)],
+        grid=(4 * H * ((W + tk - 1) // tk), 1, 1),
+        threadgroup=(4 * H, 1, 1),
+        output_shapes=[(1, 1, H, W), (1, 1, W, D)],
+        output_dtypes=[q_lat.dtype, q_lat.dtype],
+    )
+    probs = mx.softmax(scores, axis=-1, precise=True)
+    return (probs @ gathered).reshape(1, H, 1, D)
+
+
 # ---------------------------------------------------------------------------
 # DSA attention over the selected rows of a row-exact verify block
 # ---------------------------------------------------------------------------

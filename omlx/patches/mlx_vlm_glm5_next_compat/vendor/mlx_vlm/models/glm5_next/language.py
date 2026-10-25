@@ -1752,9 +1752,13 @@ class Glm5NextSparseAttention(nn.Module):
             valid_sel = topk_indices >= 0
             gathered = None
             if L == 1 and mask is None and _DECODE_FUSION:
-                gathered = _decode_kernels.dsa_gather_selected(
-                    kv_latent, topk_indices[:, :, 0, :]
+                rows = topk_indices[:, :, 0, :]
+                attended = self._selected_decode_attention(
+                    q, q_latent, kv_latent, rows, cache
                 )
+                if attended is not None:
+                    return self._finish(attended, out_dense)
+                gathered = _decode_kernels.dsa_gather_selected(kv_latent, rows)
             if gathered is not None:
                 kv_latent, attn_mask = gathered
             elif L == 1:
@@ -1873,6 +1877,33 @@ class Glm5NextSparseAttention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self._finish(output, out_dense)
+
+    def _selected_decode_attention(self, q, q_latent, kv_latent, rows, cache):
+        """One token's attention over its selected rows ``rows`` [B, 1, W]
+        (pre-o_proj flat): ``decode_kernels.dsa_decode_attention``, the
+        gather + SDPA fallback arithmetic. None when not covered."""
+        if not _decode_kernels.dsa_decode_attention_supported(
+            self.num_heads, kv_latent.shape[-1], kv_latent.dtype
+        ):
+            return None
+        if q_latent is None:
+            q_latent = _mla_head_proj(self.embed_q, q)
+        out = _decode_kernels.dsa_decode_attention(
+            q_latent, kv_latent, rows, self.scale
+        )
+        if out is None:
+            return None
+        if (
+            cache is not None
+            and cache[0] is not None
+            and cache[1] is not None
+            and cache[1].pooled is not None
+        ):
+            deps = tuple(v for v in cache[1].state if isinstance(v, mx.array))
+            if deps:
+                cache[0].keys = mx.depends(cache[0].keys, deps)
+        out = _mla_head_proj(self.unembed_out, out)
+        return out.transpose(0, 2, 1, 3).reshape(q.shape[0], 1, -1)
 
     def _decode_projections(self, x, cache):
         """Decode/verify (B == 1, L <= 8) projections, one dispatch per input

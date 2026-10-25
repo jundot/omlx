@@ -4021,6 +4021,32 @@ def test_dsa_gather_selected_is_bitwise_reference(kv_len, width):
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("heads", [16, 64])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_dsa_decode_attention_matches_gather_and_sdpa_fallback(heads, dtype):
+    """One token's attention over its selected rows (the scores kernel with
+    the gather, scaled queries and mask folded in, softmax, P x V) against
+    dsa_gather_selected + SDPA (its unfused fallback): bitwise, with unused
+    (-1) and repeated rows, short selections and short caches."""
+    if not dk.dsa_decode_attention_supported(heads, 512, dtype):
+        pytest.skip("NAX GPUs keep the gather + SDPA fallback")
+    scale = 256**-0.5
+    for kv_len, width in ((300, 2), (300, 7), (2100, 2051), (4099, 2051), (9000, 2051)):
+        mx.random.seed(kv_len + width + heads)
+        kv = (mx.random.normal((1, 1, kv_len, 512)) * 2).astype(dtype)
+        idx = mx.random.randint(-3, kv_len, (1, 1, width)).astype(mx.int32)
+        idx = mx.where(idx < 0, -1, idx)
+        q = (mx.random.normal((1, heads, 1, 512)) * 3).astype(dtype)
+        g, valid = dk.dsa_gather_selected(kv, idx)
+        reference = mx.fast.scaled_dot_product_attention(
+            q, g, g, scale=scale, mask=valid
+        )
+        got = dk.dsa_decode_attention(q, kv, idx, scale)
+        assert got is not None and got.shape == reference.shape
+        assert _mismatches(got, reference) == 0, (kv_len, width)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
 def test_decode_experts_leave_sorted_route_counts_to_switch_glu():
     moe = _moe()
     x = mx.random.normal((1, 8, 1024)).astype(mx.bfloat16)  # 64 routes -> sorted
@@ -4374,7 +4400,8 @@ def test_small_model_decode_and_verify_logits_are_bitwise_reference(monkeypatch)
     # Retain bitwise assertions for the original scorer and attention kernels.
     monkeypatch.setattr(_language(), "_SMALL_QUERY_INDEXER", False)
     used = _check_small_model()
-    assert _CORE_FUSED | {"dsa_gather"} <= used, used
+    attention = "dsa_gather" if dk.is_nax_available() else "dsa_decode_attention"
+    assert _CORE_FUSED | {attention} <= used, used
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
