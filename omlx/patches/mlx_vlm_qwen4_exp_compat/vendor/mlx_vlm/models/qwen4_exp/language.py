@@ -1010,15 +1010,17 @@ class BatchQSAKVCache:
         return self.kv_cache.make_mask(*args, **kwargs)
 
     def filter(self, batch_indices):
-        min_left = int(self.left_padding[batch_indices].min().item())
-        self.kv_cache.filter(batch_indices)
-        if self.index_keys is None:
-            return
-        kept = (
+        pads = self.left_padding.tolist()
+        kept_rows = (
             batch_indices.tolist()
             if isinstance(batch_indices, mx.array)
             else list(batch_indices)
         )
+        min_left = min((pads[i] for i in kept_rows), default=0)
+        self.kv_cache.filter(batch_indices)
+        if self.index_keys is None:
+            return
+        kept = kept_rows
         keys, positions = self.index_keys, self.index_position_ids
         width = self.index_offset
         length = width - min_left
@@ -1183,7 +1185,7 @@ class BatchQSAKVCache:
         # to one step instead of doubling the row.
         cache._geometric_capacity_managed = False
         if self.index_keys is not None:
-            padding = int(self.left_padding[idx].item())
+            padding = int(self.left_padding.tolist()[idx])
             cache.index_keys = mx.contiguous(
                 self.index_keys[idx : idx + 1, padding : self.index_offset]
             )
