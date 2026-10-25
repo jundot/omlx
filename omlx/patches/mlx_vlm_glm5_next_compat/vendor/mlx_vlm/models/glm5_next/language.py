@@ -119,7 +119,9 @@ def _decode_hc_pre(connection, norm, x: mx.array):
         or not 1 <= x.shape[1] <= _DECODE_BLOCK
     ):
         return None
-    mixes = _decode_kernels.hc_mix(x, connection.fn, connection.norm_eps)
+    mixes = _decode_kernels.hc_mix(
+        x, _decode_kernels.mix_weights(connection), connection.norm_eps
+    )
     if mixes is None:
         return None
     return exact_hc_norm(connection, norm, x, mixes)

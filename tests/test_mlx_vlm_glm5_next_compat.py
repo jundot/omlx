@@ -3221,7 +3221,8 @@ def _switch_linear(experts, out_dims, in_dims, bits, group_size=64):
 # ---------------------------------------------------------------------------
 
 
-def _hyper_connection(hidden=4096, seed=0):
+def _hyper_connection(hidden=4096, seed=0, bf16_fn=False):
+    """``bf16_fn``: mix weights that are BF16 values, as the checkpoints'."""
     from mlx_vlm.models.deepseek_v4.hyper_connection import HyperConnection
 
     mx.random.seed(seed)
@@ -3234,6 +3235,8 @@ def _hyper_connection(hidden=4096, seed=0):
     )
     hc = HyperConnection(cfg)
     hc.fn = mx.random.normal(hc.fn.shape) * 0.01
+    if bf16_fn:
+        hc.fn = hc.fn.astype(mx.bfloat16).astype(mx.float32)
     hc.base = mx.random.normal(hc.base.shape) * 0.5
     hc.scale = mx.random.uniform(0.5, 1.5, (3,))
     norm = nn.RMSNorm(hidden, eps=1e-5)
@@ -3245,11 +3248,15 @@ def _hyper_connection(hidden=4096, seed=0):
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("bf16_fn", [False, True])
 @pytest.mark.parametrize("hidden", [4096, 1024])
 @pytest.mark.parametrize("length", [1, 2, 4, 8])
-def test_decode_hc_pre_is_bitwise_reference(hidden, length):
+def test_decode_hc_pre_is_bitwise_reference(hidden, length, bf16_fn):
+    """BF16-valued mix weights (the checkpoints') are read from their BF16
+    copy (``mix_weights``); fp32 weights from the fp32 array."""
     language = _language()
-    hc, norm = _hyper_connection(hidden, seed=length)
+    hc, norm = _hyper_connection(hidden, seed=length, bf16_fn=bf16_fn)
+    assert (dk.mix_weights(hc).dtype == mx.bfloat16) == bf16_fn
     for trial in range(3):
         x = (mx.random.normal((1, length, 4, hidden)) * (1 + 2 * trial)).astype(
             mx.bfloat16
@@ -3352,7 +3359,7 @@ def test_one_token_hc_expand_is_bitwise_reference_with_nax_tf32():
     assert "checked" in out
 
 
-def _check_hc_deferred_chain(hidden):
+def _check_hc_deferred_chain(hidden, bf16_fn=False):
     """Chained one-token HC pres with each expand folded into the next
     (``_decode_hc_pre_deferred``) against the reference HyperConnection,
     RMSNorm and hc_expand; returns the number of checked half-layers."""
@@ -3361,7 +3368,10 @@ def _check_hc_deferred_chain(hidden):
     language = _language()
     checked = 0
     for seed in range(6):
-        layers = [_hyper_connection(hidden, seed=100 * seed + i) for i in range(4)]
+        layers = [
+            _hyper_connection(hidden, seed=100 * seed + i, bf16_fn=bf16_fn)
+            for i in range(4)
+        ]
         mx.random.seed(seed)
         h_ref = (mx.random.normal((1, 1, 4, hidden)) * (1 + seed)).astype(mx.bfloat16)
         x = h_ref
@@ -3422,11 +3432,12 @@ def test_hc_deferred_chain_declines_without_nax_tf32():
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("bf16_fn", [False, True])
 @pytest.mark.parametrize("hidden", [4096, 1024, 2048])
-def test_hc_deferred_chain_is_bitwise_reference_on_simdgroup_mma(hidden):
+def test_hc_deferred_chain_is_bitwise_reference_on_simdgroup_mma(hidden, bf16_fn):
     if dk.hc_comb_product() != "simd":
         pytest.skip("this GPU runs fp32 GEMMs on NAX")
-    assert _check_hc_deferred_chain(hidden) == 24
+    assert _check_hc_deferred_chain(hidden, bf16_fn) == 24
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")

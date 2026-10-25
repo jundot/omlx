@@ -1063,7 +1063,7 @@ _HC_MIX1_SOURCE = r"""
   threadgroup float partial[8];
   const int sgN = int(simd_gid);
   float result = 0;
-  const device float* mrow = fn + size_t(row) * KSZ;
+  const device auto* mrow = fn + size_t(row) * KSZ;
   int bn = (32 * sgN + int(simd_lid)) * 4;
   for (int i = 0; i < KSZ / 1024; ++i) {
     float v_coeff[4];
@@ -1072,7 +1072,7 @@ _HC_MIX1_SOURCE = r"""
       v_coeff[tn] = static_cast<float>(xr[bn + tn]) * inv;
     }
     for (int tn = 0; tn < 4; tn++) {
-      inter[tn] = mrow[bn + tn];
+      inter[tn] = static_cast<float>(mrow[bn + tn]);
     }
     for (int tn = 0; tn < 4; tn++) {
       result += inter[tn] * v_coeff[tn];
@@ -1106,14 +1106,32 @@ def _hc_mix1_kernel():
     )
 
 
+def mix_weights(connection) -> mx.array:
+    """``connection.fn`` [MIX, HC * D] as BF16 when every fp32 weight is a
+    BF16 value, else the fp32 array. GLM-5.3 checkpoints store these weights
+    in BF16 (the sanitize keeps them in fp32): the kernels read the same
+    values, as floats, from half the bytes."""
+    narrow = getattr(connection, "_omlx_fn_bf16", None)
+    if narrow is None:
+        fn = connection.fn
+        narrow = fn.astype(mx.bfloat16)
+        if mx.array_equal(narrow.astype(mx.float32), fn).item():
+            mx.eval(narrow)
+        else:
+            narrow = False
+        # A plain attribute, not a module parameter.
+        object.__setattr__(connection, "_omlx_fn_bf16", narrow)
+    return connection.fn if narrow is False else narrow
+
+
 def hc_mix(x: mx.array, fn: mx.array, eps: float) -> Optional[mx.array]:
     """``(rms_norm(x.astype(f32).flatten(-2)) @ fn.T)`` per token, M=1 exact.
 
-    ``x`` is [B, L, HC, D] bf16/fp16, ``fn`` [MIX, HC*D] float32.  Returns
-    [B, L, MIX] float32 or None when the shape is outside the replicated
-    kernel configuration.
+    ``x`` is [B, L, HC, D] bf16/fp16, ``fn`` [MIX, HC*D] float32 (or its
+    exact BF16 copy, ``mix_weights``).  Returns [B, L, MIX] float32 or None
+    when the shape is outside the replicated kernel configuration.
     """
-    if x.ndim != 4 or fn.ndim != 2 or fn.dtype != mx.float32:
+    if x.ndim != 4 or fn.ndim != 2 or fn.dtype not in (mx.float32, mx.bfloat16):
         return None
     B, L, hc, d = x.shape
     K = hc * d
@@ -2513,7 +2531,7 @@ _HC_PRE_SOURCE = r"""
   threadgroup float row_total[4];
   float result = 0;
   {
-    const device float* mrow = fn + size_t(row) * KSZ;
+    const device auto* mrow = fn + size_t(row) * KSZ;
     int bn = (32 * sgN + int(simd_lid)) * 4;
     for (int i = 0; i < KSZ / 1024; ++i) {
       float v_coeff[4];
@@ -2522,7 +2540,7 @@ _HC_PRE_SOURCE = r"""
         v_coeff[tn] = static_cast<float>(HVAL(bn + tn)) * inv;
       }
       for (int tn = 0; tn < 4; tn++) {
-        inter[tn] = mrow[bn + tn];
+        inter[tn] = static_cast<float>(mrow[bn + tn]);
       }
       for (int tn = 0; tn < 4; tn++) {
         result += inter[tn] * v_coeff[tn];
@@ -2818,7 +2836,7 @@ def hc_pre_fused(connection, norm, x=None, deferred=None):
         inputs = [x]
     mix = connection.fn.shape[0]
     inputs += [
-        connection.fn, mx.array([connection.norm_eps], dtype=mx.float32),
+        mix_weights(connection), mx.array([connection.norm_eps], dtype=mx.float32),
         connection.scale, connection.base, norm.weight,
     ]
     STATS["hc_pre_fused"] += 1
