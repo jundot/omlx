@@ -3387,6 +3387,33 @@ def _check_hc_deferred_chain(hidden):
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
+def test_hc_pre_fused_rounds_the_expand_product_before_the_add():
+    """The deferred hc_pre recomputes h = bf16(f32(post * y) + mm) as the two
+    reference kernels do; on these inputs a contracted fma(post, y, mm)
+    rounds differently in many elements."""
+    hidden = 1024
+    hc, norm = _hyper_connection(hidden, seed=9)
+    if not dk.hc_defer_supported(hc, norm, mx.bfloat16, hidden):
+        pytest.skip("no fused deferred HC chain on this GPU")
+    mx.random.seed(9)
+    y = mx.random.normal((1, 1, hidden)).astype(mx.bfloat16)
+    post = mx.random.uniform(0.5, 2.0, (1, 1, 4))
+    product = post[0, 0, :, None] * y[0, 0][None].astype(mx.float32)
+    # mm cancels most of the product: the sum keeps its low bits.
+    mm = (-product + mx.random.normal(product.shape) * 1e-3).reshape(-1)
+    _, _, h = dk.hc_pre_fused(hc, norm, deferred=(y, mm, post))
+    reference = (product + mm.reshape(4, hidden)).astype(mx.bfloat16)
+    p64 = np.array(post[0, 0], dtype=np.float64)[:, None]
+    y64 = np.array(y[0, 0].astype(mx.float32), dtype=np.float64)[None]
+    fused = (p64 * y64 + np.array(mm, dtype=np.float64).reshape(4, hidden)).astype(
+        np.float32
+    )
+    contracted = mx.array(fused).astype(mx.bfloat16)
+    assert _mismatches(contracted, reference) > 20
+    assert _mismatches(h.reshape(4, hidden), reference) == 0
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
 def test_hc_deferred_chain_declines_without_nax_tf32():
     if dk.hc_comb_product() is not None:
         pytest.skip("a kernel here replays this GPU's fp32 comb product")

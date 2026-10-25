@@ -2427,12 +2427,16 @@ _HC_PRE_HEADER = r"""
 #include <metal_stdlib>
 using namespace metal;
 
-// hc_expand_one's epilogue for element e = r * D + col of h.
+// hc_expand_one's epilogue for element e = r * D + col of h. The product is
+// its own statement, so it is rounded before the add (the reference runs
+// them as two kernels): MLX compiles kernels in MathModeSafe, which never
+// contracts across statements. No volatile: it serialized the many h loads
+// of the mix GEMV loop below.
 template <typename T, int D, typename YPtr, typename MPtr, typename PPtr>
 inline T glm_hc_expand_value(YPtr y, MPtr mm, PPtr post, int e) {
   const int r = e / D;
   const int col = e - r * D;
-  volatile float prod = post[r] * static_cast<float>(y[col]);
+  float prod = post[r] * static_cast<float>(y[col]);
   float sum = prod + mm[e];
   return static_cast<T>(sum);
 }
