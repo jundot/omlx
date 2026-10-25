@@ -697,6 +697,38 @@ def test_qwen4_gathered_prefill_requires_minimum_query_width(monkeypatch):
     )
 
 
+def test_qwen4_decode_rows_never_read_back_rank_three_positions(monkeypatch):
+    """A one-row step never takes gathered prefill, so the host comparison of
+    its rank-three positions (a GPU sync per step) is never made."""
+    config = _tiny_text_config()
+    language = _language()
+    attention = language.Qwen4ExpAttention(config)
+    mx.eval(attention.parameters())
+    cache = _crossover_cache(config, attention)
+    checked = []
+
+    def broadcast_check(position_ids, length):
+        checked.append(length)
+        return True
+
+    monkeypatch.setattr(language, "_broadcast_text_mrope_position_ids", broadcast_check)
+    row = mx.random.normal((1, 1, config.hidden_size))
+    row_planes = mx.full((3, 1, 1), cache.offset, dtype=mx.int32)
+    assert not attention._gathered_text_prefill_eligible(
+        row, "causal", cache, row_planes, None, False
+    )
+    assert checked == []
+
+    wide = mx.random.normal((1, 16, config.hidden_size))
+    wide_planes = mx.broadcast_to(
+        (cache.offset + mx.arange(16, dtype=mx.int32))[None, None], (3, 1, 16)
+    )
+    assert attention._gathered_text_prefill_eligible(
+        wide, "causal", cache, wide_planes, None, False
+    )
+    assert checked == [16]
+
+
 def test_qwen4_trim_keeps_pooled_index_prefix_exact():
     """trim() clamps the pooled frontier instead of re-pooling every block."""
     config = _tiny_text_config()

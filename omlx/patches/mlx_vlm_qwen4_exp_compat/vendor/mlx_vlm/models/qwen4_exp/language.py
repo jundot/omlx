@@ -1944,12 +1944,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and isinstance(cache.offset, int)
             and position_embeddings is None
             and not target_verify
-            and self._batch_one_text_position_ids(position_ids, x.shape[1])
+            and qwen4_gathered_prefill_route(
+                x.shape[1], cache.offset, self.indexer.token_budget
+            )
         ):
             return False
-        return qwen4_gathered_prefill_route(
-            x.shape[1], cache.offset, self.indexer.token_budget
-        )
+        # Last: rank-three positions are compared on the host (a GPU sync),
+        # which one-row decode steps, never routed here, must not pay.
+        return self._batch_one_text_position_ids(position_ids, x.shape[1])
 
     def _gathered_text_decode_eligible(
         self,
