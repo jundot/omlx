@@ -219,7 +219,7 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-@pytest.mark.parametrize("batch", [3, 8])   # odd: a tile lane holds half a vector pair
+@pytest.mark.parametrize("batch", [3, 8, 9, 10, 11, 12, 16, 17])   # odd: a tile lane holds half a vector pair
 def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
     """On the row kernels (below decode_moe.MMA_MIN_BATCH requests, and in MTP verify blocks),
     B single-token requests through decode_block_nb give each request the logits it gets
@@ -229,11 +229,12 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
 
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
     model = verify_exact(build(fmt=fmt))   # affine batches always run on matrix tiles
-    calls = {"nb": 0}
+    batches = []
     real = decode_fused.decode_block_nb
 
     def counted(*args, **kwargs):
-        calls["nb"] += 1
+        batches.append(args[1].shape[0])
+        assert 1 <= batches[-1] <= decode_fused.MAX_BATCH
         return real(*args, **kwargs)
 
     monkeypatch.setattr(decode_fused, "decode_block_nb", counted)
@@ -255,6 +256,8 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
             mx.eval(model(mx.array([p[:-1]]), cache=cache))
             target.append(cache)
     batched = [DeepseekV41Cache.merge([rows[r][i] for r in range(batch)]) for i in range(len(rows[0]))]
+    for item in batched:
+        item.prepare(lengths=[4] * batch)
     tokens = [p[-1] for p in prompts]
     # The first step decodes an even position, the second an odd one: only the second
     # completes a ratio-2 compression group.
@@ -263,9 +266,100 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
         got = np.asarray(model(mx.array([[t] for t in tokens]), cache=batched)[:, -1].astype(mx.float32))
         for r in range(batch):
             np.testing.assert_allclose(got[r], expected[r], rtol=0, atol=1e-6 * np.abs(expected[r]).max())
+            for i, (item, single) in enumerate(zip(batched, singles[r])):
+                row = item.extract(r)
+                assert row.size() == single.size()
+                assert row._ds41_buffers is rows[r][i]._ds41_buffers
+                assert item.lengths.tolist() == [3 - step] * batch
         tokens = [int(e.argmax()) for e in expected]
-    assert calls["nb"] == 2 * model._config.n_layers
-    assert attention["batched"] == 2 * model._config.n_layers   # windows are full: request-batched attention
+    chunks = [min(decode_fused.MAX_BATCH, batch - start)
+              for start in range(0, batch, decode_fused.MAX_BATCH)]
+    assert batches == [n for n in chunks for _ in model.layers] * 2
+    assert attention["batched"] == len(batches)   # windows are full: request-batched attention
+
+
+@pytest.mark.parametrize("batch", [9, 12, 17])
+@pytest.mark.parametrize("skip_logits", [False, True])
+def test_chunked_decode_matches_fused_chunks(batch, skip_logits):
+    """Keep MMA, Engram history and the vocabulary head on their <=8-row paths."""
+    from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
+
+    model = build(
+        vocab_size=4096, engram_layer_ids=(1,), engram_num_embeddings=(72,),
+        engram_vocab_size=5, engram_max_ngram_size=4, engram_n_heads=2,
+        engram_head_dim=256, engram_compressed_vocab_size=64,
+    )
+    model.set_token_map(np.arange(4096) % 64)
+    rng = np.random.default_rng(63)
+    sets = [[], []]
+    for r in range(batch):
+        prompt = mx.array([rng.integers(3, 60, 2 + r).tolist()])
+        for target in sets:
+            cache = model.make_cache()
+            mx.eval(model(prompt, cache=cache))
+            target.append(cache)
+    whole = [DeepseekV41Cache.merge(list(layer)) for layer in zip(*sets[0])]
+    chunks = [
+        [DeepseekV41Cache.merge(list(layer)) for layer in zip(*sets[1][start:start + 8])]
+        for start in range(0, batch, 8)
+    ]
+    for step in range(2):
+        ids = mx.array([[3 + r + step] for r in range(batch)])
+        expected = mx.concatenate([
+            model._forward_decode_batched(ids[start:start + 8], cache, skip_logits)
+            for start, cache in zip(range(0, batch, 8), chunks)
+        ])
+        got = model(ids, cache=whole, skip_logits=skip_logits)
+        assert mx.array_equal(got, expected).item()
+        for r in range(batch):
+            for actual, reference in zip(whole, chunks[r // 8]):
+                a, b = actual.extract(r), reference.extract(r % 8)
+                for slot in range(7):
+                    assert mx.array_equal(a[slot], b[slot]).item()
+        if step == 0:
+            # Cancellation/filtering and a later admission can change chunk membership.
+            reference = [
+                [cache.extract(r % 8) for cache in chunks[r // 8]]
+                for r in range(batch)
+            ]
+            order = list(range(batch - 1, 1, -1))
+            for item in whole:
+                late = DeepseekV41Cache.merge([item.extract(r) for r in (0, 1)])
+                item.filter(order)
+                item.extend(late)
+            reference = [reference[r] for r in order + [0, 1]]
+            chunks = [
+                [DeepseekV41Cache.merge(list(layer)) for layer in zip(*reference[start:start + 8])]
+                for start in range(0, batch, 8)
+            ]
+
+
+@pytest.mark.parametrize("reason", ["tokens", "embeds", "capture", "verify", "ced", "mask", "empty", "unsupported"])
+def test_wide_batched_decode_keeps_eligibility_guards(monkeypatch, reason):
+    from tests.test_deepseek_v41 import tiny
+
+    model = LanguageModel(tiny())
+    cache = model.make_cache()
+    for item in cache:
+        item[0] = mx.array([1], mx.int32)
+    monkeypatch.setattr(model, "_stages_decode_fused", lambda: reason != "unsupported")
+    ids, masks, embeds, capture, kwargs = mx.ones((12, 1), mx.int32), None, None, False, {}
+    if reason == "tokens":
+        ids = mx.ones((12, 2), mx.int32)
+    elif reason == "embeds":
+        embeds = mx.zeros((12, 1, model._config.dim))
+    elif reason == "capture":
+        capture = True
+    elif reason == "verify":
+        kwargs["mtp_verify_states"] = []
+    elif reason == "ced":
+        kwargs["_ced_prefill"] = True
+    elif reason == "mask":
+        masks = np.ones((12, 1), bool)
+        masks[8] = False
+    elif reason == "empty":
+        cache = model.make_cache()
+    assert not model._batched_decode_ok(ids, cache, masks, embeds, capture, kwargs)
 
 
 def _aq(rng, nb, k):

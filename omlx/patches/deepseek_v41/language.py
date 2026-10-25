@@ -1049,12 +1049,14 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         return x if skip_logits else project_logits(x, self.head.weight)
 
     def _batched_decode_ok(self, input_ids, cache, masks, inputs_embeds, capture, kwargs):
-        """One token for each of 2..MAX_BATCH requests, all at a valid position, through
-        layers the fused decode supports: run the layers once for the whole batch."""
+        """One token per request at a valid position, through supported fused layers.
+
+        Batches wider than the fused kernels are split into MAX_BATCH-row chunks.
+        """
         b_n = input_ids.shape[0]
         if not (
             input_ids.shape[1] == 1
-            and 2 <= b_n <= decode_fused.MAX_BATCH
+            and b_n >= 2
             and inputs_embeds is None
             and not capture
             and kwargs.get("mtp_verify_states") is None
@@ -1087,7 +1089,7 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         return agreed
 
     def _forward_decode_batched(self, input_ids, cache, skip_logits=False):
-        """_forward for B single-token requests with the weights read once per step.
+        """_forward for B single-token requests with weights shared within each chunk.
 
         Same per-request semantics as the row loop below (positions, caches, Engram history,
         cache bookkeeping). decode_fused.decode_block_nb, Engram (each request's row projected
@@ -1097,6 +1099,21 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
         """
         c = self._config
         b_n = input_ids.shape[0]
+        if b_n > decode_fused.MAX_BATCH:
+            results, rows = [], [[] for _ in cache]
+            for start in range(0, b_n, decode_fused.MAX_BATCH):
+                end = min(start + decode_fused.MAX_BATCH, b_n)
+                chunk = [
+                    DeepseekV41Cache.merge([item.extract(r) for r in range(start, end)])
+                    for item in cache
+                ]
+                results.append(self._forward_decode_batched(input_ids[start:end], chunk, skip_logits))
+                for i, item in enumerate(chunk):
+                    rows[i].extend(item.extract(r) for r in range(end - start))
+            for item, updated in zip(cache, rows):
+                item.adopt_rows(updated)
+                item.advance(1)
+            return mx.concatenate(results, axis=0)
         rcs = [[item.extract(row) for item in cache] for row in range(b_n)]
         starts = []
         for rc in rcs:
