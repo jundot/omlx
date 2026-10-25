@@ -1928,6 +1928,11 @@ class Glm5NextSparseAttention(nn.Module):
         if isinstance(after, list):
             after = after[0]
         plain = getattr(cache[0], "left_padding", None) is None
+        fused = self._selected_rows_attention(
+            q, kv_latent, topk_indices, mask, after, plain
+        )
+        if fused is not None:
+            return fused
         rows = []
         for r in range(L):
             kv_len = Kv - L + r + 1
@@ -1969,6 +1974,58 @@ class Glm5NextSparseAttention(nn.Module):
                 q_r, kv, kv, cache=cache, scale=self.scale, mask=attn_mask
             )
             rows.append(_mla_head_proj(self.unembed_out, out))
+        output = mx.concatenate(rows, axis=2)
+        return output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+    def _selected_rows_attention(self, q, kv_latent, topk_indices, mask, after, plain):
+        """``_rows_attention`` for a block whose rows all select: each row's
+        decode-step attention over its selected rows, all rows in one
+        ``decode_kernels.dsa_attention_rows`` (its gather + SDPA fallback
+        arithmetic). None when a row skips selection or not covered."""
+        B, H, L, _ = q.shape
+        Kv = kv_latent.shape[2]
+        indexer = self.indexer
+        if (
+            topk_indices is None
+            or B != 1
+            or not _DECODE_FUSION
+            or not _decode_kernels.dsa_attention_rows_supported(
+                H, kv_latent.shape[-1], topk_indices.shape[-1], kv_latent.dtype
+            )
+            or (
+                getattr(indexer, "bypass_short", True)
+                and after - L + 1 <= indexer.index_topk
+            )
+        ):
+            return None
+        lens = [Kv - L + r + 1 for r in range(L)]
+        idx = topk_indices[0, 0]
+        valid = None
+        if not plain and mask is not None:
+            if mask.dtype != mx.bool_:
+                return None
+            # The row's mask over the keys its step held, at the clamped rows.
+            keys = mx.broadcast_to(mask, (B, 1, L, Kv)).reshape(L, Kv)
+            clamped = mx.minimum(
+                mx.maximum(idx, 0), mx.array(lens, dtype=mx.int32)[:, None] - 1
+            )
+            valid = (idx >= 0) & mx.take_along_axis(keys, clamped, axis=-1)
+        q_lat = mx.concatenate(
+            [_mla_head_proj(self.embed_q, q[:, :, r : r + 1]) for r in range(L)], axis=2
+        )
+        out = _decode_kernels.dsa_attention_rows(
+            q_lat[0].transpose(1, 0, 2),
+            kv_latent[0, 0],
+            idx,
+            mx.array(lens, dtype=mx.int32),
+            self.scale,
+            valid,
+        )
+        if out is None:
+            return None
+        rows = [
+            _mla_head_proj(self.unembed_out, out[r][None, :, None, :]) for r in range(L)
+        ]
         output = mx.concatenate(rows, axis=2)
         return output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 

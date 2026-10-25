@@ -1551,6 +1551,288 @@ def dsa_gather_selected(kv_latent: mx.array, indices: mx.array):
 
 
 # ---------------------------------------------------------------------------
+# DSA attention over the selected rows of a row-exact verify block
+# ---------------------------------------------------------------------------
+#
+# Without NAX, a decode step's sparse attention is dsa_gather_selected plus
+# the unfused SDPA fallback (64 query heads share the latent head, so
+# GQA x L > 32): qs = bf16(q * bf16(scale)); scores = qs @ g^T, a steel GEMM
+# collapsed to M = 64 (bf16 out); where(valid, scores, bf16 lowest);
+# precise softmax; out = p @ g, a steel split-K GEMM (bk 16; fp32 partials
+# of K partitions, the last one also taking the K tail as a zero-padded
+# 16-wide tile; partials summed in order from 0). Every GEMM output is a
+# chain of fp32 8 x 8 simdgroup MMAs over K in order, independent of the
+# tiling, so two kernels with their own tiling replay the two GEMMs (the
+# gather fused in, by index) around MLX's softmax: three dispatches for all
+# rows of a verify block instead of six per row. (For one row they are no
+# faster than the stock kernels; decode keeps those.)
+_DSA_ROWS_SCORES_SOURCE = r"""
+  constexpr int TH = 16;   // heads per threadgroup (two 8-row fragments)
+  constexpr int TK = 32;   // selected rows per threadgroup
+  constexpr int BD = 32;   // latent dims staged per step
+  constexpr int LDS = BD + 8;
+  const uint lane = thread_index_in_simdgroup;
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const int tid = int(thread_index_in_threadgroup);
+  const int k0 = int(threadgroup_position_in_grid.x) * TK;
+  const int h0 = int(threadgroup_position_in_grid.y) * TH;
+  const int row = int(threadgroup_position_in_grid.z);
+  const int kv_len = int(kv_lens[row]);
+  const device int* sel = idx + size_t(row) * W;
+  const device T* qr = q + size_t(row) * H * D;
+  threadgroup T qs[TH * LDS];
+  threadgroup T ks[TK * LDS];
+  const float sbf = static_cast<float>(scale[0]);
+  const short qid = short(lane / 4);
+  const short fm = (qid & 4) + short((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + short(lane % 2) * 2;
+  // Four simdgroups: heads (sg / 2) x rows (sg % 2), 8 heads x 16 rows each.
+  const int sh = sg / 2;
+  const int sk = sg % 2;
+  simdgroup_matrix<float, 8, 8> acc[2];
+  acc[0] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  acc[1] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  for (int d0 = 0; d0 < D; d0 += BD) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int c = tid; c < TH * BD / 4; c += 128) {
+      const int h = c / (BD / 4);
+      const int d = (c % (BD / 4)) * 4;
+      const device T* src = qr + size_t(h0 + h) * D + d0 + d;
+      for (int e = 0; e < 4; e++) {
+        qs[h * LDS + d + e] = static_cast<T>(static_cast<float>(src[e]) * sbf);
+      }
+    }
+    for (int c = tid; c < TK * BD / 8; c += 128) {
+      const int k = c / (BD / 8);
+      const int d = (c % (BD / 8)) * 8;
+      const int slot = k0 + k;
+      const int raw = slot < W ? sel[slot] : 0;
+      const int r = metal::min(metal::max(raw, 0), kv_len - 1);
+      *reinterpret_cast<threadgroup uint4*>(ks + k * LDS + d) =
+          *reinterpret_cast<const device uint4*>(kv + size_t(r) * D + d0 + d);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int kk = 0; kk < BD; kk += 8) {
+      simdgroup_matrix<float, 8, 8> a;
+      simdgroup_matrix<float, 8, 8> b[2];
+      const int h = sh * 8 + fm;
+      a.thread_elements()[0] = static_cast<float>(qs[h * LDS + kk + fn]);
+      a.thread_elements()[1] = static_cast<float>(qs[h * LDS + kk + fn + 1]);
+      for (int j = 0; j < 2; j++) {
+        const int k = (sk * 2 + j) * 8 + fn;
+        b[j].thread_elements()[0] = static_cast<float>(ks[k * LDS + kk + fm]);
+        b[j].thread_elements()[1] = static_cast<float>(ks[(k + 1) * LDS + kk + fm]);
+      }
+      simdgroup_multiply_accumulate(acc[0], a, b[0], acc[0]);
+      simdgroup_multiply_accumulate(acc[1], a, b[1], acc[1]);
+    }
+  }
+  const T lowest = lowest_in[0];
+  const int h = h0 + sh * 8 + fm;
+  for (int j = 0; j < 2; j++) {
+    const int k = k0 + (sk * 2 + j) * 8 + fn;
+    for (int e = 0; e < 2; e++) {
+      if (k + e < W) {
+#if MASKED
+        const bool ok = bool(valid[size_t(row) * W + k + e]);
+#else
+        const bool ok = sel[k + e] >= 0;
+#endif
+        const T v = static_cast<T>(acc[j].thread_elements()[e]);
+        scores[(size_t(row) * H + h) * W + k + e] = ok ? v : lowest;
+      }
+    }
+  }
+"""
+
+_DSA_ROWS_PV_SOURCE = r"""
+  constexpr int TH = 16;   // heads per threadgroup
+  constexpr int TD = 16;   // output dims per threadgroup
+  const uint lane = thread_index_in_simdgroup;
+  const int p = int(simdgroup_index_in_threadgroup);  // this simdgroup's K partition
+  const int d0 = int(threadgroup_position_in_grid.x) * TD;
+  const int h0 = int(threadgroup_position_in_grid.y) * TH;
+  const int row = int(threadgroup_position_in_grid.z);
+  const int kv_len = int(kv_lens[row]);
+  const device int* sel = idx + size_t(row) * W;
+  const device T* pr = probs + size_t(row) * H * W;
+  const short qid = short(lane / 4);
+  const short fm = (qid & 4) + short((lane / 2) % 4);
+  const short fn = (qid & 2) * 2 + short(lane % 2) * 2;
+  simdgroup_matrix<float, 8, 8> acc[2][2];
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 2; j++) {
+      acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+  }
+  const int kb = p * PSZ;
+  const int kend = p == NP - 1 ? (W / 16) * 16 + (W % 16 ? 16 : 0) : kb + PSZ;
+  // The next 8 rows' fragment values load while this step's MMAs run.
+  float na[2][2];
+  float nb[2][2];
+  auto fetch = [&](int k) {
+    const int ka = k + fn;
+    for (int i = 0; i < 2; i++) {
+      const device T* prow = pr + size_t(h0 + i * 8 + fm) * W;
+      na[i][0] = ka < W ? static_cast<float>(prow[ka]) : 0.0f;
+      na[i][1] = ka + 1 < W ? static_cast<float>(prow[ka + 1]) : 0.0f;
+    }
+    const int kr = k + fm;
+    const int raw = kr < W ? sel[kr] : 0;
+    const device T* vrow = kv + size_t(metal::min(metal::max(raw, 0), kv_len - 1)) * D;
+    for (int j = 0; j < 2; j++) {
+      const int d = d0 + j * 8 + fn;
+      nb[j][0] = kr < W ? static_cast<float>(vrow[d]) : 0.0f;
+      nb[j][1] = kr < W ? static_cast<float>(vrow[d + 1]) : 0.0f;
+    }
+  };
+  fetch(kb);
+  for (int k = kb; k < kend; k += 8) {
+    simdgroup_matrix<float, 8, 8> a[2];
+    simdgroup_matrix<float, 8, 8> b[2];
+    for (int i = 0; i < 2; i++) {
+      a[i].thread_elements()[0] = na[i][0];
+      a[i].thread_elements()[1] = na[i][1];
+      b[i].thread_elements()[0] = nb[i][0];
+      b[i].thread_elements()[1] = nb[i][1];
+    }
+    if (k + 8 < kend) {
+      fetch(k + 8);
+    }
+    for (int i = 0; i < 2; i++) {
+      for (int j = 0; j < 2; j++) {
+        simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+      }
+    }
+  }
+  threadgroup float part[NP][TH][TD];
+  for (int i = 0; i < 2; i++) {
+    for (int j = 0; j < 2; j++) {
+      part[p][i * 8 + fm][j * 8 + fn] = acc[i][j].thread_elements()[0];
+      part[p][i * 8 + fm][j * 8 + fn + 1] = acc[i][j].thread_elements()[1];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int e = p * 32 + int(lane); e < TH * TD; e += NP * 32) {
+    const int hh = e / TD;
+    const int dd = e % TD;
+    float total = 0.0f;
+    for (int q = 0; q < NP; q++) {
+      total += part[q][hh][dd];
+    }
+    out[(size_t(row) * H + h0 + hh) * D + d0 + dd] = static_cast<T>(total);
+  }
+"""
+
+
+@lru_cache(maxsize=None)
+def _dsa_rows_scores_kernel(masked: bool):
+    return mx.fast.metal_kernel(
+        name="glm5_dsa_rows_scores" + ("_masked" if masked else ""),
+        input_names=["q", "kv", "idx", "kv_lens", "scale", "lowest_in"]
+        + (["valid"] if masked else []),
+        output_names=["scores"],
+        header=_QMV_HEADER,
+        source=_source(_DSA_ROWS_SCORES_SOURCE, MASKED=int(masked)),
+    )
+
+
+@lru_cache(maxsize=None)
+def _dsa_rows_pv_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_dsa_rows_pv",
+        input_names=["probs", "kv", "idx", "kv_lens"],
+        output_names=["out"],
+        header=_QMV_HEADER,
+        source=_DSA_ROWS_PV_SOURCE,
+    )
+
+
+def _splitk_partitions(M: int, N: int, K: int):
+    """steel_gemm_splitk_axpby's K partitions (count, size) for bk = 16."""
+    tm, tn, tk = (M + 31) // 32, (N + 31) // 32, K // 16
+    want = max(1, tk // (tm * tn))
+    parts = min(max(2, 1 << (want - 1).bit_length()), 32)
+    return parts, ((K // 16) // parts) * 16
+
+
+def dsa_attention_rows_supported(heads: int, dim: int, width: int, dtype) -> bool:
+    """Whether ``dsa_attention_rows`` covers these shapes on this GPU."""
+    return (
+        heads % 16 == 0
+        and dim % 32 == 0
+        and width > 512
+        and dtype in (mx.bfloat16, mx.float16)
+        and not is_nax_available()
+    )
+
+
+def dsa_attention_rows(
+    q_lat: mx.array,
+    kv: mx.array,
+    idx: mx.array,
+    kv_lens: mx.array,
+    scale: float,
+    valid: Optional[mx.array] = None,
+) -> Optional[mx.array]:
+    """Sparse attention of R one-token rows over their selected latent rows,
+    each row as its decode step computes it (gather + SDPA fallback).
+
+    ``q_lat`` [R, H, D] (the embedded queries), ``kv`` [Kv, D] latent keys,
+    ``idx`` [R, W] int32 selected rows (-1 = unused), ``kv_lens`` [R] int32
+    (each row's keys, for the index clamp), ``valid`` [R, W] bool for a
+    row's mask beyond ``idx >= 0``. Returns [R, H, D] or None when not
+    covered (NAX GPUs run other GEMMs; W <= 512 changes their kernels)."""
+    if q_lat.ndim != 3 or kv.ndim != 2 or idx.ndim != 2 or idx.dtype != mx.int32:
+        return None
+    R, H, D = q_lat.shape
+    W = idx.shape[1]
+    if kv.shape[1] != D or idx.shape[0] != R or kv_lens.shape != (R,):
+        return None
+    if kv.dtype != q_lat.dtype or not dsa_attention_rows_supported(
+        H, D, W, q_lat.dtype
+    ):
+        return None
+    masked = valid is not None
+    inputs = [
+        q_lat,
+        kv,
+        idx,
+        kv_lens.astype(mx.int32),
+        mx.array([scale], dtype=q_lat.dtype),
+        mx.array([mx.finfo(q_lat.dtype).min], dtype=q_lat.dtype),
+    ]
+    if masked:
+        inputs.append(valid)
+    STATS["dsa_rows_attention"] += 1
+    scores = _dsa_rows_scores_kernel(masked)(
+        inputs=inputs,
+        template=[("T", q_lat.dtype), ("H", H), ("D", D), ("W", W)],
+        grid=(128 * ((W + 31) // 32), H // 16, R),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(R, H, W)],
+        output_dtypes=[q_lat.dtype],
+    )[0]
+    probs = mx.softmax(scores, axis=-1, precise=True)
+    parts, size = _splitk_partitions(H, D, W)
+    return _dsa_rows_pv_kernel()(
+        inputs=[probs, kv, idx, kv_lens.astype(mx.int32)],
+        template=[
+            ("T", q_lat.dtype),
+            ("H", H),
+            ("D", D),
+            ("W", W),
+            ("NP", parts),
+            ("PSZ", size),
+        ],
+        grid=(32 * parts * (D // 16), H // 16, R),
+        threadgroup=(32 * parts, 1, 1),
+        output_shapes=[(R, H, D)],
+        output_dtypes=[q_lat.dtype],
+    )[0]
+
+
+# ---------------------------------------------------------------------------
 # KDA (linear attention) decode/verify step
 # ---------------------------------------------------------------------------
 #

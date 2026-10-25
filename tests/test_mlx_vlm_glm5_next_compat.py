@@ -3657,6 +3657,45 @@ def test_rows_gemv_rows_match_their_one_row_gemv(out_dims, in_dims):
         assert _mismatches(out, reference) == 0, rows
 
 
+@pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("rows,masked", [(1, False), (4, False), (3, True)])
+def test_dsa_attention_rows_match_the_gather_and_sdpa_fallback(rows, masked):
+    """Each row equals its decode step's dsa_gather_selected + SDPA fallback
+    (steel GEMM scores, precise softmax, split-K PV) over 2051 selected
+    rows, unused slots and masked keys included."""
+    if not dk.dsa_attention_rows_supported(64, 512, 2051, mx.bfloat16):
+        pytest.skip("NAX GPUs run other attention GEMMs")
+    kv_len, width = 4500, 2051
+    kv = (mx.random.normal((kv_len, 512), key=mx.random.key(rows)) * 2).astype(
+        mx.bfloat16
+    )
+    q = (mx.random.normal((rows, 64, 512), key=mx.random.key(10 + rows)) * 3).astype(
+        mx.bfloat16
+    )
+    lens = [kv_len - rows + r + 1 for r in range(rows)]
+    perm = mx.random.permutation(kv_len - rows, key=mx.random.key(20 + rows))[
+        : width - 5
+    ]
+    idx = mx.concatenate([perm, mx.full((5,), -1)]).astype(mx.int32)
+    idx = mx.broadcast_to(idx, (rows, width))
+    keep = mx.random.uniform(key=mx.random.key(30 + rows), shape=(rows, kv_len)) > 0.1
+    valid = None
+    if masked:
+        clamped = mx.minimum(mx.maximum(idx, 0), mx.array(lens)[:, None] - 1)
+        valid = (idx >= 0) & mx.take_along_axis(keep, clamped, axis=-1)
+    out = dk.dsa_attention_rows(
+        q, kv, idx, mx.array(lens, dtype=mx.int32), 192**-0.5, valid
+    )
+    for r in range(rows):
+        g, sel = dk.dsa_gather_selected(kv[None, None, : lens[r]], idx[r][None, None])
+        if masked:
+            sel = valid[r][None, None, None]
+        reference = mx.fast.scaled_dot_product_attention(
+            q[r][None, :, None], g, g, scale=192**-0.5, mask=sel
+        )
+        assert _mismatches(out[r], reference[0, :, 0]) == 0, r
+
+
 def _row_exact_block(model, block, cache):
     """``model(block)`` as a row-exact MTP verify forward runs it."""
     assert qwen35_verify_qmm.apply_verify_qmm_patch()
@@ -3712,6 +3751,7 @@ def _check_row_exact_verify(prompt_len, width, batch_cache, **model_kwargs):
         for start in range(0, prompt_len, 512):
             mx.eval(model(prompt[:, start : start + 512], cache=cache).logits)
         caches.append(bg._merge_row_caches([cache]) if batch_cache else cache)
+    fused_rows = _stats()["dsa_rows_attention"]
     for block_index in range(2):
         block = mx.random.randint(
             0, 256, (1, width), key=mx.random.key(11 + block_index)
@@ -3723,6 +3763,13 @@ def _check_row_exact_verify(prompt_len, width, batch_cache, **model_kwargs):
         mx.eval(steps)
         for r, step in enumerate(steps):
             assert _mismatches(rows[:, r : r + 1], step) == 0, (block_index, r)
+    # Blocks whose rows all select run their attention in one fused call;
+    # none select below index_topk.
+    fused = _stats()["dsa_rows_attention"] > fused_rows
+    if prompt_len > 2048:
+        assert fused == dk.dsa_attention_rows_supported(16, 512, 2051, mx.bfloat16)
+    elif prompt_len + 2 * width <= 2048:
+        assert not fused
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
