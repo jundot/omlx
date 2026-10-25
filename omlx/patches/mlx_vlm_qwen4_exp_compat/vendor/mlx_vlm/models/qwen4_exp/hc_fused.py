@@ -25,6 +25,7 @@ the three-launch kernels (norm, down/inject, up/mix); both produce the same bits
 
 from __future__ import annotations
 
+import functools
 import logging
 from itertools import chain
 from operator import is_
@@ -908,14 +909,24 @@ def _pack_factor(bits: int) -> int:
     return 8 if bits == 5 else (4 if bits == 6 else 32 // bits)
 
 
-# Two-launch decode geometry, tuned on an 80-core M5 Ultra; none of it changes an
-# output bit. Down rows per simdgroup: 1 for one or two rows (more threadgroups),
-# 2 above. From 7 rows on, the per-row threadgroups re-read the weights more
+# Two-launch decode geometry, tuned on an 80-core M5 Ultra and a 40-core M5 Max
+# (GPU class 's'); none of it changes an output bit. Down rows per simdgroup: 1
+# for one or two rows (more threadgroups), 2 above; on the M5 Max 2 from two rows
+# and 4 from four. Up rows per threadgroup: 32; on the M5 Max 128 from two rows, a
+# quarter of the threadgroups, each combining the slice sums once for four times
+# the rows. From 7 rows on, the per-row threadgroups re-read the weights more
 # often than the three-launch kernels, which are then as fast or faster.
 _V2_MAX_ROWS = 6
-_V2_UP_OUTPUTS = 32
 _V2_UP_THREADS = 320
 _TG_MEMORY_BYTES = 32768
+
+
+@functools.lru_cache(maxsize=None)
+def _gpu_class() -> str:
+    try:
+        return str(mx.device_info().get("architecture", ""))[-1:]
+    except Exception:
+        return ""
 
 
 def _up_chunks(bits: int, lowrank: int) -> int:
@@ -923,7 +934,13 @@ def _up_chunks(bits: int, lowrank: int) -> int:
 
 
 def _down_rps(rows: int) -> int:
+    if _gpu_class() == "s":
+        return 1 if rows == 1 else (2 if rows < 4 else 4)
     return 1 if rows <= 2 else 2
+
+
+def _up_outputs(rows: int) -> int:
+    return 128 if rows > 1 and _gpu_class() == "s" else 32
 
 
 def _down_row_groups(lowrank: int, inject: bool, rps: int) -> int:
@@ -943,7 +960,7 @@ def _decode_v2(rows: int, hc: int, hidden: int, lowrank: int, up_bits: int, inje
         and lowrank % (8 * rps) == 0
         and -(-hidden // 256) <= _down_row_groups(lowrank, inject, rps)
         and hidden * 2 + 32 <= _TG_MEMORY_BYTES
-        and lowrank * 2 + _V2_UP_OUTPUTS * (chunks + 1) * 4 <= _TG_MEMORY_BYTES
+        and lowrank * 2 + _up_outputs(rows) * (chunks + 1) * 4 <= _TG_MEMORY_BYTES
         and chunks <= _V2_UP_THREADS
     )
 
@@ -1012,6 +1029,7 @@ def _kernel_up_mix(normed, parts, rows, hc, hidden, lowrank, dtype, up, inject: 
     """(mixed, inj): slice-sum combine and activations, then the up projection and stream mix."""
     chunks = _up_chunks(up.bits, lowrank)
     threads = chunks * (_V2_UP_THREADS // chunks)
+    outputs = _up_outputs(rows)
     return _kernel(
         "omlx_qwen4_hc_decode_up",
         ["xn", "parts", "up_w", "up_s", "up_b"],
@@ -1029,10 +1047,10 @@ def _kernel_up_mix(normed, parts, rows, hc, hidden, lowrank, dtype, up, inject: 
             ("HC", hc),
             ("H", hidden),
             ("INJ", int(inject)),
-            ("NO", _V2_UP_OUTPUTS),
+            ("NO", outputs),
             ("TGS", threads),
         ],
-        grid=(threads, hc * hidden // _V2_UP_OUTPUTS, rows),
+        grid=(threads, hc * hidden // outputs, rows),
         threadgroup=(threads, 1, 1),
         output_shapes=[(rows, hidden), (rows, hc)],
         output_dtypes=[dtype, dtype],

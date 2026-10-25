@@ -1000,13 +1000,18 @@ def _two_launch_fits(hc_fused, monkeypatch, module, rows):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("gpu_class", ["d", "s"])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("use_combine", [True, False])
-def test_two_launch_decode_keeps_three_launch_bits(bits, use_combine, monkeypatch):
+def test_two_launch_decode_keeps_three_launch_bits(
+    bits, use_combine, gpu_class, monkeypatch
+):
     """Mixed, written residual and injection match the three-launch kernels bit for bit at
-    every decode row count, with and without a pending write (checkpoint shapes)."""
+    every decode row count, with and without a pending write (checkpoint shapes), in
+    each GPU class's geometry."""
     from mlx_vlm.models.qwen4_exp import hc_fused
 
+    monkeypatch.setattr(hc_fused, "_gpu_class", lambda: gpu_class)
     rows_list = range(1, hc_fused.MAX_ROWS + 1) if bits == 6 else (1, 2, 3, 5, 16)
     for seed in (0, 1, 2) if bits == 6 else (0,):
         mx.random.seed(4017 + 97 * seed + bits)
@@ -1025,11 +1030,15 @@ def test_two_launch_decode_keeps_three_launch_bits(bits, use_combine, monkeypatc
 # 64: every down block is a partial tail; 768/1152/1344: partial final down, inject
 # and norm blocks (see test_fused_matches_canonical_path_at_other_hidden_sizes).
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("gpu_class", ["d", "s"])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("hidden", [64, 1152, 1344])
-def test_two_launch_decode_keeps_bits_with_partial_blocks(hidden, bits, monkeypatch):
+def test_two_launch_decode_keeps_bits_with_partial_blocks(
+    hidden, bits, gpu_class, monkeypatch
+):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
+    monkeypatch.setattr(hc_fused, "_gpu_class", lambda: gpu_class)
     mx.random.seed(4018 + hidden + bits)
     module = _module(bits, True, hidden=hidden)
     for rows in (1, 3, 16):
@@ -1098,10 +1107,13 @@ _NDN_INV = "    const float inv = metal::rsqrt(tot / float(H) + e);\n"
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("gpu_class", ["d", "s"])
 @pytest.mark.parametrize("group_size", [32, 64])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("rows", [1, 3, 16])
-def test_two_launch_decode_keeps_three_launch_fp32_sums(bits, rows, group_size, monkeypatch):
+def test_two_launch_decode_keeps_three_launch_fp32_sums(
+    bits, rows, group_size, gpu_class, monkeypatch
+):
     """The BF16 outputs absorb most one-ulp FP32 changes (reversing the up sum order
     changed no output bit over 128 rows), so compare the FP32 values each path rounds:
     the stream sums of squares, the down and inject slice sums
@@ -1109,6 +1121,7 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(bits, rows, group_size, 
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     monkeypatch.setattr(hc_fused, "_V2_MAX_ROWS", hc_fused.MAX_ROWS)
+    monkeypatch.setattr(hc_fused, "_gpu_class", lambda: gpu_class)
     mx.random.seed(4020 + 10 * bits + rows + group_size)
     module = _module(bits, True, group_size=group_size)
     down, up = module.input_mix_weight_down, module.input_mix_weight_up
@@ -1255,7 +1268,7 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(bits, rows, group_size, 
     )[0]
     chunks = hc_fused._up_chunks(bits, LOWRANK)
     threads = chunks * (hc_fused._V2_UP_THREADS // chunks)
-    outputs = hc_fused._V2_UP_OUTPUTS
+    outputs = hc_fused._up_outputs(rows)
     up2_probe = _probe(
         _probe(
             _probe(hc_fused._U2_SOURCE, _U2_EPILOGUE, store_acc),
