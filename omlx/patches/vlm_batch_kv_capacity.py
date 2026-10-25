@@ -8,19 +8,120 @@ Prefix restore builds mlx-lm caches even for VLM models, so both backends are
 patched in place. Capacity layout adapted from PR #4030.
 """
 
+import logging
+import math
+
 import mlx.core as mx
 from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
 from mlx_lm.models.cache import KVCache as LMKVCache
 from mlx_vlm.models.cache import BatchKVCache, KVCache, dynamic_roll
 
+logger = logging.getLogger(__name__)
+
+# A ragged speculative rollback rolls every row of every layer's K/V (and the
+# QSA indexer bank) right by that row's rejected count. The stock expression
+# builds index arrays and gathers through them; this kernel moves each column
+# with one 16-byte (or one-element) copy per thread: element [b, ..., c, :]
+# of the output is element [b, ..., (c - shift[b]) mod width, :] of the input
+# for c < width and element [b, ..., c, :] otherwise, as in _stock_roll.
+_ROLL_SOURCE = r"""
+    const uint lane = thread_position_in_grid.x;
+    const uint c = thread_position_in_grid.y;
+    const uint bh = thread_position_in_grid.z;
+    const int width = params[0];
+    const int inner = params[1];
+    const int n = int(threads_per_grid.y);
+    int src = int(c);
+    if (src < width) {
+        const int s = (src - shifts[bh / uint(inner)]) % width;
+        src = s < 0 ? s + width : s;
+    }
+    const size_t row = size_t(bh) * size_t(n);
+    const device UNIT* in = (const device UNIT*)x + (row + size_t(src)) * UNITS;
+    device UNIT* o = (device UNIT*)out + (row + size_t(c)) * UNITS;
+    o[lane] = in[lane];
+"""
+_ROLL_KERNELS: dict = {}
+_ROLL_CHECKED: dict = {}
+
+
+def _roll_kernel(vector: bool):
+    kernel = _ROLL_KERNELS.get(vector)
+    if kernel is None:
+        kernel = _ROLL_KERNELS[vector] = mx.fast.metal_kernel(
+            name="omlx_batch_kv_roll_" + ("vec" if vector else "elem"),
+            input_names=["x", "shifts", "params"],
+            output_names=["out"],
+            source=_ROLL_SOURCE.replace("UNIT*", "uint4*" if vector else "T*"),
+        )
+    return kernel
+
+
+def _launch_roll(x, shifts, length: int, axis: int):
+    rows, n = x.shape[0], x.shape[axis]
+    inner = math.prod(x.shape[1:axis])
+    elems = math.prod(x.shape[axis + 1 :])
+    row_bytes = elems * x.dtype.size
+    vector = row_bytes % 16 == 0
+    units = row_bytes // 16 if vector else elems
+    lanes = min(units, 256)
+    out = _roll_kernel(vector)(
+        inputs=[
+            x.reshape(rows, inner, n, elems),
+            shifts.reshape(rows).astype(mx.int32),
+            mx.array([length, inner], dtype=mx.int32),
+        ],
+        template=[("T", x.dtype), ("UNITS", units)],
+        grid=(units, n, rows * inner),
+        threadgroup=(lanes, max(1, 256 // lanes), 1),
+        output_shapes=[(rows, inner, n, elems)],
+        output_dtypes=[x.dtype],
+    )[0]
+    return out.reshape(x.shape)
+
+
+def _fused_roll_ok(vector: bool) -> bool:
+    """Check each kernel variant once against the stock roll on a small input."""
+    ok = _ROLL_CHECKED.get(vector)
+    if ok is None:
+        try:
+            dtype, width = (mx.bfloat16, 8) if vector else (mx.int32, 1)
+            x = mx.arange(3 * 2 * 9 * width).reshape(3, 2, 9, width).astype(dtype)
+            shifts = mx.array([0, 2, 11])
+            got = _launch_roll(x, shifts, 7, 2)
+            ok = bool(mx.array_equal(got, _stock_roll(x, shifts[:, None], 7, 2)).item())
+        except Exception:  # noqa: BLE001 - optional fast path
+            ok = False
+        if not ok:
+            logger.warning("batch KV roll kernel disabled; using the stock roll")
+        _ROLL_CHECKED[vector] = ok
+    return ok
+
 
 def _roll_logical_prefix(x, shifts, length: int, axis: int):
     """``dynamic_roll`` of the first ``length`` columns; later columns stay put."""
     n = x.shape[axis]
+    if n != length and length <= 0:
+        return x
+    # MLX passes inputs of fewer than 8 elements in the constant address space.
+    if (
+        x.size >= 8
+        and length > 0
+        and axis >= 1
+        and shifts.size == x.shape[0]
+        and shifts.shape[0] == x.shape[0]
+        and mx.default_device() == mx.gpu
+    ):
+        row_bytes = math.prod(x.shape[axis + 1 :]) * x.dtype.size
+        if _fused_roll_ok(row_bytes % 16 == 0):
+            return _launch_roll(x, shifts, length, axis)
+    return _stock_roll(x, shifts, length, axis)
+
+
+def _stock_roll(x, shifts, length: int, axis: int):
+    n = x.shape[axis]
     if n == length:
         return dynamic_roll(x, shifts, axis=axis)
-    if length <= 0:
-        return x
     expand_shifts = (...,) + (None,) * (x.ndim - axis)
     expand_indices = expand_shifts[:-1]
     positions = mx.arange(n)[expand_indices]
