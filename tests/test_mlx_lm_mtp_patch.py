@@ -4645,6 +4645,80 @@ def _adapter(language):
     return VLMModelAdapter(SimpleNamespace(language_model=language))
 
 
+@pytest.mark.parametrize("compact", [False, True], ids=["batch-cache", "compact-cache"])
+@pytest.mark.parametrize("delta", [0.0, 7.0, -3.0])
+def test_singleton_mtp_rebinds_positions_after_prefill_clear(
+    monkeypatch, compact, delta
+):
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    active = mlx_lm_mtp.is_mtp_active()
+    mlx_lm_mtp.set_mtp_active(True)
+    bg.apply()
+    cache_rollback.apply()
+    monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    mx.random.seed(861)
+    model = _model("qwen_vlm")
+    # The helper has no owner config; enable the adapter's real mRoPE path.
+    model._uses_mrope = True
+    cleared = False
+    observed = []
+    original_next = bg._mtp_next
+    original_verify = Qwen3_5BatchInvariantForward.verify
+
+    def clear_between_cycles(batch, state):
+        nonlocal cleared
+        if not cleared and not state.queue and state.stats.cycles >= 1:
+            if compact:
+                batch.prompt_cache = batch.extract_cache(0)
+            # Incoming text prefill clears this shared adapter state.
+            model.clear_vlm_position_state()
+            cleared = True
+        return original_next(batch, state)
+
+    def record_positions(verifier, language_model, inputs, **kwargs):
+        if cleared:
+            cache = kwargs["cache"][language_model.model.fa_idx]
+            offset = cache._idx if hasattr(cache, "_idx") else cache.offset
+            if isinstance(offset, mx.array):
+                offset = int(offset.reshape(-1)[0].item())
+            positions = kwargs.get("position_ids")
+            first = (
+                positions[..., 0].reshape(-1).tolist()
+                if positions is not None
+                else None
+            )
+            observed.append((int(offset + delta), first))
+        return original_verify(verifier, language_model, inputs, **kwargs)
+
+    monkeypatch.setattr(bg, "_mtp_next", clear_between_cycles)
+    monkeypatch.setattr(Qwen3_5BatchInvariantForward, "verify", record_positions)
+    generator = BatchGenerator(
+        model,
+        sampler=lambda lp: mx.argmax(lp, -1),
+        max_tokens=24,
+        prefill_batch_size=1,
+    )
+    try:
+        uid = generator.insert([list(range(3, 15))], max_tokens=[24])[0]
+        model.register_rope_delta(uid, delta)
+        for _ in range(100):
+            _, responses = generator.next()
+            if any(response.finish_reason for response in responses):
+                break
+        else:
+            pytest.fail("generation did not finish")
+    finally:
+        generator.close()
+        mlx_lm_mtp.set_mtp_active(active)
+
+    assert cleared and observed
+    assert all(
+        first and all(position == expected for position in first)
+        for expected, first in observed
+    ), observed
+
+
 def _model(family):
     if family == "qwen_vlm":
         from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig, VisionConfig
