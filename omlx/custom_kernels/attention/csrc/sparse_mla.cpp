@@ -170,7 +170,12 @@ class SparseMlaAttentionPrimitive : public Primitive {
     // (measured 2-9% slower at BK=128 and 10-29% slower at BK=64, across
     // qL=512..8192 and four top-k index layouts on an M3 Ultra).
     const int bk = (q_latent.shape(1) == 32) ? 128 : 256;
-    constexpr int dc = 32;
+    // DC only chunks the staging of the QK and V tiles: every score and
+    // output keeps its MMA chain over D (resp. the K tile) in order, so the
+    // output is bitwise the same for any DC. The 64-head variant stages
+    // 16-wide chunks: about 16KB of threadgroup memory instead of ~26KB,
+    // 5-6% faster per call (qL=2048 at kL=4096..16384, M3 Ultra).
+    const int dc = (q_latent.shape(1) == 64) ? 16 : 32;
     constexpr int d_latent = 512;
     constexpr int d_pe = 64;
 

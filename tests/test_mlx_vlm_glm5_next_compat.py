@@ -2743,6 +2743,28 @@ def _smla_native(q, kv, idx, scale):
     return sparse_mla.sparse_mla_attention(q, zq, kv, zk, idx, scale)
 
 
+@pytest.mark.parametrize(
+    "L,K,topk,q_scale",
+    [(128, 4096, 2051, 1.0), (37, 700, 200, 1.0), (96, 8192, 2051, 3.0)],
+)
+def test_native_sparse_mla_matches_fp32_reference(L, K, topk, q_scale):
+    """The native 64-head prefill kernel (16-wide D staging) against fp32
+    attention over each query's selected rows."""
+    from omlx.custom_kernels.attention import fast as attention_fast
+
+    if not attention_fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+    q, kv, idx = _smla_inputs(L, K, topk, q_scale=q_scale)
+    scale = 256**-0.5
+    out = _smla_native(q, kv, idx, scale)
+    ref = _smla_reference(q, kv, idx, scale)
+    mx.eval(out, ref)
+    assert out.shape == q.shape and out.dtype == q.dtype
+    err = mx.abs(out.astype(mx.float32) - ref)
+    # Output rounding: half a bf16 ulp of each value, plus fp32 slack.
+    assert mx.all(err <= mx.abs(ref) * 2.0**-8 + 1e-3).item()
+
+
 @_needs_nax_sparse_mla
 @pytest.mark.parametrize(
     "L,K,topk,q_scale",
