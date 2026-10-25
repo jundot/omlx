@@ -1156,6 +1156,108 @@ def test_masked_decode_sdpa_matches_mlx_bit_for_bit(key_len, kind):
     assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16)).item()
 
 
+def _require_native_decode_sdpa():
+    from omlx.custom_kernels.attention import fast
+
+    if not fast.NATIVE_AVAILABLE:
+        pytest.skip("the native decode SDPA is not built")
+
+
+_S_CLASS_ONLY = pytest.mark.skipif(
+    qsa_fast._gpu_class() != "s",
+    reason="the native decode SDPA's partition count is transcribed for 's'-class GPUs only",
+)
+
+
+@_S_CLASS_ONLY
+@pytest.mark.parametrize(
+    ("key_len", "rows", "query_heads"),
+    [
+        (2052, 2048, 24),  # the budget: 128 partitions of 16 rows
+        (2055, 2051, 24),  # three-token tail: partitions of 17, the last ones empty
+        (24003, 2051, 24),
+        (4096, 1024, 24),  # 64 partitions
+        (4096, 1025, 24),  # 128 partitions
+        (40000, 8193, 24),  # 256 partitions
+        (80000, 32769, 24),  # 512 partitions
+        (4096, 2051, 8),  # four query heads per K/V head: 64 partitions
+    ],
+)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_gathered_decode_sdpa_matches_the_copies_bit_for_bit(
+    key_len, rows, query_heads, dtype
+):
+    _require_native_decode_sdpa()
+    rng = np.random.default_rng(key_len + rows)
+    capacity = key_len + 777
+    # Cache-shaped views: a prefix of a larger buffer, as update_and_fetch returns.
+    keys = mx.random.normal((1, 2, capacity, 256), key=mx.random.key(1)).astype(dtype)
+    values = mx.random.normal((1, 2, capacity, 256), key=mx.random.key(2)).astype(dtype)
+    keys, values = keys[:, :, :key_len], values[:, :, :key_len]
+    queries = 4 * mx.random.normal((1, query_heads, 1, 256), key=mx.random.key(3))
+    queries = queries.astype(dtype)
+    positions = np.sort(rng.choice(key_len, rows, replace=False))
+    tokens = mx.array(positions.astype(np.int32)[None])
+
+    actual = qsa_fast.gathered_decode_sdpa(queries, keys, values, tokens, 256**-0.5)
+    expected = qsa_fast._decode_qsa_sdpa(
+        queries,
+        qsa_fast._gather_kv_rows(keys, tokens),
+        qsa_fast._gather_kv_rows(values, tokens),
+        256**-0.5,
+    )
+
+    assert actual is not None
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16)).item()
+
+
+@_S_CLASS_ONLY
+def test_gathered_decode_reads_the_selected_rows_in_place(monkeypatch):
+    """At the model's geometry the gathered decode skips the K/V copies and
+    keeps their bits."""
+    _require_native_decode_sdpa()
+    key_len = 6003
+    keys = mx.random.normal((1, 2, key_len + 77, 256), key=mx.random.key(4))
+    values = mx.random.normal((1, 2, key_len + 77, 256), key=mx.random.key(5))
+    keys = keys.astype(mx.bfloat16)[:, :, :key_len]
+    values = values.astype(mx.bfloat16)[:, :, :key_len]
+    queries = mx.random.normal((1, 24, 1, 256), key=mx.random.key(6))
+    queries = queries.astype(mx.bfloat16)
+    index_queries = mx.random.normal((1, 1, 4, HEAD_DIM), key=mx.random.key(7))
+    pooled = mx.random.normal((1, key_len // RATIO, HEAD_DIM), key=mx.random.key(8))
+    copies = []
+    gather = qsa_fast._gather_kv_rows
+
+    def counted(kv, indices):
+        copies.append(kv.shape)
+        return gather(kv, indices)
+
+    def decode():
+        return qsa_fast.contiguous_causal_gathered_qsa_decode(
+            queries,
+            keys,
+            values,
+            index_queries.astype(mx.bfloat16),
+            pooled.astype(mx.bfloat16),
+            num_query_heads=24,
+            num_key_value_heads=2,
+            head_dim=256,
+            indexer_head_dim=HEAD_DIM,
+            compress_ratio=RATIO,
+            token_budget=TOPK * RATIO,
+        )
+
+    monkeypatch.setattr(qsa_fast, "_gather_kv_rows", counted)
+    actual = decode()
+    assert copies == []
+    monkeypatch.setattr(qsa_fast, "gathered_decode_sdpa", lambda *args: None)
+    expected = decode()
+    assert len(copies) == 2
+    assert actual.shape == expected.shape == (1, 1, 24, 256)
+    assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16)).item()
+
+
 def _official_gathered_tokens(head_scores: mx.array, key_len: int) -> mx.array:
     """``contiguous_causal_gathered_qsa_decode``'s argpartition path, verbatim."""
     blocks = key_len // RATIO

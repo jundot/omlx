@@ -999,6 +999,27 @@ def _nax_sparse_gqa_attention(
         return None
 
 
+def _native_decode_sdpa_supported(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+) -> bool:
+    """Whether the native decode_fast ABI accepts these inputs."""
+
+    try:
+        from omlx.custom_kernels.attention import fast
+
+        extension = getattr(fast, "_ext", None)
+        supported = getattr(extension, "sdpa_decode_supported", None)
+        return (
+            bool(getattr(fast, "NATIVE_AVAILABLE", False))
+            and supported is not None
+            and bool(supported(queries, keys, values))
+        )
+    except Exception:
+        return False
+
+
 def _decode_qsa_sdpa(
     queries: mx.array,
     keys: mx.array,
@@ -1015,16 +1036,10 @@ def _decode_qsa_sdpa(
     after the model caches have advanced.
     """
 
-    try:
-        from omlx.custom_kernels.attention import fast
+    if _native_decode_sdpa_supported(queries, keys, values):
+        try:
+            from omlx.custom_kernels.attention import fast
 
-        extension = getattr(fast, "_ext", None)
-        supported = getattr(extension, "sdpa_decode_supported", None)
-        if (
-            bool(getattr(fast, "NATIVE_AVAILABLE", False))
-            and supported is not None
-            and bool(supported(queries, keys, values))
-        ):
             return fast.sdpa_decode(
                 queries,
                 keys,
@@ -1032,10 +1047,10 @@ def _decode_qsa_sdpa(
                 scale,
                 causal=False,
             )
-    except Exception:
-        # Capability probing is eager and happens before a native primitive is
-        # added to the lazy graph, so this fallback cannot leave partial work.
-        pass
+        except Exception:
+            # Capability probing is eager and happens before a native primitive
+            # is added to the lazy graph, so this fallback cannot leave partial work.
+            pass
 
     return mx.fast.scaled_dot_product_attention(
         queries,
@@ -1043,6 +1058,356 @@ def _decode_qsa_sdpa(
         values,
         scale=scale,
     )
+
+
+# One gathered decode row's SDPA without the gathered copies. The gathered arm
+# takes the selected K/V rows into new arrays and runs the native decode SDPA
+# on them: from 1024 rows, omlx_sdpa_decode_2pass_1 gives partition b the rows
+# [b * chunk, (b + 1) * chunk), chunk = ceil(rows / blocks), in tiles of four
+# with FP32 partials, and omlx_sdpa_decode_2pass_2 merges the partitions. The
+# kernels below are those two, transcribed, except that gathered row i is read
+# in place as cache row tokens[i]: same partitions, same visiting order, same
+# float operations, same bits. The partition count is the native rule for the
+# GPU class; only the 's' class is transcribed (and verified), other GPUs keep
+# the copies.
+_GATHERED_SDPA_DISABLED = False
+_GATHERED_SDPA_KERNELS: list = []
+_GATHERED_SDPA_VALIDATED: set[tuple] = set()
+
+_GATHERED_SDPA_HEADER = r"""
+// The native kernel's load_vec: N contiguous elements in as few loads as possible.
+template <typename T, int N>
+inline void qsa_load_vec(thread T (&dst)[N], const device T* p) {
+  if constexpr (N == 2 || N == 4) {
+    *reinterpret_cast<thread vec<T, N>*>(dst) =
+        *reinterpret_cast<const device vec<T, N>*>(p);
+  } else if constexpr (N == 8 && sizeof(T) == 2) {
+    *reinterpret_cast<thread vec<T, 8>*>(dst) =
+        *reinterpret_cast<const device vec<T, 8>*>(p);
+  } else if constexpr (N == 8) {
+    *reinterpret_cast<thread vec<T, 4>*>(dst) =
+        *reinterpret_cast<const device vec<T, 4>*>(p);
+    *reinterpret_cast<thread vec<T, 4>*>(dst + 4) =
+        *reinterpret_cast<const device vec<T, 4>*>(p + 4);
+  } else {
+    for (int i = 0; i < N; i++) {
+      dst[i] = p[i];
+    }
+  }
+}
+
+// A cache row slice: vector loads where the native layout predicate holds
+// (unit element stride, row and head strides aligned), element loads elsewhere.
+template <typename T, int N>
+inline void qsa_load_row(
+    thread T (&dst)[N], const device T* p, int64_t stride, bool vectorized) {
+  if (vectorized) {
+    qsa_load_vec<T, N>(dst, p);
+  } else {
+    for (int i = 0; i < N; i++) {
+      dst[i] = p[i * stride];
+    }
+  }
+}
+"""
+
+_GATHERED_SDPA_PASS1_SOURCE = r"""
+    constexpr int BD = 32;
+    constexpr int TK = 4;
+    constexpr int qk_per_thread = D / BD;
+    constexpr int v_per_thread = V / BD;
+    typedef float U;
+
+    thread U q[qk_per_thread];
+    thread U o[v_per_thread] = {0};
+
+    const int kv_head_idx = threadgroup_position_in_grid.x;
+    const int block_idx = threadgroup_position_in_grid.z;
+    const int gqa_factor = threads_per_threadgroup.y;
+    const int q_head_idx = gqa_factor * kv_head_idx + thread_position_in_threadgroup.y;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const int N = int(tokens_shape[1]);
+    const int64_t t_stride = tokens_strides[1];
+    const int64_t k_seq_stride = keys_strides[2];
+    const int64_t v_seq_stride = values_strides[2];
+    const int64_t k_el = keys_strides[3];
+    const int64_t v_el = values_strides[3];
+    const bool k_vec = k_el == 1 && k_seq_stride % qk_per_thread == 0
+        && keys_strides[1] % qk_per_thread == 0;
+    const bool v_vec = v_el == 1 && v_seq_stride % v_per_thread == 0
+        && values_strides[1] % v_per_thread == 0;
+
+    // Each partition processes a contiguous chunk of the gathered rows.
+    const int chunk = (N + BLOCKS - 1) / BLOCKS;
+    const int k_start = block_idx * chunk;
+    const int k_end = min(N, k_start + chunk);
+
+    const device T* kp = keys + kv_head_idx * keys_strides[1] + simd_lid * qk_per_thread * k_el;
+    const device T* vp =
+        values + kv_head_idx * values_strides[1] + simd_lid * v_per_thread * v_el;
+
+    const float sc = scale[0];
+    for (int i = 0; i < qk_per_thread; i++) {
+        q[i] = static_cast<U>(sc) * static_cast<U>(queries[
+            q_head_idx * queries_strides[1] + (simd_lid * qk_per_thread + i) * queries_strides[3]]);
+    }
+
+    U max_score = Limits<U>::finite_min;
+    U sum_exp_score = 0;
+
+    // For each tile of TK rows in this partition's chunk
+    int i = k_start;
+    for (; i + TK <= k_end; i += TK) {
+        int64_t rows[TK];
+        for (int t = 0; t < TK; t++) {
+            rows[t] = int64_t(tokens[(i + t) * t_stride]);
+        }
+        thread T ks[TK][qk_per_thread];
+        U scores[TK];
+        for (int t = 0; t < TK; t++) {
+            qsa_load_row<T, qk_per_thread>(ks[t], kp + rows[t] * k_seq_stride, k_el, k_vec);
+        }
+        for (int t = 0; t < TK; t++) {
+            U score = 0;
+            for (int j = 0; j < qk_per_thread; j++) {
+                score += q[j] * static_cast<U>(ks[t][j]);
+            }
+            scores[t] = simd_sum(score);
+        }
+
+        U tile_max = scores[0];
+        for (int t = 1; t < TK; t++) {
+            tile_max = max(tile_max, scores[t]);
+        }
+        U new_max = max(max_score, tile_max);
+
+        thread T vs[TK][v_per_thread];
+        for (int t = 0; t < TK; t++) {
+            qsa_load_row<T, v_per_thread>(vs[t], vp + rows[t] * v_seq_stride, v_el, v_vec);
+        }
+
+        // Rescale the accumulators only when the running max actually increased
+        if (new_max > max_score) {
+            U factor = fast::exp(max_score - new_max);
+            sum_exp_score *= factor;
+            for (int j = 0; j < v_per_thread; j++) {
+                o[j] *= factor;
+            }
+            max_score = new_max;
+        }
+
+        for (int t = 0; t < TK; t++) {
+            U p = fast::exp(scores[t] - max_score);
+            sum_exp_score += p;
+            for (int j = 0; j < v_per_thread; j++) {
+                o[j] += p * static_cast<U>(vs[t][j]);
+            }
+        }
+    }
+
+    // The remaining rows of the chunk
+    for (; i < k_end; i++) {
+        const int64_t row = int64_t(tokens[i * t_stride]);
+        thread T k[qk_per_thread];
+        qsa_load_row<T, qk_per_thread>(k, kp + row * k_seq_stride, k_el, k_vec);
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+            score += q[j] * static_cast<U>(k[j]);
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        thread T vt[v_per_thread];
+        qsa_load_row<T, v_per_thread>(vt, vp + row * v_seq_stride, v_el, v_vec);
+        for (int j = 0; j < v_per_thread; j++) {
+            o[j] = o[j] * factor + exp_score * static_cast<U>(vt[j]);
+        }
+    }
+
+    if (simd_lid == 0) {
+        sums[q_head_idx * BLOCKS + block_idx] = sum_exp_score;
+        maxs[q_head_idx * BLOCKS + block_idx] = max_score;
+    }
+    for (int j = 0; j < v_per_thread; j++) {
+        partials[q_head_idx * BLOCKS * V + block_idx * V + simd_lid * v_per_thread + j] = o[j];
+    }
+"""
+
+_GATHERED_SDPA_PASS2_SOURCE = r"""
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int elem_per_thread = D / BD;
+    typedef float U;
+
+    thread U o[elem_per_thread] = {0};
+    threadgroup U outputs[BN * BD];
+
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const int q_offset = threadgroup_position_in_grid.x;
+    const device float* pp = partials + q_offset * BLOCKS * D + simd_gid * D
+        + simd_lid * elem_per_thread;
+    const device float* sp = sums + q_offset * BLOCKS;
+    const device float* mp = maxs + q_offset * BLOCKS;
+
+    U sum_exp_score = 0.0;
+    U max_score = Limits<U>::finite_min;
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        max_score = max(max_score, mp[simd_lid + BN * b]);
+    }
+    max_score = simd_max(max_score);
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = fast::exp(mp[simd_lid + BN * b] - max_score);
+        sum_exp_score += factor * sp[simd_lid + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = fast::exp(mp[simd_gid] - max_score);
+        for (int i = 0; i < elem_per_thread; i++) {
+            o[i] += factor * pp[i];
+        }
+        mp += BN;
+        sp += BN;
+        pp += BN * D;
+    }
+
+    for (int i = 0; i < elem_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        for (int i = 0; i < elem_per_thread; i++) {
+            out[q_offset * D + simd_gid * elem_per_thread + i] = static_cast<T>(o[i]);
+        }
+    }
+"""
+
+
+def _native_two_pass_decode_blocks(n_simds: int, rows: int) -> int | None:
+    """The native decode SDPA's 2-pass partition count for ``rows`` keys on an
+    's'-class GPU; None where it runs one pass or the rule is not transcribed."""
+
+    if _gpu_class() != "s" or rows < 1024:
+        return None
+    if rows == 1024 or n_simds <= 4:
+        return 64
+    if rows <= 8192:
+        return 128
+    if rows <= 32768:
+        return 256
+    if rows <= 65536:
+        return 512
+    return 1024
+
+
+def gathered_decode_sdpa(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    tokens: mx.array,
+    scale: float,
+) -> mx.array | None:
+    """``_decode_qsa_sdpa`` over the ``keys``/``values`` rows ``tokens[0]`` (the
+    gathered arm's copies) for one decode row, bit for bit, reading the rows in
+    place; None where the native kernel plan is not transcribed."""
+
+    global _GATHERED_SDPA_DISABLED
+    if _GATHERED_SDPA_DISABLED:
+        return None
+    if queries.ndim != 4 or keys.ndim != 4 or tokens.ndim != 2:
+        return None
+    _, query_heads, query_rows, head_dim = queries.shape
+    kv_heads = keys.shape[1]
+    if (
+        queries.shape[0] != 1
+        or query_rows != 1
+        or head_dim != 256
+        or keys.shape[0] != 1
+        or keys.shape[3] != head_dim
+        or values.shape != keys.shape
+        or queries.dtype not in (mx.bfloat16, mx.float16)
+        or keys.dtype != queries.dtype
+        or values.dtype != queries.dtype
+        or tokens.shape[0] != 1
+        or tokens.dtype != mx.int32
+        or query_heads % kv_heads
+    ):
+        return None
+    gqa_factor = query_heads // kv_heads
+    blocks = _native_two_pass_decode_blocks(gqa_factor, tokens.shape[1])
+    # The copies differ from the cache only in length, which the probe allows.
+    if blocks is None or not _native_decode_sdpa_supported(queries, keys, values):
+        return None
+    try:
+        if not _GATHERED_SDPA_KERNELS:
+            _GATHERED_SDPA_KERNELS.append(
+                mx.fast.metal_kernel(
+                    name="omlx_qwen4_gathered_decode_sdpa_1",
+                    input_names=["queries", "keys", "values", "tokens", "scale"],
+                    output_names=["partials", "sums", "maxs"],
+                    header=_GATHERED_SDPA_HEADER,
+                    source=_GATHERED_SDPA_PASS1_SOURCE,
+                    ensure_row_contiguous=False,
+                )
+            )
+            _GATHERED_SDPA_KERNELS.append(
+                mx.fast.metal_kernel(
+                    name="omlx_qwen4_gathered_decode_sdpa_2",
+                    input_names=["partials", "sums", "maxs"],
+                    output_names=["out"],
+                    source=_GATHERED_SDPA_PASS2_SOURCE,
+                )
+            )
+        pass_1, pass_2 = _GATHERED_SDPA_KERNELS
+        scale_array = _DECODE_SDPA_SCALES.get(scale)
+        if scale_array is None:
+            # The native kernel takes the FP32 value of the Python float.
+            scale_array = mx.array([scale], dtype=mx.float32)
+            mx.eval(scale_array)
+            _DECODE_SDPA_SCALES[scale] = scale_array
+        dtype = queries.dtype
+        partials, sums, maxs = pass_1(
+            inputs=[queries, keys, values, tokens, scale_array],
+            template=[("T", dtype), ("D", head_dim), ("V", head_dim), ("BLOCKS", blocks)],
+            grid=(32 * kv_heads, gqa_factor, blocks),
+            threadgroup=(32, gqa_factor, 1),
+            output_shapes=[
+                (query_heads, blocks, head_dim),
+                (query_heads, blocks),
+                (query_heads, blocks),
+            ],
+            output_dtypes=[mx.float32, mx.float32, mx.float32],
+        )
+        output = pass_2(
+            inputs=[partials, sums, maxs],
+            template=[("T", dtype), ("D", head_dim), ("BLOCKS", blocks)],
+            grid=(query_heads * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(1, query_heads, 1, head_dim)],
+            output_dtypes=[dtype],
+        )[0]
+        signature = (dtype, head_dim, gqa_factor, blocks)
+        if signature not in _GATHERED_SDPA_VALIDATED:
+            # Surface a pipeline failure while the copies can still take over.
+            mx.eval(output)
+            _GATHERED_SDPA_VALIDATED.add(signature)
+        return output
+    except Exception:
+        _GATHERED_SDPA_DISABLED = True
+        return None
 
 
 def contiguous_causal_gathered_qsa_decode(
@@ -1151,14 +1516,16 @@ def contiguous_causal_gathered_qsa_decode(
             tail = mx.arange(complete_key_len, key_tokens, dtype=mx.int32)[None]
             selected_tokens = mx.concatenate((selected_tokens, tail), axis=-1)
 
-    selected_keys = _gather_kv_rows(keys, selected_tokens)
-    selected_values = _gather_kv_rows(values, selected_tokens)
-    output = _decode_qsa_sdpa(
-        queries,
-        selected_keys,
-        selected_values,
-        head_dim**-0.5,
-    )
+    output = gathered_decode_sdpa(queries, keys, values, selected_tokens, head_dim**-0.5)
+    if output is None:
+        selected_keys = _gather_kv_rows(keys, selected_tokens)
+        selected_values = _gather_kv_rows(values, selected_tokens)
+        output = _decode_qsa_sdpa(
+            queries,
+            selected_keys,
+            selected_values,
+            head_dim**-0.5,
+        )
     return output.transpose(0, 2, 1, 3)
 
 
