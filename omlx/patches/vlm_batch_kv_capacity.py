@@ -42,6 +42,17 @@ def _ladder_capacity(needed: int, step: int) -> int:
     return ((needed + 2 * grain - 1) // grain) * grain
 
 
+def _host_rows(rows, like):
+    """A per-row int array built from host values.
+
+    Every reader of ``offset`` / ``left_padding`` copies them to the host
+    (masks, paddings, row extraction, MTP priming). ``tolist()`` of a device
+    op's result waits for every kernel queued before it, so each such read
+    stalled the decode pipeline; a host-built array is ready at once.
+    """
+    return mx.array(rows, dtype=like.dtype)
+
+
 def _logical_kv(cache):
     """``(keys, values)`` cut to the stock (concatenate) width."""
     keys, values = cache.keys, cache.values
@@ -133,11 +144,36 @@ class _CapacityMethods:
                 base = width
             self._grow(keys, values, base, base + n_steps * self.step)
 
-        self.offset += keys.shape[2]
-        self._idx += keys.shape[2]
+        n = keys.shape[2]
+        self.offset = _host_rows([o + n for o in self.offset.tolist()], self.offset)
+        self._idx += n
         self._keys[..., prev : self._idx, :] = keys
         self._values[..., prev : self._idx, :] = values
         return self._keys[..., : self._idx, :], self._values[..., : self._idx, :]
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchKVCache"
+                )
+            pads = [int(p) for p in left_padding]
+            self.left_padding = _host_rows(
+                [a + b for a, b in zip(self.left_padding.tolist(), pads)],
+                self.left_padding,
+            )
+            self.offset = _host_rows(
+                [a - b for a, b in zip(self.offset.tolist(), pads)], self.offset
+            )
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset = _host_rows([o - n for o in self.offset.tolist()], self.offset)
+        return n
 
     def finalize(self):
         if self._right_padding is not None:
@@ -153,8 +189,14 @@ class _CapacityMethods:
             self._values = _roll_logical_prefix(
                 self._values, padding[:, None], width, axis=2
             )
-            self.offset -= padding
-            self.left_padding += padding
+            pads = padding.tolist()
+            self.offset = _host_rows(
+                [a - b for a, b in zip(self.offset.tolist(), pads)], self.offset
+            )
+            self.left_padding = _host_rows(
+                [a + b for a, b in zip(self.left_padding.tolist(), pads)],
+                self.left_padding,
+            )
             self._right_padding = None
 
     def filter(self, batch_indices):
@@ -164,13 +206,17 @@ class _CapacityMethods:
             if isinstance(batch_indices, mx.array)
             else list(batch_indices)
         )
-        self.offset = self.offset[batch_indices]
-        self.left_padding = self.left_padding[batch_indices]
+        offsets, pads = self.offset.tolist(), self.left_padding.tolist()
+        self.offset = _host_rows([offsets[i] for i in kept], self.offset)
+        pads = [pads[i] for i in kept]
         if self._right_padding is not None and not isinstance(self, LMBatchKVCache):
-            self._right_padding = self._right_padding[batch_indices]
+            right = self._right_padding.tolist()
+            self._right_padding = _host_rows(
+                [right[i] for i in kept], self._right_padding
+            )
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item() if kept else 0
+        min_left_pad = min(pads) if kept else 0
         if self._keys is not None:
             if kept:
                 self._compact_rows(kept, min_left_pad)
@@ -179,7 +225,8 @@ class _CapacityMethods:
                 self._values = self._values[batch_indices]
         if min_left_pad > 0:
             self._idx -= min_left_pad
-            self.left_padding -= min_left_pad
+            pads = [p - min_left_pad for p in pads]
+        self.left_padding = _host_rows(pads, self.left_padding)
 
     def _compact_rows(self, kept, start: int) -> None:
         """Keep rows ``kept`` and drop the first ``start`` columns."""
@@ -201,8 +248,13 @@ class _CapacityMethods:
     def extend(self, other):
         """In-place extend this cache with the other cache."""
         if self.keys is None and other.keys is None:
-            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
-            self.offset = mx.concatenate([self.offset, other.offset])
+            self.left_padding = _host_rows(
+                self.left_padding.tolist() + other.left_padding.tolist(),
+                self.left_padding,
+            )
+            self.offset = _host_rows(
+                self.offset.tolist() + other.offset.tolist(), self.offset
+            )
             return
 
         logical = {id(c): _logical_kv(c) for c in (self, other)}
@@ -241,12 +293,15 @@ class _CapacityMethods:
                 pad = [(0, 0), (0, 0), (left, right), (0, 0)]
                 k = mx.pad(k, pad)
                 v = mx.pad(v, pad)
-            left_padding = c.left_padding + left
-            return k, v, c.offset, left_padding
+            return k, v, c.offset.tolist(), [p + left for p in c.left_padding.tolist()]
 
-        self.keys, self.values, self.offset, self.left_padding = map(
-            mx.concatenate, zip(*(pad(self), pad(other)))
-        )
+        k_a, v_a, offset_a, left_a = pad(self)
+        k_b, v_b, offset_b, left_b = pad(other)
+        offset, left_padding = self.offset, self.left_padding
+        self.keys = mx.concatenate([k_a, k_b])
+        self.values = mx.concatenate([v_a, v_b])
+        self.offset = _host_rows(offset_a + offset_b, offset)
+        self.left_padding = _host_rows(left_a + left_b, left_padding)
         self._idx = max_idx
 
     def _extend_into_capacity(self, other, logical, max_idx: int, max_size: int):
@@ -281,10 +336,12 @@ class _CapacityMethods:
             length = min(int(k.shape[2]), max_size - left)
             keys[start : start + n, :, left : left + length] = k[..., :length, :]
             values[start : start + n, :, left : left + length] = v[..., :length, :]
-            left_padding.append(c.left_padding + left)
+            left_padding.extend(p + left for p in c.left_padding.tolist())
             start += n
-        self.offset = mx.concatenate([self.offset, other.offset])
-        self.left_padding = mx.concatenate(left_padding)
+        self.offset = _host_rows(
+            self.offset.tolist() + other.offset.tolist(), self.offset
+        )
+        self.left_padding = _host_rows(left_padding, self.left_padding)
         self._keys, self._values = keys, values
         self._width = max_size
         self._idx = max_idx
@@ -321,13 +378,15 @@ class _CapacityMethods:
         cache.keys = keys
         cache.values = values
         cache._width = max_length
-        cache.offset += max_length
+        cache.offset = _host_rows(
+            [o + max_length for o in cache.offset.tolist()], cache.offset
+        )
         cache._idx = max_length
 
         return cache
 
     def extract(self, idx):
-        padding = int(self.left_padding[idx].item())
+        padding = int(self.left_padding.tolist()[idx])
         length = self._idx - padding
         # mlx-lm KVCache.state exposes the whole buffer, so its rows keep the
         # exact width.

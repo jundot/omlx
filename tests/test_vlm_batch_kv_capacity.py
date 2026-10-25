@@ -56,6 +56,7 @@ def equal(a, b):
             assert x is y
         elif isinstance(x, mx.array):
             assert x.shape == y.shape
+            assert x.dtype == y.dtype
             assert mx.array_equal(x, y).item()
         else:
             assert x == y
