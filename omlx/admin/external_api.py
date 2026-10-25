@@ -404,6 +404,12 @@ class ExternalAPIClient:
                         chunk = json.loads(payload)
                     except ValueError:
                         continue
+                    if chunk.get("error"):
+                        detail = self._redact_secret(_extract_error_detail(payload))
+                        raise ExternalEndpointError(
+                            f"External endpoint returned a streaming error: {detail}",
+                            status="stream_error",
+                        )
                     chunk_usage = chunk.get("usage")
                     if chunk_usage:
                         usage = chunk_usage
