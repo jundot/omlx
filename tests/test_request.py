@@ -10,6 +10,7 @@ from omlx.request import (
     SamplingParams,
     Request,
     RequestOutput,
+    finish_reason_with_tools,
 )
 
 
@@ -448,3 +449,17 @@ class TestRequestOutput:
         )
         assert output.tool_calls == tool_calls
         assert len(output.tool_calls) == 2
+
+
+class TestFinishReasonWithTools:
+    def test_preserves_length_over_tool_calls(self):
+        assert finish_reason_with_tools("length", True) == "length"
+
+    def test_tool_calls_when_not_truncated(self):
+        assert finish_reason_with_tools("stop", True) == "tool_calls"
+
+    def test_passthrough_without_tools(self):
+        assert finish_reason_with_tools("stop", False) == "stop"
+        assert finish_reason_with_tools("length", False) == "length"
+        assert finish_reason_with_tools(None, False) is None
+

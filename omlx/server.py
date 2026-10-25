@@ -93,6 +93,8 @@ from .api.anthropic_utils import (
     map_finish_reason_to_stop_reason,
     request_has_cache_control,
 )
+from .request import finish_reason_with_tools
+
 from .api.body_limit import RequestBodySizeLimitMiddleware
 from .api.embedding_models import (
     EmbeddingData,
@@ -5321,7 +5323,9 @@ async def create_chat_completion(
                         except (json.JSONDecodeError, AttributeError):
                             pass
 
-            finish_reason = "tool_calls" if tool_calls else output.finish_reason
+            finish_reason = finish_reason_with_tools(
+                output.finish_reason, bool(tool_calls)
+            )
             reasoning_token_count = (
                 len(engine.tokenizer.encode(cleaned_thinking))
                 if cleaned_thinking
@@ -6931,11 +6935,10 @@ async def stream_chat_completion(
         yield "data: [DONE]\n\n"
         return
 
-    # Final chunk with finish_reason
-    finish_reason = (
-        "tool_calls"
-        if tool_calls
-        else (last_output.finish_reason if last_output else "stop")
+    # Final chunk with finish_reason (keep length when truncated mid tool-calls)
+    finish_reason = finish_reason_with_tools(
+        last_output.finish_reason if last_output else "stop",
+        bool(tool_calls),
     )
     final_chunk = ChatCompletionChunk(
         id=response_id,

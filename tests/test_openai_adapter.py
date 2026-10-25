@@ -559,6 +559,36 @@ class TestOpenAIAdapter:
         assert result.choices[0].finish_reason == "tool_calls"
         assert result.choices[0].message.tool_calls == tool_calls
 
+    def test_format_response_length_with_tool_calls(self, adapter):
+        """Truncated tool-call turns keep finish_reason=length."""
+        from omlx.api.openai_models import FunctionCall, ToolCall
+
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[Message(role="user", content="Hello")],
+        )
+        tool_calls = [
+            ToolCall(
+                id="call_abc123",
+                type="function",
+                function=FunctionCall(
+                    name="get_weather",
+                    arguments='{"location": "Tokyo"}',
+                ),
+            )
+        ]
+        response = InternalResponse(
+            text="",
+            finish_reason="length",
+            tool_calls=tool_calls,
+            completion_tokens=30,
+        )
+
+        result = adapter.format_response(response, request)
+
+        assert result.choices[0].finish_reason == "length"
+        assert result.choices[0].message.tool_calls == tool_calls
+
     def test_format_response_empty_text(self, adapter):
         """Test formatting response with empty text."""
         request = ChatCompletionRequest(

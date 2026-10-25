@@ -1089,6 +1089,11 @@ def map_finish_reason_to_stop_reason(
     Returns:
         Anthropic stop_reason
     """
+    # Truncation must win over tool_use so clients do not treat a cut turn
+    # as a finished tool-call turn.
+    if finish_reason == "length":
+        return "max_tokens"
+
     if has_tool_calls:
         return "tool_use"
 

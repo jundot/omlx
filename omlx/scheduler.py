@@ -80,7 +80,7 @@ from .prefill_boundaries import (
 )
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
-from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .request import Request, RequestOutput, RequestStatus, SamplingParams, finish_reason_with_tools
 from .speculative.processing_sampler import (
     MTPProcessingSampler,
     MTPProcessorContractError,
@@ -13719,7 +13719,13 @@ class Scheduler:
                     if final_result.tool_calls:
                         output.tool_calls = final_result.tool_calls
                     if final_result.finish_reason:
-                        output.finish_reason = final_result.finish_reason
+                        # Parser-reported tool_calls must not hide a length cap.
+                        if final_result.finish_reason == "tool_calls":
+                            output.finish_reason = finish_reason_with_tools(
+                                output.finish_reason, True
+                            )
+                        elif output.finish_reason != "length":
+                            output.finish_reason = final_result.finish_reason
                     output.output_text = request.output_text
                 else:
                     # Standard finalization without a protocol parser

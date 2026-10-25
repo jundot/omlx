@@ -32,6 +32,7 @@ from ..openai_models import (
 from ..thinking import extract_thinking
 from ..utils import clean_special_tokens, extract_text_content
 from ..tool_calling import convert_tools_for_template
+from ...request import finish_reason_with_tools
 
 
 class OpenAIAdapter(BaseAdapter):
@@ -114,9 +115,9 @@ class OpenAIAdapter(BaseAdapter):
         )
         content = regular_content.strip() if regular_content else None
 
-        # Determine finish reason
-        finish_reason = (
-            "tool_calls" if response.tool_calls else response.finish_reason
+        # Determine finish reason (keep length when truncated mid tool-calls)
+        finish_reason = finish_reason_with_tools(
+            response.finish_reason, bool(response.tool_calls)
         )
 
         return ChatCompletionResponse(
