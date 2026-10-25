@@ -205,8 +205,13 @@ template <
       params->topk_valid_prefix &&
       (prefix_row || (q_abs < params->topk && length_limit >= q_abs + 1));
   const int n_tiles = (topk_limit + BK - 1) / BK;
+  // A last tile whose slots below topk_limit all sit in its first key
+  // fragment (3 of 256 for a 2051-slot selection) runs after the loop.
+  const bool one_frag_tail =
+      n_tiles > 0 && topk_limit - (n_tiles - 1) * BK <= kFragSize;
+  const int loop_tiles = one_frag_tail ? n_tiles - 1 : n_tiles;
 
-  for (int ktile = 0; ktile < n_tiles; ++ktile) {
+  for (int ktile = 0; ktile < loop_tiles; ++ktile) {
     const int topk_off = ktile * BK;
 
     for (int k = lane; k < BK; k += tgp_size) {
@@ -355,6 +360,113 @@ template <
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+
+  if (one_frag_tail) {
+    // The tile's MMA chains for its first key fragment, read straight from
+    // device memory: the same values, in the same order, as the loop's
+    // staged tiles. Its other fragments are masked (finite_min scores), so
+    // they change neither the row max nor the sum (exp2 underflows to 0
+    // once a row has a valid key; a row without one outputs 0 either way)
+    // and add only zero products to O.
+    const int topk_off = loop_tiles * BK;
+    auto tail_pos = [&](int k) {
+      const int slot = topk_off + k;
+      int k_pos = -1;
+      if (slot < topk_limit) {
+        k_pos = implicit_causal_prefix ? slot : int(topk_base[slot]);
+        if (k_pos < 0 || k_pos >= params->kL || (do_causal && k_pos > q_abs)) {
+          k_pos = -1;
+        }
+      }
+      return k_pos;
+    };
+    auto key_at = [&](int k_pos, int d) {
+      return k_pos < 0 ? AccumType(0)
+          : d < D_LATENT
+          ? static_cast<AccumType>(
+                kv_latent_base[size_t(k_pos) * params->KV_latent_strides[2] + d])
+          : static_cast<AccumType>(
+                k_pe_base[size_t(k_pos) * params->K_pe_strides[2] + d - D_LATENT]);
+    };
+    // This thread's score columns (slots sn, sn + 1) and value row (slot sm).
+    const int kp0 = tail_pos(sn);
+    const int kp1 = tail_pos(sn + 1);
+    const int kpv = tail_pos(sm);
+
+    MMATile<AccumType, TQ, 1, MMAFragAcc> S0;
+    S0.clear();
+    typename MMAFragAcc::frag_type kfrag;
+    STEEL_PRAGMA_UNROLL
+    for (short f = 0; f < D_TOTAL / kFragSize; ++f) {
+      const int d = f * kFragSize;
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; ++iq) {
+        const int h = tm + iq * kFragSize + sm;
+        STEEL_PRAGMA_UNROLL
+        for (short e = 0; e < 2; ++e) {
+          const int dim = d + sn + e;
+          Qtile.frag_at(iq, 0)[e] = dim < D_LATENT
+              ? static_cast<AccumType>(
+                    q_latent_base[size_t(h) * params->Q_latent_strides[1] + dim])
+              : static_cast<AccumType>(
+                    q_pe_base[size_t(h) * params->Q_pe_strides[1] + dim - D_LATENT]);
+        }
+      }
+      kfrag[0] = key_at(kp0, d + sm);
+      kfrag[1] = key_at(kp1, d + sm);
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; ++iq) {
+        MMAFragAcc::mma(S0.frag_at(iq, 0), Qtile.frag_at(iq, 0), kfrag, S0.frag_at(iq, 0));
+      }
+    }
+
+    STEEL_PRAGMA_UNROLL
+    for (short ii = 0; ii < decltype(S0)::kElemsPerTile; ++ii) {
+      S0.elems()[ii] *= scale;
+    }
+    constexpr auto neg_inf = Limits<AccumType>::finite_min;
+    STEEL_PRAGMA_UNROLL
+    for (short iq = 0; iq < TQ; ++iq) {
+      if (kp0 < 0) {
+        S0.frag_at(iq, 0)[0] = neg_inf;
+      }
+      if (kp1 < 0) {
+        S0.frag_at(iq, 0)[1] = neg_inf;
+      }
+    }
+
+    AccumType new_max[rows_per_thread];
+    AccumType factor[rows_per_thread];
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < rows_per_thread; ++i) {
+      new_max[i] = max_score[i];
+    }
+    S0.template row_reduce<SparseMlaMaxOp>(new_max);
+    S0.template row_bin_op<SparseMlaExpSubOp>(new_max);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < rows_per_thread; ++i) {
+      factor[i] = fast::exp2(max_score[i] - new_max[i]);
+      max_score[i] = new_max[i];
+    }
+    AccumType sum_score_tmp[rows_per_thread] = {0};
+    S0.template row_reduce<SparseMlaSumOp>(sum_score_tmp);
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < rows_per_thread; ++i) {
+      sum_score[i] = sum_score[i] * factor[i] + sum_score_tmp[i];
+    }
+
+    Otile.template row_bin_op<SparseMlaMulOp>(factor);
+
+    STEEL_PRAGMA_UNROLL
+    for (short f = 0; f < TD_LATENT; ++f) {
+      kfrag[0] = key_at(kpv, f * kFragSize + sn);
+      kfrag[1] = key_at(kpv, f * kFragSize + sn + 1);
+      STEEL_PRAGMA_UNROLL
+      for (short iq = 0; iq < TQ; ++iq) {
+        MMAFragAcc::mma(Otile.frag_at(iq, f), S0.frag_at(iq, 0), kfrag, Otile.frag_at(iq, f));
+      }
     }
   }
 

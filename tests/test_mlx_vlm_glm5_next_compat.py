@@ -2765,6 +2765,35 @@ def test_native_sparse_mla_matches_fp32_reference(L, K, topk, q_scale):
     assert mx.all(err <= mx.abs(ref) * 2.0**-8 + 1e-3).item()
 
 
+@pytest.mark.parametrize(
+    "L,K,width,pe",
+    # The 3-slot tail of GLM's 2051-slot selection; early rows whose causal
+    # limit leaves a 1..8-slot tail; real (nonzero) rope parts.
+    [(128, 4100, 2051, False), (64, 2080, 2056, False), (32, 4100, 2051, True)],
+)
+def test_native_sparse_mla_one_fragment_tail_matches_the_tile_loop(L, K, width, pe):
+    """A last key tile whose slots sit in its first fragment runs outside the
+    kernel's tile loop; padding the selection with unused slots sends the
+    same tile through the loop (masked slots), bit for bit the same output."""
+    from omlx.custom_kernels.attention import fast as attention_fast
+
+    if not attention_fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+    q, kv, idx = _smla_inputs(L, K, width)
+    q_pe = mx.zeros(q.shape[:-1] + (64,), q.dtype)
+    k_pe = mx.zeros(kv.shape[:-1] + (64,), kv.dtype)
+    if pe:
+        q_pe = mx.random.normal(q_pe.shape).astype(q.dtype)
+        k_pe = mx.random.normal(k_pe.shape).astype(kv.dtype)
+    padded = mx.concatenate(
+        [idx, mx.full(idx.shape[:-1] + (2304 - width,), -1, dtype=idx.dtype)], axis=-1
+    )
+    scale = 256**-0.5
+    tail = sparse_mla.sparse_mla_attention(q, q_pe, kv, k_pe, idx, scale)
+    loop = sparse_mla.sparse_mla_attention(q, q_pe, kv, k_pe, padded, scale)
+    assert _mismatches(tail, loop) == 0
+
+
 @_needs_nax_sparse_mla
 @pytest.mark.parametrize(
     "L,K,topk,q_scale",
