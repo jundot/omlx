@@ -21,13 +21,9 @@ def _adapter():
 def test_complete_text_cache_hit_keeps_gathered_decode_and_verify(cached_tokens, monkeypatch):
     import omlx.models.vlm as vlm_module
 
-    # This checks the cache-hit proof, not the threshold policy (which keeps
-    # the masked path while fused attention rows run): pin the gathered crossover.
-    monkeypatch.setattr(
-        vlm_module,
-        "_step_text_positions_min_context",
-        lambda: vlm_module._GATHERED_STEP_MIN_CONTEXT,
-    )
+    # This checks the cache-hit proof, not the step policy (which keeps the
+    # masked path while fused attention rows run): engage the gathered arms.
+    monkeypatch.setattr(vlm_module, "_step_text_positions_engaged", lambda: True)
     scheduler = _make_scheduler()
     request = _make_request("cached-text", 40001)
     scheduler.add_request(request)

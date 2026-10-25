@@ -29,23 +29,18 @@ from mlx_vlm.models.cache import RotatingKVCache
 logger = logging.getLogger(__name__)
 
 
-# Cached tokens below which decode/verify rows keep rank-three positions (the
-# masked QSA path): _GATHERED_STEP_MIN_CONTEXT, the M5 Max crossover for the
-# gathered arms (~12k serial, higher for MTP) -- unless Qwen4's fused attention
-# rows run on this GPU: the masked path is then faster at every context (M5
-# Ultra, 16K-128K) and bit-identical to the unfused MLX ops, so steps never
-# switch.
-_GATHERED_STEP_MIN_CONTEXT = 32768
-
-
-def _step_text_positions_min_context() -> float:
-    """Cached tokens from which a text-proven Qwen4 step takes rank-two
-    positions (the gathered QSA arms); infinite while fused attention rows run."""
+def _step_text_positions_engaged() -> bool:
+    """Whether a text-proven Qwen4 decode/verify step takes rank-two positions:
+    the gathered QSA arms past the block budget (below it, the same dense rows
+    as rank three, bit for bit). Not while Qwen4's fused attention rows run on
+    this GPU: the masked path is then faster at every context (M5 Ultra,
+    16K-128K) and bit-identical to the unfused MLX ops, so steps keep
+    rank-three positions."""
     try:
         from mlx_vlm.models.qwen4_exp import attn_fused
     except ImportError:
-        return _GATHERED_STEP_MIN_CONTEXT
-    return float("inf") if attn_fused.rows_available() else _GATHERED_STEP_MIN_CONTEXT
+        return True
+    return not attn_fused.rows_available()
 
 
 class PrefillReadyRotatingKVCache(RotatingKVCache):
@@ -648,13 +643,12 @@ class VLMModelAdapter(nn.Module):
                         break
                 batch_size, seq_len = input_ids.shape
                 deltas = self._batch_rope_deltas_for_size(batch_size)
-                # The step proof engages only above the context threshold; a
-                # scalar offset is the batch-one case the proof is bound to.
+                # A scalar offset is the batch-one case the step proof is bound to.
                 qwen4_text_prefill_positions = prefill_text_positions or (
                     step_text_positions
                     and self.model_type == "qwen4_exp"
                     and isinstance(offsets, (int, float))
-                    and offsets >= _step_text_positions_min_context()
+                    and _step_text_positions_engaged()
                 )
                 base_offsets = None
                 if isinstance(offsets, mx.array):

@@ -740,7 +740,7 @@ class TestPerRequestMRoPEDecode:
         """A scheduler-proven text request keeps (1, T) positions through decode and MTP verify steps."""
         import omlx.models.vlm as vlm_module
 
-        monkeypatch.setattr(vlm_module, "_step_text_positions_min_context", lambda: 0)
+        monkeypatch.setattr(vlm_module, "_step_text_positions_engaged", lambda: True)
         import mlx.core as mx
 
         from omlx.models.vlm import VLMModelAdapter
@@ -765,7 +765,7 @@ class TestPerRequestMRoPEDecode:
         """Unproven requests and batched steps keep the fail-closed (3, B, T) form."""
         import omlx.models.vlm as vlm_module
 
-        monkeypatch.setattr(vlm_module, "_step_text_positions_min_context", lambda: 0)
+        monkeypatch.setattr(vlm_module, "_step_text_positions_engaged", lambda: True)
         import mlx.core as mx
 
         from omlx.models.vlm import VLMModelAdapter
@@ -802,44 +802,45 @@ class TestPerRequestMRoPEDecode:
         adapter(mx.zeros((1, 2), dtype=mx.int32), cache=[cache_layer])
         assert vlm.language_model.call_args.kwargs["position_ids"].shape == (3, 1, 2)
 
-    def test_qwen4_step_text_positions_engage_only_above_min_context(self, monkeypatch):
-        """Backbone rows keep the generic form below the context threshold (gathered arms are
-        null-to-negative there) and switch to (1, T) above it."""
+    def test_qwen4_step_text_positions_follow_the_step_policy(self, monkeypatch):
+        """Backbone rows take (1, T) at every context while the step policy is
+        engaged and keep the generic form otherwise."""
         import mlx.core as mx
 
         import omlx.models.vlm as vlm_module
         from omlx.models.vlm import VLMModelAdapter
 
-        monkeypatch.setattr(
-            vlm_module, "_step_text_positions_min_context", lambda: 65536
-        )
         vlm = self._make_qwen4_mrope_vlm_model()
         adapter = VLMModelAdapter(vlm)
         adapter.mark_text_positions(7)
         cache_layer = MagicMock()
 
-        cache_layer.offset = 41_000
-        adapter.set_step_rope_deltas(mx.array([0.0]), uids=[7])
-        adapter(mx.zeros((1, 4), dtype=mx.int32), cache=[cache_layer])
-        assert vlm.language_model.call_args.kwargs["position_ids"].shape == (3, 1, 4)
+        def step_positions(offset):
+            cache_layer.offset = offset
+            adapter.set_step_rope_deltas(mx.array([0.0]), uids=[7])
+            adapter(mx.zeros((1, 4), dtype=mx.int32), cache=[cache_layer])
+            return vlm.language_model.call_args.kwargs["position_ids"]
 
-        cache_layer.offset = 82_000
-        adapter.set_step_rope_deltas(mx.array([0.0]), uids=[7])
-        adapter(mx.zeros((1, 4), dtype=mx.int32), cache=[cache_layer])
-        position_ids = vlm.language_model.call_args.kwargs["position_ids"]
-        assert position_ids.shape == (1, 4)
-        assert position_ids.tolist() == [[82_000, 82_001, 82_002, 82_003]]
+        monkeypatch.setattr(vlm_module, "_step_text_positions_engaged", lambda: True)
+        for offset in (64, 1_000, 82_000):
+            position_ids = step_positions(offset)
+            assert position_ids.shape == (1, 4)
+            assert position_ids.tolist() == [list(range(offset, offset + 4))]
 
-        # The scheduler-proven prefill positions are not subject to the threshold.
+        monkeypatch.setattr(vlm_module, "_step_text_positions_engaged", lambda: False)
+        for offset in (64, 82_000):
+            assert step_positions(offset).shape == (3, 1, 4)
+
+        # The scheduler-proven prefill positions are not subject to the policy.
         cache_layer.offset = 1_000
         adapter.set_text_prefill_rope_delta(0.0)
         adapter(mx.zeros((1, 4), dtype=mx.int32), cache=[cache_layer])
         assert vlm.language_model.call_args.kwargs["position_ids"].shape == (1, 4)
 
-    def test_qwen4_step_threshold_default_follows_fused_attention_rows(self, monkeypatch):
-        """The threshold keeps the masked path at every context while the fused
-        attention rows run (faster there, and bit-identical to the MLX ops), and is
-        the gathered crossover otherwise."""
+    def test_qwen4_step_policy_default_follows_fused_attention_rows(self, monkeypatch):
+        """Steps keep the masked path at every context while the fused attention
+        rows run (faster there, and bit-identical to the MLX ops), and take the
+        rank-two positions at every context otherwise."""
         import mlx.core as mx
 
         from omlx.models.vlm import VLMModelAdapter
@@ -860,11 +861,12 @@ class TestPerRequestMRoPEDecode:
             return vlm.language_model.call_args.kwargs["position_ids"].shape
 
         monkeypatch.setattr(attn_fused, "rows_available", lambda: True)
+        assert step_shape(64) == (3, 1, 4)
         assert step_shape(130_000) == (3, 1, 4)
 
         monkeypatch.setattr(attn_fused, "rows_available", lambda: False)
-        assert step_shape(32_767) == (3, 1, 4)
-        assert step_shape(32_768) == (1, 4)
+        assert step_shape(64) == (1, 4)
+        assert step_shape(130_000) == (1, 4)
 
     def test_qwen4_unregister_clears_text_positions_proof(self):
         import mlx.core as mx
