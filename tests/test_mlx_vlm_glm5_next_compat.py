@@ -4000,6 +4000,33 @@ def test_mla_head_qmv_declines_qmv_quad_shapes():
 
 
 @pytest.mark.usefixtures("glm5_fused_decode")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_pool_compress_matches_the_composed_window_softmax(dtype):
+    """The indexer's pool compress in one kernel against the op graph it
+    replaces (gate + ape, the composed softmax over each window, the
+    weighted sum): one window (a decode step), a prefill chunk, a partial
+    window left over, two sequences, and large logits."""
+    mx.random.seed(7)
+    for batch, rows, scale in (
+        (1, 4, 1.0),
+        (1, 2048, 3.0),
+        (1, 10, 20.0),
+        (2, 12, 1.0),
+    ):
+        keys = (mx.random.normal((batch, rows, 128)) * scale).astype(dtype)
+        gate = (mx.random.normal((batch, rows, 128)) * scale).astype(dtype)
+        ape = (mx.random.normal((4, 128)) * 0.5).astype(dtype)
+        usable = rows // 4 * 4
+        k = keys[:, :usable].reshape(batch, -1, 4, 128)
+        g = gate[:, :usable].reshape(batch, -1, 4, 128)
+        probs = mx.softmax(g + ape[None, None], axis=2)
+        reference = mx.sum(probs * k, axis=2)
+        got = dk.pool_compress(keys, gate, ape)
+        assert got is not None and got.shape == reference.shape
+        assert _mismatches(got, reference) == 0, (batch, rows, scale)
+
+
+@pytest.mark.usefixtures("glm5_fused_decode")
 @pytest.mark.parametrize("kv_len", [1, 300, 4099])
 @pytest.mark.parametrize("width", [1, 7, 2051])
 def test_dsa_gather_selected_is_bitwise_reference(kv_len, width):

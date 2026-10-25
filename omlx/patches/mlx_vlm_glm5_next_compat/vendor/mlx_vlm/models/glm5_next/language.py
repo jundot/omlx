@@ -875,6 +875,12 @@ class Glm5NextIndexer(nn.Module):
         kp = self.index_kpool
         if S == 0:
             return mx.zeros((B, 0, hd), dtype=keys.dtype)
+        if _DECODE_FUSION:
+            pooled = _decode_kernels.pool_compress(
+                keys, gate_scores, self.index_kpool_compress_ape
+            )
+            if pooled is not None:
+                return pooled
         usable = (S // kp) * kp
         keys = keys[:, :usable].reshape(B, -1, kp, hd)
         gate_scores = gate_scores[:, :usable].reshape(B, -1, kp, hd)

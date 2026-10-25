@@ -17,7 +17,7 @@ stock MLX arithmetic bit for bit:
   (routed + shared experts, clamped SwiGLU, routing-weighted sum);
 * KDA linear attention: ``kda_decode_step`` (short conv, SiLU, l2norm,
   gate projections, vector-gated delta rule, RMSNormGated);
-* DSA indexer: ``dsa_decode_scores`` and ``dsa_select_topk``;
+* DSA indexer: ``pool_compress``, ``dsa_decode_scores`` and ``dsa_select_topk``;
 * row-exact verify: ``rows_gemv`` (float projections of a verify block,
   every row with the one-token gemv arithmetic).
 
@@ -1479,6 +1479,88 @@ def dsa_select_topk(
         threadgroup=(1024, 1, 1),
         output_shapes=[(1, 1, L, output_width)],
         output_dtypes=[mx.int32],
+    )[0]
+
+
+# The indexer's pool compress (Glm5NextIndexer._compress_windows): logits =
+# gate + ape, a softmax over each window's KPOOL rows, then the probability-
+# weighted sum of the window's keys. The softmax is not over the last axis,
+# so MLX composes it (max, subtract, exp, sum, divide) and the weighted sum
+# is a multiply and a sum: eight dispatches, every one rounded to the
+# activation dtype, the sums accumulated in it (row by row from 0). One
+# thread per (window, column) replays them; on a decode step that completes
+# a window they precede the indexer scores.
+_POOL_COMPRESS_SOURCE = r"""
+  const int d = int(thread_position_in_grid.x);
+  const int w = int(thread_position_in_grid.y);
+  if (d >= HD) {
+    return;
+  }
+  const int b = w / NWIN;
+  const size_t base = (size_t(b) * ROWS + size_t(w - b * NWIN) * KP) * HD + d;
+  T logits[KP];
+  for (int j = 0; j < KP; j++) {
+    logits[j] = static_cast<T>(
+        static_cast<float>(gate[base + j * HD]) + static_cast<float>(ape[j * HD + d]));
+  }
+  T top = logits[0];
+  for (int j = 1; j < KP; j++) {
+    top = logits[j] > top ? logits[j] : top;
+  }
+  T ex[KP];
+  for (int j = 0; j < KP; j++) {
+    const T shifted = static_cast<T>(static_cast<float>(logits[j]) - static_cast<float>(top));
+    ex[j] = static_cast<T>(metal::precise::exp(static_cast<float>(shifted)));
+  }
+  T total = static_cast<T>(0.0f);
+  for (int j = 0; j < KP; j++) {
+    total = static_cast<T>(static_cast<float>(ex[j]) + static_cast<float>(total));
+  }
+  T acc = static_cast<T>(0.0f);
+  for (int j = 0; j < KP; j++) {
+    const T prob = static_cast<T>(static_cast<float>(ex[j]) / static_cast<float>(total));
+    const T prod = static_cast<T>(static_cast<float>(prob) * static_cast<float>(keys[base + j * HD]));
+    acc = static_cast<T>(static_cast<float>(prod) + static_cast<float>(acc));
+  }
+  out[size_t(w) * HD + d] = acc;
+"""
+
+
+@lru_cache(maxsize=None)
+def _pool_compress_kernel():
+    return mx.fast.metal_kernel(
+        name="glm5_pool_compress",
+        input_names=["keys", "gate", "ape"],
+        output_names=["out"],
+        source=_POOL_COMPRESS_SOURCE,
+    )
+
+
+def pool_compress(keys: mx.array, gate: mx.array, ape: mx.array) -> Optional[mx.array]:
+    """``Glm5NextIndexer._compress_windows(keys, gate)``: ``keys`` and
+    ``gate`` [B, S, hd], ``ape`` [kpool, hd], all of one 16-bit float dtype.
+    Returns [B, S // kpool, hd], or None when not covered."""
+    if keys.ndim != 3 or gate.shape != keys.shape or ape.ndim != 2:
+        return None
+    B, S, hd = keys.shape
+    kp = ape.shape[0]
+    if ape.shape[1] != hd or not 1 <= hd <= 1024 or S < kp:
+        return None
+    if (
+        keys.dtype not in (mx.bfloat16, mx.float16)
+        or gate.dtype != keys.dtype
+        or ape.dtype != keys.dtype
+    ):
+        return None
+    n = S // kp
+    STATS["pool_compress"] += 1
+    return _pool_compress_kernel()(
+        inputs=[keys, gate, ape],
+        template=[("T", keys.dtype), ("KP", kp), ("HD", hd), ("NWIN", n), ("ROWS", S)],
+        grid=(hd, B * n, 1),
+        threadgroup=(hd, 1, 1),
+        output_shapes=[(B, n, hd)],
+        output_dtypes=[keys.dtype],
     )[0]
 
 
