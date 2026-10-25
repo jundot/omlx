@@ -2176,7 +2176,7 @@ class Glm5NextMoEGate(nn.Module):
             rows = x.shape[1]
             routed = _decode_kernels.moe_router(
                 x.reshape(rows, -1),
-                self.weight,
+                _decode_kernels.router_weights(self),
                 self.e_score_correction_bias,
                 self.top_k,
                 self.routed_scaling_factor,
@@ -2259,7 +2259,9 @@ class Glm5NextMoE(nn.Module):
         if limit is None or shared.limit != limit:
             return None
         x2 = x.reshape(1, -1)
-        logits = dk.moe_router_logits(x2, gate.weight, gate.e_score_correction_bias)
+        logits = dk.moe_router_logits(
+            x2, dk.router_weights(gate), gate.e_score_correction_bias
+        )
         if logits is None:
             return None
         if "gate_up_proj" in sw:

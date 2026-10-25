@@ -4970,6 +4970,38 @@ def test_router_declines_other_gemv_configurations():
     assert dk.moe_router(x, mx.zeros((16, 1024)), mx.zeros((16,)), 8, 2.5, True) is None
 
 
+@pytest.mark.usefixtures("glm5_fused_decode", "verify_router")
+def test_router_reads_bf16_valued_weights_from_a_bf16_copy(monkeypatch):
+    """Router weights holding BF16 values (both GLM-5.3 checkpoints) are read
+    from an exact BF16 copy: the decode and verify routes and scores of the
+    fp32 read and of the reference graph. Other weights stay fp32, and a
+    reassigned weight is checked again."""
+    language = _language()
+    gate = _router(seed=5)
+    assert dk.router_weights(gate).dtype == mx.float32
+    gate.weight = gate.weight.astype(mx.bfloat16).astype(mx.float32)
+    assert dk.router_weights(gate).dtype == mx.bfloat16
+    for rows in (1, 3):
+        x = mx.random.normal((1, rows, 4096)).astype(mx.bfloat16)
+        indices, scores = gate(x)
+        fp32 = dk.moe_router(
+            x.reshape(rows, -1),
+            gate.weight,
+            gate.e_score_correction_bias,
+            gate.top_k,
+            gate.routed_scaling_factor,
+            gate.norm_topk_prob,
+        )
+        assert mx.array_equal(indices.reshape(rows, -1), fp32[0]).item()
+        assert _mismatches(scores.reshape(rows, -1), fp32[1]) == 0
+        if rows == 1:
+            monkeypatch.setattr(language, "_DECODE_FUSION", False)
+            ref_indices, ref_scores = gate(x)
+            monkeypatch.setattr(language, "_DECODE_FUSION", True)
+            assert mx.array_equal(indices, ref_indices).item()
+            assert _mismatches(scores, ref_scores) == 0
+
+
 _FUSED_ROUTER = dk.moe_router
 
 

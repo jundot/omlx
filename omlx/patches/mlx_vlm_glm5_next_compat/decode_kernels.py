@@ -1106,22 +1106,39 @@ def _hc_mix1_kernel():
     )
 
 
+def _exact_bf16(owner, name: str) -> mx.array:
+    """``getattr(owner, name)`` as BF16 when every fp32 value is a BF16
+    value, else the fp32 array (decided once per array, cached on ``owner``)."""
+    key = f"_omlx_{name}_bf16"
+    wide = getattr(owner, name)
+    cached = getattr(owner, key, None)
+    if cached is None or cached[0] is not wide:
+        narrow = wide.astype(mx.bfloat16)
+        if mx.array_equal(narrow.astype(mx.float32), wide).item():
+            mx.eval(narrow)
+        else:
+            narrow = None
+        cached = (wide, narrow)
+        # A plain attribute, not a module parameter.
+        object.__setattr__(owner, key, cached)
+    return wide if cached[1] is None else cached[1]
+
+
 def mix_weights(connection) -> mx.array:
     """``connection.fn`` [MIX, HC * D] as BF16 when every fp32 weight is a
     BF16 value, else the fp32 array. GLM-5.3 checkpoints store these weights
     in BF16 (the sanitize keeps them in fp32): the kernels read the same
     values, as floats, from half the bytes."""
-    narrow = getattr(connection, "_omlx_fn_bf16", None)
-    if narrow is None:
-        fn = connection.fn
-        narrow = fn.astype(mx.bfloat16)
-        if mx.array_equal(narrow.astype(mx.float32), fn).item():
-            mx.eval(narrow)
-        else:
-            narrow = False
-        # A plain attribute, not a module parameter.
-        object.__setattr__(connection, "_omlx_fn_bf16", narrow)
-    return connection.fn if narrow is False else narrow
+    return _exact_bf16(connection, "fn")
+
+
+def router_weights(gate) -> mx.array:
+    """The MoE router's ``gate.weight`` [E, K] as BF16 when every fp32 weight
+    is a BF16 value, else the fp32 array: the FP8 checkpoint stores it in
+    BF16 and oQ in fp32 from those BF16 values, and the router runs in fp32
+    (``moe_router_dtype``), so ``moe_router`` reads the same values, as
+    floats, from half the bytes."""
+    return _exact_bf16(gate, "weight")
 
 
 def hc_mix(x: mx.array, fn: mx.array, eps: float) -> Optional[mx.array]:
@@ -2485,7 +2502,7 @@ _ROUTER_LOGITS_SOURCE = r"""
   if (out_row >= E) {
     return;
   }
-  const device float* mat = w + size_t(out_row) * K;
+  const device auto* mat = w + size_t(out_row) * K;
   const device T* xv = x + size_t(tok) * K;
   float result[RPS];
   for (int tm = 0; tm < RPS; tm++) {
@@ -2501,7 +2518,7 @@ _ROUTER_LOGITS_SOURCE = r"""
     for (int tm = 0; tm < RPS; tm++) {
       float inter[4];
       for (int tn = 0; tn < 4; tn++) {
-        inter[tn] = mat[mat_offset + bn + tn];
+        inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]);
       }
       for (int tn = 0; tn < 4; tn++) {
         result[tm] += inter[tn] * v_coeff[tn];
@@ -2620,14 +2637,15 @@ def _router_select_kernel():
 
 def moe_router_logits(x: mx.array, weight: mx.array, bias: mx.array):
     """The router logits kernel alone: ``(sigmoid(x @ W.T), sigmoid + bias)``
-    [T, E] fp32 with ``moe_router``'s arithmetic, or None when not covered."""
+    [T, E] fp32 with ``moe_router``'s arithmetic, or None when not covered.
+    ``weight`` may be ``router_weights``' BF16 copy."""
     if x.ndim != 2 or weight.ndim != 2 or bias.ndim != 1:
         return None
     T, K = x.shape
     E = weight.shape[0]
     if weight.shape[1] != K or bias.shape[0] != E:
         return None
-    if weight.dtype != mx.float32 or bias.dtype != mx.float32:
+    if weight.dtype not in (mx.float32, mx.bfloat16) or bias.dtype != mx.float32:
         return None
     if x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
         return None
@@ -2655,10 +2673,11 @@ def moe_router(
 ):
     """``group_expert_select(x.astype(f32) @ weight.T, bias, ...)`` for n_group == 1.
 
-    ``x`` [T, K] (one-token rows; bf16/fp16/fp32), ``weight`` [E, K] fp32,
-    ``bias`` [E] fp32. Returns ``(indices uint32 [T, top_k], scores fp32
-    [T, top_k])`` bit-identical to the reference for rows that the reference
-    computes with the one-token gemv, or None when not covered.
+    ``x`` [T, K] (one-token rows; bf16/fp16/fp32), ``weight`` [E, K] fp32
+    (or ``router_weights``' BF16 copy of it), ``bias`` [E] fp32. Returns
+    ``(indices uint32 [T, top_k], scores fp32 [T, top_k])`` bit-identical to
+    the reference for rows that the reference computes with the one-token
+    gemv, or None when not covered.
     """
     if x.ndim != 2 or weight.ndim != 2 or bias.ndim != 1:
         return None
@@ -2666,7 +2685,7 @@ def moe_router(
     E = weight.shape[0]
     if weight.shape[1] != K or bias.shape[0] != E:
         return None
-    if weight.dtype != mx.float32 or bias.dtype != mx.float32:
+    if weight.dtype not in (mx.float32, mx.bfloat16) or bias.dtype != mx.float32:
         return None
     if x.dtype not in (mx.bfloat16, mx.float16, mx.float32):
         return None
