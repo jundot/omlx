@@ -402,6 +402,10 @@ class CacheSettings:
     gdn_ssd_split_enabled: bool | None = None
     gdn_ssd_pending_max_size: str = "512MB"
     gdn_sidecar_state_dtype: str = "fp32"
+    # Snapshot stateful (hybrid) models at the end of a chat request's system
+    # messages and tools; keep up to this much of them out of LRU eviction.
+    system_prefix_snapshots: bool = True
+    system_prefix_snapshot_max_size: str = "2GB"
 
     def get_gdn_snapshot_storage(self) -> str:
         """Return the user-facing GDN storage policy."""
@@ -493,6 +497,8 @@ class CacheSettings:
             "hot_cache_write_through": self.hot_cache_write_through,
             "ane_compile_cache": self.ane_compile_cache,
             "initial_cache_blocks": self.initial_cache_blocks,
+            "system_prefix_snapshots": self.system_prefix_snapshots,
+            "system_prefix_snapshot_max_size": self.system_prefix_snapshot_max_size,
         }
 
     @classmethod
@@ -543,6 +549,10 @@ class CacheSettings:
             ),
             ane_compile_cache=bool(data.get("ane_compile_cache", False)),
             initial_cache_blocks=data.get("initial_cache_blocks", 256),
+            system_prefix_snapshots=bool(data.get("system_prefix_snapshots", True)),
+            system_prefix_snapshot_max_size=data.get(
+                "system_prefix_snapshot_max_size", "2GB"
+            ),
         )
 
 
@@ -1962,6 +1972,10 @@ class GlobalSettings:
                 self.cache.gdn_ssd_pending_max_size
             ),
             gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
+            system_prefix_snapshots=self.cache.system_prefix_snapshots,
+            system_prefix_snapshot_max_size=parse_size(
+                self.cache.system_prefix_snapshot_max_size
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:

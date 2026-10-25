@@ -4100,6 +4100,46 @@ class TestSchedulerBoundarySnapshots:
         scheduler._resolve_generation_prompt_start(whole)
         assert whole.generation_prompt_start == 0
 
+    def test_resolve_system_prefix_end_requires_prompt_to_start_with_it(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """The system prefix end is accepted only when the prompt starts with
+        its tokens; the last one may merge with the text that follows."""
+        monkeypatch.setattr("omlx.scheduler.SYSTEM_PREFIX_MIN_TOKENS", 3)
+        scheduler = Scheduler(
+            model=mock_model,
+            tokenizer=mock_tokenizer,
+            config=SchedulerConfig(paged_cache_block_size=4),
+        )
+        scheduler.tokenizer = MagicMock()
+        scheduler.tokenizer.encode.side_effect = lambda text, **kw: {
+            "<sys>": [5, 6, 7, 8],
+            "<short>": [5, 6],
+        }[text]
+        scheduler.block_aware_cache = MagicMock()
+        scheduler._boundary_snapshot_required = True
+
+        def resolve(prompt_token_ids, text="<sys>", enabled=True):
+            request = Request(
+                request_id="req-sys", prompt="x", sampling_params=SamplingParams()
+            )
+            request.prompt_token_ids = prompt_token_ids
+            request.system_prefix_text = text
+            scheduler.config.system_prefix_snapshots = enabled
+            scheduler._resolve_system_prefix_end(request)
+            return request.system_prefix_end
+
+        assert resolve([5, 6, 7, 8, 1, 2]) == 4
+        assert resolve([5, 6, 7, 3, 1, 2]) == 3  # last token merged
+        assert resolve([5, 6, 4, 8, 1, 2]) == 0  # diverges inside it
+        assert resolve([5, 6, 1, 2], text="<short>") == 0  # below the minimum
+        assert resolve([5, 6, 7, 8, 1, 2], enabled=False) == 0
+        # Models without snapshot-needing caches never tokenize it.
+        scheduler._boundary_snapshot_required = False
+        scheduler.tokenizer.encode.reset_mock()
+        assert resolve([5, 6, 7, 8, 1, 2]) == 0
+        scheduler.tokenizer.encode.assert_not_called()
+
     def test_emit_prefill_boundary_snapshot_persists_before_uid_assignment(
         self, mock_model, mock_tokenizer
     ):

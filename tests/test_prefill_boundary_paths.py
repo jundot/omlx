@@ -317,3 +317,85 @@ def test_prefill_end_emits_tail_snapshot_off_the_grid(
     assert context.snapshots == expected_snapshots
     assert tails == expected_tails
     assert [e[1] for e in context.events if e[0] == "forward"] == expected_chunks
+
+
+@pytest.mark.parametrize("path", ["external", "resumable"])
+@pytest.mark.parametrize(
+    "base_tokens,prefill_tokens,gen_start,system_end,"
+    "expected_snapshots,expected_tails,expected_chunks",
+    [
+        # The system prefix end splits the first chunk; the grid and the
+        # end tail are unchanged.
+        (0, 7, 0, 2, [4], [2, 7], [2, 2, 3]),
+        # It comes before the generation prompt marker as well.
+        (0, 7, 6, 3, [4], [3, 6], [3, 1, 2, 1]),
+        # On the grid, the boundary snapshot already covers it.
+        (0, 7, 0, 4, [4], [7], [4, 3]),
+        # Cached past it (a system prefix hit): no extra stop.
+        (6, 5, 0, 5, [8], [11], [2, 3]),
+    ],
+)
+@pytest.mark.parametrize("guard_limit", [None, 2])
+def test_prefill_stops_at_system_prefix_end(
+    boundary_scheduler,
+    path,
+    base_tokens,
+    prefill_tokens,
+    gen_start,
+    system_end,
+    expected_snapshots,
+    expected_tails,
+    expected_chunks,
+    guard_limit,
+):
+    """Both prefill paths stop once more at an uncached system prefix end off
+    the grid, so the state shared by every request with that system prefix is
+    captured there."""
+    context = boundary_scheduler
+    scheduler = context.scheduler
+    context.limit.tokens = guard_limit
+    if guard_limit is not None:
+        expected_chunks = [
+            n
+            for chunk in expected_chunks
+            for n in [guard_limit] * (chunk // guard_limit)
+            + ([chunk % guard_limit] if chunk % guard_limit else [])
+        ]
+    tails = []
+
+    def tail(request, cache, total_tokens):
+        assert cache[0].offset == total_tokens
+        tails.append(total_tokens)
+
+    tokens = list(range(base_tokens + prefill_tokens + 1))
+    request = Request(
+        request_id="system-prefix",
+        prompt=tokens,
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    request.prompt_token_ids = tokens
+    request.num_prompt_tokens = len(tokens)
+    request.cached_tokens = base_tokens
+    request.remaining_tokens = tokens[base_tokens:]
+    request.generation_prompt_start = gen_start
+    request.system_prefix_end = system_end
+    cache = [KVCache()]
+    if base_tokens:
+        keys = mx.zeros((1, 1, base_tokens, 1))
+        cache[0].update_and_fetch(keys, keys)
+
+    with patch.object(scheduler, "_emit_prefill_tail_snapshot", side_effect=tail):
+        if path == "external":
+            scheduler._do_external_prefill(request, request.remaining_tokens, cache)
+        else:
+            state = scheduler._begin_prefill(request, request.remaining_tokens, cache)
+            state.sampler = MagicMock()
+            state.sm = MagicMock()
+            state.per_row_lps = []
+            while not scheduler._step_prefill_chunk(state):
+                pass
+            scheduler._emit_final_boundary_if_needed(state)
+
+    assert context.snapshots == expected_snapshots
+    assert tails == expected_tails
+    assert [e[1] for e in context.events if e[0] == "forward"] == expected_chunks

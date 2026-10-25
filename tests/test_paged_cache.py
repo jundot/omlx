@@ -1059,6 +1059,35 @@ class TestPagedCacheManager:
             manager.register_tail_block(None, bytes([i]) * 4, i + 4)
         assert len(manager._tail_index[None]) == _TAIL_INDEX_PER_PARENT
 
+    def test_protected_tail_outlives_tail_index_bounds(self, monkeypatch):
+        """A protected tail sits beside the per-parent bound and survives the
+        reset when the index runs out of parents; unprotected, it ages out."""
+        from omlx.cache import paged_cache
+
+        monkeypatch.setattr(paged_cache, "_TAIL_INDEX_MAX_PARENTS", 2)
+        per_parent = paged_cache._TAIL_INDEX_PER_PARENT
+        manager = PagedCacheManager(
+            block_size=4, max_blocks=100, model_name="test-model", initial_blocks=100
+        )
+        manager.register_tail_block(None, b"system", 3)
+        manager.set_tail_protected(b"system", True)
+        for i in range(per_parent + 2):
+            manager.register_tail_block(None, bytes([i]) * 4, 2)
+        assert b"system" in manager._tail_index[None]
+        assert len(manager._tail_index[None]) == per_parent + 1
+
+        manager.register_tail_block(b"parent-1", b"tail-1", 2)
+        manager.register_tail_block(b"parent-2", b"tail-2", 2)
+        assert manager._tail_index == {
+            None: {b"system": 3},
+            b"parent-2": {b"tail-2": 2},
+        }
+
+        manager.set_tail_protected(b"system", False)
+        for i in range(per_parent):
+            manager.register_tail_block(None, bytes([i]) * 4, 2)
+        assert b"system" not in manager._tail_index[None]
+
     def test_get_computed_blocks_tail_cold_registration_and_stale_pruning(self):
         """Indexed tails are verified against the tiers on every lookup."""
         manager = PagedCacheManager(

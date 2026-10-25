@@ -286,7 +286,7 @@ def _tiny_rotating_model():
     )
 
 
-def _run_through_scheduler(scheduler, tokens, marker, request_id):
+def _run_through_scheduler(scheduler, tokens, marker, request_id, system_end=0):
     """Serve one request end to end: prefix lookup, prefill, decode, store."""
     request = Request(
         request_id=request_id,
@@ -295,6 +295,7 @@ def _run_through_scheduler(scheduler, tokens, marker, request_id):
     )
     scheduler.add_request(request)
     request.generation_prompt_start = marker
+    request.system_prefix_end = system_end
     for _ in range(50):
         scheduler.step()
         if request_id not in scheduler.requests:
@@ -395,6 +396,76 @@ def test_prefill_tail_reuse_matches_cold_forward(
         request = _run_through_scheduler(scheduler, second, 13, "turn-2")
         assert request.cached_tokens == 7
         _assert_restored_matches_cold(model, scheduler, prefix, second + [7, 8], 13)
+    finally:
+        scheduler.shutdown()
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("split", [False, True])
+def test_system_prefix_snapshot_is_shared_across_conversations(
+    mock_tokenizer, tmp_path, monkeypatch, split, chunked
+):
+    """A request whose system prefix ends off the grid stores a protected tail
+    there. New conversations restore it to the state a cold forward produces,
+    also after another conversation that restored it went on for two turns:
+    its tip lineage deletes an ordinary tail it started from."""
+    monkeypatch.setattr("omlx.scheduler.SYSTEM_PREFIX_MIN_TOKENS", 1)
+    mx.random.seed(7)
+    model = _tiny_hybrid_model()
+    scheduler = Scheduler(
+        model=model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(
+            paged_cache_block_size=4,
+            prefill_step_size=4,
+            gdn_ssd_split_enabled=split,
+            chunked_prefill=chunked,
+        ),
+    )
+    paged = PagedCacheManager(
+        block_size=4, max_blocks=64, initial_blocks=64, model_name="tiny"
+    )
+    ssd = PagedSSDCacheManager(
+        cache_dir=tmp_path / "cache",
+        max_size_bytes=16 * 1024**2,
+        expected_model_name="tiny",
+        expected_num_layers=2,
+        expected_block_size=4,
+        expected_layer_cache_types=["ArraysCache", "KVCache"],
+        gdn_ssd_split_enabled=split,
+    )
+    boundary = BoundarySnapshotSSDStore(tmp_path / "cache")
+    prefix = BlockAwarePrefixCache(
+        model=model,
+        paged_cache_manager=paged,
+        paged_ssd_cache_manager=ssd,
+        gdn_ssd_split_enabled=split,
+        system_prefix_max_bytes=16 * 1024**2,
+    )
+    prefix.set_gdn_checkpoint_loader(boundary.load_file)
+    scheduler.paged_cache_manager = paged
+    scheduler.paged_ssd_cache_manager = ssd
+    scheduler._boundary_snapshot_store = boundary
+    scheduler.block_aware_cache = prefix
+
+    # The system prefix ends at 6, off the 4-token grid. Each request's last
+    # token stands for the generation prompt.
+    system = list(range(3, 9))
+    try:
+        _run_through_scheduler(scheduler, system + [20, 21, 22, 23], 9, "doc-1", 6)
+        assert len(prefix._system_prefixes) == 1
+        _assert_restored_matches_cold(model, scheduler, prefix, system + [29, 30], 6)
+
+        # Both turns end on a tail, so the second supersedes the first one's
+        # predecessor in the chat's lineage: the system prefix tail.
+        request = _run_through_scheduler(scheduler, system + [24, 25], 7, "chat-1", 6)
+        assert request.cached_tokens == 6
+        chat = system + [24, 25, 26, 27]
+        request = _run_through_scheduler(scheduler, chat, 9, "chat-2", 6)
+        assert request.cached_tokens == 7
+
+        request = _run_through_scheduler(scheduler, system + [29, 30], 7, "doc-2", 6)
+        assert request.cached_tokens == 6
     finally:
         scheduler.shutdown()
 
