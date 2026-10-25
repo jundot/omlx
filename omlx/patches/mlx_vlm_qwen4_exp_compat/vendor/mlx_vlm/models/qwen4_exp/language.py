@@ -1736,7 +1736,8 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
         query = self._apply_rope(query, position_ids)
         if cache is not None and hasattr(cache, "pooled_indexer_keys"):
-            pooled_keys = cache.pooled_indexer_keys(
+            # The FP32 values the selection mask scores with (no per-call cast).
+            pooled_keys = cache.pooled_indexer_keys_f32(
                 self.compress_ratio,
                 self.k_layernorm,
                 self._apply_rope,
@@ -2402,14 +2403,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         cache.update_indexer(projected[:, :, indexer.n_heads :].squeeze(2), index_positions)
         index_queries = indexer._apply_rope(index_queries, index_positions)
         pooled_keys = mx.expand_dims(
-            cache.pooled_indexer_keys(
+            cache.pooled_indexer_keys_f32(
                 indexer.compress_ratio,
                 indexer.k_layernorm,
                 indexer._apply_rope,
                 cache_tag=indexer,
             ),
             axis=1,
-        ).astype(mx.float32)
+        )
 
         if fused:
             values = v_out.reshape(batch, length, self.num_key_value_heads, -1).transpose(

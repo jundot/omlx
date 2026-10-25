@@ -273,6 +273,24 @@ def test_portable_scores_from_the_fp32_bank_keep_their_bits():
     assert mx.array_equal(actual.view(mx.uint32), expected.view(mx.uint32)).item()
 
 
+@pytest.mark.parametrize("rows", [1, 3])
+def test_official_selection_scores_from_the_fp32_bank_keep_their_bits(rows):
+    """The official indexer's FP32 block scores (masked decode and prefill rows)
+    read the FP32 bank with the bits they had casting the pooled bank."""
+    mx.random.seed(912 + rows)
+    cache = language.QSAKVCache()
+    raw = mx.random.normal((1, 6003, 128)).astype(mx.bfloat16)
+    _append(cache, raw, 0, 6003)
+    bank, fp32 = _pools(cache, cache)
+    query = mx.random.normal((1, 4, rows, 128)).astype(mx.bfloat16)
+    q32 = query.astype(mx.float32)
+    expected = q32 @ mx.expand_dims(bank, 1).astype(mx.float32).transpose(0, 1, 3, 2)
+    actual = q32 @ mx.expand_dims(fp32, 1).astype(mx.float32).transpose(0, 1, 3, 2)
+    mx.eval(expected, actual)
+    assert actual.shape == expected.shape == (1, 4, rows, 6003 // 4)
+    assert mx.array_equal(actual.view(mx.uint32), expected.view(mx.uint32)).item()
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 def test_portable_qsa_flattened_gemm_is_exactly_the_broadcast_reference(dtype):
     mx.random.seed(909)
