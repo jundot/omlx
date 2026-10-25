@@ -984,13 +984,15 @@ class Glm5NextIndexer(nn.Module):
     ):
         """Decode/verify (S <= 8, one sequence) selection on fused kernels.
 
-        Same scores, top-k kernel and index expansion as the general path;
-        see ``decode_kernels.dsa_decode_scores``.  Returns None to fall back.
+        Same scores, top-k order and index expansion as the general path;
+        see ``decode_kernels.dsa_decode_scores`` and ``dsa_select_topk``.
+        Returns None to fall back.
         """
         from omlx.custom_kernels.sparse_index import fast
 
-        # The fused top-k follows native ordering, not the argpartition fallback.
-        if not fast.has_symbol("dsa_topk_indices"):
+        # The fused top-k follows the native kernel's order (which covers
+        # select_k == 512 only), not the argpartition fallback.
+        if select_k != 512 or not fast.has_symbol("dsa_topk_indices"):
             return None
         if isinstance(before, list):
             if len(before) != 1 or after[0] - before[0] != S:
@@ -1004,8 +1006,7 @@ class Glm5NextIndexer(nn.Module):
         weights = w_raw if w_raw is not None else linear_forward(self.weights_proj, x)
         weights = (weights * self.weight_scale).astype(q.dtype)
         if (
-            select_k == 512
-            and self.n_heads == 32
+            self.n_heads == 32
             and self.head_dim == 128
             and q.dtype == mx.bfloat16
             and pool_keys.dtype == mx.bfloat16
@@ -1022,17 +1023,12 @@ class Glm5NextIndexer(nn.Module):
             )
         if scores is None:
             return None
-        # Same output as the native top-k (which covers select_k == 512 only).
-        selected = dk.dsa_topk_rows(scores, select_k) if select_k == 512 else None
-        if selected is None:
-            selected = self._native_topk(scores, select_k)
-        if selected is None:
-            return None
         left_padding = getattr(kv_cache, "left_padding", None)
         if left_padding is None:
             left_padding = mx.zeros((1,), dtype=mx.int32)
-        return dk.dsa_expand_topk(
-            selected,
+        return dk.dsa_select_topk(
+            scores,
+            select_k,
             before,
             pool_lengths,
             left_padding,

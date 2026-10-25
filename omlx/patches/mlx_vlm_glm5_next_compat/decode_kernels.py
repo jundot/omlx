@@ -17,7 +17,7 @@ stock MLX arithmetic bit for bit:
   (routed + shared experts, clamped SwiGLU, routing-weighted sum);
 * KDA linear attention: ``kda_decode_step`` (short conv, SiLU, l2norm,
   gate projections, vector-gated delta rule, RMSNormGated);
-* DSA indexer: ``dsa_decode_scores`` and ``dsa_expand_topk``;
+* DSA indexer: ``dsa_decode_scores`` and ``dsa_select_topk``;
 * row-exact verify: ``rows_gemv`` (float projections of a verify block,
   every row with the one-token gemv arithmetic).
 
@@ -1289,59 +1289,78 @@ def dsa_decode_scores(
     )[0]
 
 
-# Top-k of the indexer's pooled-block scores for decode/verify rows (at most
-# 2048 blocks): the native radix-select kernel's output, which is a function
-# of the scores alone (keys of the 16-bit ordered score bits; strictly
-# greater keys in index order, then threshold ties in index order), found
-# with a threadgroup bitonic sort of (key, index) instead of two histogram
-# passes over contended threadgroup atomics and two serial bin scans.
-_DSA_TOPK_SOURCE = r"""
-  // One threadgroup (1024 threads) per score row; P <= 2048 scores.
+# Top-k of the indexer's pooled-block scores for decode/verify rows, expanded
+# into token indices: the native radix-select kernel's output (a function of
+# the scores alone: keys of the 16-bit ordered score bits; strictly greater
+# keys in index order, then threshold ties in index order) passed through
+# Glm5NextIndexer.__call__'s expansion (validity, kpool expansion, left
+# padding, the always-selected tail window and the -1 padding up to the
+# output width), in one dispatch. The threshold key comes from a 4-bit radix
+# select (four passes of simdgroup digit counts, two barriers each).
+_DSA_SELECT_SOURCE = r"""
+  // One threadgroup (1024 threads) per score row.
   const uint tid = thread_position_in_threadgroup.x;
-  const int row = int(threadgroup_position_in_grid.y);
-  const int P = int(dims[0]);
-  const device T* rs = scores + size_t(row) * P;
-  device uint* ro = out + size_t(row) * TOPK;
-  threadgroup uint sorted[2048];
-  threadgroup uint part_g[32];
-  threadgroup uint part_t[32];
-  threadgroup uint tkey[1];
   const uint lane = tid % 32;
   const uint sg = tid / 32;
+  const int row = int(threadgroup_position_in_grid.y);
+  const int P = int(meta[0]);
+  const int qp = int(meta[1]) + row;
+  const int pool_len = int(meta[2]);
+  const int lp = int(left_padding[0]);
+  const device T* rs = scores + size_t(row) * P;
+  device int* ro = out + size_t(row) * OUT_W;
+  threadgroup uint part[32][16];
+  threadgroup uint bcast[2];
+  threadgroup uint part_g[32];
+  threadgroup uint part_t[32];
 
-  // Composite sort keys: ordered 16-bit score key, then lower index first.
-  for (uint i = tid; i < 2048u; i += 1024u) {
-    uint v = 0u;
-    if (int(i) < P) {
+  // The TOPK-th largest key: digit by digit from the top, keep the digit
+  // whose keys (among those matching the digits so far) reach rank `need`.
+  uint prefix = 0u;
+  uint need = uint(TOPK);
+  for (int shift = 12; shift >= 0; shift -= 4) {
+    const uint hi_mask = (0xffffu << uint(shift + 4)) & 0xffffu;
+    uint cnt[16];
+    for (int b = 0; b < 16; b++) {
+      cnt[b] = 0u;
+    }
+    for (int i = int(tid); i < P; i += 1024) {
       const ushort bits = as_type<ushort>(rs[i]);
       const uint key = (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
-      v = (key << 16) | (0xffffu - i);
-    }
-    sorted[i] = v;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  // Bitonic sort, descending.
-  for (uint k = 2u; k <= 2048u; k <<= 1) {
-    for (uint j = k >> 1; j > 0u; j >>= 1) {
-      const uint i = ((tid / j) * 2u * j) + (tid % j);
-      const uint p = i + j;
-      const uint a = sorted[i];
-      const uint b = sorted[p];
-      const bool desc = (i & k) == 0u;
-      if ((a < b) == desc) {
-        sorted[i] = b;
-        sorted[p] = a;
+      if ((key & hi_mask) == prefix) {
+        cnt[(key >> uint(shift)) & 15u] += 1u;
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    for (int b = 0; b < 16; b++) {
+      const uint c = metal::simd_sum(cnt[b]);
+      if (lane == uint(b)) {
+        part[sg][b] = c;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      // Lane r counts digit 15 - r; its inclusive prefix counts digits >= 15 - r.
+      uint total = 0u;
+      if (lane < 16) {
+        for (int s = 0; s < 32; s++) {
+          total += part[s][15 - lane];
+        }
+      }
+      const uint incl = metal::simd_prefix_inclusive_sum(total);
+      const uint r = metal::simd_min(lane < 16 && incl >= need ? lane : 31u);
+      const uint above = metal::simd_shuffle(incl - total, ushort(r));
+      if (lane == 0) {
+        bcast[0] = 15u - r;
+        bcast[1] = need - above;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    prefix |= bcast[0] << uint(shift);
+    need = bcast[1];
   }
-  if (tid == 0) {
-    tkey[0] = sorted[TOPK - 1] >> 16;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const uint threshold_key = tkey[0];
+  const uint threshold_key = prefix;
 
-  // Deterministic output (as the native kernel): strictly greater keys in
+  // Deterministic order (as the native kernel): strictly greater keys in
   // index order fill [0, n_greater), threshold ties in index order the rest.
   const int seg = (P + 1023) / 1024;
   const int s0 = int(tid) * seg;
@@ -1368,123 +1387,96 @@ _DSA_TOPK_SOURCE = r"""
     part_g[lane] = eg;
     part_t[lane] = et;
     if (lane == 31) {
-      tkey[0] = eg + pg;   // total strictly greater
+      bcast[0] = eg + pg;   // total strictly greater
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const uint n_greater = tkey[0];
+  const uint n_greater = bcast[0];
   uint pos_g = part_g[sg] + pre_g;
   uint pos_t = n_greater + part_t[sg] + pre_t;
   if (local_g > 0 || (local_t > 0 && pos_t < uint(TOPK))) {
     for (int j = s0; j < s1; ++j) {
       const ushort bits = as_type<ushort>(rs[j]);
       const uint key = (bits & 0x8000) ? uint((~bits) & 0xffff) : uint(bits | 0x8000);
+      uint pos = uint(TOPK);
       if (key > threshold_key) {
-        ro[pos_g++] = uint(j);
-      } else if (key == threshold_key) {
-        if (pos_t < uint(TOPK)) {
-          ro[pos_t++] = uint(j);
+        pos = pos_g++;
+      } else if (key == threshold_key && pos_t < uint(TOPK)) {
+        pos = pos_t++;
+      }
+      if (pos < uint(TOPK)) {
+        // Selected pool row j -> its KPOOL token indices, or -1 when the
+        // row is not a complete window before this query.
+        const bool valid = j < pool_len && (j + 1) * KPOOL - 1 <= qp;
+        for (int c = 0; c < KPOOL; c++) {
+          ro[pos * KPOOL + c] = valid ? j * KPOOL + c + lp : -1;
         }
       }
     }
   }
+  // The always-selected tail window, then -1 up to OUT_W.
+  for (int col = TOPK * KPOOL + int(tid); col < OUT_W; col += 1024) {
+    const int t = col - TOPK * KPOOL;
+    int v = -1;
+    if (t < TAIL_W) {
+      const int tail_count = (qp + 1) % KPOOL;
+      if (t < tail_count) {
+        v = qp + 1 - tail_count + t + lp;
+      }
+    }
+    ro[col] = v;
+  }
 """
 
 
 @lru_cache(maxsize=None)
-def _dsa_topk_kernel():
+def _dsa_select_kernel():
     return mx.fast.metal_kernel(
-        name="glm5_dsa_topk_rows",
-        input_names=["scores", "dims"],
+        name="glm5_dsa_select_topk",
+        input_names=["scores", "meta", "left_padding"],
         output_names=["out"],
-        source=_DSA_TOPK_SOURCE,
+        source=_DSA_SELECT_SOURCE,
     )
 
 
-def dsa_topk_rows(scores: mx.array, topk: int) -> Optional[mx.array]:
-    """``omlx_glm_kernels.dsa_topk_indices(scores[:, None], topk)[:, 0]``
-    (non-bucketed, no causal prefix) for ``scores`` [1, L, P] with L <= 8 and
-    topk <= P <= 2048. Returns [1, L, topk] uint32 or None."""
-    if scores.ndim != 3 or scores.shape[0] != 1 or not 1 <= scores.shape[1] <= 8:
-        return None
-    _, L, P = scores.shape
-    if not 1 <= topk <= P <= 2048 or scores.dtype not in (mx.bfloat16, mx.float16):
-        return None
-    STATS["dsa_topk"] += 1
-    return _dsa_topk_kernel()(
-        inputs=[scores, mx.array([P], dtype=mx.int32)],
-        template=[("T", scores.dtype), ("TOPK", topk)],
-        grid=(1024, L, 1),
-        threadgroup=(1024, 1, 1),
-        output_shapes=[(1, L, topk)],
-        output_dtypes=[mx.uint32],
-    )[0]
-
-
-# Expands the selected pooled blocks into token indices exactly like
-# Glm5NextIndexer.__call__ (validity, kpool expansion, left padding, the
-# always-selected tail window and the -1 padding up to the output width).
-_DSA_EXPAND_SOURCE = r"""
-  const int col = int(thread_position_in_grid.x);
-  const int row = int(thread_position_in_grid.y);
-  if (col >= OUT_W) {
-    return;
-  }
-  const int qp = int(qpos[0]) + row;
-  const int pool_len = int(pool_len_arr[0]);
-  const int lp = int(left_padding[0]);
-  int v = -1;
-  if (col < SEL_K * KPOOL) {
-    const int s = int(selected[row * SEL_K + col / KPOOL]);
-    const bool valid = s < pool_len && (s + 1) * KPOOL - 1 <= qp;
-    if (valid) {
-      v = s * KPOOL + (col % KPOOL) + lp;
-    }
-  } else if (TAIL_W > 0 && col < SEL_K * KPOOL + TAIL_W) {
-    const int t = col - SEL_K * KPOOL;
-    const int tail_count = (qp + 1) % KPOOL;
-    if (t < tail_count) {
-      v = qp + 1 - tail_count + t + lp;
-    }
-  }
-  out[row * OUT_W + col] = v;
-"""
-
-
-@lru_cache(maxsize=None)
-def _dsa_expand_kernel():
-    return mx.fast.metal_kernel(
-        name="glm5_dsa_expand_topk",
-        input_names=["selected", "qpos", "pool_len_arr", "left_padding"],
-        output_names=["out"],
-        source=_DSA_EXPAND_SOURCE,
-    )
-
-
-def dsa_expand_topk(
-    selected: mx.array,
+def dsa_select_topk(
+    scores: mx.array,
+    topk: int,
     query_pos0: int,
     pool_len: int,
     left_padding: mx.array,
     kpool: int,
     tail_width: int,
     output_width: int,
-) -> mx.array:
-    """[1, L, SEL_K] selected pool rows -> [1, 1, L, output_width] int32.
-
-    ``left_padding`` is the KV cache's [1] padding array (kept on device).
-    """
-    _, L, sel_k = selected.shape
-    return _dsa_expand_kernel()(
+) -> Optional[mx.array]:
+    """Selected token indices of ``scores`` [1, L, P] (L <= 8): the native
+    ``dsa_topk_indices(scores[:, None], topk)`` pool rows, expanded as
+    Glm5NextIndexer.__call__ expands them. ``left_padding`` is the KV
+    cache's [1] padding array (kept on device). Returns [1, 1, L,
+    output_width] int32, or None when not covered."""
+    if scores.ndim != 3 or scores.shape[0] != 1 or not 1 <= scores.shape[1] <= 8:
+        return None
+    _, L, P = scores.shape
+    if not 1 <= topk <= P or scores.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    if output_width < topk * kpool + tail_width:
+        return None
+    STATS["dsa_topk"] += 1
+    return _dsa_select_kernel()(
         inputs=[
-            selected,
-            mx.array([query_pos0], dtype=mx.int32),
-            mx.array([pool_len], dtype=mx.int32),
+            scores,
+            mx.array([P, query_pos0, pool_len], dtype=mx.int32),
             left_padding.astype(mx.int32) if left_padding.dtype != mx.int32 else left_padding,
         ],
-        template=[("SEL_K", sel_k), ("KPOOL", kpool), ("TAIL_W", tail_width), ("OUT_W", output_width)],
-        grid=(output_width, L, 1),
-        threadgroup=(min(256, output_width), 1, 1),
+        template=[
+            ("T", scores.dtype),
+            ("TOPK", topk),
+            ("KPOOL", kpool),
+            ("TAIL_W", tail_width),
+            ("OUT_W", output_width),
+        ],
+        grid=(1024, L, 1),
+        threadgroup=(1024, 1, 1),
         output_shapes=[(1, 1, L, output_width)],
         output_dtypes=[mx.int32],
     )[0]

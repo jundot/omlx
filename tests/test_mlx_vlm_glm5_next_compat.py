@@ -4103,30 +4103,56 @@ def _make_pool_caches():
     return PoolingCache(4), KVCache()
 
 
+def _expand_reference(
+    selected, first, pool_len, left_padding, kpool, tail_width, width
+):
+    """Glm5NextIndexer.__call__'s expansion of selected pool rows [1, L, K]
+    (one sequence, rows at positions first, first + 1, ...)."""
+    _, rows, _ = selected.shape
+    selected = selected.astype(mx.int32)
+    query_pos = first + mx.arange(rows)[None]
+    valid = (selected < pool_len) & ((selected + 1) * kpool - 1 <= query_pos[..., None])
+    tokens = selected[..., None] * kpool + mx.arange(kpool) + left_padding
+    topk = mx.where(valid[..., None], tokens, -1).reshape(1, rows, -1)
+    tail_count = (query_pos + 1) % kpool
+    offsets = mx.arange(tail_width)
+    tail = query_pos[..., None] + 1 - tail_count[..., None] + offsets + left_padding
+    tail = mx.where(offsets < tail_count[..., None], tail, -1)
+    topk = mx.concatenate([topk, tail], axis=-1)
+    pad = mx.full((1, rows, width - topk.shape[-1]), -1, dtype=topk.dtype)
+    return mx.concatenate([topk, pad], axis=-1)[:, None]
+
+
 @pytest.mark.usefixtures("glm5_fused_decode")
-@pytest.mark.parametrize("pool", [512, 1025, 1026, 1500, 2048])
-def test_dsa_topk_rows_matches_native_topk(pool):
-    """Decode/verify indexer top-k (bitonic sort) against the native
-    radix-select kernel: same indices in the same order, with exact score
-    ties, -1e30 masked blocks and a NaN."""
+@pytest.mark.parametrize("pool", [512, 1025, 1026, 1500, 2048, 2049, 5000, 66000])
+def test_dsa_select_topk_matches_native_topk_expanded(pool):
+    """Decode/verify indexer selection (radix select and index expansion in
+    one kernel) against the native radix-select kernel followed by the
+    general path's expansion: same token indices in the same order, with
+    exact score ties, -1e30 masked blocks, a NaN, FP16 scores, left padding
+    and partial tail windows."""
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
     from omlx.custom_kernels.sparse_index import fast as index_fast
 
     for rows in (1, 4, 8):
-        for trial in range(4):
+        for trial in range(5):
             mx.random.seed(pool + 10 * rows + trial)
             s = mx.random.normal((1, rows, pool))
             if trial == 1:
                 s = mx.round(s * 4) / 4
             if trial == 2:
                 s = mx.where(mx.random.uniform(shape=s.shape) < 0.3, -1e30, s)
-            s = s.astype(mx.bfloat16)
+            s = s.astype(mx.float16 if trial == 4 else mx.bfloat16)
             if trial == 3:
                 s = s.at[0, 0, 7].add(float("nan"))
-            expected = index_fast.dsa_topk_indices(s[:, None], 512)[:, 0]
-            got = dk.dsa_topk_rows(s, 512)
-            assert got is not None and got.dtype == expected.dtype
+            pool_len = pool - trial % 2
+            first = pool_len * 4 - rows + trial
+            padding = mx.array([trial % 3], dtype=mx.int32)
+            selected = index_fast.dsa_topk_indices(s[:, None], 512)[:, 0]
+            expected = _expand_reference(selected, first, pool_len, padding, 4, 3, 2051)
+            got = dk.dsa_select_topk(s, 512, first, pool_len, padding, 4, 3, 2051)
+            assert got is not None and got.dtype == mx.int32
             assert mx.array_equal(got, expected).item(), (rows, trial)
 
 
