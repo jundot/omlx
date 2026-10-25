@@ -1386,11 +1386,12 @@ def _qwen4_decode_static_check(module) -> bool:
     # The shipped oQe allocation is intentionally mixed per tensor.  This
     # kernel begins after those projections, so accept only the exact
     # canonical layouts emitted by the converter rather than demanding that
-    # all four happen to share layer 0's q6/g64 allocation.  ``wide`` lifts the
+    # all four happen to share layer 0's q6/g64 allocation (the re-quantized
+    # oQ4e keeps all four at 8-bit/g64).  ``wide`` lifts the
     # recipe allow-list only; every shape/dtype/bias check above still applies.
     wide = getattr(module, "_omlx_qwen4_wide_projections", False)
-    qkv_signatures = None if wide else {(4, 64), (5, 64), (6, 64)}
-    aux_signatures = None if wide else {(5, 128), (6, 64)}
+    qkv_signatures = None if wide else {(4, 64), (5, 64), (6, 64), (8, 64)}
+    aux_signatures = None if wide else {(5, 128), (6, 64), (8, 64)}
     if not _canonical_projection(
         module.in_proj_qkv,
         conv_dim,

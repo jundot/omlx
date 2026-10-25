@@ -617,6 +617,7 @@ def _canonical_qwen4_decode_module(signatures):
         ((6, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 0
         ((4, 64), (5, 128), (5, 128), (5, 128)),  # physical layer 1
         ((5, 64), (6, 64), (6, 64), (6, 64)),  # physical layer 29
+        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e, every layer
     ],
 )
 def test_qwen4_decode_static_gate_accepts_canonical_oqe_allocations(signatures):
@@ -1176,6 +1177,7 @@ def patched_decode(monkeypatch):
         ((4, 64), (5, 128), (5, 128), (5, 128)),  # one mixed-quantization group launch
         ((5, 64), (6, 64), (6, 64), (6, 64)),
         ((4, 64), (5, 128), (5, 128), (6, 64)),  # oQ4e layer 2's own mix
+        ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e
     ],
 )
 @pytest.mark.parametrize("seed", [3, 11])
@@ -1260,8 +1262,8 @@ def test_qwen4_decode_plan_turns_ineligible_on_replacement(monkeypatch):
         mx.zeros((1, HV, DV, DK)),
     )
     assert not fallbacks
-    # 8-bit in-projections are outside the shipped allocation allow-list.
-    module.in_proj_qkv = _random_projection(2560, C, 8, 64)
+    # 8-bit/g128 in-projections are outside the shipped allocation allow-list.
+    module.in_proj_qkv = _random_projection(2560, C, 8, 128)
     _decode_steps(
         module,
         [mx.zeros((1, 1, 2560), dtype=mx.bfloat16)],
@@ -1424,7 +1426,9 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("signatures", [((6, 64),) * 4, *_MIXED_SIGNATURES])
+@pytest.mark.parametrize(
+    "signatures", [((6, 64),) * 4, ((8, 64),) * 4, *_MIXED_SIGNATURES]
+)
 @pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8, 12, 16])
 @pytest.mark.parametrize("seed", [5, 23])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
@@ -1477,7 +1481,9 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("signatures", [((6, 64),) * 4, *_MIXED_SIGNATURES])
+@pytest.mark.parametrize(
+    "signatures", [((6, 64),) * 4, ((8, 64),) * 4, *_MIXED_SIGNATURES]
+)
 @pytest.mark.parametrize("rows", [2, 3])
 def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
     monkeypatch, qwen4_verify, signatures, rows
