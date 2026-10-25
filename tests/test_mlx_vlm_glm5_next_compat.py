@@ -2766,6 +2766,39 @@ def test_native_sparse_mla_matches_fp32_reference(L, K, topk, q_scale):
 
 
 @pytest.mark.parametrize(
+    "L,K,width,heads",
+    [(128, 4100, 2051, 64), (64, 2080, 2056, 64), (64, 4100, 2051, 32)],
+)
+def test_native_sparse_mla_nope_matches_zero_rope(L, K, width, heads):
+    """Zero-width rope parts (GLM-5.3's NoPE attention) select the
+    latent-only kernel: bit for bit the output of 64 zero rope dims."""
+    from omlx.custom_kernels.attention import fast as attention_fast
+
+    if not attention_fast.is_native_available():
+        pytest.skip("GLM MoE DSA native extension is unavailable")
+    q, kv, idx = _smla_inputs(L, K, width, H=heads)
+    scale = 256**-0.5
+    rope = sparse_mla.sparse_mla_attention(
+        q,
+        mx.zeros(q.shape[:-1] + (64,), q.dtype),
+        kv,
+        mx.zeros(kv.shape[:-1] + (64,), kv.dtype),
+        idx,
+        scale,
+    )
+    nope = sparse_mla.sparse_mla_attention(
+        q,
+        mx.zeros(q.shape[:-1] + (0,), q.dtype),
+        kv,
+        mx.zeros(kv.shape[:-1] + (0,), kv.dtype),
+        idx,
+        scale,
+    )
+    assert nope is not None
+    assert _mismatches(nope, rope) == 0
+
+
+@pytest.mark.parametrize(
     "L,K,width,pe",
     # The 3-slot tail of GLM's 2051-slot selection; early rows whose causal
     # limit leaves a 1..8-slot tail; real (nonzero) rope parts.

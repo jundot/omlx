@@ -403,9 +403,9 @@ def sparse_mla_attention(
 
     Shapes:
       q_latent: [B, H, L, 512]
-      q_pe: [B, H, L, 64]
+      q_pe: [B, H, L, 64], or [B, H, L, 0] for NoPE attention
       kv_latent: [B, 1, K, 512]
-      k_pe: [B, 1, K, 64]
+      k_pe: [B, 1, K, 64], or [B, 1, K, 0]
       topk_indices: [B, 1, L, TOPK]
       topk_length: optional [B, L] or [B, 1, L] valid prefix length
     """
@@ -445,7 +445,7 @@ def sparse_mla_attention(
         or kv_latent.shape[-1] != D_LATENT
         or k_pe.shape[-1] != D_PE
         or D_LATENT != 512
-        or D_PE != 64
+        or D_PE not in (0, 64)
         or q_latent.dtype not in (mx.float16, mx.bfloat16)
         or q_pe.dtype != q_latent.dtype
         or kv_latent.dtype != q_latent.dtype

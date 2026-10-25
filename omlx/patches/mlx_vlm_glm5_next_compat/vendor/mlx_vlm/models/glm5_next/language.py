@@ -1803,8 +1803,9 @@ class Glm5NextSparseAttention(nn.Module):
                     q_latent, kv_latent_native, topk_indices, self.scale
                 )
                 if output is None and Kv >= 4096:
-                    q_pe = mx.zeros(q_latent.shape[:-1] + (64,), dtype=native_dtype)
-                    k_pe = mx.zeros(kv_latent.shape[:-1] + (64,), dtype=native_dtype)
+                    # NoPE: zero-width rope parts select the latent-only kernel.
+                    q_pe = mx.zeros(q_latent.shape[:-1] + (0,), dtype=native_dtype)
+                    k_pe = mx.zeros(kv_latent.shape[:-1] + (0,), dtype=native_dtype)
                     output = sparse_mla_attention(
                         q_latent,
                         q_pe,

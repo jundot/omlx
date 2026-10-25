@@ -104,8 +104,10 @@ class SparseMlaAttentionPrimitive : public Primitive {
         topk_indices.shape(1) != 1) {
       return true;
     }
+    // Rope parts are 64 wide, or 0 wide for NoPE attention (GLM-5.3).
     if (q_latent.shape(3) != 512 || kv_latent.shape(3) != 512 ||
-        q_pe.shape(3) != 64 || k_pe.shape(3) != 64) {
+        (q_pe.shape(3) != 64 && q_pe.shape(3) != 0) ||
+        k_pe.shape(3) != q_pe.shape(3)) {
       return true;
     }
     if (q_latent.shape(2) <= 1 || topk_indices.shape(3) < 16 ||
@@ -177,7 +179,10 @@ class SparseMlaAttentionPrimitive : public Primitive {
     // 5-6% faster per call (qL=2048 at kL=4096..16384, M3 Ultra).
     const int dc = (q_latent.shape(1) == 64) ? 16 : 32;
     constexpr int d_latent = 512;
-    constexpr int d_pe = 64;
+    // 0: NoPE, scores over the latent part only. Zero rope parts would add
+    // exactly +0 to every score (which starts at +0, so is never -0): the
+    // same output without their 64 dims of staging and MMAs.
+    const int d_pe = q_pe.shape(3);
 
     const int B = q_latent.shape(0);
     const int H = q_latent.shape(1);
@@ -278,9 +283,10 @@ class SparseMlaAttentionPrimitive : public Primitive {
             o.strides(0), o.strides(1), o.strides(2)}};
 
     compute_encoder.set_input_array(q_latent, 0);
-    compute_encoder.set_input_array(q_pe, 1);
+    // A NoPE kernel never reads its rope buffers: bind the latent ones.
+    compute_encoder.set_input_array(d_pe ? q_pe : q_latent, 1);
     compute_encoder.set_input_array(kv_latent, 2);
-    compute_encoder.set_input_array(k_pe, 3);
+    compute_encoder.set_input_array(d_pe ? k_pe : kv_latent, 3);
     compute_encoder.set_input_array(topk, 4);
     compute_encoder.set_input_array(topk_length, 5);
     compute_encoder.set_output_array(o, 6);
