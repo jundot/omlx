@@ -66,6 +66,7 @@ from .exceptions import (
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
+from .patches.mlx_lm_mtp.batch_generator import set_request_mtp_opt_out
 from .patches.vlm_batch_kv_capacity import apply_batch_kv_capacity_patch
 from .prefill.packed import (
     PackedRow,
@@ -2945,6 +2946,7 @@ class Scheduler:
                     # Cleanup uid maps now that the slot is reclaimable.
                     _unregister_uid_row(self.model, uid)
                     del self.uid_to_request_id[uid]
+                    set_request_mtp_opt_out(uid, False)
                 if uid is not None and self.request_id_to_uid.get(request_id) == uid:
                     del self.request_id_to_uid[request_id]
                 self._inflight_store_futures.pop(request_id, None)
@@ -7082,6 +7084,7 @@ class Scheduler:
                 now = time.monotonic()
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
+                set_request_mtp_opt_out(uid, getattr(request, "mtp_opt_out", False))
                 self.running[request.request_id] = request
                 scheduled.append(request)
             except Exception:
@@ -13444,6 +13447,7 @@ class Scheduler:
                 self._dflash_bind_uid(request.request_id, uid)
                 self.request_id_to_uid[request.request_id] = uid
                 self.uid_to_request_id[uid] = request.request_id
+                set_request_mtp_opt_out(uid, getattr(request, "mtp_opt_out", False))
                 now = time.monotonic()
                 request.batch_uid = uid
                 request.status = RequestStatus.RUNNING

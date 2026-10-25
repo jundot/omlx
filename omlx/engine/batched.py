@@ -1203,6 +1203,7 @@ class BatchedEngine(BaseEngine):
             request_id=kwargs.pop("_request_id", None),
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            mtp_opt_out=bool(kwargs.get("mtp_opt_out", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
@@ -1290,6 +1291,7 @@ class BatchedEngine(BaseEngine):
             request_id=kwargs.pop("_request_id", None),
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            mtp_opt_out=bool(kwargs.get("mtp_opt_out", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
             benchmark_ane_sequence_length=int(

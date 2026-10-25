@@ -178,6 +178,9 @@ class Request:
     # pollute the shared cache tiers or trigger the completion-time
     # host memcpy + disk write.
     skip_cache_store: bool = False
+    # Per-request opt-out of Lightning MTP speculation (header X-oMLX-MTP: off).
+    # The MTP head stays loaded; only this request decodes without drafts.
+    mtp_opt_out: bool = False
     # Emit per-chunk timing diagnostics for an internal throughput benchmark.
     # This is never set by ordinary API traffic.
     benchmark_trace: bool = False
