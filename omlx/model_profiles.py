@@ -109,6 +109,7 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_ced_prefill_enabled",
         # Gain and memory cost depend on the checkpoint's GDN recipe.
         "qwen4_gdn_decode_wide_proj",
+        "qwen4_qsa_shared_prefix_enabled",
         # Which engine serves the model depends on what this Mac has installed.
         "external_engine",
         # Security flag must be explicit per model — never propagated via profiles.

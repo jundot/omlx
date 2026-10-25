@@ -85,6 +85,8 @@ class CacheTypeRegistry:
         "QSAKVCache": CacheType.QWEN4_QSA_KVCACHE,
         "QSAQuantizedKVCache": CacheType.QWEN4_QSA_QUANTIZED_KVCACHE,
         "BatchQSAKVCache": CacheType.QWEN4_BATCH_QSA_KVCACHE,
+        "SharedSuffixQSAKVCache": CacheType.QWEN4_QSA_KVCACHE,
+        "SharedBatchQSAKVCache": CacheType.QWEN4_BATCH_QSA_KVCACHE,
     }
 
     # Default handler instance

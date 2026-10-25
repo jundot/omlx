@@ -571,6 +571,24 @@ async def test_qwen4_wide_decode_is_persisted_for_qwen4_only(model_type, expecte
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_type", "expected"), [("qwen4_exp", True), ("qwen3_5_moe", False)]
+)
+async def test_qwen4_shared_qsa_is_persisted_for_qwen4_only(model_type, expected):
+    pool, entry = _failed_pool()
+    entry.config_model_type = model_type
+    settings = ModelSettings()
+
+    await _update_settings(
+        pool,
+        settings,
+        admin_routes.ModelSettingsRequest(qwen4_qsa_shared_prefix_enabled=True),
+    )
+
+    assert settings.qwen4_qsa_shared_prefix_enabled is expected
+
+
+@pytest.mark.asyncio
 async def test_deepseek_v41_engram_ssd_offload_is_persisted_for_v41_only():
     pool, entry = _failed_pool()
     entry.config_model_type = "deepseek_v41"

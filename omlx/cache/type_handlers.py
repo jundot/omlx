@@ -1680,6 +1680,9 @@ class Qwen4QSAKVCacheHandler(CacheTypeHandler):
         return self._validate_serialized_state(tuple(state_tuple))
 
     def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        materialize = getattr(cache_obj, "materialize", None)
+        if callable(materialize):
+            cache_obj = materialize()
         keys, values, index_keys, position_ids = cache_obj.state
         elements = (
             keys,
@@ -1861,6 +1864,9 @@ class Qwen4BatchQSAKVCacheHandler(CacheTypeHandler):
         )
 
     def serialize_state(self, cache_obj: Any) -> tuple[Any, ...]:
+        materialize = getattr(cache_obj, "materialize", None)
+        if callable(materialize):
+            cache_obj = materialize()
         kv_state, index_keys, position_ids = cache_obj.state
         keys, values, offset, left_padding = kv_state
         return (

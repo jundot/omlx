@@ -1034,6 +1034,26 @@ for _cache_cls, _filter in (
     _cache_cls.extend = _regular_cache_extend_singleton
 
 
+def _bind_request_cache_scope(caches, request, *, shared_prefix_enabled=False):
+    """Bind model-owned cache activation and media reuse boundaries."""
+    scope = (
+        getattr(request, "vlm_extra_keys_for_cache", None),
+    )
+    for cache in caches or ():
+        set_shared_serving = getattr(cache, "set_shared_serving", None)
+        if callable(set_shared_serving):
+            set_shared_serving(shared_prefix_enabled)
+        bind_scope = getattr(cache, "bind_cache_scope", None)
+        if callable(bind_scope):
+            bind_scope(scope)
+
+
+def _qwen4_qsa_shared_prefix_enabled(scheduler) -> bool:
+    """Read the optional runtime flag without widening test-double contracts."""
+    config = getattr(scheduler, "config", None)
+    return bool(getattr(config, "qwen4_qsa_shared_prefix_enabled", False))
+
+
 def _cache_layer_supports_singleton_passthrough(cache_obj: Any) -> bool:
     sub_caches = getattr(cache_obj, "caches", None)
     if isinstance(sub_caches, (list, tuple)):
@@ -1086,6 +1106,9 @@ def _patched_merge_caches(caches):
     if len(caches) == 1:
         merged = []
         for layer_cache in caches[0]:
+            prepare_serving = getattr(layer_cache, "prepare_serving_cache", None)
+            if callable(prepare_serving):
+                layer_cache = prepare_serving()
             if _cache_layer_supports_singleton_passthrough(layer_cache):
                 merged.append(layer_cache)
             elif hasattr(layer_cache, "merge"):
@@ -1885,6 +1908,8 @@ class SchedulerConfig:
     decode_fairness: bool = True
     # Set by the engine when MoE expert offload wrapped the model.
     moe_offload_active: bool = False
+    # Experimental Qwen4-Exp immutable-prefix/private-suffix QSA cache.
+    qwen4_qsa_shared_prefix_enabled: bool = False
 
     # Paged cache settings (internal defaults)
     paged_cache_block_size: int = 256  # Tokens per block
@@ -7052,6 +7077,11 @@ class Scheduler:
                 return
 
         self._finalize_chunked_prefill_cache_for_insert(request, state.cache)
+        _bind_request_cache_scope(
+            state.cache,
+            request,
+            shared_prefix_enabled=_qwen4_qsa_shared_prefix_enabled(self),
+        )
 
         per_row_lps = state.per_row_lps if state.per_row_lps is not None else []
         # insert() merges the prompt cache into the batch KV caches with lazy
@@ -13416,6 +13446,12 @@ class Scheduler:
                         f"(uid={vlm_mtp_uid}, {request.num_prompt_tokens} prompt tokens)"
                     )
                     continue
+
+            _bind_request_cache_scope(
+                cache_to_use,
+                request,
+                shared_prefix_enabled=_qwen4_qsa_shared_prefix_enabled(self),
+            )
 
             # Insert into BatchGenerator with pre-filled cache + last token.
             # BatchGenerator only handles decode from here.
