@@ -72,11 +72,12 @@ class BatchPolicy:
         if self.remaining:
             self.remaining -= 1
             if not self.remaining:
-                self.costs.clear()
-                self.last_seen.clear()
-                self.acceptance = [0.6] * self.max_depth
-                self.cur = self.max_depth
+                # Measure MTP again from the costs and acceptance it had, at
+                # its best depth: newer cycles replace them, and a loss parks
+                # again after four decisions, not after measuring every depth.
                 self.losing = 0
+                if self.costs:
+                    self.cur = max(self.costs, key=self.score)
 
     def score(self, depth):
         if depth == 0:
@@ -171,12 +172,20 @@ class ParkMemory:
     grows across cohorts as it does within one. A cohort where MTP held up
     for 32 measured decisions clears the verdicts it contradicts (those at
     its row count or fewer).
+
+    The MTP cycle costs and draft acceptance a cohort measured outlive it
+    too: the next cohort of the same row count starts from them at its best
+    depth, so it decides from its first MTP cycle instead of measuring every
+    depth three times first (about a dozen cycles each join or finish under
+    concurrency, which mostly lose).
     """
 
     def __init__(self):
         self.clock = 0
         # rows -> (clock value the park ends at, cooldown of the next park)
         self._verdicts = {}
+        # rows -> ({depth: recent MTP cycle costs}, acceptance per draft position)
+        self._measured = {}
 
     def tick(self):
         """Count one batched decode step (ordinary or MTP) of this model."""
@@ -186,6 +195,15 @@ class ParkMemory:
         if policy.fixed:
             return
         rows = len(policy.uids)
+        measured = self._measured.get(rows)
+        if measured is not None and len(measured[1]) == policy.max_depth:
+            costs, acceptance = measured
+            policy.costs = {
+                depth: deque(samples, maxlen=8) for depth, samples in costs.items()
+            }
+            policy.acceptance = list(acceptance)
+            policy.last_seen = dict.fromkeys(policy.costs, 0.0)
+            policy.cur = max(policy.costs, key=policy.score)
         verdicts = [verdict for k, verdict in self._verdicts.items() if k <= rows]
         if not verdicts:
             return
@@ -196,13 +214,28 @@ class ParkMemory:
         else:
             policy.cooldown = cooldown
 
+    def _remember(self, policy):
+        """Keep the MTP cycle costs and acceptance ``policy`` measured."""
+        if policy.fixed or not policy.costs:
+            return
+        rows = len(policy.uids)
+        costs = dict(self._measured.get(rows, ({}, ()))[0])
+        costs.update(
+            (depth, tuple(samples))
+            for depth, samples in policy.costs.items()
+            if samples
+        )
+        self._measured[rows] = (costs, tuple(policy.acceptance))
+
     def parked(self, policy):
+        self._remember(policy)
         self._verdicts[len(policy.uids)] = (
             self.clock + policy.remaining,
             policy.cooldown,
         )
 
     def retired(self, policy):
+        self._remember(policy)
         if policy.held_up():
             rows = len(policy.uids)
             for k in [k for k in self._verdicts if k <= rows]:

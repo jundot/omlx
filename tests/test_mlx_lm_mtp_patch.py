@@ -5409,8 +5409,13 @@ def test_whole_batch_cost_can_lose_despite_per_row_acceptance():
     assert policy.needs_standard()
     policy.observe_standard(10)
     assert not policy.needs_standard()
-    assert not policy.costs
-    assert policy.cur == 2
+    # MTP is measured again from the costs it had, at its best depth: the
+    # clear loss parks again after four decisions.
+    assert set(policy.costs) == {1, 2} and policy.cur == 2
+    for _ in range(4):
+        assert not policy.should_park()
+        policy.observe_mtp(policy.cur, [policy.cur] * 4, 40, stable=True)
+    assert policy.should_park()
 
 
 def test_depth_transition_does_not_measure_mixed_async_work():
@@ -6574,6 +6579,44 @@ def test_batch_park_backoff_survives_cohort_changes():
     memory.seed(fresh)
     fresh.park()
     assert fresh.remaining == 128
+
+
+def test_new_cohort_decides_from_the_costs_its_row_count_measured():
+    """A cohort after another at its row count measured MTP skips the
+    measuring round: it starts at the measured best depth with the measured
+    acceptance and parks after four clearly losing cycles."""
+    from omlx.patches.mlx_lm_mtp.batch_policy import ParkMemory
+
+    memory = ParkMemory()
+    first = calibrated(batch=4, depth=3)
+    measuring = 0
+    while not first.should_park():
+        first.observe_mtp(first.cur, [1] * 4, 40, stable=True)
+        measuring += 1
+    first.park()
+    memory.parked(first)
+    for _ in range(first.remaining):
+        memory.tick()
+    second = BatchPolicy(range(4), 3)
+    memory.seed(second)
+    assert second.remaining == 0
+    assert {d: list(c) for d, c in second.costs.items()} == {
+        d: list(c) for d, c in first.costs.items()
+    }
+    assert second.acceptance == first.acceptance
+    for cost in [100, 50, 10, 10, 10]:
+        second.observe_standard(cost)
+    cycles = 0
+    while not second.should_park():
+        second.observe_mtp(second.cur, [1] * 4, 40, stable=True)
+        cycles += 1
+    assert cycles == 4 < measuring
+    # Another row count, and a fixed policy, measure for themselves.
+    other, fixed = BatchPolicy(range(2), 3), BatchPolicy(range(4), 3, fixed=True)
+    memory.seed(other)
+    memory.seed(fixed)
+    assert not other.costs and not fixed.costs
+
 
 def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
     """A fallback rebuilds rows that draft deeper than the lowered policy depth."""
