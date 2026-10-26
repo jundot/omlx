@@ -46,11 +46,15 @@ def rowwise_gemm(lhs: mx.array, rhs: mx.array, transpose_rhs: bool) -> mx.array:
     if steel_rowwise_available():
         from omlx.custom_kernels.attention import fast
 
-        return fast.rowwise_gemm(
-            mx.contiguous(lhs),
-            mx.contiguous(rhs),
-            transpose_rhs,
-        )
+        # The native kernel rejects other layouts, such as TP-sharded heads.
+        try:
+            return fast.rowwise_gemm(
+                mx.contiguous(lhs),
+                mx.contiguous(rhs),
+                transpose_rhs,
+            )
+        except Exception:
+            pass
     return mx.concatenate(
         [
             lhs[idx : idx + 1]
