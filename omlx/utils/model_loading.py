@@ -1654,6 +1654,10 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
         pending = pending[_MATERIALIZE_EVAL_CHUNK:]
         converted = [(key, value.astype(mx.float16)) for key, value in chunk]
         mx.eval([value for _, value in converted])
+        # mx.eval returns once the float16 copies are ready, but the command
+        # buffer's completion handler still holds the bfloat16 inputs; wait
+        # for it so they are freed before the next chunk allocates.
+        mx.synchronize()
         model.update(tree_unflatten(converted))
         del chunk, converted
     if count:
