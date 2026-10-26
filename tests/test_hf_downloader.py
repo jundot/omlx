@@ -4,6 +4,7 @@
 import asyncio
 import contextlib
 import fcntl
+import importlib
 import io
 import json
 import os
@@ -40,6 +41,11 @@ from omlx.admin.hf_downloader import (
     _sum_safetensors_blob_bytes,
 )
 from omlx.engine_pool import EnginePool
+
+# huggingface_hub 2.x sends requests through httpx2 instead of httpx.
+hub_httpx = importlib.import_module(
+    type(huggingface_hub.get_session()).__module__.partition(".")[0]
+)
 
 
 @pytest.fixture(autouse=True)
@@ -3185,11 +3191,12 @@ class TestSafetensorsBlobSize:
         def respond(request):
             requests.append(request)
             if reject_token and request.headers.get("authorization"):
-                return httpx.Response(401)
-            raise httpx.ReadTimeout("Hub stalled", request=request)
+                return hub_httpx.Response(401)
+            raise hub_httpx.ReadTimeout("Hub stalled", request=request)
 
         api = HfApi(token="test-token" if reject_token else False)
-        with httpx.Client(transport=httpx.MockTransport(respond)) as client, patch(
+        transport = hub_httpx.MockTransport(respond)
+        with hub_httpx.Client(transport=transport) as client, patch(
             "huggingface_hub.hf_api.get_session", return_value=client
         ), patch.object(hf_downloader_mod, "_HF_API_TIMEOUT", 0.1):
             for _ in range(2):

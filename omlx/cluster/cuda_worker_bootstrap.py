@@ -40,7 +40,7 @@ WORKER_REQUIREMENTS = (
     "mlx==0.32.4",
     "mlx-cuda-13==0.32.4",
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d",
-    "transformers>=5.12.1,<5.18",
+    "transformers>=5.12.1,<5.21",
     "mistral-common>=1.10",
     "tokenizers>=0.19.0",
     "huggingface-hub>=1.19.0",
