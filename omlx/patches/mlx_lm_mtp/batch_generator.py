@@ -1338,16 +1338,8 @@ def _replace_cache_rows(
 
 def _initial_batch_forward(gen_batch):
     """Advance fresh Qwen rows together without extracting target caches."""
-    from mlx_lm.models.cache import ArraysCache, BatchKVCache
-
-    cache_types = (ArraysCache, BatchKVCache)
-    try:
-        from mlx_vlm.models.cache import ArraysCache as VLMArray
-        from mlx_vlm.models.cache import BatchKVCache as VLMKV
-    except ImportError:
-        pass
-    else:
-        cache_types += (VLMArray, VLMKV)
+    # The caches the shared verify then rolls back in place, QSA's included.
+    from .fused_batch import _supports_batch_rollback
 
     host = getattr(gen_batch.model, "_language_model", None)
     chain, _, head_clone = _resolve_mtp_chain_depth(gen_batch.model)
@@ -1357,7 +1349,7 @@ def _initial_batch_forward(gen_batch):
         and not head_clone
         and getattr(host, "_omlx_mtp_batch_rollback", False)
         and gen_batch._next_tokens is not None
-        and all(type(c) in cache_types for c in gen_batch.prompt_cache)
+        and all(_supports_batch_rollback(c) for c in gen_batch.prompt_cache)
         and all(
             _is_greedy(
                 _make_row_batch(gen_batch, i, prompt_cache=gen_batch.prompt_cache)
