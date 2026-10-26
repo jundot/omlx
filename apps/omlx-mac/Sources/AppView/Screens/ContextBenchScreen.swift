@@ -122,6 +122,7 @@ private struct ConfigurationSection: View {
                     options: modelOptions
                 )
             }
+            GPUPowerBenchNotice(model: models.first { $0.id == selectedModelId })
 
             Row(label: String(localized: "bench.context.row.target.label",
                               defaultValue: "Maximum context to test",

@@ -32360,6 +32360,2160 @@
           }
         }
       }
+    },
+    "askai.preset.error.empty_command" : {
+      "comment" : "Validation error when a preset has no command name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter a command name."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Введите имя команды."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请输入命令名称。"
+          }
+        }
+      }
+    },
+    "askai.preset.error.invalid_command" : {
+      "comment" : "Validation error for a preset command with invalid characters",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Use letters, digits, - and _ only, in lowercase and without spaces."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Используйте только буквы, цифры, - и _, в нижнем регистре и без пробелов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "只能使用字母、数字、- 和 _，须为小写且不含空格。"
+          }
+        }
+      }
+    },
+    "askai.preset.error.duplicate_command" : {
+      "comment" : "Validation error when two presets share a command",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Another preset already uses this command."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Эта команда уже используется другим пресетом."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已有其他预设使用此命令。"
+          }
+        }
+      }
+    },
+    "askai.preset.error.missing_model" : {
+      "comment" : "Validation error when a preset has no model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Choose a model."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выберите модель."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请选择模型。"
+          }
+        }
+      }
+    },
+    "askai.hotkey.error.in_use" : {
+      "comment" : "Shown when the Ask AI hotkey cannot be registered; the argument is the shortcut",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ is already used by macOS or another app. Choose a different shortcut."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ уже используется macOS или другим приложением. Выберите другое сочетание клавиш."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 已被 macOS 或其他应用占用。请选择其他快捷键。"
+          }
+        }
+      }
+    },
+    "askai.notice.unknown_preset" : {
+      "comment" : "Shown when the typed slash command matches no preset",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No preset named /%@. Add it in Ask AI settings."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пресет /%@ не найден. Добавьте его в настройках Ask AI."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "没有名为 /%@ 的预设。请在 Ask AI 设置中添加。"
+          }
+        }
+      }
+    },
+    "askai.notice.empty_body" : {
+      "comment" : "Shown when a slash command has no text after it",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Type the text to send after /%@."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Введите текст после /%@."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请在 /%@ 后输入要发送的文本。"
+          }
+        }
+      }
+    },
+    "askai.notice.no_default_model" : {
+      "comment" : "Shown when a plain question is sent with no default model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Choose a default model in Ask AI settings."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выберите модель по умолчанию в настройках Ask AI."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请在 Ask AI 设置中选择默认模型。"
+          }
+        }
+      }
+    },
+    "askai.copy.block" : {
+      "comment" : "Tooltip on the copy button of a code block or quote in an Ask AI answer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Копировать"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制"
+          }
+        }
+      }
+    },
+    "askai.copy.answer" : {
+      "comment" : "Tooltip on the button that copies a whole Ask AI answer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy answer"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Копировать ответ"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制回答"
+          }
+        }
+      }
+    },
+    "askai.copied" : {
+      "comment" : "Notice after an Ask AI answer was copied",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copied to clipboard"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скопировано в буфер обмена"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已复制到剪贴板"
+          }
+        }
+      }
+    },
+    "askai.open_settings" : {
+      "comment" : "Button in the Ask AI panel that opens the Ask AI settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open Settings"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открыть настройки"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开设置"
+          }
+        }
+      }
+    },
+    "askai.input.placeholder" : {
+      "comment" : "Placeholder in the Ask AI prompt field",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask anything, or type / for a preset"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Спросите что угодно или введите / для пресета"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "随便问，或输入 / 使用预设"
+          }
+        }
+      }
+    },
+    "askai.stop.help" : {
+      "comment" : "Tooltip on the stop button while an Ask AI answer streams",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stop (⌘.)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Остановить (⌘.)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "停止 (⌘.)"
+          }
+        }
+      }
+    },
+    "askai.hint.streaming" : {
+      "comment" : "Key hint in the Ask AI footer while an answer streams",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esc Stop"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esc Остановить"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esc 停止"
+          }
+        }
+      }
+    },
+    "askai.hint.idle" : {
+      "comment" : "Key hints in the Ask AI footer before the first question",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘↩ Send   Esc Close"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘↩ Отправить   Esc Закрыть"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘↩ 发送   Esc 关闭"
+          }
+        }
+      }
+    },
+    "askai.hint.conversation" : {
+      "comment" : "Key hints in the Ask AI footer after an answer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘↩ Follow up   ⌘N New   ⇧⌘C Copy"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘↩ Уточнить   ⌘N Новый   ⇧⌘C Копировать"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘↩ 追问   ⌘N 新对话   ⇧⌘C 复制"
+          }
+        }
+      }
+    },
+    "askai.turn.stopped" : {
+      "comment" : "Marker under an Ask AI answer that was stopped early",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stopped"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Остановлено"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已停止"
+          }
+        }
+      }
+    },
+    "askai.thinking.active" : {
+      "comment" : "Label while the model is still reasoning",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thinking…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Размышляет…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "思考中…"
+          }
+        }
+      }
+    },
+    "askai.thinking.done" : {
+      "comment" : "Label of the collapsed reasoning section after the answer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thought process"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ход размышлений"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "思考过程"
+          }
+        }
+      }
+    },
+    "askai.hotkey.recording" : {
+      "comment" : "Hotkey recorder label while waiting for a key press",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Press shortcut…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нажмите сочетание…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请按快捷键…"
+          }
+        }
+      }
+    },
+    "askai.hotkey.help" : {
+      "comment" : "Tooltip on the Ask AI hotkey recorder",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Click, then press the new shortcut. Esc cancels."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нажмите, затем введите новое сочетание клавиш. Esc отменяет."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "点击后按下新的快捷键。按 Esc 取消。"
+          }
+        }
+      }
+    },
+    "askai.error.invalid_response" : {
+      "comment" : "Error when the chat stream response is not HTTP",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The server sent a response Ask AI could not read."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сервер прислал ответ, который Ask AI не может прочитать."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器返回了 Ask AI 无法读取的响应。"
+          }
+        }
+      }
+    },
+    "askai.error.server_unreachable" : {
+      "comment" : "Error when the chat request cannot connect to the local server",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Can't reach the oMLX server. Make sure it is running."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удаётся подключиться к серверу oMLX. Убедитесь, что он запущен."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法连接到 oMLX 服务器。请确认它正在运行。"
+          }
+        }
+      }
+    },
+    "askai.error.timed_out" : {
+      "comment" : "Error when the chat request times out",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The server took too long to respond."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сервер слишком долго не отвечал."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器响应超时。"
+          }
+        }
+      }
+    },
+    "askai.error.unauthorized" : {
+      "comment" : "Error when the chat request is rejected with HTTP 401",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The server rejected the API key. Check Security settings."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сервер отклонил API-ключ. Проверьте настройки безопасности."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器拒绝了 API 密钥。请检查安全设置。"
+          }
+        }
+      }
+    },
+    "askai.models.unavailable" : {
+      "comment" : "Hint when the model list could not be loaded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Start the server to pick from installed models."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запустите сервер, чтобы выбрать из установленных моделей."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启动服务器后即可从已安装的模型中选择。"
+          }
+        }
+      }
+    },
+    "askai.model.select_placeholder" : {
+      "comment" : "Placeholder option at the top of the Ask AI model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Select model…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Выберите модель…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "选择模型…"
+          }
+        }
+      }
+    },
+    "askai.model.missing" : {
+      "comment" : "Model picker option for a saved model that is no longer found",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (not installed)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (не установлена)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@（未安装）"
+          }
+        }
+      }
+    },
+    "askai.section.general" : {
+      "comment" : "Section header for the Ask AI switch and hotkey",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        }
+      }
+    },
+    "askai.row.enabled" : {
+      "comment" : "Row label for the Ask AI feature switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enable Ask AI"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Включить Ask AI"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启用 Ask AI"
+          }
+        }
+      }
+    },
+    "askai.row.enabled.sub" : {
+      "comment" : "Sublabel for the Ask AI feature switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open a question bar from any app with a global shortcut."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открывайте строку вопросов из любого приложения глобальным сочетанием клавиш."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在任意应用中用全局快捷键打开提问栏。"
+          }
+        }
+      }
+    },
+    "askai.row.hotkey" : {
+      "comment" : "Row label for the Ask AI global shortcut",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hotkey"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Горячая клавиша"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "快捷键"
+          }
+        }
+      }
+    },
+    "askai.row.hotkey.sub" : {
+      "comment" : "Sublabel for the Ask AI global shortcut",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Press it again or Esc to close the bar."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нажмите её ещё раз или Esc, чтобы закрыть строку."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "再按一次或按 Esc 关闭提问栏。"
+          }
+        }
+      }
+    },
+    "askai.row.new_conversation" : {
+      "comment" : "Row label for the idle time that resets the Ask AI conversation",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Start New Conversation After"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Новый разговор через"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "多久后开始新对话"
+          }
+        }
+      }
+    },
+    "askai.row.new_conversation.sub" : {
+      "comment" : "Sublabel for the Ask AI conversation reset time",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reopening the bar sooner keeps the last conversation for follow-up questions."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Если открыть строку раньше, последний разговор сохранится для уточняющих вопросов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在此时间内重新打开提问栏，会保留上一段对话以便追问。"
+          }
+        }
+      }
+    },
+    "askai.new_conversation.always" : {
+      "comment" : "Ask AI option: always start a new conversation",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Every Time"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Каждый раз"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每次"
+          }
+        }
+      }
+    },
+    "askai.new_conversation.2m" : {
+      "comment" : "Ask AI option: new conversation after 2 idle minutes",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2 Minutes"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2 минуты"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2 分钟"
+          }
+        }
+      }
+    },
+    "askai.new_conversation.5m" : {
+      "comment" : "Ask AI option: new conversation after 5 idle minutes",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "5 Minutes"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "5 минут"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "5 分钟"
+          }
+        }
+      }
+    },
+    "askai.new_conversation.15m" : {
+      "comment" : "Ask AI option: new conversation after 15 idle minutes",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "15 Minutes"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "15 минут"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "15 分钟"
+          }
+        }
+      }
+    },
+    "askai.section.default" : {
+      "comment" : "Section header for the Ask AI default model and prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Default"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "По умолчанию"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "默认"
+          }
+        }
+      }
+    },
+    "askai.section.default.sub" : {
+      "comment" : "Subtitle for the Ask AI default section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Used when a question does not start with a preset command."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Используется, когда вопрос не начинается с команды пресета."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用于不以预设命令开头的问题。"
+          }
+        }
+      }
+    },
+    "askai.prompt.default_placeholder" : {
+      "comment" : "Placeholder for the Ask AI default system prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optional. For example: Answer briefly."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Необязательно. Например: Отвечай кратко."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可选。例如：简短回答。"
+          }
+        }
+      }
+    },
+    "askai.section.presets" : {
+      "comment" : "Section header for the Ask AI slash-command presets",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Presets"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пресеты"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "预设"
+          }
+        }
+      }
+    },
+    "askai.section.presets.sub" : {
+      "comment" : "Subtitle for the Ask AI presets section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Type /command in the Ask AI bar to use a preset's model and system prompt."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Введите /команду в строке Ask AI, чтобы использовать модель и системный промпт пресета."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 Ask AI 提问栏中输入 /命令，即可使用预设的模型和系统提示词。"
+          }
+        }
+      }
+    },
+    "askai.presets.new" : {
+      "comment" : "Button that adds an Ask AI preset",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "New"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Новый"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "新建"
+          }
+        }
+      }
+    },
+    "askai.presets.empty" : {
+      "comment" : "Empty state of the Ask AI presets list",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No presets yet."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пресетов пока нет."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "还没有预设。"
+          }
+        }
+      }
+    },
+    "askai.presets.delete.confirm" : {
+      "comment" : "Confirm button for deleting an Ask AI preset",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Delete"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "删除"
+          }
+        }
+      }
+    },
+    "askai.presets.delete.title" : {
+      "comment" : "Confirmation title before deleting an Ask AI preset; the argument is the command",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Delete /%@?"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить /%@?"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "删除 /%@？"
+          }
+        }
+      }
+    },
+    "askai.presets.edit" : {
+      "comment" : "Tooltip on the edit button of an Ask AI preset",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Edit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Изменить"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "编辑"
+          }
+        }
+      }
+    },
+    "askai.presets.delete" : {
+      "comment" : "Tooltip on the delete button of an Ask AI preset",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Delete"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "删除"
+          }
+        }
+      }
+    },
+    "askai.preset.command" : {
+      "comment" : "Row label for an Ask AI preset command name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Command"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Команда"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "命令"
+          }
+        }
+      }
+    },
+    "askai.preset.command.sub" : {
+      "comment" : "Sublabel for an Ask AI preset command name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Letters in any language, digits, - and _. No spaces."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Буквы любого языка, цифры, - и _. Без пробелов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "任意语言的字母、数字、- 和 _。不能有空格。"
+          }
+        }
+      }
+    },
+    "askai.preset.command.placeholder" : {
+      "comment" : "Placeholder for an Ask AI preset command name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "translate"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "translate"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "translate"
+          }
+        }
+      }
+    },
+    "askai.prompt.preset_placeholder" : {
+      "comment" : "Placeholder for an Ask AI preset system prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "For example: Translate the text into English in a concise, professional Slack tone. Output only the translation."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Например: Переведи текст на английский в кратком деловом стиле для Slack. Выведи только перевод."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "例如：将文本翻译成简洁、专业的 Slack 语气的英文。只输出译文。"
+          }
+        }
+      }
+    },
+    "askai.row.system_prompt" : {
+      "comment" : "Label above the Ask AI system prompt editor",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "System Prompt"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Системный промпт"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "系统提示词"
+          }
+        }
+      }
+    },
+    "askai.row.model" : {
+      "comment" : "Row label for the Ask AI model picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модель"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型"
+          }
+        }
+      }
+    },
+    "askai.presets.no_model" : {
+      "comment" : "Shown in a preset row when no model is chosen",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No model"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нет модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未选择模型"
+          }
+        }
+      }
+    },
+    "askai.row.thinking" : {
+      "comment" : "Row label for the Ask AI thinking switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thinking"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Размышление"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "思考"
+          }
+        }
+      }
+    },
+    "askai.row.thinking.sub" : {
+      "comment" : "Sublabel for the Ask AI thinking switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Off asks reasoning models to answer without a thinking pass."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Если выключено, модели с рассуждением отвечают без этапа размышления."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "关闭时，推理模型将不经过思考步骤直接回答。"
+          }
+        }
+      }
+    },
+    "askai.row.auto_copy" : {
+      "comment" : "Row label for the Ask AI auto copy switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto Copy"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Автокопирование"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自动复制"
+          }
+        }
+      }
+    },
+    "askai.row.auto_copy.sub" : {
+      "comment" : "Sublabel for the Ask AI auto copy switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy the answer to the clipboard when it finishes."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Копировать ответ в буфер обмена, когда он готов."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "回答完成后自动复制到剪贴板。"
+          }
+        }
+      }
+    },
+    "sidebar.askAI" : {
+      "comment" : "Sidebar row label / navigation title for the Ask AI section",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        }
+      }
+    },
+    "askai.notice.model_no_images" : {
+      "comment" : "Shown when an image is pasted or sent but the target model is not a vision model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ can't read images. Use a vision (VLM) model for questions with images."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ не умеет читать изображения. Для вопросов с изображениями используйте модель с поддержкой зрения (VLM)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 无法读取图片。带图片的问题请使用视觉模型 (VLM)。"
+          }
+        }
+      }
+    },
+    "askai.notice.too_many_images" : {
+      "comment" : "Shown when more images are pasted than the Ask AI limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "You can attach up to %lld images."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Можно прикрепить не более %lld изображений."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最多可以附加 %lld 张图片。"
+          }
+        }
+      }
+    },
+    "askai.attachment.remove" : {
+      "comment" : "Tooltip on the button that removes a pasted image",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remove image"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалить изображение"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "移除图片"
+          }
+        }
+      }
+    },
+    "askai.panel.drag.help" : {
+      "comment" : "Tooltip on the Ask AI panel icon that moves the panel",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Drag to move. Right-click to reset."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Перетащите, чтобы переместить. Правый клик — сброс."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "拖动以移动。右键点击可重置。"
+          }
+        }
+      }
+    },
+    "askai.panel.reset_position" : {
+      "comment" : "Context menu item that moves the Ask AI panel back to its default spot",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset Position"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сбросить положение"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重置位置"
+          }
+        }
+      }
+    },
+    "askai.panel.reset_width" : {
+      "comment" : "Context menu item that restores the default Ask AI panel width",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset Width"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сбросить ширину"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重置宽度"
+          }
+        }
+      }
+    },
+    "askai.notice.model_type_unknown" : {
+      "comment" : "Shown when the model list cannot be loaded to check image support",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Couldn't check whether %@ reads images. Make sure the server is running."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось проверить, умеет ли %@ читать изображения. Убедитесь, что сервер запущен."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法确认 %@ 是否能读取图片。请确认服务器正在运行。"
+          }
+        }
+      }
+    },
+    "sidebar.group.app" : {
+      "comment" : "Sidebar group heading for settings stored by the Mac app itself",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "App"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Приложение"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "应用"
+          }
+        }
+      }
+    },
+    "settings.advanced.gpu_power_limit.label" : {
+      "comment" : "Row label for the per-model GPU power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU Power Limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ограничение мощности GPU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 功率限制"
+          }
+        }
+      }
+    },
+    "settings.advanced.gpu_power_limit.sub" : {
+      "comment" : "Sublabel for the per-model GPU power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Caps GPU power for the whole Mac while this model generates, from 2 to 1000 W. It only helps below the usual draw. For example, an M5 Max uses about 25 W to generate an answer: 10 W saves about 40% energy per token and 5 W about half."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ограничивает мощность GPU для всего Mac, пока эта модель генерирует, от 2 до 1000 Вт. Помогает только ниже обычного потребления. Например, M5 Max тратит около 25 Вт на генерацию ответа: 10 Вт экономят около 40% энергии на токен, 5 Вт — около половины."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在此模型生成期间限制整台 Mac 的 GPU 功率，范围 2 到 1000 W。只有低于平时功耗时才有效。例如，M5 Max 生成回答时约使用 25 W：10 W 可让每 token 能耗降低约 40%，5 W 约降低一半。"
+          }
+        }
+      }
+    },
+    "settings.advanced.gpu_power_limit.range" : {
+      "comment" : "Error when the GPU power limit is outside the accepted range",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU power limit must be between 2 and 1000 W."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лимит мощности GPU должен быть от 2 до 1000 Вт."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 功率限制必须在 2 到 1000 W 之间。"
+          }
+        }
+      }
+    },
+    "bench.gpu_power_limit_note" : {
+      "comment" : "Note under a benchmark model picker when the model has a GPU power limit; placeholder is the watt value",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This model's %lld W GPU power limit does not apply to benchmarks."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лимит мощности GPU этой модели (%lld Вт) не действует в бенчмарках."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此模型的 GPU 功率限制（%lld W）不适用于基准测试。"
+          }
+        }
+      }
+    },
+    "settings.summary.gpu_power_limit" : {
+      "comment" : "GPU power limit in the Advanced row value; placeholder is the watt value",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %@ W"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %@ Вт"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %@ W"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.unsupported" : {
+      "comment" : "Shown instead of the GPU power limit description when the GPU rejects a power cap",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This Mac's GPU does not support a power limit."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU этого Mac не поддерживает ограничение мощности."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 Mac 的 GPU 不支持功率限制。"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.title" : {
+      "comment" : "Title of the GPU power limit guide popover",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Measured on M5 Max (other chips differ)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Замеры на M5 Max (на других чипах иначе)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "M5 Max 实测（其他芯片不同）"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.limit" : {
+      "comment" : "GPU power guide column: the power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лимит"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上限"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.answer" : {
+      "comment" : "GPU power guide column: change in token generation speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Answer speed"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скорость ответа"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "回答速度"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.energy" : {
+      "comment" : "GPU power guide column: change in energy used per generated token",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Energy per token"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Энергия на токен"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "每 token 能耗"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.prompt" : {
+      "comment" : "GPU power guide column: change in prompt processing speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt speed"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Скорость промпта"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "提示处理速度"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.none" : {
+      "comment" : "GPU power guide row for running without a power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Без лимита"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无限制"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.note" : {
+      "comment" : "Footnote of the GPU power limit guide popover",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 W or more barely changes answer speed. Below 5 W, energy per token stops falling and answers only get slower. The minimum is 2 W. Other requests and apps also slow down while the limit is active. Benchmarks run without it."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "От 30 Вт скорость ответа почти не меняется. Ниже 5 Вт энергия на токен больше не снижается, ответы только замедляются. Минимум — 2 Вт. Пока лимит действует, другие запросы и приложения тоже замедляются. Бенчмарки запускаются без него."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 W 及以上几乎不影响回答速度。低于 5 W 时每 token 能耗不再下降，只会让回答变慢。最小值为 2 W。限制生效期间，其他请求和应用也会变慢。基准测试不受此限制。"
+          }
+        }
+      }
+    },
+    "settings.gpu_power_guide.button" : {
+      "comment" : "Tooltip on the info button that opens the GPU power limit guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How much does a limit save?"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сколько экономит лимит?"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "限制能节省多少？"
+          }
+        }
+      }
+    },
+    "profile.detail.behavior.gpu_power_limit.on" : {
+      "comment" : "Behavior chip when a GPU power limit is set; placeholder is the watt value",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %lld W"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %lld Вт"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %lld W"
+          }
+        }
+      }
+    },
+    "profile.detail.behavior.gpu_power_limit.off" : {
+      "comment" : "Behavior chip label when the GPU power limit is off",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU power limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Лимит мощности GPU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 功率限制"
+          }
+        }
+      }
+    },
+    "askai.row.gpu_power_limit" : {
+      "comment" : "Row label for the GPU power limit while Ask AI answers",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU Power Limit"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ограничение мощности GPU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 功率限制"
+          }
+        }
+      }
+    },
+    "askai.row.gpu_power_limit.sub" : {
+      "comment" : "Sublabel for the Ask AI GPU power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Caps GPU power for the whole Mac while Ask AI answers, to save battery (2 to 1000 W). If the model also has a limit, the lower one applies."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ограничивает мощность GPU для всего Mac, пока Ask AI отвечает, чтобы экономить батарею (от 2 до 1000 Вт). Если у модели тоже есть лимит, действует меньший."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在 Ask AI 回答期间限制整台 Mac 的 GPU 功率以节省电量（2 到 1000 W）。如果模型也设置了限制，则采用较低的值。"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

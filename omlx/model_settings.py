@@ -252,6 +252,8 @@ class ModelSettings:
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
+        gpu_power_limit_w: System-wide GPU power cap in watts while this model
+            generates (None = no cap).
         reasoning_parser: xgrammar builtin name: "qwen", "harmony", "llama", etc.
         guided_grammar_enabled: Whether a default guided grammar is active.
         guided_grammar: Default EBNF grammar for constrained decoding.
@@ -396,6 +398,7 @@ class ModelSettings:
     )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
+    gpu_power_limit_w: Optional[int] = None
     reasoning_parser: Optional[str] = (
         None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
     )

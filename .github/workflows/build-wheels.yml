@@ -19,9 +19,11 @@ concurrency:
 
 jobs:
   build-wheels:
-    # macos-15: the native kernels target MACOSX_DEPLOYMENT_TARGET=15.0, so
-    # the post-build import smoke test needs a Sequoia host.
-    runs-on: macos-15
+    runs-on: macos-26
+    env:
+      # Compile the separate NAX library with SDK 26.5; ordinary kernels
+      # retain their macOS 15.0 deployment target.
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +33,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -44,6 +46,8 @@ jobs:
         # runners (it found the system framework Python without nanobind), so
         # we build against the job's Python and pin it for CMake explicitly.
         run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
           python -m pip install --upgrade pip
           python -m pip install build setuptools wheel "cmake>=3.27" "nanobind==3.1.0" "mlx==0.32.4"
           export CMAKE_ARGS="-DPython_EXECUTABLE=$(python -c 'import sys; print(sys.executable)')"

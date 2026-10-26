@@ -45,6 +45,7 @@
                 "preserve_thinking": null,
                 "thinking_budget_enabled": false,
                 "thinking_budget_tokens": 8192,
+                "gpu_power_limit_w": null,
                 "reasoning_parser": null,
                 "turboquant_kv_enabled": false,
                 "turboquant_kv_bits": 4.0,

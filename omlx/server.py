@@ -243,6 +243,7 @@ from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
 from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .utils import gpu_power
 from .utils.network import is_loopback_bind
 
 logging.basicConfig(level=logging.INFO)
@@ -315,6 +316,7 @@ class ServerState:
     hf_downloader: Optional[object] = None  # HFDownloader
     ms_downloader: Optional[object] = None  # MSDownloader
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
+    gpu_power_limiter: Optional[gpu_power.GpuPowerLimiter] = None
     responses_store: ResponseStore = field(default_factory=ResponseStore)
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
@@ -720,6 +722,9 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
+    # The GPU power cap affects the whole Mac, so remove it before slow steps.
+    if _server_state.gpu_power_limiter is not None:
+        await _server_state.gpu_power_limiter.close()
     if bonjour_task is not None:
         bonjour_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -1647,13 +1652,26 @@ class _LLMEngineLease:
 
     model_id: str | None = None
     released: bool = False
+    gpu_power_w: int | None = None
+
+    def limit_gpu_power(self, watts: int | None) -> None:
+        limiter = _server_state.gpu_power_limiter
+        if watts is None or limiter is None or self.gpu_power_w is not None:
+            return
+        self.gpu_power_w = watts
+        limiter.acquire(watts)
 
     async def release(self) -> None:
         if self.released:
             return
         self.released = True
-        if self.model_id is not None:
-            await get_engine_pool().release_engine(self.model_id)
+        limiter = _server_state.gpu_power_limiter
+        try:
+            if self.gpu_power_w is not None and limiter is not None:
+                limiter.release(self.gpu_power_w)
+        finally:
+            if self.model_id is not None:
+                await get_engine_pool().release_engine(self.model_id)
 
     def abort_requested(self) -> bool:
         return self.abort_reason() is not None
@@ -1829,6 +1847,7 @@ async def get_decision_engine(model: str, lease: _LLMEngineLease) -> DecisionEng
     )
     if leased:
         lease.model_id = leased[0]
+    lease.limit_gpu_power(_resolve_gpu_power_limit(None, model))
     return engine
 
 
@@ -2026,6 +2045,22 @@ def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
     if ms and ms.thinking_budget_enabled and ms.thinking_budget_tokens:
         return ms.thinking_budget_tokens
     return None
+
+
+def _resolve_gpu_power_limit(request, model_id: str | None) -> int | None:
+    """Return the lower of the request and model-settings GPU power caps."""
+    limits = [getattr(request, "gpu_power_limit_w", None)]
+    ms = get_model_settings_for_request(model_id)
+    if ms:
+        limits.append(ms.gpu_power_limit_w)
+    # Responses requests keep extra fields unvalidated.
+    limits = [
+        watts
+        for watts in limits
+        if type(watts) is int
+        and gpu_power.MIN_WATTS <= watts <= gpu_power.MAX_WATTS
+    ]
+    return min(limits) if limits else None
 
 
 def _no_repeat_ngram_kwargs(request) -> dict[str, int]:
@@ -2486,6 +2521,8 @@ def init_server(
         Path(global_settings.base_path) if global_settings else Path.home() / ".omlx"
     )
     _server_state.settings_manager = ModelSettingsManager(base_path)
+    _server_state.gpu_power_limiter = gpu_power.GpuPowerLimiter(base_path)
+    _server_state.gpu_power_limiter.recover()
 
     # Get pinned models from settings file only (managed via admin page)
     pinned_models = _server_state.settings_manager.get_pinned_model_ids()
@@ -4427,6 +4464,7 @@ async def _chat_model_decisions(
 ):
     """Lease the chat model and return the readout runner for ``request``."""
     engine = await get_engine_for_model(request.model, lease=lease)
+    lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
     multimodal = isinstance(engine, VLMBatchedEngine) or getattr(
         engine, "supports_multimodal_fallback", False
     )
@@ -4522,6 +4560,7 @@ async def create_completion(
         load_start = time.perf_counter()
         engine = await get_engine_for_model(request.model, lease=lease)
         model_load_duration = time.perf_counter() - load_start
+        lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
         resolved_model = _serving_model_id(lease, request.model)
 
         # Handle single prompt or list of prompts
@@ -4975,6 +5014,7 @@ async def create_chat_completion(
         load_start = time.perf_counter()
         engine = await get_engine_for_model(request.model, lease=lease)
         model_load_duration = time.perf_counter() - load_start
+        lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
@@ -7602,6 +7642,7 @@ async def create_anthropic_message(
     lease = _LLMEngineLease()
     try:
         engine = await get_engine_for_model(request.model, lease=lease)
+        lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
 
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
@@ -8355,6 +8396,7 @@ async def create_response(
     try:
         engine = await get_engine_for_model(request.model, lease=lease)
         model_load_duration = time.perf_counter() - load_start
+        lease.limit_gpu_power(_resolve_gpu_power_limit(request, request.model))
 
         resolved_model = _serving_model_id(lease, request.model)
 

@@ -264,6 +264,10 @@ def _extract_leading_thinking(
     body = text.lstrip()
     if body.startswith(_OPEN_TAG):
         body = body[_OPEN_LEN:]
+    elif body.startswith(_CLOSE_TAG):
+        # The model skipped thinking and wrote only the close tag, which
+        # ThinkingParser drops before the answer too.
+        return ("", body[_CLOSE_LEN:].strip())
     elif not start_in_thinking:
         return ("", text)
     end = body.find(_CLOSE_TAG)

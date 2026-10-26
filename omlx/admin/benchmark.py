@@ -1980,7 +1980,6 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             run.sampler = None
 
         # Phase 3: Single request tests
-        single_pp1024_gen_tps = None
         ane_trace_config: dict[str, Any] | None = None
         if model_settings is not None and getattr(
             model_settings, "qwen35_ane_prefill_enabled", False
@@ -2126,9 +2125,6 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
 
             await _send_event(run, {"type": "result", "data": result})
 
-            # Store pp1024 gen_tps for speedup calculation
-            if pp_len == 1024:
-                single_pp1024_gen_tps = metrics["gen_tps"]
 
         # Phase 4: Batch tests
         # Each request has a unique UUID prefix (no cache hits)

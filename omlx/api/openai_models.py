@@ -377,6 +377,9 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: Optional[Union[str, int, float]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
+    # System-wide GPU power cap in watts while this request runs. The lower of
+    # this and the model setting applies.
+    gpu_power_limit_w: Optional[int] = Field(default=None, ge=2, le=1000)
     # SpecPrefill: per-request enable/disable (None = use model setting)
     specprefill: Optional[bool] = None
     # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
@@ -513,6 +516,7 @@ class CompletionRequest(BaseModel):
     seed: Optional[int] = None
     # Cap reasoning/thinking tokens (parity with /v1/chat/completions)
     thinking_budget: Optional[int] = Field(default=None, ge=0)
+    gpu_power_limit_w: Optional[int] = Field(default=None, ge=2, le=1000)
 
     @field_validator("stop", mode="before")
     @classmethod

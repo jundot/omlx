@@ -1214,7 +1214,7 @@ private struct AdvancedPage: View {
                 sublabel: String(localized: "settings.advanced.trust_remote_code.sub",
                                  defaultValue: "Execute HuggingFace custom model code. Only enable for models you trust. Per-model only — never inherited from profiles.",
                                  comment: "Sublabel describing the security implications of trust-remote-code"),
-                isLast: !showsLLMRows) {
+                isLast: !vm.isLLMLike) {
                 RowSwitch(isOn: vm.bind($vm.trustRemoteCode, save: {
                     Task { await vm.save(.trustRemoteCode, client: client) }
                 }))
@@ -1235,6 +1235,33 @@ private struct AdvancedPage: View {
                         RowSwitch(isOn: vm.bindProfile($vm.thinkingBudgetEnabled))
                     }
                 }
+            }
+            // The cap applies to every generating engine, diffusion included.
+            if vm.isLLMLike {
+                Row(label: String(localized: "settings.advanced.gpu_power_limit.label",
+                                  defaultValue: "GPU Power Limit",
+                                  comment: "Row label for the per-model GPU power limit"),
+                    sublabel: vm.gpuPowerLimitSupported
+                        ? String(localized: "settings.advanced.gpu_power_limit.sub",
+                                 defaultValue: "Caps GPU power for the whole Mac while this model generates, from 2 to 1000 W. It only helps below the usual draw. For example, an M5 Max uses about 25 W to generate an answer: 10 W saves about 40% energy per token and 5 W about half.",
+                                 comment: "Sublabel for the per-model GPU power limit")
+                        : GPUPowerGuide.unsupportedText,
+                    isLast: !showsLLMRows) {
+                    HStack(spacing: 8) {
+                        if vm.limitGpuPower {
+                            TextInput(text: vm.bindProfile($vm.gpuPowerLimitWatts),
+                                      placeholder: "2-1000", mono: true, isNumeric: true,
+                                      range: 2...1000, step: 1, suffix: "W",
+                                      width: .controlCompact)
+                        }
+                        GPUPowerGuideButton()
+                        // Unsupported GPUs can still turn an existing limit off.
+                        RowSwitch(isOn: vm.bindProfile($vm.limitGpuPower))
+                            .disabled(!vm.gpuPowerLimitSupported && !vm.limitGpuPower)
+                    }
+                }
+            }
+            if showsLLMRows {
                 Row(label: String(localized: "settings.advanced.tool_result_limit.label",
                                   defaultValue: "Limit Tool Result Tokens",
                                   comment: "Row label for the tool-result token limit field"),
@@ -2630,5 +2657,125 @@ enum SamplingValidator {
         }
         if let msg = check(v) { return .failure(.init(message: msg)) }
         return .success(v)
+    }
+}
+
+// MARK: - GPU power limit guide
+
+/// M5 Max measurements that show what a GPU power limit costs and saves.
+/// Shared by the model settings and Ask AI rows.
+struct GPUPowerGuide: View {
+    static var unsupportedText: String {
+        String(localized: "settings.gpu_power_guide.unsupported",
+               defaultValue: "This Mac's GPU does not support a power limit.",
+               comment: "Shown instead of the GPU power limit description when the GPU rejects a power cap")
+    }
+
+    /// Limit, answer speed, energy per token, prompt speed.
+    private static let rows: [(String, String, String, String)] = [
+        ("30-40 W", "0%", "0%", "-14 ~ -30%"),
+        ("20 W", "-3 ~ -4%", "-11 ~ -12%", "-38 ~ -44%"),
+        ("15 W", "-6 ~ -7%", "-25 ~ -29%", "-49 ~ -53%"),
+        ("10 W", "-14 ~ -18%", "-37 ~ -43%", "-59 ~ -64%"),
+        ("5 W", "-36 ~ -48%", "-49 ~ -52%", "-75 ~ -78%"),
+        ("2 W", "-67 ~ -78%", "-47 ~ -52%", "-90 ~ -91%"),
+    ]
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(String(localized: "settings.gpu_power_guide.title",
+                        defaultValue: "Measured on M5 Max (other chips differ)",
+                        comment: "Title of the GPU power limit guide popover"))
+                .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 4) {
+                GridRow {
+                    Text(String(localized: "settings.gpu_power_guide.limit",
+                                defaultValue: "Limit",
+                                comment: "GPU power guide column: the power limit"))
+                    Text(String(localized: "settings.gpu_power_guide.answer",
+                                defaultValue: "Answer speed",
+                                comment: "GPU power guide column: change in token generation speed"))
+                    Text(String(localized: "settings.gpu_power_guide.energy",
+                                defaultValue: "Energy per token",
+                                comment: "GPU power guide column: change in energy used per generated token"))
+                    Text(String(localized: "settings.gpu_power_guide.prompt",
+                                defaultValue: "Prompt speed",
+                                comment: "GPU power guide column: change in prompt processing speed"))
+                }
+                .foregroundStyle(theme.textSecondary)
+                GridRow {
+                    Text(String(localized: "settings.gpu_power_guide.none",
+                                defaultValue: "No limit",
+                                comment: "GPU power guide row for running without a power limit"))
+                    Text(verbatim: "GPU 23-27 W")
+                    Text(verbatim: "-")
+                    Text(verbatim: "GPU 67-76 W")
+                }
+                ForEach(Self.rows, id: \.0) { row in
+                    GridRow {
+                        Text(verbatim: row.0)
+                        Text(verbatim: row.1)
+                        Text(verbatim: row.2)
+                        Text(verbatim: row.3)
+                    }
+                }
+            }
+            .font(.omlxText(DesignTokens.FontSize.subheadline).monospacedDigit())
+            Text(String(localized: "settings.gpu_power_guide.note",
+                        defaultValue: "30 W or more barely changes answer speed. Below 5 W, energy per token stops falling and answers only get slower. The minimum is 2 W. Other requests and apps also slow down while the limit is active. Benchmarks run without it.",
+                        comment: "Footnote of the GPU power limit guide popover"))
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
+                .foregroundStyle(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(width: 400, alignment: .leading)
+    }
+}
+
+struct GPUPowerGuideButton: View {
+    @State private var isShown = false
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        Button {
+            isShown.toggle()
+        } label: {
+            Image(systemName: "info.circle")
+                .font(.system(size: 12))
+                .foregroundStyle(theme.textSecondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(String(localized: "settings.gpu_power_guide.button",
+                     defaultValue: "How much does a limit save?",
+                     comment: "Tooltip on the info button that opens the GPU power limit guide"))
+        .popover(isPresented: $isShown, arrowEdge: .bottom) {
+            GPUPowerGuide()
+        }
+    }
+}
+
+/// Shown under a benchmark model picker: benchmarks never take a model's
+/// GPU power limit, so their numbers are full-power numbers.
+struct GPUPowerBenchNotice: View {
+    let model: ModelDTO?
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        if let watts = model?.settings?.gpuPowerLimitW, watts > 0 {
+            FreeRow {
+                Label(String(localized: "bench.gpu_power_limit_note",
+                             defaultValue: "This model's \(watts) W GPU power limit does not apply to benchmarks.",
+                             comment: "Note under a benchmark model picker when the model has a GPU power limit; placeholder is the watt value"),
+                      systemImage: "info.circle")
+                    .font(.omlxText(DesignTokens.FontSize.callout))
+                    .foregroundStyle(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }

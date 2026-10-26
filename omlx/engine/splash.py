@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import functools
 import hashlib
 import json
@@ -29,6 +30,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import time
 import uuid
@@ -48,6 +50,69 @@ from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
+
+
+def scan_ssd_cache(
+    root: Path, *, clear: bool = False, exclude: Iterable[Path] = ()
+) -> tuple[int, int]:
+    """Count or remove Splash's cache data, keeping its lock files in place."""
+    excluded = {path.resolve() for path in exclude}
+    try:
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return 0, 0
+    count = size = 0
+    try:
+        for folder, directories, _, directory_fd in os.fwalk(".", dir_fd=root_fd):
+            parts = Path(folder).parts
+            if not parts:
+                directories[:] = [
+                    name
+                    for name in directories
+                    if (root / name).resolve() not in excluded
+                ]
+                continue
+            if len(parts) == 1:
+                directories[:] = [
+                    name
+                    for name in directories
+                    if re.fullmatch(r"[0-9a-f]{1,64}", name)
+                ]
+                continue
+            directories.clear()
+            lock_fd = None
+            try:
+                if clear:
+                    lock_fd = os.open(
+                        "lock",
+                        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError as exc:
+                        raise RuntimeError(
+                            "Splash SSD cache is in use by another process; stop it and retry"
+                        ) from exc
+                for name in ("kv.slots", "kv.records", "state.slots", "state.records"):
+                    try:
+                        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                        if not stat.S_ISREG(info.st_mode):
+                            continue
+                        if clear:
+                            os.unlink(name, dir_fd=directory_fd)
+                        count += 1
+                        size += info.st_blocks * 512
+                    except FileNotFoundError:
+                        continue
+            finally:
+                if lock_fd is not None:
+                    os.close(lock_fd)
+    finally:
+        os.close(root_fd)
+    return count, size
+
 
 # External engines a model can be served by, as model settings name them.
 EXTERNAL_ENGINES = {"splash": "Splash"}
@@ -1086,6 +1151,10 @@ class SplashEngine(BaseEngine):
 
     def has_active_requests(self) -> bool:
         return self._active > 0
+
+    @property
+    def ssd_cache_dir(self) -> Path | None:
+        return self._options.cache_dir if self._options.cache_disk_bytes > 0 else None
 
     @property
     def runtime_failed_reason(self) -> str | None:

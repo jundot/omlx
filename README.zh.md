@@ -416,3 +416,4 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - 融合 GDN 验证预处理内核改编自 mlx-serve 对 mlxfast-challenge qwen35_packed_gdn_prework 内核的移植，Qwen4 的融合 GDN decode 与 prefill 内核改编自 mlx-serve 的 MIT 开源 `transformer.zig`；Qwen4 QSA 的 128 位 K/V 暂存改编自 mlx-serve 的 MIT 开源 `msv_attn_p256` 内核
 - [Splash](https://github.com/incoai/splash) - 验证形态线性内核采用 Splash 的 bf16 `0x4300 | q` 权重操作数与分组输入求和（来自其 Apache-2.0 开源的 `linear_q4_sgmatrix.metal`），张量运算验证注意力借鉴了 Splash `paged_attention_tile.h` 的分块设计，GGUF 的分词器按照 Splash Apache-2.0 开源的 `install/gguf.py` 从文件头生成
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 菜单栏统计信息的设计和渲染方法参考了 Kennt Kim 的 SiliconScope，这也启发了高能效重渲染门禁机制
+- [m5gpu](https://github.com/beamivalice/m5gpu) - GPU 功率限制使用了 beamivalice 的 m5gpu 所记录的 AGX GPU 功率目标（`SetMaxGPUAbsolutePower` 与 `AbsoluteTarget`，以及用于解除的 `-1000`）

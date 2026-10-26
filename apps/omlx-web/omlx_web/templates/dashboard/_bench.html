@@ -86,6 +86,8 @@
                                         <option :value="m.id" x-text="m.id + ' (' + (m.estimated_size ? (m.estimated_size / 1073741824).toFixed(1) + ' GB' : 'unknown') + ')'"></option>
                                     </template>
                                 </select>
+                                <p x-show="!benchExternalEnabled && benchGpuPowerLimit(benchModelId)" x-cloak class="text-xs text-amber-700 mt-1.5"
+                                   x-text="window.t('bench.config.gpu_power_limit_note').replace('{watts}', () => benchGpuPowerLimit(benchModelId))"></p>
                             </div>
 
                             <!-- Context Profile -->

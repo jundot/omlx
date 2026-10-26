@@ -33,6 +33,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "cache_reasoning_output",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
+    "gpu_power_limit_w",
     "reasoning_parser",
     "guided_grammar_enabled",
     "guided_grammar",

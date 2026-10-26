@@ -179,6 +179,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSLog("oMLX: CLI shim setup failed — \(error)")
             }
             startControlServer()
+            services.askAI.start(services: services) { [weak self] in
+                guard let self else { return }
+                self.services.requestedSection = .askAI
+                self.presentAppView()
+            }
         }
 
         let config = AppConfig.load()
@@ -518,6 +523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.removeObserver(self)
         controlServer?.stop()
         controlServer = nil
+        services.askAI.shutdown()
         // Reap synchronously. An async stop needs the main actor, which this
         // method blocks until it returns.
         server?.reapSync(timeout: 8)

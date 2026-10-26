@@ -500,10 +500,18 @@ class SwitchGLU(nn.Module):
 
         block_plan = None
         native_kinds = None
-        use_f16_moe = original_dtype == mx.bfloat16 and all(
-            isinstance(p, QuantizedSwitchLinear)
-            and p._has_affine_metadata_dtype(mx.float16)
-            for p in projections
+        # A bfloat16 activation against float16 affine metadata promotes the
+        # matmul to float32, which the MXFP4 kernels reject. MXFP4 projections
+        # take float16 too, so a stack that mixes them with float16 affine
+        # projections (oQ3.5e keeps an MXFP4 source down_proj) runs in float16.
+        use_f16_moe = (
+            original_dtype == mx.bfloat16
+            and all(isinstance(p, QuantizedSwitchLinear) for p in projections)
+            and any(p._has_affine_metadata_dtype(mx.float16) for p in projections)
+            and all(
+                p._has_affine_metadata_dtype(mx.float16) or p.mode == "mxfp4"
+                for p in projections
+            )
         )
         if do_sort and all(isinstance(p, QuantizedSwitchLinear) for p in projections):
             native_kinds = tuple(p._native_block_kind(x, do_sort) for p in projections)
@@ -512,8 +520,10 @@ class SwitchGLU(nn.Module):
                     p._native_block_kind(x, do_sort, dtype=mx.float16)
                     for p in projections
                 )
-                if all(kind == "mxfp4" for kind in f16_native_kinds) or all(
-                    kind == "affine" for kind in f16_native_kinds
+                if (
+                    use_f16_moe
+                    or all(kind == "mxfp4" for kind in f16_native_kinds)
+                    or all(kind == "affine" for kind in f16_native_kinds)
                 ):
                     native_kinds = f16_native_kinds
                     use_f16_moe = True

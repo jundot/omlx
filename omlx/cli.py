@@ -190,8 +190,8 @@ def serve_command(args):
         build_number = None
 
     # Print version banner
-    print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
-    print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
+    print("\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
+    print("\033[33m├─ https://github.com/jundot/omlx\033[0m")
     if build_number:
         print(f"\033[33m├─ Version: {__version__}\033[0m")
         print(f"\033[33m└─ Build: {build_number}\033[0m")
@@ -878,7 +878,7 @@ def diagnose_menubar() -> int:
 
     mac_ver = platform.mac_ver()[0] or "unknown"
     print(f"macOS:          {mac_ver}")
-    print(f"Bundle ID:      app.omlx")
+    print("Bundle ID:      app.omlx")
 
     app_path = Path("/Applications/oMLX.app")
     print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")

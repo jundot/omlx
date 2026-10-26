@@ -34,6 +34,8 @@ In the model downloader, the **GGUF only** view lists GGUF repositories. Downloa
 
 oMLX lists each GGUF in a model directory, an organization folder (`<owner>/<repo>/`, as the downloader and LM Studio lay them out) or the Hugging Face cache as its own model, named by its file, for example `Qwen3.8-27B-UD-Q4_K_M`. Split GGUFs can also be in a folder named for their variant, such as `Q2_0/Model-Q2_0-00001-of-00002.gguf`. All parts must be present; a vision projector at the repository root is paired with them. Vision projectors, imatrix files and draft subfolders are not models. For each GGUF oMLX generates a folder under `<base path>/gguf` with a `config.json` derived from the file's header and links to the file and its projectors; for the Qwen families the folder also holds the tokenizer the header defines. A GGUF runs only on an external engine: it never loads in oMLX's MLX engines, and `/v1/models` lists it only while an engine can serve it. Deleting a GGUF in the model manager removes its parts, and the folder goes with its last GGUF.
 
+PLE variants such as `Q4-PLE8/` can keep their lookup table in a separately named last shard. oMLX groups the complete numbered set as one model and includes the variant name in its model ID, so `Q4-PLE4` and `Q4-PLE8` remain separate even when their body files have the same names. Pick any shard in the downloader to select the whole set and its projector.
+
 ## How it works
 
 Splash finds models by Hugging Face repository ID in a Hugging Face cache. oMLX presents the model folder to it as an entry of a private cache under `<base path>/splash/hub`: a snapshot made of symlinks to the model's files. For a GGUF that is the GGUF and its projectors, and Splash reads the tokenizer and configuration from the GGUF itself. Splash starts with `--offline` against that cache, so it never downloads the model, and the files it reads are the ones in your model directory. The draft is passed with `--draft-model`.
@@ -59,6 +61,8 @@ Unloading the model stops the Splash process. Splash runs in its own process gro
 oMLX unloads idle models itself, so Splash starts with `--idle-release off`.
 
 ## Memory
+
+The dashboard's SSD cache Delete button also clears Splash's persistent cache, including cache left by unloaded models. Idle Splash models unload first so their cache files can be removed safely; the next request loads them again. If a Splash model is serving a request, wait for it to finish before deleting the cache.
 
 Splash spends whatever memory budget it gets beyond the weights on KV pages, and keeps the pages it no longer needs as a prefix cache. Its context window is the whole KV pool, and concurrent requests that outgrow the pool wait for pages. With the memory limit empty, oMLX sizes the budget for the model's context window: the weights, the draft, scratch and one window of KV pages (about 29 GB for Qwen3.8-27B at 256K with int8 KV). A larger limit gives the prefix cache more room.
 

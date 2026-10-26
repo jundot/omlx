@@ -691,7 +691,7 @@ struct ProfileDetailCard: View {
         let hasPenalty = ["repetition_penalty", "presence_penalty"].contains { s[$0] != nil }
         let behaviorKeys = [
             "enable_thinking", "thinking_budget_enabled", "max_tool_result_tokens",
-            "force_sampling", "is_pinned",
+            "gpu_power_limit_w", "force_sampling", "is_pinned",
         ]
         let hasBehavior = behaviorKeys.contains { s[$0] != nil }
         // Per-model "Advanced" surface — fields from
@@ -852,6 +852,16 @@ struct ProfileDetailCard: View {
                 flagChip(label: String(localized: "profile.detail.behavior.limit_tool_output",
                                        defaultValue: "Limit tool output",
                                        comment: "Behavior chip: cap on tool result tokens"),
+                         on: v > 0)
+            }
+            if let v = s["gpu_power_limit_w"].flatMap({ intOf($0) }) {
+                flagChip(label: v > 0
+                         ? String(localized: "profile.detail.behavior.gpu_power_limit.on",
+                                  defaultValue: "GPU \(v) W",
+                                  comment: "Behavior chip when a GPU power limit is set; placeholder is the watt value")
+                         : String(localized: "profile.detail.behavior.gpu_power_limit.off",
+                                  defaultValue: "GPU power limit",
+                                  comment: "Behavior chip label when the GPU power limit is off"),
                          on: v > 0)
             }
             if let v = s["force_sampling"].flatMap({ boolOf($0) }) {

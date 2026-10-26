@@ -995,6 +995,39 @@ def test_model_settings_header_wraps_only_below_sm():
     assert "max-sm:absolute max-sm:right-2" in actions
 
 
+def test_gpu_power_limit_row_follows_thinking_budget():
+    html = _model_settings_template()
+    after_budget = _section(
+        html, "<!-- Thinking Budget -->", "<!-- Limit Tool Result Tokens -->"
+    )
+    row = after_budget.split("<!-- GPU Power Limit -->", 1)[1]
+    assert 'x-model.number="modelSettings.gpu_power_limit_w"' in row
+    assert 'min="2"' in row
+    # Unsupported GPUs can still turn an existing limit off.
+    assert (
+        ':disabled="!modelSettings.gpu_power_limit_supported'
+        ' && !modelSettings.enableGpuPowerLimit"'
+    ) in row
+
+    js = _dashboard_script()
+    # Profile serialization, preset apply, server load, and save payload.
+    assert js.count("gpu_power_limit_w") >= 4
+    # Off sends 0, which the server stores as no limit.
+    payload = js.split("gpu_power_limit_w: ms.enableGpuPowerLimit", 1)[1]
+    assert payload.split("\n", 3)[2].strip() == ": 0,"
+    # Out-of-range values get the range message instead of a raw 422 list.
+    save = js.split("async saveModelSettings()", 1)[1].split("async ", 1)[0]
+    assert "this.validateGpuPowerLimit()" in save
+    assert "Array.isArray(data.detail)" in save
+
+
+def test_speed_benches_say_the_gpu_power_limit_does_not_apply():
+    root = Path(__file__).resolve().parents[1] / "omlx_web/templates/dashboard"
+    for name in ("_bench.html", "_bench_context.html"):
+        html = (root / name).read_text()
+        assert "bench.config.gpu_power_limit_note" in html, name
+
+
 def test_reranker_context_window_is_in_basic_settings():
     """Reranker requests use max_context_window as their default max_length,
     the same knob embeddings already expose."""

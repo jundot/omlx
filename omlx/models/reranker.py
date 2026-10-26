@@ -961,6 +961,12 @@ class MLXRerankerModel:
     _DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION = 512
     _DEFAULT_MAX_LENGTH_CAUSAL_LM = 8192
 
+    # Limits of the Jina v3.5 MLX reference rerank(). The v3 MLX reference
+    # scores all documents in one pass and truncates nothing.
+    _JINA_V35_MAX_QUERY_TOKENS = 2048 - 64
+    _JINA_V35_MAX_DOC_TOKENS = 8192 - 1
+    _JINA_V35_BLOCK_SIZE = 125
+
     def rerank(
         self,
         query: "str | dict",
@@ -976,10 +982,10 @@ class MLXRerankerModel:
                 'text' and/or 'image' for multimodal rerankers.
             documents: List of documents to rerank. Each item can be a string
                 or a dict with 'text' and/or 'image' keys.
-            max_length: Maximum token length for each query-document pair.
-                If None, uses model-appropriate default (the tokenizer limit
-                for encoders, 8192 for CausalLM). Encoder values are capped
-                at the tokenizer limit.
+            max_length: Maximum token length for each query-document pair,
+                or for each listwise block on Jina. If None, uses the
+                tokenizer limit for encoders and Jina, 8192 for CausalLM.
+                Encoder values are capped at the tokenizer limit.
             instruction: Task instruction for the Qwen3 reranker `<Instruct>:`
                 slot. None or empty uses the default. Other rerankers ignore it.
 
@@ -1011,7 +1017,7 @@ class MLXRerankerModel:
             effective_max_length = (
                 max_length
                 if max_length is not None
-                else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
+                else self._tokenizer_max_length(self._DEFAULT_MAX_LENGTH_CAUSAL_LM)
             )
             return self._rerank_jina(query_str, docs_str, effective_max_length)
         elif self._is_causal_lm:
@@ -1026,7 +1032,9 @@ class MLXRerankerModel:
         else:
             # Absolute position tables read out of range without an error, so
             # never exceed the tokenizer's declared limit.
-            limit = self._seq_classification_max_length()
+            limit = self._tokenizer_max_length(
+                self._DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION
+            )
             effective_max_length = (
                 min(max_length, limit) if max_length is not None else limit
             )
@@ -1220,6 +1228,20 @@ class MLXRerankerModel:
 
             return best_doc, best_ids
 
+        def _truncate_text(text: str, limit: int) -> str:
+            token_ids = _to_token_ids(text)
+            if len(token_ids) < limit:
+                return text
+            return decode(token_ids[:limit], skip_special_tokens=False)
+
+        block_size = len(documents)
+        if self._is_jina_v35:
+            query = _truncate_text(query, self._JINA_V35_MAX_QUERY_TOKENS)
+            documents = [
+                _truncate_text(doc, self._JINA_V35_MAX_DOC_TOKENS) for doc in documents
+            ]
+            block_size = self._JINA_V35_BLOCK_SIZE
+
         sanitized_query = self._sanitize_jina_text(query)
         sanitized_docs = [self._sanitize_jina_text(doc) for doc in documents]
 
@@ -1234,40 +1256,35 @@ class MLXRerankerModel:
         all_doc_indices: list[int] = []
         all_doc_vecs: list[mx.array] = []
         while start < len(sanitized_docs):
-            chunk_doc_indices: list[int] = []
-            chunk_docs: list[str] = []
-            chunk_input_ids: list[int] | None = None
-            cursor = start
-
-            while cursor < len(sanitized_docs):
-                candidate_docs = chunk_docs + [sanitized_docs[cursor]]
-                candidate_prompt = self._format_jina_prompt(
-                    sanitized_query, candidate_docs
+            # The prompt grows with every document, so a binary search finds
+            # the longest fitting run without encoding each prefix.
+            fit_count = 0
+            chunk_input_ids: list[int] = []
+            lo = 1
+            hi = min(block_size, len(sanitized_docs) - start)
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate_ids = _to_token_ids(
+                    self._format_jina_prompt(
+                        sanitized_query, sanitized_docs[start : start + mid]
+                    )
                 )
-                candidate_ids = _to_token_ids(candidate_prompt)
-
                 if len(candidate_ids) <= max_length:
-                    chunk_docs = candidate_docs
-                    chunk_doc_indices.append(cursor)
+                    fit_count = mid
                     chunk_input_ids = candidate_ids
-                    cursor += 1
-                    continue
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
 
-                if chunk_docs:
-                    break
-
-                truncated_doc, truncated_ids = _truncate_doc_to_fit(
-                    sanitized_query,
-                    sanitized_docs[cursor],
+            if fit_count:
+                chunk_docs = sanitized_docs[start : start + fit_count]
+            else:
+                truncated_doc, chunk_input_ids = _truncate_doc_to_fit(
+                    sanitized_query, sanitized_docs[start]
                 )
                 chunk_docs = [truncated_doc]
-                chunk_doc_indices = [cursor]
-                chunk_input_ids = truncated_ids
-                cursor += 1
-                break
-
-            if chunk_input_ids is None or not chunk_doc_indices:
-                raise ValueError("Failed to create a valid Jina reranker chunk.")
+            chunk_doc_indices = list(range(start, start + len(chunk_docs)))
+            cursor = start + len(chunk_docs)
 
             input_array = mx.array([chunk_input_ids])
             hidden_states = self._get_jina_hidden_states(input_array)
@@ -1362,13 +1379,13 @@ class MLXRerankerModel:
             return processor._tokenizer
         return processor
 
-    def _seq_classification_max_length(self) -> int:
-        """Return the tokenizer's declared input limit for encoder rerankers."""
+    def _tokenizer_max_length(self, default: int) -> int:
+        """Return the tokenizer's declared input limit, or default."""
         limit = getattr(self._seq_classification_tokenizer(), "model_max_length", None)
         # transformers uses int(1e30) when the tokenizer declares no limit.
         if isinstance(limit, int) and 0 < limit < _TOKENIZER_MAX_LENGTH_SENTINEL:
             return limit
-        return self._DEFAULT_MAX_LENGTH_SEQ_CLASSIFICATION
+        return default
 
     def _seq_classification_logits(
         self, input_ids: mx.array, attention_mask: mx.array

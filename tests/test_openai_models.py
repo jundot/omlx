@@ -521,6 +521,12 @@ class TestChatCompletionRequest:
             "reasoning_effort": "low",
         }
 
+    @pytest.mark.parametrize("watts", [0, 1, 1001])
+    def test_gpu_power_limit_rejects_out_of_range_watts(self, watts):
+        # A 0 W target parks the GPU at its lowest clock; it is not "off".
+        with pytest.raises(ValidationError):
+            ChatCompletionRequest(model="m", messages=[], gpu_power_limit_w=watts)
+
     @pytest.mark.parametrize("enabled", [True, False])
     def test_matching_thinking_alias_preserves_input(self, enabled):
         template_kwargs = {"enable_thinking": enabled, "custom": "value"}

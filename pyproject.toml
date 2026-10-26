@@ -115,7 +115,7 @@ dependencies = [
     # mlx-vlm requires mlx-audio>=0.5.2 in the shared runtime.
     "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
     "Pillow>=9.0.0",
-    "markitdown[pdf,docx,pptx]==0.1.8",
+    "markitdown[pdf,docx,pptx]==0.1.9",
 ]
 
 [project.optional-dependencies]

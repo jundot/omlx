@@ -51,6 +51,10 @@ final class AppServices: NSObject {
     let accuracyBench   = AccuracyBenchScreenVM()
     let contextBench    = ContextBenchScreenVM()
 
+    /// Ask AI bar. Lives for the whole app so an answer keeps streaming
+    /// while the panel is hidden.
+    let askAI = AskAIController()
+
     @ObservationIgnored
     private weak var server: ServerProcess?
 

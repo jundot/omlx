@@ -450,3 +450,4 @@ apps/omlx-mac/Scripts/build.sh release --rebuild-donor
 - [MTPLX](https://github.com/youssofal/mtplx) - Lightning MTP의 verify-shape Metal 커널은 Youssof Altoukhi의 MTPLX를 기반으로 하며, depth-k 파이프라인도 여기서 영감을 받았습니다
 - [mlx-serve](https://github.com/ddalcu/mlx-serve) - fused GDN verify prework 커널은 mlx-serve가 포팅한 mlxfast-challenge의 qwen35_packed_gdn_prework 커널을 바탕으로 수정되었고, Qwen4의 fused GDN decode·prefill 커널은 mlx-serve의 MIT 라이선스 `transformer.zig`를 바탕으로 수정되었습니다
 - [SiliconScope](https://github.com/kennss/SiliconScope) - 메뉴 바 통계의 디자인과 렌더링 방식은 Kennt Kim의 SiliconScope에서 가져왔으며, 에너지 효율적인 리렌더 게이팅도 여기서 영감을 받았습니다
+- [m5gpu](https://github.com/beamivalice/m5gpu) - GPU 전력 제한은 beamivalice의 m5gpu가 정리한 AGX GPU 전력 목표값(`SetMaxGPUAbsolutePower`와 `AbsoluteTarget`, 해제값 `-1000`)을 사용합니다

@@ -1302,6 +1302,38 @@ class TestExposedProfileModels:
 
         assert budget == 512
 
+    def test_gpu_power_limit_takes_lower_of_request_and_settings(self, manager):
+        pool = srv.EnginePool()
+        pool._entries["qwen-base"] = object()
+        manager.set_settings("qwen-base", ModelSettings(gpu_power_limit_w=30))
+        self._save_exposed_profile(manager, {"gpu_power_limit_w": 20})
+        srv._server_state.engine_pool = pool
+        resolve = srv._resolve_gpu_power_limit
+
+        assert resolve(object(), "qwen-base") == 30
+        assert resolve(object(), "qwen-base:thinking") == 20
+        assert resolve(SimpleNamespace(gpu_power_limit_w=10), "qwen-base") == 10
+        assert resolve(SimpleNamespace(gpu_power_limit_w=25), "qwen-base") == 25
+        assert resolve(SimpleNamespace(gpu_power_limit_w=40), "qwen-base") == 30
+        # Responses requests pass extra fields through unvalidated.
+        for raw in (True, 1, "10", 7.5):
+            assert resolve(SimpleNamespace(gpu_power_limit_w=raw), "qwen-base") == 30
+
+    @pytest.mark.asyncio
+    async def test_lease_acquires_and_releases_gpu_power_once(self, monkeypatch):
+        limiter = MagicMock()
+        monkeypatch.setattr(srv._server_state, "gpu_power_limiter", limiter)
+        lease = srv._LLMEngineLease()
+
+        lease.limit_gpu_power(None)
+        lease.limit_gpu_power(10)
+        lease.limit_gpu_power(5)
+        await lease.release()
+        await lease.release()
+
+        limiter.acquire.assert_called_once_with(10)
+        limiter.release.assert_called_once_with(10)
+
     def test_max_context_window_uses_exposed_profile_settings(self, manager):
         import omlx.server as server_module
         from omlx.engine_pool import EnginePool

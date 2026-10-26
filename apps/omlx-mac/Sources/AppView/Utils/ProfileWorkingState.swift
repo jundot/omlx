@@ -125,6 +125,7 @@ enum ProfileSettingsKey {
     static let thinkingBudgetTokens = "thinking_budget_tokens"
     static let reasoningParser = "reasoning_parser"
     static let maxToolResultTokens = "max_tool_result_tokens"
+    static let gpuPowerLimitW = "gpu_power_limit_w"
     static let forceSampling = "force_sampling"
     static let isPinned = "is_pinned"
     static let chatTemplateKwargs = "chat_template_kwargs"
@@ -138,8 +139,8 @@ enum ProfileSettingsKey {
         maxContextWindow, maxTokens, temperature, topP, topK, minP,
         repetitionPenalty, presencePenalty, enableThinking,
         thinkingBudgetEnabled, thinkingBudgetTokens, reasoningParser,
-        maxToolResultTokens, forceSampling, chatTemplateKwargs, forcedCtKwargs,
-        guidedGrammarEnabled, guidedGrammar,
+        maxToolResultTokens, gpuPowerLimitW, forceSampling, chatTemplateKwargs,
+        forcedCtKwargs, guidedGrammarEnabled, guidedGrammar,
     ]
 
     // Model-specific

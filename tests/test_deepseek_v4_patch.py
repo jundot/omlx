@@ -1349,6 +1349,65 @@ class TestDeepseekV4SwitchGLU:
         assert y.dtype == mx.bfloat16
         assert projection_input_dtypes == [mx.float16, mx.float16, mx.float16]
 
+    @pytest.mark.parametrize("tokens", [7, 16])
+    def test_affine_gate_up_with_mxfp4_down_runs_in_float16(
+        self, applied_patch, monkeypatch, tokens
+    ):
+        # oQ3.5e of an MXFP4 source keeps the source down projection next to
+        # affine gate/up projections, whose metadata sanitize stores as float16.
+        mx = pytest.importorskip("mlx.core")
+        from omlx.patches.deepseek_v4 import switch_layers
+
+        mx.random.seed(17)
+        layer = switch_layers.SwitchGLU(
+            input_dims=64,
+            hidden_dims=64,
+            num_experts=4,
+            bias=False,
+        )
+        for name in ("up_proj", "gate_proj"):
+            projection = getattr(layer, name).to_quantized(
+                group_size=64,
+                bits=3,
+                mode="affine",
+            )
+            projection.scales = projection.scales.astype(mx.float16)
+            projection.biases = projection.biases.astype(mx.float16)
+            setattr(layer, name, projection)
+        layer.down_proj = layer.down_proj.to_quantized(
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+
+        projection_input_dtypes = []
+        original_call = switch_layers.QuantizedSwitchLinear.__call__
+
+        def record_projection_input(projection, value, *args, **kwargs):
+            projection_input_dtypes.append(value.dtype)
+            return original_call(projection, value, *args, **kwargs)
+
+        monkeypatch.setattr(
+            switch_layers.QuantizedSwitchLinear,
+            "__call__",
+            record_projection_input,
+        )
+
+        x = mx.random.normal((1, tokens, 64), dtype=mx.bfloat16)
+        indices = mx.array(
+            [[[0, 1, 2, 3, 0, 1]] * tokens],
+            dtype=mx.int32,
+        )
+
+        # 16 tokens reach the sorted route, where the MXFP4 block kernel
+        # rejects float32 input.
+        y = layer(x, indices)
+        mx.eval(y)
+
+        assert y.shape == (1, tokens, 6, 64)
+        assert y.dtype == mx.bfloat16
+        assert projection_input_dtypes == [mx.float16, mx.float16, mx.float16]
+
     def test_shared_expert_uses_configured_swiglu_limit(self, applied_patch):
         dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
 

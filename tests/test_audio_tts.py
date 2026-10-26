@@ -96,6 +96,7 @@ def server_tts_client():
         mock_state.global_settings = None
         mock_state.distributed_inference_enabled = False
         mock_state.process_memory_enforcer = None
+        mock_state.gpu_power_limiter = None
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
@@ -774,6 +775,7 @@ class TestTTSModelAliasResolution:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
@@ -806,6 +808,7 @@ class TestTTSModelAliasResolution:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
@@ -1204,6 +1207,7 @@ class TestTTSVoiceCloneEndpoint:
             mock_state.global_settings = None
             mock_state.distributed_inference_enabled = False
             mock_state.process_memory_enforcer = None
+            mock_state.gpu_power_limiter = None
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None

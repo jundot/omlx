@@ -201,6 +201,7 @@ private struct ConfigurationSection: View {
                     options: modelOptions
                 )
             }
+            GPUPowerBenchNotice(model: models.first { $0.id == selectedModelId })
 
             Row(label: String(localized: "bench.throughput.row.context.label",
                               defaultValue: "Benchmark Context",

@@ -813,6 +813,20 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, false)
     }
 
+    func testGPUPowerLimitSendsZeroWhenOff() throws {
+        let vm = ModelSettingsScreenVM()
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 0)
+        vm.limitGpuPower = true
+        vm.gpuPowerLimitWatts = "12"
+        XCTAssertEqual(vm.currentSettingsDict()[ProfileSettingsKey.gpuPowerLimitW]?.value as? Int, 12)
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        vm.model = try decoder.decode(ModelDTO.self, from: Data(#"{"id":"q","loaded":false,"is_loading":false,"estimated_size":0,"gpu_power_limit_supported":true,"settings":{"gpu_power_limit_w":20}}"#.utf8))
+        XCTAssertTrue(vm.gpuPowerLimitSupported)
+        XCTAssertEqual(vm.model?.settings?.gpuPowerLimitW, 20)
+    }
+
     func testQwenInt8RowNeedsSupportedHardwareUnlessAlreadyOn() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

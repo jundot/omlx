@@ -483,6 +483,32 @@ class TestCausalLMPromptAffixes:
         assert "static output, no slots" in str(excinfo.value)
 
 
+class _JinaWordTokenizer:
+    """One token per word; Jina special tokens map to 2001 (doc) and 2002 (query)."""
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        ids = []
+        for piece in text.replace("\n", " ").split():
+            if "<|rerank_token|>" in piece:
+                ids.append(2002)
+                remainder = piece.replace("<|rerank_token|>", "")
+                if remainder:
+                    ids.append(7)
+            elif "<|embed_token|>" in piece:
+                ids.append(2001)
+                remainder = piece.replace("<|embed_token|>", "")
+                if remainder:
+                    ids.append(7)
+            else:
+                ids.append(7)
+        return ids
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        del skip_special_tokens
+        return " ".join(["tok"] * len(token_ids))
+
+
 class TestJinaReranker:
     """Focused tests for Jina listwise reranker internals."""
 
@@ -810,30 +836,7 @@ class TestJinaReranker:
         model._query_embed_token_id = 2002
         model._jina_projector = lambda x: x
 
-        class _Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                del add_special_tokens
-                ids = []
-                for piece in text.replace("\n", " ").split():
-                    if "<|rerank_token|>" in piece:
-                        ids.append(2002)
-                        remainder = piece.replace("<|rerank_token|>", "")
-                        if remainder:
-                            ids.append(7)
-                    elif "<|embed_token|>" in piece:
-                        ids.append(2001)
-                        remainder = piece.replace("<|embed_token|>", "")
-                        if remainder:
-                            ids.append(7)
-                    else:
-                        ids.append(7)
-                return ids
-
-            def decode(self, token_ids, skip_special_tokens=False):
-                del skip_special_tokens
-                return " ".join(["tok"] * len(token_ids))
-
-        model.processor = _Tokenizer()
+        model.processor = _JinaWordTokenizer()
 
         def _fake_hidden_states(input_ids):
             token_ids = input_ids[0].tolist()
@@ -877,30 +880,7 @@ class TestJinaReranker:
         model._query_embed_token_id = 2002
         model._jina_projector = lambda x: x
 
-        class _Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                del add_special_tokens
-                ids = []
-                for piece in text.replace("\n", " ").split():
-                    if "<|rerank_token|>" in piece:
-                        ids.append(2002)
-                        remainder = piece.replace("<|rerank_token|>", "")
-                        if remainder:
-                            ids.append(7)
-                    elif "<|embed_token|>" in piece:
-                        ids.append(2001)
-                        remainder = piece.replace("<|embed_token|>", "")
-                        if remainder:
-                            ids.append(7)
-                    else:
-                        ids.append(7)
-                return ids
-
-            def decode(self, token_ids, skip_special_tokens=False):
-                del skip_special_tokens
-                return " ".join(["tok"] * len(token_ids))
-
-        model.processor = _Tokenizer()
+        model.processor = _JinaWordTokenizer()
 
         def _fake_hidden_states(input_ids):
             token_ids = input_ids[0].tolist()
@@ -1035,30 +1015,7 @@ class TestJinaReranker:
         model._query_embed_token_id = 2002
         model._jina_projector = lambda x: x
 
-        class _Tokenizer:
-            def encode(self, text, add_special_tokens=False):
-                del add_special_tokens
-                ids = []
-                for piece in text.replace("\n", " ").split():
-                    if "<|rerank_token|>" in piece:
-                        ids.append(2002)
-                        remainder = piece.replace("<|rerank_token|>", "")
-                        if remainder:
-                            ids.append(7)
-                    elif "<|embed_token|>" in piece:
-                        ids.append(2001)
-                        remainder = piece.replace("<|embed_token|>", "")
-                        if remainder:
-                            ids.append(7)
-                    else:
-                        ids.append(7)
-                return ids
-
-            def decode(self, token_ids, skip_special_tokens=False):
-                del skip_special_tokens
-                return " ".join(["tok"] * len(token_ids))
-
-        model.processor = _Tokenizer()
+        model.processor = _JinaWordTokenizer()
 
         # Empirically measured under this tokenizer: 1 doc -> 114 tokens,
         # 2 docs -> 120 tokens. max_length=115 fits exactly 1 doc per chunk,
@@ -1141,12 +1098,70 @@ class TestJinaReranker:
             args, _ = mock_method.call_args
             assert args[2] == 8192
 
+        # The default listwise window follows the tokenizer, as in the reference.
+        model.processor = MagicMock(model_max_length=131072)
+        with patch.object(
+            model, "_rerank_jina", return_value=mock_result
+        ) as mock_method:
+            model.rerank("query", ["doc"])
+            args, _ = mock_method.call_args
+            assert args[2] == 131072
+
         with patch.object(
             model, "_rerank_jina", return_value=mock_result
         ) as mock_method:
             model.rerank("query", ["doc"], max_length=1024)
             args, _ = mock_method.call_args
             assert args[2] == 1024
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_rerank_jina_v35_truncates_query_and_docs_to_reference_limits(
+        self, tmp_path
+    ):
+        """A query longer than the window used to raise instead of being cut."""
+        model = MLXRerankerModel(str(self._make_jina_model_dir(tmp_path)))
+        model._is_jina_reranker = True
+        model._is_jina_v35 = True
+        model._doc_embed_token_id = 2001
+        model._query_embed_token_id = 2002
+        model._jina_projector = lambda x: x
+        model.processor = _JinaWordTokenizer()
+
+        with (
+            patch.object(
+                model, "_format_jina_prompt", wraps=model._format_jina_prompt
+            ) as format_prompt,
+            patch.object(
+                model,
+                "_get_jina_hidden_states",
+                side_effect=lambda ids: mx.ones((1, ids.shape[1], 2)),
+            ),
+        ):
+            model._rerank_jina("q " * 10000, ["d " * 10000], max_length=8192)
+
+        query, docs = format_prompt.call_args_list[0].args[:2]
+        assert len(query.split()) == 2048 - 64
+        assert len(docs[0].split()) == 8192 - 1
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_rerank_jina_v35_caps_docs_per_block(self, tmp_path):
+        model = MLXRerankerModel(str(self._make_jina_model_dir(tmp_path)))
+        model._is_jina_reranker = True
+        model._is_jina_v35 = True
+        model._doc_embed_token_id = 2001
+        model._query_embed_token_id = 2002
+        model._jina_projector = lambda x: x
+        model.processor = _JinaWordTokenizer()
+
+        with patch.object(
+            model,
+            "_get_jina_hidden_states",
+            side_effect=lambda ids: mx.ones((1, ids.shape[1], 2)),
+        ) as hidden_states:
+            result = model._rerank_jina("query", ["doc"] * 130, max_length=131072)
+
+        assert hidden_states.call_count == 2
+        assert len(result.scores) == 130
 
 
 class TestRerankerCompileFallback:

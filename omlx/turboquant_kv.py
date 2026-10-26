@@ -510,7 +510,6 @@ class BatchTurboQuantKVCache(TurboQuantKVCache):
             raise ValueError("Cannot extend caches with mixed quantization configs")
         self._ensure_array_offset()
         other._ensure_array_offset()
-        max_off = max(self.offset.max().item(), other.offset.max().item())
         # Align on the WRITTEN ends: _state_length is step-allocated capacity,
         # and padding a joining row by capacity difference would bury its
         # content behind unwritten columns. _pad_and_trim also slices each

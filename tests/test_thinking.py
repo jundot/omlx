@@ -471,6 +471,12 @@ def test_truncated_stream_flushes_partial_tag_only_as_thinking(prompt_opened):
             False,
             ("plan", "Use <think>x</think> here"),
         ),
+        # Thinking skipped: the answer follows a bare close tag.
+        (
+            "</think>\n\nUse <think>x</think> here",
+            False,
+            ("", "Use <think>x</think> here"),
+        ),
         # The prompt opened the block, with and without the scheduler prefix.
         ("reason</think>answer <think>", True, ("reason", "answer <think>")),
         ("<think>\nreason</think>answer", True, ("reason", "answer")),

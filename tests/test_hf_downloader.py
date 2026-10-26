@@ -1951,7 +1951,9 @@ class TestHFDownloaderRoutes:
             assert not (models_dir / "unsloth").exists()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("cached, aliased", [(False, False), (True, False), (False, True)])
+    @pytest.mark.parametrize(
+        "cached, aliased", [(False, False), (True, False), (False, True)]
+    )
     async def test_split_variant_delete_preserves_other_variants(
         self, tmp_path, write_gguf, cached, aliased
     ):
@@ -3631,6 +3633,37 @@ class TestRetryDownload:
             await downloader.shutdown()
 
     @pytest.mark.asyncio
+    async def test_retry_refused_keeps_the_old_row(self, downloader, blocked_worker):
+        """A retry refused because the repo is already downloading must not
+        drop the failed or cancelled row it was asked to retry."""
+        with patch(
+            "omlx.admin.hf_downloader.HfApi"
+        ) as mock_api_cls, patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=blocked_worker.call,
+        ):
+            mock_api = MagicMock()
+            mock_info = MagicMock()
+            mock_info.siblings = []
+            mock_api.model_info.return_value = mock_info
+            mock_api_cls.return_value = mock_api
+
+            old = DownloadTask(
+                task_id="t-old",
+                repo_id="owner/model",
+                status=DownloadStatus.CANCELLED,
+            )
+            downloader._tasks[old.task_id] = old
+            await downloader.start_download("owner/model")
+            await asyncio.wait_for(blocked_worker.started.wait(), timeout=5)
+
+            with pytest.raises(ValueError, match="already in progress"):
+                await downloader.retry_download(old.task_id)
+
+            assert downloader._tasks.get(old.task_id) is old
+            await downloader.shutdown()
+
+    @pytest.mark.asyncio
     async def test_retry_nonexistent_raises(self, downloader):
         """Retrying a nonexistent task should raise ValueError."""
         with pytest.raises(ValueError, match="not found"):
@@ -4480,6 +4513,43 @@ class TestDownloadSpeed:
         assert observed > 0, "wire traffic must show while the disk is idle"
         assert task.speed_bps == 0.0  # terminal tasks publish 0
 
+    @pytest.mark.asyncio
+    async def test_block_allocation_ahead_of_writes_does_not_spike(
+        self, model_dir, monkeypatch
+    ):
+        """APFS can allocate a file's blocks well ahead of the bytes written:
+        the readout must follow the reported bytes, not the allocation."""
+        downloader, task = _downloading_task(
+            model_dir, task_id="t-alloc", total_size=10_000_000_000
+        )
+        state = {"logical": 0, "allocated": 0}
+
+        def scan(_path, _only=None):
+            state["logical"] += 100_000
+            state["allocated"] += 100_000_000
+            return _DownloadActivity(
+                file_count=1,
+                logical_size=state["logical"],
+                allocated_size=state["allocated"],
+                latest_mtime_ns=1,
+                files={"payload": state["allocated"]},
+            )
+
+        with patch.object(downloader, "_get_download_activity", side_effect=scan):
+            poll = start_poll(monkeypatch, downloader, task, model_dir)
+            started_at, started_bytes = time.monotonic(), state["logical"]
+            observed = 0.0
+            for _ in range(10):
+                await asyncio.sleep(0.02)
+                observed = max(observed, task.speed_bps)
+            reported_bps = (state["logical"] - started_bytes) / (
+                time.monotonic() - started_at
+            )
+            task.status = DownloadStatus.COMPLETED
+            await poll
+
+        assert 0 < observed < 2 * reported_bps
+
 # =============================================================================
 # Progress Reads Both Pipeline Stages (fetch = wire, reconstruction = disk)
 # =============================================================================
@@ -5116,3 +5186,26 @@ class TestFileSelection:
             assert row["group"] == "Q2_0/Flash-Next-Q2_0"
             assert row["mmproj"] == "mmproj-BF16.gguf"
         assert all(row["kind"] == "other" for row in files[2:6])
+
+    def test_variant_body_and_table_select_as_one_model(self):
+        names = [
+            f"Q4-PLE8/Qwen3.8-Flash-Next-UD-Q4_K_XL-{index:05d}-of-00005.gguf"
+            for index in range(1, 5)
+        ] + ["Q4-PLE8/Qwen3.8-Flash-Next-ple8-table-00005-of-00005.gguf"]
+        files = [{"name": name, "size": 1} for name in names + ["mmproj-BF16.gguf"]]
+
+        hf_downloader_mod._describe_repo_files(files, None)
+
+        assert {row["kind"] for row in files[:5]} == {"gguf"}
+        assert {row["group"] for row in files[:5]} == {
+            "Q4-PLE8/Qwen3.8-Flash-Next-UD-Q4_K_XL-Q4-PLE8"
+        }
+        assert {row["mmproj"] for row in files[:5]} == {"mmproj-BF16.gguf"}
+
+        # The task row names the model even when the table is listed first.
+        selected = [names[-1], "mmproj-BF16.gguf", *names[:-1]]
+        row = DownloadTask(task_id="t", repo_id="o/m", files=selected).to_dict()
+        assert row["gguf_files"] == [names[-1], *names[:-1]]
+        assert row["gguf_model_id"] == "Qwen3.8-Flash-Next-UD-Q4_K_XL-Q4-PLE8"
+        row = DownloadTask(task_id="t", repo_id="o/m", files=["Q-Q8_0.gguf"]).to_dict()
+        assert row["gguf_model_id"] == "Q-Q8_0"

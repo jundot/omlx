@@ -1023,6 +1023,61 @@
                             </div>
                         </div>
 
+                        <!-- GPU Power Limit -->
+                        <div class="px-4 py-3.5 space-y-3">
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.gpu_power_limit') }}</span>
+                                    <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.gpu_power_limit_hint') }}</p>
+                                    <p x-show="!modelSettings.gpu_power_limit_supported" x-cloak
+                                       class="text-xs text-amber-700 mt-1">{{ t('modal.model_settings.gpu_power_limit_unsupported') }}</p>
+                                </div>
+                                <button type="button"
+                                        @click="if (modelSettings.gpu_power_limit_supported || modelSettings.enableGpuPowerLimit) { modelSettings.enableGpuPowerLimit = !modelSettings.enableGpuPowerLimit; if (modelSettings.enableGpuPowerLimit && !modelSettings.gpu_power_limit_w) modelSettings.gpu_power_limit_w = 10; }"
+                                        :disabled="!modelSettings.gpu_power_limit_supported && !modelSettings.enableGpuPowerLimit"
+                                        :class="[
+                                            modelSettings.enableGpuPowerLimit ? 'bg-black' : 'bg-neutral-200',
+                                            (!modelSettings.gpu_power_limit_supported && !modelSettings.enableGpuPowerLimit) ? 'opacity-40 cursor-not-allowed' : ''
+                                        ]"
+                                        role="switch"
+                                        :aria-checked="modelSettings.enableGpuPowerLimit ? 'true' : 'false'"
+                                        class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                    <span :class="modelSettings.enableGpuPowerLimit ? 'translate-x-5' : 'translate-x-0'"
+                                          class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                </button>
+                            </div>
+                            <div x-show="modelSettings.enableGpuPowerLimit" x-transition class="pt-1 flex items-center gap-2">
+                                <input type="number" x-model.number="modelSettings.gpu_power_limit_w" placeholder="2-1000" min="2" max="1000" step="1"
+                                       class="w-32 px-4 py-2.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                <span class="text-sm text-neutral-500">W</span>
+                            </div>
+                            <details class="rounded-lg border border-neutral-200 bg-white px-3 py-2">
+                                <summary class="cursor-pointer select-none text-xs font-medium text-neutral-700">
+                                    {{ t('modal.model_settings.gpu_power_limit_guide_title') }}
+                                </summary>
+                                <table class="mt-2 w-full text-xs text-neutral-600 tabular-nums">
+                                    <thead>
+                                        <tr class="text-left text-neutral-500">
+                                            <th class="py-1 pr-2 font-medium">{{ t('modal.model_settings.gpu_power_limit_guide_limit') }}</th>
+                                            <th class="py-1 pr-2 font-medium">{{ t('modal.model_settings.gpu_power_limit_guide_answer') }}</th>
+                                            <th class="py-1 pr-2 font-medium">{{ t('modal.model_settings.gpu_power_limit_guide_energy') }}</th>
+                                            <th class="py-1 font-medium">{{ t('modal.model_settings.gpu_power_limit_guide_prompt') }}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <tr><td class="py-0.5 pr-2">{{ t('modal.model_settings.gpu_power_limit_guide_none') }}</td><td class="pr-2">GPU 23-27 W</td><td class="pr-2">-</td><td>GPU 67-76 W</td></tr>
+                                        <tr><td class="py-0.5 pr-2">30-40 W</td><td class="pr-2">0%</td><td class="pr-2">0%</td><td>-14 ~ -30%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">20 W</td><td class="pr-2">-3 ~ -4%</td><td class="pr-2">-11 ~ -12%</td><td>-38 ~ -44%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">15 W</td><td class="pr-2">-6 ~ -7%</td><td class="pr-2">-25 ~ -29%</td><td>-49 ~ -53%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">10 W</td><td class="pr-2">-14 ~ -18%</td><td class="pr-2">-37 ~ -43%</td><td>-59 ~ -64%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">5 W</td><td class="pr-2">-36 ~ -48%</td><td class="pr-2">-49 ~ -52%</td><td>-75 ~ -78%</td></tr>
+                                        <tr><td class="py-0.5 pr-2">2 W</td><td class="pr-2">-67 ~ -78%</td><td class="pr-2">-47 ~ -52%</td><td>-90 ~ -91%</td></tr>
+                                    </tbody>
+                                </table>
+                                <p class="mt-2 text-xs text-neutral-500">{{ t('modal.model_settings.gpu_power_limit_guide_note') }}</p>
+                            </details>
+                        </div>
+
                         <!-- Limit Tool Result Tokens -->
                         <div class="px-4 py-3.5 space-y-3"
                              x-show="!modelSettings.is_diffusion_model" x-cloak>

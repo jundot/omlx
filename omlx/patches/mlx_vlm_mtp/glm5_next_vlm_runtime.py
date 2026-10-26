@@ -531,7 +531,6 @@ def _patch_language_model(g5_lang: Any) -> None:
     create_attention_mask = g5_lang.create_attention_mask
 
     original_init = cls.__init__
-    original_call = cls.__call__
     original_sanitize = cls.sanitize
 
     def __init__(self, args, config=None):

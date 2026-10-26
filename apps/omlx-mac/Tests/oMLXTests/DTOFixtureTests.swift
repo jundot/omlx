@@ -218,7 +218,7 @@ final class DTOFixtureTests: XCTestCase {
             taskId: "t1", repoId: "mlx-community/model", status: "downloading",
             progress: 45.5, totalSize: 100, downloadedSize: 50,
             speedBps: 0, etaSeconds: nil, error: "", createdAt: 1.0, startedAt: 1.0,
-            completedAt: 0.0, retryCount: 0, files: nil
+            completedAt: 0.0, retryCount: 0, files: nil, ggufFiles: nil
         )
         XCTAssertEqual(stopped.speedText, "0 B/s")
         XCTAssertNil(stopped.etaText)
@@ -227,7 +227,7 @@ final class DTOFixtureTests: XCTestCase {
             taskId: "t2", repoId: "mlx-community/model", status: "downloading",
             progress: 45.5, totalSize: 100, downloadedSize: 50,
             speedBps: 512, etaSeconds: 125, error: "", createdAt: 1.0, startedAt: 1.0,
-            completedAt: 0.0, retryCount: 0, files: nil
+            completedAt: 0.0, retryCount: 0, files: nil, ggufFiles: nil
         )
         XCTAssertEqual(active.speedText, "512 B/s")
         XCTAssertEqual(active.etaText, "2m 5s")

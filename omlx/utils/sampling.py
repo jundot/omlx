@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Callable, List, Sequence
+from typing import Callable, List, Optional, Sequence
 
 import mlx.core as mx
 
@@ -206,13 +206,15 @@ def make_sampler(
     top_k: int = 0,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
-    xtc_special_tokens: List[int] = [],
+    xtc_special_tokens: Optional[List[int]] = None,
 ) -> Callable[[mx.array], mx.array]:
     """Build a sampler callable matching ``mlx_lm.sample_utils.make_sampler``.
 
     Returns ``argmax`` when ``temp == 0``; otherwise composes optional
     top-p / min-p / xtc / top-k filters and finishes with categorical sampling.
     """
+    if xtc_special_tokens is None:
+        xtc_special_tokens = []
     if temp == 0:
         sampler = lambda x: mx.argmax(x, axis=-1)
     else:

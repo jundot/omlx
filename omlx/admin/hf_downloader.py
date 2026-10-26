@@ -468,6 +468,7 @@ class DownloadTask:
 
     def to_dict(self) -> dict:
         """Serialize task to a JSON-compatible dict."""
+        models = gguf.model_ids(self.files or [])
         return {
             "task_id": self.task_id,
             "repo_id": self.repo_id,
@@ -483,6 +484,8 @@ class DownloadTask:
             "completed_at": self.completed_at,
             "retry_count": self.retry_count,
             "files": self.files,
+            "gguf_files": list(models),
+            "gguf_model_id": next(iter(models.values()), None),
         }
 
     @classmethod
@@ -730,6 +733,7 @@ def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
     """
     names = [row["name"] for row in files]
     layout = _repo_layout(names)
+    split_groups = gguf.split_file_groups(names)
     projectors = _default_mmproj(names)
     # A selection starts from what downloading the whole repo would fetch.
     preselected = (
@@ -742,11 +746,10 @@ def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
         lower = name.lower()
         row["group"] = None
         row["mmproj"] = None
-        if lower.endswith(".gguf") and ("/" not in name or gguf.is_split_variant(name)):
+        if lower.endswith(".gguf") and ("/" not in name or name in split_groups):
             row["kind"] = gguf.file_kind(name)
             if row["kind"] == "gguf":
-                split = gguf.SPLIT_RE.match(name)
-                row["group"] = split["prefix"] if split else None
+                row["group"] = split_groups.get(name)
                 # Discovery pairs every GGUF with a root projector.
                 row["mmproj"] = projectors.get("")
         elif lower.endswith(".safetensors"):
@@ -1690,15 +1693,14 @@ class HFDownloader(_QueuePersistenceMixin):
         repo_id = old_task.repo_id
         old_retry_count = old_task.retry_count
 
-        # Remove old task entry
-        del self._tasks[task_id]
-        self._cancelled.discard(task_id)
-
         # Start fresh download (snapshot_download resumes from existing files).
-        # An empty retry token keeps the stored one.
+        # An empty retry token keeps the stored one. If it raises, the old
+        # row stays so the user can retry later.
         new_task = await self.start_download(
             repo_id, hf_token or old_task.token, files=old_task.files
         )
+        del self._tasks[task_id]
+        self._cancelled.discard(task_id)
         new_task.retry_count = old_retry_count + 1
         self._persist()
         return new_task
@@ -2129,6 +2131,9 @@ class HFDownloader(_QueuePersistenceMixin):
         speed_meter.add(last_activity.files, now=last_activity_at)
         wire_meter = _WireSpeedMeter()
         wire_meter.add(wire.value, now=last_activity_at)
+        # Allocated blocks can jump ahead of the bytes written, so the readout
+        # never exceeds how fast the reported bytes move.
+        reported_meter = _WireSpeedMeter()
         # Rate of the reported bytes, so a disk flush of fetched bytes does not
         # count twice. Fed from the first moving tick to skip startup idle time.
         eta_meter = _WireSpeedMeter(window=_ETA_WINDOW)
@@ -2164,8 +2169,9 @@ class HFDownloader(_QueuePersistenceMixin):
 
                 disk_bps = speed_meter.add(activity.files)
                 wire_bps = wire_meter.add(wire_now)
+                reported_bps = reported_meter.add(task.downloaded_size)
                 # Both meters see the same payload, so never sum them.
-                task.speed_bps = max(disk_bps, wire_bps)
+                task.speed_bps = min(max(disk_bps, wire_bps), reported_bps)
                 if eta_started_at is None and task.speed_bps > 0:
                     eta_started_at = time.monotonic()
                 if eta_started_at is not None:

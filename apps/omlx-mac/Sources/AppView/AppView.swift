@@ -1,5 +1,5 @@
 // AppView shell. NavigationSplitView backed by the `AppSection` enum, one
-// sidebar row per screen, grouped into Server / Models / Benchmark / General
+// sidebar row per screen, grouped into Server / App / Models / Benchmark / General
 // sections. Sized close to the minimum comfortable settings window so the
 // first open does not feel oversized, while still surviving a resize.
 //
@@ -126,6 +126,7 @@ struct AppView: View {
         case .appearance:   AppearanceScreen()
         case .network:      NetworkScreen()
         case .performance:  PerformanceScreen()
+        case .askAI:        AskAIScreen()
         case .status:       StatusScreen()
         case .logs:         LogsScreen()
         case .models:
@@ -468,7 +469,6 @@ private struct SettingsSidebar: View {
         List(selection: $selection) {
             Section {
                 SidebarRow(section: .status)
-                SidebarRow(section: .appearance)
                 SidebarRow(section: .server)
                 SidebarRow(section: .network)
                 SidebarRow(section: .performance)
@@ -477,6 +477,14 @@ private struct SettingsSidebar: View {
                 Text(String(localized: "sidebar.group.server",
                             defaultValue: "Server",
                             comment: "Sidebar group heading for server-related screens"))
+            }
+            Section {
+                SidebarRow(section: .appearance)
+                SidebarRow(section: .askAI)
+            } header: {
+                Text(String(localized: "sidebar.group.app",
+                            defaultValue: "App",
+                            comment: "Sidebar group heading for settings stored by the Mac app itself"))
             }
             Section {
                 SidebarRow(section: .models)

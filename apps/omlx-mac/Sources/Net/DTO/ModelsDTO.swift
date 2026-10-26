@@ -76,6 +76,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var moeOffloadAllowsMtp: Bool? = nil
     /// True when this Mac can run the Qwen INT8 activation prefill kernels.
     var qwen35OqA8Supported: Bool? = nil
+    /// True when this Mac's GPU accepts a power cap.
+    var gpuPowerLimitSupported: Bool? = nil
     /// "hf_cache" for models found in the shared Hugging Face Hub cache.
     var sourceType: String? = nil
     /// "gguf" for a GGUF file, which only an external engine serves.
@@ -130,6 +132,7 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     var deepseekV41CedPrefillEnabled: Bool? = nil
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
+    var gpuPowerLimitW: Int? = nil
     let reasoningParser: String?
     let ttlSeconds: Int?
     let isPinned: Bool?
@@ -225,6 +228,7 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
+    var gpuPowerLimitW: Int? = nil // 0 turns the limit off.
     var forceSampling: Bool? = nil
     var isPinned: Bool? = nil
     var isFavorite: Bool? = nil

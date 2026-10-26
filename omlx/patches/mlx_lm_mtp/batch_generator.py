@@ -3897,6 +3897,8 @@ def _mtp_next(gen_batch: Any, state: _MtpState) -> Any:
         _bump_emit_stat(state, source)
         return _emit_response(gen_batch, token_id, logprobs_1d, state.stats)
 
+    # Another request's prefill may have cleared the shared adapter state.
+    _set_singleton_mrope_delta(gen_batch)
     _run_verify_cycle(gen_batch, state)
     if not state.queue:
         # Verify cycle should always populate the queue with at least the

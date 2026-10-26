@@ -3,6 +3,7 @@
 
 import asyncio
 import copy
+import fcntl
 import json
 import os
 import re
@@ -164,6 +165,187 @@ def _engine(tmp_path, version="1.3.1", **options) -> SplashEngine:
         log_dir=tmp_path / "logs",
         options=SplashOptions(**options),
     )
+
+
+def _disk_cache(root):
+    folder = root / ("a" * 32)
+    folder.mkdir(parents=True)
+    files = [
+        folder / name
+        for name in ("kv.slots", "kv.records", "state.slots", "state.records")
+    ]
+    for path in files:
+        path.write_bytes(b"cached")
+    (folder / "lock").touch()
+    return files
+
+
+class TestDiskCache:
+    def test_clear_removes_cache_data_and_keeps_lock_and_other_files(self, tmp_path):
+        root = tmp_path / "splash"
+        files = _disk_cache(root / "model")
+        folder = files[0].parent
+        (folder / "notes.txt").write_text("keep")
+        lock_inode = (folder / "lock").stat().st_ino
+        sparse = files[0]
+        with sparse.open("wb") as stream:
+            stream.truncate(1024**3)
+        expected = sum(path.stat().st_blocks * 512 for path in files)
+
+        assert splash_mod.scan_ssd_cache(root) == (4, expected)
+        assert splash_mod.scan_ssd_cache(root, clear=True) == (4, expected)
+        assert not any(path.exists() for path in files)
+        assert (folder / "lock").stat().st_ino == lock_inode
+        assert (folder / "notes.txt").read_text() == "keep"
+        assert splash_mod.scan_ssd_cache(root) == (0, 0)
+
+    def test_clear_refuses_a_locked_namespace(self, tmp_path):
+        root = tmp_path / "splash"
+        files = _disk_cache(root / "model")
+        with (files[0].parent / "lock").open("r+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with pytest.raises(RuntimeError, match="in use by another process"):
+                splash_mod.scan_ssd_cache(root, clear=True)
+        assert all(path.exists() for path in files)
+
+    @pytest.mark.parametrize("level", ["root", "model", "namespace", "file"])
+    def test_scan_and_clear_preserve_symlink_targets(self, tmp_path, level):
+        root = tmp_path / "splash"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target = outside / "kv.slots"
+        target.write_text("keep")
+        link = root
+        if level != "root":
+            root.mkdir()
+            link = root / "model"
+        if level in ("namespace", "file"):
+            link.mkdir()
+            link /= "a" * 32
+        if level == "file":
+            link.mkdir()
+            link /= "kv.slots"
+        link.symlink_to(target if level == "file" else outside)
+
+        if level == "root":
+            with pytest.raises(OSError):
+                splash_mod.scan_ssd_cache(root, clear=True)
+        else:
+            assert splash_mod.scan_ssd_cache(root) == (0, 0)
+            assert splash_mod.scan_ssd_cache(root, clear=True) == (0, 0)
+        assert target.read_text() == "keep"
+
+    @pytest.mark.parametrize("custom", [False, True])
+    async def test_api_clears_unloaded_splash_cache_and_usage(
+        self, tmp_path, monkeypatch, custom
+    ):
+        settings = GlobalSettings(base_path=tmp_path)
+        if custom:
+            settings.cache.ssd_cache_dir = str(tmp_path / "custom-cache")
+        root = settings.cache.get_ssd_cache_dir(tmp_path)
+        files = _disk_cache(root / "splash" / "model")
+        pool = EnginePool()
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+        monkeypatch.setattr(
+            admin_routes, "_clear_cold_remote_cluster_cache_roots", lambda _: (0, 0)
+        )
+
+        before = admin_routes._build_runtime_cache_observability(settings)
+        assert before["total_num_files"] == 4
+        assert before["total_size_bytes"] > 0
+        with patch.dict(
+            srv.app.dependency_overrides, {admin_routes.require_admin: lambda: True}
+        ):
+            response = TestClient(srv.app).post("/admin/api/ssd-cache/clear")
+        assert response.status_code == 200
+        assert response.json()["total_deleted"] == 4
+        assert not any(path.exists() for path in files)
+        after = admin_routes._build_runtime_cache_observability(settings)
+        assert after["total_num_files"] == after["total_size_bytes"] == 0
+
+    def test_usage_counts_cold_cache_without_counting_a_loaded_cache_twice(
+        self, tmp_path, monkeypatch
+    ):
+        settings = GlobalSettings(base_path=tmp_path)
+        root = tmp_path / "cache" / "splash"
+        _disk_cache(root / "loaded")
+        cold = _disk_cache(root / "unloaded")
+        pool, entry = _pool(tmp_path)
+        engine = _engine(tmp_path, cache_dir=root / "loaded", cache_disk_bytes=GIB)
+        entry.engine = engine
+        engine._status = {"disk": {"used_bytes": 123, "capacity_bytes": GIB}}
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+        stats = admin_routes._build_runtime_cache_observability(settings)
+        assert stats["total_num_files"] == 5
+        assert stats["total_size_bytes"] == 123 + sum(
+            path.stat().st_blocks * 512 for path in cold
+        )
+
+    async def test_clear_also_reaches_a_loaded_models_previous_cache_root(
+        self, tmp_path
+    ):
+        root = tmp_path / "cache" / "splash"
+        old_root = tmp_path / "old-cache" / "splash"
+        files = _disk_cache(root / "unloaded") + _disk_cache(old_root / "loaded")
+        pool, entry = _pool(tmp_path)
+        engine = _engine(tmp_path, cache_dir=old_root / "loaded", cache_disk_bytes=GIB)
+        entry.engine = engine
+        engine.stop = AsyncMock()
+        assert await pool.clear_splash_ssd_cache(root) == 8
+        assert not any(path.exists() for path in files)
+
+    async def test_api_unloads_idle_splash_before_deleting_its_cache(
+        self, tmp_path, monkeypatch
+    ):
+        settings = GlobalSettings(base_path=tmp_path)
+        root = tmp_path / "cache" / "splash"
+        files = _disk_cache(root / "model")
+        pool, entry = _pool(tmp_path)
+        engine = _engine(tmp_path, cache_dir=root / "model", cache_disk_bytes=GIB)
+        entry.engine = engine
+        entry.is_pinned = True
+
+        async def stop():
+            assert all(path.exists() for path in files)
+            assert (
+                pool._acquire_loaded_engine(entry.model_id, False, True, None) is None
+            )
+
+        engine.stop = AsyncMock(side_effect=stop)
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+        monkeypatch.setattr(
+            admin_routes, "_clear_cold_remote_cluster_cache_roots", lambda _: (0, 0)
+        )
+        response = await admin_routes.clear_ssd_cache(is_admin=True)
+
+        assert response["total_deleted"] == 4
+        engine.stop.assert_awaited_once()
+        assert entry.engine is None
+        assert entry.is_pinned
+        assert not any(path.exists() for path in files)
+
+    @pytest.mark.parametrize("busy", ["lease", "request", "loading", "pending"])
+    async def test_api_refuses_to_clear_busy_splash(self, tmp_path, monkeypatch, busy):
+        settings = GlobalSettings(base_path=tmp_path)
+        root = tmp_path / "cache" / "splash"
+        files = _disk_cache(root / "model")
+        pool, entry = _pool(tmp_path)
+        engine = _engine(tmp_path, cache_dir=root / "model", cache_disk_bytes=GIB)
+        entry.engine = engine
+        engine.stop = AsyncMock()
+        entry.in_use = int(busy == "lease")
+        engine._active = int(busy == "request")
+        entry.is_loading = busy == "loading"
+        entry.pending_unload_reason = "manual unload" if busy == "pending" else None
+        monkeypatch.setattr(admin_routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: pool)
+        with pytest.raises(HTTPException) as error:
+            await admin_routes.clear_ssd_cache(is_admin=True)
+        assert error.value.status_code == 409
+        engine.stop.assert_not_awaited()
+        assert all(path.exists() for path in files)
 
 
 # -- binary ---------------------------------------------------------------------

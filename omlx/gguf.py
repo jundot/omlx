@@ -164,9 +164,60 @@ def is_split_variant(name: str) -> bool:
         and "/" not in folder
         and not folder.startswith(".")
         and split
-        and split["prefix"].lower().endswith(f"-{folder.lower()}")
+        and (
+            split["prefix"].lower().endswith(f"-{folder.lower()}")
+            or re.fullmatch(r"(?:UD-)?[A-Za-z0-9_]+-PLE\d+", folder, re.IGNORECASE)
+        )
         and file_kind(base) == "gguf"
     )
+
+
+def split_file_groups(names: list[str]) -> dict[str, str]:
+    """Map split files to one model, including separately named table shards."""
+    groups: dict[str, str] = {}
+    folders: dict[str, list[str]] = {}
+    for name in names:
+        folder, _, base = name.rpartition("/")
+        if base.startswith(".") or file_kind(base) != "gguf":
+            continue
+        split = SPLIT_RE.match(base)
+        if split and (not folder or is_split_variant(name)):
+            groups[name] = f"{folder}/{split['prefix']}" if folder else split["prefix"]
+        if is_split_variant(name):
+            folders.setdefault(folder, []).append(name)
+    for folder, parts in folders.items():
+        splits = [SPLIT_RE.match(name.rsplit("/", 1)[-1]) for name in parts]
+        if len(parts) < 2:
+            continue
+        # A PLE table can have another prefix; its shard number keeps it in order.
+        ordered = sorted(zip(parts, splits), key=lambda item: int(item[1]["index"]))
+        count = int(ordered[0][1]["count"])
+        if {int(split["count"]) for _, split in ordered} != {count} or [
+            int(split["index"]) for _, split in ordered
+        ] != list(range(1, count + 1)):
+            continue
+        prefix = ordered[0][1]["prefix"]
+        if not prefix.lower().endswith(f"-{folder.lower()}"):
+            prefix = f"{prefix}-{folder}"
+        groups.update((name, f"{folder}/{prefix}") for name in parts)
+    return groups
+
+
+def model_ids(names: list[str]) -> dict[str, str]:
+    """Map the GGUF model files among repo paths to the ID each serves under."""
+    groups = split_file_groups(names)
+    ids: dict[str, str] = {}
+    for name in names:
+        if name in groups:
+            ids[name] = groups[name].rsplit("/", 1)[-1]
+        elif (
+            "/" not in name
+            and not name.startswith(".")
+            and name.lower().endswith(".gguf")
+            and file_kind(name) == "gguf"
+        ):
+            ids[name] = name[: -len(".gguf")]
+    return ids
 
 
 def _variant_ggufs(folder: Path) -> list[Path]:
@@ -201,29 +252,33 @@ def holds_checkpoint(folder: Path) -> bool:
 def find_models(folder: Path) -> list[GgufModel]:
     """The GGUF models in ``folder``, including split VARIANT/ folders.
 
-    A split GGUF is one model named by its prefix; projectors and imatrix
-    files and MTP heads are not models.
+    A split GGUF is one model; PLE variants also include their folder name.
+    Projectors, imatrix files and MTP heads are not models.
     """
     files = _model_ggufs(folder)
+    groups = split_file_groups([path.relative_to(folder).as_posix() for path in files])
     projectors = tuple(
         sorted(
             (path for path in files if file_kind(path.name) == "mmproj"),
             key=lambda path: projector_rank(path.name),
         )
     )
-    split_parts: dict[tuple[Path, str], list[Path]] = {}
+    split_parts: dict[str, list[Path]] = {}
     models: list[GgufModel] = []
     for path in files:
         if file_kind(path.name) != "gguf":
             continue
         split = SPLIT_RE.match(path.name)
         if split:
-            split_parts.setdefault((path.parent, split["prefix"]), []).append(path)
+            group = groups[path.relative_to(folder).as_posix()]
+            split_parts.setdefault(group, []).append(path)
             continue
         models.append(
             GgufModel(path.name[: -len(".gguf")], (path,), projectors, folder)
         )
-    for (_, prefix), parts in split_parts.items():
+    for group, parts in split_parts.items():
+        prefix = group.rsplit("/", 1)[-1]
+        parts.sort(key=lambda path: int(SPLIT_RE.match(path.name)["index"]))
         splits = [SPLIT_RE.match(part.name) for part in parts]
         count = int(splits[0]["count"])
         if {int(split["count"]) for split in splits} != {count} or [

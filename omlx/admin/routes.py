@@ -51,6 +51,10 @@ from ..engine.splash import (
     find_splash_binary,
     inspect_splash_binary,
 )
+from ..engine.splash import (
+    scan_ssd_cache as scan_splash_ssd_cache,
+)
+from ..exceptions import ModelBusyError
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
@@ -85,6 +89,7 @@ from ..settings import (
     SubKeyEntry,
     burst_decode_env,
 )
+from ..utils import gpu_power
 from ..utils.fatal import is_command_buffer_error
 from ..utils.hardware import (
     compute_owner_hash,
@@ -378,6 +383,7 @@ class ModelSettingsRequest(BaseModel):
     deepseek_v41_ced_prefill_enabled: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
+    gpu_power_limit_w: int | None = None
     mtp_adaptive_max_depth: int | None = None
     # Fixed Lightning MTP draft depth (None = adaptive).
     mtp_fixed_depth: int | None = None
@@ -451,6 +457,19 @@ class ModelSettingsRequest(BaseModel):
             return 4 if value == 0 else None
         if value not in (2, 2.5, 3, 3.5, 4, 6, 8):
             raise ValueError("turboquant_kv_bits must be 2, 2.5, 3, 3.5, 4, 6, or 8")
+        return value
+
+    @field_validator("gpu_power_limit_w")
+    @classmethod
+    def validate_gpu_power_limit(cls, value: int | None) -> int | None:
+        # Profiles and templates reuse this model, so the range applies to them too.
+        if value is None or value <= 0:
+            return None
+        if not gpu_power.MIN_WATTS <= value <= gpu_power.MAX_WATTS:
+            raise ValueError(
+                f"gpu_power_limit_w must be between {gpu_power.MIN_WATTS} and "
+                f"{gpu_power.MAX_WATTS} W, or 0 to turn it off"
+            )
         return value
 
     @field_validator("dflash_verify_mode")
@@ -2321,6 +2340,7 @@ def _model_options(model_info: dict, settings) -> dict:
         "qwen35_oq_a8_supported": (
             _oq_a8_model_supported(model_type) and _oq_a8_kernels_available()
         ),
+        "gpu_power_limit_supported": gpu_power.gpu_power_cap_supported(),
     }
 
 
@@ -2947,6 +2967,8 @@ async def update_model_settings(
             if request.thinking_budget_tokens and request.thinking_budget_tokens > 0
             else None
         )
+    if "gpu_power_limit_w" in sent:
+        current_settings.gpu_power_limit_w = request.gpu_power_limit_w
     for name in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
         if name not in sent:
             continue
@@ -3220,70 +3242,17 @@ async def update_model_settings(
     if "mtp_enabled" in sent:
         new_mtp_enabled = False if is_diffusion_model else bool(request.mtp_enabled)
         if new_mtp_enabled:
-            # Compatibility check: the model needs MTP heads in config.json AND
-            # the model_type must be one PR 990 / PR 15 covers AND the weight
-            # files must actually contain MTP tensors (mtp.* or the native
-            # nextn layers). The last check is the one that catches
-            # mlx-community converted weights where the default sanitize
-            # path stripped the MTP heads.
-            import json
-            from pathlib import Path
-
-            from ..utils.model_loading import (
-                _checkpoint_has_mtp_weights,
-                _is_mtp_compatible,
+            # Same gate as the toggle status in the model list, which also
+            # accepts MiniMax M3.1 through its bundled dspark/ draft.
+            compat_ok, compat_reason = _mtp_compat_for_model(
+                {
+                    "model_path": entry.model_path,
+                    "config_model_type": entry.config_model_type,
+                    "engine_type": entry.engine_type,
+                }
             )
-
-            cfg_path = Path(entry.model_path) / "config.json"
-            if not cfg_path.exists():
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"MTP enabled but config.json missing at {cfg_path}; "
-                        "cannot verify MTP compatibility."
-                    ),
-                )
-            try:
-                cfg = json.loads(cfg_path.read_text())
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"MTP enabled but failed to read model config: {e}",
-                )
-            model_type = cfg.get("model_type")
-            # qwen4_exp routes through the dedicated VLM Lightning MTP path
-            # (see _mtp_compat_for_model); skip the mlx-lm whitelist here but
-            # keep the mtp.* weight check below.
-            if model_type != "qwen4_exp" and not _is_mtp_compatible(cfg, model_type):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Model is not MTP-compatible (model_type={model_type!r}, "
-                        f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
-                        "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
-                        "MTP heads."
-                    ),
-                )
-            if not _checkpoint_has_mtp_weights(entry.model_path):
-                if model_type == "qwen4_exp":
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Qwen4-Exp Lightning MTP requires embedded mtp.* "
-                            "tensors; native nextn layers are not supported by "
-                            "its dedicated runtime."
-                        ),
-                    )
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Config declares MTP layers but the weight files contain "
-                        "neither mtp.* tensors nor native nextn layers. Re-convert "
-                        "from HF with a converter that preserves MTP weights. The "
-                        "default mlx-lm sanitize() path strips them."
-                    ),
-                )
+            if not compat_ok:
+                raise HTTPException(status_code=400, detail=compat_reason)
             # Mutual exclusion with DFlash — ModelSettings.__post_init__
             # also enforces this, but we surface a clearer error here.
             dflash_after = (
@@ -6500,6 +6469,7 @@ def _build_runtime_cache_observability(
         return payload
 
     block_sizes = set()
+    live_splash_dirs = set()
 
     for model_info in engine_pool.get_status().get("models", []):
         model_id = model_info.get("id")
@@ -6726,6 +6696,8 @@ def _build_runtime_cache_observability(
         if isinstance(splash_cache, dict):
             model_payload["cache_tier"] = "splash"
             model_payload["splash_cache"] = splash_cache
+            if isinstance(entry.engine, SplashEngine) and entry.engine.ssd_cache_dir:
+                live_splash_dirs.add(entry.engine.ssd_cache_dir)
 
         payload["models"].append(model_payload)
         payload["total_num_files"] += model_payload["num_files"]
@@ -6781,6 +6753,14 @@ def _build_runtime_cache_observability(
         except Exception as exc:
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
+    try:
+        files, size = scan_splash_ssd_cache(
+            cache_dir / "splash", exclude=live_splash_dirs
+        )
+        payload["total_num_files"] += files
+        payload["total_size_bytes"] += size
+    except OSError as exc:
+        logger.warning("Failed to scan Splash SSD cache: %s", exc)
     return payload
 
 
@@ -7303,6 +7283,26 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
     total_deleted = 0
     distributed_ranks = 0
     distributed_failures = []
+
+    global_settings = _get_global_settings()
+    if global_settings is not None:
+        cache_root = (
+            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+            / "splash"
+        )
+        pool = _get_engine_pool()
+        clear_splash = getattr(pool, "clear_splash_ssd_cache", None)
+        try:
+            if callable(clear_splash):
+                total_deleted += await clear_splash(cache_root)
+            else:
+                total_deleted += scan_splash_ssd_cache(cache_root, clear=True)[0]
+        except ModelBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(
+                status_code=503, detail=f"Could not delete Splash SSD cache: {exc}"
+            ) from exc
 
     for model_id, scheduler, core in _iter_loaded_engine_records():
         distributed_clear = getattr(core, "clear_prompt_caches", None)
@@ -8618,6 +8618,15 @@ async def get_ms_model_info(
 # =============================================================================
 
 
+def _drop_idle_gpu_power_cap() -> None:
+    # Benchmarks never take a GPU power cap. One still held for the release
+    # delay after a capped request would throttle the start of the run.
+    state = _get_server_state() if _get_server_state is not None else None
+    limiter = getattr(state, "gpu_power_limiter", None)
+    if limiter is not None:
+        limiter.drop_idle_cap()
+
+
 @router.post("/api/bench/accuracy/queue/add")
 async def add_to_accuracy_queue(
     request: Request,
@@ -8688,6 +8697,7 @@ async def add_to_accuracy_queue(
     )
 
     # Start processing if not already running (synchronous — sets bench_id immediately)
+    _drop_idle_gpu_power_cap()
     start_next_from_queue(engine_pool)
 
     return get_queue_status()
@@ -8887,6 +8897,7 @@ async def start_ane_tuning(
     tuning_request.backend = "k2" if entry.config_model_type == "k2_horizon" else "qwen"
     cleanup_old_runs()
     run = create_run(tuning_request)
+    _drop_idle_gpu_power_cap()
     run.task = asyncio.create_task(run_tuning(run, engine_pool))
     return {"tuning_id": run.tuning_id, "status": "started", "total": run.total}
 
@@ -9055,6 +9066,7 @@ async def start_context_benchmark(
 
     cleanup_old_runs()
     run = create_run(bench_request)
+    _drop_idle_gpu_power_cap()
     run.task = asyncio.create_task(run_context_benchmark(run, engine_pool))
 
     logger.info(
@@ -9302,6 +9314,7 @@ async def start_benchmark(
     run = create_run(bench_request)
     total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
 
+    _drop_idle_gpu_power_cap()
     run.task = asyncio.create_task(run_benchmark(run, engine_pool))
 
     logger.info(
