@@ -5325,10 +5325,11 @@ def test_context_copy_width_follows_the_targets_verify_window(wide_window):
     assert copier.propose(64) == source[107 : 107 + expected]
 
 
+@pytest.mark.parametrize("family", ["qwen_vlm", "qwen4"])
 @pytest.mark.parametrize("size", [2, 4])
 @pytest.mark.parametrize("late_join", [False, True])
 def test_initialization_uses_one_forward_without_cache_extraction(
-    size, late_join, monkeypatch
+    family, size, late_join, monkeypatch
 ):
     active = mlx_lm_mtp.is_mtp_active()
     mlx_lm_mtp.set_mtp_active(True)
@@ -5336,7 +5337,7 @@ def test_initialization_uses_one_forward_without_cache_extraction(
     monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
     try:
         mx.random.seed(173)
-        model = _model("qwen_vlm")
+        model = _model(family)
         original = bg._prepare_mtp_batch_state_for_next
         forward = bg._call_backbone
         calls = []
