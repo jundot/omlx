@@ -7652,6 +7652,196 @@ async def stream_anthropic_messages(
 _AUTO_MODE_CLASSIFIER_THINKING_BUDGET = 256
 
 
+@dataclass
+class _AnthropicPrompt:
+    messages: list[dict]
+    tools: list[dict] | None
+    chat_template_kwargs: dict
+    is_partial: bool
+    native_reasoning: bool
+    thinking_budget: int | None
+    model_settings: object | None
+
+
+async def _prepare_anthropic_prompt(
+    request: AnthropicMessagesRequest,
+    engine: BaseEngine,
+    resolved_model: str | None,
+) -> _AnthropicPrompt:
+    """Build the messages, tools and template kwargs /v1/messages renders.
+
+    /v1/messages/count_tokens calls this too, so the count is taken on the
+    prompt generation would see.
+    """
+    max_tool_result_tokens = None
+    ms = get_model_settings_for_request(request.model)
+    if ms:
+        max_tool_result_tokens = ms.max_tool_result_tokens
+    merged_ct_kwargs = merge_chat_template_request_kwargs(
+        ms,
+        request.chat_template_kwargs,
+    )
+    forced_keys = forced_ct_keys(ms)
+    _entry = get_engine_pool().get_entry(resolved_model)
+
+    # Pass Anthropic thinking config to chat template (except forced keys)
+    if hasattr(request, "thinking") and request.thinking:
+        if "enable_thinking" not in forced_keys:
+            thinking_type = getattr(request.thinking, "type", None)
+            if thinking_type in ("enabled", "adaptive"):
+                merged_ct_kwargs["enable_thinking"] = True
+            elif thinking_type == "disabled":
+                merged_ct_kwargs["enable_thinking"] = False
+            # MiniMax M3 templates have a separate adaptive thinking_mode.
+            if (
+                thinking_type == "adaptive"
+                and "thinking_mode" not in forced_keys
+                and getattr(_entry, "config_model_type", None)
+                in MINIMAX_M3_MODEL_TYPES
+            ):
+                merged_ct_kwargs.setdefault("thinking_mode", "adaptive")
+
+    logger.debug(
+        f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
+        f"has_tokenizer={engine.tokenizer is not None}"
+    )
+
+    # Convert Anthropic format to internal format
+    # Harmony models need special handling to preserve tool format
+    is_vlm = _engine_accepts_images(engine)
+    native_reasoning = uses_native_reasoning_content(
+        resolved_model,
+        config_model_type=(
+            getattr(_entry, "config_model_type", None) if _entry is not None else None
+        ),
+        engine_model_type=getattr(engine, "model_type", None),
+        preserve_thinking_default=(
+            getattr(_entry, "preserve_thinking_default", None)
+            if _entry is not None
+            else None
+        ),
+    )
+    if engine.model_type == "gpt_oss":
+        messages = convert_anthropic_to_internal_harmony(
+            request,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            consolidate_system_messages=False,
+        )
+    else:
+        messages = convert_anthropic_to_internal(
+            request,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            preserve_images=is_vlm,
+            native_reasoning_content=native_reasoning,
+            consolidate_system_messages=False,
+        )
+
+    # Apply model-specific message extraction (e.g. Gemma 4 converts
+    # role=tool messages into tool_responses on assistant turns).
+    extractor = getattr(engine, "message_extractor", None)
+    if extractor is not None:
+        extractor_kwargs = {}
+        try:
+            if "consolidate_system_messages" in inspect.signature(extractor).parameters:
+                extractor_kwargs["consolidate_system_messages"] = False
+        except (TypeError, ValueError):
+            pass
+        messages = extractor(
+            messages,
+            max_tool_result_tokens,
+            engine.tokenizer,
+            **extractor_kwargs,
+        )
+
+    # Detect and strip partial mode at the API boundary — exactly once.
+    is_partial = detect_and_strip_partial(messages)
+
+    # Auto-set enable_thinking in chat template kwargs when a positive thinking
+    # budget is active but enable_thinking was not already set (e.g. via
+    # the Anthropic thinking.type field above or model settings).
+    thinking_budget = _resolve_thinking_budget(request, request.model)
+    if (
+        thinking_budget is not None
+        and thinking_budget > 0
+        and "enable_thinking" not in merged_ct_kwargs
+    ):
+        merged_ct_kwargs["enable_thinking"] = True
+
+    _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
+
+    # Merge MCP tools with user-provided Anthropic tools unless
+    # tool_choice is {"type": "none"}, same as /v1/chat/completions.
+    tools_disabled = getattr(request.tool_choice, "type", None) == "none"
+    user_internal = (
+        None if tools_disabled else convert_anthropic_tools_to_internal(request.tools)
+    )
+    if getattr(engine, "is_diffusion_model", False) and not getattr(
+        engine, "supports_tool_calling", False
+    ):
+        if user_internal:
+            raise InvalidRequestError(
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
+                field="tools",
+            )
+        internal_tools = None
+    elif not tools_disabled and _server_state.mcp_manager and mcp_tools_exposed():
+        mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
+        combined = (mcp_openai_tools or []) + (user_internal or [])
+        # Deduplicate by function name (user tools take precedence)
+        if combined:
+            seen = {}
+            for tool in combined:
+                name = tool.get("function", {}).get("name", "")
+                seen[name] = tool
+            internal_tools = list(seen.values())
+        else:
+            internal_tools = None
+    else:
+        internal_tools = user_internal
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if internal_tools and "gemma" in (resolved_model or "").lower():
+        internal_tools = enrich_tool_params_for_gemma4(internal_tools)
+
+    await _ensure_tokenizer_for_system_probe(engine, messages)
+    messages = prepare_system_messages_for_template(
+        messages,
+        engine.tokenizer,
+        tools=internal_tools,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        is_partial=is_partial,
+        unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+    )
+    return _AnthropicPrompt(
+        messages=messages,
+        tools=internal_tools,
+        chat_template_kwargs=merged_ct_kwargs,
+        is_partial=is_partial,
+        native_reasoning=native_reasoning,
+        thinking_budget=thinking_budget,
+        model_settings=ms,
+    )
+
+
+def _count_anthropic_prompt(
+    engine: BaseEngine, prompt: _AnthropicPrompt
+) -> tuple[int, tuple[str, list[int]] | None]:
+    try:
+        return _prepare_chat_prompt_for_request(
+            engine,
+            prompt.messages,
+            prompt.tools,
+            chat_template_kwargs=prompt.chat_template_kwargs or None,
+            is_partial=prompt.is_partial,
+        )
+    except Exception as e:
+        if _is_chat_template_error(e):
+            raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
+        raise
+
+
 @app.post("/v1/messages")
 async def create_anthropic_message(
     request: AnthropicMessagesRequest,
@@ -7698,96 +7888,11 @@ async def create_anthropic_message(
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
 
-        # Get per-model settings
-        max_tool_result_tokens = None
-        ms = get_model_settings_for_request(request.model)
-        if ms:
-            max_tool_result_tokens = ms.max_tool_result_tokens
-        merged_ct_kwargs = merge_chat_template_request_kwargs(
-            ms,
-            request.chat_template_kwargs,
-        )
-        forced_keys = forced_ct_keys(ms)
-        _entry = get_engine_pool().get_entry(resolved_model)
-
-        # Pass Anthropic thinking config to chat template (except forced keys)
-        if hasattr(request, "thinking") and request.thinking:
-            if "enable_thinking" not in forced_keys:
-                thinking_type = getattr(request.thinking, "type", None)
-                if thinking_type in ("enabled", "adaptive"):
-                    merged_ct_kwargs["enable_thinking"] = True
-                elif thinking_type == "disabled":
-                    merged_ct_kwargs["enable_thinking"] = False
-                # MiniMax M3 templates have a separate adaptive thinking_mode.
-                if (
-                    thinking_type == "adaptive"
-                    and "thinking_mode" not in forced_keys
-                    and getattr(_entry, "config_model_type", None)
-                    in MINIMAX_M3_MODEL_TYPES
-                ):
-                    merged_ct_kwargs.setdefault("thinking_mode", "adaptive")
-
-        logger.debug(
-            f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
-            f"has_tokenizer={engine.tokenizer is not None}"
-        )
-
-        # Convert Anthropic format to internal format
-        # Harmony models need special handling to preserve tool format
-        is_vlm = _engine_accepts_images(engine)
-        native_reasoning = uses_native_reasoning_content(
-            resolved_model,
-            config_model_type=(
-                getattr(_entry, "config_model_type", None)
-                if _entry is not None
-                else None
-            ),
-            engine_model_type=getattr(engine, "model_type", None),
-            preserve_thinking_default=(
-                getattr(_entry, "preserve_thinking_default", None)
-                if _entry is not None
-                else None
-            ),
-        )
-        if engine.model_type == "gpt_oss":
-            messages = convert_anthropic_to_internal_harmony(
-                request,
-                max_tool_result_tokens,
-                engine.tokenizer,
-                consolidate_system_messages=False,
-            )
-        else:
-            messages = convert_anthropic_to_internal(
-                request,
-                max_tool_result_tokens,
-                engine.tokenizer,
-                preserve_images=is_vlm,
-                native_reasoning_content=native_reasoning,
-                consolidate_system_messages=False,
-            )
-
-        # Apply model-specific message extraction (e.g. Gemma 4 converts
-        # role=tool messages into tool_responses on assistant turns).
-        extractor = getattr(engine, "message_extractor", None)
-        if extractor is not None:
-            extractor_kwargs = {}
-            try:
-                if (
-                    "consolidate_system_messages"
-                    in inspect.signature(extractor).parameters
-                ):
-                    extractor_kwargs["consolidate_system_messages"] = False
-            except (TypeError, ValueError):
-                pass
-            messages = extractor(
-                messages,
-                max_tool_result_tokens,
-                engine.tokenizer,
-                **extractor_kwargs,
-            )
-
-        # Detect and strip partial mode at the API boundary — exactly once.
-        is_partial = detect_and_strip_partial(messages)
+        prompt = await _prepare_anthropic_prompt(request, engine, resolved_model)
+        messages = prompt.messages
+        internal_tools = prompt.tools
+        merged_ct_kwargs = prompt.chat_template_kwargs
+        ms = prompt.model_settings
 
         # Prepare kwargs
         (
@@ -7832,76 +7937,14 @@ async def create_anthropic_message(
             chat_kwargs["repetition_context_size"] = repetition_context_size
 
         # Add thinking budget if applicable
-        thinking_budget = _resolve_thinking_budget(request, request.model)
-        if thinking_budget is not None:
-            chat_kwargs["thinking_budget"] = thinking_budget
-
-        # Auto-set enable_thinking in chat template kwargs when a positive thinking
-        # budget is active but enable_thinking was not already set (e.g. via
-        # the Anthropic thinking.type field above or model settings).
-        if (
-            thinking_budget is not None
-            and thinking_budget > 0
-            and "enable_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["enable_thinking"] = True
+        if prompt.thinking_budget is not None:
+            chat_kwargs["thinking_budget"] = prompt.thinking_budget
 
         if is_auto_mode_classifier_request(request):
             # Claude Code sends no thinking field here for non-Claude model
             # names. Bound reasoning to its deadline, but do not turn it on.
             chat_kwargs["thinking_budget"] = _AUTO_MODE_CLASSIFIER_THINKING_BUDGET
 
-        # Auto-set preserve_thinking only when the template advertises support
-        # for it (Qwen 3.6+). Gated on detection so other templates don't
-        # receive an unknown kwarg.
-        _entry = get_engine_pool().get_entry(resolved_model)
-        if (
-            _entry is not None
-            and _entry.preserve_thinking_default is True
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
-
-        # Merge MCP tools with user-provided Anthropic tools unless
-        # tool_choice is {"type": "none"}, same as /v1/chat/completions.
-        tools_disabled = getattr(request.tool_choice, "type", None) == "none"
-        user_internal = (
-            None
-            if tools_disabled
-            else convert_anthropic_tools_to_internal(request.tools)
-        )
-        if getattr(engine, "is_diffusion_model", False) and not getattr(
-            engine, "supports_tool_calling", False
-        ):
-            if user_internal:
-                raise InvalidRequestError(
-                    "Tool calling is not supported for this diffusion model "
-                    "(no tool parser matched its chat template).",
-                    field="tools",
-                )
-            internal_tools = None
-        elif (
-            not tools_disabled
-            and _server_state.mcp_manager
-            and mcp_tools_exposed()
-        ):
-            mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
-            combined = (mcp_openai_tools or []) + (user_internal or [])
-            # Deduplicate by function name (user tools take precedence)
-            if combined:
-                seen = {}
-                for tool in combined:
-                    name = tool.get("function", {}).get("name", "")
-                    seen[name] = tool
-                internal_tools = list(seen.values())
-            else:
-                internal_tools = None
-        else:
-            internal_tools = user_internal
-        # Gemma 4 drops required params that lack descriptions — enrich them
-        if internal_tools and "gemma" in (resolved_model or "").lower():
-            internal_tools = enrich_tool_params_for_gemma4(internal_tools)
         if internal_tools:
             chat_kwargs["tools"] = internal_tools
 
@@ -7910,41 +7953,16 @@ async def create_anthropic_message(
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
         # Forward partial-mode decision to the engine explicitly
-        chat_kwargs["is_partial"] = is_partial
+        chat_kwargs["is_partial"] = prompt.is_partial
         chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
-            ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
+            ms,
+            native_reasoning=prompt.native_reasoning,
+            chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
 
-        await _ensure_tokenizer_for_system_probe(engine, messages)
-        messages = prepare_system_messages_for_template(
-            messages,
-            engine.tokenizer,
-            tools=internal_tools,
-            chat_template_kwargs=merged_ct_kwargs or None,
-            is_partial=is_partial,
-            unsupported_mid_system_policy=_unsupported_mid_system_policy(),
-        )
-
         # Validate context window before sending to model
-        try:
-            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
-                engine,
-                messages,
-                internal_tools,
-                chat_template_kwargs=merged_ct_kwargs or None,
-                is_partial=is_partial,
-            )
-        except Exception as e:
-            err_name = type(e).__name__.lower()
-            err_msg = str(e).lower()
-            if (
-                "template" in err_name
-                or "template" in err_msg
-                or isinstance(e, (AssertionError, ValueError))
-            ):
-                raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
-            raise
+        num_prompt_tokens, prepared_prompt = _count_anthropic_prompt(engine, prompt)
         validate_context_window(num_prompt_tokens, request.model)
 
         if prepared_prompt is not None:
@@ -8132,8 +8150,10 @@ async def count_anthropic_tokens(
         engine = await get_engine_for_model(request.model, lease=lease)
         await _raise_if_llm_lease_abort_requested(lease)
 
-        # Convert Anthropic format to internal format
-        # Create a temporary MessagesRequest to reuse existing conversion logic
+        resolved_model = _serving_model_id(lease, request.model)
+
+        # Count through the /v1/messages prompt path so tools, thinking and
+        # model-settings template kwargs render the way generation sees them.
         temp_request = AnthropicMessagesRequest(
             model=request.model,
             max_tokens=1,  # Dummy value, not used for token counting
@@ -8143,44 +8163,11 @@ async def count_anthropic_tokens(
             tool_choice=request.tool_choice,
             thinking=request.thinking,
         )
-        messages = convert_anthropic_to_internal(temp_request)
-
-        # Convert tools if present; count them only when the model sees them.
-        internal_tools = (
-            None
-            if getattr(request.tool_choice, "type", None) == "none"
-            else convert_anthropic_tools_to_internal(request.tools)
+        prompt = await _prepare_anthropic_prompt(temp_request, engine, resolved_model)
+        input_tokens = _count_anthropic_prompt(engine, prompt)[0]
+        logger.debug(
+            f"Token count: {input_tokens} tokens for {len(prompt.messages)} messages"
         )
-
-        # Apply chat template to get prompt
-        tokenizer = engine.tokenizer
-        template_kwargs = {
-            "tokenize": False,
-            "add_generation_prompt": True,
-        }
-        if internal_tools:
-            template_kwargs["tools"] = internal_tools
-
-        try:
-            prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
-        except Exception as e:
-            logger.warning(
-                f"Failed to apply chat template: {e}, using simple concatenation"
-            )
-            # Fallback: simple concatenation
-            prompt = "\n".join(
-                f"{msg.get('role', 'user')}: {msg.get('content', '')}"
-                for msg in messages
-            )
-
-        # Tokenize to count tokens
-        if isinstance(prompt, str):
-            token_ids = tokenizer.encode(prompt)
-        else:
-            token_ids = prompt  # Already tokenized
-
-        input_tokens = len(token_ids)
-        logger.debug(f"Token count: {input_tokens} tokens for {len(messages)} messages")
 
         return TokenCountResponse(input_tokens=input_tokens)
 
