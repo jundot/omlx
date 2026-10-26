@@ -238,7 +238,9 @@ class TensorFile:
                             )
                     # A query error warrants a conservative read now, but is
                     # not evidence for a permanent scheduling change.
-                    read_all = wide and (prefer_rows or resident is None)
+                    read_all = (not wide and bool(fresh.size)) or (
+                        wide and (prefer_rows or resident is None)
+                    )
                     if fresh.size or read_all:
                         exact = (
                             _read_row_runs(

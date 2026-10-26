@@ -841,7 +841,7 @@ def test_mixed_warm_rows_are_not_read_again(tmp_path, monkeypatch, row_bytes):
     try:
         reader.read("w", np.arange(24))
         monkeypatch.setattr(storage.os, "pread", counted)
-        rows = np.array([[4095, 2, 15], [0, 4095, 2]])
+        rows = np.tile([4095, 2, 15, 0, 4095, 2], 2500).reshape(3, -1)
         actual, _ = reader.read("w", rows)
         np.testing.assert_array_equal(actual, raw[rows])
         assert calls == [(reader._start + 4095 * row_bytes, row_bytes)]
@@ -869,7 +869,7 @@ def test_row_crossing_from_a_warm_page_is_read_exactly(tmp_path, monkeypatch):
         offset = reader._start + crossing * row_bytes
         assert offset < storage.PAGE_SIZE < offset + row_bytes
         monkeypatch.setattr(storage.os, "pread", counted)
-        rows = np.array([0, crossing, 0])
+        rows = np.tile([0, crossing, 0], 5000)
         actual, _ = reader.read("w", rows)
         np.testing.assert_array_equal(actual, raw[rows])
         assert calls == [(offset, row_bytes)]
@@ -884,7 +884,7 @@ def test_slow_mixed_warm_gather_rearms_reads(tmp_path, monkeypatch):
         ticks = iter([0.0, 1.0])
         monkeypatch.setattr(storage.time, "perf_counter", lambda: next(ticks))
         monkeypatch.setattr(storage.time, "monotonic", lambda: 100.0)
-        rows = np.array([0, 4095, 2])
+        rows = np.tile([0, 4095, 2], 5000)
         actual, _ = reader.read("w", rows)
         np.testing.assert_array_equal(actual, raw[rows])
         assert reader._seen_pages is None
@@ -1183,3 +1183,40 @@ def test_evicted_weights_do_not_disable_resident_scale_and_bias(tmp_path, monkey
         assert not calls, "weight eviction disabled unrelated resident tensor gathers"
     finally:
         reader.close()
+
+
+@pytest.mark.parametrize("row_bytes", [16, 128, 519])
+@pytest.mark.parametrize("count", [24, 48, 72, 96, 12288])
+def test_narrow_mixed_reads_cover_all_requested_rows(
+    tmp_path, monkeypatch, row_bytes, count
+):
+    path = tmp_path / "narrow-mixed.safetensors"
+    raw = np.random.default_rng(17).integers(0, 256, (4096, row_bytes), dtype=np.uint8)
+    raw_safetensors(path, {"w": (raw, "U8")})
+    reader = storage.TensorFile(path)
+    original = storage.os.pread
+    calls = []
+
+    def counted(fd, length, offset):
+        calls.append((offset, offset + length))
+        return original(fd, length, offset)
+
+    try:
+        reader.read("w", np.arange(24))
+        monkeypatch.setattr(storage.os, "pread", counted)
+        rows = np.resize([4095, 2, 15, 0, 4095, 2], count).reshape(1, -1)
+        actual, _ = reader.read("w", rows)
+        np.testing.assert_array_equal(actual, raw[rows])
+        # Mixed decode and verify reads retain main's full positional-read coverage.
+        for row in np.unique(rows):
+            begin = reader._start + int(row) * row_bytes
+            assert any(
+                low <= begin and begin + row_bytes <= high for low, high in calls
+            )
+        calls.clear()
+        repeated, _ = reader.read("w", rows)
+        assert not calls
+        np.testing.assert_array_equal(repeated, actual)
+    finally:
+        reader.close()
+    np.testing.assert_array_equal(actual, raw[rows])
