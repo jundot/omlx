@@ -9158,3 +9158,36 @@ def test_token_bytes_follow_the_detokenizer_vocab():
     ):
         assert scheduler_module._token_bytes(detokenizer, None, 0) == b" hi"
         assert scheduler_module._token_bytes(detokenizer, None, 1) == b"\xec"
+
+
+class TestMiniMaxM3AdaptivePrefillFromModelPath:
+    """The engine pool sets ``model_name`` to the API model id, so detection
+    from the checkpoint config has to read ``model_path``."""
+
+    def _write_checkpoint(self, tmp_path, model_type):
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model_type": model_type}), encoding="utf-8"
+        )
+        return str(tmp_path)
+
+    @pytest.mark.parametrize("model_type", ["minimax_m3", "minimax_m3_vl"])
+    def test_detects_minimax_m3_from_model_path_when_name_is_model_id(
+        self, tmp_path, mock_model, mock_tokenizer, model_type
+    ):
+        config = SchedulerConfig(
+            model_name="MiniMax-M3.1-Flash-oQ4e-mtp",
+            model_path=self._write_checkpoint(tmp_path, model_type),
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        assert scheduler._minimax_m3_adaptive_prefill is not None
+        assert scheduler._minimax_m3_adaptive_prefill.step_size == 4096
+
+    def test_other_checkpoints_keep_default_prefill(
+        self, tmp_path, mock_model, mock_tokenizer
+    ):
+        config = SchedulerConfig(
+            model_name="Qwen3-0.6B",
+            model_path=self._write_checkpoint(tmp_path, "qwen3"),
+        )
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer, config=config)
+        assert scheduler._minimax_m3_adaptive_prefill is None
