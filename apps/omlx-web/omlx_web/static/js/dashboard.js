@@ -164,7 +164,7 @@
                 server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
-                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
+                scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true, decode_fair_share: 0.5 },
                 cache: { enabled: true, ssd_cache_dir: '', ssd_cache_unavailable: false, ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
@@ -1379,6 +1379,13 @@
                 // Validate required fields
                 const errors = [];
                 const s = this.globalSettings;
+                if (typeof s.scheduler.decode_fair_share !== 'number'
+                    || !Number.isFinite(s.scheduler.decode_fair_share)
+                    || s.scheduler.decode_fair_share < 0 || s.scheduler.decode_fair_share > 1) {
+                    this.saveError = window.t('settings.resource.decode_fair_share_invalid');
+                    this.saving = false;
+                    return;
+                }
                 if (!s.server.host) errors.push(window.t('settings.server.host'));
                 if (!s.server.port) errors.push(window.t('settings.server.port'));
                 if (!s.server.max_audio_upload_size) errors.push(window.t('settings.advanced.max_audio_upload_size'));
@@ -1446,6 +1453,7 @@
                             chunked_prefill: this.globalSettings.scheduler.chunked_prefill,
                             prefill_priority: this.globalSettings.scheduler.prefill_priority,
                             decode_fairness: this.globalSettings.scheduler.decode_fairness,
+                            decode_fair_share: this.globalSettings.scheduler.decode_fair_share,
                             cache_enabled: this.globalSettings.cache.enabled,
                             ssd_cache_dir: this.globalSettings.cache.ssd_cache_dir,
                             ssd_cache_max_size: this.globalSettings.cache.ssd_cache_max_size,

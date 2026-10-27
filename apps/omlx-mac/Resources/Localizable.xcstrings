@@ -1,6 +1,76 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "performance.scheduler.decode_fairness" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prioritize Decoding During Prefill"
+          }
+        }
+      }
+    },
+    "performance.scheduler.decode_fairness.sub" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Let running responses progress between prefill chunks."
+          }
+        }
+      }
+    },
+    "performance.scheduler.decode_fair_share" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decode Fairness Ratio"
+          }
+        }
+      }
+    },
+    "performance.scheduler.decode_fair_share.sub" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decode-time budget per second of competing prefill. Default 0.5; range 0–1. Effects depend on workload and MTP."
+          }
+        }
+      }
+    },
+    "performance.scheduler.decode_fair_share.help" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "At 0, fairness chunk caps remain active. Turn prioritization off to disable fairness. The saved ratio is retained."
+          }
+        }
+      }
+    },
+    "performance.scheduler.decode_fair_share.unavailable" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This server does not expose Decode Fairness Ratio. Update the server to tune it."
+          }
+        }
+      }
+    },
+    "performance.error.decode_fair_share_invalid" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Decode Fairness Ratio must be a finite number between 0 and 1."
+          }
+        }
+      }
+    },
     "settings.button.reset_defaults" : {
       "localizations" : {
         "en" : {
