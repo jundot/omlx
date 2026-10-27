@@ -221,6 +221,7 @@ private struct AuthenticationSection: View {
                 RowSwitch(isOn: vm.bind($vm.skipApiKeyVerification, save: {
                     Task { await vm.saveSkipApiKeyVerification(client: client) }
                 }))
+                .tint(theme.redDot)
             }
             Row(
                 label: String(localized: "security.auth.keyless_inference",
