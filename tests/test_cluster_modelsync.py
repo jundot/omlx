@@ -20,7 +20,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from omlx.cluster import modelsync
+from omlx.cluster import memory_guard, modelsync
 from omlx.cluster.deployment import (
     ClusterDeployment,
     ClusterHost,
@@ -660,6 +660,10 @@ def test_preflight_uses_per_node_model_paths(monkeypatch):
 
     versions = _local_runtime_versions()
     calls = []
+    # The local rank measures live memory, which other test workers consume.
+    monkeypatch.setattr(
+        memory_guard, "ceiling_breakdown", lambda tier: {"hard_limit": 1024**4}
+    )
 
     def runner(argv, **kwargs):
         calls.append(argv)
