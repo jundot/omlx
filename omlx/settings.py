@@ -1996,7 +1996,9 @@ class GlobalSettings:
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
             hot_cache_write_through=self.cache.hot_cache_write_through,
             gdn_ssd_split_enabled=self.cache.get_gdn_ssd_split_enabled(),
-            gdn_ssd_pending_max_bytes=parse_size(self.cache.gdn_ssd_pending_max_size),
+            gdn_ssd_pending_max_bytes=parse_size(
+                self.cache.gdn_ssd_pending_max_size
+            ),
             gdn_sidecar_state_dtype=self.cache.gdn_sidecar_state_dtype,
         )
 

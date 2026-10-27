@@ -3350,6 +3350,17 @@ def test_inference_opt_in_keeps_network_management_requirements(
 
 
 class TestDecodeFairShare:
+    @pytest.mark.parametrize("ratio", [1.1, float("nan")])
+    def test_invalid_persisted_ratio_is_rejected_without_overwriting_file(
+        self, tmp_path, ratio
+    ):
+        path = tmp_path / "settings.json"
+        original = json.dumps({"scheduler": {"decode_fair_share": ratio}})
+        path.write_text(original)
+        with pytest.raises(ValueError, match="decode_fair_share"):
+            GlobalSettings.load(base_path=tmp_path)
+        assert path.read_text() == original
+
     @pytest.mark.parametrize("ratio", [0, 0.1, 0.5, 0.75, 1])
     def test_persistence_and_scheduler_conversion(self, tmp_path, ratio):
         settings = GlobalSettings(base_path=tmp_path)
