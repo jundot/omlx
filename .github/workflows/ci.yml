@@ -47,7 +47,7 @@ jobs:
         run: >-
           python -m pytest tests/ apps/omlx-web/tests apps/omlx-mac/Tests/python
           -m "not slow and not integration"
-          -n 3 --dist loadgroup
+          -n 3 --dist loadgroup --no-loadscope-reorder
           --durations=50 --junitxml=test-results.xml
 
       - name: Run web UI script tests

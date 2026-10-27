@@ -1,4 +1,3 @@
-import fnmatch
 import os
 import struct
 import subprocess
@@ -38,22 +37,125 @@ apply_m5_gather_qmm_workaround()
 
 from omlx.request import Request, SamplingParams
 
-# Model and kernel numerics tests keep the GPU busy. Under --dist loadgroup
-# they share one worker so concurrent command buffers do not trip the Metal
-# GPU timeout. Every other test file stays on a single worker.
-_GPU_SERIAL_TEST_FILES = (
-    "test_deepseek_v4*",
-    "test_glm5_*",
-    "test_glm_moe_*",
-    "test_mlx_lm_mtp_patch.py",
-    "test_mlx_vlm_*",
-    "test_moe_expert_offload.py",
-    "test_qwen35_*",
-    "test_qwen4_*",
-    "test_row_exact_qmv.py",
-    "test_scheduler_chunked_prefill.py",
-    "test_sdpa*",
-)
+# Tests that keep the GPU busy for seconds on the CI runner. Under --dist
+# loadgroup they share one worker so concurrent command buffers do not trip the
+# Metal GPU timeout. Every other test runs with the rest of its file. Add a test
+# here when CI reports kIOGPUCommandBufferCallbackErrorTimeout for it.
+_GPU_SERIAL_TESTS = {
+    "test_deepseek_v41.py": {
+        "test_chunk_boundaries_and_late_join",
+        "test_in_place_cache_growth_matches_concatenation",
+        "test_official_prefill_decode",
+        "test_persistent_cache_is_packed_and_decode_only_unpacks_selected_rows",
+        "test_real_vlm_engine_text_and_images",
+        "test_vision_and_aligner_reference",
+    },
+    "test_deepseek_v41_activation.py": {
+        "test_normal_scales_are_exact_and_nonzero",
+    },
+    "test_deepseek_v41_fused_decode.py": {
+        "test_batched_decode_matches_single_requests",
+        "test_batched_mma_kernels_match_rows_kernels",
+        "test_batched_moe_matches_single_token_moe",
+        "test_fused_decode_matches_unfused_block",
+        "test_mtp_generation_matches_greedy_with_fused_kernels",
+        "test_offloaded_experts_decode_on_the_unfused_path",
+        "test_verify_block_matches_token_by_token_decode",
+    },
+    "test_deepseek_v41_prefill_backpressure.py": {
+        "test_v41_prefill_evals_stream_per_layer",
+    },
+    "test_deepseek_v4_batch_padding.py": {
+        "test_short_request_after_long_one_leaves_batch",
+    },
+    "test_deepseek_v4_dspark.py": {
+        "test_dspark_target_tap_and_parallel_draft_shapes",
+    },
+    "test_deepseek_v4_offload.py": {
+        "test_wrap_and_release_return_descriptors_to_baseline",
+        "test_wrap_replaces_module_and_keeps_only_slots",
+    },
+    "test_deepseek_v4_patch.py": {
+        "test_deepseek_patch_preserves_mixed_model_owned_conversion",
+    },
+    "test_glm5_next_mtp.py": {
+        "test_vector_restore_and_continuation_match_scalar",
+    },
+    "test_glm_moe_dsa_offload.py": {
+        "test_wrap_and_release_return_descriptors_to_baseline",
+    },
+    "test_mlx_lm_mtp_patch.py": {
+        "test_context_copy_drafts_keep_greedy_output",
+        "test_copied_drafts_preserve_filtered_target_marginal",
+        "test_multi_request_mtp_or_singleton_only_matches_standard",
+        "test_qwen_late_join_as_batch_row_finishes_skips_history_replay",
+        "test_shared_verify_boundary_emit_uses_private_row_cache",
+        "test_singleton_mtp_rebinds_positions_after_prefill_clear",
+        "test_sparse_stochastic_acceptance_preserves_filtered_target_marginal",
+        "test_stochastic_acceptance_preserves_target_marginal",
+        "test_vector_commit_matches_scalar_states_and_ordinary_tokens",
+    },
+    "test_mlx_vlm_glm5_next_compat.py": {
+        "test_bitwise_equal_to_canonical_path_without_tf32",
+        "test_sparse_attention_native_routes_get_fp16_despite_fp32_activations",
+    },
+    "test_mlx_vlm_qwen4_exp_compat.py": {
+        "test_qwen4_fp16_model_stays_fp16_with_bf16_ple_table",
+    },
+    "test_moe_expert_offload.py": {
+        "test_overlap_matches_serial_cache_state",
+    },
+    "test_qwen35_moe_routed_decode.py": {
+        "test_bf16_shared_expert_stays_composed_and_bit_identical",
+        "test_experts_past_the_bound_view_are_read_from_the_stacked_weights",
+        "test_tied_router_logits_route_like_the_served_block",
+    },
+    "test_qwen35_moe_router.py": {
+        "test_fused_combine_sigmoid_matches_every_gate_encoding",
+    },
+    "test_qwen35_moe_verify_window.py": {
+        "test_batched_decode_rows_equal_one_token_decode",
+        "test_four_bit_window_rows_equal_one_token_decode",
+        "test_kernel_failure_falls_back_to_the_composed_verifier",
+        "test_router_ties_and_high_experts",
+        "test_top8_window_and_batched_rows_equal_one_token_decode",
+        "test_window_rows_equal_one_token_decode",
+    },
+    "test_qwen35_verify_sdpa_split.py": {
+        "test_chain_tail_matches_cache_writes",
+    },
+    "test_qwen35_yarn_without_mlx_vlm.py": {
+        "test_yarn_patch_imports_and_applies_without_mlx_vlm",
+    },
+    "test_qwen4_batch_qsa_indexer.py": {
+        "test_indexer_capacity_matches_concatenate_bit_for_bit",
+    },
+    "test_qwen4_hc_fused.py": {
+        "test_decode_and_verify_rows_match_eager_writes",
+        "test_prefill_chunks_match_eager_writes",
+    },
+    "test_qwen4_ple_load_resources_cpu.py": {
+        "test_real_loader_wrapper_strict_failure_closes_retained_model",
+    },
+    "test_qwen4_qsa_reserved_capacity.py": {
+        "test_scheduler_reserves_kv_once_and_decode_grows_in_steps",
+    },
+    "test_qwen4_verify_attention_rows.py": {
+        "test_masked_verify_rollback_then_decode_matches_serial",
+        "test_masked_verify_rows_equal_serial_decode_steps",
+    },
+    "test_row_exact_qmv.py": {
+        "test_rows_equal_one_row_quantized_matmul",
+    },
+    "test_sdpa256_attention.py": {
+        "test_flash_sdpa256_memory_is_sub_quadratic",
+    },
+}
+
+
+def _gpu_serial(item) -> bool:
+    name = getattr(item, "originalname", item.name)
+    return name in _GPU_SERIAL_TESTS.get(item.path.name, ())
 
 
 @pytest.hookimpl(tryfirst=True)  # Before xdist reads the xdist_group markers.
@@ -61,12 +163,12 @@ def pytest_collection_modifyitems(config, items):
     if not config.pluginmanager.hasplugin("xdist"):
         return
     for item in items:
-        name = item.path.name
-        if any(fnmatch.fnmatch(name, pattern) for pattern in _GPU_SERIAL_TEST_FILES):
-            group = "gpu"
-        else:
-            group = item.nodeid.split("::", 1)[0]
+        group = "gpu" if _gpu_serial(item) else item.nodeid.split("::", 1)[0]
         item.add_marker(pytest.mark.xdist_group(group))
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        # With --no-loadscope-reorder, groups start in collection order; start
+        # the long serial group first.
+        items.sort(key=lambda item: not _gpu_serial(item))
 
 
 @pytest.fixture
