@@ -3495,6 +3495,7 @@ class TestDecodeFairShare:
         from unittest.mock import AsyncMock
 
         from fastapi import HTTPException
+
         from omlx.admin import routes
         from omlx.server import _server_state
 
