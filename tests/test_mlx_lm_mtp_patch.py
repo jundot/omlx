@@ -5225,22 +5225,22 @@ def test_batch_policy_skips_copied_windows(monkeypatch):
         mlx_lm_mtp.set_mtp_active(previous)
 
 
-@pytest.mark.parametrize("wide_window", [False, True])
-def test_context_copy_width_follows_the_targets_verify_window(wide_window):
+@pytest.mark.parametrize("family, width", [("qwen4", 15), ("glm5", 7)])
+def test_context_copy_width_follows_the_targets_verify_window(family, width):
     """A verbatim run after a whole accept copies 15 tokens only for a target
-    that verifies 16-row windows; other targets (GLM-5.3 rolls back at most
-    8 rows) keep 7-token copies."""
-    from omlx.patches.mlx_lm_mtp import context_copy
-
+    that verifies 16-row windows. GLM-5.3 is row-exact too, but its indexer
+    pool rolls back at most 8 rows, so it keeps 7-token copies."""
     source = list(range(1000, 1200))
     history = source + source[:100]  # the tail repeats the source verbatim
-    copier = context_copy.ContextCopy(wide_window=wide_window)
-    copier.extend(history, [])
-    assert copier.propose(64) == source[100:107]
-    copier.observe(7, 7)
-    copier.extend(history + source[100:107], [])
-    expected = 15 if wide_window else 7
-    assert copier.propose(64) == source[107 : 107 + expected]
+    gen_batch = SimpleNamespace(
+        model=_model(family), tokens=[history], max_tokens=[1000], _num_tokens=[0]
+    )
+    state = SimpleNamespace(context_copy=None)
+    assert bg._context_copy_drafts(gen_batch, state, []) == source[100:107]
+    state.context_copy.observe(7, 7)
+    gen_batch.tokens = [history + source[100:107]]
+    copied = bg._context_copy_drafts(gen_batch, state, [])
+    assert copied == source[107 : 107 + width]
 
 
 @pytest.mark.parametrize("size", [2, 4])

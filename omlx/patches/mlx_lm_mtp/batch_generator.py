@@ -4206,6 +4206,19 @@ def _predraft(gen_batch, state, drafter, captured, host_arr, m_arr, anchor) -> b
     return bool(predraft(gen_batch, state, captured, m_arr + 1, anchor))
 
 
+def _max_verify_rows(model: Any) -> Optional[int]:
+    """The target's ``_omlx_mtp_max_verify_rows`` cap, or None without one."""
+    for candidate in (
+        model,
+        getattr(model, "_language_model", None),
+        getattr(model, "language_model", None),
+    ):
+        rows = getattr(candidate, "_omlx_mtp_max_verify_rows", None)
+        if rows is not None:
+            return int(rows)
+    return None
+
+
 def _context_copy_drafts(
     gen_batch: Any,
     state: _MtpState,
@@ -4223,8 +4236,12 @@ def _context_copy_drafts(
     of exactly that many tokens replaces the drafter's block.
     """
     if state.context_copy is None:
+        # A wide copy verifies MAX_COPY + 1 rows, so it must fit the target's
+        # verify cap (GLM-5.3's indexer pool rolls back at most 8 rows).
+        cap = _max_verify_rows(gen_batch.model)
         state.context_copy = _context_copy.ContextCopy(
             wide_window=_row_exact_verify(gen_batch.model)
+            and (cap is None or cap > _context_copy.MAX_COPY)
         )
     copier = state.context_copy
     state.copy_untimed = copier.extend(gen_batch.tokens[0], committed_ids)
