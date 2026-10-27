@@ -316,6 +316,8 @@ Point `--model-dir` at a directory containing MLX-format model subdirectories. T
 
 Models are auto-detected by type. You can also download models directly from the admin dashboard.
 
+Model directories on disconnected drives or without read permission remain in your settings and are skipped during discovery. Reconnect the drive or restore access, then reload models or restart oMLX to discover them again.
+
 | Type | Models |
 |------|--------|
 | LLM | Any model supported by [mlx-lm](https://github.com/ml-explore/mlx-lm) |

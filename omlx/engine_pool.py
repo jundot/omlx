@@ -69,7 +69,6 @@ from .exceptions import (
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     detect_model_type,
-    discover_models,
     format_size,
     is_realtime_stt_model,
 )
@@ -1538,10 +1537,7 @@ class EnginePool:
         self._model_dirs = dirs
 
         gguf_root = _gguf_model_root()
-        if len(dirs) == 1:
-            discovered = discover_models(dirs[0], gguf_root)
-        else:
-            discovered = discover_models_from_dirs(dirs, gguf_root)
+        discovered = discover_models_from_dirs(dirs, gguf_root)
 
         pinned_set = set(pinned_models or [])
 

@@ -2564,7 +2564,11 @@ def init_server(
     for md in dir_list:
         model_path = Path(md)
         if not model_path.exists():
-            model_path.mkdir(parents=True, exist_ok=True)
+            try:
+                model_path.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                logger.warning(f"Model directory unavailable, skipping: {md} ({e})")
+                continue
             logger.warning(f"Model directory created (empty): {md}")
 
     # Create engine pool. The pool consults enforcer.get_final_ceiling()

@@ -1664,8 +1664,8 @@ class GlobalSettings:
             fallback_dir.mkdir(parents=True, exist_ok=True)
             self.cache.unavailable_ssd_cache_dir = cache_dir
 
-        # Model directories - skip unavailable paths (e.g. disconnected external drive)
-        valid_dirs = []
+        # Model directories may be temporarily unavailable (e.g. an external drive).
+        # Keep configured paths so discovery can find them after reconnection.
         for directory in self.model.get_model_dirs(self.base_path):
             if not directory.exists():
                 try:
@@ -1681,12 +1681,6 @@ class GlobalSettings:
             if access_error is not None:
                 logger.warning(f"Model directory unavailable, skipping: {access_error}")
                 continue
-
-            valid_dirs.append(str(directory))
-
-        # Update model_dirs to only include valid paths
-        self.model.model_dirs = valid_dirs
-        self.model.model_dir = None
 
     def validate(self) -> list[str]:
         """

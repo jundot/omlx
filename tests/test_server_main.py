@@ -321,3 +321,38 @@ def test_download_queues_are_wired_for_restart_resume(wired_downloaders):
 
     hf.restore_tasks.assert_awaited_once()
     ms.restore_tasks.assert_awaited_once()
+
+
+@pytest.mark.parametrize("failure", ["missing", "unreadable"])
+def test_init_server_with_unavailable_model_dir(tmp_path, monkeypatch, failure):
+    """A sole offline model root must not block startup or be forgotten."""
+    from omlx import server
+    from omlx.settings import GlobalSettings
+
+    monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path / "base"))
+    settings = GlobalSettings(base_path=tmp_path / "base")
+    external = tmp_path / "external_models"
+    settings.model.model_dirs = [str(external)]
+    settings.huggingface.hf_cache_enabled = False
+    if failure == "unreadable":
+        external.mkdir()
+    original_mkdir = Path.mkdir
+    original_iterdir = Path.iterdir
+
+    def offline_mkdir(path, *args, **kwargs):
+        if path == external:
+            raise OSError("Drive is disconnected")
+        return original_mkdir(path, *args, **kwargs)
+
+    def offline_iterdir(path):
+        if path == external:
+            raise PermissionError("Operation not permitted")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "mkdir", offline_mkdir)
+    monkeypatch.setattr(Path, "iterdir", offline_iterdir)
+    monkeypatch.setattr(server.app, "middleware_stack", None)
+    with patch("mlx.core.set_cache_limit"):
+        server.init_server(model_dirs=[str(external)], global_settings=settings)
+    assert settings.model.model_dirs == [str(external)]
+    assert server.get_engine_pool()._model_dirs == [external]

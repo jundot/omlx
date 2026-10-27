@@ -108,6 +108,21 @@ class TestEnginePoolInit:
         assert "model-a" in pool.get_model_ids()
         assert "model-b" in pool.get_model_ids()
 
+    def test_discover_reconnected_single_directory(self, tmp_path):
+        """Retain a missing sole root and find its models on the next scan."""
+        root = tmp_path / "external_models"
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(root))
+        assert pool.model_count == 0
+        assert pool._model_dirs == [root]
+
+        model = root / "returned-model"
+        model.mkdir(parents=True)
+        (model / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model / "model.safetensors").write_bytes(b"\x00" * 100)
+        pool.discover_models([str(path) for path in pool._model_dirs])
+        assert pool.get_model_ids() == ["returned-model"]
+
     def test_discover_models_with_pinned(self, small_mock_model_dir):
         """Test model discovery with pinned models."""
         pool = _make_pool(ceiling=10 * 1024**3)

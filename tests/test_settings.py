@@ -1548,46 +1548,75 @@ class TestGlobalSettings:
         assert config.paged_ssd_cache_max_size == 180 * 1024**3
         assert config.paged_ssd_cache_auto_size is False
 
-    def test_ensure_directories_unavailable_model_dir(self):
-        """Test that unavailable model dirs are skipped instead of crashing."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            base = Path(tmpdir) / "omlx"
-            valid_models = Path(tmpdir) / "valid_models"
-            unavailable = Path("/Volumes/NonExistentDrive/Models")
+    @pytest.mark.parametrize("all_unavailable", [False, True])
+    @pytest.mark.parametrize("failure", ["missing", "unreadable"])
+    def test_save_preserves_unavailable_model_dirs(
+        self, tmp_path, monkeypatch, all_unavailable, failure
+    ):
+        """Saving offline keeps paths and order; reconnecting restores discovery."""
+        from omlx.model_discovery import discover_models_from_dirs
 
-            settings = GlobalSettings(base_path=base)
-            settings.model.model_dirs = [str(valid_models), str(unavailable)]
-            settings.ensure_directories()
-
-            assert base.exists()
-            assert valid_models.exists()
-            # Unavailable path should be removed from model_dirs
-            resolved_dirs = settings.model.get_model_dirs(base)
-            assert len(resolved_dirs) == 1
-            assert resolved_dirs[0] == valid_models.resolve()
-
-    def test_ensure_directories_unreadable_model_dir(self, tmp_path, monkeypatch):
-        """Test that existing but unreadable model dirs are skipped."""
         base = tmp_path / "omlx"
-        valid_models = tmp_path / "valid_models"
-        unreadable = tmp_path / "unreadable_models"
-        unreadable.mkdir()
-
-        original_iterdir = Path.iterdir
-
-        def fake_iterdir(path):
-            if path == unreadable.resolve():
-                raise PermissionError("Operation not permitted")
-            return original_iterdir(path)
-
-        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+        local = tmp_path / "local_models"
+        external = tmp_path / "external_models"
+        configured = [str(external)]
+        if not all_unavailable:
+            configured.append(str(local))
+        if failure == "unreadable":
+            external.mkdir()
 
         settings = GlobalSettings(base_path=base)
-        settings.model.model_dirs = [str(valid_models), str(unreadable)]
-        settings.ensure_directories()
+        settings.huggingface.hf_cache_enabled = False
+        settings.model.model_dirs = configured.copy()
+        original_mkdir = Path.mkdir
+        original_iterdir = Path.iterdir
 
-        resolved_dirs = settings.model.get_model_dirs(base)
-        assert resolved_dirs == [valid_models.resolve()]
+        with monkeypatch.context() as offline:
+
+            def offline_mkdir(path, *args, **kwargs):
+                if path == external:
+                    raise OSError("Drive is disconnected")
+                return original_mkdir(path, *args, **kwargs)
+
+            def offline_iterdir(path):
+                if path == external:
+                    raise PermissionError("Operation not permitted")
+                return original_iterdir(path)
+
+            offline.setattr(Path, "mkdir", offline_mkdir)
+            offline.setattr(Path, "iterdir", offline_iterdir)
+            settings.ensure_directories()
+            settings.server.port = 8765
+            settings.save()
+            saved = json.loads((base / "settings.json").read_text())
+            assert saved["model"]["model_dirs"] == configured
+            assert settings.model.model_dirs == configured
+            assert discover_models_from_dirs(settings.get_effective_model_dirs()) == {}
+
+        # A rescan in this process and a later restart must both find the drive.
+        model = external / "reconnected-model"
+        model.mkdir(parents=True)
+        (model / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model / "model.safetensors").write_bytes(b"\x00" * 100)
+        assert "reconnected-model" in discover_models_from_dirs(
+            settings.get_effective_model_dirs()
+        )
+        restored = GlobalSettings.load(base_path=base)
+        assert restored.model.model_dirs == configured
+        assert restored.server.port == 8765
+        assert "reconnected-model" in discover_models_from_dirs(
+            restored.get_effective_model_dirs()
+        )
+
+    def test_ensure_directories_preserves_legacy_model_dir(self, tmp_path):
+        """Directory creation must not clear the deprecated configured path."""
+        settings = GlobalSettings(base_path=tmp_path / "omlx")
+        legacy = str(tmp_path / "legacy")
+        settings.model.model_dir = legacy
+        settings.ensure_directories()
+        assert settings.model.model_dir == legacy
+        assert settings.model.model_dirs == []
+        assert Path(legacy).is_dir()
 
     def test_validate_valid_settings(self):
         """Test validation with valid settings."""
