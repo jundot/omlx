@@ -5913,7 +5913,9 @@ async def update_global_settings(
             )
         if request.decode_fair_share is not None:
             runtime_applied.append("decode_fair_share")
-            logger.info("Decode fairness ratio set to %g (live)", request.decode_fair_share)
+            logger.info(
+                "Decode fairness ratio set to %g (live)", request.decode_fair_share
+            )
 
     if pending_max_concurrent_requests is not None:
         from ..server import _server_state
