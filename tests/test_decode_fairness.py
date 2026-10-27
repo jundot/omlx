@@ -50,6 +50,16 @@ def _make_scheduler(**config_kwargs) -> Scheduler:
 
 
 class TestPrefillGate:
+
+    @pytest.mark.parametrize("ratio", [0, 0.1, 0.5, 1])
+    def test_configured_ratio_accrues_debt_without_changing_chunk_cap(self, ratio):
+        s = _make_scheduler(decode_fair_share=ratio)
+        s.running = {"r1": MagicMock()}
+        s._decode_time_owed_s = 0.2
+        s._accrue_decode_debt(2.0)
+        assert s._decode_time_owed_s == pytest.approx(0.2 + 2 * ratio)
+        assert s._decode_fairness is True
+
     def test_open_when_fairness_disabled(self):
         s = _make_scheduler(decode_fairness=False)
         s.running = {"r1": MagicMock()}

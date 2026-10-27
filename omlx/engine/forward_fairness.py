@@ -87,8 +87,9 @@ class ForwardFairnessGate:
                 else (1.0 - _EMA_ALPHA) * ema + _EMA_ALPHA * per_item
             )
         if contended or self.contended():
+            ratio = getattr(self._config, "decode_fair_share", _DECODE_FAIR_SHARE)
             get_decode_activity().extend_hold(
-                time.perf_counter() + max(0.0, forward_seconds) * _DECODE_FAIR_SHARE
+                time.perf_counter() + max(0.0, forward_seconds) * ratio
             )
 
     def should_clear_cache(self) -> bool:
