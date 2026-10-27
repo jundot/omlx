@@ -31,7 +31,8 @@ struct LogsScreen: View {
                 case .raw: LogRawPane(vm: vm)
                 }
             }
-            .frame(minHeight: 360, idealHeight: 480, maxHeight: .infinity)
+            // 346, not 360: keeps the header's top inset at the default window height.
+            .frame(minHeight: 346, idealHeight: 480, maxHeight: .infinity)
             .padding(.horizontal, 14)
             .padding(.bottom, 8)
 
