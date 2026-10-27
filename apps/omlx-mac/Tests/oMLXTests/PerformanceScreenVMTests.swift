@@ -233,3 +233,134 @@ final class PerformanceScreenVMTests: XCTestCase {
         XCTAssertEqual(balanced.binding, "dynamic")
     }
 }
+
+extension PerformanceScreenVMTests {
+    private func fairnessClient(port: Int = 18161) -> OMLXClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DecodeFairnessURLProtocol.self]
+        return OMLXClient(port: port, session: URLSession(configuration: configuration))
+    }
+
+    func testFairnessLoadResetAndCancelRetainDraft() async {
+        let vm = PerformanceScreenVM()
+        let client = fairnessClient()
+        await vm.load(client: client)
+        XCTAssertTrue(vm.supportsDecodeFairShare)
+        XCTAssertEqual(vm.parsedDecodeFairShare, 0.5)
+        vm.decodeFairShareText = "0.75"
+        vm.decodeFairness = false
+        await vm.resetDefaults(client: client)
+        XCTAssertEqual(vm.parsedDecodeFairShare, 0.5)
+        XCTAssertTrue(vm.decodeFairness)
+        vm.cancelReset()
+        XCTAssertEqual(vm.parsedDecodeFairShare, 0.75)
+        XCTAssertFalse(vm.decodeFairness)
+        await vm.save(client: client)
+        XCTAssertNil(vm.lastError)
+        XCTAssertFalse(vm.hasPendingChanges)
+    }
+
+    func testFairnessOldServerDoesNotSendUnsupportedFields() async {
+        let vm = PerformanceScreenVM()
+        let client = fairnessClient(port: 18162)
+        await vm.load(client: client)
+        XCTAssertFalse(vm.supportsDecodeFairShare)
+        XCTAssertFalse(vm.supportsDecodeFairness)
+        vm.decodeFairShareText = "0.25"
+        vm.decodeFairness = false
+        XCTAssertFalse(vm.hasPendingChanges)
+        await vm.save(client: client)
+        XCTAssertNil(vm.lastError)
+    }
+
+    func testFairnessFailedSaveRetainsPendingValue() async {
+        let vm = PerformanceScreenVM()
+        let client = fairnessClient(port: 18163)
+        await vm.load(client: client)
+        vm.decodeFairShareText = "0.25"
+        await vm.save(client: client)
+        XCTAssertNotNil(vm.lastError)
+        XCTAssertEqual(vm.loadedDecodeFairShare, 0.5)
+        XCTAssertEqual(vm.parsedDecodeFairShare, 0.25)
+        XCTAssertTrue(vm.hasPendingChanges)
+    }
+
+    func testFairnessZeroAndInvalidInput() async {
+        let vm = PerformanceScreenVM()
+        let client = fairnessClient(port: 18164)
+        await vm.load(client: client)
+        for text in ["", "NaN", "infinity", "-0.1", "1.1"] {
+            vm.decodeFairShareText = text
+            await vm.save(client: client)
+            XCTAssertNotNil(vm.lastError)
+            XCTAssertNil(vm.parsedDecodeFairShare)
+        }
+        vm.decodeFairShareText = "0"
+        await vm.save(client: client)
+        XCTAssertNil(vm.lastError)
+        XCTAssertEqual(vm.loadedDecodeFairShare, 0)
+        XCTAssertFalse(vm.hasPendingChanges)
+    }
+}
+
+private final class DecodeFairnessURLProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "127.0.0.1" && (18161...18164).contains(request.url?.port ?? 0)
+    }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        do {
+            let port = request.url!.port!
+            var status = 200
+            let body: Data
+            if request.httpMethod == "GET" {
+                let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+                    .appendingPathComponent("Fixtures/global-settings.json")
+                var json = try JSONSerialization.jsonObject(with: Data(contentsOf: path)) as! [String: Any]
+                var scheduler = json["scheduler"] as! [String: Any]
+                if port != 18162 {
+                    scheduler["decode_fairness"] = true
+                    scheduler["decode_fair_share"] = 0.5
+                }
+                json["scheduler"] = scheduler
+                body = try JSONSerialization.data(withJSONObject: json)
+            } else {
+                var data = request.httpBody ?? Data()
+                if data.isEmpty, let stream = request.httpBodyStream {
+                    stream.open()
+                    defer { stream.close() }
+                    var buffer = [UInt8](repeating: 0, count: 4096)
+                    while stream.hasBytesAvailable {
+                        let count = stream.read(&buffer, maxLength: buffer.count)
+                        if count <= 0 { break }
+                        data.append(contentsOf: buffer.prefix(count))
+                    }
+                }
+                let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+                switch port {
+                case 18161:
+                    XCTAssertEqual(json["decode_fair_share"] as? Double, 0.75)
+                    XCTAssertEqual(json["decode_fairness"] as? Bool, false)
+                    XCTAssertEqual(json.count, 2, "Only changed settings should be sent")
+                case 18162:
+                    XCTAssertNil(json["decode_fair_share"])
+                    XCTAssertNil(json["decode_fairness"])
+                case 18163:
+                    XCTAssertEqual(json["decode_fair_share"] as? Double, 0.25)
+                    status = 500
+                default:
+                    XCTAssertEqual(json["decode_fair_share"] as? Double, 0)
+                    XCTAssertEqual(json.count, 1)
+                }
+                body = Data((status == 200 ? "{\"success\":true,\"message\":\"saved\",\"runtime_applied\":[\"decode_fair_share\"]}" : "{\"detail\":\"test save failure\"}").utf8)
+            }
+            let response = HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: body)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+    override func stopLoading() {}
+}

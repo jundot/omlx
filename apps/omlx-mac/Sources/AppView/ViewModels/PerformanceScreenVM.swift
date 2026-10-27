@@ -8,6 +8,10 @@ final class PerformanceScreenVM {
     var embeddingBatchSizeText: String = "32"
     var chunkedPrefill: Bool = false
     var prefillPriority: String = "context"
+    var decodeFairness: Bool = true
+    var decodeFairShareText: String = "0.5"
+    private(set) var supportsDecodeFairness = false
+    private(set) var supportsDecodeFairShare = false
 
     // Memory & Lifecycle
     var prefillMemoryGuard: Bool = false
@@ -30,6 +34,8 @@ final class PerformanceScreenVM {
     private(set) var loadedEmbeddingBatchSize: Int = 32
     private(set) var loadedChunkedPrefill: Bool = false
     private(set) var loadedPrefillPriority: String = "context"
+    private(set) var loadedDecodeFairness: Bool = true
+    private(set) var loadedDecodeFairShare: Double = 0.5
     private(set) var loadedPrefillMemoryGuard: Bool = false
     private(set) var loadedMemoryGuardTier: String = "balanced"
     private(set) var loadedMemoryGuardCustomCeilingGb: Double = 0
@@ -61,6 +67,8 @@ final class PerformanceScreenVM {
             || parsedEmbeddingBatchSize != loadedEmbeddingBatchSize
             || chunkedPrefill != loadedChunkedPrefill
             || prefillPriority != loadedPrefillPriority
+            || (supportsDecodeFairness && decodeFairness != loadedDecodeFairness)
+            || (supportsDecodeFairShare && parsedDecodeFairShare != loadedDecodeFairShare)
             || prefillMemoryGuard != loadedPrefillMemoryGuard
             || canonicalMemoryGuardTier(memoryGuardTier) != loadedMemoryGuardTier
             || parsedMemoryGuardCustomCeiling != loadedMemoryGuardCustomCeilingGb
@@ -83,6 +91,8 @@ final class PerformanceScreenVM {
             embeddingBatchSizeText: embeddingBatchSizeText,
             chunkedPrefill: chunkedPrefill,
             prefillPriority: prefillPriority,
+            decodeFairness: decodeFairness,
+            decodeFairShareText: decodeFairShareText,
             prefillMemoryGuard: prefillMemoryGuard,
             memoryGuardTier: memoryGuardTier,
             memoryGuardCustomCeilingText: memoryGuardCustomCeilingText,
@@ -103,6 +113,8 @@ final class PerformanceScreenVM {
                 self.embeddingBatchSizeText = previous.embeddingBatchSizeText
                 self.chunkedPrefill = previous.chunkedPrefill
                 self.prefillPriority = previous.prefillPriority
+                self.decodeFairness = previous.decodeFairness
+                self.decodeFairShareText = previous.decodeFairShareText
                 self.prefillMemoryGuard = previous.prefillMemoryGuard
                 self.memoryGuardTier = previous.memoryGuardTier
                 self.memoryGuardCustomCeilingText = previous.memoryGuardCustomCeilingText
@@ -122,6 +134,8 @@ final class PerformanceScreenVM {
                 self.chunkedPrefill = sched.chunkedPrefill ?? false
                 let priority = sched.prefillPriority == "speed" ? "speed" : "context"
                 self.prefillPriority = priority
+                self.decodeFairness = sched.decodeFairness ?? true
+                self.decodeFairShareText = trimDouble(sched.decodeFairShare ?? 0.5)
             }
             if let mem = s.memory {
                 self.prefillMemoryGuard = mem.prefillMemoryGuard ?? false
@@ -178,6 +192,12 @@ final class PerformanceScreenVM {
                 let priority = sched.prefillPriority == "speed" ? "speed" : "context"
                 self.prefillPriority = priority
                 self.loadedPrefillPriority = priority
+                self.supportsDecodeFairness = sched.decodeFairness != nil
+                self.supportsDecodeFairShare = sched.decodeFairShare != nil
+                self.decodeFairness = sched.decodeFairness ?? true
+                self.loadedDecodeFairness = self.decodeFairness
+                self.decodeFairShareText = trimDouble(sched.decodeFairShare ?? 0.5)
+                self.loadedDecodeFairShare = sched.decodeFairShare ?? 0.5
             }
             if let mem = s.memory {
                 self.prefillMemoryGuard = mem.prefillMemoryGuard ?? false
@@ -235,6 +255,11 @@ final class PerformanceScreenVM {
                                     comment: "Performance screen error when embedding batch size input is invalid")
             return
         }
+        if supportsDecodeFairShare && parsedDecodeFairShare == nil {
+            self.lastError = String(localized: "performance.error.decode_fair_share_invalid",
+                                    defaultValue: "Decode Fairness Ratio must be a finite number between 0 and 1.")
+            return
+        }
         // Idle timeout: empty or "0" = explicit null (disable), matching the
         // WebUI's "None (disabled)" option. Non-zero must be >= 60; the
         // server enforces the minimum.
@@ -289,6 +314,13 @@ final class PerformanceScreenVM {
         if prefillPriority != loadedPrefillPriority {
             patch.prefillPriority = prefillPriority
         }
+        if supportsDecodeFairness && decodeFairness != loadedDecodeFairness {
+            patch.decodeFairness = decodeFairness
+        }
+        if supportsDecodeFairShare, let ratio = parsedDecodeFairShare,
+           ratio != loadedDecodeFairShare {
+            patch.decodeFairShare = ratio
+        }
         // Memory & lifecycle
         if prefillMemoryGuard != loadedPrefillMemoryGuard {
             patch.memoryPrefillMemoryGuard = prefillMemoryGuard
@@ -332,6 +364,8 @@ final class PerformanceScreenVM {
             self.loadedEmbeddingBatchSize = embeddingBatchSize
             self.loadedChunkedPrefill = chunkedPrefill
             self.loadedPrefillPriority = prefillPriority
+            self.loadedDecodeFairness = decodeFairness
+            if let ratio = parsedDecodeFairShare { self.loadedDecodeFairShare = ratio }
             self.loadedPrefillMemoryGuard = prefillMemoryGuard
             self.loadedMemoryGuardTier = tier
             self.loadedMemoryGuardCustomCeilingGb = customCeiling
@@ -355,6 +389,12 @@ final class PerformanceScreenVM {
     }
 
     // MARK: - Parsing helpers
+
+    var parsedDecodeFairShare: Double? {
+        guard let value = Double(trim(decodeFairShareText)),
+              value.isFinite, (0...1).contains(value) else { return nil }
+        return value
+    }
 
     private var parsedMaxConcurrent: Int? {
         Int(maxConcurrentText.trimmingCharacters(in: .whitespaces))
