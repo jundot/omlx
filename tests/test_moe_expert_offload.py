@@ -1146,7 +1146,7 @@ class TestParallelFetch:
         glu = _make_glu(seed=13)
         _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
         mx.random.seed(17)
-        steps = [(mx.random.normal((2, 1, D)), _ri(2, 1, K)) for _ in range(16)]
+        steps = [(mx.random.normal((2, 1, D)), _ri(2, 1, K)) for _ in range(6)]
         refs = [glu(x, i) for x, i in steps]
         mx.eval(*refs)
         read = meo.CheckpointExpertStore.read

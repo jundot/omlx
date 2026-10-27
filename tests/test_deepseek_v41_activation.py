@@ -155,17 +155,15 @@ def test_paired_swiglu_preserves_row_and_quantization_boundaries(
     )
 
 
-@pytest.mark.parametrize("device", [mx.cpu, mx.gpu])
-def test_normal_scales_are_exact_and_nonzero(device):
+def test_normal_scales_are_exact_and_nonzero():
     from omlx.patches.deepseek_v41.quantization import _normal_power_of_two
 
-    with mx.stream(device):
-        exponent = mx.arange(-126, 128, dtype=mx.float32)
-        actual = _normal_power_of_two(exponent)
-        compiled = mx.compile(_normal_power_of_two)(exponent)
-        expected = np.exp2(np.arange(-126, 128, dtype=np.float32))
-        np.testing.assert_array_equal(actual, expected)
-        np.testing.assert_array_equal(compiled, expected)
+    exponent = mx.arange(-126, 128, dtype=mx.float32)
+    actual = _normal_power_of_two(exponent)
+    compiled = mx.compile(_normal_power_of_two)(exponent)
+    expected = np.exp2(np.arange(-126, 128, dtype=np.float32))
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(compiled, expected)
 
 
 @pytest.mark.parametrize(

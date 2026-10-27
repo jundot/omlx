@@ -72,14 +72,14 @@ def test_flash_sdpa256_chunked_prefill_offset_causal(q_len, k_len):
 
 
 def test_flash_sdpa256_memory_is_sub_quadratic():
-    """Peak memory must grow ~O(L), not O(L^2). Over an 8K->32K span (4x in L)
+    """Peak memory must grow ~O(L), not O(L^2). Over a 4K->16K span (4x in L)
     O(L^2) would grow ~16x; we require < 6x (O(L) is ~4x), a sharp signal."""
     if not hasattr(mx, "reset_peak_memory"):
         return  # peak-memory API unavailable on this MLX build; skip
     from omlx.patches.sdpa256_attention import _flash_sdpa256
 
     peaks = []
-    for seq_len in (8192, 32768):
+    for seq_len in (4096, 16384):
         baseline = mx.get_active_memory()
         q, k, v = _qkv(seq_len, seq_len, n_q=6, n_kv=1)
         mx.eval(_flash_sdpa256(q, k, v, SCALE_256, "causal"))

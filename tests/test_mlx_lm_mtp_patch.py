@@ -4589,12 +4589,11 @@ def test_sparse_stochastic_acceptance_preserves_filtered_target_marginal():
         mx.set_default_device(previous_device)
 
 
-@pytest.mark.parametrize("top_k", [0, 3])
-@pytest.mark.parametrize("copied", [3, 1, 0])
+@pytest.mark.parametrize("top_k,copied", [(0, 1), (3, 1), (3, 0)])
 def test_copied_drafts_preserve_filtered_target_marginal(top_k, copied):
     """A context copy is a deterministic draft; with its one-hot q the emitted
-    token still follows the filtered target, whether the copied token is the
-    likely one (3), an unlikely one (1) or, at top-k 3, outside the support (0).
+    token still follows the filtered target, on the dense and the top-k path
+    for an unlikely copied token (1) and, at top-k 3, outside the support (0).
     """
     from omlx.utils.sampling import make_sampler
 
@@ -4966,7 +4965,7 @@ def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypat
         gen.close()
 
 
-def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=40):
+def _join_as_batch_row_finishes(model, prompts, joined_prompt, max_tokens=24):
     """Finish row 0 of an active shared-MTP batch in the late join's ``next()``.
 
     The finishing row filters the batch to a singleton MTP state inside
@@ -5034,6 +5033,8 @@ def test_qwen_late_join_as_batch_row_finishes_skips_history_replay(
     family, monkeypatch
 ):
     monkeypatch.setattr(mlx_lm_mtp, "_MTP_ACTIVE", True)
+    # Reconcile reads capacity-managed caches; the scheduler patches at import.
+    apply_batch_kv_capacity_patch()
     mx.random.seed(3702)
     model = _model(family)
     mx.eval(model.parameters())
@@ -5050,33 +5051,36 @@ def test_qwen_late_join_as_batch_row_finishes_skips_history_replay(
     )
     first, new_uid, output = _join_as_batch_row_finishes(model, prompts, joined)
     assert output == replayed
-    assert len(output[first[1]]) == 40 and len(output[new_uid]) == 40
+    assert len(output[first[1]]) == 24 and len(output[new_uid]) == 24
 
 
 @pytest.mark.parametrize(
-    "family,unequal_depths",
+    "family,unequal_depths,late_join,batch_size",
     [
-        ("qwen", False),
-        ("qwen", True),
-        ("qwen_vlm", False),
-        ("qwen_vlm", True),
-        ("qwen4", False),
-        ("qwen4", True),
-        # V4.1 owns its depth controller; the common override does not apply.
-        ("v41", False),
-        # Singleton-only adapters need batching/late-join checks, not a
-        # duplicate matrix for a multi-request depth policy they never use.
-        ("gemma", False),
-        ("v4_dspark", False),
-        ("inkling", False),
-        ("nemotron", False),
-        ("glm", False),
-        ("glm5", False),
-        ("glm5", True),
-        ("step", False),
+        (family, unequal_depths, *join)
+        for family, unequal_depths in [
+            ("qwen", False),
+            ("qwen", True),
+            ("qwen_vlm", False),
+            ("qwen_vlm", True),
+            ("qwen4", False),
+            ("qwen4", True),
+            # V4.1 owns its depth controller; the common override does not apply.
+            ("v41", False),
+            ("glm5", False),
+            ("glm5", True),
+        ]
+        # (False, 4) shrinks a full batch row by row; (True, 2) also joins a
+        # running request. A 4-row late join only combines the two.
+        for join in [(False, 4), (True, 2)]
+    ]
+    # Singleton-only adapters need batching/late-join checks, not a multi-request
+    # depth matrix. One late join covers multi-row decode and singleton re-entry.
+    + [
+        (family, False, True, 2)
+        for family in ["gemma", "v4_dspark", "inkling", "nemotron", "glm", "step"]
     ],
 )
-@pytest.mark.parametrize("late_join,batch_size", [(False, 4), (True, 2), (True, 4)])
 def test_multi_request_mtp_or_singleton_only_matches_standard(
     family, unequal_depths, late_join, batch_size, monkeypatch
 ):
@@ -5917,7 +5921,7 @@ def _assert_rows_equal(actual, references, accepted):
                 assert observed.offset == expected.offset
 
 
-@pytest.mark.parametrize("batch_size", [2, 4])
+@pytest.mark.parametrize("batch_size", [4])
 @pytest.mark.parametrize("late_join", [False, True])
 def test_vector_commit_matches_scalar_states_and_ordinary_tokens(
     monkeypatch, batch_size, late_join

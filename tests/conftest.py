@@ -50,9 +50,6 @@ _GPU_SERIAL_TESTS = {
         "test_real_vlm_engine_text_and_images",
         "test_vision_and_aligner_reference",
     },
-    "test_deepseek_v41_activation.py": {
-        "test_normal_scales_are_exact_and_nonzero",
-    },
     "test_deepseek_v41_fused_decode.py": {
         "test_batched_decode_matches_single_requests",
         "test_batched_mma_kernels_match_rows_kernels",
@@ -74,9 +71,6 @@ _GPU_SERIAL_TESTS = {
     "test_deepseek_v4_offload.py": {
         "test_wrap_and_release_return_descriptors_to_baseline",
         "test_wrap_replaces_module_and_keeps_only_slots",
-    },
-    "test_deepseek_v4_patch.py": {
-        "test_deepseek_patch_preserves_mixed_model_owned_conversion",
     },
     "test_glm5_next_mtp.py": {
         "test_vector_restore_and_continuation_match_scalar",
@@ -115,7 +109,6 @@ _GPU_SERIAL_TESTS = {
     },
     "test_qwen35_moe_verify_window.py": {
         "test_batched_decode_rows_equal_one_token_decode",
-        "test_four_bit_window_rows_equal_one_token_decode",
         "test_kernel_failure_falls_back_to_the_composed_verifier",
         "test_router_ties_and_high_experts",
         "test_top8_window_and_batched_rows_equal_one_token_decode",
@@ -124,18 +117,12 @@ _GPU_SERIAL_TESTS = {
     "test_qwen35_verify_sdpa_split.py": {
         "test_chain_tail_matches_cache_writes",
     },
-    "test_qwen35_yarn_without_mlx_vlm.py": {
-        "test_yarn_patch_imports_and_applies_without_mlx_vlm",
-    },
     "test_qwen4_batch_qsa_indexer.py": {
         "test_indexer_capacity_matches_concatenate_bit_for_bit",
     },
     "test_qwen4_hc_fused.py": {
         "test_decode_and_verify_rows_match_eager_writes",
         "test_prefill_chunks_match_eager_writes",
-    },
-    "test_qwen4_ple_load_resources_cpu.py": {
-        "test_real_loader_wrapper_strict_failure_closes_retained_model",
     },
     "test_qwen4_qsa_reserved_capacity.py": {
         "test_scheduler_reserves_kv_once_and_decode_grows_in_steps",

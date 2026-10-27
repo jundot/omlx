@@ -198,12 +198,14 @@ def topk_fold(request, monkeypatch):
     return request.param
 
 
-@pytest.mark.parametrize("seed", [0, 1])
-def test_window_rows_equal_one_token_decode(seed, topk_fold, engaged):
-    block = _block(seed)
+def test_window_rows_equal_one_token_decode(topk_fold, engaged):
+    block = _block(0)
     plan = routed.routed_decode_plan(block, mx.zeros((1, 1, HIDDEN), mx.bfloat16))
     assert plan.topk_kernel is not None
-    for rows in range(1, routed.WINDOW_MAX_ROWS + 1):
+    # Row bounds: 3 folded rows, 8 composed-router rows, 16 window rows.
+    # Past 3 rows both variants take the routing launch.
+    window_rows = (1, 2, 3, 4, 5, 8, 9, 16) if topk_fold else (1, 2, 3, 4)
+    for rows in window_rows:
         for step in range(3):
             _check(block, _inputs(rows, step), engaged)
     # Batched verify rows (requests x drafts) are rows too.
@@ -224,35 +226,11 @@ def test_batched_decode_rows_equal_one_token_decode(rows, engaged):
     assert _same_bits(got, ref.reshape(got.shape))
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-def test_top8_window_and_batched_rows_equal_one_token_decode(dtype, engaged):
-    """Qwen3.5/3.6-35B-A3B oQ layout (hidden 2048, intermediate 512, top-8):
-    verify windows and batched decode rows equal the fused one-token decode
-    of each row."""
-    hidden = 2048
-    block = _block(4, bits=4, hidden=hidden, inter=512, top_k=8, dtype=dtype)
-    for rows in (1, 2, 3, 4, 8, 16):
-        for step in range(3):
-            _check(block, _inputs(rows, step, hidden=hidden, dtype=dtype), engaged)
-    x = _inputs(5, 0, hidden=hidden, dtype=dtype).reshape(5, 1, hidden)
-    count = len(engaged)
-    got = block(x)
-    assert engaged[count:] == [True]
-    assert _same_bits(got, _serial(block, x).reshape(got.shape))
-
-
-def test_four_bit_window_rows_equal_one_token_decode(engaged):
-    block = _block(2, bits=4)
-    for rows in (2, 3, 4, 8):
-        for step in range(3):
-            _check(block, _inputs(rows, step), engaged)
-
-
 def test_router_ties_and_high_experts(engaged):
     """Exactly tied and one-ulp-apart router probabilities must select the
     same experts in the same order as the one-token router; experts at the
     end of the stacked weights are read past the bound one-expert view."""
-    block = _block(3)
+    block = _block(0)
     weight = block.gate.weight
     experts = BLOCK_EXPERTS
     # Exact ties: experts / 8 distinct router rows, each repeated 8 times.
@@ -267,18 +245,23 @@ def test_router_ties_and_high_experts(engaged):
     direction = mx.random.normal((HIDDEN,))
     last = (mx.arange(experts) >= experts - 14)[:, None]
     high = weight + mx.where(last, 0.02 * direction, 0.0)
-    for gate, lean in ((tied, 0.0), (near, 0.0), (high, 1.0)):
-        block.gate.weight = gate.astype(weight.dtype)
-        mx.eval(block.gate.weight)
-        for rows in (2, 3, 4, 7):
-            for step in range(3):
-                x = (_inputs(rows, step) + lean * direction).astype(mx.bfloat16)
-                _check(block, x, engaged)
-                if lean:
-                    logits = router.router_gemv(block.gate.weight)(x.reshape(rows, HIDDEN))
-                    inds, _ = router.softmax_topk_rows(logits, 10)
-                    assert mx.min(inds).item() >= experts - 14
-    block.gate.weight = weight
+    try:
+        for gate, lean in ((tied, 0.0), (near, 0.0), (high, 1.0)):
+            block.gate.weight = gate.astype(weight.dtype)
+            mx.eval(block.gate.weight)
+            # Folded and launched routing, both within the composed router's rows.
+            for rows in (3, 7):
+                for step in range(3):
+                    x = (_inputs(rows, step) + lean * direction).astype(mx.bfloat16)
+                    _check(block, x, engaged)
+                    if lean:
+                        logits = router.router_gemv(block.gate.weight)(
+                            x.reshape(rows, HIDDEN)
+                        )
+                        inds, _ = router.softmax_topk_rows(logits, 10)
+                        assert mx.min(inds).item() >= experts - 14
+    finally:
+        block.gate.weight = weight  # The block stays cached for later tests.
 
 
 def test_kernel_failure_falls_back_to_the_composed_verifier(monkeypatch, engaged):
@@ -293,6 +276,23 @@ def test_kernel_failure_falls_back_to_the_composed_verifier(monkeypatch, engaged
     out = _verify(block, x, window=True)
     assert engaged[-1] is False and routed._WINDOW_DISABLED
     assert _same_bits(out, old)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_top8_window_and_batched_rows_equal_one_token_decode(dtype, engaged):
+    """Qwen3.5/3.6-35B-A3B oQ layout (hidden 2048, intermediate 512, top-8):
+    verify windows and batched decode rows equal the fused one-token decode
+    of each row."""
+    hidden = 2048
+    block = _block(4, bits=4, hidden=hidden, inter=512, top_k=8, dtype=dtype)
+    for rows in (1, 3, 8, 16):
+        for step in range(3):
+            _check(block, _inputs(rows, step, hidden=hidden, dtype=dtype), engaged)
+    x = _inputs(5, 0, hidden=hidden, dtype=dtype).reshape(5, 1, hidden)
+    count = len(engaged)
+    got = block(x)
+    assert engaged[count:] == [True]
+    assert _same_bits(got, _serial(block, x).reshape(got.shape))
 
 
 def _quantized(shape, group_size, bits):

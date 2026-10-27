@@ -139,17 +139,17 @@ def test_fused_decode_is_bit_identical(hidden, inter, bits, group_size, monkeypa
     assert not routed._DISABLED
 
 
-@pytest.mark.parametrize("experts", [EXPERTS, 512])
+@pytest.mark.parametrize("experts", [EXPERTS, 128])
 def test_bf16_shared_expert_stays_composed_and_bit_identical(experts):
-    # 512 experts select inside the gate+up launch, 32 in the routing launch.
-    # The 512-expert block takes the smaller shape to fit CI runner memory.
+    # 128 experts select inside the gate+up launch, 32 in the routing launch.
+    # The 128-expert block keeps hidden < 16 x experts, so the fused router gemv runs.
     hidden, inter = (2560, 640) if experts == EXPERTS else (1024, 320)
     block = _block(hidden, inter, bits=5, quantized_shared=False, experts=experts)
     for step in range(4):
         x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
         plan = routed.routed_decode_plan(block, x)
         assert not plan.fold
-        assert routed._topk_folds(plan, block.gate(x)) == (experts == 512)
+        assert routed._topk_folds(plan, block.gate(x)) == (experts == 128)
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
     assert routed._PROVEN and not routed._DISABLED
@@ -301,10 +301,10 @@ def test_experts_past_the_bound_view_are_read_from_the_stacked_weights():
     out of the stacked buffer would read the wrong bytes for high experts."""
     from omlx.patches.qwen35_moe_router import fused_moe_combine
 
-    block = _block(1024, 320, bits=5, experts=512)
+    block = _block(1024, 320, bits=5, experts=128)
     plan = routed.routed_decode_plan(block, mx.zeros((1, 1, 1024), mx.bfloat16))
     assert all(o.shape[0] == 1 for o in plan.gate_up_operands + plan.down_operands)
-    for ids in ([502 + i for i in range(10)], [511, 0, 500, 256, 1, 510, 3, 499, 7, 400]):
+    for ids in (list(range(118, 128)), [127, 0, 116, 64, 1, 126, 3, 115, 7, 100]):
         x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
         inds = mx.array(ids, dtype=mx.uint32).reshape(1, 1, 10)
         scores = mx.softmax(mx.random.normal((1, 1, 10)), axis=-1).astype(mx.bfloat16)
@@ -322,9 +322,9 @@ def test_tied_router_logits_route_like_the_served_block():
     router launches."""
     from omlx.patches.qwen35_moe_router import router_logits_row, softmax_topk_row
 
-    block = _block(1024, 320, bits=5, experts=512)
-    rows = block.gate.weight[:64]
-    block.gate.weight = mx.concatenate([rows] * 8)[mx.random.permutation(512)]
+    block = _block(1024, 320, bits=5, experts=128)
+    rows = block.gate.weight[:16]
+    block.gate.weight = mx.concatenate([rows] * 8)[mx.random.permutation(128)]
     mx.eval(block.gate.weight)
     for step in range(8):
         x = (mx.random.normal((1, 1, 1024)) * (0.5 + step)).astype(mx.bfloat16)

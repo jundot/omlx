@@ -440,9 +440,10 @@ def test_wrap_and_release_return_descriptors_to_baseline(
         cycle()
         gc.collect()
         baseline = len(os.listdir("/dev/fd"))
-        for _ in range(10):
+        for _ in range(3):
             cycle()
-            gc.collect()
+        # One collection releases every cycle's store; a leaked descriptor stays.
+        gc.collect()
         assert len(os.listdir("/dev/fd")) == baseline
     finally:
         _shutdown_io_pool()

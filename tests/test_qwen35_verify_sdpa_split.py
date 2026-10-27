@@ -131,8 +131,10 @@ def test_chain_tail_matches_cache_writes(prefix):
     attn.set_dtype(mx.bfloat16)
     assert install_chain_attention(Qwen3NextAttention)
     stock, base = KVCache(), KVCache()
-    history = mx.random.normal((1, prefix, 512)).astype(mx.bfloat16)
-    mx.eval(attn(history, cache=stock), attn(history, cache=base))
+    # Only the cached history matters; write the same rows into both caches.
+    keys = mx.random.normal((1, HKV, prefix, HD)).astype(mx.bfloat16)
+    values = mx.random.normal((1, HKV, prefix, HD)).astype(mx.bfloat16)
+    mx.eval(stock.update_and_fetch(keys, values), base.update_and_fetch(keys, values))
     tail = ChainKVCache(base)
     for _ in range(4):
         x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)

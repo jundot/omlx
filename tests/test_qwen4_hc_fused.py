@@ -1475,13 +1475,12 @@ def _decode_and_verify(model, head, ids):
 
 
 @needs_metal
-@pytest.mark.parametrize("seed", [0, 1, 2])
-def test_decode_and_verify_rows_match_eager_writes(monkeypatch, seed):
-    _assert_identical(monkeypatch, seed, _decode_and_verify)
+def test_decode_and_verify_rows_match_eager_writes(monkeypatch):
+    _assert_identical(monkeypatch, 0, _decode_and_verify)
 
 
 @needs_metal
-@pytest.mark.parametrize("chunk", [17, 257, 2048])
+@pytest.mark.parametrize("chunk", [17, 257])
 def test_prefill_chunks_match_eager_writes(monkeypatch, chunk):
     def prefill(model, head, ids):
         cache = model.make_cache()

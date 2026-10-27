@@ -150,13 +150,13 @@ def test_in_place_cache_growth_matches_concatenation(monkeypatch):
 
     model = LanguageModel(tiny())
     load_reference_weights(model)
-    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 40), dtype=np.int32))
+    ids = mx.array(np.random.default_rng(17).integers(3, 60, (1, 24), dtype=np.int32))
 
     def run():
         cache = model.make_cache()
         logits = [model(ids[:, :9], cache=cache)]
-        for position in range(9, 40):
-            if position == 24:
+        for position in range(9, 24):
+            if position == 16:
                 # Extracting a single row keeps its storage.
                 cache = [layer.extract(0) for layer in cache]
             logits.append(model(ids[:, position : position + 1], cache=cache))
@@ -825,7 +825,7 @@ def test_engram_gate_matches_official(expected):
     np.testing.assert_array_equal(actual[:, 1], h[:, 1])
 
 
-async def _run_vlm_engine(tmp_path, direct=False):
+async def _run_vlm_engine(tmp_path):
     import asyncio
 
     from PIL import Image
@@ -835,9 +835,10 @@ async def _run_vlm_engine(tmp_path, direct=False):
     from omlx.scheduler import SchedulerConfig
 
     source, _ = write_checkpoint(tmp_path)
-    target = source if direct else tmp_path / "mlx"
-    if not direct:
-        convert(source, target)
+    target = tmp_path / "mlx"
+    # The engine passes source and converted checkpoints to the same load().
+    # Conversion also runs the source weight reader.
+    convert(source, target)
     engine = VLMBatchedEngine(
         str(target),
         enable_thinking=False,
@@ -968,14 +969,7 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import test_deepseek_v41 as t
 
-async def main():
-    for direct in (False, True):
-        root = Path(sys.argv[2]) / ("direct" if direct else "converted")
-        root.mkdir()
-        print(f"Testing {root.name} checkpoint", flush=True)
-        await asyncio.wait_for(t._run_vlm_engine(root, direct), timeout=60)
-
-asyncio.run(main())
+asyncio.run(asyncio.wait_for(t._run_vlm_engine(Path(sys.argv[2])), timeout=60))
 """
     # Engine startup installs process-wide Metal routes. Keep those real hooks
     # in a subprocess so unrelated estimator unit tests retain their fixtures.

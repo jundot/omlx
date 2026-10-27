@@ -12,7 +12,6 @@ import json
 import os
 import subprocess
 import sys
-import textwrap
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -888,20 +887,21 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
     """FP32 projections must produce FP16 inputs at native attention boundaries."""
     import mlx_vlm.models.glm5_next.language as lang
 
+    # Routing depends on the context length, not on the widths, so they stay small.
     text = lang.TextConfig(
         model_type="glm5_next_text",
         vocab_size=128,
-        hidden_size=4096,
+        hidden_size=512,
         intermediate_size=64,
         moe_intermediate_size=16,
         num_hidden_layers=2,
-        num_attention_heads=64,
-        num_key_value_heads=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
         n_shared_experts=None,
         n_routed_experts=None,
         routed_scaling_factor=1.0,
         kv_lora_rank=512,
-        q_lora_rank=1536,
+        q_lora_rank=256,
         qk_rope_head_dim=0,
         v_head_dim=256,
         qk_nope_head_dim=256,
@@ -912,7 +912,7 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
         rms_norm_eps=1e-5,
         index_topk=2048,
         index_head_dim=128,
-        index_n_heads=32,
+        index_n_heads=4,
         layer_types=["deepseek_sparse_attention"],
         mlp_layer_types=["dense"],
         linear_attn_config={
@@ -956,7 +956,7 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
     # a real FP32 attention pass over 2051 rows.
     monkeypatch.setattr(attn, "_dense_prefix_rows", lambda *args: (0, 0))
 
-    x = mx.random.normal((1, 4096, 4096), dtype=mx.float32)
+    x = mx.random.normal((1, 4096, 512), dtype=mx.float32)
     out = attn(x, mask=None, cache=None)
     mx.eval(out)
     nax = [s for s in seen if s[0] == "sparse_mla_nax"]
@@ -971,7 +971,7 @@ def test_sparse_attention_native_routes_get_fp16_despite_fp32_activations(monkey
     )
 
     seen.clear()
-    x = mx.random.normal((1, 2500, 4096), dtype=mx.float32)
+    x = mx.random.normal((1, 2500, 512), dtype=mx.float32)
     out = attn(x, mask=None, cache=None)
     mx.eval(out)
     eba = [s for s in seen if s[0] == "exact_block"]
@@ -1824,38 +1824,25 @@ def test_fused_expand_is_batch_invariant():
 def test_bitwise_equal_to_canonical_path_without_tf32():
     """With MLX_ENABLE_TF32=0 the canonical prefill path runs its matmuls in
     fp32; the fused kernels then reproduce it bit for bit on this data."""
-    script = textwrap.dedent("""
-        import mlx.core as mx
-        from omlx.patches import mlx_vlm_glm5_next_compat as compat
-        compat.apply_mlx_vlm_glm5_next_compat_patch()
-        from mlx_vlm.models.deepseek_v4 import hyper_connection as dsv4_hc
-        from mlx_vlm.models.glm5_next import hc_prefill
-        from tests.test_mlx_vlm_glm5_next_compat import _hc_connection, _hc_stream
-        c = _hc_connection(cls=dsv4_hc.HyperConnection)
-        x = _hc_stream(300)
-        branch = (mx.random.normal((1, 300, 4096), key=mx.random.key(3))).astype(mx.bfloat16)
-        ref = c(x)
-        fused = hc_prefill.hc_pre(c, x)
-        ref_e = dsv4_hc.hc_expand(branch, x, ref[1], ref[2])
-        fused_e = hc_prefill.hc_expand(branch, x, fused[1], fused[2])
-        mx.eval(ref, fused, ref_e, fused_e)
-        ok = all(bool(mx.array_equal(a, b)) for a, b in zip(ref, fused))
-        ok = ok and bool(mx.array_equal(ref_e, fused_e))
-        print("BITWISE", ok)
-        """)
-    env = dict(os.environ, MLX_ENABLE_TF32="0")
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=300,
+    # MLX reads MLX_ENABLE_TF32 once per process; conftest sets it before import.
+    if os.environ.get("MLX_ENABLE_TF32") != "0":
+        pytest.skip("MLX_ENABLE_TF32 is not 0 in this session")
+    dsv4_hc, hc_prefill, _ = _hc_modules()
+    c = _hc_connection(cls=dsv4_hc.HyperConnection)
+    x = _hc_stream(300)
+    branch = (mx.random.normal((1, 300, 4096), key=mx.random.key(3))).astype(
+        mx.bfloat16
     )
-    assert result.returncode == 0, result.stderr[-2000:]
-    assert "BITWISE True" in result.stdout, result.stdout + result.stderr[-2000:]
+    ref = c(x)
+    fused = hc_prefill.hc_pre(c, x)
+    assert fused is not None
+    ref_e = dsv4_hc.hc_expand(branch, x, ref[1], ref[2])
+    fused_e = hc_prefill.hc_expand(branch, x, fused[1], fused[2])
+    assert fused_e is not None
+    mx.eval(ref, fused, ref_e, fused_e)
+    for a, b in zip(ref, fused):
+        assert mx.array_equal(a, b)
+    assert mx.array_equal(ref_e, fused_e)
 
 
 def test_unsupported_inputs_fall_back():

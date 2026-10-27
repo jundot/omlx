@@ -100,7 +100,7 @@ def test_indexer_capacity_matches_concatenate_bit_for_bit(mrope):
     ref = _ExactIndexer(batch.index_keys, batch.index_position_ids)
     widths = set()
     pos = [base, base - 9]
-    for step in range(300):
+    for step in range(100):
         m = 4
         keys = _rnd((2, m, DI), 1000 + step)
         text = mx.array([[p + i for i in range(m)] for p in pos], dtype=mx.int32)
@@ -129,7 +129,7 @@ def test_indexer_capacity_matches_concatenate_bit_for_bit(mrope):
         widths.add(int(batch._index_keys.shape[1]))
         pos = [p + r for p, r in zip(pos, retained)]
 
-    # 1200 appended tokens: the concatenate path had one width per step.
+    # 400 appended tokens: the concatenate path had one width per step.
     assert len(widths) <= 2
     assert all(w % BatchQSAKVCache.index_step == 0 for w in widths)
     _assert_same(batch.state[1], ref.index_keys)

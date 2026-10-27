@@ -47,14 +47,19 @@ def _float_cache_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
     )
 
 
-@pytest.fixture(autouse=True)
-def _stock_sdpa_helper(monkeypatch):
+@pytest.fixture(autouse=True, scope="module")
+def _stock_sdpa_helper():
     # Other suites install SDPA wrappers around fakes into these module
     # globals and leave them behind; pin the stock float-cache behavior.
-    monkeypatch.setattr(q35_language, "scaled_dot_product_attention", _float_cache_sdpa)
-    monkeypatch.setattr(
-        q35_verifier, "scaled_dot_product_attention", _float_cache_sdpa, raising=False
-    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(q35_language, "scaled_dot_product_attention", _float_cache_sdpa)
+        patch.setattr(
+            q35_verifier,
+            "scaled_dot_product_attention",
+            _float_cache_sdpa,
+            raising=False,
+        )
+        yield
 
 
 def _text_config():
@@ -146,6 +151,34 @@ def _prefill(attn, tokens: int, seed: int, chunk: int = 4096):
     return cache
 
 
+def _copy_cache(cache):
+    """``cache`` with its own array objects (cache writes update arrays in place)."""
+    copy = language.QSAKVCache.__new__(language.QSAKVCache)
+    copy.__dict__.update(
+        (name, mx.array(value) if isinstance(value, mx.array) else value)
+        for name, value in vars(cache).items()
+    )
+    return copy
+
+
+@pytest.fixture(scope="module")
+def masked_prefill(_stock_sdpa_helper):
+    """``(attn, cache)`` for a context: one prefill per context, a copy per case.
+
+    Trimming a verify window restores the offsets, not the position rank or
+    buffer capacities, so every case starts from a copy of the prefill.
+    """
+    attn = _attention(seed=3)
+    prefills = {}
+
+    def prefilled(context):
+        if context not in prefills:
+            prefills[context] = _prefill(attn, context, seed=4)
+        return attn, _copy_cache(prefills[context])
+
+    return prefilled
+
+
 def _verify(attn, cache, x):
     qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
     try:
@@ -213,9 +246,10 @@ def _bit_equal(a: mx.array, b: mx.array) -> bool:
 # 24K case.
 @pytest.mark.parametrize("context", [2060, 16382, 24000])
 @pytest.mark.parametrize("rows", [2, 3, 8, 16])
-def test_masked_verify_rows_equal_serial_decode_steps(monkeypatch, context, rows):
-    attn = _attention(seed=3)
-    cache = _prefill(attn, context, seed=4)
+def test_masked_verify_rows_equal_serial_decode_steps(
+    masked_prefill, monkeypatch, context, rows
+):
+    attn, cache = masked_prefill(context)
     selections = _record_selection(monkeypatch)
     for seed in (11, 12):
         mx.random.seed(seed + rows)
@@ -251,8 +285,10 @@ def test_masked_verify_rows_equal_serial_decode_steps(monkeypatch, context, rows
 def test_masked_verify_rollback_then_decode_matches_serial():
     """Accept one draft of a four-row window, roll the rest back, decode on."""
     attn = _attention(seed=5)
-    reference = _prefill(attn, 24002, seed=6)
-    cache = _prefill(attn, 24002, seed=6)
+    # Past the block budget and two tokens into a block: the accepted rows
+    # complete it and the rollback lands on its boundary.
+    reference = _prefill(attn, 2062, seed=6)
+    cache = _prefill(attn, 2062, seed=6)
     mx.random.seed(21)
     window = (mx.random.normal((1, 4, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
     follow = (mx.random.normal((1, 3, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)

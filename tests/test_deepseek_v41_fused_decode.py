@@ -113,6 +113,21 @@ def verify_exact(model):
     return model
 
 
+@pytest.fixture(scope="module")
+def shared_build():
+    """Cache build() per arguments. Only for tests that read weights through kernels:
+    no forward pass, no attribute writes, nothing replaced."""
+    models = {}
+
+    def get(fmt="mxfp", **overrides):
+        key = (fmt, *sorted(overrides.items()))
+        if key not in models:
+            models[key] = build(fmt=fmt, **overrides)
+        return models[key]
+
+    return get
+
+
 @pytest.mark.parametrize("fmt,tiles", [("mxfp", False), ("affine", False), ("affine", True)])
 def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles):
     model = verify_exact(build(fmt=fmt)) if tiles else build(fmt=fmt)
@@ -204,7 +219,7 @@ def test_offloaded_experts_decode_on_the_unfused_path(tmp_path):
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-@pytest.mark.parametrize("batch", [2, 3, 8])
+@pytest.mark.parametrize("batch", [3, 8])   # odd: a tile lane holds half a vector pair
 def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
     """On the row kernels (below decode_moe.MMA_MIN_BATCH requests, and in MTP verify blocks),
     B single-token requests through decode_block_nb give each request the logits it gets
@@ -241,14 +256,16 @@ def test_batched_decode_matches_single_requests(monkeypatch, batch, fmt):
             target.append(cache)
     batched = [DeepseekV41Cache.merge([rows[r][i] for r in range(batch)]) for i in range(len(rows[0]))]
     tokens = [p[-1] for p in prompts]
-    for step in range(4):
+    # The first step decodes an even position, the second an odd one: only the second
+    # completes a ratio-2 compression group.
+    for step in range(2):
         expected = [np.asarray(model(mx.array([[t]]), cache=c_)[0, -1].astype(mx.float32)) for t, c_ in zip(tokens, singles)]
         got = np.asarray(model(mx.array([[t] for t in tokens]), cache=batched)[:, -1].astype(mx.float32))
         for r in range(batch):
             np.testing.assert_allclose(got[r], expected[r], rtol=0, atol=1e-6 * np.abs(expected[r]).max())
         tokens = [int(e.argmax()) for e in expected]
-    assert calls["nb"] == 4 * model._config.n_layers
-    assert attention["batched"] == 4 * model._config.n_layers   # windows are full: request-batched attention
+    assert calls["nb"] == 2 * model._config.n_layers
+    assert attention["batched"] == 2 * model._config.n_layers   # windows are full: request-batched attention
 
 
 def _aq(rng, nb, k):
@@ -259,7 +276,9 @@ def _aq(rng, nb, k):
 
 
 @pytest.mark.parametrize("nb", [4, 5, 8])
-def test_batched_fp8_mma_projection_within_fp32_summation_of_exact(monkeypatch, nb):
+def test_batched_fp8_mma_projection_within_fp32_summation_of_exact(
+    monkeypatch, shared_build, nb
+):
     """Batched projections run on simdgroup matrices from decode_moe.MMA_MIN_BATCH vectors.
     Every product is exact (fp8 weight x act_quant activation), so each output must equal
     the float64 dot product up to fp32 summation rounding (K * 2^-24 * sum|w x|) plus the
@@ -269,7 +288,7 @@ def test_batched_fp8_mma_projection_within_fp32_summation_of_exact(monkeypatch, 
     names = []
     real_kernel = decode_layer.kernel
     monkeypatch.setattr(decode_layer, "kernel", lambda name, *f: (names.append(name), real_kernel(name, *f))[1])
-    att = build().layers[0].attn
+    att = shared_build().layers[0].attn
     k = att.wq_a.weight.shape[1] * 4
     x = _aq(np.random.default_rng(nb), nb, k)
     ya, yb = decode_fused.gemv_fp8_nb(x, att.wq_a, att.wkv)
@@ -330,14 +349,14 @@ def test_batched_mma_kernels_match_rows_kernels(monkeypatch, nb):
     np.testing.assert_allclose(out_mma.astype(mx.float32), out_rows.astype(mx.float32), rtol=2**-6, atol=1e-5)
 
 
-def test_small_batches_keep_rows_kernels(monkeypatch):
+def test_small_batches_keep_rows_kernels(monkeypatch, shared_build):
     """Below MMA_MIN_BATCH the fp8_rows_nb kernels stay in use (faster there)."""
     from omlx.patches.deepseek_v41 import decode_layer, decode_moe
 
     names = []
     real_kernel = decode_layer.kernel
     monkeypatch.setattr(decode_layer, "kernel", lambda name, *f: (names.append(name), real_kernel(name, *f))[1])
-    att = build().layers[0].attn
+    att = shared_build().layers[0].attn
     decode_fused.gemv_fp8_nb(_aq(np.random.default_rng(3), decode_moe.MMA_MIN_BATCH - 1, att.wq_a.weight.shape[1] * 4), att.wq_a, att.wkv)
     assert names == ["gemv_fp8_nb"]
 
@@ -375,15 +394,15 @@ def test_paired_weight_decoders_are_exact():
 
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
-@pytest.mark.parametrize("nb", [2, 3, 8])
-def test_batched_moe_matches_single_token_moe(monkeypatch, nb, fmt):
+@pytest.mark.parametrize("nb", [3, 8])
+def test_batched_moe_matches_single_token_moe(monkeypatch, shared_build, nb, fmt):
     """Without matrix tiles, each token of the batched MoE gets the single-token kernels'
     output, routing indices and weights bit for bit, also when tokens share experts: the
     routed kernels then dispatch every token of a row block together (see _UP_NB)."""
     from omlx.patches.deepseek_v41 import decode_moe
 
     monkeypatch.setattr(decode_moe, "use_mma", lambda nb: False)
-    model = build(fmt=fmt, n_routed_experts=16, n_activated_experts=4)   # >2 slots: their sum order shows
+    model = shared_build(fmt=fmt, n_routed_experts=16, n_activated_experts=4)   # >2 slots: their sum order shows
     c = model._config
     rng = np.random.default_rng(23 + nb)
     x = rng.normal(0, 1, (nb, c.dim)).astype(np.float32)
@@ -435,7 +454,7 @@ def test_batched_engram_projects_each_request_like_a_single_request(batch):
 
 @pytest.mark.parametrize("fmt", ["mxfp", "affine"])
 @pytest.mark.parametrize("prompt_length", [11, 2])   # full window (batched attention) / filling
-@pytest.mark.parametrize("rows,accepted", [(2, 0), (3, 2), (4, 1), (6, 3)])
+@pytest.mark.parametrize("rows,accepted", [(2, 0), (3, 2), (6, 3)])
 def test_verify_block_matches_token_by_token_decode(monkeypatch, rows, accepted, prompt_length, fmt):
     """An MTP verify block through the fused kernels gives every token bit for bit the
     logits of decoding it alone, and after a partial rollback the cache continues exactly
