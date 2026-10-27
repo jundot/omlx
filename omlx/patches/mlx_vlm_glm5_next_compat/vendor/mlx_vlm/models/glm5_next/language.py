@@ -2386,6 +2386,7 @@ class Glm5NextDecoderLayer(nn.Module):
         self.ffn_hc = HyperConnection(config)
         self.compile_ffn = True
         self._ffn_c = None
+        self._ffn_rc = None
         self._ffn_dc = None
         self._ffn_eager_shapes = set()
 
@@ -2416,12 +2417,19 @@ class Glm5NextDecoderLayer(nn.Module):
         x = _decode_hc_expand(r, residual, post, comb)
         # Short verification shares the decode compiler; prefill remains eager.
         if self.compile_ffn and x.shape[0] == 1 and 1 <= x.shape[1] <= _DECODE_BLOCK:
-            shape = (x.shape, x.dtype)
+            # A trace keeps the row-exact branches it was traced with, so each
+            # mode compiles its own.
+            exact = _row_exact_armed()
+            shape = (x.shape, x.dtype, exact)
             if x.shape[1] > 1 and shape not in self._ffn_eager_shapes:
                 # Prime bitwise kernel checks once per verification shape;
                 # they cannot evaluate their canaries inside a compiled trace.
                 self._ffn_eager_shapes.add(shape)
                 return self._ffn_block(x)
+            if exact:
+                if self._ffn_rc is None:
+                    self._ffn_rc = mx.compile(self._ffn_block)
+                return self._ffn_rc(x)
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)

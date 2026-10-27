@@ -396,12 +396,18 @@ def _patch_decoder_layer(g5_lang: Any) -> None:
             and x.shape[0] == 1
             and 1 <= x.shape[1] <= _MAX_CHAIN_DEPTH + 1
         ):
-            shape = (x.shape, x.dtype)
+            # One trace per row-exact mode (see Glm5NextDecoderLayer.__call__).
+            exact = g5_lang._row_exact_armed()
+            shape = (x.shape, x.dtype, exact)
             if x.shape[1] > 1 and shape not in self._ffn_eager_shapes:
                 # Kernel self-checks cannot evaluate their canaries inside a
                 # compiled trace, so each verify shape runs eagerly once.
                 self._ffn_eager_shapes.add(shape)
                 return self._ffn_block(x)
+            if exact:
+                if self._ffn_rc is None:
+                    self._ffn_rc = mx.compile(self._ffn_block)
+                return self._ffn_rc(x)
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)

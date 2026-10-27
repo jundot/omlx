@@ -3826,6 +3826,11 @@ def _check_row_exact_verify(prompt_len, width, batch_cache, **model_kwargs):
 
     decoded = _fused_shape_model(51, **model_kwargs)
     verified = _fused_shape_model(51, **model_kwargs)
+    # A disarmed forward of the block's width (a short prefill chunk) compiles
+    # its FFN first; the verify must not reuse that trace.
+    short = mx.random.randint(0, 256, (1, width), key=mx.random.key(5)).astype(mx.int32)
+    for _ in range(2):
+        mx.eval(verified(short, cache=verified.make_cache()).logits)
     prompt = mx.random.randint(0, 256, (1, prompt_len), key=mx.random.key(7)).astype(
         mx.int32
     )
