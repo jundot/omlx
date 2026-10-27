@@ -3822,6 +3822,8 @@ def test_row_exact_verify_rows_of_the_fp8_checkpoint_match_their_decode_steps(
 def _check_row_exact_verify(prompt_len, width, batch_cache, **model_kwargs):
     if not _native_indexer_available():
         pytest.skip("GLM DSA native indexer extension is not built")
+    if sparse_mla_nax.nax_sparse_mla_available():
+        pytest.skip("row-exact verify runs only without NAX")
     from omlx.patches.mlx_lm_mtp import batch_generator as bg
 
     decoded = _fused_shape_model(51, **model_kwargs)

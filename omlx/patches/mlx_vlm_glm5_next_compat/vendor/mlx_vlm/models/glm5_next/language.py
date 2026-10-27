@@ -2603,9 +2603,13 @@ def _dequantize_router_gates(weights, hidden_size):
 
 
 class LanguageModel(nn.Module):
-    # MTP verify rows run with their one-token decode step's arithmetic, so
-    # greedy MTP output equals MTP-off output (batch_generator._row_exact_verify).
-    _omlx_mtp_row_exact_verify = True
+    @property
+    def _omlx_mtp_row_exact_verify(self) -> bool:
+        """MTP verify rows run with their one-token decode step's arithmetic, so
+        greedy MTP output equals MTP-off output (batch_generator._row_exact_verify).
+        Not on NAX: there a block's HC comb product and sparse attention run
+        other kernels than its decode steps, so the per-row cost buys nothing."""
+        return not nax_sparse_mla_available()
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()

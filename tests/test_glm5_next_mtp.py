@@ -652,6 +652,12 @@ def test_rollback_refuses_when_the_capture_is_short(applied, config, monkeypatch
     assert sparse.trimmed == [], "no layer may be trimmed once the capture is short"
 
 
+@pytest.mark.parametrize("nax", [False, True])
+def test_row_exact_verify_only_without_nax(applied, monkeypatch, nax):
+    monkeypatch.setattr(applied, "nax_sparse_mla_available", lambda: nax)
+    assert bg._row_exact_verify(make_host(mtp_layers=1)) is not nax
+
+
 @pytest.mark.parametrize("layer_idx", [0, 3])
 @pytest.mark.parametrize("width", [1, 2, 4, 8])
 def test_verify_compiled_ffn_matches_eager(applied, config, layer_idx, width):
