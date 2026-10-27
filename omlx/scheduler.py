@@ -58,6 +58,7 @@ from .cache.observability import BoundarySnapshotDiagnostics, CacheRateTracker
 from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
+from .config import validate_decode_fair_share
 from .decode_activity import get_decode_activity
 from .exceptions import (
     InvalidRequestError,
@@ -1928,6 +1929,7 @@ class SchedulerConfig:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk. Inert while nothing is decoding.
     decode_fairness: bool = True
+    decode_fair_share: float = _DECODE_FAIR_SHARE
     # Set by the engine when MoE expert offload wrapped the model.
     moe_offload_active: bool = False
 
@@ -1968,6 +1970,9 @@ class SchedulerConfig:
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
     mlx_cache_cleanup_interval: int = 512  # Steps between mx.clear_cache() calls
+
+    def __post_init__(self) -> None:
+        self.decode_fair_share = validate_decode_fair_share(self.decode_fair_share)
 
 
 @dataclass
@@ -6423,7 +6428,9 @@ class Scheduler:
     def _accrue_decode_debt(self, chunk_seconds: float) -> None:
         if not self._decode_fairness:
             return
-        share = max(0.0, chunk_seconds) * _DECODE_FAIR_SHARE
+        share = max(0.0, chunk_seconds) * getattr(
+            self.config, "decode_fair_share", _DECODE_FAIR_SHARE
+        )
         if share <= 0.0:
             return
         if self.running:

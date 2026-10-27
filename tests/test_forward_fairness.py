@@ -101,6 +101,21 @@ class TestWaitTurn:
 
 
 class TestSettle:
+
+    def test_uses_live_ratio_and_preserves_existing_hold(self):
+        config = SchedulerConfig(decode_fair_share=0.1)
+        gate = ForwardFairnessGate("embed:test", config)
+        _publish_other_decode()
+        with patch("omlx.engine.forward_fairness.time.perf_counter", return_value=100):
+            gate.settle(2, 8, contended=True)
+            assert get_decode_activity().hold_until() == pytest.approx(100.2)
+            config.decode_fair_share = 0.75
+            gate.settle(2, 8, contended=True)
+            assert get_decode_activity().hold_until() == pytest.approx(101.5)
+            config.decode_fair_share = 0
+            gate.settle(2, 8, contended=True)
+            assert get_decode_activity().hold_until() == pytest.approx(101.5)
+
     def test_accrues_shared_hold_when_contended(self):
         _publish_other_decode()
         gate = ForwardFairnessGate("embed:test")
