@@ -1607,7 +1607,7 @@ async def get_engine(
                 raise HTTPException(
                     status_code=400,
                     detail=f"Model '{model_id}' is not a decision model. "
-                    f"Use a decision model such as Clef, OpenJev or Decision 3.0.",
+                    f"Use a decision model such as Clef, OpenJev, Decision 3.0 or d1.",
                 )
         elif engine_type == EngineType.LLM:
             # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
@@ -4365,7 +4365,7 @@ async def create_systemone(
                 return (
                     result["answers"],
                     result["input_tokens"],
-                    0,
+                    result.get("cached_tokens", 0),
                     time.perf_counter() - start_time,
                 )
 

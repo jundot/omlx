@@ -284,7 +284,7 @@ OpenAI 和 Anthropic API 的直接替代品。支持流式使用统计（`stream
 | OCR | DeepSeek-OCR、DOTS-OCR、GLM-OCR |
 | 嵌入 | BERT、BGE-M3、ModernBERT、EmbeddingGemma 2 |
 | 重排序 | ModernBERT、XLM-RoBERTa |
-| 决策 | Clef、Clef-Flash、OpenJev、Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
+| 决策 | Clef、Clef-Flash、OpenJev、Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge)、LiquidAI d1 |
 
 ## CLI 配置
 
