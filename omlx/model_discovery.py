@@ -77,6 +77,7 @@ VLM_MODEL_TYPES = {
     "youtu_vl",
     "inkling",
     "inkling_mm_model",  # config model_type of Inkling Small checkpoints
+    "lfm3_vl",  # LiquidAI/LFM3-VL-2B (lfm3 text stays an LLM)
     "muse_glimmer",
     "muse_spark",
     "glm5_next",
@@ -204,6 +205,7 @@ VLM_ARCHITECTURES = {
     "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
     "MuseSparkForConditionalGeneration",  # meta-models/Muse-Spark-Open-816B-A42B
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
+    "Lfm3VlForConditionalGeneration",  # LiquidAI/LFM3-VL-2B
     "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
     "Moondream",  # vikhyatk/moondream2 (2024 revisions)
 }

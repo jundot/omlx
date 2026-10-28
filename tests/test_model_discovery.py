@@ -307,6 +307,32 @@ class TestDetectModelType:
         (llm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(llm_dir) == "llm"
 
+    def test_detect_lfm3_text_model_is_llm(self, tmp_path):
+        """LFM3-1.7B is text; its config still carries a leftover vision_config."""
+        llm_dir = tmp_path / "LFM3-1.7B-MLX-8bit"
+        llm_dir.mkdir()
+        config = {
+            "model_type": "lfm3",
+            "architectures": ["Lfm3ForCausalLM"],
+            # The shipped checkpoint keeps an empty vision_config block.
+            "vision_config": {},
+        }
+        (llm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(llm_dir) == "llm"
+
+    def test_detect_lfm3_vl_model_is_vlm(self, tmp_path):
+        """LiquidAI/LFM3-VL-2B needs the mlx-vlm engine, not the text engine."""
+        vlm_dir = tmp_path / "LFM3-VL-2B-MLX-8bit"
+        vlm_dir.mkdir()
+        config = {
+            "model_type": "lfm3_vl",
+            "architectures": ["Lfm3VlForConditionalGeneration"],
+            "text_config": {"model_type": "lfm3"},
+            "vision_config": {"hidden_size": 1024},
+        }
+        (vlm_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(vlm_dir) == "vlm"
+
     def test_detect_qwen3_vl_reranker(self, tmp_path):
         """Qwen3VLForConditionalGeneration + 'reranker' in dir name → reranker."""
         reranker_dir = tmp_path / "Qwen3-VL-Reranker-2B-4bit"
