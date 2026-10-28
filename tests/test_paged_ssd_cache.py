@@ -2654,7 +2654,9 @@ class TestEffectiveMaxSize:
 
         assert effective == 50 * 1024**3
 
-    @pytest.mark.parametrize("auto_size,expected_gib", [(True, 100), (False, 495)])
+    # Volume figures stay below the auto ceiling, so the ceiling cannot mask a
+    # budget that re-reads the cache size between disk samples.
+    @pytest.mark.parametrize("auto_size,expected_gib", [(True, 50), (False, 99)])
     def test_effective_max_size_cache_30s(self, tmp_path, auto_size, expected_gib):
         manager = PagedSSDCacheManager(
             cache_dir=tmp_path / "ssd_cache",
@@ -2664,16 +2666,16 @@ class TestEffectiveMaxSize:
         try:
             manager._disk_usage_cache = None
             mock_usage = self._make_disk_usage(
-                1000 * 1024**3, 500 * 1024**3, 500 * 1024**3
+                1000 * 1024**3, 900 * 1024**3, 100 * 1024**3
             )
             with patch("shutil.disk_usage", return_value=mock_usage) as mock_du:
                 assert manager.max_size == expected_gib * 1024**3
-                manager._index._total_size = 100 * 1024**3
+                manager._index._total_size = 40 * 1024**3
                 assert manager.max_size == expected_gib * 1024**3
                 assert mock_du.call_count == 1
                 manager._disk_usage_cache_time -= 31
                 mock_du.return_value = self._make_disk_usage(
-                    1000 * 1024**3, 600 * 1024**3, 400 * 1024**3
+                    1000 * 1024**3, 940 * 1024**3, 60 * 1024**3
                 )
                 assert manager.max_size == expected_gib * 1024**3
                 assert mock_du.call_count == 2
