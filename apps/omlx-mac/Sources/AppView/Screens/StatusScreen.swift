@@ -576,7 +576,7 @@ private struct ActiveNowList: View {
                                                       comment: "Active Now badge: model has queued requests"),
                                         fillBg: true))
         } else {
-            StatusPill(status: .custom(color: theme.textTertiary,
+            StatusPill(status: .custom(color: theme.greenDot,
                                         label: String(localized: "status.active_now.badge.loaded",
                                                       defaultValue: "Loaded",
                                                       comment: "Active Now badge: model is loaded but idle"),
