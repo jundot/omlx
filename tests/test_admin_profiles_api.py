@@ -1148,7 +1148,6 @@ def test_a8_profile_roundtrip_supported_architectures(client, monkeypatch, model
         {"turboquant_kv_bits": 5},
         {"dflash_verify_mode": "typo"},
         {"dflash_block_size": 1.5},
-        {"specprefill_enabled": "not-a-boolean"},
         {"dflash_draft_quant_enabled": []},
         {"reasoning_parser": "unknown-parser"},
     ],
@@ -1273,6 +1272,8 @@ def test_exposed_profile_rejects_draft_that_cannot_load(client, tmp_path):
 
     An exposed profile is merged over the base settings per request, so a
     draft it only parks still loads when the base model has the feature on.
+    VLM MTP stands in for SpecPrefill here: specprefill-activation-split keeps
+    SpecPrefill's switch and drafter model-only, so a profile cannot carry them.
     """
     c, mgr = client
     usable = tmp_path / "usable-draft"
@@ -1283,8 +1284,8 @@ def test_exposed_profile_rejects_draft_that_cannot_load(client, tmp_path):
         "model-a",
         ModelSettings(
             temperature=0.5,
-            specprefill_enabled=True,
-            specprefill_draft_model=str(usable),
+            vlm_mtp_enabled=True,
+            vlm_mtp_draft_model=str(usable),
         ),
     )
 
@@ -1294,7 +1295,7 @@ def test_exposed_profile_rejects_draft_that_cannot_load(client, tmp_path):
             "name": "broken",
             "display_name": "Broken",
             "expose_as_model": True,
-            "settings": {"specprefill_draft_model": missing},
+            "settings": {"vlm_mtp_draft_model": missing},
         },
     )
 
@@ -1303,7 +1304,22 @@ def test_exposed_profile_rejects_draft_that_cannot_load(client, tmp_path):
     assert mgr.get_profile("model-a", "broken") is None
     stored = mgr.get_settings("model-a")
     assert stored.temperature == 0.5
-    assert stored.specprefill_draft_model == str(usable)
+    assert stored.vlm_mtp_draft_model == str(usable)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"specprefill_enabled": "not-a-boolean"},
+    ],
+)
+def test_invalid_specprefill_load_fields_rejected_on_model_settings(client, values):
+    """SpecPrefill load fields validate on the model, never on a profile."""
+    c, mgr = client
+    before = {p.name: p.read_bytes() for p in mgr.base_path.glob("*.json")}
+    response = c.put("/admin/api/models/model-a/settings", json=values)
+    assert response.status_code == 422, response.text
+    assert {p.name: p.read_bytes() for p in mgr.base_path.glob("*.json")} == before
 
 
 @pytest.mark.parametrize("operation", ["settings", "create", "update"])
@@ -1314,7 +1330,7 @@ def test_valid_settings_are_normalized_and_preserved(client, tmp_path, operation
     (draft / "config.json").write_text('{"model_type":"muse_glimmer_assistant"}')
     url = "/admin/api/models/model-a"
     payload = {
-        "specprefill_enabled": "false",
+        "specprefill_auto_enabled": "false",
         "dflash_draft_quant_enabled": "false",
         "cache_reasoning_output": "false",
         "turboquant_kv_bits": 0,
@@ -1339,18 +1355,18 @@ def test_valid_settings_are_normalized_and_preserved(client, tmp_path, operation
         assert response.status_code == 200, response.text
         saved = response.json()["profile"]["settings"]
         assert "temperature" not in saved
-        assert saved["specprefill_enabled"] is False
+        assert saved["specprefill_auto_enabled"] is False
         model_id, exposed = mgr.get_exposed_profile_runtime_settings_for_request(
             "model-a:valid"
         )
         assert model_id == "model-a"
-        assert exposed.specprefill_enabled is False
+        assert exposed.specprefill_auto_enabled is False
         assert exposed.dflash_draft_quant_enabled is False
         assert exposed.cache_reasoning_output is False
         response = c.post(url + "/profiles/valid/apply")
     assert response.status_code == 200, response.text
     result = mgr.get_settings("model-a")
-    assert result.specprefill_enabled is False
+    assert result.specprefill_auto_enabled is False
     assert result.dflash_draft_quant_enabled is False
     assert result.cache_reasoning_output is False
     assert result.turboquant_kv_bits == 4
@@ -1489,7 +1505,7 @@ def test_draft_references_follow_local_path_rules(
     "values",
     [
         {"mtp_enabled": True, "dflash_enabled": True},
-        {"vlm_mtp_enabled": True, "specprefill_enabled": True},
+        {"mtp_enabled": True, "vlm_mtp_enabled": True},
     ],
 )
 def test_profile_conflicting_flags_rejected_before_storage(client, operation, values):
@@ -2103,7 +2119,11 @@ class TestSettingsSnapshotRoutes:
 
 
 def test_apply_rejects_profile_draft_that_cannot_load(client, tmp_path):
-    """Applying a profile may not turn on a feature with an unloadable draft."""
+    """Applying a profile may not turn on a feature with an unloadable draft.
+
+    VLM MTP stands in for SpecPrefill: specprefill-activation-split keeps
+    SpecPrefill's switch and drafter model-only, so a profile cannot carry them.
+    """
     c, mgr = client
     missing = str(tmp_path / "deleted-draft")
     mgr.save_profile(
@@ -2111,7 +2131,7 @@ def test_apply_rejects_profile_draft_that_cannot_load(client, tmp_path):
         name="broken",
         display_name="Broken",
         description=None,
-        settings={"specprefill_enabled": True, "specprefill_draft_model": missing},
+        settings={"vlm_mtp_enabled": True, "vlm_mtp_draft_model": missing},
     )
     mgr.set_settings("model-a", ModelSettings(temperature=0.5))
 
@@ -2122,4 +2142,4 @@ def test_apply_rejects_profile_draft_that_cannot_load(client, tmp_path):
     stored = mgr.get_settings("model-a")
     assert stored.temperature == 0.5
     assert stored.active_profile_name is None
-    assert stored.specprefill_draft_model != missing
+    assert stored.vlm_mtp_draft_model != missing

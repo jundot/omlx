@@ -2856,6 +2856,10 @@ class VLMBatchedEngine(BaseEngine):
                         threshold=getattr(
                             self._model_settings, "specprefill_threshold", None
                         ),
+                        auto_enabled=getattr(
+                            self._model_settings, "specprefill_auto_enabled", None
+                        )
+                        is not False,
                     )
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
