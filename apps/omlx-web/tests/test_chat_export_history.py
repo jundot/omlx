@@ -12,6 +12,11 @@ import pytest
 CHAT_TEMPLATE = Path(__file__).parents[1] / "omlx_web" / "templates" / "chat.html"
 
 METHODS = [
+    "isTemporaryChat",
+    "toggleTemporaryChat",
+    "discardTemporaryChat",
+    "resetStreamSession",
+    "createThinkingState",
     "messageForStorage",
     "saveCurrentChat",
     "saveChatHistory",
@@ -75,6 +80,9 @@ console.warn = () => {};
         + """
 app.chatHistory = [];
 app.chatSessions = {};
+app.streamSessions = {};
+app.getStreamSession = id => app.streamSessions[id] || null;
+app.cancelStreamTransport = () => {};
 app.currentChatId = 'chat_1';
 app.currentModel = 'model';
 app.systemPrompt = '';
@@ -126,6 +134,36 @@ console.log(JSON.stringify({
             "messages": [["user", "question"], ["assistant", "answer"]],
         }
     ]
+
+
+def test_temporary_chat_stays_out_of_history_and_export():
+    """Switching to temporary, saving, and a stream finishing after leaving."""
+    result = _run("""
+app.chatSessions.chat_old = {messages: [], model: 'model', systemPrompt: '',
+                             modelSettingsByModel: {}};
+app.saveCurrentChat('chat_old', [{id: 'o1', role: 'user', content: 'kept'}]);
+const session = {messages: [], model: 'model', systemPrompt: '',
+                 modelSettingsByModel: {}};
+app.chatSessions.chat_1 = session;
+app.messages = session.messages;
+app.saveCurrentChat('chat_1');
+await app.toggleTemporaryChat();
+session.messages.push({id: 'u1', role: 'user', content: 'secret'});
+app.saveCurrentChat('chat_1');
+const stream = {chatId: 'chat_1', isStreaming: true};
+app.streamSessions.chat_1 = stream;
+app.discardTemporaryChat('chat_1');
+app.currentChatId = 'chat_2';
+app.saveCurrentChat('chat_1', session.messages, 'model', '');
+app.resetStreamSession(stream);
+const stored = JSON.parse(localStorage.getItem(CHAT_HISTORY_STORAGE_KEY));
+const chats = await exportedChats();
+console.log(JSON.stringify({stored: stored.map(c => c.id),
+                            exported: chats.map(c => c.id),
+                            sessions: Object.keys(app.chatSessions)}));
+""")
+    assert result == {"stored": ["chat_old"], "exported": ["chat_old"],
+                      "sessions": ["chat_old"]}
 
 
 def test_export_keeps_the_current_chat_when_another_chat_is_pinned():

@@ -1385,8 +1385,29 @@
             <i data-lucide="settings" class="w-5 h-5"></i>
         </button>
 
+        <button @click="toggleTemporaryChat()" :disabled="messages.length > 0"
+            class="absolute p-1.5 bg-surface hover:bg-surface-muted rounded-lg border border-line z-[100] shadow-sm disabled:cursor-not-allowed"
+            :class="{ 'disabled:opacity-40': !isTemporaryChat() }"
+            style="top: 1rem; right: 3.75rem; color: var(--text-primary);"
+            :aria-pressed="isTemporaryChat().toString()"
+            :title="window.t(messages.length > 0
+                ? 'chat.temporary_chat_locked'
+                : (isTemporaryChat() ? 'chat.temporary_chat_on' : 'chat.temporary_chat_off'))"
+            aria-label="{{ t('chat.temporary_chat') }}"
+            x-show="showRightToggle">
+            <i x-show="!isTemporaryChat()" data-lucide="message-square-dashed" class="w-5 h-5"></i>
+            <i x-show="isTemporaryChat()" x-cloak data-lucide="message-square" class="w-5 h-5" style="fill: currentColor;"></i>
+        </button>
+
         <!-- Messages area with rail -->
         <div class="flex-1 min-h-0 relative">
+            <div x-show="isTemporaryChat()" x-cloak
+                class="absolute left-1/2 -translate-x-1/2 z-20 flex items-center gap-1.5 px-3 py-1 bg-surface-alt border border-line rounded-full text-xs text-fg-secondary whitespace-nowrap shadow-sm pointer-events-none"
+                style="top: 1rem;" role="status">
+                <i data-lucide="message-square-dashed" class="w-3.5 h-3.5"></i>
+                <span class="md:hidden">{{ t('chat.temporary_chat') }}</span>
+                <span class="max-md:hidden">{{ t('chat.temporary_chat_notice') }}</span>
+            </div>
             <!-- Messages Container -->
             <div class="absolute inset-0 overflow-y-auto overflow-x-hidden custom-scrollbar" id="messagesContainer">
             <!-- Welcome Screen -->
@@ -1432,7 +1453,7 @@
                                         <div x-show="contextOpen" x-transition
                                             class="absolute right-0 top-full mt-1 z-50 bg-surface border border-line rounded-lg shadow-lg py-1 min-w-[150px]"
                                             style="min-width: 160px; border-color: var(--border-normal);">
-                                            <button @click="branchChat(index); contextOpen = false"
+                                            <button x-show="!isTemporaryChat()" @click="branchChat(index); contextOpen = false"
                                                 class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
                                                 style="color: var(--text-primary);">
                                                 <i data-lucide="git-branch" class="w-3.5 h-3.5"></i>
@@ -1707,7 +1728,7 @@
                                         <div x-show="contextOpen" x-transition
                                             class="absolute right-0 top-full mt-1 z-50 bg-surface border border-line rounded-lg shadow-lg py-1 min-w-[150px]"
                                             style="min-width: 160px; border-color: var(--border-normal);">
-                                            <button @click="branchChat(index); contextOpen = false"
+                                            <button x-show="!isTemporaryChat()" @click="branchChat(index); contextOpen = false"
                                                 class="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-left hover:bg-surface-muted"
                                                 style="color: var(--text-primary);">
                                                 <i data-lucide="git-branch" class="w-3.5 h-3.5"></i>
@@ -4259,6 +4280,9 @@
                     cancelAnimationFrame(stream._domUpdateRaf);
                     stream._domUpdateRaf = null;
                 }
+                if (stream.chatId !== this.currentChatId && this.chatSessions[stream.chatId]?.temporary) {
+                    delete this.chatSessions[stream.chatId];
+                }
             },
 
             stopAllStreams() {
@@ -5753,13 +5777,52 @@
         }
     },
 
+    isTemporaryChat(chatId = this.currentChatId) {
+        return !!this.getChatSession(chatId, false)?.temporary;
+    },
+
+    // A temporary chat only lives in memory; leaving it discards it. While a
+    // stream or recording still runs, a flagged placeholder keeps its late
+    // save out of history; resetStreamSession() drops it when that ends.
+    discardTemporaryChat(chatId) {
+        if (!this.isTemporaryChat(chatId)) return false;
+        const stream = this.getStreamSession(chatId, false);
+        const busy = stream?.isStreaming || this.micSession?.chatId === chatId;
+        this.cancelStreamTransport(stream);
+        delete this.streamSessions[chatId];
+        if (busy) this.chatSessions[chatId] = { messages: [], temporary: true };
+        else delete this.chatSessions[chatId];
+        return true;
+    },
+
+    // Only an empty chat can switch; once it has messages it stays as it is.
+    // A renamed or pinned chat keeps its entry and gets a new temporary chat.
+    async toggleTemporaryChat() {
+        if (this.messages.length > 0) return;
+        const saved = this.chatHistory.find(c => c.id === this.currentChatId);
+        if (!this.currentChatId || saved?.manualTitle || saved?.pinned) {
+            const draft = this.inputMessage;
+            await this.startNewChat({ preserveDraft: true, temporary: true });
+            this.inputMessage = draft;
+            return;
+        }
+        const session = this.getChatSession(this.currentChatId, true);
+        session.temporary = !session.temporary;
+        if (session.temporary) {
+            this.chatHistory = this.chatHistory.filter(c => c.id !== this.currentChatId);
+            this.saveChatHistory();
+        } else {
+            this.saveCurrentChat(this.currentChatId);
+        }
+    },
+
     async startNewChat(options = {}) {
         this.cancelPersistModelSettingsTimer();
         const prevChatId = this.currentChatId;
         const preserveDraft = options.preserveDraft === true && !prevChatId;
         const draftSystemPrompt = this.systemPrompt;
         const draftActiveProfile = this.activePromptProfile;
-        if (prevChatId) {
+        if (prevChatId && !this.discardTemporaryChat(prevChatId)) {
             const prevSession = this.getChatSession(prevChatId, false);
             if (prevSession) {
                 prevSession.messages = this.messages;
@@ -5803,6 +5866,7 @@
             speculativeEngine: null,
             speculativeDraftModel: null,
             modelSettingsByModel: {},
+            temporary: options.temporary === true,
         };
         this.chatSessions[chatId] = session;
         this.messages = session.messages;
@@ -5843,7 +5907,7 @@
 
     async loadChat(chatId) {
         this.cancelPersistModelSettingsTimer();
-        if (this.currentChatId && this.currentChatId !== chatId) {
+        if (this.currentChatId && this.currentChatId !== chatId && !this.discardTemporaryChat(this.currentChatId)) {
             const prevSession = this.getChatSession(this.currentChatId, false);
             if (prevSession) {
                 prevSession.messages = this.messages;
@@ -5994,6 +6058,7 @@
                 this.saveModelSettingsForModel(session, chatModel);
             }
         }
+        if (session?.temporary) return;
 
         if (existingIndex >= 0) {
             this.chatHistory[existingIndex] = chatData;
