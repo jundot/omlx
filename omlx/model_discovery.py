@@ -129,6 +129,8 @@ DECISION_SIDECAR_FILES = (
     *DECISION_SIDECAR_WEIGHTS,
     CLEF_HEAD_CONFIG,
     D3_DECISION_CONFIG,
+    "readout.json",
+    "calibration.json",
 )
 
 # Speculative-decoding "helper" checkpoints (dFlash / MTP / assistant drafters)

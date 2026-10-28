@@ -23,6 +23,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..model_discovery import BASELABS_CONTEXT_LENGTH
+from ..patches.sdpa256_attention import apply_sdpa256_attention_patch
 from .decision import (
     ChunkSize,
     DecisionBackbone,
@@ -238,6 +239,8 @@ class BaseLabsModel:
                 )
         self.backbone.load()
         try:
+            # Decision-only servers also need bounded head-dim-256 attention.
+            apply_sdpa256_attention_patch()
             ids = []
             for label in SLOT_LABELS:
                 encoded = self.backbone.tokenize(label)
@@ -305,6 +308,13 @@ class BaseLabsModel:
             raise DecisionRequestError(
                 "state must contain finite JSON values"
             ) from error
+        if images and not _IMAGE_PLACEHOLDER.search(text):
+            # /v1/decisions supplies images separately from its state text.
+            text = (
+                "\n".join(f"<image:{i}>" for i in range(1, len(images) + 1))
+                + "\n"
+                + text
+            )
         block = f"<state>\n{text}\n</state>\n\n"
         items = [
             normalize_question(key, question)
@@ -379,46 +389,6 @@ class BaseLabsModel:
             grid,
         )
 
-    def _prefill_block(
-        self,
-        embeds: mx.array,
-        positions: mx.array | None,
-        cache: list,
-        chunk_size: ChunkSize,
-    ) -> Generator[int, None, mx.array]:
-        """Read one bidirectional block, attending to its cached predecessors.
-
-        A block cannot be split across tokens: every full-attention query must
-        see its whole block. Yield between groups of layers instead. Gated
-        DeltaNet retains its causal recurrence and its own cache state.
-        """
-        backbone = self.backbone
-        layers = backbone._text_model.layers
-        depth, length = len(layers), embeds.shape[1]
-        positional = {}
-        if backbone.has_vision:
-            rotary = next(
-                layer.self_attn.rotary_emb for layer in layers if not layer.is_linear
-            )
-            positional = {
-                "position_ids": positions,
-                "position_embeddings": (
-                    None if rotary.fused_apply else rotary(embeds, positions)
-                ),
-            }
-        hidden = embeds
-        done = 0
-        while done < depth:
-            end = min(depth, done + max(1, chunk_size() * depth // length))
-            for index in range(done, end):
-                hidden = layers[index](
-                    hidden, mask=None, cache=cache[index], **positional
-                )
-            mx.eval(hidden, [entry.state for entry in cache[done:end]])
-            yield length * end // depth - length * done // depth
-            done = end
-        return backbone._text_model.norm(hidden[0, -1])
-
     def run(
         self, plan: BaseLabsPlan, chunk_size: ChunkSize
     ) -> Generator[int, None, dict]:
@@ -429,14 +399,16 @@ class BaseLabsModel:
             plan.prefix_ids, plan.pixel_values, plan.image_grid_thw
         )
         prefix_cache = backbone.make_cache()
-        yield from self._prefill_block(embeds, positions, prefix_cache, chunk_size)
+        yield from backbone.encode(
+            embeds, positions, chunk_size, causal=False, cache=prefix_cache
+        )
         last_position = None if positions is None else positions[:, :, -1]
         answers = {}
         for item, suffix in zip(plan.items, plan.suffix_ids):
             cache = copy.deepcopy(prefix_cache)
             embeds, positions = backbone.embed_continuation(suffix, last_position)
-            hidden = yield from self._prefill_block(
-                embeds, positions, cache, chunk_size
+            hidden = yield from backbone.encode(
+                embeds, positions, chunk_size, causal=False, cache=cache
             )
             logits = (
                 self._slot_weights[: len(item.labels)] @ hidden.astype(mx.float32)

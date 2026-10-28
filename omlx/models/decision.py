@@ -249,9 +249,10 @@ class DecisionBackbone:
     def encode(
         self,
         embeds: mx.array,
-        positions: mx.array,
+        positions: mx.array | None,
         chunk_size: ChunkSize,
         causal: bool,
+        cache: list | None = None,
     ) -> Generator[int, None, mx.array]:
         """Run every layer over the whole prompt; return the last token's
         final-normed hidden state.
@@ -259,32 +260,39 @@ class DecisionBackbone:
         Without ``causal`` the full-attention layers read every prompt token;
         the Gated DeltaNet layers stay causal. One step runs the layers that
         ``chunk_size()`` tokens of causal prefill would cost and yields that
-        token count.
+        token count. An optional cache carries a preceding block; a whole
+        bidirectional block must stay together rather than be token-chunked.
         """
         layers = self._text_model.layers
         depth = len(layers)
         length = embeds.shape[1]
         mask = "causal" if causal else None
-        position_embeddings = None
-        for layer in layers:
-            if not layer.is_linear:
-                rotary = layer.self_attn.rotary_emb
-                if not rotary.fused_apply:
-                    position_embeddings = rotary(embeds, positions)
-                break
+        positional = {}
+        if self.has_vision:
+            position_embeddings = None
+            for layer in layers:
+                if not layer.is_linear:
+                    rotary = layer.self_attn.rotary_emb
+                    if not rotary.fused_apply:
+                        position_embeddings = rotary(embeds, positions)
+                    break
+            positional = {
+                "position_ids": positions,
+                "position_embeddings": position_embeddings,
+            }
         hidden = embeds
         done = 0
         while done < depth:
             end = min(depth, done + max(1, chunk_size() * depth // length))
-            for layer in layers[done:end]:
+            for index in range(done, end):
+                layer = layers[index]
                 hidden = layer(
                     hidden,
                     mask=None if layer.is_linear else mask,
-                    cache=None,
-                    position_ids=positions,
-                    position_embeddings=position_embeddings,
+                    cache=None if cache is None else cache[index],
+                    **positional,
                 )
-            mx.eval(hidden)
+            mx.eval(hidden, [] if cache is None else [c.state for c in cache[done:end]])
             yield length * end // depth - length * done // depth
             done = end
         return self._text_model.norm(hidden[0, -1])

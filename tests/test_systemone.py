@@ -1155,8 +1155,6 @@ def _full_block_readout(backbone, ids, boundary, pixels=None, grid=None):
 @pytest.mark.parametrize("chunk", [1, 4096])
 def test_block_prefill_matches_full_masked_forward(block_backbone, chunk):
     backbone = block_backbone
-    model = baselabs.BaseLabsModel("tiny")
-    model.backbone = backbone
     ids = np.arange(5, 35, dtype=np.int32)
     pixels = grid = None
     if backbone.has_vision:
@@ -1165,14 +1163,20 @@ def test_block_prefill_matches_full_masked_forward(block_backbone, chunk):
     expected = _full_block_readout(backbone, ids, split, pixels, grid)
     prefix_embeds, positions = backbone.embed(ids[:split], pixels, grid)
     prefix_cache = backbone.make_cache()
-    steps = model._prefill_block(prefix_embeds, positions, prefix_cache, lambda: chunk)
+    steps = backbone.encode(
+        prefix_embeds, positions, lambda: chunk, causal=False, cache=prefix_cache
+    )
     assert sum(steps) == split
     last_position = None if positions is None else positions[:, :, -1]
     for _ in range(2):
         embeds, tail_positions = backbone.embed_continuation(ids[split:], last_position)
         actual = _drain(
-            model._prefill_block(
-                embeds, tail_positions, copy.deepcopy(prefix_cache), lambda: chunk
+            backbone.encode(
+                embeds,
+                tail_positions,
+                lambda: chunk,
+                causal=False,
+                cache=copy.deepcopy(prefix_cache),
             )
         )
         assert np.allclose(np.array(actual), np.array(expected), atol=2e-4)
@@ -1323,6 +1327,38 @@ def test_baselabs_image_plan_matches_full_multimodal_block(tiny_backbone, monkey
     expected = np.exp(np.asarray(logits) - max(logits))
     expected /= expected.sum()
     assert actual == pytest.approx(expected[0], abs=2e-4)
+    # The public Decisions translation has images but no inline placeholders.
+    from omlx.api.decisions import to_systemone
+    from omlx.api.decisions_models import DecisionRequest
+
+    translated = to_systemone(
+        DecisionRequest.model_validate(
+            {
+                "model": "tiny",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Inspect the image."},
+                            {
+                                "type": "input_image",
+                                "image_url": "data:image/png;base64,AA==",
+                            },
+                        ],
+                    }
+                ],
+                "questions": [{"type": "predicate", "name": "q", "instructions": "?"}],
+            }
+        )
+    )
+    automatic = model.encode(translated)
+    explicit = model.encode(
+        {**translated, "state": "<image:1>\n" + translated["state"]}
+    )
+    assert np.array_equal(automatic.prefix_ids, explicit.prefix_ids)
+    assert _drain(model.run(automatic, lambda: 32)) == _drain(
+        model.run(explicit, lambda: 32)
+    )
     with pytest.raises(DecisionRequestError, match="once, in order"):
         model.encode({**request, "state": "Inspect <image:2>."})
     with pytest.raises(DecisionRequestError, match="not questions"):
@@ -1336,8 +1372,8 @@ def test_baselabs_image_plan_matches_full_multimodal_block(tiny_backbone, monkey
         )
 
 
-@pytest.mark.parametrize("readout", ["head", "unknown"])
-def test_baselabs_rejects_unsupported_readout_before_loading_weights(tmp_path, readout):
+@pytest.fixture
+def baselabs_checkpoint(tmp_path):
     config = {
         "modeling_overrides": {
             "attention": {
@@ -1349,8 +1385,36 @@ def test_baselabs_rejects_unsupported_readout_before_loading_weights(tmp_path, r
         }
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
-    (tmp_path / "readout.json").write_text(
+    (tmp_path / "readout.json").write_text('{"readout": "slot_lm", "n_slots": 256}')
+    return tmp_path
+
+
+@pytest.mark.parametrize("readout", ["head", "unknown"])
+def test_baselabs_rejects_unsupported_readout_before_loading_weights(
+    baselabs_checkpoint, readout
+):
+    (baselabs_checkpoint / "readout.json").write_text(
         json.dumps({"readout": readout, "n_slots": 256})
     )
     with pytest.raises(ValueError, match="slot_lm"):
-        baselabs.BaseLabsModel(str(tmp_path)).load()
+        baselabs.BaseLabsModel(str(baselabs_checkpoint)).load()
+
+
+def test_baselabs_load_installs_bounded_attention(baselabs_checkpoint, monkeypatch):
+    model = baselabs.BaseLabsModel(str(baselabs_checkpoint))
+    installed = []
+    monkeypatch.setattr(
+        baselabs, "apply_sdpa256_attention_patch", lambda: installed.append(True)
+    )
+    monkeypatch.setattr(model.backbone, "load", lambda: None)
+    monkeypatch.setattr(
+        model.backbone, "tokenize", lambda label: [baselabs.SLOT_LABELS.index(label)]
+    )
+    model.backbone.tokenizer = SimpleNamespace(
+        decode=lambda ids: baselabs.SLOT_LABELS[ids[0]]
+    )
+    monkeypatch.setattr(
+        model.backbone, "output_rows", lambda ids: mx.zeros((len(ids), 4))
+    )
+    model.load()
+    assert installed == [True]
