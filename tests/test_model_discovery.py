@@ -333,6 +333,37 @@ class TestDetectModelType:
         (vlm_dir / "config.json").write_text(json.dumps(config))
         assert detect_model_type(vlm_dir) == "vlm"
 
+    def test_detect_lfm3_audio_model_is_vlm(self, tmp_path):
+        """LFM3-Audio is audio-in/text-out through mlx-vlm, not an mlx-audio STS.
+
+        Its config has no vision sub-config, and the generic ``lfm*`` fallback
+        would otherwise route it to the mlx-audio engine, which has no LFM3.
+        """
+        audio_dir = tmp_path / "LFM3-Audio-2B-MLX-8bit"
+        audio_dir.mkdir()
+        config = {
+            "model_type": "lfm3_audio",
+            "architectures": ["Lfm3AudioForConditionalGeneration"],
+            "text_config": {"model_type": "lfm3"},
+            "audio_config": {"num_mel_bins": 128},
+        }
+        (audio_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(audio_dir) == "vlm"
+
+    def test_detect_lfm3_omni_model_is_vlm(self, tmp_path):
+        """LFM3-Omni carries vision and audio towers and is served by mlx-vlm."""
+        omni_dir = tmp_path / "LFM3-Omni-2B-MLX-8bit"
+        omni_dir.mkdir()
+        config = {
+            "model_type": "lfm3_omni",
+            "architectures": ["Lfm3OmniForConditionalGeneration"],
+            "text_config": {"model_type": "lfm3"},
+            "vision_config": {"hidden_size": 1024},
+            "audio_config": {"num_mel_bins": 128},
+        }
+        (omni_dir / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(omni_dir) == "vlm"
+
     def test_detect_qwen3_vl_reranker(self, tmp_path):
         """Qwen3VLForConditionalGeneration + 'reranker' in dir name → reranker."""
         reranker_dir = tmp_path / "Qwen3-VL-Reranker-2B-4bit"

@@ -78,6 +78,8 @@ VLM_MODEL_TYPES = {
     "inkling",
     "inkling_mm_model",  # config model_type of Inkling Small checkpoints
     "lfm3_vl",  # LiquidAI/LFM3-VL-2B (lfm3 text stays an LLM)
+    "lfm3_audio",  # LiquidAI/LFM3-Audio-2B (audio in, text/speech out)
+    "lfm3_omni",  # LiquidAI/LFM3-Omni-2B (any-to-any)
     "muse_glimmer",
     "muse_spark",
     "glm5_next",
@@ -96,6 +98,15 @@ VLM_NATIVE_TEXT_MODEL_TYPES = {
     # The VLM engine's loader also reads the earlier oMLX layout of text-only
     # Muse Spark conversions.
     "muse_spark",
+}
+
+# Served by mlx-vlm even though config.json carries no vision sub-config:
+# Gemma 4 Unified / Diffusion Gemma are text-only mlx-vlm models, and
+# LFM3-Audio is audio-in / text-and-speech-out with no vision tower.
+VLM_WITHOUT_VISION_CONFIG_MODEL_TYPES = {
+    "gemma4_unified",
+    "diffusion_gemma",
+    "lfm3_audio",
 }
 
 # Multimodal checkpoints whose currently vendored mlx-lm implementation only
@@ -206,6 +217,8 @@ VLM_ARCHITECTURES = {
     "MuseSparkForConditionalGeneration",  # meta-models/Muse-Spark-Open-816B-A42B
     "Glm5NextForConditionalGeneration",  # zai-org/GLM-5.3-Flash
     "Lfm3VlForConditionalGeneration",  # LiquidAI/LFM3-VL-2B
+    "Lfm3AudioForConditionalGeneration",  # LiquidAI/LFM3-Audio-2B
+    "Lfm3OmniForConditionalGeneration",  # LiquidAI/LFM3-Omni-2B
     "HfMoondream",  # vikhyatk/moondream2 (2025 revisions), moondream/moondream3-preview
     "Moondream",  # vikhyatk/moondream2 (2024 revisions)
 }
@@ -813,7 +826,11 @@ def detect_model_type(model_path: Path) -> ModelType:
     # ``mm_vision_tower``).
     for arch in architectures:
         if arch in VLM_ARCHITECTURES:
-            if normalized_type in VLM_MODEL_TYPES and not _has_vision_subconfig(config):
+            if (
+                normalized_type in VLM_MODEL_TYPES
+                and normalized_type not in VLM_WITHOUT_VISION_CONFIG_MODEL_TYPES
+                and not _has_vision_subconfig(config)
+            ):
                 logger.info(
                     f"Architecture '{arch}' is a VLM architecture but no "
                     "vision_config / vit_config / mm_vision_tower found — "
@@ -828,7 +845,7 @@ def detect_model_type(model_path: Path) -> ModelType:
     # diffusion_gemma are exceptions: they are served by mlx-vlm regardless of
     # vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
-        if normalized_type in {"gemma4_unified", "diffusion_gemma"}:
+        if normalized_type in VLM_WITHOUT_VISION_CONFIG_MODEL_TYPES:
             logger.info(
                 f"{model_type} detected as VLM (mlx-vlm native model)"
             )

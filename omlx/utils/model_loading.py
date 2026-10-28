@@ -564,6 +564,9 @@ def maybe_apply_pre_load_patches(
     - LFM3-VL registration (mlx-vlm PR 2607) when ``config.json`` declares
       ``model_type == "lfm3_vl"``. Pinned mlx-vlm predates the merge, so the
       architecture is vendored and registered as ``mlx_vlm.models.lfm3_vl``.
+    - LFM3-Audio (mlx-vlm PR 2609) and LFM3-Omni (PR 2610) registration for
+      their own ``model_type`` values, sharing the vendored ``lfm3`` text
+      tower and, for Omni, the ``lfm3_vl`` vision tower.
     Safe to call repeatedly; the patches are idempotent.
     """
     from ..model_settings import validate_moe_expert_offload
@@ -858,6 +861,28 @@ def maybe_apply_pre_load_patches(
         if apply_mlx_vlm_lfm3_vl_compat_patch():
             logger.info(
                 "LFM3-VL mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
+    if for_vlm and model_type == "lfm3_audio":
+        from ..patches.mlx_vlm_lfm3_audio_compat import (
+            apply_mlx_vlm_lfm3_audio_compat_patch,
+        )
+
+        if apply_mlx_vlm_lfm3_audio_compat_patch():
+            logger.info(
+                "LFM3-Audio mlx-vlm compatibility patch applied for %s",
+                model_name,
+            )
+
+    if for_vlm and model_type == "lfm3_omni":
+        from ..patches.mlx_vlm_lfm3_omni_compat import (
+            apply_mlx_vlm_lfm3_omni_compat_patch,
+        )
+
+        if apply_mlx_vlm_lfm3_omni_compat_patch():
+            logger.info(
+                "LFM3-Omni mlx-vlm compatibility patch applied for %s",
                 model_name,
             )
 
