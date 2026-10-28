@@ -385,7 +385,7 @@ class CacheSettings:
     enabled: bool = True
     hot_cache_only: bool = False
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
-    ssd_cache_max_size: str = "auto"  # "auto" reserves half of available cache space
+    ssd_cache_max_size: str = "auto"  # "auto": half of free space + cache, max 100GB
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     # When True (and the hot cache is enabled), every saved block is kept in
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent

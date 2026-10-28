@@ -61,7 +61,7 @@ Unloading the model stops the Splash process. Splash runs in its own process gro
 | `reasoning_effort`, `enable_thinking: false` | `reasoning_effort` (`enable_thinking: false` becomes `none`); Flint decides when to reason itself and ignores it |
 | `response_format` (JSON object / JSON schema) | enforced by Splash itself, no prompt injection |
 
-The SSD cache size is a limit for each Splash model, not a shared total. Each Splash process enforces it on its own folder, and a model's folder stays after the model unloads. Three Splash models with a 100 GB limit can therefore hold up to 300 GB, in addition to oMLX's own SSD cache. Left empty, every Splash model may use the whole oMLX SSD cache size (with `auto`, about half the free disk space), so set a size when you use more than one Splash model. The dashboard's SSD cache Delete button clears these folders too.
+The SSD cache size is a limit for each Splash model, not a shared total. Each Splash process enforces it on its own folder, and a model's folder stays after the model unloads. Three Splash models with a 100 GB limit can therefore hold up to 300 GB, in addition to oMLX's own SSD cache. Left empty, every Splash model may use the whole oMLX SSD cache size (with `auto`, about half the free disk space and never more than 100 GB), so set a size when you use more than one Splash model. The dashboard's SSD cache Delete button clears these folders too.
 
 oMLX unloads idle models itself, so Splash starts with `--idle-release off`.
 
