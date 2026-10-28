@@ -18,6 +18,7 @@ METHODS = [
     "sortChatHistory",
     "cloneData",
     "downloadChats",
+    "loadChatHistory",
 ]
 
 
@@ -84,6 +85,7 @@ app.resolveAutoChatTitle = (messages, existing) => existing?.title || 'Untitled'
 app.syncSessionModelSettingsFromUi = () => {};
 app.captureSessionModelSettings = () => ({});
 app.saveModelSettingsForModel = () => {};
+app.resolveGatewayModelId = model => model;
 const exportedChats = async () => {
     exported = null;
     await app.downloadChats();
@@ -160,3 +162,26 @@ console.log(JSON.stringify({chats}));
         ("chat_1", ["first", "re: first", "second", "re: second"]),
         ("chat_old", ["earlier question", "re: earlier question"]),
     ]
+
+
+def test_chat_started_before_history_loads_keeps_saved_chats():
+    """New Chat can save before init() has loaded the history."""
+    result = _run("""
+localStorage.setItem(CHAT_HISTORY_STORAGE_KEY, JSON.stringify([
+    {id: 'chat_a', title: 'A', messages: [], updatedAt: '2026-01-02T00:00:00Z'},
+    {id: 'chat_b', title: 'B', messages: [], updatedAt: '2026-01-01T00:00:00Z'},
+]));
+app.chatHistoryPending = true;
+app.chatSessions.chat_1 = {messages: [], model: 'model', systemPrompt: '',
+                           modelSettingsByModel: {}};
+app.saveCurrentChat('chat_1');
+const ids = () => JSON.parse(localStorage.getItem(CHAT_HISTORY_STORAGE_KEY))
+    .map(c => c.id);
+const beforeLoad = ids();
+app.loadChatHistory();
+console.log(JSON.stringify({beforeLoad, after: ids()}));
+""")
+    assert result == {
+        "beforeLoad": ["chat_a", "chat_b"],
+        "after": ["chat_1", "chat_a", "chat_b"],
+    }

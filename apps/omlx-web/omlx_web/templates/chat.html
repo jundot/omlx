@@ -2847,6 +2847,7 @@
             // Chat State
             currentChatId: null,
             chatHistory: [],
+            chatHistoryPending: true,
             _thinkingDomSeq: 0,
             _adminModelsList: null,
             _adminModelsListPromise: null,
@@ -5691,6 +5692,9 @@
     },
 
     loadChatHistory() {
+        // init() awaits the model list first, so a chat can start before this runs.
+        const early = this.chatHistoryPending ? this.chatHistory.splice(0) : [];
+        this.chatHistoryPending = false;
         const history = localStorage.getItem(CHAT_HISTORY_STORAGE_KEY);
         if (history) {
             try {
@@ -5722,9 +5726,18 @@
                 this.chatHistory = [];
             }
         }
+        const ids = new Set(this.chatHistory.map(c => c.id));
+        const unsaved = early.filter(c => !ids.has(c.id));
+        if (unsaved.length) {
+            this.chatHistory.unshift(...unsaved);
+            this.sortChatHistory();
+            this.saveChatHistory();
+        }
     },
 
     saveChatHistory() {
+        // Writing before the history is loaded would replace it.
+        if (this.chatHistoryPending) return;
         const key = CHAT_HISTORY_STORAGE_KEY;
         // Trim only the stored copy; the sidebar and export keep every chat.
         const toStore = this.chatHistory.slice();
