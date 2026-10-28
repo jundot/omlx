@@ -27,7 +27,9 @@ from omlx.admin.benchmark import (
     BenchmarkRun,
     _benchmark_runs,
     _send_event as bench_send_event,
+    clear_queue,
     get_active_run,
+    get_queue,
 )
 from omlx.admin.accuracy_benchmark import (
     AccuracyBenchmarkRequest,
@@ -325,7 +327,7 @@ class TestAccuracyBenchmarkSSEReplay:
         }
 
 
-# --- Route-level: /api/bench/active + 409 on concurrent start ---------------
+# --- Route-level: /api/bench/active + queueing on concurrent start ----------
 
 
 class _FakeEntry:
@@ -354,7 +356,11 @@ def bench_client(monkeypatch):
 
     from omlx.admin import routes as admin_routes
 
+    from omlx.admin import benchmark as bench_module
+
     _benchmark_runs.clear()
+    clear_queue()
+    monkeypatch.setattr(bench_module, "_queue_task", None)
     monkeypatch.setattr(admin_routes, "_get_engine_pool", lambda: _FakePool())
 
     async def _fake_require_admin():
@@ -365,6 +371,7 @@ def bench_client(monkeypatch):
     app.dependency_overrides[admin_routes.require_admin] = _fake_require_admin
     yield TestClient(app)
     _benchmark_runs.clear()
+    clear_queue()
 
 
 class TestActiveBenchEndpoint:
@@ -376,6 +383,7 @@ class TestActiveBenchEndpoint:
             "bench_id": None,
             "model_id": None,
             "context_profile": None,
+            "queue": [],
         }
 
     def test_returns_running_run_payload(self, bench_client):
@@ -390,6 +398,7 @@ class TestActiveBenchEndpoint:
         assert r.status_code == 200
         assert r.json() == {
             "running": True,
+            "queue": [],
             "bench_id": "bench-abc",
             "model_id": "model-x",
             "context_profile": "code_python",
@@ -398,12 +407,12 @@ class TestActiveBenchEndpoint:
         }
 
 
-class TestConcurrentStartRejection:
-    """Server refuses to start a second throughput bench while one is
+class TestConcurrentStartQueueing:
+    """Server never starts a second throughput bench while one is
     running — two concurrent runs on the same engine produce mutually-
-    corrupted measurements, and there's no way to recover the data."""
+    corrupted measurements — so the second request waits in the queue."""
 
-    def test_start_409_when_already_running(self, bench_client):
+    def test_start_queues_when_already_running(self, bench_client):
         # Seed a running run in the registry.
         existing = BenchmarkRun(
             bench_id="bench-existing",
@@ -419,13 +428,68 @@ class TestConcurrentStartRejection:
                 "prompt_lengths": [1024],
             },
         )
-        assert r.status_code == 409
-        body = r.json()
-        assert "already running" in body["detail"].lower()
-        assert "bench-existing" in body["detail"]
-        # Confirm the registry still has only the original run — no
-        # second one was spuriously created and abandoned.
+        assert r.status_code == 200, r.text
+        assert r.json() == {
+            "status": "queued",
+            "queue": [{"model_id": "model-x", "external": False}],
+        }
+        # The registry still has only the original run — the queued
+        # request starts after it, not alongside it.
         assert len(_benchmark_runs) == 1
+        assert get_queue() == [{"model_id": "model-x", "external": False}]
+
+    def test_start_queues_while_finished_run_uploads(self, bench_client, monkeypatch):
+        # The run is "completed" but its queue task is still uploading and
+        # will start the next queued request: a new start must wait too.
+        from omlx.admin import benchmark as bench_module
+
+        class _Pending:
+            def done(self):
+                return False
+
+        uploading = BenchmarkRun(
+            bench_id="bench-uploading",
+            request=BenchmarkRequest(model_id="model-x", prompt_lengths=[1024]),
+        )
+        uploading.status = "completed"
+        uploading.task = _Pending()
+        _benchmark_runs[uploading.bench_id] = uploading
+        monkeypatch.setattr(bench_module, "_queue_task", uploading.task)
+
+        r = bench_client.post(
+            "/admin/api/bench/start",
+            json={"model_id": "model-x", "prompt_lengths": [1024]},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "queued"
+        assert len(_benchmark_runs) == 1
+
+        # Cancel still reaches the queue behind the uploading run.
+        r = bench_client.post("/admin/api/bench/bench-uploading/cancel")
+        assert r.status_code == 200, r.text
+        assert get_queue() == []
+        assert uploading.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_queue_runs_after_the_current_run(self, bench_client, monkeypatch):
+        from omlx.admin import benchmark as bench_module
+
+        ran = []
+
+        async def _fake_run(run, pool):
+            ran.append(run.request.model_id)
+            run.status = "completed"
+
+        monkeypatch.setattr(bench_module, "run_benchmark", _fake_run)
+        first = bench_module.create_run(
+            BenchmarkRequest(model_id="model-a", prompt_lengths=[1024])
+        )
+        bench_module.add_to_queue(
+            BenchmarkRequest(model_id="model-b", prompt_lengths=[1024])
+        )
+        await bench_module.run_queue(first, None)
+        assert ran == ["model-a", "model-b"]
+        assert get_queue() == []
 
     def test_start_allowed_when_previous_completed(self, bench_client, monkeypatch):
         # A completed prior run must not block a fresh start.

@@ -50,14 +50,19 @@ def _clean_bench_state():
     """Keep module-level run/queue state isolated between tests.
 
     Cleared on both sides of the test: other test modules leak runs into
-    _benchmark_runs (a leftover status=="running" run makes /start 409).
+    _benchmark_runs (a leftover status=="running" run makes /start queue
+    instead of start).
     """
     from omlx.admin import accuracy_benchmark, benchmark
 
     benchmark._benchmark_runs.clear()
+    benchmark.clear_queue()
+    benchmark._queue_task = None
     accuracy_benchmark._queue.clear()
     yield
     benchmark._benchmark_runs.clear()
+    benchmark.clear_queue()
+    benchmark._queue_task = None
     accuracy_benchmark._queue.clear()
 
 
