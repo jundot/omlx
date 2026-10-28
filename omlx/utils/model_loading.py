@@ -545,6 +545,10 @@ def maybe_apply_pre_load_patches(
       declares ``model_type == "glm_moe_dsa"``. Required because pinned
       mlx-lm exposes it as a bare DeepSeek-V3.2 subclass and cannot load
       checkpoints whose shared DSA layers carry no indexer weights.
+    - LFM3 registration (mlx-lm PR 2016) when ``config.json`` declares
+      ``model_type == "lfm3"``. Pinned mlx-lm has no ``lfm3`` module, so the
+      architecture is vendored and registered as ``mlx_lm.models.lfm3``.
+      Text checkpoints only; LFM3-VL is an mlx-vlm model.
     - Lightning MTP patch (PR 990 + PR 15) when the config declares MTP heads
       on a supported model_type. Always applied for sanitize correctness;
       head attachment is gated by ``model_settings.mtp_enabled``.
@@ -757,6 +761,15 @@ def maybe_apply_pre_load_patches(
 
         if apply_raon1_mini_patch():
             logger.info("Raon-1 mini pre-load patch applied for %s", model_name)
+
+    if not for_vlm and model_type == "lfm3":
+        # mlx-lm resolves architectures through ``mlx_lm.models.<model_type>``;
+        # pinned mlx-lm stops at LFM2, so LFM3 is registered from the vendored
+        # implementation before the loader imports it.
+        from ..patches.lfm3_mlx_lm import apply_lfm3_mlx_lm_patch
+
+        if apply_lfm3_mlx_lm_patch():
+            logger.info("LFM3 mlx-lm registration applied for %s", model_name)
 
     if model_type == "laguna":
         # MLX-LM dynamically imports the architecture and tokenizer-configured
