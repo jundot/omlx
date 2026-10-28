@@ -9,12 +9,17 @@ and runs causal prefill in chunks, or a whole-prompt encode in layer steps,
 so the engine can give the GPU to other models between steps.
 """
 
+import copy
+import hashlib
 import json
 import logging
 import os
 import tempfile
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +57,111 @@ def decode_images(urls: list[str] | None) -> list:
     return [load_image(url, field="images") for url in urls or []]
 
 
+def image_digest(pixel_values: np.ndarray, image_grid_thw: np.ndarray) -> bytes:
+    """Digest of preprocessed image pixels and their patch grids.
+
+    Image tokens are the same placeholder for every image, so a prompt
+    prefix is identified by its token ids together with this digest.
+    """
+    pixels = np.ascontiguousarray(pixel_values)
+    digest = hashlib.sha256()
+    digest.update(str(pixels.dtype).encode())
+    digest.update(np.asarray(pixels.shape, dtype=np.int64).tobytes())
+    digest.update(pixels.tobytes())
+    digest.update(np.ascontiguousarray(image_grid_thw, dtype=np.int64).tobytes())
+    return digest.digest()
+
+
+@dataclass
+class Prefix:
+    """A prefilled prompt prefix that one request continues from."""
+
+    cache: list
+    """Layer caches after the prefix. They belong to this request."""
+    hidden: mx.array | None
+    """Final hidden states of every prefix token, when they were kept."""
+    last_position: mx.array | None
+    """M-RoPE positions of the last prefix token; None on text backbones."""
+    cached: bool
+    """True when the prefix came from the prefix cache."""
+
+
+@dataclass
+class _PrefixEntry:
+    cache: list
+    hidden: mx.array | None
+    last_position: mx.array | None
+    nbytes: int
+
+
+class PrefixCache:
+    """Prefilled prompt prefixes kept across requests, least recently used first.
+
+    Requests that repeat a prompt prefix, such as the same state and images
+    asked different questions, continue from a copy of the stored layer
+    caches instead of prefilling it again. Entries are evicted once their
+    total size exceeds ``max_bytes``; a larger entry is not stored. Requests
+    use it on the MLX executor while stats come from the event loop, so a
+    lock guards the entries.
+    """
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.nbytes = 0
+        self.hits = 0
+        self.misses = 0
+        self._entries: OrderedDict[str, _PrefixEntry] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def get(self, key: str) -> _PrefixEntry | None:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self.misses += 1
+                return None
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return entry
+
+    def put(self, key: str, entry: _PrefixEntry) -> None:
+        with self._lock:
+            if entry.nbytes > self.max_bytes:
+                return
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self.nbytes -= old.nbytes
+            self._entries[key] = entry
+            self.nbytes += entry.nbytes
+            self._evict()
+
+    def _evict(self) -> None:
+        while self.nbytes > self.max_bytes:
+            _, evicted = self._entries.popitem(last=False)
+            self.nbytes -= evicted.nbytes
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "entries": len(self._entries),
+                "bytes": self.nbytes,
+                "max_bytes": self.max_bytes,
+                "hits": self.hits,
+                "misses": self.misses,
+            }
+
+
+def prefix_key(ids: np.ndarray, images: bytes | None, keep_all: bool) -> str:
+    """Key of a prompt prefix: its token ids and the digest of its images."""
+    digest = hashlib.sha256(b"all" if keep_all else b"last")
+    digest.update(np.ascontiguousarray(ids, dtype=np.int64).tobytes())
+    digest.update(images or b"")
+    return digest.hexdigest()
+
+
 @contextmanager
 def _backbone_files(path: Path) -> Iterator[Path]:
     """Yield ``path``, or a symlinked view of it without decision head weights.
@@ -82,6 +192,7 @@ class DecisionBackbone:
         self.config: dict = {}
         self._text_model: Any = None
         self._lm_head: Any = None
+        self.prefix_cache: PrefixCache | None = None
 
     @property
     def has_vision(self) -> bool:
@@ -123,6 +234,7 @@ class DecisionBackbone:
 
     def close(self) -> None:
         self.model = None
+        self.prefix_cache = None
         self.tokenizer = None
         self.image_processor = None
         self._text_model = None
@@ -212,6 +324,49 @@ class DecisionBackbone:
             yield end - start
             start = end
         return mx.concatenate(kept, axis=0) if keep_all else kept[-1][0]
+
+    def prefill_prefix(
+        self,
+        ids: np.ndarray,
+        pixel_values: np.ndarray | None,
+        image_grid_thw: np.ndarray | None,
+        chunk_size: ChunkSize,
+        keep_all: bool,
+        images: bytes | None = None,
+    ) -> Generator[int, None, Prefix]:
+        """Prefill a prompt prefix, or copy it from the prefix cache.
+
+        The prefix must hold every image token of ``pixel_values``. With a
+        prefix cache, a prefix with the same token ids and image pixels is
+        copied from the cache, and a new one is stored after its prefill.
+        ``images`` is the :func:`image_digest` of the pixels, if already known.
+        """
+        store = self.prefix_cache
+        key = None
+        if store is not None:
+            if images is None and pixel_values is not None:
+                images = image_digest(pixel_values, image_grid_thw)
+            key = prefix_key(ids, images, keep_all)
+            entry = store.get(key)
+            if entry is not None:
+                # Caches update in place; the request continues from a copy.
+                return Prefix(
+                    copy.deepcopy(entry.cache), entry.hidden, entry.last_position, True
+                )
+        embeds, positions = self.embed(ids, pixel_values, image_grid_thw)
+        cache = self.make_cache()
+        hidden = yield from self.prefill(
+            ids, embeds, positions, cache, chunk_size, keep_all
+        )
+        kept = hidden if keep_all else None
+        last_position = None if positions is None else positions[:, :, -1]
+        if store is not None:
+            snapshot = copy.deepcopy(cache)
+            nbytes = sum(c.nbytes for c in snapshot)
+            if kept is not None:
+                nbytes += kept.nbytes
+            store.put(key, _PrefixEntry(snapshot, kept, last_position, nbytes))
+        return Prefix(cache, kept, last_position, False)
 
     def _forward(
         self,
