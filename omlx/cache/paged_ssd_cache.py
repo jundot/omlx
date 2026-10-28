@@ -38,6 +38,7 @@ import numpy as np
 
 from omlx.utils.formatting import format_bytes
 
+from ..config import AUTO_SSD_CACHE_MAX_BYTES
 from ..utils.fatal import fatal_exit
 from .interface import CacheManager
 from .pooling_delta import (
@@ -1782,7 +1783,8 @@ class PagedSSDCacheManager(CacheManager):
         Args:
             cache_dir: Directory for SSD cache files.
             max_size_bytes: Maximum total size of SSD cache.
-            auto_size: Use 50% of the sum of free space and existing SSD cache.
+            auto_size: Use 50% of the sum of free space and existing SSD cache,
+                up to 100GB.
             hot_cache_max_bytes: Maximum in-memory hot cache size in bytes.
                 0 means disabled (default).
             hot_cache_only: When True, skip directory init and writer thread.
@@ -4976,8 +4978,8 @@ class PagedSSDCacheManager(CacheManager):
     def _get_effective_max_size(self) -> int:
         """Get effective max size considering actual disk free space.
 
-        Auto mode uses 50% of the sum of free space and existing cache.
-        Explicit limits retain the 99% disk-space guard.
+        Auto mode uses 50% of the sum of free space and existing cache, capped
+        at AUTO_SSD_CACHE_MAX_BYTES. Explicit limits retain the 99% disk-space guard.
         Sampling both sizes together keeps writes from increasing the cached budget.
 
         Uses a 30-second TTL cache for shutil.disk_usage() results.
@@ -5025,7 +5027,7 @@ class PagedSSDCacheManager(CacheManager):
                 self._disk_cache_size_at_check + self._disk_usage_cache.free
             )
             if self._auto_size:
-                return disk_available // 2
+                return min(disk_available // 2, AUTO_SSD_CACHE_MAX_BYTES)
             disk_limit = int(disk_available * self._DISK_SAFE_RATIO)
             return min(self._max_size, disk_limit)
 
