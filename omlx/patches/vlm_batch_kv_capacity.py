@@ -8,19 +8,120 @@ Prefix restore builds mlx-lm caches even for VLM models, so both backends are
 patched in place. Capacity layout adapted from PR #4030.
 """
 
+import logging
+import math
+
 import mlx.core as mx
 from mlx_lm.models.cache import BatchKVCache as LMBatchKVCache
 from mlx_lm.models.cache import KVCache as LMKVCache
 from mlx_vlm.models.cache import BatchKVCache, KVCache, dynamic_roll
 
+logger = logging.getLogger(__name__)
+
+# A ragged speculative rollback rolls every row of every layer's K/V (and the
+# QSA indexer bank) right by that row's rejected count. The stock expression
+# builds index arrays and gathers through them; this kernel moves each column
+# with one 16-byte (or one-element) copy per thread: element [b, ..., c, :]
+# of the output is element [b, ..., (c - shift[b]) mod width, :] of the input
+# for c < width and element [b, ..., c, :] otherwise, as in _stock_roll.
+_ROLL_SOURCE = r"""
+    const uint lane = thread_position_in_grid.x;
+    const uint c = thread_position_in_grid.y;
+    const uint bh = thread_position_in_grid.z;
+    const int width = params[0];
+    const int inner = params[1];
+    const int n = int(threads_per_grid.y);
+    int src = int(c);
+    if (src < width) {
+        const int s = (src - shifts[bh / uint(inner)]) % width;
+        src = s < 0 ? s + width : s;
+    }
+    const size_t row = size_t(bh) * size_t(n);
+    const device UNIT* in = (const device UNIT*)x + (row + size_t(src)) * UNITS;
+    device UNIT* o = (device UNIT*)out + (row + size_t(c)) * UNITS;
+    o[lane] = in[lane];
+"""
+_ROLL_KERNELS: dict = {}
+_ROLL_CHECKED: dict = {}
+
+
+def _roll_kernel(vector: bool):
+    kernel = _ROLL_KERNELS.get(vector)
+    if kernel is None:
+        kernel = _ROLL_KERNELS[vector] = mx.fast.metal_kernel(
+            name="omlx_batch_kv_roll_" + ("vec" if vector else "elem"),
+            input_names=["x", "shifts", "params"],
+            output_names=["out"],
+            source=_ROLL_SOURCE.replace("UNIT*", "uint4*" if vector else "T*"),
+        )
+    return kernel
+
+
+def _launch_roll(x, shifts, length: int, axis: int):
+    rows, n = x.shape[0], x.shape[axis]
+    inner = math.prod(x.shape[1:axis])
+    elems = math.prod(x.shape[axis + 1 :])
+    row_bytes = elems * x.dtype.size
+    vector = row_bytes % 16 == 0
+    units = row_bytes // 16 if vector else elems
+    lanes = min(units, 256)
+    out = _roll_kernel(vector)(
+        inputs=[
+            x.reshape(rows, inner, n, elems),
+            shifts.reshape(rows).astype(mx.int32),
+            mx.array([length, inner], dtype=mx.int32),
+        ],
+        template=[("T", x.dtype), ("UNITS", units)],
+        grid=(units, n, rows * inner),
+        threadgroup=(lanes, max(1, 256 // lanes), 1),
+        output_shapes=[(rows, inner, n, elems)],
+        output_dtypes=[x.dtype],
+    )[0]
+    return out.reshape(x.shape)
+
+
+def _fused_roll_ok(vector: bool) -> bool:
+    """Check each kernel variant once against the stock roll on a small input."""
+    ok = _ROLL_CHECKED.get(vector)
+    if ok is None:
+        try:
+            dtype, width = (mx.bfloat16, 8) if vector else (mx.int32, 1)
+            x = mx.arange(3 * 2 * 9 * width).reshape(3, 2, 9, width).astype(dtype)
+            shifts = mx.array([0, 2, 11])
+            got = _launch_roll(x, shifts, 7, 2)
+            ok = bool(mx.array_equal(got, _stock_roll(x, shifts[:, None], 7, 2)).item())
+        except Exception:  # noqa: BLE001 - optional fast path
+            ok = False
+        if not ok:
+            logger.warning("batch KV roll kernel disabled; using the stock roll")
+        _ROLL_CHECKED[vector] = ok
+    return ok
+
 
 def _roll_logical_prefix(x, shifts, length: int, axis: int):
     """``dynamic_roll`` of the first ``length`` columns; later columns stay put."""
     n = x.shape[axis]
+    if n != length and length <= 0:
+        return x
+    # MLX passes inputs of fewer than 8 elements in the constant address space.
+    if (
+        x.size >= 8
+        and length > 0
+        and axis >= 1
+        and shifts.size == x.shape[0]
+        and shifts.shape[0] == x.shape[0]
+        and mx.default_device() == mx.gpu
+    ):
+        row_bytes = math.prod(x.shape[axis + 1 :]) * x.dtype.size
+        if _fused_roll_ok(row_bytes % 16 == 0):
+            return _launch_roll(x, shifts, length, axis)
+    return _stock_roll(x, shifts, length, axis)
+
+
+def _stock_roll(x, shifts, length: int, axis: int):
+    n = x.shape[axis]
     if n == length:
         return dynamic_roll(x, shifts, axis=axis)
-    if length <= 0:
-        return x
     expand_shifts = (...,) + (None,) * (x.ndim - axis)
     expand_indices = expand_shifts[:-1]
     positions = mx.arange(n)[expand_indices]
@@ -40,6 +141,17 @@ def _ladder_capacity(needed: int, step: int) -> int:
     grain = max(step, 1 << max(0, needed.bit_length() - 5))
     grain = ((grain + step - 1) // step) * step
     return ((needed + 2 * grain - 1) // grain) * grain
+
+
+def _host_rows(rows, like):
+    """A per-row int array built from host values.
+
+    Every reader of ``offset`` / ``left_padding`` copies them to the host
+    (masks, paddings, row extraction, MTP priming). ``tolist()`` of a device
+    op's result waits for every kernel queued before it, so each such read
+    stalled the decode pipeline; a host-built array is ready at once.
+    """
+    return mx.array(rows, dtype=like.dtype)
 
 
 def _logical_kv(cache):
@@ -133,11 +245,36 @@ class _CapacityMethods:
                 base = width
             self._grow(keys, values, base, base + n_steps * self.step)
 
-        self.offset += keys.shape[2]
-        self._idx += keys.shape[2]
+        n = keys.shape[2]
+        self.offset = _host_rows([o + n for o in self.offset.tolist()], self.offset)
+        self._idx += n
         self._keys[..., prev : self._idx, :] = keys
         self._values[..., prev : self._idx, :] = values
         return self._keys[..., : self._idx, :], self._values[..., : self._idx, :]
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchKVCache"
+                )
+            pads = [int(p) for p in left_padding]
+            self.left_padding = _host_rows(
+                [a + b for a, b in zip(self.left_padding.tolist(), pads)],
+                self.left_padding,
+            )
+            self.offset = _host_rows(
+                [a - b for a, b in zip(self.offset.tolist(), pads)], self.offset
+            )
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def trim(self, n):
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset = _host_rows([o - n for o in self.offset.tolist()], self.offset)
+        return n
 
     def finalize(self):
         if self._right_padding is not None:
@@ -153,8 +290,14 @@ class _CapacityMethods:
             self._values = _roll_logical_prefix(
                 self._values, padding[:, None], width, axis=2
             )
-            self.offset -= padding
-            self.left_padding += padding
+            pads = padding.tolist()
+            self.offset = _host_rows(
+                [a - b for a, b in zip(self.offset.tolist(), pads)], self.offset
+            )
+            self.left_padding = _host_rows(
+                [a + b for a, b in zip(self.left_padding.tolist(), pads)],
+                self.left_padding,
+            )
             self._right_padding = None
 
     def filter(self, batch_indices):
@@ -164,13 +307,17 @@ class _CapacityMethods:
             if isinstance(batch_indices, mx.array)
             else list(batch_indices)
         )
-        self.offset = self.offset[batch_indices]
-        self.left_padding = self.left_padding[batch_indices]
+        offsets, pads = self.offset.tolist(), self.left_padding.tolist()
+        self.offset = _host_rows([offsets[i] for i in kept], self.offset)
+        pads = [pads[i] for i in kept]
         if self._right_padding is not None and not isinstance(self, LMBatchKVCache):
-            self._right_padding = self._right_padding[batch_indices]
+            right = self._right_padding.tolist()
+            self._right_padding = _host_rows(
+                [right[i] for i in kept], self._right_padding
+            )
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item() if kept else 0
+        min_left_pad = min(pads) if kept else 0
         if self._keys is not None:
             if kept:
                 self._compact_rows(kept, min_left_pad)
@@ -179,7 +326,8 @@ class _CapacityMethods:
                 self._values = self._values[batch_indices]
         if min_left_pad > 0:
             self._idx -= min_left_pad
-            self.left_padding -= min_left_pad
+            pads = [p - min_left_pad for p in pads]
+        self.left_padding = _host_rows(pads, self.left_padding)
 
     def _compact_rows(self, kept, start: int) -> None:
         """Keep rows ``kept`` and drop the first ``start`` columns."""
@@ -201,8 +349,13 @@ class _CapacityMethods:
     def extend(self, other):
         """In-place extend this cache with the other cache."""
         if self.keys is None and other.keys is None:
-            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
-            self.offset = mx.concatenate([self.offset, other.offset])
+            self.left_padding = _host_rows(
+                self.left_padding.tolist() + other.left_padding.tolist(),
+                self.left_padding,
+            )
+            self.offset = _host_rows(
+                self.offset.tolist() + other.offset.tolist(), self.offset
+            )
             return
 
         logical = {id(c): _logical_kv(c) for c in (self, other)}
@@ -241,12 +394,15 @@ class _CapacityMethods:
                 pad = [(0, 0), (0, 0), (left, right), (0, 0)]
                 k = mx.pad(k, pad)
                 v = mx.pad(v, pad)
-            left_padding = c.left_padding + left
-            return k, v, c.offset, left_padding
+            return k, v, c.offset.tolist(), [p + left for p in c.left_padding.tolist()]
 
-        self.keys, self.values, self.offset, self.left_padding = map(
-            mx.concatenate, zip(*(pad(self), pad(other)))
-        )
+        k_a, v_a, offset_a, left_a = pad(self)
+        k_b, v_b, offset_b, left_b = pad(other)
+        offset, left_padding = self.offset, self.left_padding
+        self.keys = mx.concatenate([k_a, k_b])
+        self.values = mx.concatenate([v_a, v_b])
+        self.offset = _host_rows(offset_a + offset_b, offset)
+        self.left_padding = _host_rows(left_a + left_b, left_padding)
         self._idx = max_idx
 
     def _extend_into_capacity(self, other, logical, max_idx: int, max_size: int):
@@ -281,10 +437,12 @@ class _CapacityMethods:
             length = min(int(k.shape[2]), max_size - left)
             keys[start : start + n, :, left : left + length] = k[..., :length, :]
             values[start : start + n, :, left : left + length] = v[..., :length, :]
-            left_padding.append(c.left_padding + left)
+            left_padding.extend(p + left for p in c.left_padding.tolist())
             start += n
-        self.offset = mx.concatenate([self.offset, other.offset])
-        self.left_padding = mx.concatenate(left_padding)
+        self.offset = _host_rows(
+            self.offset.tolist() + other.offset.tolist(), self.offset
+        )
+        self.left_padding = _host_rows(left_padding, self.left_padding)
         self._keys, self._values = keys, values
         self._width = max_size
         self._idx = max_idx
@@ -321,13 +479,15 @@ class _CapacityMethods:
         cache.keys = keys
         cache.values = values
         cache._width = max_length
-        cache.offset += max_length
+        cache.offset = _host_rows(
+            [o + max_length for o in cache.offset.tolist()], cache.offset
+        )
         cache._idx = max_length
 
         return cache
 
     def extract(self, idx):
-        padding = int(self.left_padding[idx].item())
+        padding = int(self.left_padding.tolist()[idx])
         length = self._idx - padding
         # mlx-lm KVCache.state exposes the whole buffer, so its rows keep the
         # exact width.

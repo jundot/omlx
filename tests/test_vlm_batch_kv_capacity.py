@@ -2,6 +2,7 @@
 """Compare the patched generic cache with the installed, unmodified source."""
 
 import importlib.util
+import math
 import random
 
 import mlx.core as mx
@@ -56,6 +57,7 @@ def equal(a, b):
             assert x is y
         elif isinstance(x, mx.array):
             assert x.shape == y.shape
+            assert x.dtype == y.dtype
             assert mx.array_equal(x, y).item()
         else:
             assert x == y
@@ -225,3 +227,28 @@ def test_qwen4_qsa_batch_decode_appends_in_place():
         keys, _ = batch.update_and_fetch(x, x / 4)
         assert keys.shape[2] == 600 + 4 * (step + 1)
         assert batch.keys.shape[2] == capacity
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32, mx.int32])
+def test_fused_roll_places_every_element_like_the_stock_roll(dtype):
+    from omlx.patches import vlm_batch_kv_capacity as capacity
+
+    rng = random.Random(5)
+    for shape, axis in (
+        ((3, 2, 40, 256), 2),
+        ((4, 2, 33, 80), 2),
+        ((2, 1, 17, 3), 2),
+        ((5, 37, 128), 1),
+        ((3, 29), 1),
+    ):
+        x = (mx.arange(math.prod(shape)) % 997).reshape(shape).astype(dtype)
+        for length in (shape[axis], shape[axis] - 1, 1):
+            shifts = mx.array(
+                [rng.randrange(0, 2 * length + 3) for _ in range(shape[0])]
+            )
+            # The forms the caches pass: [B, 1] for K/V, [B] for the QSA bank.
+            s = shifts[:, None] if len(shape) == 4 else shifts
+            got = capacity._roll_logical_prefix(x, s, length, axis)
+            want = capacity._stock_roll(x, s, length, axis)
+            assert got.dtype == want.dtype
+            assert mx.array_equal(got, want).item()
