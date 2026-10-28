@@ -38,6 +38,8 @@ from functools import cache
 
 import mlx.core as mx
 
+from .flint_fp16_activation import mlp_parts, routed_scale
+
 logger = logging.getLogger(__name__)
 
 _ROUTER_THREADS = 256
@@ -123,6 +125,24 @@ _COMBINE_SOURCE = """
     out[r * D + d] = static_cast<T>(float(residual[r * D + d]) + float(mlp));
 """
 
+# float16 range-safe SwiGLU (flint_fp16_activation): the routed and shared
+# outputs carry a scale, undone with the roundings of the separate multiplies.
+_SCALED_COMBINE_SOURCE = """
+    const uint d = thread_position_in_grid.x;
+    const uint r = thread_position_in_grid.y;
+    if (d >= uint(D)) return;
+    const float rs = float(routed_scale[0]);
+    float acc = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        T v = static_cast<T>(float(routed[(r * K + k) * D + d]) * rs);
+        acc += float(v) * weights[r * K + k];
+    }
+    T moe = static_cast<T>(acc);
+    T sh = static_cast<T>(float(shared[r * D + d]) * float(shared_scale[0]));
+    T mlp = static_cast<T>(float(moe) + float(sh));
+    out[r * D + d] = static_cast<T>(float(residual[r * D + d]) + float(mlp));
+"""
+
 
 @cache
 def _router_kernel():
@@ -141,6 +161,23 @@ def _combine_kernel():
         input_names=["routed", "weights", "shared", "residual"],
         output_names=["out"],
         source=_COMBINE_SOURCE,
+    )
+
+
+@cache
+def _scaled_combine_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_flint_moe_scaled_combine",
+        input_names=[
+            "routed",
+            "weights",
+            "shared",
+            "residual",
+            "routed_scale",
+            "shared_scale",
+        ],
+        output_names=["out"],
+        source=_SCALED_COMBINE_SOURCE,
     )
 
 
@@ -163,13 +200,23 @@ def fused_router(logits: mx.array, bias: mx.array, top_k: int):
     return indices, weights
 
 
-def fused_combine(routed, weights, shared, residual):
-    """``residual + ((routed * weights).sum(-2) + shared)`` with stock roundings."""
+def fused_combine(
+    routed, weights, shared, residual, routed_scale=None, shared_scale=None
+):
+    """``residual + ((routed * weights).sum(-2) + shared)`` with stock roundings.
+
+    ``routed_scale`` / ``shared_scale`` (float16 range-safe SwiGLU) multiply
+    the routed and shared outputs first; both or neither.
+    """
     dim = residual.shape[-1]
     rows = residual.size // dim
     top_k = weights.shape[-1]
-    return _combine_kernel()(
-        inputs=[routed, weights, shared, residual],
+    kernel, inputs = _combine_kernel(), [routed, weights, shared, residual]
+    if routed_scale is not None:
+        kernel = _scaled_combine_kernel()
+        inputs += [routed_scale, shared_scale]
+    return kernel(
+        inputs=inputs,
         template=[("T", residual.dtype), ("D", dim), ("K", top_k)],
         grid=(dim, rows, 1),
         threadgroup=(min(dim, 256), 1, 1),
@@ -220,7 +267,13 @@ def apply_flint_decode_patch() -> bool:
             moe.gate(y), moe.expert_bias.astype(mx.float32), moe.top_k
         )
         routed = moe.switch_mlp(y, indices.reshape(*x.shape[:2], moe.top_k))
-        return fused_combine(routed, weights, moe.shared_expert(y), h)
+        shared, shared_scale = mlp_parts(moe.shared_expert, y)
+        scale = routed_scale(moe)
+        if (scale is None) != (shared_scale is None):
+            routed = routed if scale is None else routed * scale
+            shared = shared if shared_scale is None else shared * shared_scale
+            scale = shared_scale = None
+        return fused_combine(routed, weights, shared, h, scale, shared_scale)
 
     cls.__call__ = patched_call
     cls._omlx_flint_decode = True
