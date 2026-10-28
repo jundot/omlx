@@ -1418,6 +1418,8 @@
   "modal.model_settings.index_cache_hint": "Ignorez le calcul du indexer redondant dans les couches DSA (DeepSeek V3/GLM-5).",
   "modal.model_settings.index_cache_freq": "Fréquence (chaque Nème couche garde le indexer)",
   "modal.model_settings.specprefill": "SpecPrefill",
+  "modal.model_settings.specprefill_auto": "Actif pour chaque requête",
+  "modal.model_settings.specprefill_auto_hint": "Applique SpecPrefill à chaque requête au-dessus du seuil. Désactivé, le modèle d’approximation reste chargé mais inactif : les requêtes peuvent l’activer individuellement et les alias de modèle peuvent l’activer.",
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Forcer l'échantillonnage",
   "modal.model_settings.force_sampling_hint": "Utilise ces valeurs de Temperature, Top P et Top K même si un client ou un agent en demande d’autres.",

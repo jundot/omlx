@@ -380,7 +380,8 @@ class ChatCompletionRequest(BaseModel):
     # System-wide GPU power cap in watts while this request runs. The lower of
     # this and the model setting applies.
     gpu_power_limit_w: Optional[int] = Field(default=None, ge=2, le=1000)
-    # SpecPrefill: per-request enable/disable (None = use model setting)
+    # SpecPrefill: per-request enable/disable (None = use the model/alias
+    # "active for every request" setting; see specprefill_auto_enabled)
     specprefill: Optional[bool] = None
     # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
     specprefill_keep_pct: Optional[float] = None

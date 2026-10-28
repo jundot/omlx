@@ -1418,6 +1418,8 @@
   "modal.model_settings.index_cache_hint": "Omitir cómputo redundante del indexador en capas DSA (DeepSeek V3/GLM-5).",
   "modal.model_settings.index_cache_freq": "Frecuencia (cada N-ésima capa mantiene el indexador)",
   "modal.model_settings.specprefill": "SpecPrefill",
+  "modal.model_settings.specprefill_auto": "Activo para cada solicitud",
+  "modal.model_settings.specprefill_auto_hint": "Usa SpecPrefill en cada solicitud por encima del umbral. Si está desactivado, el modelo borrador sigue cargado pero inactivo: las solicitudes pueden activarlo de forma individual y los alias de modelo pueden habilitarlo.",
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Forzar Muestreo",
   "modal.model_settings.force_sampling_hint": "Usa estos valores de Temperature, Top P y Top K aunque un cliente o agente solicite otros.",

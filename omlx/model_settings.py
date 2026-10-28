@@ -318,6 +318,11 @@ class ModelSettings:
         specprefill_draft_model: Path to draft model for SpecPrefill.
         specprefill_keep_pct: Keep rate for SpecPrefill (0.1–0.5).
         specprefill_threshold: Min tokens to trigger SpecPrefill.
+        specprefill_auto_enabled: Apply SpecPrefill to every request by default
+            when the drafter is loaded (None = on). False keeps the drafter
+            loaded but idle: requests opt in with the per-request
+            ``specprefill`` flag, and a model alias (exposed profile) may turn
+            it back on without a reload.
         dflash_enabled: Enable DFlash speculative decoding. Qwen3.5-family,
             Qwen3, Laguna and MiMo V2 targets, and GLM-5.3, Gemma 4 and Muse
             Glimmer VLM targets, draft inside the batched engine (Lightning
@@ -474,6 +479,11 @@ class ModelSettings:
     )
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
+    # When the drafter is loaded, apply SpecPrefill to every request by
+    # default (None). False loads the drafter but leaves it idle until a
+    # request opts in; per-request flag and per-alias (universal profile)
+    # override. Not an engine-construction field: it never forks a variant.
+    specprefill_auto_enabled: Optional[bool] = None
 
     # DFlash (block diffusion speculative decoding)
     dflash_enabled: bool = False

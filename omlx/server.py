@@ -5251,10 +5251,27 @@ async def create_chat_completion(
         # SpecPrefill: per-request overrides
         if request.specprefill is not None:
             chat_kwargs["specprefill"] = request.specprefill
+        elif ms is not None and ms.specprefill_enabled and ms.specprefill_draft_model:
+            # The drafter is loaded for this model, so the model/alias
+            # activation flag decides the default for this request (None/True
+            # = active for every request). It is a universal (request-time)
+            # profile field: an alias may differ from its base model without
+            # changing the engine's runtime identity.
+            chat_kwargs["specprefill"] = ms.specprefill_auto_enabled is not False
         if request.specprefill_keep_pct is not None:
             chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
         if getattr(request, "specprefill_threshold", None) is not None:
             chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
+        # SPEC-1: with the drafter loaded, the EFFECTIVE (profile-merged)
+        # keep rate and threshold ride the same per-request channel as body
+        # overrides — the body value above always wins. They left the engine
+        # runtime signature, so an alias may tune them without a reload; a
+        # caller that sends nothing keeps the engine's load-time defaults.
+        if ms is not None and ms.specprefill_enabled and ms.specprefill_draft_model:
+            if "specprefill_keep_pct" not in chat_kwargs and ms.specprefill_keep_pct is not None:
+                chat_kwargs["specprefill_keep_pct"] = ms.specprefill_keep_pct
+            if "specprefill_threshold" not in chat_kwargs and ms.specprefill_threshold is not None:
+                chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
 
         if request.stop:
             chat_kwargs["stop"] = request.stop

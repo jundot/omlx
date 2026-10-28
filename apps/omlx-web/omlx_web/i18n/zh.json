@@ -1418,6 +1418,8 @@
   "modal.model_settings.index_cache_hint": "跳过 DSA 层中的冗余索引器计算（DeepSeek V3/GLM-5）。",
   "modal.model_settings.index_cache_freq": "频率（每 N 层保留索引器）",
   "modal.model_settings.specprefill": "SpecPrefill",
+  "modal.model_settings.specprefill_auto": "对每个请求生效",
+  "modal.model_settings.specprefill_auto_hint": "对超过阈值的每个请求应用 SpecPrefill。关闭时草稿模型仍会加载但保持空闲：请求可单独启用，模型别名可将其打开。",
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "强制采样",
   "modal.model_settings.force_sampling_hint": "即使客户端或智能体请求了不同的值，也强制使用此处设置的 Temperature、Top P 和 Top K。",

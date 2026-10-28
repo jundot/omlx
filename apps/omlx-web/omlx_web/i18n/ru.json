@@ -1418,6 +1418,8 @@
   "modal.model_settings.index_cache_hint": "Пропускать избыточные вычисления индексатора в слоях DSA (DeepSeek V3/GLM-5).",
   "modal.model_settings.index_cache_freq": "Частота (каждый N-й слой содержит индексатор)",
   "modal.model_settings.specprefill": "SpecPrefill",
+  "modal.model_settings.specprefill_auto": "Активно для каждого запроса",
+  "modal.model_settings.specprefill_auto_hint": "Применяет SpecPrefill к каждому запросу сверх порога. При выключении модель-драфтер остаётся загруженной, но бездействует: запросы могут включать её отдельно, а псевдонимы моделей — глобально.",
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Принудительная выборка",
   "modal.model_settings.force_sampling_hint": "Использует эти значения Temperature, Top P и Top K, даже если клиент или агент запрашивает другие.",

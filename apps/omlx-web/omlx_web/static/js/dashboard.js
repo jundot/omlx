@@ -51,10 +51,6 @@
         'moe_expert_offload_resident_fraction',
         'a8_prefill_enabled',
         'a8_prefill_min_tokens',
-        'specprefill_enabled',
-        'specprefill_draft_model',
-        'specprefill_keep_pct',
-        'specprefill_threshold',
         'dflash_enabled',
         'dflash_draft_model',
         'dflash_draft_quant_enabled',
@@ -2216,6 +2212,7 @@
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
                     specprefill_threshold: s.specprefill_threshold || null,
+                    specprefill_auto_enabled: s.specprefill_auto_enabled !== false,
                     dflash_enabled: s.dflash_enabled || false,
                     dflash_draft_model: s.dflash_draft_model || '',
                     dflash_draft_quant_enabled: s.dflash_draft_quant_enabled || false,
@@ -2320,9 +2317,15 @@
             _resetPresetApplicableFields() {
                 // Reset all fields a preset can touch so switching presets does not leave
                 // stale values. Intentionally does NOT touch model_alias / model_type_override
-                // / is_pinned / is_default / turboquant_* / dflash_* / specprefill_* / index_cache_*.
+                // / is_pinned / is_default / turboquant_* / dflash_* / index_cache_* nor
+                // SpecPrefill's master switch and drafter (they ride the model load).
+                // SPEC-1 v3: activation, keep rate and threshold are universal
+                // request-time fields — preset-eligible, reset to form defaults.
                 const ms = this.modelSettings;
                 ms.temperature = null;
+                ms.specprefill_auto_enabled = true;
+                ms.specprefill_keep_pct = '0.2';
+                ms.specprefill_threshold = null;
                 ms.top_p = null;
                 ms.top_k = null;
                 ms.min_p = null;
@@ -3309,6 +3312,10 @@
                     specprefill_threshold: ms.specprefill_enabled
                         ? (ms.specprefill_threshold || null)
                         : null,
+                    // null = unset (active for every request, the default);
+                    // only an idle override is worth storing.
+                    specprefill_auto_enabled:
+                        ms.specprefill_auto_enabled === false ? false : null,
                     dflash_enabled: ms.dflash_enabled,
                     dflash_draft_model: ms.dflash_draft_model || null,
                     dflash_draft_quant_enabled: ms.dflash_enabled && !!ms.dflash_draft_quant_enabled,
@@ -3385,6 +3392,7 @@
                         specprefill_draft_model: null,
                         specprefill_keep_pct: null,
                         specprefill_threshold: null,
+                        specprefill_auto_enabled: null,
                         external_engine: null,
                         dflash_enabled: false,
                         dflash_draft_model: null,
@@ -3698,6 +3706,7 @@
                         this.modelSettings.specprefill_draft_model = null;
                         this.modelSettings.specprefill_keep_pct = 0.2;
                         this.modelSettings.specprefill_threshold = null;
+                        this.modelSettings.specprefill_auto_enabled = true;
                         this.modelSettings.dflash_enabled = false;
                         this.modelSettings.dflash_draft_model = null;
                         this.modelSettings.dflash_draft_quant_enabled = false;

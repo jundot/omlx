@@ -2460,6 +2460,10 @@ class Scheduler:
         self._specprefill_draft_model: Any | None = None
         self._specprefill_default_keep_pct: float | None = None
         self._specprefill_default_threshold: int | None = None
+        # Model-level default for applying SpecPrefill to every request when
+        # the drafter is loaded. False keeps the drafter idle until a request
+        # (or an alias profile via the server) opts in explicitly.
+        self._specprefill_auto_enabled: bool = True
         self._draft_paged_ssd_cache_manager: Any | None = None
         self._draft_prefix_cache: Any | None = None
         # Track active specprefill request for RoPE cleanup
@@ -10867,11 +10871,14 @@ class Scheduler:
         draft_model_name: str | None = None,
         keep_pct: float | None = None,
         threshold: int | None = None,
+        auto_enabled: bool = True,
     ) -> None:
         """Set the draft model for SpecPrefill scoring.
 
         Creates separate block and SSD cache managers for the draft model so
         target TurboQuant signatures cannot invalidate draft cache blocks.
+        ``auto_enabled`` is the model-level "active for every request"
+        default; False leaves the loaded drafter idle until a request opts in.
         """
         if not self._close_specprefill_draft_cache_manager():
             raise RuntimeError(
@@ -10880,6 +10887,7 @@ class Scheduler:
         self._specprefill_draft_model = draft_model
         self._specprefill_default_keep_pct = keep_pct
         self._specprefill_default_threshold = threshold
+        self._specprefill_auto_enabled = bool(auto_enabled)
         self._draft_prefix_cache = None
         if not draft_model_name:
             logger.info(

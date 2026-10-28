@@ -1420,9 +1420,13 @@ class EnginePool:
         )
         add("specprefill_enabled", specprefill_active)
         if specprefill_active:
+            # SPEC-1: only the drafter's IDENTITY is engine material. The
+            # keep rate and threshold are forwarded per request by the server
+            # (engine_pool callers pass them like the body override does), so
+            # an alias may differ on them without forking a variant. The
+            # load-time values stay the engine's defaults for callers that
+            # send nothing.
             add("specprefill_draft_model", data.get("specprefill_draft_model"))
-            add("specprefill_keep_pct", data.get("specprefill_keep_pct", 0.2))
-            add("specprefill_threshold", data.get("specprefill_threshold"))
 
         dflash_enabled = bool(data.get("dflash_enabled", False)) and not is_diffusion
         dflash_draft = data.get("dflash_draft_model")

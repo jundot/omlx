@@ -1418,6 +1418,8 @@
   "modal.model_settings.index_cache_hint": "Přeskočit nadbytečný výpočet indexeru ve vrstvách DSA (DeepSeek V3/GLM-5).",
   "modal.model_settings.index_cache_freq": "Frekvence (každá Ntá vrstva si ponechá indexer)",
   "modal.model_settings.specprefill": "SpecPrefill",
+  "modal.model_settings.specprefill_auto": "Aktivní pro každý požadavek",
+  "modal.model_settings.specprefill_auto_hint": "Použije SpecPrefill na každý požadavek nad nastaveným prahem. Při vypnutí zůvá drafter načtený, ale nečinný: požadavky se mohou přihlásit individuálně a aliasy modelů ho mohou zapnout.",
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Vynutit parametry vzorkování",
   "modal.model_settings.force_sampling_hint": "Použije tyto hodnoty Temperature, Top P a Top K, i když klient nebo agent požaduje jiné.",
