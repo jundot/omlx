@@ -1787,6 +1787,8 @@
   "bench.config.batch_tests": "Непрерывные пакетные тесты",
   "bench.config.batch_hint": "Пакетные тесты используют pp1024 / tg128",
   "bench.config.run_button": "Запустить тест",
+  "bench.config.add_to_queue": "Добавить в очередь",
+  "bench.completed.section_label": "Завершённые запуски",
   "bench.progress.preparing": "Подготовка...",
   "bench.progress.cancel": "Отмена",
   "bench.confirm.title": "Запустить этот тест?",
