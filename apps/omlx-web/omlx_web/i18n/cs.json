@@ -656,7 +656,7 @@
   "settings.resource.cold_cache_limit": "Limit studené cache (SSD cache)",
   "settings.resource.cold_cache_auto": "Automaticky",
   "settings.resource.cold_cache_fixed": "Pevný",
-  "settings.resource.cold_cache_auto_description": "Aktuální limit je 50 % součtu volného místa na disku a existující cache na SSD. Pevný limit nastavíte úpravou hodnoty v GB.",
+  "settings.resource.cold_cache_auto_description": "Aktuální limit je 50 % součtu volného místa na disku a existující cache na SSD, nejvýše 100 GB. Pevný limit nastavíte úpravou hodnoty v GB.",
   "settings.resource.cold_cache_description": "Trvalé úložiště na SSD pro eviktované bloky KV cache.",
   "settings.resource.prefill_memory_guard": "Hlídač paměti",
   "settings.resource.prefill_memory_guard_description": "Při tlaku na paměť odvozenému od úrovně rezervy vpravo pozastaví plánování prefillu a eviktuje modely principem LRU.",
