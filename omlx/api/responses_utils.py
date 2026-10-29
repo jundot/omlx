@@ -518,6 +518,7 @@ def build_message_output_item(
     text: str,
     item_id: Optional[str] = None,
     status: str = "completed",
+    phase: Optional[str] = None,
 ) -> OutputItem:
     """Build a message-type OutputItem."""
     return OutputItem(
@@ -526,6 +527,7 @@ def build_message_output_item(
         status=status,
         role="assistant",
         content=[OutputContent(type="output_text", text=text)],
+        phase=phase,
     )
 
 
@@ -564,6 +566,20 @@ def build_reasoning_output_item(
         status=status,
         summary=summary,
     )
+
+
+def assistant_message_phase(has_tools: bool, has_tool_calls: bool) -> Optional[str]:
+    """Name the phase of a completed assistant message item.
+
+    Clients fold reasoning and tool blocks under the narration only when the
+    message item names its phase. A tool-enabled turn that ends in a tool call
+    is interim narration; one that stops without a tool call is the answer.
+    Requests without tools cannot separate the two, so they leave the field
+    unset instead of guessing.
+    """
+    if not has_tools:
+        return None
+    return "commentary" if has_tool_calls else "final_answer"
 
 
 def build_response_usage(
