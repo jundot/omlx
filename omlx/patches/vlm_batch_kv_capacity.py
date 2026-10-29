@@ -70,8 +70,7 @@ class _CapacityMethods:
 
     @keys.setter
     def keys(self, value):
-        self._keys = value
-        self._width = None
+        self._set_bank("_keys", value)
         self._drop_spare_rows("_values")
 
     @property
@@ -82,9 +81,19 @@ class _CapacityMethods:
 
     @values.setter
     def values(self, value):
-        self._values = value
-        self._width = None
+        self._set_bank("_values", value)
         self._drop_spare_rows("_keys")
+
+    def _set_bank(self, name: str, value) -> None:
+        """Adopt ``value`` as the bank; a same-width set keeps the logical width.
+
+        ``cache.keys = mx.depends(cache.keys, deps)`` writes back the whole bank,
+        spare columns included, and must not turn them into logical columns.
+        """
+        old = getattr(self, name, None)
+        if old is None or value is None or value.shape[2] != old.shape[2]:
+            self._width = None
+        setattr(self, name, value)
 
     def _drop_spare_rows(self, partner: str) -> None:
         """Cut the partner bank to the live rows when one bank is set alone.
@@ -132,6 +141,7 @@ class _CapacityMethods:
                 ],
                 axis=2,
             )
+            self._width = None
             return
         capacity = 0 if old_k is None else int(old_k.shape[2])
         if width > capacity:
@@ -309,6 +319,7 @@ class _CapacityMethods:
         self.keys, self.values, self.offset, self.left_padding = map(
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
+        self._width = None
         self._idx = max_idx
 
     def _extend_in_place(self, other, logical, max_idx: int, max_size: int) -> bool:
@@ -485,6 +496,7 @@ def _lm_state(cache):
 
 def _set_lm_state(cache, state):
     cache.keys, cache.values, cache.offset, cache.left_padding, cache._idx = state
+    cache._width = None
 
 
 def _refill_order(keep):
