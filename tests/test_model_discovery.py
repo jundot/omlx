@@ -849,6 +849,25 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
+    def test_detect_lfm3_text_model_as_vlm_native_text(self, tmp_path):
+        """LFM3 text checkpoints load through mlx-vlm; mlx-lm has no lfm3."""
+        config = {
+            "model_type": "lfm3",
+            "architectures": ["Lfm3ForCausalLM"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_lfm3_audio_as_vlm_not_audio_sts(self, tmp_path):
+        """LFM3-Audio has no vision config and is served by mlx-vlm, not mlx-audio STS."""
+        config = {
+            "model_type": "lfm3_audio",
+            "architectures": ["Lfm3AudioForConditionalGeneration"],
+            "audio_config": {"model_type": "lfm3_audio_encoder"},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
     def test_detect_lfm_audio_architecture_as_sts(self, tmp_path):
         """mlx-audio LFM STS remains classified via LFM2AudioModel architecture."""
         config = {

@@ -80,6 +80,7 @@ VLM_MODEL_TYPES = {
     "muse_glimmer",
     "muse_spark",
     "glm5_next",
+    "lfm3_audio",
 }
 
 # Text-only model families that are implemented in mlx-vlm rather than
@@ -88,6 +89,8 @@ VLM_MODEL_TYPES = {
 VLM_NATIVE_TEXT_MODEL_TYPES = {
     "cohere2_moe",
     "flint",
+    # Same mlx-vlm text tower as LFM3-VL, LFM3-Audio and LFM3-Omni.
+    "lfm3",
     # mlx-lm ships its own deepseek_v41 without the oMLX cache and kernels.
     "deepseek_v41",
     "glm5_next",
@@ -823,11 +826,11 @@ def detect_model_type(model_path: Path) -> ModelType:
 
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
-    # Text-only quants won't carry a vision sub-config. gemma4_unified and
-    # diffusion_gemma are exceptions: they are served by mlx-vlm regardless of
-    # vision_config presence in config.json.
+    # Text-only quants won't carry a vision sub-config. gemma4_unified,
+    # diffusion_gemma and lfm3_audio are exceptions: they are served by mlx-vlm
+    # regardless of vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
-        if normalized_type in {"gemma4_unified", "diffusion_gemma"}:
+        if normalized_type in {"gemma4_unified", "diffusion_gemma", "lfm3_audio"}:
             logger.info(
                 f"{model_type} detected as VLM (mlx-vlm native model)"
             )
