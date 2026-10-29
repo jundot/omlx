@@ -202,6 +202,22 @@ def test_setting_keys_alone_after_a_refill_keeps_rows_aligned(backend):
         assert mx.array_equal(x[..., : a._idx, :], y[..., : b._idx, :]).item()
 
 
+def test_join_fills_a_freed_row_and_shifts_live_rows_in_place(backend):
+    stock, patched = backend
+    lengths = [300, 290, 299, 200]
+    a, b = make(stock, lengths), make(patched, lengths)
+    # A row shorter than the batch, then one longer that moves the live rows right.
+    for joined in (120, 700):
+        for c in (a, b):
+            c.filter(_refill_order([0, 1, 2]))
+        bank = b._keys
+        a.extend(make(stock, [joined]))
+        b.extend(make(patched, [joined]))
+        assert b._keys is bank
+        equal(a, b)
+    assert b._idx == 700
+
+
 def test_prefix_handler_restore_uses_capacity_managed_cache():
     handler = KVCacheHandler()
     source = make(vlm_cache, [513]).extract(0)

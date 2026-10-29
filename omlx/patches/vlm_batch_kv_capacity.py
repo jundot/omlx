@@ -4,8 +4,8 @@
 The stock classes regrow by concatenation, so every 256-token step, merge,
 join and filter copies the whole bank. These methods keep the stock logical
 layout (``_width``) inside a larger buffer that grows on a ratio ladder.
-A filter that drops no common padding refills freed rows from the last rows.
-The spare rows (``_rows``) stay until a regrow, join or compaction.
+A filter that drops no common padding refills freed rows from the last rows,
+and a later join writes into those spare rows (``_rows``) in place.
 Prefix restore builds mlx-lm caches even for VLM models, so both backends are
 patched in place. Capacity layout adapted from PR #4030.
 """
@@ -45,6 +45,10 @@ def _ladder_capacity(needed: int, step: int) -> int:
     return ((needed + 2 * grain - 1) // grain) * grain
 
 
+# A join that moves the live rows right copies them in this many column chunks.
+_SHIFT_CHUNKS = 8
+
+
 def _logical_kv(cache):
     """``(keys, values)`` cut to the stock (concatenate) width."""
     keys, values = cache.keys, cache.values
@@ -55,7 +59,7 @@ def _logical_kv(cache):
 
 
 class _CapacityMethods:
-    # Live rows when a filter left spare rows in the bank, else None.
+    # Live rows when the bank has spare rows, else None.
     _rows = None
 
     @property
@@ -277,6 +281,8 @@ class _CapacityMethods:
             else mx.float32
         )
 
+        if self._extend_in_place(other, logical, max_idx, max_size):
+            return
         if self._extend_into_capacity(other, logical, max_idx, max_size):
             return
 
@@ -304,6 +310,67 @@ class _CapacityMethods:
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
         self._idx = max_idx
+
+    def _extend_in_place(self, other, logical, max_idx: int, max_size: int) -> bool:
+        """Write the stock join layout into the spare rows a filter left.
+
+        When ``other`` is longer, the stock layout moves the live rows right; they
+        move inside the bank. False when the rows, width or dtypes do not fit.
+        """
+        if self._keys is None or other.keys is None:
+            return False
+        keys, values = logical[id(other)]
+        live, new = int(self.keys.shape[0]), int(keys.shape[0])
+        for bank, part in ((self._keys, keys), (self._values, values)):
+            if (
+                live + new > int(bank.shape[0])
+                or max_size > int(bank.shape[2])
+                or part.dtype != bank.dtype
+                or part.shape[1] != bank.shape[1]
+                or part.shape[3] != bank.shape[3]
+            ):
+                return False
+        # The caller's view of this bank would make every write below copy it.
+        del logical[id(self)]
+        shift = max_idx - self._idx
+        if shift:
+            self._shift_right(live, shift, min(self._logical_width(), max_size - shift))
+        left = max_idx - other._idx
+        length = min(int(keys.shape[2]), max_size - left)
+        rows = slice(live, live + new)
+        for bank, part in ((self._keys, keys), (self._values, values)):
+            # Freed rows still hold old tokens.
+            bank[rows, :, :max_size] = 0
+            bank[rows, :, left : left + length] = part[..., :length, :]
+        self.offset = mx.concatenate([self.offset, other.offset])
+        self.left_padding = mx.concatenate(
+            [self.left_padding + shift, other.left_padding + left]
+        )
+        self._idx = max_idx
+        self._width = max_size
+        self._rows = live + new if live + new < int(self._keys.shape[0]) else None
+        return True
+
+    def _shift_right(self, live: int, shift: int, length: int) -> None:
+        """Move the first ``length`` columns of the live rows ``shift`` to the right.
+
+        Chunks go right to left, so no chunk reads columns that a write changed.
+        Each chunk is evaluated before its write, or the write copies the bank.
+        """
+        rows = slice(live)
+        chunk = max(1, -(-length // _SHIFT_CHUNKS))
+        for start in range((length - 1) // chunk * chunk, -1, -chunk):
+            end = min(start + chunk, length)
+            columns = mx.arange(start, end)
+            moved = [
+                mx.take(bank[rows], columns, axis=2)
+                for bank in (self._keys, self._values)
+            ]
+            mx.eval(moved)
+            for bank, part in zip((self._keys, self._values), moved):
+                bank[rows, :, start + shift : end + shift] = part
+        for bank in (self._keys, self._values):
+            bank[rows, :, :shift] = 0
 
     def _extend_into_capacity(self, other, logical, max_idx: int, max_size: int):
         """Write the stock join layout straight into a ladder bank.
