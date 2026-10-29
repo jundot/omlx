@@ -88,9 +88,12 @@ from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
     SubKeyEntry,
+    _clean_say_chunk_chars,
+    _clean_say_long_input,
     burst_decode_env,
 )
 from ..utils import gpu_power
+from ..utils import macos_say
 from ..utils.fatal import is_command_buffer_error
 from ..utils.hardware import (
     compute_owner_hash,
@@ -785,6 +788,13 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
     ) = None
+    # macOS speech: the system `say` engine plus its per-language voices.
+    # say_voices replaces the whole map on save; an entry set to "" removes
+    # that language's override and hands the choice back to macOS.
+    say_enabled: bool | None = None
+    say_voices: dict[str, str] | None = None
+    say_long_input: str | None = None
+    say_chunk_chars: int | None = None
     markitdown_enabled: bool | None = None
     markitdown_expose_model: bool | None = None
     markitdown_max_file_size_mb: int | None = None
@@ -4742,6 +4752,13 @@ def _global_settings_response(global_settings):
             "splash_max_memory_gb": global_settings.integrations.splash_max_memory_gb,
             "splash_ssd_cache_gb": global_settings.integrations.splash_ssd_cache_gb,
             "splash_ane_prefill": global_settings.integrations.splash_ane_prefill,
+            "say_enabled": global_settings.integrations.say_enabled,
+            "say_voices": dict(global_settings.integrations.say_voices),
+            "say_long_input": global_settings.integrations.say_long_input,
+            "say_chunk_chars": global_settings.integrations.say_chunk_chars,
+            # Whether THIS server can speak at all: the card hides its
+            # controls off macOS instead of offering a dead engine.
+            "say_supported": macos_say.available(),
         },
         "external_engines": {"splash": _splash_status(global_settings)},
         "system": {
@@ -5663,6 +5680,46 @@ async def update_global_settings(
             request.splash_ane_prefill
         )
         integrations_changed = True
+    if "say_enabled" in request.model_fields_set:
+        global_settings.integrations.say_enabled = bool(request.say_enabled)
+        integrations_changed = True
+        logger.info(
+            "macOS speech %s via admin settings",
+            "enabled" if request.say_enabled else "disabled",
+        )
+    if "say_voices" in request.model_fields_set:
+        # The card sends the whole map; an entry cleared to "" removes that
+        # language's override. Voices the box cannot speak are dropped.
+        global_settings.integrations.say_voices = macos_say.clean_voices(
+            request.say_voices or {}
+        )
+        integrations_changed = True
+        logger.info(
+            "macOS speech voices updated: %s",
+            global_settings.integrations.say_voices or "(all macOS defaults)",
+        )
+    if "say_long_input" in request.model_fields_set:
+        # Only the two policies the engine knows; junk reads back as 'speak',
+        # the same rule the settings file applies on load.
+        global_settings.integrations.say_long_input = _clean_say_long_input(
+            request.say_long_input
+        )
+        integrations_changed = True
+        logger.info(
+            "macOS speech long-input policy: %s",
+            global_settings.integrations.say_long_input,
+        )
+    if "say_chunk_chars" in request.model_fields_set:
+        # 0 switches segmentation off (one `say` call, however long the text);
+        # the bounds are the engine's, since it is what pays per call.
+        global_settings.integrations.say_chunk_chars = _clean_say_chunk_chars(
+            request.say_chunk_chars
+        )
+        integrations_changed = True
+        logger.info(
+            "macOS speech segment size: %s characters",
+            global_settings.integrations.say_chunk_chars or "unsegmented",
+        )
     if "markitdown_enabled" in request.model_fields_set:
         global_settings.integrations.markitdown_enabled = bool(
             request.markitdown_enabled
@@ -6088,6 +6145,35 @@ class WebSearchTestRequest(BaseModel):
     searxng_url: str = ""
     ddgs_backends: str = ""
     max_results: int = Field(default=DEFAULT_MAX_RESULTS, ge=1, le=10)
+
+
+@router.get("/api/macos-say/voices")
+async def macos_say_voices(is_admin: bool = Depends(require_admin)):
+    """The macOS Speech card's data: every language this Mac can speak, the
+    voices installed for it, the per-language choice the owner made in System
+    Settings (the only default macOS lets us observe per language), and the
+    voice the settings map currently pins. The probes shell out to Apple
+    tooling, so they run off the event loop; off macOS the answer is
+    supported=False and the card hides itself."""
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    enabled = global_settings.integrations.say_enabled
+    pinned = dict(global_settings.integrations.say_voices)
+    if not await asyncio.to_thread(macos_say.available):
+        return {"supported": False, "enabled": enabled, "voices": pinned,
+                "languages": []}
+    languages = await asyncio.to_thread(macos_say.language_options, pinned)
+    default = await asyncio.to_thread(macos_say.default_voice)
+    return {
+        "supported": True,
+        "enabled": enabled,
+        "voices": pinned,
+        "system_language": await asyncio.to_thread(macos_say.system_language),
+        "system_voice": (macos_say.address_of(default) if default else ""),
+        "system_voice_name": (str(default["name"]) if default else ""),
+        "languages": languages,
+    }
 
 
 @router.post("/api/web-search/test")

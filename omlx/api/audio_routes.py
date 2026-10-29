@@ -17,9 +17,11 @@ import logging
 import math
 import os
 import re
+import struct
 import tempfile
+import wave
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import (
     APIRouter,
@@ -30,7 +32,8 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
 from ..engine.lfm3_speech import SPEECH_MODEL_TYPES, VOICES
@@ -868,6 +871,354 @@ def _transcode_speech_output(wav_bytes: bytes, response_format: str) -> bytes:
     return buf.getvalue()
 
 
+def _macos_say_settings() -> tuple[bool, dict[str, str], str, int]:
+    """(engine switched on, per-language voice map, long-input policy,
+    segment size in characters) from the global settings. A settings file the
+    server never loaded means the defaults: on, no overrides, say the whole
+    utterance in sentence-sized pieces - so macOS picks every voice and a long
+    reply still gets read instead of being cut. The audio ceiling is
+    deliberately absent: it is the environment's, not the settings file's
+    (macos_say.max_audio_mb reads OMLX_SAY_MAX_AUDIO_MB per request)."""
+    from ..utils import macos_say
+
+    try:
+        from omlx.settings import get_settings
+
+        integrations = get_settings().integrations
+    except RuntimeError:
+        return (True, {}, "speak", macos_say.DEFAULT_CHUNK_CHARS)
+    return (
+        bool(integrations.say_enabled),
+        dict(integrations.say_voices),
+        str(integrations.say_long_input),
+        macos_say.clean_chunk_chars(getattr(integrations, "say_chunk_chars", None)),
+    )
+
+
+def say_model_visible() -> bool:
+    """Whether the model list should advertise the system speech engine.
+
+    Two gates, both cheap: `say` must exist on this machine (a PATH probe) and
+    the operator must not have switched it off. A model-less engine is not in
+    the pool, so nothing else names it and strict clients - anything that
+    validates a model id against GET /v1/models - would refuse the only name
+    that works."""
+    from ..utils import macos_say
+
+    enabled = _macos_say_settings()[0]
+    return bool(enabled) and macos_say.available()
+
+
+def _say_engine_request(model: str) -> tuple[bool, str]:
+    """Whether this model token asks for the macOS system synthesizer, and
+    the voice or locale it carries ('say', 'say:Zuzana', 'say:cs-CZ').
+
+    A discovered model that happens to be named 'say' keeps its name: this
+    engine only answers when no model on the box claims it."""
+    from ..utils import macos_say
+
+    is_say, tail = macos_say.split_model_token(model)
+    if not is_say:
+        return False, ""
+    try:
+        from omlx.server import _server_state
+
+        pool = _server_state.engine_pool
+        wanted = str(model).strip().lower()
+        if pool is not None and any(
+            str(known).strip().lower() == wanted for known in pool.get_model_ids()
+        ):
+            return False, ""
+    except Exception:  # no server state (tests, early boot): nothing claims it
+        pass
+    return True, tail
+
+
+async def _speech_via_macos_say(
+    request: AudioSpeechRequest, say_voice: str, response_format: str
+) -> Response:
+    """The model='say' path of POST /v1/audio/speech: render the text with
+    the macOS speech synthesizer. No engine, no model load, no GPU - `say`
+    writes the file and the bytes go straight back.
+
+    A reply longer than the configured segment size is rendered in sentence
+    pieces and stitched into one file, so the server's memory tracks the
+    longest segment rather than the longest answer. The ceiling is MB of
+    audio - the one unit that means the same for every voice - and its knob
+    is the environment (OMLX_SAY_MAX_AUDIO_MB), not the card. A reply that
+    cannot fit even at the fastest speaking pace is refused before anything
+    renders; one that crosses the ceiling on a slow voice is aborted, never
+    delivered cut short.
+
+    ``say_voice`` is the voice the model token named ('say:Zuzana') and is
+    held to: an address this Mac cannot speak answers 400. ``request.voice``
+    is only consulted when the token named none, and an OpenAI client always
+    sends one of ITS names - a voice that is neither an installed macOS voice
+    nor a locale is dropped, because the caller chose the engine by model and
+    has no way to know the macOS roster. With no voice at all the language
+    routes it, and with no language either macOS names the language of the
+    text and the voice chain answers."""
+    from ..utils import macos_say
+
+    if request.ref_audio:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "model 'say' is the macOS system synthesizer: it cannot clone "
+                "a reference voice, drop 'ref_audio' or pick a TTS model"
+            ),
+        )
+    if not await asyncio.to_thread(macos_say.available):
+        raise HTTPException(
+            status_code=400,
+            detail="model 'say' needs a macOS server with the 'say' command",
+        )
+    enabled, pinned, long_input, chunk_chars = await asyncio.to_thread(
+        _macos_say_settings
+    )
+    if not enabled:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "macOS speech is switched off: enable it under "
+                "Settings > Integrations > macOS Speech"
+            ),
+        )
+    voice = (say_voice or "").strip()
+    client_voice = str(request.voice or "").strip()
+    if not voice and client_voice:
+        resolved = await asyncio.to_thread(macos_say.resolve, client_voice)
+        if resolved is not None or macos_say.looks_like_locale(client_voice):
+            voice = client_voice
+        else:
+            logger.info(
+                "model 'say': ignoring voice '%s', not a macOS voice", client_voice
+            )
+
+    text = (request.input or "").strip()
+    max_mb = macos_say.max_audio_mb()
+    refused = macos_say.long_input_error(len(text), long_input, max_mb)
+    if refused:
+        # Fail or pass up front: this answer costs no render time at all.
+        logger.warning("macOS speech refused before rendering: %s", refused)
+        raise HTTPException(status_code=400, detail=refused)
+
+    # Route ONCE for the whole utterance. Re-detecting per segment would let
+    # one Czech answer come back in three different voices.
+    try:
+        address = await asyncio.to_thread(
+            macos_say.route, voice, request.language, text, pinned
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    segments = _say_segments(text, chunk_chars)
+    ceiling_bytes = max_mb * 1_000_000
+    media_type = _SPEECH_RESPONSE_FORMATS[response_format]
+    _record_audio_request(macos_say.SAY_ENGINE)
+
+    if request.stream:
+        return StreamingResponse(
+            _iter_say_stream(segments, address, request.speed, ceiling_bytes),
+            media_type=media_type,
+        )
+
+    try:
+        spool = await asyncio.to_thread(
+            _say_spool_and_encode,
+            segments,
+            address,
+            request.speed,
+            response_format,
+            ceiling_bytes,
+        )
+    except ValueError as exc:
+        logger.warning("macOS speech refused: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return FileResponse(
+        spool,
+        media_type=media_type,
+        background=BackgroundTask(_cleanup_tempfile, spool),
+    )
+
+
+# --- long utterances: segment, spool to disk, stitch, encode ----------------
+
+_SAY_WINDOW = 65536  # frames per block: ~128 KB of audio in flight
+
+
+def _say_segments(text: str, chunk_chars: int) -> list[str]:
+    """Sentence-sized pieces of one utterance; ``chunk_chars`` 0 keeps it in
+    one `say` call. Reuses the splitter the model streaming path already uses,
+    so both doors cut a reply in the same place.'"""
+    if chunk_chars <= 0:
+        return [text]
+    return _split_tts_text(text, max_chars=chunk_chars) or [text]
+
+
+def _say_ceiling_error(payload_bytes: int, ceiling_bytes: int) -> ValueError:
+    from ..utils import macos_say
+
+    return ValueError(
+        "this reply crossed the %d MB ceiling of one spoken answer while it "
+        "was still rendering - this voice speaks slower than the pre-check "
+        "promises. Ask for a shorter reply, or set %s to raise the ceiling"
+        % (ceiling_bytes // 1_000_000, macos_say.MAX_AUDIO_ENV)
+    )
+
+
+def _say_segment_pcm(segment: str, address: Any, speed: Any) -> tuple:
+    """Render one segment and hand back (rate, channels, width, pcm). The WAV
+    wrapper dies here, so the peak is one segment, not the utterance."""
+    from ..utils import macos_say
+
+    wav = macos_say.synth_wav(segment, address, speed)
+    try:
+        return wav_bytes_to_pcm_frames(wav)
+    finally:
+        del wav
+
+
+def _say_spool(segments, address, speed, ceiling_bytes, out_path):
+    """Render every segment into ONE WAV file, header patched to the truth.
+
+    Nothing longer than a segment is ever held: the reply accumulates on disk.
+    Returns (rate, channels, width, payload_bytes)."""
+    fmt = None
+    total = 0
+    with open(out_path, "wb") as out:
+        out.write(b"\x00" * 44)  # the real header lands once sizes are known
+        for segment in segments:
+            rate, channels, width, pcm = _say_segment_pcm(segment, address, speed)
+            if fmt is None:
+                fmt = (rate, channels, width)
+            elif (rate, channels, width) != fmt:
+                raise RuntimeError(
+                    "macOS speech changed format between segments: %s then %s"
+                    % (fmt, (rate, channels, width))
+                )
+            total += len(pcm)
+            if total > ceiling_bytes:
+                raise _say_ceiling_error(total, ceiling_bytes)
+            if pcm:
+                out.write(pcm)
+    if fmt is None:
+        raise ValueError("nothing to say")
+    rate, channels, width = fmt
+    with open(out_path, "r+b") as fh:
+        fh.seek(0)
+        fh.write(
+            wav_header(sample_rate=rate, channels=channels, sample_width=width)
+        )
+        # audio_utils.wav_header emits the canonical 44-byte PCM header, so
+        # 4 (RIFF size) and 40 (data size) are where the spec says they are.
+        # A streamed response cannot promise this - it does not know the length
+        # yet - which is exactly why the finished file carries the real one.
+        fh.seek(4)
+        fh.write(struct.pack("<I", min(36 + total, 0x7FFFFFF0)))
+        fh.seek(40)
+        fh.write(struct.pack("<I", total))
+    return fmt, total
+
+
+def _say_spool_and_encode(
+    segments, address, speed, response_format, ceiling_bytes
+) -> str:
+    """Spool, then encode if the client asked for something other than WAV.
+    Returns a temp path the caller must delete once it has been sent."""
+    fd, spool = tempfile.mkstemp(prefix="omlx-say-", suffix=".wav")
+    os.close(fd)
+    try:
+        _say_spool(segments, address, speed, ceiling_bytes, spool)
+        if response_format == "wav":
+            return spool
+        fd, out = tempfile.mkstemp(prefix="omlx-say-", suffix="." + response_format)
+        os.close(fd)
+        try:
+            _transcode_speech_file(spool, out, response_format)
+        except BaseException:
+            _cleanup_tempfile(out)
+            raise
+        _cleanup_tempfile(spool)
+        return out
+    except BaseException:
+        _cleanup_tempfile(spool)
+        raise
+
+
+def _transcode_speech_file(src: str, dst: str, response_format: str) -> None:
+    """:func:`_transcode_speech_output` for a file, a block at a time.
+
+    The in-memory version loads the whole reply and then a float32 copy of it,
+    four bytes for every 16-bit sample: measured on a 235 s render that is
+    +43 MB of peak for flac against +19 MB here, and unlike the array this
+    does not grow with the text. libsndfile takes incremental writes for all
+    three targets and CoreAudio reads the results back at the right length."""
+    if response_format == "pcm":
+        with wave.open(src, "rb") as wf:
+            left = wf.getnframes()
+            with open(dst, "wb") as out:
+                while left > 0:
+                    step = min(left, _SAY_WINDOW)
+                    out.write(wf.readframes(step))
+                    left -= step
+        return
+
+    # soundfile ships with the audio extra; lazy import like the array path
+    import soundfile as sf
+
+    fmt = {"mp3": "MP3", "opus": "OGG", "flac": "FLAC"}.get(response_format)
+    if fmt is None:
+        raise ValueError("no streaming encoder for '%s'" % response_format)
+    kwargs = {"format": fmt}
+    if response_format == "opus":
+        kwargs["subtype"] = "OPUS"
+    with sf.SoundFile(src) as fin:
+        with sf.SoundFile(
+            dst, "w", samplerate=fin.samplerate, channels=fin.channels, **kwargs
+        ) as fout:
+            for block in fin.blocks(blocksize=_SAY_WINDOW, dtype="float32"):
+                fout.write(block)
+
+
+async def _iter_say_stream(segments, address, speed, ceiling_bytes):
+    """Header first, then each segment the moment it finishes rendering: a
+    long answer starts playing after its first sentence instead of after the
+    last one, and the server holds one segment at a time.
+
+    Like the model streaming path this emits the house unknown-length header
+    (``audio_utils.wav_header``), so a client that trusts the size field sees a
+    maximum. Clients that need the true length ask without ``stream``, and get
+    the spooled file above with the real numbers written in.'"""
+    fmt = None
+    total = 0
+    for segment in segments:
+        rate, channels, width, pcm = await asyncio.to_thread(
+            _say_segment_pcm, segment, address, speed
+        )
+        if fmt is None:
+            fmt = (rate, channels, width)
+            yield wav_header(
+                sample_rate=rate, channels=channels, sample_width=width
+            )
+        elif (rate, channels, width) != fmt:
+            raise RuntimeError(
+                "macOS speech changed format between segments: %s then %s"
+                % (fmt, (rate, channels, width))
+            )
+        total += len(pcm)
+        if total > ceiling_bytes:
+            # The bytes already sent cannot be taken back, so this dies loudly
+            # rather than ending the reply with a silent cut.
+            raise _say_ceiling_error(total, ceiling_bytes)
+        if pcm:
+            yield pcm
+
+
 @router.post("/v1/audio/speech")
 async def create_speech(request: AudioSpeechRequest):
     """OpenAI-compatible text-to-speech endpoint."""
@@ -893,6 +1244,11 @@ async def create_speech(request: AudioSpeechRequest):
                 detail="Streaming TTS currently only supports response_format='wav'",
             )
         streaming_interval = _resolve_tts_streaming_interval(request)
+
+    # macOS system speech: a model-less engine, so it never reaches the pool.
+    is_say, say_voice = _say_engine_request(request.model)
+    if is_say:
+        return await _speech_via_macos_say(request, say_voice, response_format)
 
     audio_bytes = _decode_ref_audio_base64(request)
 

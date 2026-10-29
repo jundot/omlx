@@ -201,6 +201,11 @@
                     splash_max_memory_gb: null,
                     splash_ssd_cache_gb: null,
                     splash_ane_prefill: true,
+                    say_enabled: true,
+                    say_voices: {},
+                    say_long_input: 'speak',
+                    say_chunk_chars: 1200,
+                    say_supported: false,
                 },
                 external_engines: {
                     splash: { available: false, path: null, auto_detected: null, version: null, label: null, reason: '', install_hint: '', models: [] },
@@ -212,6 +217,12 @@
 
             // Web search "Test search" button state
             webSearchTest: { running: false, ok: null, message: '' },
+            // macOS Speech card: the per-language voice list, read from the
+            // server because only the Mac itself knows what it can speak.
+            macosSay: { languages: [], loading: false, loaded: false, error: '' },
+            // A Mac with every language pack installed has 50+ languages to
+            // list; the card shows the first screenful and offers the rest.
+            sayVisibleLimit: 8,
             // Splash launcher path row: manual entry when not detected or changed
             splashPath: { editing: false, draft: '', error: '', saving: false },
             splashOptionsError: '',
@@ -1024,6 +1035,7 @@
                 this.activeTab = tab;
                 this.mainTab = 'settings';
                 this.syncTabStateToUrl();
+                if (tab === 'integrations') this.loadMacosSayVoices();
             },
 
             settingsGoToSection(id) {
@@ -1301,6 +1313,13 @@
                         this.idleTimeoutValue = this.globalSettings.idle_timeout?.idle_timeout_seconds != null
                             ? String(this.globalSettings.idle_timeout.idle_timeout_seconds)
                             : '';
+
+                        // The macOS voice roster is only knowable by the server
+                        // running it: fetch it when the owner lands on the tab
+                        // (a deep link skips setSettingsTab entirely).
+                        if (this.activeTab === 'integrations') {
+                            this.loadMacosSayVoices();
+                        }
 
                         // Normalize memory guard tier to one of the known values.
                         const validTiers = ['safe', 'balanced', 'aggressive', 'custom'];
@@ -4404,6 +4423,10 @@
                             splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
                             splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
                             splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
+                            say_enabled: this.globalSettings.integrations.say_enabled,
+                            say_voices: this.sayVoicesMap(),
+                            say_long_input: this.globalSettings.integrations.say_long_input,
+                            say_chunk_chars: this.globalSettings.integrations.say_chunk_chars,
                         }),
                     });
                     if (!response.ok) {
@@ -4416,6 +4439,173 @@
                     return String(err);
                 }
                 return '';
+            },
+
+            /* ---------- macOS Speech card (Settings > Integrations) ------ */
+
+            // The locale -> voice map the server stores: a language back on
+            // 'macOS default' is absent from it, not empty.
+            sayVoicesMap() {
+                const out = {};
+                (this.macosSay.languages || []).forEach(lang => {
+                    if (lang.configured) out[lang.locale] = lang.configured;
+                });
+                return out;
+            },
+
+            async loadMacosSayVoices(force) {
+                if (!this.globalSettings.integrations.say_supported) return;
+                if (this.macosSay.loading) return;
+                if (this.macosSay.loaded && !force) return;
+                this.macosSay.loading = true;
+                this.macosSay.error = '';
+                try {
+                    const response = await fetch('/admin/api/macos-say/voices');
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    const data = await response.json();
+                    const pinned = data.voices || {};
+                    // The card owns the map it shows: a language the server
+                    // still has a voice for, but that is no longer installed,
+                    // comes back without a choice and reads as the default.
+                    const list = (data.languages || []).map(lang => ({
+                        ...lang,
+                        configured: pinned[lang.locale] || '',
+                    }));
+                    // macOS lets us observe its own pick for some languages and
+                    // not others, and the observable half is the interesting
+                    // half in a list this long: those go first, the rest after,
+                    // each group in the alphabet the operator reads (the card
+                    // names languages in the dashboard's own language, so a
+                    // Czech operator sorts by Czech names).
+                    let byName = (a, b) =>
+                        String(a.locale).localeCompare(String(b.locale));
+                    try {
+                        const ui = this.globalSettings.ui.language || 'en';
+                        const names = new Intl.DisplayNames(
+                            [ui, 'en'], { type: 'language' });
+                        const collator = new Intl.Collator(ui);
+                        byName = (a, b) => collator.compare(
+                            names.of(a.locale) || a.locale,
+                            names.of(b.locale) || b.locale);
+                    } catch (err) {
+                        // an engine without Intl.DisplayNames keeps tag order
+                    }
+                    const seen = lang => (lang.default || {}).preference === true;
+                    this.macosSay.languages = list.filter(seen).sort(byName)
+                        .concat(list.filter(lang => !seen(lang)).sort(byName));
+                    this.macosSay.loaded = true;
+                } catch (err) {
+                    console.error('Failed to load macOS voices:', err);
+                    this.macosSay.error = String(err);
+                } finally {
+                    this.macosSay.loading = false;
+                }
+            },
+
+            // First option of a language's dropdown: what macOS answers when
+            // the owner chose nothing. A Spoken Content pick per language is
+            // the only default the system exposes, so anything else stays
+            // unnamed rather than claiming a voice it cannot prove.
+            sayDefaultLabel(lang) {
+                const d = lang.default || {};
+                if (d.preference && d.name) {
+                    return window.t('settings.integrations.speech.default_preference')
+                        .replace('{voice}', d.name);
+                }
+                return window.t('settings.integrations.speech.default_system');
+            },
+
+            // Counts follow the repo's plural convention: a `_one` key that
+            // already carries the number, a base key with {count}.
+            sayCount(key, count) {
+                if (count === 1) return window.t(key + '_one');
+                return window.t(key).replace('{count}', count);
+            },
+
+            sayVoiceCount(lang) {
+                return this.sayCount(
+                    'settings.integrations.speech.voice_count',
+                    (lang.voices || []).length
+                );
+            },
+
+            sayBadgeText() {
+                if (!this.globalSettings.integrations.say_supported) {
+                    return window.t('settings.integrations.speech.mac_only_badge');
+                }
+                return this.sayCount(
+                    'settings.integrations.speech.languages_badge',
+                    (this.macosSay.languages || []).length
+                );
+            },
+
+            // 'cs-CZ' -> "Čeština (Česko)" in the dashboard's own language,
+            // falling back to the bare tag where the browser cannot name it.
+            sayLanguageLabel(locale) {
+                try {
+                    const ui = this.globalSettings.ui.language || 'en';
+                    const names = new Intl.DisplayNames([ui, 'en'], { type: 'language' });
+                    const label = names.of(String(locale).replace('_', '-'));
+                    return label && label !== locale ? label : locale;
+                } catch (err) {
+                    return locale;
+                }
+            },
+
+            setSayVoice(lang, value) {
+                const previous = lang.configured || '';
+                lang.configured = value || '';
+                this.saveIntegrationSettings().then(err => {
+                    if (!err) return;
+                    lang.configured = previous;
+                    this.macosSay.error = err;
+                });
+            },
+
+            // Policy for text past OpenAI's input limit. The engine answers a
+            // refusal with a 400, so the choice belongs to the operator, not
+            // the caller; a failed save flips the select back.
+            saveSayLongInput() {
+                const integrations = this.globalSettings.integrations;
+                const chosen = integrations.say_long_input || 'speak';
+                this.saveIntegrationSettings().then(err => {
+                    if (!err) return;
+                    integrations.say_long_input = chosen === 'speak' ? 'reject' : 'speak';
+                    this.macosSay.error = err;
+                });
+            },
+
+            // Segment size. The server clamps it to the bound the engine
+            // actually honours, so a field that reads 5 after a reload is not
+            // a bug - the next page load shows the truth, and min/max on the
+            // input keeps the guess close to it. The audio ceiling is fixed in
+            // the engine (256 MB, about ninety minutes of speech): there is
+            // nothing to tune there, only a refusal past the limit.
+            saveSayLimits() {
+                const integrations = this.globalSettings.integrations;
+                const previous = {
+                    say_chunk_chars: integrations.say_chunk_chars,
+                };
+                this.saveIntegrationSettings().then(err => {
+                    if (!err) return;
+                    Object.assign(integrations, previous);
+                    this.macosSay.error = err;
+                });
+            },
+
+            toggleSayEnabled() {
+                const integrations = this.globalSettings.integrations;
+                integrations.say_enabled = !integrations.say_enabled;
+                this.saveIntegrationSettings().then(err => {
+                    if (err) {
+                        integrations.say_enabled = !integrations.say_enabled;
+                        this.macosSay.error = err;
+                        return;
+                    }
+                    // The list only costs an Apple probe, so fetch it when the
+                    // owner opens the section rather than on every page load.
+                    if (integrations.say_enabled) this.loadMacosSayVoices(true);
+                });
             },
 
             // Number inputs where an empty field means "automatic".
