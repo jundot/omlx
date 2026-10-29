@@ -108,6 +108,7 @@ from .api.embedding_utils import (
     normalize_input,
     truncate_embedding,
 )
+from .api.image_routes import router as image_router
 from .api.markitdown import (
     MARKITDOWN_MODEL_ID,
     MarkItDownRequestError,
@@ -885,7 +886,6 @@ else:
     )
     # Before admin_router so the page routes keep their original order.
     app.include_router(_web_ui.router)
-from .api.image_routes import router as image_router
 
 app.include_router(image_router, dependencies=[Depends(verify_inference_api_key)])
 app.include_router(admin_router)

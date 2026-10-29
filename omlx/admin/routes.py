@@ -2856,12 +2856,13 @@ async def update_model_settings(
         model_id, current_settings
     )
     is_diffusion_model = _entry_is_diffusion_model(entry)
-    if entry.model_type == "image":
-        if request.is_default or request.model_type_override:
-            raise HTTPException(
-                status_code=400,
-                detail="Image pipelines cannot be chat defaults or use a model-type override",
-            )
+    if entry.model_type == "image" and (
+        request.is_default or request.model_type_override
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Image pipelines cannot be chat defaults or use a model-type override",
+        )
 
     if "model_alias" in sent:
         alias_value = request.model_alias.strip() if request.model_alias else None
