@@ -1438,6 +1438,29 @@ class TestStreamingHelpers:
         assert vision not in budgeted
         assert plan.boost_map["language_model.lm_head"]["bits"] == 6
 
+    def test_hybrid_dense_global_attention_gets_one_bit(self):
+        named_shapes = {}
+        for i in range(8):
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                named_shapes[f"model.layers.{i}.self_attn.{proj}"] = (1024, 1024)
+            for proj in ("gate_proj", "up_proj"):
+                named_shapes[f"model.layers.{i}.mlp.{proj}"] = (4096, 1024)
+            named_shapes[f"model.layers.{i}.mlp.down_proj"] = (1024, 4096)
+        config = {
+            "num_hidden_layers": 8,
+            "layer_types": (["sliding_attention"] * 3 + ["full_attention"]) * 2,
+            "_oq_use_budget_plan": True,
+        }
+
+        plan = _build_quant_plan(
+            named_shapes, config, 3, target_bpw=3.5, hard_cap_bpw=3.565
+        )
+
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            assert plan.boost_map[f"model.layers.3.self_attn.{proj}"]["bits"] == 4
+            assert plan.boost_map[f"model.layers.7.self_attn.{proj}"]["bits"] == 4
+        assert "model.layers.2.self_attn.q_proj" not in plan.boost_map
+
     def test_qwen4_ngram_table_stays_outside_budget_plan(self):
         from omlx.oq import _budgeted_shapes, _get_predicate_bits
 
@@ -1510,9 +1533,9 @@ class TestLevelBudgetPlan:
     def test_bpw_targets_for_level_returns_correct_values(self):
         assert _bpw_targets_for_level(2.5) == (3.1, 3.3)
         assert _bpw_targets_for_level(2.7) == (3.25, 3.35)
-        assert _bpw_targets_for_level(3) == (3.5, 3.7)
+        assert _bpw_targets_for_level(3) == (3.6, 3.8)
         assert _bpw_targets_for_level(3.5) == (3.8, 4.0)
-        assert _bpw_targets_for_level(4) == (4.6, 4.7)
+        assert _bpw_targets_for_level(4) == (4.7, 4.8)
         assert _bpw_targets_for_level(5) == (5.5, 5.7)
         assert _bpw_targets_for_level(6) == (6.5, 6.7)
         assert _bpw_targets_for_level(2.8) is None

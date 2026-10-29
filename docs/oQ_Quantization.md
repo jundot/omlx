@@ -21,9 +21,9 @@ For most models, **oQ4e** is the place to start.
 | oQ2 | 2 | about 2.8 to 3.0 | Very large MoE models that do not fit otherwise |
 | oQ2.5 | 2 | about 3.1 to 3.3 | Large MoE models, with some expert layers lifted to 3-bit |
 | oQ2.7 | 2 | about 3.25 to 3.35 | Same as oQ2.5 with more 3-bit expert layers |
-| oQ3 | 3 | about 3.5 to 3.7 | When memory is tight |
+| oQ3 | 3 | about 3.6 to 3.8 | When memory is tight |
 | oQ3.5 | 3 | about 3.8 to 4.0 | oQ3 with 4-bit expert down projections |
-| oQ4 | 4 | about 4.6 to 4.7 | Recommended default |
+| oQ4 | 4 | about 4.7 to 4.8 | Recommended default |
 | oQ5 | 5 | about 5.5 to 5.7 | Higher quality |
 | oQ6 | 6 | about 6.5 to 6.7 | Very close to the original |
 | oQ8 | 8 | about 8.5 | Every quantized tensor at 8-bit |
@@ -61,7 +61,7 @@ The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix`
 - **MoE routers:** kept at full precision. Shared-expert gates are 8-bit.
 - **Vision and audio encoders:** not quantized, and not counted in the size budget.
 - **Norms and recurrent state parameters** (SSM and linear attention): not quantized.
-- **Attention and other sensitive projections:** extra bits where the measurement says so.
+- **Attention and other sensitive projections:** extra bits where the measurement says so. In dense models that mix full attention with sliding or linear attention, the full-attention projections get one bit above the base from oQ3 up.
 - **Routed experts:** stay at the base bits, because they are most of the model and the most expensive to raise. oQ3.5 gives their down projections one extra bit, and oQ2.5 and oQ2.7 raise whole expert layers to 3-bit.
 - **MTP heads** (with **Preserve MTP weights**): kept, with the small connecting layers at full precision and the rest at 4-bit or more.
 

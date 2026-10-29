@@ -273,9 +273,9 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
     2: (2.8, 3.0),
     2.5: (3.1, 3.3),
     2.7: (3.25, 3.35),
-    3: (3.5, 3.7),
+    3: (3.6, 3.8),
     3.5: (3.8, 4.0),
-    4: (4.6, 4.7),
+    4: (4.7, 4.8),
     5: (5.5, 5.7),
     6: (6.5, 6.7),
 }
@@ -1113,6 +1113,17 @@ _ALWAYS_ON_LADDER = (3, 4, 5, 6, 8)
 # 8-bit to starve the layers that every token runs through.
 _LARGE_EMBEDDING_SHARE = 0.03
 
+_GLOBAL_ATTENTION_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.self_attn\.[qkvo]_proj$")
+
+
+def _global_attention_layers(config: dict) -> set[int]:
+    """Full-attention layers of a hybrid model (sliding or linear attention elsewhere)."""
+    text_config = config.get("text_config") or {}
+    layer_types = config.get("layer_types") or text_config.get("layer_types") or []
+    if len(set(layer_types)) < 2:
+        return set()
+    return {i for i, kind in enumerate(layer_types) if kind == "full_attention"}
+
 
 def _is_always_on_tensor(path: str) -> bool:
     """Decoder weights every token runs through: all but routed experts and heads."""
@@ -1297,16 +1308,18 @@ def _build_quant_plan(
     Strategy:
     1. Mandatory pre-allocation: output head and token embeddings, sized by
        _mandatory_head_bits.
-    2. Dense models below 3-bit: every decoder tensor is lifted to 3-bit with
+    2. Hybrid dense models at 3-bit and above: full-attention q/k/v/o get one
+       bit above the base.
+    3. Dense models below 3-bit: every decoder tensor is lifted to 3-bit with
        group 128 first, most sensitive layers first.
-    3. MoE models: after the protection floor, the tensors every token runs
+    4. MoE models: after the protection floor, the tensors every token runs
        through climb one width per round, most sensitive first.
-    4. Data-driven: remaining non-expert tensors compete by layer sensitivity.
-    5. Budget still left returns the output head and embeddings to 8-bit.
-    6. Routed experts stay at base bits except explicit fractional floors and
+    5. Data-driven: remaining non-expert tensors compete by layer sensitivity.
+    6. Budget still left returns the output head and embeddings to 8-bit.
+    7. Routed experts stay at base bits except explicit fractional floors and
        the oQ2.5/oQ2.7 fallback routed-layer boost.
 
-    always_on_rules=False skips steps 2 and 3 for callers with their own
+    always_on_rules=False skips steps 2 to 4 for callers with their own
     allocation or exporter constraints.
 
     fixed_overrides marks tensors whose output format is fixed up front
@@ -1399,6 +1412,46 @@ def _build_quant_plan(
                     total_bits_f += delta
                     current_bpw = next_bpw
                 break
+
+    # Hybrid dense models: the few full-attention layers carry the long-range
+    # context that the sliding or linear layers cannot. One bit above the base
+    # keeps q/k/v at one width for the fused projection kernels.
+    if always_on_rules and not is_moe and base_bits >= 3:
+        global_layers = _global_attention_layers(config)
+        for path, shape in named_shapes.items():
+            if path in boost_map or path in fixed_overrides:
+                continue
+            match = _GLOBAL_ATTENTION_RE.search(path)
+            if match is None or int(match.group(1)) not in global_layers:
+                continue
+            if _is_mtp_tensor(path) or _is_vision_tensor(path):
+                continue
+            if (
+                universal_quant_predicate(
+                    path, module, {**config, "_oq_boost_map": {}}, oq_level
+                )
+                is False
+            ):
+                continue
+            cand_bits = base_bits + 1
+            if cand_bits not in supported_bits:
+                continue
+            delta = 8 * (
+                _tensor_quantized_bytes(
+                    shape, cand_bits, _OQ_DEFAULT_GROUP_SIZE, "affine"
+                )
+                - _tensor_quantized_bytes(shape, base_bits, base_group_size, base_mode)
+            )
+            next_bpw = (total_bits_f + delta) / total_params
+            if delta <= 0 or next_bpw > hard_cap_bpw:
+                continue
+            boost_map[path] = {
+                "bits": cand_bits,
+                "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                "mode": "affine",
+            }
+            total_bits_f += delta
+            current_bpw = next_bpw
 
     # Fractional levels with a blanket Super Weights floor: mandatory expert
     # down_proj boost above base bits.
