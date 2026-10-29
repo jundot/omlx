@@ -749,6 +749,58 @@ class TestTTSStreaming:
 
 
 # ---------------------------------------------------------------------------
+# LFM3-Audio / LFM3-Omni speech on the VLM engine
+# ---------------------------------------------------------------------------
+
+
+class TestTTSLFM3Speech:
+    def test_vlm_engine_speech_serves_speech(self, server_tts_client):
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        client, mock_pool = server_tts_client
+        engine = MagicMock(spec=VLMBatchedEngine)
+        engine.speech.synthesize = AsyncMock(return_value=DUMMY_WAV)
+        mock_pool.get_engine.return_value = engine
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "lfm3", "input": "Hi", "voice": "male", "language": "ko"},
+        )
+        assert response.status_code == 200
+        kwargs = engine.speech.synthesize.call_args.kwargs
+        assert (kwargs["voice"], kwargs["language"]) == ("male", "ko")
+
+    def test_vlm_engine_without_speech_is_rejected(self, server_tts_client):
+        from omlx.engine.vlm import VLMBatchedEngine
+
+        client, mock_pool = server_tts_client
+        engine = MagicMock(spec=VLMBatchedEngine)
+        engine.speech = None
+        mock_pool.get_engine.return_value = engine
+        response = client.post("/v1/audio/speech", json={"model": "vl", "input": "Hi"})
+        assert response.status_code == 400
+
+    def test_tts_prompt_names_the_locale_and_voice(self):
+        from omlx.engine.lfm3_speech import tts_prompt
+
+        assert tts_prompt(None, None) == (
+            "Perform TTS in American English using a female voice."
+        )
+        assert tts_prompt("en-GB", "male") == (
+            "Perform TTS in British English using a male voice."
+        )
+        assert tts_prompt("ko", "Female") == (
+            "Perform TTS in Korean using a female voice."
+        )
+        assert tts_prompt("japanese", None) == (
+            "Perform TTS in Japanese using a female voice."
+        )
+        with pytest.raises(ValueError, match="voice"):
+            tts_prompt("en", "alloy")
+        with pytest.raises(ValueError, match="language"):
+            tts_prompt("xx", None)
+
+
+# ---------------------------------------------------------------------------
 # TestTTSModelAliasResolution
 # ---------------------------------------------------------------------------
 

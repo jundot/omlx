@@ -81,6 +81,7 @@ from .base import (
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
+from .lfm3_speech import SPEECH_MODEL_TYPES, LFM3Speech
 
 logger = logging.getLogger(__name__)
 
@@ -1748,6 +1749,13 @@ class VLMBatchedEngine(BaseEngine):
             if hasattr(config, "model_type"):
                 return config.model_type
         return None
+
+    @property
+    def speech(self) -> LFM3Speech | None:
+        """ASR, TTS and spoken replies of a loaded LFM3-Audio or LFM3-Omni model."""
+        if self.model_type not in SPEECH_MODEL_TYPES:
+            return None
+        return LFM3Speech(self)
 
     @property
     def message_extractor(self):

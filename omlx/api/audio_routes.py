@@ -33,6 +33,8 @@ from fastapi import (
 from fastapi.responses import Response, StreamingResponse
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
+from ..engine.lfm3_speech import SPEECH_MODEL_TYPES, VOICES
+from ..engine.vlm import VLMBatchedEngine
 from ..server_metrics import get_server_metrics
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
@@ -531,6 +533,8 @@ async def create_transcription(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     if not isinstance(engine, STTEngine):
+        engine = _lfm3_speech(engine)
+    if engine is None:
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a speech-to-text model",
@@ -615,6 +619,11 @@ async def create_transcription(
         duration=result.get("duration"),
         segments=segments,
     )
+
+
+def _lfm3_speech(engine):
+    """Return the speech service of an LFM3-Audio or LFM3-Omni engine, or None."""
+    return engine.speech if isinstance(engine, VLMBatchedEngine) else None
 
 
 def _verify_ws_api_key(websocket: WebSocket, api_key: Optional[str]) -> bool:
@@ -831,7 +840,9 @@ async def list_model_voices(model: Optional[str] = None):
             config = {}
         talker = config.get("talker_config") or {}
         spk = talker.get("spk_id") or config.get("spk_id") or {}
-        if isinstance(spk, dict):
+        if config.get("model_type") in SPEECH_MODEL_TYPES:
+            voices = list(VOICES)
+        elif isinstance(spk, dict):
             voices = sorted(spk.keys())
     return {"model": resolved, "voices": voices}
 
@@ -900,6 +911,8 @@ async def create_speech(request: AudioSpeechRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     if not isinstance(engine, TTSEngine):
+        engine = _lfm3_speech(engine)
+    if engine is None:
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a text-to-speech model",
@@ -998,6 +1011,8 @@ async def process_audio(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     if not isinstance(engine, STSEngine):
+        engine = _lfm3_speech(engine)
+    if engine is None:
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a speech-to-speech / audio processing model",
