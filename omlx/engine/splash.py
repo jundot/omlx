@@ -1086,7 +1086,8 @@ def _free_port() -> int:
 
 
 def _signal_group(group: int, sig: int) -> None:
-    with contextlib.suppress(ProcessLookupError):  # the group already exited
+    # The group already exited, or macOS reports EPERM as it holds only zombies.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(group, sig)
 
 
@@ -1099,13 +1100,21 @@ def _group_alive(group: int) -> bool:
     return True
 
 
-async def _wait_group_exit(group: int, timeout: float) -> bool:
-    """Whether every process in ``group`` exited within ``timeout``."""
+async def _wait_group_exit(
+    group: int, timeout: float, resend: int | None = None
+) -> bool:
+    """Whether every process in ``group`` exited within ``timeout``.
+
+    ``resend`` goes to the group again on each poll: a process forked while
+    the first signal was in flight never got it.
+    """
     deadline = time.monotonic() + timeout
     while _group_alive(group):
         if time.monotonic() >= deadline:
             return False
         await asyncio.sleep(STOP_POLL_SECONDS)
+        if resend is not None:
+            _signal_group(group, resend)
     return True
 
 
@@ -1451,10 +1460,13 @@ class SplashEngine(BaseEngine):
             return
         # The watchdog leads Splash's process group and exits on the signal
         # at once, so wait for the whole group: unloading is the memory
-        # barrier the pool relies on.
+        # barrier the pool relies on. Splash ignores SIGTERM while it stops,
+        # so the repeats only end processes that missed the first one.
         group = process.pid
         _signal_group(group, signal.SIGTERM)
-        if not await _wait_group_exit(group, STOP_TIMEOUT_SECONDS):
+        if not await _wait_group_exit(
+            group, STOP_TIMEOUT_SECONDS, resend=signal.SIGTERM
+        ):
             logger.warning("Splash: server ignored SIGTERM; killing it")
             _signal_group(group, signal.SIGKILL)
             await _wait_group_exit(group, STOP_TIMEOUT_SECONDS)

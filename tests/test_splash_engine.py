@@ -2,6 +2,7 @@
 """Tests for the Splash external engine and its pool, settings and API wiring."""
 
 import asyncio
+import contextlib
 import copy
 import fcntl
 import json
@@ -1430,6 +1431,41 @@ class TestLifecycle:
         await engine.stop()
 
         assert not _group_alive(group)
+
+    async def test_stop_signals_a_process_that_missed_the_first_sigterm(
+        self, tmp_path, caplog
+    ):
+        # Stands in for a process the watchdog forks while SIGTERM is in
+        # flight: the first signal never reaches it, a second one ends it.
+        ready = tmp_path / "ready"
+        late = [
+            sys.executable,
+            "-c",
+            "import pathlib, signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, lambda *_: signal.signal(signal.SIGTERM, signal.SIG_DFL))\n"
+            "pathlib.Path(sys.argv[1]).touch()\n"
+            "while True: time.sleep(0.1)",
+            str(ready),
+        ]
+        engine = _engine(tmp_path)
+        engine._process = subprocess.Popen(
+            splash_mod._watchdog_command(late), start_new_session=True
+        )
+        group = engine._process.pid
+        try:
+            for _ in range(100):
+                if ready.exists():
+                    break
+                await asyncio.sleep(0.1)
+            assert ready.exists()
+
+            await asyncio.wait_for(engine.stop(), timeout=10)
+        finally:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(group, signal.SIGKILL)
+
+        assert not _group_alive(group)
+        assert "ignored SIGTERM" not in caplog.text
 
     async def test_dead_splash_is_reported_and_not_relaunched(self, tmp_path):
         engine = _engine(tmp_path)
