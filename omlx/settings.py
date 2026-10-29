@@ -952,6 +952,64 @@ class ClaudeCodeSettings:
         )
 
 
+def _clean_say_voices(raw: Any) -> dict[str, str]:
+    """Shape-check the persisted per-language macOS voice map: locale ->
+    voice identifier. Anything that is not a non-empty string pair is
+    dropped, and locales keep one spelling (BCP-47: 'cs_CZ' -> 'cs-CZ').
+
+    Normalised here rather than through omlx.utils: that package pulls the
+    tokenizer and hardware probes in, and settings load long before either
+    is needed."""
+    out: dict[str, str] = {}
+    if not isinstance(raw, dict):
+        return out
+    for locale, voice in raw.items():
+        key = str(locale or "").strip().replace("_", "-")
+        if not key or not isinstance(voice, str) or not voice.strip():
+            continue
+        out[key] = voice.strip()
+    return out
+
+
+# What model='say' does with text past OpenAI's input limit. Same two strings
+# as omlx.utils.macos_say.LONG_INPUT_*; repeated because settings must not
+# import omlx.utils (it pulls the tokenizer and hardware probes in).
+_SAY_LONG_INPUTS = ("speak", "reject")
+
+
+def _clean_say_long_input(raw: Any) -> str:
+    """Long-input policy for the macOS speech engine; anything unknown
+    means the default, which speaks the whole utterance."""
+    value = str(raw or "").strip().lower()
+    return value if value in _SAY_LONG_INPUTS else _SAY_LONG_INPUTS[0]
+
+
+# Segment size for the same engine. Bounds repeated from
+# omlx.utils.macos_say (DEFAULT_CHUNK_CHARS and friends) for the same reason
+# as the policies above. The audio ceiling is deliberately NOT a card
+# setting: the default is about ninety minutes of speech, past any reply a
+# chat produces, and the one knob is the OMLX_SAY_MAX_AUDIO_MB environment
+# variable (see macos_say.max_audio_mb).
+_SAY_CHUNK_DEFAULT = 1200
+_SAY_CHUNK_MIN = 200
+_SAY_CHUNK_MAX = 20000
+
+
+def _clean_say_chunk_chars(raw: Any) -> int:
+    """Characters per `say` call. 0 means 'never split, one call whatever the
+    length'; anything under the floor is raised, because each extra call costs
+    about 0.9 s of setup and a 20-character chunk would only be slow."""
+    if raw is None:
+        return _SAY_CHUNK_DEFAULT
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return _SAY_CHUNK_DEFAULT
+    if value <= 0:
+        return 0
+    return max(_SAY_CHUNK_MIN, min(_SAY_CHUNK_MAX, value))
+
+
 @dataclass
 class IntegrationSettings:
     """Other integrations settings."""
@@ -979,6 +1037,25 @@ class IntegrationSettings:
     web_search_content_mode: str = "snippet"  # "snippet" | "full"
     web_search_content_truncate: bool = True
     web_search_content_max_chars: int = 20000
+    # macOS speech: the system `say` engine (omlx/utils/macos_say.py) serves
+    # POST /v1/audio/speech for model='say' - no model, no GPU. Enabled by
+    # default; off macOS the engine is not available and the setting is inert.
+    say_enabled: bool = True
+    # Per-language voice choice: BCP-47 locale -> voice identifier, as
+    # offered by Settings > Integrations > macOS Speech. A language that is
+    # absent here is left to macOS: the owner's Spoken Content pick for it,
+    # else the system default.
+    say_voices: dict[str, str] = field(default_factory=dict)
+    # Text past OpenAI's 4096 character input limit: "speak" says the whole
+    # utterance (one `say` call renders it in seconds), "reject" answers 400
+    # exactly like OpenAI does.
+    say_long_input: str = "speak"
+    # A reply past one segment is rendered in sentence-sized pieces and
+    # stitched into one file, so memory tracks the longest segment, not the
+    # longest answer. The engine's audio ceiling is fixed and not stored
+    # here: it refuses a runaway render, it is not a size plan an operator
+    # tunes.
+    say_chunk_chars: int = _SAY_CHUNK_DEFAULT
     # External engines: Splash (omlx/engine/splash.py). An empty path means
     # oMLX looks for an installed launcher itself.
     splash_path: str | None = None
@@ -1012,6 +1089,10 @@ class IntegrationSettings:
             "web_search_content_mode": self.web_search_content_mode,
             "web_search_content_truncate": self.web_search_content_truncate,
             "web_search_content_max_chars": self.web_search_content_max_chars,
+            "say_enabled": self.say_enabled,
+            "say_voices": dict(self.say_voices),
+            "say_long_input": self.say_long_input,
+            "say_chunk_chars": self.say_chunk_chars,
             "splash_path": self.splash_path,
             "splash_kv_format": self.splash_kv_format,
             "splash_max_memory_gb": self.splash_max_memory_gb,
@@ -1053,6 +1134,10 @@ class IntegrationSettings:
             web_search_content_max_chars=data.get(
                 "web_search_content_max_chars", 20000
             ),
+            say_enabled=bool(data.get("say_enabled", True)),
+            say_voices=_clean_say_voices(data.get("say_voices")),
+            say_long_input=_clean_say_long_input(data.get("say_long_input")),
+            say_chunk_chars=_clean_say_chunk_chars(data.get("say_chunk_chars")),
             splash_path=data.get("splash_path") or None,
             splash_kv_format=data.get("splash_kv_format", "int8"),
             splash_max_memory_gb=data.get("splash_max_memory_gb"),
