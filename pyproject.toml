@@ -109,11 +109,11 @@ dependencies = [
     "openai-harmony",
     # Cohere Command/Cohere2 output parser for reasoning and tool calls
     "cohere_melody>=0.9.0",
-    # mlx-vlm from commit 4319ef2 (v0.7.10). oMLX model implementations remain registered
+    # mlx-vlm from commit 138d761 (v0.7.11). oMLX model implementations remain registered
     # by their pre-load patches.
-    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@4319ef2c837b7226b758c3dd69edda51b7079785",
-    # mlx-vlm requires mlx-audio>=0.5.2 in the shared runtime.
-    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
+    "mlx-vlm @ git+https://github.com/Blaizzy/mlx-vlm@138d7617d39653b39a5cbc379b1b5907a4481d67",
+    # mlx-vlm requires mlx-audio>=0.6.2 in the shared runtime.
+    "mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@8c244a1faff44cfa69e3151c195f52a4c1c90be5",
     "Pillow>=9.0.0",
     "markitdown[pdf,docx,pptx]==0.1.9",
 ]
@@ -142,8 +142,8 @@ modelscope = [
     "modelscope>=1.28.0",
 ]
 audio = [
-    # mlx-audio from commit (94c7716, v0.5.7) with tts/stt/sts extras
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@94c7716212b2228f178d2f9c7619a591fd1b0b78",
+    # mlx-audio from commit (8c244a1, v0.6.3) with tts/stt/sts extras
+    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@8c244a1faff44cfa69e3151c195f52a4c1c90be5",
     # Keep dependencies for existing audio models removed from upstream extras.
     "espeakng-loader>=0.2.4",
     "librosa==0.11.0",

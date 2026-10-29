@@ -226,6 +226,34 @@ class TestSSDCache:
         assert mx.allclose(result, features, atol=1e-5)
         cache2.close()
 
+    def test_numerics_revision_isolates_ssd_features(self, tmp_cache_dir):
+        features = mx.ones((4, 8))
+        mx.eval(features)
+
+        def store(numerics):
+            cache = VisionFeatureSSDCache(
+                cache_dir=tmp_cache_dir, max_memory_entries=3, numerics=numerics
+            )
+            cache.put("img_hash", "model_a", features)
+            assert _wait_until(lambda: not cache._pending_write_keys)
+            cache.close()
+
+        def lookup(numerics):
+            cache = VisionFeatureSSDCache(
+                cache_dir=tmp_cache_dir, max_memory_entries=3, numerics=numerics
+            )
+            result = cache.get("img_hash", "model_a")
+            cache.close()
+            return result
+
+        store(None)
+        # Features from before a vision-tower change are not reused...
+        assert lookup("rev-1") is None
+        store("rev-1")
+        # ...and the new revision survives a restart scan.
+        assert lookup("rev-1") is not None
+        assert lookup(None) is not None
+
     def test_ssd_eviction(self, tmp_cache_dir):
         # Very small max_size to trigger eviction
         cache = VisionFeatureSSDCache(

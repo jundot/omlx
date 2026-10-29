@@ -46,6 +46,7 @@ from ..api.utils import (
     detect_and_strip_partial,
     remove_special_tokens_preserve_whitespace,
 )
+from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
@@ -2333,6 +2334,7 @@ class VLMBatchedEngine(BaseEngine):
                 # Agent sessions resend 20-90 screenshots; bound by bytes.
                 max_memory_entries=4096,
                 max_memory_bytes=1024**3,
+                numerics=numerics_revision_for_model(self._vlm_model),
             )
             logger.info(
                 "Vision feature cache enabled (SSD: %s)",

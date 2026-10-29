@@ -312,8 +312,9 @@ UNSUPPORTED_ARCHITECTURES: set[str] = set()
 # Some base LLM model_types (qwen3, llama, …) collide with mlx-audio TTS
 # model directory names because mlx-audio extends these architectures for
 # audio.  We exclude them so a plain Qwen3 LLM is not misdetected as TTS.
+# mlx-audio maps "mimo" to its MiMo ASR model; MiMo-7B LLMs use that type too.
 
-_LLM_TYPE_COLLISIONS = {"qwen3", "llama", "dense"}
+_LLM_TYPE_COLLISIONS = {"qwen3", "llama", "dense", "mimo"}
 
 
 def _build_audio_detection_sets():

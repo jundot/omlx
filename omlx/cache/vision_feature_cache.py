@@ -81,6 +81,8 @@ class VisionFeatureSSDCache:
         max_size_bytes: Maximum SSD cache size in bytes (default 10GB).
         max_memory_entries: Maximum in-memory LRU entries (default 20).
         max_memory_bytes: Maximum in-memory LRU size in bytes (default 1GB).
+        numerics: The model's numerics revision. Features stored under another
+            revision never match.
     """
 
     def __init__(
@@ -89,8 +91,10 @@ class VisionFeatureSSDCache:
         max_size_bytes: int = 10 * 1024**3,
         max_memory_entries: int = 20,
         max_memory_bytes: int = 1024**3,
+        numerics: Optional[str] = None,
     ):
         self._cache_dir = cache_dir
+        self._numerics = numerics
         self._max_size_bytes = max_size_bytes
         self._max_memory_entries = max_memory_entries
         self._max_memory_bytes = max_memory_bytes
@@ -146,6 +150,7 @@ class VisionFeatureSSDCache:
         Returns:
             Cached mx.array features, or None on miss.
         """
+        model_name = self._model_key(model_name)
         key = _composite_key(model_name, image_hash)
 
         # Check memory LRU
@@ -191,6 +196,7 @@ class VisionFeatureSSDCache:
             features: Evaluated mx.array (or list of mx.array for multi-image).
             grid: Optional per-image patch grid ``[t, h, w]``.
         """
+        model_name = self._model_key(model_name)
         key = _composite_key(model_name, image_hash)
 
         # Store in memory LRU
@@ -207,7 +213,7 @@ class VisionFeatureSSDCache:
 
     def get_grid(self, image_hash: str, model_name: str) -> Optional[List[int]]:
         """Return the cached patch grid ``[t, h, w]``, or None if not stored."""
-        key = _composite_key(model_name, image_hash)
+        key = _composite_key(self._model_key(model_name), image_hash)
         with self._memory_lock:
             grid = self._memory_grid.get(key)
         if grid is not None:
@@ -217,6 +223,12 @@ class VisionFeatureSSDCache:
                 entry = self._ssd_index.get(key)
                 return entry.grid if entry is not None else None
         return None
+
+    def _model_key(self, model_name: str) -> str:
+        # Stored in SSD metadata too, so the revision survives a restart scan.
+        if self._numerics is None:
+            return model_name
+        return f"{model_name}#numerics={self._numerics}"
 
     def close(self) -> None:
         """Shut down the background writer and flush pending writes."""

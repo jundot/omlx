@@ -360,6 +360,13 @@ _NUMERICS_REVISIONS = {
     # mlx-lm's Muse Spark keeps the residual stream in FP32; oMLX's own model
     # served Muse Spark before and kept it in BF16.
     "mlx_lm.models.muse_spark": "upstream-1",
+    # mlx-vlm 138d761 changes the DeepSeek-OCR SAM and CLIP encoders (also
+    # used by DeepSeek-OCR 2 and Unlimited-OCR), the MiniCPM-V 4.6/4.7 vision
+    # tower, and per-expert NVFP4 MoE matmuls (gather_qmm global_scale).
+    "mlx_vlm.models.deepseekocr.sam": "mlx-vlm-138d761",
+    "mlx_vlm.models.deepseekocr.vision": "mlx-vlm-138d761",
+    "mlx_vlm.models.minicpmv4_6.vision": "mlx-vlm-138d761",
+    "mlx_vlm.quantization.nvfp4": "mlx-vlm-138d761",
 }
 
 
