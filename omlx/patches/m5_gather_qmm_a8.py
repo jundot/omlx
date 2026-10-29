@@ -313,6 +313,11 @@ METAL_FUNC void omlx_a8_gather_nax(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+  // A row simdgroup past the tile's rows has nothing to store; no barrier
+  // follows the staging.
+  if (row_base >= tile_rows) {
+    return;
+  }
   // Local-row base of this lane's columns in the staged tile.
   const int lr0 = (kPair ? sg_n * kA8FragM : sg_n * kA8FragN) + int(coord.x);
   const int lr_h = kPair ? 32 : kA8FragM;
