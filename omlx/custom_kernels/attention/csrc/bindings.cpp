@@ -6,6 +6,7 @@
 #include "block_mask_attention.h"
 #include "compressed_sparse_attention.h"
 #include "fa256_attention.h"
+#include "kv_roll.h"
 #include "packed_sparse_attention.h"
 #include "sdpa_decode.h"
 #include "sparse_gqa_attention.h"
@@ -29,6 +30,15 @@ NB_MODULE(_ext, m) {
         return static_cast<int64_t>(a.size());
       },
       "a"_a);
+  m.def(
+      "roll_rows",
+      &omlx::attention::roll_rows,
+      "x"_a,
+      "shifts"_a,
+      "axis"_a,
+      "length"_a,
+      "max_shift"_a,
+      "stream"_a = nb::none());
   m.def(
       "sparse_gqa_attention",
       &omlx::attention::sparse_gqa_attention,

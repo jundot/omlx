@@ -180,6 +180,27 @@ def sparse_gqa_attention(
     )
 
 
+def roll_rows(
+    x: mx.array,
+    shifts: mx.array,
+    axis: int,
+    length: int,
+    max_shift: int,
+    *,
+    stream=None,
+) -> mx.array:
+    if _ext is None or not hasattr(_ext, "roll_rows"):
+        raise RuntimeError("roll_rows native kernel is unavailable")
+    return _ext.roll_rows(
+        x,
+        shifts,
+        axis,
+        length,
+        max_shift,
+        **_native_stream_kwargs(stream),
+    )
+
+
 def rowwise_gemm(
     lhs: mx.array,
     rhs: mx.array,

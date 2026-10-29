@@ -994,16 +994,25 @@ class BatchQSAKVCache:
         # place relative to its first real token, so the bank stays. Only the
         # logical prefix rolls; a capacity buffer keeps its width.
         length = int(self.index_keys.shape[1])
+        max_shift = max(right_padding.tolist())
         self._index_keys = _roll_logical_prefix(
-            self._index_keys, right_padding, length, axis=1
+            self._index_keys, right_padding, length, axis=1, max_shift=max_shift
         )
         if self._index_position_ids.ndim == 3:
             self._index_position_ids = _roll_logical_prefix(
-                self._index_position_ids, right_padding[None], length, axis=2
+                self._index_position_ids,
+                right_padding[None],
+                length,
+                axis=2,
+                max_shift=max_shift,
             )
         else:
             self._index_position_ids = _roll_logical_prefix(
-                self._index_position_ids, right_padding, length, axis=1
+                self._index_position_ids,
+                right_padding,
+                length,
+                axis=1,
+                max_shift=max_shift,
             )
 
     def make_mask(self, *args, **kwargs):
@@ -1012,7 +1021,7 @@ class BatchQSAKVCache:
     def filter(self, batch_indices):
         width_before = self.kv_cache._idx
         self.kv_cache.filter(batch_indices)
-        # The KV bank drops the common left padding only when it compacts.
+        # The KV bank drops the common left padding in place or by compacting.
         min_left = width_before - self.kv_cache._idx
         if self.index_keys is None:
             return

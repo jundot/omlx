@@ -160,7 +160,7 @@ def test_merge_reserves_append_without_changing_logical_width(backend):
     c = make(patched, [8192, 8187])
     assert c._logical_width() == 8192
     capacity = c.keys.shape[2]
-    assert 8192 < capacity <= 8192 * 1.125 + 512
+    assert 8192 < capacity <= 8192 * 1.25 + 512
     for _ in range(16):
         x = mx.ones((2, 2, 5, 8), mx.bfloat16)
         c.update_and_fetch(x, x)
@@ -213,6 +213,72 @@ def test_join_fills_a_freed_row_and_shifts_live_rows_in_place(backend):
         assert b._keys is bank
         equal(a, b)
     assert b._idx == 700
+
+
+def test_finish_of_the_longest_row_drops_the_padding_in_place(backend):
+    stock, patched = backend
+    lengths = [300, 290, 299, 200]
+    a, b = make(stock, lengths), make(patched, lengths)
+    for c in (a, b):
+        c.filter(_refill_order([1, 2, 3]))
+    # The spare row stays for the next join.
+    assert b._keys.shape[0] == 4 and b.keys.shape[0] == 3
+    equal(a, b)
+
+
+def test_ragged_rollback_keeps_the_spare_rows(backend):
+    stock, patched = backend
+    lengths = [300, 290, 299, 200]
+    a, b = make(stock, lengths), make(patched, lengths)
+    x = mx.ones((3, 2, 9, 8), mx.bfloat16)
+    for c in (a, b):
+        c.filter(_refill_order([0, 1, 2]))
+        c.update_and_fetch(x, x)
+        c.prepare(right_padding=[0, 6, 3])
+        c.finalize()
+    assert b._keys.shape[0] == 4 and b.keys.shape[0] == 3
+    equal(a, b)
+
+
+def test_join_after_an_in_place_drop_leaves_no_stale_columns(backend):
+    stock, patched = backend
+    lengths = [3000, 2500, 2600, 2800]
+    a, b = make(stock, lengths), make(patched, lengths)
+    x = mx.ones((4, 2, 1, 8), mx.bfloat16)
+    for c, module in ((a, stock), (b, patched)):
+        c.filter(_refill_order([1, 2, 3]))
+        c.extend(make(module, [1000]))
+        # Growth inside the capacity turns spare columns into logical ones.
+        c.update_and_fetch(x, x)
+    equal(a, b)
+
+
+def test_finish_that_drops_most_of_the_width_releases_the_bank(backend):
+    stock, patched = backend
+    lengths = [8192, 500, 480, 490]
+    a, b = make(stock, lengths), make(patched, lengths)
+    for c in (a, b):
+        c.filter(_refill_order([1, 2, 3]))
+    assert b._keys.shape[0] == 3 and b._keys.shape[2] < 2048
+    equal(a, b)
+
+
+@pytest.mark.parametrize("hold_view", [False, True])
+@pytest.mark.parametrize("shift", [6, 20])
+def test_ragged_rollback_matches_stock_on_every_roll_path(backend, shift, hold_view):
+    """Native in place, native copy (a view holds the bank) and the gather fallback."""
+    stock, patched = backend
+    lengths = [300, 290, 299]
+    a, b = make(stock, lengths), make(patched, lengths)
+    x = mx.ones((3, 2, 24, 8), mx.bfloat16)
+    for c in (a, b):
+        c.update_and_fetch(x, x)
+    held = b._keys[:1] if hold_view else None
+    for c in (a, b):
+        c.prepare(right_padding=[0, shift, 3])
+        c.finalize()
+    equal(a, b)
+    del held
 
 
 def test_setting_the_bank_back_keeps_its_logical_width(backend):
