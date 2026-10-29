@@ -3576,7 +3576,7 @@ class ToolCallStreamFilter:
         if not self.active:
             return text
 
-        # Prose fast path: no marker can begin, so skip the ~35 us scan below.
+        # Prose fast path: no marker can begin, so skip the ~24 us scan below.
         if (
             not self._buffer
             and not self._after_naked_function
