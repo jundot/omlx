@@ -2710,6 +2710,16 @@ class ToolCallStreamFilter:
         )
         self._after_naked_function = False
         self._buffer = ""
+        # First character of every marker family, incl. custom pairs.
+        markers = [
+            "<",
+            *self._suppress_after_markers,
+            *self._orphan_close_markers,
+            *self._stray_close_markers,
+            *self._bracket_prefixes,
+            *(pair[0] for pair in self._marker_pairs),
+        ]
+        self._marker_trigger_chars = frozenset(m[0] for m in markers if m)
         self._suppressing_until: Optional[str] = None
         self._suppressing = False
         self._pending_envelope_parts: List[str] = []
@@ -3565,6 +3575,16 @@ class ToolCallStreamFilter:
             return ""
         if not self.active:
             return text
+
+        # Prose fast path: no marker can begin, so skip the ~35 us scan below.
+        if (
+            not self._buffer
+            and not self._after_naked_function
+            and self._suppressing_until is None
+            and self._marker_trigger_chars.isdisjoint(text)
+        ):
+            self._record_content(out := [], text)
+            return out[0]
 
         self._buffer += text
         out: List[str] = []
