@@ -1,7 +1,9 @@
 // Multi-line prompt field for the Ask AI panel. An NSTextView instead of a
-// SwiftUI TextEditor, so Command-Return can commit an in-progress IME
-// composition (Korean, Japanese, Chinese) before the text is sent, and the
+// SwiftUI TextEditor, so the field can commit an in-progress IME composition
+// (Korean, Japanese, Chinese) before Return or Command-Return acts, and the
 // panel can take Return, Tab, arrows, and Escape while suggestions are open.
+// Which Return sends is a preference (`sendOnEnter`); the other inserts a
+// newline.
 
 import AppKit
 import SwiftUI
@@ -34,6 +36,8 @@ struct AskAIInputView: NSViewRepresentable {
     @Binding var text: String
     @Binding var height: CGFloat
     let suggestionsVisible: Bool
+    /// Return submits and Command-Return inserts a newline. Off swaps them.
+    let sendOnEnter: Bool
     let focus: AskAIInputFocus
     let onCommand: (AskAIInputCommand) -> Void
     /// Returns true when the paste was taken as image attachments.
@@ -123,8 +127,21 @@ struct AskAIInputView: NSViewRepresentable {
             case #selector(NSResponder.cancelOperation(_:)):
                 parent.onCommand(.escape)
                 return true
-            case #selector(NSResponder.insertNewline(_:)) where suggestions,
-                 #selector(NSResponder.insertTab(_:)) where suggestions:
+            case #selector(NSResponder.insertNewline(_:)):
+                if suggestions {
+                    parent.onCommand(.acceptSuggestion)
+                    return true
+                }
+                guard parent.sendOnEnter else { return false }
+                // A live IME composition owns Return; commit it, don't send.
+                if textView.hasMarkedText() {
+                    textView.unmarkText()
+                    parent.text = textView.string
+                    return true
+                }
+                parent.onCommand(.submit)
+                return true
+            case #selector(NSResponder.insertTab(_:)) where suggestions:
                 parent.onCommand(.acceptSuggestion)
                 return true
             case #selector(NSResponder.moveUp(_:)) where suggestions:
@@ -145,10 +162,15 @@ struct AskAIInputView: NSViewRepresentable {
             let isReturn = event.keyCode == 36 || event.keyCode == 76
             switch (flags, key) {
             case (.command, _) where isReturn:
-                // Commit the IME composition so the send includes it.
+                // Commit the IME composition so the action includes it.
                 if textView.hasMarkedText() {
                     textView.unmarkText()
                     parent.text = textView.string
+                }
+                if parent.sendOnEnter {
+                    // Enter sends, so Command-Return takes the newline.
+                    textView.insertText("\n", replacementRange: textView.selectedRange())
+                    return true
                 }
                 parent.onCommand(.submit)
                 return true

@@ -104,6 +104,7 @@ final class AskAITests: XCTestCase {
         XCTAssertEqual(prefs.presets.first?.command, "tldr")
         XCTAssertEqual(prefs.presets.first?.allowThinking, false)
         XCTAssertFalse(prefs.gpuPowerLimitEnabled)
+        XCTAssertTrue(prefs.sendOnEnter)
         XCTAssertNil(prefs.requestGPUPowerLimit)
     }
 
@@ -120,14 +121,16 @@ final class AskAITests: XCTestCase {
     func testPrefsDecodeKeepsGoodFieldsWhenOthersAreMalformed() throws {
         let json = #"""
         {"enabled":true,"hotKey":{"keyCode":49},"panelPosition":"left","gpuPowerLimitWatts":"ten",
+         "sendOnEnter":false,
          "presets":[{"id":"not-a-uuid","command":"tldr","model":"qwen"},{"command":7},
-                    {"command":"번역","model":"gemma"}]}
+                   {"command":"번역","model":"gemma"}]}
         """#
         let prefs = try JSONDecoder().decode(AskAIPrefs.self, from: Data(json.utf8))
         XCTAssertTrue(prefs.enabled)
         XCTAssertEqual(prefs.hotKey, .optionSpace)
         XCTAssertNil(prefs.panelPosition)
         XCTAssertEqual(prefs.gpuPowerLimitWatts, 10)
+        XCTAssertFalse(prefs.sendOnEnter)
         XCTAssertEqual(prefs.presets.map(\.command), ["tldr", "", "번역"])
     }
 

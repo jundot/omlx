@@ -32967,6 +32967,54 @@
         }
       }
     },
+    "askai.hint.idle.enter" : {
+      "comment" : "Key hints in the Ask AI footer before the first question when Enter sends",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↩ Send   ⌘↩ Newline   Esc Close"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↩ Отправить   ⌘↩ Перенос   Esc Закрыть"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↩ 发送   ⌘↩ 换行   Esc 关闭"
+          }
+        }
+      }
+    },
+    "askai.hint.conversation.enter" : {
+      "comment" : "Key hints in the Ask AI footer after an answer when Enter sends",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↩ Follow up   ⌘↩ Newline   ⌘N New   ⇧⌘C Copy"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↩ Уточнить   ⌘↩ Перенос   ⌘N Новый   ⇧⌘C Копировать"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↩ 追问   ⌘↩ 换行   ⌘N 新对话   ⇧⌘C 复制"
+          }
+        }
+      }
+    },
     "askai.turn.stopped" : {
       "comment" : "Marker under an Ask AI answer that was stopped early",
       "extractionState" : "manual",
@@ -33467,6 +33515,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "2 分钟"
+          }
+        }
+      }
+    },
+    "askai.row.send_on_enter" : {
+      "comment" : "Row label for the Ask AI Enter-to-send switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Send on Enter"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отправка по Enter"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "回车发送"
+          }
+        }
+      }
+    },
+    "askai.row.send_on_enter.sub" : {
+      "comment" : "Sublabel for the Ask AI Enter-to-send switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter sends the question and ⌘↩ adds a new line. Turn off to swap them."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter отправляет вопрос, ⌘↩ добавляет новую строку. Выключите, чтобы поменять их местами."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "回车发送问题，⌘↩ 换行。关闭后两者互换。"
           }
         }
       }

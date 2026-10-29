@@ -131,6 +131,16 @@ private struct GeneralSection: View {
                     }
                 }
                 Row(
+                    label: String(localized: "askai.row.send_on_enter",
+                                  defaultValue: "Send on Enter",
+                                  comment: "Row label for the Ask AI Enter-to-send switch"),
+                    sublabel: String(localized: "askai.row.send_on_enter.sub",
+                                     defaultValue: "Enter sends the question and ⌘↩ adds a new line. Turn off to swap them.",
+                                     comment: "Sublabel for the Ask AI Enter-to-send switch")
+                ) {
+                    RowSwitch(isOn: $store.prefs.sendOnEnter)
+                }
+                Row(
                     label: String(localized: "askai.row.new_conversation",
                                   defaultValue: "Start New Conversation After",
                                   comment: "Row label for the idle time that resets the Ask AI conversation"),

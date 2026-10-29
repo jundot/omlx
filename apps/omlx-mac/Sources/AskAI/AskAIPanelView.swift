@@ -115,6 +115,7 @@ struct AskAIPanelView: View {
                     text: $controller.draft,
                     height: $inputHeight,
                     suggestionsVisible: suggestionsVisible,
+                    sendOnEnter: controller.store.prefs.sendOnEnter,
                     focus: controller.inputFocus,
                     onCommand: controller.handle,
                     onPasteImages: controller.attachImages
@@ -238,6 +239,16 @@ struct AskAIPanelView: View {
         if conversation.isStreaming {
             return String(localized: "askai.hint.streaming", defaultValue: "Esc Stop",
                           comment: "Key hint in the Ask AI footer while an answer streams")
+        }
+        if controller.store.prefs.sendOnEnter {
+            if conversation.isEmpty {
+                return String(localized: "askai.hint.idle.enter",
+                              defaultValue: "↩ Send   ⌘↩ Newline   Esc Close",
+                              comment: "Key hints in the Ask AI footer before the first question when Enter sends")
+            }
+            return String(localized: "askai.hint.conversation.enter",
+                          defaultValue: "↩ Follow up   ⌘↩ Newline   ⌘N New   ⇧⌘C Copy",
+                          comment: "Key hints in the Ask AI footer after an answer when Enter sends")
         }
         if conversation.isEmpty {
             return String(localized: "askai.hint.idle", defaultValue: "⌘↩ Send   Esc Close",

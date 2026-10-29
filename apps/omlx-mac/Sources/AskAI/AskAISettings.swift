@@ -86,6 +86,9 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
     /// lower of this and the model's own limit.
     var gpuPowerLimitEnabled = false
     var gpuPowerLimitWatts = 10
+    /// Return sends the prompt and Command-Return inserts a newline.
+    /// Off swaps them so Command-Return sends.
+    var sendOnEnter = true
 
     init() {}
 
@@ -107,6 +110,7 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
         panelWidth = c.lenient(Double.self, .panelWidth) ?? fallback.panelWidth
         gpuPowerLimitEnabled = c.lenient(Bool.self, .gpuPowerLimitEnabled) ?? fallback.gpuPowerLimitEnabled
         gpuPowerLimitWatts = c.lenient(Int.self, .gpuPowerLimitWatts) ?? fallback.gpuPowerLimitWatts
+        sendOnEnter = c.lenient(Bool.self, .sendOnEnter) ?? fallback.sendOnEnter
     }
 
     /// The `gpu_power_limit_w` to send, clamped to what the server accepts.
