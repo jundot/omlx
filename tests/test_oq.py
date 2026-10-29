@@ -1461,6 +1461,41 @@ class TestStreamingHelpers:
             assert plan.boost_map[f"model.layers.7.self_attn.{proj}"]["bits"] == 4
         assert "model.layers.2.self_attn.q_proj" not in plan.boost_map
 
+    @pytest.mark.parametrize("level,target,cap", [(3, 3.6, 3.8), (4, 4.7, 4.8)])
+    def test_mtp_head_does_not_move_the_backbone_plan(self, level, target, cap):
+        backbone = {"lm_head": (2048, 1024)}
+        for i in range(8):
+            for proj in ("q_proj", "o_proj"):
+                backbone[f"model.layers.{i}.self_attn.{proj}"] = (1024, 1024)
+            backbone[f"model.layers.{i}.mlp.down_proj"] = (1024, 4096)
+        head = {
+            "mtp.fc": (1024, 2048),
+            "mtp.layers.0.self_attn.q_proj": (1024, 1024),
+            "mtp.layers.0.mlp.down_proj": (1024, 4096),
+        }
+        config = {
+            "num_hidden_layers": 8,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {str(i): 1.0 - i / 8 for i in range(8)},
+        }
+        def bits(plan, path):
+            return plan.boost_map.get(path, {"bits": level})["bits"]
+
+        plain = _build_quant_plan(
+            backbone, config, level, target_bpw=target, hard_cap_bpw=cap
+        )
+        with_head = _build_quant_plan(
+            {**backbone, **head}, config, level, target_bpw=target, hard_cap_bpw=cap
+        )
+
+        assert {p: bits(with_head, p) for p in backbone} == {
+            p: bits(plain, p) for p in backbone
+        }
+        assert min(bits(with_head, p) for p in head) == max(4, level)
+        # The head floor may sit above an oQ3 cap; lifts never cross it.
+        if max(4, level) <= cap:
+            assert with_head.effective_bpw <= cap
+
     def test_qwen4_ngram_table_stays_outside_budget_plan(self):
         from omlx.oq import _budgeted_shapes, _get_predicate_bits
 

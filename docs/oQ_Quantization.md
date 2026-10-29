@@ -63,7 +63,7 @@ The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix`
 - **Norms and recurrent state parameters** (SSM and linear attention): not quantized.
 - **Attention and other sensitive projections:** extra bits where the measurement says so. In dense models that mix full attention with sliding or linear attention, the full-attention projections get one bit above the base from oQ3 up.
 - **Routed experts:** stay at the base bits, because they are most of the model and the most expensive to raise. oQ3.5 gives their down projections one extra bit, and oQ2.5 and oQ2.7 raise whole expert layers to 3-bit.
-- **MTP heads** (with **Preserve MTP weights**): kept, with the small connecting layers at full precision and the rest at 4-bit or more.
+- **MTP heads** (with **Preserve MTP weights**): kept, with the small connecting layers at full precision and the rest at the base bits and at least 4-bit. The head is planned after the rest of the model, so the other layers get the same bits as in a build without the head. Budget left under the size cap raises the head further.
 
 Every model ends up with its own bit layout, because the plan follows that model's measurements.
 

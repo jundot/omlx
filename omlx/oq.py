@@ -1321,14 +1321,42 @@ def _build_quant_plan(
     7. Routed experts stay at base bits except explicit fractional floors and
        the oQ2.5/oQ2.7 fallback routed-layer boost.
 
-    always_on_rules=False skips steps 2 to 4 for callers with their own
-    allocation or exporter constraints.
+    An MTP head is planned after the backbone (_plan_mtp_head), so an -mtp
+    build keeps the backbone plan of the plain build.
+
+    always_on_rules=False skips steps 2 to 4 and the separate head plan for
+    callers with their own allocation or exporter constraints.
 
     fixed_overrides marks tensors whose output format is fixed up front
     (pre-quantized source tensors passed through as mxfp4/mxfp8). They are
     priced into the baseline bpw at their true cost and excluded from every
     boost decision.
     """
+    if always_on_rules:
+        head_shapes = {p: s for p, s in named_shapes.items() if _is_mtp_tensor(p)}
+        if head_shapes:
+            backbone_shapes = {
+                p: s for p, s in named_shapes.items() if p not in head_shapes
+            }
+            plan = _build_quant_plan(
+                backbone_shapes,
+                config,
+                oq_level,
+                target_bpw=target_bpw,
+                hard_cap_bpw=hard_cap_bpw,
+                fixed_overrides=fixed_overrides,
+                supported_bits=supported_bits,
+            )
+            return _plan_mtp_head(
+                plan,
+                backbone_shapes,
+                head_shapes,
+                config,
+                oq_level,
+                fixed_overrides or {},
+                supported_bits,
+            )
+
     base_bits = _base_bits_for_level(oq_level)
     if base_bits not in supported_bits:
         raise ValueError("Base quantization width is not supported by this model")
@@ -1612,11 +1640,10 @@ def _build_quant_plan(
             continue
         layer_idx = _extract_layer_index(path)
         if layer_idx < 0:
-            # MTP-head tensors carry no ``layers.<n>`` index but should
-            # compete like any other non-expert tensor (the stated contract
-            # is backbone-equal treatment for the head's internal block);
-            # score 0 seeds them at the bottom tier and the under-target
-            # fallback lifts them with the rest.
+            # Only always_on_rules=False plans the MTP head with the backbone.
+            # Its tensors carry no ``layers.<n>`` index but compete like any
+            # other non-expert tensor; score 0 seeds them at the bottom tier
+            # and the under-target fallback lifts them with the rest.
             if not _is_mtp_tensor(path):
                 continue
             layer_score = 0.0
@@ -1807,6 +1834,102 @@ def _build_quant_plan(
         effective_bpw=current_bpw,
         target_bpw=target_bpw,
         hard_cap_bpw=hard_cap_bpw,
+    )
+
+
+def _plan_mtp_head(
+    plan: QuantPlan,
+    backbone_shapes: dict[str, tuple],
+    head_shapes: dict[str, tuple],
+    config: dict,
+    oq_level,
+    fixed_overrides: dict[str, dict],
+    supported_bits: tuple[int, ...],
+) -> QuantPlan:
+    """Add the MTP head to a backbone plan without moving the backbone.
+
+    The head keeps at least max(_MTP_MIN_BITS, base) bits. Room left under the
+    hard cap, counted over backbone and head together, then lifts its
+    non-expert tensors one width per round. Routed experts stay at the floor,
+    as in the backbone.
+    """
+    base_bits = _base_bits_for_level(oq_level)
+    base = {
+        "bits": base_bits,
+        "group_size": _gs_for_mode(base_bits, _OQ_DEFAULT_GROUP_SIZE),
+        "mode": _mode_for_bits(base_bits),
+    }
+    floor_bits = _mtp_bits_override(base_bits)
+    boost_map = dict(plan.boost_map)
+    lift = []
+    for path, shape in head_shapes.items():
+        if path in fixed_overrides or len(shape) < 2:
+            continue
+        indexer = _indexer_q8_override(path, config)
+        if indexer is not None:
+            # A format invariant, seeded like the backbone indexers.
+            boost_map[path] = indexer
+            continue
+        pred = universal_quant_predicate(
+            path, None, {**config, "_oq_boost_map": {}}, oq_level
+        )
+        if pred is False:
+            continue
+        if floor_bits > base_bits:
+            boost_map[path] = {
+                "bits": floor_bits,
+                "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                "mode": _mode_for_bits(floor_bits),
+            }
+        if not _is_routed_expert(path):
+            lift.append((path, shape))
+
+    named_shapes = {**backbone_shapes, **head_shapes}
+    total_params = sum(math.prod(shape) for shape in named_shapes.values())
+    total_bits = total_params * _estimate_effective_bpw(
+        named_shapes,
+        base["bits"],
+        base["group_size"],
+        base["mode"],
+        overrides={**fixed_overrides, **boost_map},
+    )
+    ladder = [b for b in _ALWAYS_ON_LADDER if b in supported_bits]
+    raised = True
+    while raised:
+        raised = False
+        for path, shape in lift:
+            cur = boost_map.get(path, base)
+            steps = [b for b in ladder if b > cur["bits"]]
+            if not steps:
+                continue
+            new = {
+                "bits": steps[0],
+                "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                "mode": _mode_for_bits(steps[0]),
+            }
+            delta = 8 * (
+                _tensor_quantized_bytes(
+                    shape, new["bits"], new["group_size"], new["mode"]
+                )
+                - _tensor_quantized_bytes(
+                    shape, cur["bits"], cur["group_size"], cur["mode"]
+                )
+            )
+            if delta <= 0 or (total_bits + delta) / total_params > plan.hard_cap_bpw:
+                continue
+            boost_map[path] = new
+            total_bits += delta
+            raised = True
+    total_bits += _unify_shared_bits(
+        head_shapes, config, boost_map, fixed_overrides, base
+    )
+    head_bits = sorted({boost_map.get(p, base)["bits"] for p, _ in lift})
+    logger.info(f"  MTP head planned after the backbone: bits {head_bits}")
+    return QuantPlan(
+        boost_map=boost_map,
+        effective_bpw=total_bits / total_params,
+        target_bpw=plan.target_bpw,
+        hard_cap_bpw=plan.hard_cap_bpw,
     )
 
 
