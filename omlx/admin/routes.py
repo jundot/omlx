@@ -55,7 +55,12 @@ from ..engine.splash import (
 from ..engine.splash import (
     scan_ssd_cache as scan_splash_ssd_cache,
 )
-from ..exceptions import ModelBusyError
+from ..exceptions import (
+    InsufficientMemoryError,
+    ModelBusyError,
+    ModelNotFoundError,
+    ModelTooLargeError,
+)
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
@@ -2701,8 +2706,16 @@ async def load_model(
 
     try:
         await engine_pool.get_engine(model_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ModelNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ModelTooLargeError as e:
+        # The model cannot fit under the current ceiling: not a server fault,
+        # and the message already explains which ceiling binds.
+        raise HTTPException(status_code=413, detail=str(e))
+    except InsufficientMemoryError as e:
+        raise HTTPException(status_code=507, detail=str(e))
+    except ModelBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
     logger.info(f"Manually loaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Loaded {model_id}"}
