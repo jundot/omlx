@@ -426,6 +426,12 @@ struct ModelCardSheet: View {
                             comment: "Marker on a file in the model card's Files tab that is already in the model folder"))
                     .font(.omlxText(10.5, weight: .medium))
                     .foregroundStyle(theme.successText)
+            } else if file.outdated == true {
+                Text(String(localized: "downloads.card.files.outdated",
+                            defaultValue: "Changed",
+                            comment: "Marker on a file in the model card's Files tab whose copy in the model folder differs from the Hub"))
+                    .font(.omlxText(10.5, weight: .medium))
+                    .foregroundStyle(theme.warningText)
             } else if file.required == true {
                 Text(String(localized: "downloads.card.files.required",
                             defaultValue: "Required",
@@ -596,6 +602,10 @@ struct ModelCardSheet: View {
     private func hfDownloadButtons(dto: ModelCardDTO) -> some View {
         let picked = selectedFiles(dto)
         let pickedSize = picked.reduce(Int64(0)) { $0 + $1.size }
+        let update = Set(dto.updateFiles ?? [])
+        let updateSize = (dto.files ?? [])
+            .filter { update.contains($0.name) }
+            .reduce(Int64(0)) { $0 + $1.size }
         // What "Download All" still fetches: its files not downloaded yet.
         let files = dto.files ?? []
         let allSize = files.isEmpty
@@ -603,7 +613,7 @@ struct ModelCardSheet: View {
             : files
                 .filter { (dto.layout != "safetensors" || $0.preselected == true) && $0.local != true }
                 .reduce(Int64(0)) { $0 + $1.size }
-        if !fitsDisk(pickedSize, dto) {
+        if !fitsDisk(update.isEmpty ? pickedSize : updateSize, dto) {
             Text(String(localized: "downloads.card.not_enough_space",
                         defaultValue: "Not enough free space in the model folder",
                         comment: "Warning beside the download buttons when the selection does not fit on disk"))
@@ -632,9 +642,28 @@ struct ModelCardSheet: View {
                   systemImage: "icloud.and.arrow.down")
                 .labelStyle(.titleAndIcon)
         }
-        .buttonStyle(.omlx(.primary))
-        .keyboardShortcut(.defaultAction)
+        .buttonStyle(.omlx(update.isEmpty ? .primary : .normal))
+        .keyboardShortcut(update.isEmpty ? .defaultAction : nil)
         .disabled(picked.isEmpty || !fitsDisk(pickedSize, dto))
+        if !update.isEmpty {
+            Button {
+                onDownload(target.repoId, update.sorted())
+                dismiss()
+            } label: {
+                Label("\(updateLabel) · \(formatBytes(updateSize))",
+                      systemImage: "arrow.triangle.2.circlepath")
+                    .labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.omlx(.primary))
+            .keyboardShortcut(.defaultAction)
+            .disabled(!fitsDisk(updateSize, dto))
+        }
+    }
+
+    private var updateLabel: String {
+        String(localized: "downloads.card.update",
+               defaultValue: "Update",
+               comment: "Primary button in the model card sheet that fetches the files changed on the Hub since the model was downloaded")
     }
 
     private var downloadAllLabel: String {
@@ -720,7 +749,7 @@ struct ModelCardSheet: View {
                 dto = try await client.getMSModelCard(modelId: target.repoId)
             }
             selected = Set((dto.files ?? [])
-                .filter { $0.preselected == true && $0.local != true }
+                .filter { ($0.preselected == true || $0.outdated == true) && $0.local != true }
                 .map(\.name))
             state = .loaded(dto)
         } catch {

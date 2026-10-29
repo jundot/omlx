@@ -57,6 +57,9 @@ struct ModelCardDTO: Decodable, Equatable, Sendable {
     /// HF-only: bytes "Download All" fetches.
     let downloadAllSize: Int64?
 
+    /// HF-only: files that bring a downloaded copy up to date with the repo.
+    let updateFiles: [String]?
+
     /// HF-only: free bytes in the model folder.
     let diskFree: Int64?
 
@@ -82,6 +85,8 @@ struct ModelCardFile: Decodable, Equatable, Sendable, Identifiable {
     let preselected: Bool?
     /// Already in the model folder.
     let local: Bool?
+    /// In the model folder but changed on the Hub.
+    let outdated: Bool?
 
     var id: String { name }
 }

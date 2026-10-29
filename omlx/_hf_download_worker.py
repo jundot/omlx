@@ -21,6 +21,7 @@ _ALLOWED_DOWNLOAD_KWARGS = {
     "ignore_patterns",
     "local_dir",
     "repo_id",
+    "revision",
     "token",
 }
 

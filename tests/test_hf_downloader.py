@@ -22,6 +22,7 @@ from fastapi import HTTPException
 from huggingface_hub import HfApi
 from huggingface_hub import constants as hub_constants
 from huggingface_hub import file_download as hub_file_download
+from huggingface_hub._local_folder import write_download_metadata
 from huggingface_hub.utils import HfHubHTTPError
 
 from omlx._hf_download_worker import _download_without_xet
@@ -4837,6 +4838,188 @@ class TestRedownloadProgress:
             await _wait_for_downloads(downloader)
 
         assert list(polled["stale"]) == [str(target / "model.safetensors")]
+
+
+def _remote(name, size, etag, *, lfs=False):
+    return SimpleNamespace(
+        rfilename=name,
+        size=size,
+        blob_id=None if lfs else etag,
+        lfs=SimpleNamespace(sha256=etag) if lfs else None,
+    )
+
+
+class TestModelUpdates:
+    """A downloaded copy is compared with the repo by the etags hub recorded."""
+
+    @pytest.fixture
+    def model_dir(self, tmp_path):
+        repo_dir = tmp_path / "owner" / "model"
+        for name in ("config.json", "model.safetensors", "README.md", "tokenizer.json"):
+            _write(repo_dir / name, 100)
+        for name, etag in (
+            ("config.json", "c1"),
+            ("model.safetensors", "w1"),
+            ("README.md", "r1"),
+        ):
+            write_download_metadata(repo_dir, name, _OLD_COMMIT, etag)
+        return tmp_path
+
+    @staticmethod
+    def _describe(siblings, local_dir):
+        files = hf_downloader_mod._file_rows(siblings)
+        hf_downloader_mod._describe_repo_files(
+            files, local_dir, hf_downloader_mod._remote_etags(siblings)
+        )
+        return files, hf_downloader_mod._update_files(files, local_dir)
+
+    def test_changed_and_missing_required_files_are_the_update(self, model_dir):
+        repo_dir = model_dir / "owner" / "model"
+        _write(repo_dir / "generation_config.json", 100)
+        write_download_metadata(repo_dir, "generation_config.json", _OLD_COMMIT, "g1")
+        # Edited after download while the Hub copy stayed the same.
+        _write(repo_dir / "generation_config.json", 150)
+        edited = time.time() + 100
+        os.utime(repo_dir / "generation_config.json", (edited, edited))
+        siblings = [
+            _remote("config.json", 100, "c2"),
+            _remote("model.safetensors", 100, "w1", lfs=True),
+            _remote("generation_config.json", 100, "g1"),
+            _remote("README.md", 100, "r2"),
+            # No hub record: only the size shows the change.
+            _remote("tokenizer.json", 120, "t1", lfs=True),
+            _remote("chat_template.jinja", 10, "j1"),
+            _remote("LICENSE", 10, "l1"),
+        ]
+        files, update = self._describe(siblings, repo_dir)
+
+        assert {row["name"] for row in files if row["local"]} == {
+            "model.safetensors",
+            "generation_config.json",
+        }
+        assert {row["name"] for row in files if row["outdated"]} == {
+            "config.json",
+            "README.md",
+            "tokenizer.json",
+        }
+        assert set(update) == {
+            "config.json",
+            "README.md",
+            "tokenizer.json",
+            "chat_template.jinja",
+        }
+
+    def test_card_edit_fresh_or_unrecorded_folder_is_not_an_update(self, model_dir):
+        siblings = [
+            _remote("config.json", 100, "c1"),
+            _remote("model.safetensors", 100, "w1", lfs=True),
+            _remote("README.md", 100, "r2"),
+            _remote("tokenizer.json", 100, "t1", lfs=True),
+        ]
+        assert self._describe(siblings, model_dir / "owner" / "model")[1] == []
+        assert self._describe(siblings, model_dir / "owner" / "fresh")[1] == []
+
+        # Another tool's copy: a size change shows, but no update is offered.
+        copied = model_dir / "owner" / "copied"
+        shutil.copytree(model_dir / "owner" / "model", copied)
+        shutil.rmtree(copied / ".cache")
+        siblings[0] = _remote("config.json", 120, "c2")
+        files, update = self._describe(siblings, copied)
+        assert [row["name"] for row in files if row["outdated"]] == ["config.json"]
+        assert update == []
+
+    @pytest.mark.asyncio
+    async def test_check_updates_reports_changed_repos(self, model_dir):
+        for name in ("same", "busy", "broken", "plain"):
+            shutil.copytree(model_dir / "owner" / "model", model_dir / "owner" / name)
+        shutil.rmtree(model_dir / "owner" / "plain" / ".cache")
+        changed = [
+            _remote("config.json", 100, "c2"),
+            _remote("model.safetensors", 300, "w2", lfs=True),
+        ]
+        current = [
+            _remote("config.json", 100, "c1"),
+            _remote("model.safetensors", 100, "w1", lfs=True),
+        ]
+        hub = {"owner/model": changed, "owner/busy": changed, "owner/same": current}
+
+        def model_info(repo_id, **kwargs):
+            if repo_id == "owner/broken":
+                raise OSError("Hub unreachable")
+            return SimpleNamespace(siblings=hub[repo_id])
+
+        api = MagicMock()
+        api.model_info.side_effect = model_info
+        downloader = HFDownloader(model_dir=str(model_dir))
+        busy = DownloadTask(task_id="t", repo_id="Owner/Busy")
+        downloader._tasks[busy.task_id] = busy
+        with patch("omlx.admin.hf_downloader._get_hf_api", return_value=(api, None)):
+            result = await downloader.check_updates(
+                [
+                    "owner/model",
+                    "owner/same",
+                    "owner/busy",
+                    "owner/broken",
+                    "owner/plain",
+                    "owner/absent",
+                    "bad",
+                ],
+                token="tok",
+            )
+
+        assert result == {
+            "updates": {"owner/model": {"files": 2, "size": 400}},
+            "checked": 3,
+            "failed": ["owner/broken"],
+        }
+        assert {call.kwargs["token"] for call in api.model_info.call_args_list} == {
+            "tok"
+        }
+
+    @pytest.mark.asyncio
+    async def test_download_removes_files_the_repo_dropped(self, model_dir):
+        repo_dir = model_dir / "owner" / "model"
+        for name in ("model-00001-of-00002.safetensors", "helper.py"):
+            _write(repo_dir / name, 10)
+            write_download_metadata(repo_dir, name, _OLD_COMMIT, "e")
+        _write(repo_dir / "notes.txt", 10)
+        edited = time.time() + 100
+        os.utime(repo_dir / "helper.py", (edited, edited))
+
+        info = MagicMock()
+        info.sha = _NEW_COMMIT
+        info.safetensors = {"parameters": {"BF16": 10}}
+        info.siblings = [
+            _sibling("config.json", 10),
+            _sibling("model.safetensors", 10),
+        ]
+        api = MagicMock()
+        api.model_info.return_value = info
+        calls = []
+
+        def fake_snapshot_download(**kwargs):
+            calls.append(kwargs)
+            return [] if kwargs.get("dry_run") else None
+
+        downloader = HFDownloader(model_dir=str(model_dir))
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api", return_value=(api, None)
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            task = await downloader.start_download("owner/model")
+            await _wait_for_downloads(downloader)
+
+        assert task.status == DownloadStatus.COMPLETED
+        # The removal list and the payload come from the same commit.
+        assert [call["revision"] for call in calls] == [_NEW_COMMIT] * 2
+        records = repo_dir / ".cache" / "huggingface" / "download"
+        assert not (repo_dir / "model-00001-of-00002.safetensors").exists()
+        assert not (records / "model-00001-of-00002.safetensors.metadata").exists()
+        # Edited locally or never fetched by hub.
+        assert (repo_dir / "helper.py").exists()
+        assert (repo_dir / "notes.txt").exists()
 
 
 # =============================================================================

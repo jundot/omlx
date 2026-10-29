@@ -6439,6 +6439,30 @@
         }
       }
     },
+    "downloads.card.files.outdated" : {
+      "comment" : "Marker on a file in the model card's Files tab whose copy in the model folder differs from the Hub",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Changed"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Изменён"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已更改"
+          }
+        }
+      }
+    },
     "downloads.card.files.required" : {
       "comment" : "Marker on a file in the model card's Files tab that the model cannot load without",
       "extractionState" : "manual",
@@ -6651,6 +6675,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "无标签。"
+          }
+        }
+      }
+    },
+    "downloads.card.update" : {
+      "comment" : "Primary button in the model card sheet that fetches the files changed on the Hub since the model was downloaded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обновить"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "更新"
           }
         }
       }
