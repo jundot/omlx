@@ -8153,7 +8153,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
     from ..image_inspect import inspect_bundle
 
     def _add_image(path, name, **source):
-        if not (path / "omlx-pipeline.json").exists():
+        if not _is_listed_model_folder(path):
             return
         _add_model(path, name, **source)
         row = next(m for m in models if m["name"] == name)
@@ -8283,7 +8283,10 @@ def _is_listed_model_folder(path: Path) -> bool:
     from ..image_bundle import image_boundary
 
     if image_boundary(path):
-        return (path / "omlx-pipeline.json").is_file()
+        return any(
+            (path / marker).is_file()
+            for marker in ("model_index.json", "omlx-pipeline.json")
+        )
     return (path / "config.json").exists() or gguf.is_gguf_folder(path)
 
 

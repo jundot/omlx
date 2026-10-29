@@ -1915,16 +1915,14 @@ class EnginePool:
         """Drop stale unloaded entries whose backing model directory vanished."""
         model_path = Path(entry.model_path)
         source = entry.source_path
+        markers = (
+            ("model_index.json", "omlx-pipeline.json")
+            if entry.model_type == "image"
+            else ("config.json",)
+        )
         if (
             model_path.exists()
-            and (
-                model_path
-                / (
-                    "omlx-pipeline.json"
-                    if entry.model_type == "image"
-                    else "config.json"
-                )
-            ).is_file()
+            and any((model_path / marker).is_file() for marker in markers)
             and (source is None or Path(source).exists())
         ):
             return
