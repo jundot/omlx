@@ -22,6 +22,7 @@ from unittest.mock import patch
 import pytest
 
 from omlx.cache.paged_ssd_cache import (
+    GDNCheckpointMetadata,
     PagedSSDBlockMetadata,
     PagedSSDCacheIndex,
     PagedSSDCacheManager,
@@ -567,6 +568,40 @@ class TestPagedSSDCacheManager:
         assert stats.saves == 0
         assert stats.loads == 0
         assert stats.errors == 0
+
+    def test_model_stats_include_the_models_gdn_sidecars(self, tmp_path: Path):
+        """Sidecars share the SSD budget; a named one counts toward its model's
+        row, while one found at startup (no model name) counts only in the
+        directory total."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache",
+            max_size_bytes=1024**3,
+        )
+
+        def sidecar(i, model_name, size):
+            return GDNCheckpointMetadata(
+                source_block_hash=bytes([i]) * 32,
+                cache_signature_digest="digest",
+                file_path=tmp_path / f"sidecar-{i}",
+                file_size=size,
+                token_count=0,
+                model_name=model_name,
+                block_size=0,
+                created_at=0.0,
+                last_access=0.0,
+            )
+
+        try:
+            manager._gdn_sidecar_index.add(sidecar(1, "model-a", 300))
+            manager._gdn_sidecar_index.add(sidecar(2, "", 70))
+
+            stats = manager.get_stats_for_model("model-a")
+
+            assert (stats.num_files, stats.total_size_bytes) == (1, 300)
+            assert (stats.reusable_num_files, stats.reusable_size_bytes) == (0, 0)
+            assert sum(manager.tracked_file_sizes().values()) == 370
+        finally:
+            manager.close()
 
     def test_get_stats_dict(self, tmp_path: Path):
         """Test getting statistics as dictionary."""
@@ -1395,6 +1430,54 @@ class TestPagedSSDCacheManagerWithMLX:
         ]
         assert scan_lines, "scan completion log not emitted"
         assert "skipped_incompatible=3 blocks" in scan_lines[-1]
+
+    def test_model_stats_count_stale_layout_blocks_apart_from_reusable_ones(
+        self, tmp_path: Path, mock_mlx
+    ):
+        """#4911: blocks a model saved in an older layout fill the disk and the
+        budget, so its row counts them, but they are not reported as reusable."""
+        mx = mock_mlx
+        cache_dir = tmp_path / "ssd_cache"
+        paths = []
+
+        def write(i, model_name, block_size):
+            path = self._write_versioned_fixture_block(
+                cache_dir,
+                mx,
+                bytes([0x90 + i]) + b"\x00" * 31,
+                num_layers=1,
+                model_name=model_name,
+                block_size=block_size,
+            )
+            paths.append(path)
+            return path.stat().st_size
+
+        reusable = sum(write(i, "model-a", 256) for i in range(2))
+        stale = sum(write(2 + i, "model-a", 2048) for i in range(3))
+        other_model = write(5, "model-b", 256)
+
+        manager = PagedSSDCacheManager(
+            cache_dir=cache_dir,
+            max_size_bytes=1024**3,
+            expected_model_name="model-a",
+            expected_num_layers=1,
+            expected_block_size=256,
+        )
+        try:
+            stats = manager.get_stats_for_model("model-a")
+
+            assert (stats.reusable_num_files, stats.reusable_size_bytes) == (
+                2,
+                reusable,
+            )
+            assert (stats.num_files, stats.total_size_bytes) == (5, reusable + stale)
+            # model-b's block shares the directory and budget but is not model-a's.
+            tracked = manager.tracked_file_sizes()
+            assert sorted(tracked) == sorted(str(path) for path in paths)
+            assert sum(tracked.values()) == reusable + stale + other_model
+            assert manager.get_stats().total_size_bytes == sum(tracked.values())
+        finally:
+            manager.close()
 
     def test_model_switch_enforces_shared_ssd_limit_on_new_save(
         self, tmp_path: Path, mock_mlx

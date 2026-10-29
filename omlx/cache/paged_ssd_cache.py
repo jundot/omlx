@@ -5374,6 +5374,8 @@ class PagedSSDCacheManager(CacheManager):
                 max_size_bytes=self._get_effective_max_size(),
                 configured_max_size_bytes=self._max_size,
                 num_files=self._tracked_ssd_count(),
+                reusable_size_bytes=self._index.total_size,
+                reusable_num_files=self._index.count,
                 hot_cache_entries=hot_entries,
                 hot_cache_size_bytes=hot_size,
                 hot_cache_max_bytes=self._effective_hot_cache_max_bytes(),
@@ -5403,12 +5405,34 @@ class PagedSSDCacheManager(CacheManager):
         with self._lock:
             return self._gdn_legacy_fp32_fallbacks
 
+    def tracked_file_sizes(self) -> dict[str, int]:
+        """Return every file this manager charges against its SSD budget.
+
+        Keyed by path, so callers holding several managers over one shared
+        cache directory can take the union instead of counting a file once
+        per manager.
+        """
+        with self._lock:
+            entries = [
+                *self._index.get_all_metadata(),
+                *self._incompatible_index.get_all_metadata(),
+                *self._gdn_sidecar_index.get_all_metadata(),
+            ]
+        return {str(entry.file_path): entry.file_size for entry in entries}
+
     def get_stats_for_model(self, model_name: str) -> PagedSSDCacheStats:
         """Get model-scoped SSD cache statistics.
 
         The SSD cache directory can be shared across multiple loaded models, so
         dashboard per-model rows must be filtered by block metadata rather than
         reusing the global cache totals.
+
+        ``total_size_bytes``/``num_files`` cover everything on disk saved for
+        this model: reusable blocks, its blocks in an older layout and its GDN
+        sidecars, all of which count against the SSD budget. The reusable part
+        alone is reported as ``reusable_size_bytes``/``reusable_num_files``.
+        Sidecars found by the startup scan carry no model name, so they count
+        only in directory totals (see ``tracked_file_sizes``).
         """
         normalized_name = model_name.rstrip("/")
         basename = os.path.basename(normalized_name) if normalized_name else ""
@@ -5431,6 +5455,17 @@ class PagedSSDCacheManager(CacheManager):
             ]
             indexed_size = sum(metadata.file_size for metadata in indexed_entries)
             indexed_count = len(indexed_entries)
+            # Blocks this model saved in a layout the loaded copy can't read
+            # (and its sidecars) still fill the directory and the budget.
+            other_entries = [
+                metadata
+                for metadata in (
+                    *self._incompatible_index.get_all_metadata(),
+                    *self._gdn_sidecar_index.get_all_metadata(),
+                )
+                if _matches(metadata.model_name)
+            ]
+            other_size = sum(metadata.file_size for metadata in other_entries)
 
             with self._hot_cache_lock:
                 hot_entries = []
@@ -5451,10 +5486,12 @@ class PagedSSDCacheManager(CacheManager):
                 loads=self._stats["loads"],
                 errors=self._stats["errors"],
                 evict_unlink_failures=self._stats["evict_unlink_failures"],
-                total_size_bytes=indexed_size,
+                total_size_bytes=indexed_size + other_size,
                 max_size_bytes=self._get_effective_max_size(),
                 configured_max_size_bytes=self._max_size,
-                num_files=indexed_count,
+                num_files=indexed_count + len(other_entries),
+                reusable_size_bytes=indexed_size,
+                reusable_num_files=indexed_count,
                 hot_cache_entries=len(hot_entries),
                 hot_cache_size_bytes=hot_size,
                 hot_cache_max_bytes=self._effective_hot_cache_max_bytes(),

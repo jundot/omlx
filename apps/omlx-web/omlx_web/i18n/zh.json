@@ -114,6 +114,7 @@
   "status.runtime_cache.col_subblock_cache": "子块缓存",
   "status.runtime_cache.col_ssd_files": "SSD 文件数",
   "status.runtime_cache.col_ssd_size": "SSD 大小",
+  "status.runtime_cache.ssd_reusable": "可复用 {size}",
   "status.runtime_cache.col_memory_entries": "RAM 条目",
   "status.runtime_cache.col_memory_size": "RAM 大小",
   "status.runtime_cache.subblock_note": "注：子块缓存指未达一个完整块的请求（例如某些模型上 <1024 Token）被缓存在 RAM/分页缓存中，但不计入已索引的 SSD 块。",

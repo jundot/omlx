@@ -222,6 +222,12 @@ class PagedSSDCacheStats(BaseCacheStats):
     max_size_bytes: int = 0
     configured_max_size_bytes: int = 0
     num_files: int = 0
+    # The part of ``total_size_bytes``/``num_files`` the loaded model can
+    # reuse. Blocks in an older layout (different block size, layer count or
+    # payload format) still occupy disk and count against the SSD budget, but
+    # are never read back, so they are left out of this pair.
+    reusable_size_bytes: int = 0
+    reusable_num_files: int = 0
 
     # Hot cache (in-memory tier) metrics
     hot_cache_entries: int = 0

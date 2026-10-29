@@ -6499,6 +6499,10 @@ def _build_runtime_cache_observability(
 
     block_sizes = set()
     live_splash_dirs = set()
+    # Loaded models share one SSD cache directory and each manager tracks all
+    # of it, so the directory total is the union of their files, not a sum.
+    tracked_files: dict[str, int] = {}
+    untracked_rows: list[dict] = []
 
     for model_info in engine_pool.get_status().get("models", []):
         model_id = model_info.get("id")
@@ -6568,6 +6572,20 @@ def _build_runtime_cache_observability(
         scheduler_model_name = getattr(
             getattr(scheduler, "config", None), "model_name", ""
         )
+        manager_tracks_files = False
+        if ssd_manager is not None and hasattr(ssd_manager, "tracked_file_sizes"):
+            try:
+                manager_files = ssd_manager.tracked_file_sizes()
+                # Anything but a path->size map falls back to the row's own totals.
+                if isinstance(manager_files, dict):
+                    tracked_files.update(manager_files)
+                    manager_tracks_files = True
+            except Exception as exc:
+                logger.warning(
+                    "Failed to collect tracked SSD cache files for model '%s': %s",
+                    model_id,
+                    exc,
+                )
         if ssd_manager is not None and hasattr(ssd_manager, "get_stats_for_model"):
             try:
                 scoped_ssd_stats = ssd_manager.get_stats_for_model(
@@ -6685,6 +6703,8 @@ def _build_runtime_cache_observability(
             "last_tokens_to_next_block": last_tokens_to_next_block,
             "num_files": int(ssd_stats.get("num_files", 0) or 0),
             "total_size_bytes": int(ssd_stats.get("total_size_bytes", 0) or 0),
+            "reusable_num_files": int(ssd_stats.get("reusable_num_files", 0) or 0),
+            "reusable_size_bytes": int(ssd_stats.get("reusable_size_bytes", 0) or 0),
             "max_size_bytes": int(ssd_stats.get("max_size_bytes", 0) or 0),
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
@@ -6729,13 +6749,19 @@ def _build_runtime_cache_observability(
                 live_splash_dirs.add(entry.engine.ssd_cache_dir)
 
         payload["models"].append(model_payload)
-        payload["total_num_files"] += model_payload["num_files"]
-        payload["total_size_bytes"] += model_payload["total_size_bytes"]
+        if not manager_tracks_files:
+            untracked_rows.append(model_payload)
 
         if isinstance(block_size, int) and block_size > 0:
             block_sizes.add(block_size)
 
     payload["effective_block_sizes"] = sorted(block_sizes)
+    payload["total_num_files"] = len(tracked_files) + sum(
+        row["num_files"] for row in untracked_rows
+    )
+    payload["total_size_bytes"] = sum(tracked_files.values()) + sum(
+        row["total_size_bytes"] for row in untracked_rows
+    )
 
     # Aggregate hot-cache and disk-max across models. Hot cache max is a single
     # process-wide budget shared by all loaded model managers, so keep the

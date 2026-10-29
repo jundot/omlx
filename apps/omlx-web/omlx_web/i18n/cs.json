@@ -114,6 +114,7 @@
   "status.runtime_cache.col_subblock_cache": "Sub-block cache",
   "status.runtime_cache.col_ssd_files": "Soubory na SSD",
   "status.runtime_cache.col_ssd_size": "Velikost na SSD",
+  "status.runtime_cache.ssd_reusable": "{size} znovu použitelné",
   "status.runtime_cache.col_memory_entries": "Položky v paměti",
   "status.runtime_cache.col_memory_size": "Velikost v paměti",
   "status.runtime_cache.subblock_note": "Poznámka: Sub-block cache znamená, že požadavky menší než celý blok (např. <1024 tokenů u některých modelů) jsou cachovány v paměti/paged cache, ale nejsou započítány jako indexované bloky na SSD.",

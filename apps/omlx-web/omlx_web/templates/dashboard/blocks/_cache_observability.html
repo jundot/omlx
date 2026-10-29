@@ -244,7 +244,13 @@
                                 <td class="px-3 py-2 text-right" x-text="formatNumber(m.num_files || 0)"></td>
                             </template>
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
-                                <td class="px-3 py-2 text-right" x-text="formatSizeBytes(m.total_size_bytes || 0)"></td>
+                                <td class="px-3 py-2 text-right">
+                                    <span x-text="formatSizeBytes(m.total_size_bytes || 0)"></span>
+                                    <!-- Blocks in an older layout still use disk but are never read back. -->
+                                    <div x-show="(m.reusable_size_bytes || 0) < (m.total_size_bytes || 0)"
+                                         class="text-xs text-neutral-500"
+                                         x-text="window.t('status.runtime_cache.ssd_reusable').replace('{size}', formatSizeBytes(m.reusable_size_bytes || 0))"></div>
+                                </td>
                             </template>
                             <template x-if="m.cache_tier !== 'rank-prompt-snapshot'">
                                 <td x-show="stats.runtime_cache?.hot_cache_max_bytes > 0" class="px-3 py-2 text-right" x-text="m.hot_cache_entries || 0"></td>

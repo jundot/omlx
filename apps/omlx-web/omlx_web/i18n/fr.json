@@ -114,6 +114,7 @@
   "status.runtime_cache.col_subblock_cache": "Sub-block Cache",
   "status.runtime_cache.col_ssd_files": "SSD Files",
   "status.runtime_cache.col_ssd_size": "SSD Size",
+  "status.runtime_cache.ssd_reusable": "{size} réutilisable",
   "status.runtime_cache.col_memory_entries": "Memory Entries",
   "status.runtime_cache.col_memory_size": "Memory Size",
   "status.runtime_cache.subblock_note": "Note: Sub-block Cache means requests below one full block (for example <1024 tokens on some models) are cached in memory/paged cache but are not counted as indexed SSD blocks.",

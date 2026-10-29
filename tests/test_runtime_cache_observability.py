@@ -228,3 +228,58 @@ def test_unavailable_ssd_cache_dir_reports_ssd_cache_off(tmp_path):
     assert payload["response_state_dir"] == ""
     # The auto limit would otherwise follow the free space of a parent disk.
     assert payload["disk_max_bytes"] == 0
+
+
+def test_shared_ssd_dir_total_is_the_union_of_tracked_files(tmp_path):
+    """#4911: every loaded manager tracks the whole shared cache directory, so
+    the total must count each file once, including ones no model row owns."""
+    tracked = {
+        "/cache/a-reusable": 100,
+        "/cache/a-old-layout": 200,
+        "/cache/b-reusable": 50,
+        "/cache/unattributed-sidecar": 1000,
+    }
+    model_stats = {
+        "model-a": {
+            "num_files": 2,
+            "total_size_bytes": 300,
+            "reusable_num_files": 1,
+            "reusable_size_bytes": 100,
+        },
+        "model-b": {
+            "num_files": 1,
+            "total_size_bytes": 50,
+            "reusable_num_files": 1,
+            "reusable_size_bytes": 50,
+        },
+    }
+
+    def engine(model_id):
+        manager = SimpleNamespace(
+            tracked_file_sizes=lambda: dict(tracked),
+            get_stats_for_model=lambda name: model_stats[name],
+        )
+        return SimpleNamespace(
+            scheduler=SimpleNamespace(
+                get_ssd_cache_stats=lambda: {"block_size": 256, "ssd_cache": {}},
+                paged_ssd_cache_manager=manager,
+                config=SimpleNamespace(model_name=model_id),
+            )
+        )
+
+    class TwoModelPool:
+        _entries = {
+            model_id: SimpleNamespace(engine=engine(model_id))
+            for model_id in ("model-a", "model-b")
+        }
+
+        def get_status(self):
+            return {"models": [{"id": m, "loaded": True} for m in self._entries]}
+
+    payload = _build(TwoModelPool(), tmp_path)
+
+    assert payload["total_size_bytes"] == 1350
+    assert payload["total_num_files"] == 4
+    row_a = next(row for row in payload["models"] if row["id"] == "model-a")
+    assert (row_a["total_size_bytes"], row_a["reusable_size_bytes"]) == (300, 100)
+    assert (row_a["num_files"], row_a["reusable_num_files"]) == (2, 1)
