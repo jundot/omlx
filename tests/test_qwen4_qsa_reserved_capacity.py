@@ -208,6 +208,7 @@ def test_chunked_reservation_includes_restored_prefix(snapshots_enabled):
         _stream=mx.default_stream(mx.gpu),
         _prefill_tail_plan=lambda *a: (None, False),
         _memory_hard_limit_bytes=0,
+        _model_has_unreconstructible_cache=lambda: False,
     )
     state = Scheduler._begin_prefill(
         ns,
