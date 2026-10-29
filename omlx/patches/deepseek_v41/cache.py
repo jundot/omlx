@@ -45,13 +45,19 @@ class DeepseekV41Cache(ArraysCache):
 
     def __setitem__(self, idx, value):
         if self._rows is not None:
+            if any(row.has_pending() for row in self._rows) and len(self._rows) > 1:
+                # The dense layout has no per-row replay slots.
+                raise ValueError("A pending V4.1 decoder replay cannot be batched")
             dense = self.cache
             self._rows = None
             self._dense = dense
         self._dense[idx] = value
 
     def _materialize(self):
-        """Padded dense arrays of a row-backed batch (same layout extend() builds)."""
+        """Padded dense arrays of a row-backed batch (same layout extend() builds).
+        A single row keeps its replay slots."""
+        if len(self._rows) == 1:
+            return list(self._rows[0].cache)
         states = []
         for slot in range(7):
             values = [row.cache[slot] for row in self._rows]
@@ -133,7 +139,11 @@ class DeepseekV41Cache(ArraysCache):
     def pending(self):
         """The decoder replay input: midpoint output hidden, pre weights, top-k
         ids and candidate blocks of the last window, or None."""
-        return tuple(self.cache[7:]) if self.has_pending() else None
+        if not self.has_pending():
+            return None
+        if self._rows is not None and len(self._rows) > 1:
+            raise ValueError("A batch holds its decoder replay inputs per row")
+        return tuple(self.cache[7:])
 
     def set_pending(self, values):
         self.cache = list(self.cache[:7]) + ([] if values is None else list(values))

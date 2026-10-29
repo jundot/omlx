@@ -31,6 +31,7 @@ from .cache import DeepseekV41Cache
 from .engram import Engram, NgramHash, build_compressed_token_map
 from .head import project_logits
 from .hyper_connection import (
+    PROJECTION_WIDTH_MULTIPLE,
     fused_hc_post,
     fused_hc_pre_norm,
     fused_hc_projection,
@@ -841,6 +842,7 @@ def hc_mixes(x, fn, scale, base, c):
         and x.dtype == mx.bfloat16
         and fn.dtype == mx.float32
         and fn.shape == (24, 4 * x.shape[-1])
+        and (4 * x.shape[-1]) % PROJECTION_WIDTH_MULTIPLE == 0
         and mx.default_device() == mx.gpu
     ):
         mixes = fused_hc_projection(x, fn, c.norm_eps)
@@ -1423,7 +1425,12 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                                 mx.zeros((1, 0), mx.int64) if slot == 6 else empty
                             )
                     rows[j].append(rc[j])
-            logits = self._stage_output(h, pre, skip_logits)
+            if skip_decoder:
+                # Cache-only: a skipped chunk has no decoder output to project.
+                width = c.dim if skip_logits else c.vocab_size
+                logits = mx.zeros((1, h.shape[1], width), h.dtype)
+            else:
+                logits = self._stage_output(h, pre, skip_logits)
             # The scheduler discards this tail-only result. Ordinary forward
             # calls still return real logits for every input token.
             results.append(

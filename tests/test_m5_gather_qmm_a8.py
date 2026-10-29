@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from mlx_vlm.models.switch_layers import SwitchGLU
 
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
 from omlx.patches import m5_gather_qmm_a8 as a8
 from omlx.patches import m5_gather_qmm_nax as nax
 from omlx.patches import qwen35_moe_gate_up as gate_up
@@ -183,9 +184,7 @@ def _v41_reference(x, gate, up, idx, rmap, bits, act, limit, rw):
     """The DeepSeek V4.1 A8 contract in float32: Stage A codes times their row
     or GS64 scales, against the dequantized experts, then the clamped,
     route-weighted SwiGLU (or the plain projection when ``up`` is None)."""
-    from omlx.custom_kernels.quant_matmul import fast
-
-    qa, sa, _ = fast.oq_a8_quantize(x, act)
+    qa, sa, _ = quant_fast.oq_a8_quantize(x, act)
     tokens, k_dim = x.shape[0], x.shape[-1]
     scale = sa.reshape(tokens, -1, 1) if act else sa.reshape(tokens, 1, 1)
     xa = (qa.reshape(tokens, -1, GROUP).astype(mx.float32) * scale).reshape(

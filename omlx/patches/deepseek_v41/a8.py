@@ -8,31 +8,49 @@ projections use the oQ A8 GEMM with a plan tagged on each eligible module at
 load. Only affine GS64 weights qualify (Q2/Q3/Q4 routed, Q4/Q5/Q6/Q8 dense).
 """
 
+from functools import partial
+
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..m5_gather_qmm_a8 import sorted_gather_qmm_a8
+from ..m5_gather_qmm_a8 import _MIN_TOKENS_FLOOR, sorted_gather_qmm_a8
 from ..qwen35_oq_a8 import _plan_for, apply_plan, stage_a
 
 # (plan, min_tokens) on each tagged dense projection.
 _PLAN = "_omlx_a8_plan"
+# Decode and verify blocks stay on the A16 path; the setting can only raise it.
+MIN_TOKENS_FLOOR = _MIN_TOKENS_FLOOR
 
 
 def _affine_gs64(projection, bits, ndim):
+    """Affine GS64 codes with matching fp16/bf16 scales and biases, as the
+    A8 kernels read them."""
     weight = projection.get("weight")
+    scales, biases = projection.get("scales"), projection.get("biases")
+    bits_ok = getattr(projection, "bits", None) in bits
     return (
         getattr(projection, "mode", None) == "affine"
         and getattr(projection, "group_size", None) == 64
-        and getattr(projection, "bits", None) in bits
-        and projection.get("biases") is not None
+        and bits_ok
+        and "bias" not in projection
         and weight is not None
         and weight.ndim == ndim
+        and weight.dtype == mx.uint32
+        and scales is not None
+        and biases is not None
+        and scales.dtype in (mx.float16, mx.bfloat16)
+        and biases.dtype == scales.dtype
+        and scales.shape == biases.shape
+        and scales.shape[:-1] == weight.shape[:-1]
+        and weight.shape[-1] * 32 == scales.shape[-1] * 64 * projection.bits
     )
 
 
-def _tokens(x, min_tokens):
+def _tokens(x, min_tokens, dtype):
+    """Rows of ``x`` for the A8 path, or 0. The output takes the dtype of the
+    scales, so ``x`` must already have it."""
     tokens = x.size // x.shape[-1]
-    if tokens < min_tokens or x.dtype not in (mx.bfloat16, mx.float16):
+    if tokens < min_tokens or x.dtype != dtype:
         return 0
     return tokens
 
@@ -54,7 +72,7 @@ def tag_dense_a8(language_model, min_tokens) -> int:
 
 def _plan(projection, x):
     tag = getattr(projection, _PLAN, None)
-    if tag is None or not _tokens(x, tag[1]):
+    if tag is None or not _tokens(x, tag[1], projection.scales.dtype):
         return None
     return tag[0]
 
@@ -86,7 +104,7 @@ def dense_a8_pair(first, second, x):
     return apply_plan(first, stage, p1), apply_plan(second, stage, p2)
 
 
-@mx.compile
+@partial(mx.compile, shapeless=True)
 def _clamped_swiglu(gate, up, limit):
     """silu(min(gate, limit)) * clip(up, -limit, limit) in float, as one kernel."""
     g, u = gate.astype(mx.float32), up.astype(mx.float32)
@@ -116,11 +134,13 @@ def routed_experts_a8(experts, x, flat, order, weights, min_tokens):
     ``x`` holds the token rows, ``flat[order]`` the sorted expert ids and
     ``weights`` the route weights in token order.
     """
-    tokens = _tokens(x, min_tokens)
-    w1, w3, w2 = experts.w1, experts.w3, experts.w2
-    if not tokens or not all(_affine_gs64(p, (2, 3, 4), 3) for p in (w1, w3, w2)):
+    # Offloaded experts stream their weights and keep the A16 path.
+    projections = [getattr(experts, name, None) for name in ("w1", "w3", "w2")]
+    if not all(p is not None and _affine_gs64(p, (2, 3, 4), 3) for p in projections):
         return None
-    if w1.bits != w3.bits:
+    w1, w3, w2 = projections
+    tokens = _tokens(x, min_tokens, w1.scales.dtype)
+    if not tokens or w1.bits != w3.bits:
         return None
     indices = flat[order].astype(mx.uint32)
     row_map = (order // (flat.size // tokens)).astype(mx.uint32)

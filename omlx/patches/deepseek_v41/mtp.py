@@ -34,9 +34,15 @@ class AcceptanceDepthController:
 class DSparkMixin:
     _omlx_mtp_multi_request = True
 
-    def _omlx_prefill(self, input_ids, cache=None, **kwargs):
+    def _omlx_prefill(self, input_ids, cache=None, next_prefill_tokens=0, **kwargs):
         """Scheduler cache-only entry; normal forward retains full logits."""
-        return self(input_ids, cache=cache, _ced_prefill=True, **kwargs)
+        return self(
+            input_ids,
+            cache=cache,
+            _ced_prefill=True,
+            next_prefill_tokens=next_prefill_tokens,
+            **kwargs,
+        )
 
     @property
     def args(self):

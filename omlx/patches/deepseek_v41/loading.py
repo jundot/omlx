@@ -16,7 +16,7 @@ from transformers import PreTrainedTokenizerFast
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
 from ..mlx_lm_mtp import get_mtp_depth
-from .a8 import tag_dense_a8
+from .a8 import MIN_TOKENS_FLOOR, tag_dense_a8
 from .config import ModelConfig
 from .convert import iter_source_weights, source_engram_tables
 from .dspark import make_stages
@@ -161,7 +161,7 @@ def load(
             )
     if a8_prefill:
         config.a8_prefill = quant_fast.oq_a8_available()
-        config.a8_prefill_min_tokens = a8_prefill_min_tokens
+        config.a8_prefill_min_tokens = max(int(a8_prefill_min_tokens), MIN_TOKENS_FLOOR)
         if config.a8_prefill:
             logger.info("DeepSeek V4.1 A8 prefill enabled")
         else:
@@ -438,7 +438,7 @@ def load(
                     layer.engram.embed.make_resident()
         mx.eval(model.parameters())
         if config.a8_prefill:
-            tagged = tag_dense_a8(model.language_model, a8_prefill_min_tokens)
+            tagged = tag_dense_a8(model.language_model, config.a8_prefill_min_tokens)
             logger.info("DeepSeek V4.1 dense A8 prefill on %d projections", tagged)
         model.eval()
         return model, processor

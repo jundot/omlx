@@ -97,6 +97,8 @@ class DSparkBlock(Block):
             n_activated_experts=active,
             engram_layer_ids=(),
             engram_num_embeddings=(),
+            # Drafts keep the A16 path, as their dense projections do.
+            a8_prefill=False,
         )
         super().__init__(draft, c.n_layers + stage)
         self.attn = DSparkAttention(draft, c.n_layers + stage)

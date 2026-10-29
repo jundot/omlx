@@ -280,7 +280,11 @@ def test_short_external_prefills_share_admission_debt(clock, ane_prefill):
 
     scheduler.model.side_effect = forward
     if ane_prefill:
-        scheduler.model._omlx_prefill = forward
+        # The K2 ANE hook's signature: no extra keyword arguments.
+        def ane_forward(tokens, *, cache):
+            forward(tokens)
+
+        scheduler.model._omlx_prefill = ane_forward
     with patch("omlx.scheduler.make_prompt_cache", return_value=[]):
         scheduled, rejected = scheduler._schedule_waiting()
         assert scheduled == [requests[0]]

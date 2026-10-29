@@ -10,11 +10,12 @@ from omlx.cache.paged_ssd_cache import (
     numerics_revision_for_model,
 )
 from omlx.models.vlm import VLMModelAdapter
+from omlx.patches.deepseek_v41.cache import DeepseekV41Cache
 from omlx.patches.deepseek_v41.language import Attention
 from omlx.patches.deepseek_v41.model import Model
 
 
-def make_model(mtp=False, targets=(3, 4, 5)):
+def make_model(mtp=False, targets=(3, 4, 5), **config):
     kwargs = {}
     if mtp:
         kwargs = dict(
@@ -28,7 +29,7 @@ def make_model(mtp=False, targets=(3, 4, 5)):
             dspark_markov_rank=32,
             compress_ratios=(0, 2, 2, 1, 1, 1, 0, 0, 0),
         )
-    model = Model(tiny_ced(**kwargs))
+    model = Model(tiny_ced(**kwargs, **config))
     load_reference_weights(model.language_model)
     model.language_model.configure_mtp(mtp, 3)
     return model
@@ -110,6 +111,35 @@ def test_skipped_decoder_tail_keeps_dspark_priming(follow):
     for a, b in zip(keys, expected_keys):
         np.testing.assert_array_equal(a, b)
     np.testing.assert_array_equal(logits, expected)
+
+
+def test_dspark_drafts_keep_the_a16_path():
+    model = make_model(mtp=True, a8_prefill=True).language_model
+    assert model.layers[1].ffn._a8_min_tokens == 128
+    assert model.mtp[0].ffn._a8_min_tokens is None
+
+
+def test_pending_replay_survives_single_row_batches():
+    """A one-row batch keeps the replay slots through a write; a write to a
+    mixed batch would drop them, so it is refused."""
+    pending = DeepseekV41Cache(1)
+    pending.cache = [mx.array([4], mx.int32)] + [None] * 6
+    pending.set_pending(
+        (
+            mx.zeros((1, 2, 4, 8)),
+            mx.zeros((1, 2, 4)),
+            mx.zeros((1, 2, 3), mx.int32),
+            mx.zeros((1, 2, 0), mx.int32),
+        )
+    )
+    batch = DeepseekV41Cache.merge([pending])
+    batch[0] = mx.array([4], mx.int32)
+    assert batch.has_pending() and len(batch.pending()) == 4
+    plain = DeepseekV41Cache(1)
+    plain.cache = [mx.array([3], mx.int32)] + [None] * 6
+    mixed = DeepseekV41Cache.merge([pending, plain])
+    with pytest.raises(ValueError, match="cannot be batched"):
+        mixed[0] = mx.array([4, 3], mx.int32)
 
 
 def test_scoring_and_explicit_capture_are_full_depth():

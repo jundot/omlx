@@ -204,6 +204,11 @@ _MERGE = r"""
 """
 
 
+# The tensor-unit path saves about 2.4 us per query over the native kernel on
+# M5 Max and decoding a pooled row costs about 3 ns, so it needs at least one
+# query per 512 pooled rows to win with margin.
+_POOLED_ROWS_PER_QUERY = 512
+
 # One thread per decoded value: window rows (512 FP8 + 16 exponent bytes) then
 # pooled rows (256 FP4 bytes + 32 FP8 scales), as the native prefill unpack.
 _UNPACK = r"""
@@ -251,6 +256,9 @@ def nax_packed_sparse_attention(q, window, pooled, ci, sink, scale, start, ratio
         or pooled.shape[-1] != 288
         or not pooled.shape[1]
         or not ci.shape[-1]
+        # Every call decodes all pooled rows; a short chunk over a long context
+        # is cheaper on the native kernel, which reads only the selected rows.
+        or q.shape[1] * _POOLED_ROWS_PER_QUERY < pooled.shape[1]
     ):
         return None
     rows, pooled_rows = window.shape[1], pooled.shape[1]

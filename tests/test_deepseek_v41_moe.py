@@ -137,6 +137,34 @@ def test_moe_a8_keeps_a16_below_min_tokens():
     )
 
 
+def test_a8_skips_offloaded_experts_and_mismatched_metadata():
+    """Offloaded experts have no resident weights, and fp32 scales are not
+    what the A8 kernels read: both stay on the A16 path."""
+    x = mx.zeros((1, 256, 64), mx.bfloat16)
+    flat = mx.zeros((512,), mx.int32)
+    weights = mx.ones((1, 256, 2))
+    offloaded = SimpleNamespace(slots=None)
+    assert (
+        a8.routed_experts_a8(offloaded, x, flat, mx.argsort(flat), weights, 128) is None
+    )
+    packed, scales, biases = mx.quantize(
+        mx.zeros((128, 64), mx.bfloat16), bits=8, group_size=64
+    )
+    bf16 = QuantizedProjection(
+        packed, scales, 8, "affine", biases=biases, group_size=64
+    )
+    fp32 = QuantizedProjection(
+        packed,
+        scales.astype(mx.float32),
+        8,
+        "affine",
+        biases=biases.astype(mx.float32),
+        group_size=64,
+    )
+    assert a8._affine_gs64(bf16, (8,), 2)
+    assert not a8._affine_gs64(fp32, (8,), 2)
+
+
 def test_expert_rejects_prequantized_input_for_unquantized_projections():
     expert = language.Expert(ModelConfig(dim=64, moe_inter_dim=64))
     with pytest.raises(ValueError, match="matching quantized projections"):

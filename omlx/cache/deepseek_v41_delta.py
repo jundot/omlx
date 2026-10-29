@@ -27,12 +27,12 @@ _SLOTS = {("deepseek_v41", "3"): 7, ("deepseek_v41", "4"): 11}
 
 def is_delta(state):
     """Whether ``state`` is a compacted block (cache slots plus a range record)."""
-    return len(state) in (8, 12)
+    return len(state) - 1 in _SLOTS.values()
 
 
 def full_snapshot_slots(state):
     """Slot count of a full V4.1 state, or None for a compacted block."""
-    return len(state) if len(state) in (7, 11) else None
+    return len(state) if len(state) in _SLOTS.values() else None
 
 
 def compact_state(state, meta, start, end):

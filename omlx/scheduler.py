@@ -1837,6 +1837,14 @@ class SchedulingPolicy(Enum):
     PRIORITY = "priority"  # Priority-based
 
 
+def _takes_next_prefill_tokens(prefill_model: Any) -> bool:
+    """Whether a cache-only prefill hook accepts the next chunk's size."""
+    try:
+        return "next_prefill_tokens" in inspect.signature(prefill_model).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _expected_chunk_len(step_size: int, remaining: int, kv_total: int, boundary_enabled: bool, block_size: int) -> int:
     """Size the prefill loops give the next chunk: the step, clamped to the next block boundary."""
     next_n = min(step_size, remaining)
@@ -4565,7 +4573,7 @@ class Scheduler:
                     )
                     prefetch(input_arr[:, n_to_process : n_to_process + next_n], input_arr[:, :n_to_process])
                 prefill_model = getattr(self.model, "_omlx_prefill", self.model)
-                if prefill_model is not self.model:
+                if _takes_next_prefill_tokens(prefill_model):
                     # A cache-only model may skip work the next chunk replaces.
                     rest = remaining - n_to_process
                     after = processed_tokens + n_to_process
@@ -6966,7 +6974,7 @@ class Scheduler:
         chunk_kwargs = {}
         if self._supports_skip_lm_head():
             chunk_kwargs["skip_lm_head"] = True
-        if prefill_model is not self.model:
+        if _takes_next_prefill_tokens(prefill_model):
             chunk_kwargs["next_prefill_tokens"] = (
                 Scheduler._next_prefill_chunk_len(self, state, n)
                 if state.tokens_remaining.shape[1] > 0

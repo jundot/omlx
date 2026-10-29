@@ -193,3 +193,21 @@ def test_nax_packed_attention_matches_native(start, length, pooled_count):
     assert nax is not None
     diff = mx.linalg.norm(nax.astype(mx.float32) - native) / mx.linalg.norm(native)
     assert float(diff) < 5e-3
+
+
+@pytest.mark.skipif(
+    not nax_sparse_attention_available(), reason="needs M5 tensor units"
+)
+def test_short_chunk_over_long_context_keeps_the_native_kernel():
+    """The tensor-unit path decodes every pooled row, so a chunk with fewer
+    than one query per 512 pooled rows reads them through the native kernel."""
+    q = mx.zeros((1, 16, 64, 512), mx.bfloat16)
+    window = pack_activation(mx.zeros((1, 16, 512)))
+    sinks = mx.zeros((64,))
+    ci = mx.zeros((1, 16, 4), mx.int32)
+    for rows, used in ((16 * 512, True), (16 * 512 + 1, False)):
+        pooled = pack_activation(mx.zeros((1, rows, 512)), 4, 16, True)
+        out = nax_packed_sparse_attention(
+            q, window, pooled, ci, sinks, 512**-0.5, rows * 4, 4, 128
+        )
+        assert (out is not None) == used
