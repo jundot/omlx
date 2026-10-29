@@ -341,3 +341,13 @@ def test_incremental_prefill_matches_explicit_cache_updates(
     mx.eval(actual)
     assert mx.all(mx.isfinite(actual)).item()
     assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("scheme", ["affine4", "turboquant"])
+def test_unlimited_ocr_caches_are_not_packed(scheduler, scheme):
+    from mlx_vlm.models.unlimited_ocr.dash import DashKVCache
+    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+
+    scheduler._turboquant_kv_scheme = scheme
+    assert not scheduler._turboquant_eligible([DashKVCache(None)])
+    assert not scheduler._turboquant_eligible([RingSlidingKVCache(128)])

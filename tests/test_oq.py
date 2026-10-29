@@ -588,6 +588,11 @@ class TestHelpers:
     def test_is_moe_router_gemma4_router_proj(self):
         assert _is_moe_router("language_model.model.layers.0.router.proj") is True
 
+    def test_unlimited_ocr_2_dash_router_stays_dense(self):
+        path = "language_model.model.layers.3.self_attn.dash_router.q_proj"
+        config = {"model_type": "unlimited-ocr", "num_hidden_layers": 12}
+        assert universal_quant_predicate(path, None, config, 4) is False
+
     def test_is_moe_router_gate_proj_not_router(self):
         assert _is_moe_router("model.layers.0.mlp.gate_proj") is False
 

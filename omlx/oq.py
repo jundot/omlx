@@ -711,6 +711,9 @@ def universal_quant_predicate(
     if _is_moe_router(path):
         return False  # fp16 — tiny weights, some models (MoEGate) lack to_quantized()
 
+    if ".dash_router." in path:
+        return False  # Unlimited-OCR-2 block router; mlx-vlm keeps it dense too.
+
     if path.endswith("lm_head") and str(config.get("model_type", "")) == "muse_spark":
         # mlx-lm's Muse Spark casts the lm_head input to the weight dtype, so
         # a quantized lm_head gives wrong logits there.

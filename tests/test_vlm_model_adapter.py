@@ -57,6 +57,42 @@ class TestVLMModelAdapter:
         assert adapter._pending_embeds is None
         assert adapter._embed_offset == 0
 
+    def test_prefill_prompt_ids_reach_only_the_first_chunk(self):
+        """Bound ids replace another request's stash at offset 0, nowhere else."""
+        from types import SimpleNamespace
+
+        from omlx.models.vlm import VLMModelAdapter
+
+        seen = []
+
+        class LanguageModel:
+            _prompt_ids = None
+
+            def __call__(self, inputs, cache=None, **kwargs):
+                seen.append(self._prompt_ids)
+                return MockMXArray()
+
+        vlm = self._make_mock_vlm_model()
+        vlm.language_model = LanguageModel()
+        vlm.config.model_type = "unlimited-ocr"
+        adapter = VLMModelAdapter(vlm)
+        stale = [7, 7]
+
+        for offset, bound, expected in (
+            (0, [1, 2, 3], [1, 2, 3]),  # first prefill chunk
+            (256, [1, 2, 3], None),  # later prefill chunk
+            (0, None, None),  # unbound call
+            (300, None, None),  # decode
+        ):
+            vlm.language_model._prompt_ids = stale
+            if bound is not None:
+                adapter.bind_prefill_prompt_ids(bound)
+            adapter(MockMXArray((1, 4)), cache=[SimpleNamespace(offset=offset)])
+            if expected is None:
+                assert seen[-1] is None
+            else:
+                assert seen[-1].tolist() == expected
+
     def test_release_resources_drops_model_references(self):
         """release_resources drops raw VLM/language model and pending arrays."""
         from omlx.models.vlm import VLMModelAdapter

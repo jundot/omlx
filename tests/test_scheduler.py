@@ -345,9 +345,12 @@ class TestSchedulerInitialization:
 
         assert scheduler.config.max_num_seqs == 64
 
-    def test_llama4_effective_cap_is_serial(self, mock_model, mock_tokenizer):
-        """Llama 4 uses ChunkedKVCache layers that are serialized for now."""
-        mock_model.config.model_type = "llama4"
+    @pytest.mark.parametrize("model_type", ["llama4", "unlimited-ocr"])
+    def test_serial_model_effective_cap_is_one(
+        self, mock_model, mock_tokenizer, model_type
+    ):
+        """Llama 4 and Unlimited-OCR caches cannot join a multi-row batch."""
+        mock_model.config.model_type = model_type
         scheduler = Scheduler(
             model=mock_model,
             tokenizer=mock_tokenizer,
@@ -355,6 +358,24 @@ class TestSchedulerInitialization:
         )
 
         assert scheduler._effective_max_num_seqs() == 1
+
+    def test_serial_model_type_reads_module_attributes(self):
+        """nn.Module subclasses dict, so model_type is read as an attribute."""
+        import mlx.nn as nn
+
+        class Llama4(nn.Module):  # mlx-lm Model keeps its ModelArgs as .args
+            def __init__(self):
+                super().__init__()
+                self.args = SimpleNamespace(model_type="llama4")
+
+        class Adapter(nn.Module):  # VLMModelAdapter exposes the VLM config
+            @property
+            def config(self):
+                return SimpleNamespace(model_type="unlimited-ocr")
+
+        assert scheduler_module._serial_model_type(Llama4()) == "llama4"
+        assert scheduler_module._serial_model_type(Adapter()) == "unlimited-ocr"
+        assert scheduler_module._serial_model_type(nn.Linear(2, 2)) is None
 
     def test_init_falls_back_when_paged_ssd_cache_unavailable(
         self, mock_model, mock_tokenizer, tmp_path, monkeypatch, caplog
@@ -9105,6 +9126,36 @@ def test_external_prefill_keeps_image_prefix_atomic(mock_model, mock_tokenizer):
     assert [
         c.args[2] for c in scheduler._emit_prefill_boundary_snapshot.call_args_list
     ] == [8, 12]
+
+
+def test_external_prefill_keeps_full_chunks_without_snapshots(
+    mock_model, mock_tokenizer
+):
+    """Layouts the prefix cache never stores are not cut at block boundaries."""
+    from mlx_vlm.models.cache import RotatingKVCache
+
+    scheduler = Scheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(prefill_step_size=8, paged_cache_block_size=4),
+    )
+    scheduler.block_aware_cache = MagicMock()
+    scheduler._model_has_unreconstructible_cache = lambda: True
+    request = Request(
+        request_id="no-snapshots",
+        prompt=list(range(13)),
+        sampling_params=SamplingParams(),
+    )
+    request.prompt_token_ids = list(range(13))
+    request.num_prompt_tokens = 13
+    request.benchmark_trace = True
+    scheduler._do_external_prefill(
+        request,
+        request.prompt_token_ids,
+        [RotatingKVCache(max_size=16)],
+        vlm_embeds=(mx.zeros((1, 13, 8)), {}, 0),
+    )
+    assert request.benchmark_prefill_chunks == [8, 4]
 
 
 @pytest.mark.parametrize("on_ssd", [True, False])

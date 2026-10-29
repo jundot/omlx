@@ -1669,6 +1669,13 @@ def _bind_text_prefill_rope_delta(model: Any, delta: float) -> None:
         generic_setter(mx.array([delta]))
 
 
+def _bind_prefill_prompt_ids(model: Any, request: Any) -> None:
+    """Hand the request's full prompt ids to the imminent prefill call."""
+    binder = getattr(type(model), "bind_prefill_prompt_ids", None)
+    if callable(binder):
+        binder(model, getattr(request, "prompt_token_ids", None))
+
+
 def _mark_text_positions(model: Any, request: Any, uid: int) -> None:
     """Hand a text-proven request's batch uid to the adapter after insert(); the
     prefill chunks ran under a temporary uid and only marked the request."""
@@ -1746,8 +1753,9 @@ def _advance_vlm_extra(extra: dict[str, Any], n: int) -> dict[str, Any]:
 
 
 def _get_attr_or_key(obj: Any, name: str) -> Any:
-    if isinstance(obj, dict):
-        return obj.get(name)
+    # nn.Module is a dict of its arrays and child modules; also read attributes.
+    if isinstance(obj, dict) and name in obj:
+        return obj[name]
     try:
         value = getattr(obj, name)
     except Exception:
@@ -1791,8 +1799,13 @@ def _ceil_to_contended_grid(tokens: int) -> int:
     return -(-tokens // _CONTENDED_CHUNK_GRID) * _CONTENDED_CHUNK_GRID
 
 
-def _model_declares_llama4(model: Any) -> bool:
-    """Return True if the loaded model/config tree declares Llama 4."""
+# Model types whose caches cannot join a multi-row batch yet: Llama 4's
+# ChunkedKVCache and Unlimited-OCR's R-SWA ring and DASH caches.
+_SERIAL_MODEL_TYPES = frozenset({"llama4", "unlimited-ocr"})
+
+
+def _serial_model_type(model: Any) -> str | None:
+    """Return the model_type in the model/config tree that needs serial requests."""
     seen: set[int] = set()
     stack = [model]
     while stack:
@@ -1804,8 +1817,9 @@ def _model_declares_llama4(model: Any) -> bool:
             continue
         seen.add(obj_id)
 
-        if _get_attr_or_key(obj, "model_type") == "llama4":
-            return True
+        model_type = _get_attr_or_key(obj, "model_type")
+        if model_type in _SERIAL_MODEL_TYPES:
+            return model_type
 
         for attr in ("config", "args", "text_config", "language_config", "llm_config"):
             child = _get_attr_or_key(obj, attr)
@@ -1813,7 +1827,7 @@ def _model_declares_llama4(model: Any) -> bool:
                 child, (str, bytes, int, float, bool)
             ):
                 stack.append(child)
-    return False
+    return None
 
 
 class SchedulingPolicy(Enum):
@@ -2181,11 +2195,13 @@ class Scheduler:
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
         self._stream = stream if stream is not None else _default_generation_stream
-        self._serialize_llama4_requests = _model_declares_llama4(model)
-        if self._serialize_llama4_requests and self.config.max_num_seqs > 1:
+        serial_model_type = _serial_model_type(model)
+        self._serialize_requests = serial_model_type is not None
+        if self._serialize_requests and self.config.max_num_seqs > 1:
             logger.info(
-                "Llama 4 detected; serializing requests because ChunkedKVCache "
-                "does not support multi-row batching yet"
+                "%s detected; serializing requests because its KV cache "
+                "does not support multi-row batching yet",
+                serial_model_type,
             )
 
         # Load additional EOS tokens from generation_config.json.
@@ -3896,6 +3912,12 @@ class Scheduler:
             return False
 
         def _ok(c: Any) -> bool:
+            # Unlimited-OCR's DASH caches keep router state beside K/V and its
+            # R-SWA cache overwrites a decode ring. A packed cache drops both.
+            if getattr(c, "preserve_auxiliary_kv_state", False) or (
+                type(c).__name__ == "RingSlidingKVCache"
+            ):
+                return False
             if isinstance(c, (KVCache, _vlm_cache.KVCache)):
                 return True
             if isinstance(c, (ArraysCache, _vlm_cache.ArraysCache)):
@@ -4298,6 +4320,8 @@ class Scheduler:
             block_size > 0
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
+            # Unsupported layouts never store snapshots; keep full prefill chunks.
+            and not self._model_has_unreconstructible_cache()
         )
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
@@ -4550,6 +4574,7 @@ class Scheduler:
                     model_kwargs,
                     first_chunk=processed_tokens == 0,
                 )
+                _bind_prefill_prompt_ids(self.model, request)
                 prefill_out = prefill_model(
                     input_arr[:, :n_to_process],
                     cache=prompt_cache,
@@ -6556,6 +6581,8 @@ class Scheduler:
             block_size > 0
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
+            # Unsupported layouts never store snapshots; keep full prefill chunks.
+            and not self._model_has_unreconstructible_cache()
         )
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
@@ -6939,6 +6966,7 @@ class Scheduler:
             chunk_kwargs,
             first_chunk=state.tokens_processed == 0,
         )
+        _bind_prefill_prompt_ids(self.model, state.request)
         prefill_out = prefill_model(chunk, cache=state.cache, **chunk_kwargs)
         if capture_from is not None:
             self._dflash_seed_prefill(
@@ -12061,7 +12089,7 @@ class Scheduler:
         """Current admission cap, narrowed for models that require serial decode."""
         self._refresh_generation_overflow_recovery_ids()
         if (
-            self._serialize_llama4_requests
+            self._serialize_requests
             or self._generation_overflow_recovery_ids
             or self._memory_requeue_ids
         ):
