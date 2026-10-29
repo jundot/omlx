@@ -2007,7 +2007,7 @@ class TestForwardLayer:
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_returns_tensor_when_block_returns_tensor(self):
         tensor = mx.ones((2, 4, 8))
-        block = lambda x, mask, cache, pos: x * 2
+        block = lambda x, mask=None, cache=None: x * 2
         result = _forward_layer(block, tensor, None, None)
         assert isinstance(result, mx.array)
         assert result.shape == (2, 4, 8)
@@ -2015,7 +2015,7 @@ class TestForwardLayer:
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_unwraps_3tuple_gemma4_style(self):
         tensor = mx.ones((2, 4, 8))
-        block = lambda x, mask, cache, pos: (x * 2, None, 0)
+        block = lambda x, mask=None, cache=None: (x * 2, None, 0)
         result = _forward_layer(block, tensor, None, None)
         assert isinstance(result, mx.array)
         assert result.shape == (2, 4, 8)
@@ -2023,18 +2023,42 @@ class TestForwardLayer:
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_unwraps_2tuple_hunyuan_style(self):
         tensor = mx.ones((2, 4, 8))
-        block = lambda x, mask, cache, pos: (x * 2, None)
+        block = lambda x, mask=None, cache=None: (x * 2, None)
         result = _forward_layer(block, tensor, None, None)
         assert isinstance(result, mx.array)
         assert result.shape == (2, 4, 8)
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
-    def test_returns_none_when_all_signatures_fail(self):
+    def test_returns_none_when_the_block_fails(self):
         def bad_block(*args, **kwargs):
             raise TypeError("unsupported")
 
         result = _forward_layer(bad_block, mx.ones((2, 4)), None, None)
         assert result is None
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_binds_arguments_by_name(self):
+        """Position ids must not land in an unrelated 4th parameter."""
+        seen = []
+
+        def block(x, mask=None, cache=None, offset=0):
+            seen.append((mask, cache, offset))
+            return x
+
+        _forward_layer(block, mx.ones((2, 4, 8)), "mask", mx.zeros((2, 4)))
+        assert seen == [("mask", None, 0)]
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_failing_block_runs_once(self):
+        """A retry after a failed call would feed the capture wrappers twice."""
+        calls = []
+
+        def block(x, mask=None, cache=None):
+            calls.append(mask)
+            raise ValueError("failed after the first projection")
+
+        assert _forward_layer(block, mx.ones((2, 4, 8)), "mask", None) is None
+        assert calls == ["mask"]
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_fallback_signature_with_tuple(self):
@@ -2089,7 +2113,7 @@ class TestForwardLayer:
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestGemma4StatefulLayerForward:
     @staticmethod
-    def _tiny_model(backend: str):
+    def _tiny_model(backend: str, dense: bool = False):
         common = {
             "hidden_size": 16,
             "intermediate_size": 32,
@@ -2107,6 +2131,15 @@ class TestGemma4StatefulLayerForward:
             "layer_types": ["sliding_attention", "sliding_attention"],
             "use_double_wide_mlp": False,
         }
+        if dense:
+            # 31B-like: no shared KV or per-layer inputs, a window shorter
+            # than the prompt.
+            common.update(
+                hidden_size_per_layer_input=0,
+                num_kv_shared_layers=0,
+                sliding_window=2,
+                layer_types=["sliding_attention", "full_attention"],
+            )
         if backend == "mlx_vlm":
             config_module = pytest.importorskip("mlx_vlm.models.gemma4.config")
             language_module = pytest.importorskip("mlx_vlm.models.gemma4.language")
@@ -2117,9 +2150,10 @@ class TestGemma4StatefulLayerForward:
         config = gemma4_text.ModelArgs(**common)
         return gemma4_text.Gemma4TextModel(config)
 
+    @pytest.mark.parametrize("dense", [False, True], ids=["shared-kv", "dense"])
     @pytest.mark.parametrize("backend", ["mlx_vlm", "mlx_lm"])
-    def test_manual_layer_walk_matches_native_forward(self, backend):
-        model = self._tiny_model(backend)
+    def test_manual_layer_walk_matches_native_forward(self, backend, dense):
+        model = self._tiny_model(backend, dense)
         tokens = mx.array([[1, 2, 3]])
 
         expected = model(tokens)
@@ -2129,7 +2163,7 @@ class TestGemma4StatefulLayerForward:
         )
 
         assert state["kind"] == "gemma4_shared_kv"
-        assert state["previous_kvs"] == [0, 0]
+        assert state["previous_kvs"] == ([0, 1] if dense else [0, 0])
         for layer_idx, layer in enumerate(model.layers):
             hidden, aux = _forward_layer_result(
                 layer,
@@ -2243,7 +2277,7 @@ class TestGemma4StatefulLayerForward:
         assert masks == [None, None, None]
         assert positions.tolist() == [[0, 1, 2, 3]]
 
-    def test_cache_signature_invalidates_only_stateful_gemma4(self, tmp_path):
+    def test_cache_signature_tracks_gemma4_layer_walks(self, tmp_path):
         common = {
             "model_type": "gemma4",
             "text_config": {
@@ -2277,29 +2311,341 @@ class TestGemma4StatefulLayerForward:
         dense_signature = _source_imatrix_signature(tmp_path, dense, **kwargs)
 
         assert e2b_signature["layer_walk"] == "gemma4_shared_kv_v1"
-        assert "layer_walk" not in dense_signature
+        assert dense_signature["layer_walk"] == "native_inputs_v1"
 
-    def test_dense_gemma4_keeps_generic_layer_path(self):
-        class Config:
-            model_type = "gemma4_text"
-            num_kv_shared_layers = 0
-            hidden_size_per_layer_input = 0
 
-        class DenseGemma4:
-            model_type = "gemma4_text"
-            config = Config()
-            layers = [object(), object()]
+def _tiny_vlm_model(path, config):
+    """Build a weightless mlx-vlm model the way oQ's VLM calibration route does."""
+    from mlx_vlm.utils import get_model_and_args, update_module_configs
 
-        model = DenseGemma4()
-        tokens = mx.array([[1, 2, 3]])
-        inputs = mx.ones((1, 3, 8))
-        prepared, masks, state = _prepare_layer_inputs(
-            model, model.layers, tokens, inputs
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    path.mkdir(exist_ok=True)
+    (path / "config.json").write_text(json.dumps(config))
+    maybe_apply_pre_load_patches(str(path), for_vlm=True)
+    cfg = json.loads(json.dumps(config))
+    model_class, _ = get_model_and_args(config=cfg, model_path=path)
+    for key in ("text_config", "vision_config", "audio_config"):
+        cfg.setdefault(key, {})
+    model_config = update_module_configs(
+        model_class.ModelConfig.from_dict(cfg),
+        model_class,
+        cfg,
+        ["text", "vision", "perceiver", "projector", "audio"],
+    )
+    model = model_class.Model(model_config)
+    model.eval()
+    return model
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestCalibrationWalkMatchesNativeForward:
+    """The oQe walk calls every decoder block itself. Each projection must see
+    what the model's own cached forward feeds it."""
+
+    @staticmethod
+    def _qwen3_5(path):
+        text = {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            # The gated-delta Metal kernel needs a key head dim of 32.
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 128,
+            "max_position_embeddings": 256,
+            "tie_word_embeddings": False,
+            "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+            "rope_parameters": {
+                "rope_type": "default",
+                "mrope_section": [2, 1, 1],
+                "rope_theta": 10000,
+                "partial_rotary_factor": 1.0,
+            },
+        }
+        vision = {
+            "model_type": "qwen3_5",
+            "depth": 1,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "out_hidden_size": 32,
+            "num_heads": 4,
+            "patch_size": 14,
+            "in_channels": 3,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2,
+            "num_position_embeddings": 16,
+            "deepstack_visual_indexes": [],
+        }
+        config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": text,
+            "vision_config": vision,
+        }
+        mx.random.seed(11)
+        model = _tiny_vlm_model(path, config)
+        language_model = model.language_model
+
+        def forward(tokens):
+            return language_model(tokens, cache=language_model.make_cache()).logits
+
+        return model, config, forward, 32
+
+    @staticmethod
+    def _muse_glimmer(path):
+        text = {
+            "model_type": "muse_glimmer_text",
+            "vocab_size": 128,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "max_position_embeddings": 256,
+            "sliding_window": 8,
+            "layer_types": ["sliding_attention"] * 3 + ["full_attention"],
+            "layer_rope_theta": [10000.0, 10000.0, 10000.0, 0],
+        }
+        vision = {
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 2,
+            "patch_size": 2,
+            "patch_temporal": 2,
+            "merge_size": 2,
+            "pos_emb_height": 4,
+            "pos_emb_width": 4,
+            "max_position_embeddings": 16,
+            "layer_types": ["window_attention", "full_attention"],
+        }
+        config = {
+            "model_type": "muse_glimmer",
+            "architectures": ["MuseGlimmerForConditionalGeneration"],
+            "text_config": text,
+            "vision_config": vision,
+            "image_token_id": 7,
+            "video_token_id": 6,
+            "out_hidden_size": 32,
+            "projector_hidden_size": 16,
+        }
+        mx.random.seed(17)
+        model = _tiny_vlm_model(path, config)
+        language_model = model.language_model
+
+        def forward(tokens):
+            return language_model(tokens, cache=language_model.make_cache()).logits
+
+        return model, config, forward, 32
+
+    @staticmethod
+    def _deepseek_v4(path):
+        from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+        from tests.test_deepseek_v4_dspark import _tiny_config
+
+        apply_deepseek_v4_patch()
+        import mlx_lm.models.deepseek_v4 as dsv4
+
+        args = _tiny_config(dsv4)
+        args.num_nextn_predict_layers = 0
+        # Compressed layers, with a window shorter than the prompt.
+        args.compress_ratios = [4, 4, 4, 0, 0, 0]
+        args.num_hash_layers = 1
+        args.sliding_window = 16
+        mx.random.seed(4)
+        model = dsv4.Model(args)
+        model.eval()
+
+        def forward(tokens):
+            return model(tokens, cache=model.make_cache())
+
+        return model, {**vars(args), "model_type": "deepseek_v4"}, forward, 64
+
+    @staticmethod
+    def _tiny_lm(model_type, config):
+        import importlib
+
+        from mlx_lm.models.cache import make_prompt_cache
+
+        module = importlib.import_module(f"mlx_lm.models.{model_type}")
+        config = {**config, "model_type": model_type}
+        mx.random.seed(7)
+        model = module.Model(module.ModelArgs.from_dict(config))
+        model.eval()
+
+        def forward(tokens):
+            return model(tokens, cache=make_prompt_cache(model))
+
+        return model, config, forward, 32
+
+    # MLA layers in the DeepSeek V3 style, which read the mask with mx.where.
+    _MLA = {
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "moe_intermediate_size": 32,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "n_shared_experts": 1,
+        "n_routed_experts": 4,
+        "routed_scaling_factor": 1.0,
+        "kv_lora_rank": 16,
+        "q_lora_rank": 32,
+        "qk_rope_head_dim": 8,
+        "v_head_dim": 16,
+        "qk_nope_head_dim": 16,
+        "topk_method": "noaux_tc",
+        "scoring_func": "sigmoid",
+        "norm_topk_prob": True,
+        "n_group": 1,
+        "topk_group": 1,
+        "num_experts_per_tok": 2,
+        "moe_layer_freq": 1,
+        "first_k_dense_replace": 1,
+        "max_position_embeddings": 256,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000.0,
+        "rope_scaling": None,
+        "attention_bias": False,
+    }
+
+    def _deepseek_v3(self, path):
+        return self._tiny_lm("deepseek_v3", self._MLA)
+
+    def _kimi_k3(self, path):
+        # Attention-residual blocks thread state from layer to layer.
+        config = {
+            **self._MLA,
+            "num_hidden_layers": 4,
+            "num_experts": 4,
+            "num_experts_per_token": 2,
+            "num_shared_experts": 1,
+            "num_expert_group": 1,
+            "routed_expert_hidden_size": 32,
+            "attn_res_block_size": 2,
+            "linear_attn_config": {
+                "kda_layers": [1, 2, 3],
+                "full_attn_layers": [4],
+                "num_heads": 4,
+                "head_dim": 16,
+                "short_conv_kernel_size": 4,
+            },
+        }
+        return self._tiny_lm("kimi_k3", config)
+
+    def _ministral3(self, path):
+        # Llama 4 attention scaling, and a window shorter than the prompt.
+        config = {
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 256,
+            "tie_word_embeddings": False,
+            "sliding_window": 8,
+            "layer_types": ["sliding_attention", "full_attention"] * 2,
+            "rope_parameters": {
+                "rope_theta": 10000.0,
+                "rope_type": "default",
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 8,
+            },
+        }
+        return self._tiny_lm("ministral3", config)
+
+    # Plain attention stack: 4 layers alternating sliding and full attention.
+    _DENSE = {
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "intermediate_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "rms_norm_eps": 1e-6,
+        "max_position_embeddings": 256,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": False,
+        "sliding_window": 8,
+    }
+
+    def _gpt_oss(self, path):
+        # The model lists the layer types; no layer carries a sliding flag.
+        config = {
+            **self._DENSE,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "rope_scaling": None,
+            "layer_types": ["sliding_attention", "full_attention"] * 2,
+        }
+        return self._tiny_lm("gpt_oss", config)
+
+    def _gemma3_text(self, path):
+        # Embeddings scaled by sqrt(hidden_size) before the first layer.
+        config = {**self._DENSE, "sliding_window_pattern": 2}
+        return self._tiny_lm("gemma3_text", config)
+
+    @pytest.mark.parametrize(
+        "family",
+        [
+            "qwen3_5",
+            "muse_glimmer",
+            "deepseek_v4",
+            "deepseek_v3",
+            "kimi_k3",
+            "ministral3",
+            "gpt_oss",
+            "gemma3_text",
+        ],
+    )
+    def test_imatrix_matches_native_forward(self, family, tmp_path, monkeypatch):
+        from omlx import oq as oq_module
+
+        model, config, forward, length = getattr(self, f"_{family}")(tmp_path)
+        # Two rows: the fused MRoPE kernel reads one position row per batch row.
+        tokens = (mx.arange(2 * length).reshape(2, length) * 7 % 32).astype(mx.int32)
+
+        native = OQImatrixCollector()
+        native.install(model)
+        try:
+            mx.eval(forward(tokens))
+        finally:
+            native.restore(model)
+        monkeypatch.setattr(
+            oq_module, "_load_calibration_data", lambda *_args, **_kwargs: tokens
+        )
+        walk, _ = _collect_imatrix_from_model(
+            model,
+            object(),
+            config,
+            calib_dataset=oq_module._OQE_CALIB_DATASET,
+            num_samples=2,
+            seq_length=length,
         )
 
-        assert prepared is inputs
-        assert len(masks) == 2
-        assert not isinstance(state, dict)
+        names = {name for name in native.entries if "lm_head" not in name}
+        assert names and names <= set(walk)
+        for name in sorted(names):
+            expected = native.entries[name].in_sum2
+            error = np.abs(walk[name].in_sum2 - expected).max()
+            assert error <= 1e-3 * np.abs(expected).max(), name
+            assert np.array_equal(walk[name].counts, native.entries[name].counts)
 
 
 # =============================================================================

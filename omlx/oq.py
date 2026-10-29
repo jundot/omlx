@@ -10,8 +10,10 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 """
 
 import contextlib
+import copy
 import functools
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -5992,6 +5994,13 @@ def _source_imatrix_signature(
         # GLM-5.3 needs its mHC-expanded layer walk plus the untied output-head
         # capture. Older caches completed without either and must not be reused.
         signature["layer_walk"] = "glm5_next_hc_moe_lm_head_v4"
+    else:
+        # The first layer input from the model's own forward, blocks bound by
+        # parameter name, boolean and sliding-window masks, per-row position
+        # ids, plus the family fixes (Gemma 4 walk, DeepSeek V4 prompt caches,
+        # Kimi K3 residual blocks, Mistral attention scale). Older caches saw
+        # other layer inputs.
+        signature["layer_walk"] = "native_inputs_v1"
     return signature
 
 
@@ -8139,6 +8148,9 @@ _QWEN4_EXP_LAYER_STATE_KIND = "qwen4_exp"
 _GLM5_NEXT_LAYER_STATE_KIND = "glm5_next"
 _EMBEDDING_GEMMA2_LAYER_STATE_KIND = "embedding_gemma2"
 _FLINT_LAYER_STATE_KIND = "flint"
+_DEEPSEEK_V4_LAYER_STATE_KIND = "deepseek_v4"
+_KIMI_K3_LAYER_STATE_KIND = "kimi_k3"
+_LLAMA4_SCALED_LAYER_STATE_KIND = "llama4_attn_scale"
 
 
 def _find_layer_model(model, layers):
@@ -8180,13 +8192,15 @@ def _object_config_int(config, key: str, default: int = 0) -> int:
 
 
 def _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs):
-    """Build the stateful E2B/E4B layer-walk inputs.
+    """Build the stateful Gemma 4 layer-walk inputs.
 
     Gemma 4 E2B/E4B cannot be calibrated by invoking each decoder block as an
     independent transformer layer. They project a token-derived input for
     every layer and their tail layers consume K/V tensors produced by earlier
-    blocks. Mirror the native Gemma 4 model loop so imatrix collection and
-    sensitivity measurement see the same activations as inference.
+    blocks. Every Gemma 4 text model also scales its embeddings and gives
+    sliding and full layers different masks. Mirror the native Gemma 4 model
+    loop so imatrix collection and sensitivity measurement see the same
+    activations as inference.
     """
     layer_model = _find_layer_model(model, layers)
     if layer_model is None:
@@ -8203,9 +8217,7 @@ def _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs):
     per_layer_input_size = _object_config_int(
         layer_config, "hidden_size_per_layer_input"
     )
-    if not model_type.startswith("gemma4") or (
-        num_kv_shared_layers <= 0 and per_layer_input_size <= 0
-    ):
+    if not model_type.startswith("gemma4"):
         return None
 
     num_layers = len(layers)
@@ -8405,9 +8417,13 @@ def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None
             raise RuntimeError(
                 f"Gemma 4 calibration layer {layer_idx} returned invalid state"
             )
-        state["intermediates"][layer_idx] = aux
+        # Keep K/V only for layers a shared-KV tail reads; dense models have none.
+        if layer_idx in state["previous_kvs"][layer_idx + 1 :]:
+            state["intermediates"][layer_idx] = aux
     elif state.get("kind") == "glm_moe_dsa":
         state["prev_topk_indices"] = aux if aux is not None else fallback
+    elif state.get("kind") == _KIMI_K3_LAYER_STATE_KIND:
+        state["blocks"] = aux
 
 
 def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
@@ -8481,6 +8497,47 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
         if isinstance(result, tuple):
             return result[0], result[1] if len(result) > 1 else None
         return result, None
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _KIMI_K3_LAYER_STATE_KIND
+    ):
+        # A copy per call: block-start layers append to the summaries, and the
+        # sensitivity walk runs each block twice on the same inputs.
+        blocks = copy.copy(position_ids["blocks"])
+        try:
+            result = block(inputs, mask=mask, cache=None, blocks=blocks)
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                f"Kimi K3 calibration forward failed at layer {layer_idx}: {e}"
+            ) from e
+        return result[0], result[1]
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _LLAMA4_SCALED_LAYER_STATE_KIND
+    ):
+        try:
+            result = block(inputs, position_ids["attn_scale"], mask, cache=None)
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                f"Mistral calibration forward failed at layer {layer_idx}: {e}"
+            ) from e
+        return (result[0] if isinstance(result, tuple) else result), None
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _DEEPSEEK_V4_LAYER_STATE_KIND
+    ):
+        if layer_idx is None:
+            raise RuntimeError("DeepSeek V4 calibration requires a layer index")
+        # A fresh prompt cache per call: the sensitivity walk runs each block
+        # twice on the same inputs.
+        cache = position_ids["make_cache"]()[int(layer_idx)]
+        try:
+            result = block(inputs, mask, cache, position_ids["input_ids"])
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                f"DeepSeek V4 calibration forward failed at layer {layer_idx}: {e}"
+            ) from e
+        return (result[0] if isinstance(result, tuple) else result), None
     if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
         try:
             result = block(
@@ -8518,30 +8575,44 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
         result = block(inputs, mask=mask, cache=None)
         return (result[0] if isinstance(result, tuple) else result), None
 
-    last_exc = None
-    for call_args in [
-        (inputs, mask, None, position_ids),
-        (inputs, mask, None),
-        (inputs, mask),
-        (inputs, None, mask, None),
-        (inputs,),
-    ]:
-        try:
-            result = block(*call_args)
-            if isinstance(result, tuple):
-                return result[0], result[1] if len(result) > 1 else None
-            return result, None
-        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
-            # The traceback references this frame, which holds the block. Kept
-            # as-is it forms a cycle that leaves a streamed layer resident.
-            last_exc = e.with_traceback(None)
-            continue
-    if last_exc is not None:
-        logger.debug(
-            f"_forward_layer: all signatures failed for "
-            f"{type(block).__name__}: {last_exc}"
-        )
-    return None, None
+    try:
+        result = _call_layer_by_name(block, inputs, mask, position_ids)
+    except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+        logger.debug(f"_forward_layer: {type(block).__name__} failed: {e}")
+        return None, None
+    if isinstance(result, tuple):
+        return result[0], result[1] if len(result) > 1 else None
+    return result, None
+
+
+# Parameter names decoder blocks give the attention mask.
+_LAYER_MASK_PARAMS = ("mask", "attention_mask", "attn_mask")
+
+
+def _call_layer_by_name(block, inputs, mask, position_ids):
+    """Run a decoder block on an unpadded prompt without a cache, by name.
+
+    Binding by position put the position ids into whatever the 4th parameter
+    was (an offset, residual state or per-layer input), and retrying other
+    signatures after an error ran some projections twice. Each block is
+    called once; a required parameter without a calibration value fails.
+    """
+    params = list(inspect.signature(block).parameters.values())[1:]
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        # (*args, **kwargs) wrappers forward to an (x, mask, cache) block.
+        return block(inputs, mask)
+    kwargs = {}
+    for p in params:
+        if p.name in _LAYER_MASK_PARAMS and kwargs.keys().isdisjoint(
+            _LAYER_MASK_PARAMS
+        ):
+            kwargs[p.name] = mask
+        elif p.name == "position_ids":
+            kwargs[p.name] = position_ids
+        elif p.default is p.empty and (p.name == "cache" or p.name.endswith("_mask")):
+            # No cache, and an unpadded prompt needs no recurrent padding mask.
+            kwargs[p.name] = None
+    return block(inputs, **kwargs)
 
 
 def _forward_layer(block, inputs, mask, position_ids):
@@ -8549,60 +8620,121 @@ def _forward_layer(block, inputs, mask, position_ids):
     return _forward_layer_result(block, inputs, mask, position_ids)[0]
 
 
+def _is_recurrent_layer(layer) -> bool:
+    """Linear-attention or SSM layer of a hybrid stack."""
+    if hasattr(layer, "is_linear"):
+        return bool(layer.is_linear)
+    if hasattr(layer, "is_global"):
+        return not bool(layer.is_global)
+    return False
+
+
+# Layer or attention attributes that mark a sliding-window layer.
+_SLIDING_LAYER_FLAGS = (
+    "is_sliding",
+    "use_sliding",
+    "use_sliding_window",
+    "is_sliding_window",
+    "is_local",
+    "is_local_attention",
+)
+
+
+def _is_sliding_layer(layer, layer_type) -> bool:
+    for owner in (layer, getattr(layer, "self_attn", None)):
+        for flag in _SLIDING_LAYER_FLAGS:
+            value = getattr(owner, flag, None)
+            if value is not None:
+                return bool(value)
+    return layer_type == "sliding_attention"
+
+
 def _layer_masks_for_model(model, layers, inputs):
-    """Build the per-layer mask schedule used by the original model."""
-    if hasattr(model, "make_cache") and any(
-        hasattr(layer, "is_linear") or hasattr(layer, "is_global")
-        for layer in layers
-    ):
-        try:
-            from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+    """Build the per-layer mask schedule used by the original model.
 
-            cache = model.make_cache()
-            model_core = getattr(model, "model", model)
-            fa_idx = getattr(
-                model_core, "fa_idx", getattr(model_core, "_attn_idx", 0)
-            )
-            ssm_idx = getattr(
-                model_core, "ssm_idx", getattr(model_core, "_gla_idx", 0)
-            )
-            fa_cache = cache[fa_idx] if fa_idx < len(cache) else None
-            ssm_cache = cache[ssm_idx] if ssm_idx < len(cache) else None
-            try:
-                fa_mask = create_attention_mask(inputs, fa_cache)
-            except TypeError:
-                # mlx-lm API changed — cache.make_mask signature differs
-                fa_mask = None
-            try:
-                ssm_mask = create_ssm_mask(inputs, ssm_cache)
-            except TypeError:
-                ssm_mask = None
-            if fa_mask is not None or ssm_mask is not None:
-                if fa_mask is None:
-                    fa_mask = nn.MultiHeadAttention.create_additive_causal_mask(
-                        inputs.shape[1]
-                    ).astype(inputs.dtype if hasattr(inputs, "dtype") else mx.float16)
-                # SSM layers (GatedDeltaNet) expect (B, S) boolean mask, not
-                # (S, S) causal mask.  During calibration there is no padding,
-                # so None is the correct mask for SSM layers.
-                def _is_ssm_layer(layer):
-                    if hasattr(layer, "is_linear"):
-                        return bool(layer.is_linear)
-                    if hasattr(layer, "is_global"):
-                        return not bool(layer.is_global)
-                    return False
+    Calibration prompts are unpadded and start from an empty cache, so
+    recurrent layers take no mask, sliding layers the windowed causal mask
+    and other attention layers the full one, each as a fresh cache builds
+    it. Boolean, not additive: MLA attention selects scores with
+    mx.where(mask, ...), which reads an additive mask inverted.
+    """
+    text_model = _find_layer_model(model, layers)
+    args = getattr(text_model, "args", None) or getattr(text_model, "config", None)
+    layer_types = (
+        getattr(text_model, "layer_types", None)
+        or getattr(args, "layer_types", None)
+        or []
+    )
+    window = (
+        getattr(text_model, "window_size", None)
+        or getattr(text_model, "sliding_window", None)
+        or getattr(args, "sliding_window", None)
+    )
+    causal = create_attention_mask(inputs, None, return_array=True)
+    sliding = causal
+    if window:
+        sliding = create_attention_mask(
+            inputs, None, window_size=window, return_array=True
+        )
+    masks = []
+    for idx, layer in enumerate(layers):
+        layer_type = layer_types[idx] if idx < len(layer_types) else None
+        if _is_recurrent_layer(layer):
+            masks.append(None)
+        elif _is_sliding_layer(layer, layer_type):
+            masks.append(sliding)
+        else:
+            masks.append(causal)
+    return masks
 
-                return [
-                    ssm_mask if _is_ssm_layer(layer) else fa_mask
-                    for layer in layers
-                ]
-        except (ImportError, AttributeError):
-            pass
 
-    seq_len = inputs.shape[1]
-    mask = nn.MultiHeadAttention.create_additive_causal_mask(seq_len)
-    dtype = inputs.dtype if hasattr(inputs, "dtype") else mx.float16
-    return [mask.astype(dtype)] * len(layers)
+class _FirstLayerReachedError(Exception):
+    """Stops a model's own forward at its first decoder layer."""
+
+
+class _FirstLayerProbe:
+    """Stands in for the first decoder layer and raises with its input."""
+
+    def __init__(self, layer):
+        self._layer = layer
+
+    def __getattr__(self, name):
+        return getattr(self._layer, name)
+
+    def __call__(self, hidden, *args, **kwargs):
+        raise _FirstLayerReachedError(hidden)
+
+
+def _native_first_layer_input(text_model, layers, calib_data, inputs):
+    """The hidden state the model's own forward hands its first layer.
+
+    Many families scale or normalize the token embeddings first (Gemma by
+    sqrt(hidden_size), Granite and MiniCPM by a multiplier, Glimmer with
+    embed_norm). Running the forward up to the first layer keeps that
+    without a per-family list.
+    """
+    original = layers[0]
+    layers[0] = _FirstLayerProbe(original)
+    try:
+        text_model(calib_data)
+    except _FirstLayerReachedError as reached:
+        return reached.args[0]
+    except (TypeError, ValueError, RuntimeError, AttributeError, IndexError) as e:
+        logger.warning(
+            "oQe calibration: %s did not reach its first layer (%s); "
+            "walking from the raw token embeddings",
+            type(text_model).__name__,
+            e,
+        )
+        return inputs
+    finally:
+        layers[0] = original
+    logger.warning(
+        "oQe calibration: %s finished without calling its first layer; "
+        "walking from the raw token embeddings",
+        type(text_model).__name__,
+    )
+    return inputs
 
 
 def _qdq_weight_only(weight, bits: int, group_size: int, mode: str):
@@ -8666,12 +8798,17 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
     non-causal attention (Decision 3.0).
 
     DeepSeek V4 blocks run on a 4D hidden (B, S, hc_mult, hidden), take a
-    window-limited array mask, and need the real token ids as their 4th
-    argument (hash expert routing indexes tid2eid with them). Everything
-    else keeps the generic 3D inputs + causal masks + position ids.
+    window-limited array mask, need the real token ids as their 4th
+    argument (hash expert routing indexes tid2eid with them), and a fresh
+    prompt cache whose PoolingCache keeps the compressed windows causal.
+    Everything else keeps the generic 3D inputs + causal masks + position ids.
     """
+    # One position row per batch row: the fused MRoPE kernel reads
+    # position_ids[b * S + t], so a shared (1, S) row runs past its end.
+    position_ids = mx.broadcast_to(
+        mx.arange(calib_data.shape[1])[None, :], calib_data.shape
+    )
     if noncausal:
-        position_ids = mx.arange(calib_data.shape[1])[None, :]
         return inputs, [None] * len(layers), position_ids
     model_type = str(
         getattr(model, "model_type", "")
@@ -8727,7 +8864,12 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
             window_size=args.sliding_window,
             return_array=True,
         )
-        return h, [mask] * len(layers), calib_data
+        state = {
+            "kind": _DEEPSEEK_V4_LAYER_STATE_KIND,
+            "input_ids": calib_data,
+            "make_cache": model.make_cache,
+        }
+        return h, [mask] * len(layers), state
     if model_type == "glm_moe_dsa":
         mask = create_attention_mask(inputs, None, return_array=True)
         state = {"kind": "glm_moe_dsa", "prev_topk_indices": None}
@@ -8740,8 +8882,34 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
         # generic signature probe only lands on ``(inputs,)`` after four
         # caught exceptions per layer.
         return inputs, [None] * len(layers), {"kind": "inkling"}
+    text_model = _find_layer_model(model, layers)
+    if text_model is not None:
+        inputs = _native_first_layer_input(text_model, layers, calib_data, inputs)
     masks = _layer_masks_for_model(model, layers, inputs)
-    position_ids = mx.arange(calib_data.shape[1])[None, :]
+    if model_type == "kimi_k3":
+        # Attention-residual layers mix in the block summaries of earlier
+        # layers and extend them; the native loop threads them through.
+        blocks = None
+        if getattr(text_model, "use_attn_res", False):
+            residual_blocks = sys.modules[type(text_model).__module__].ResidualBlocks
+            blocks = residual_blocks(text_model.args.rms_norm_eps)
+        return inputs, masks, {"kind": _KIMI_K3_LAYER_STATE_KIND, "blocks": blocks}
+    text_args = getattr(text_model, "args", None) or getattr(text_model, "config", None)
+    rope_parameters = getattr(text_args, "rope_parameters", None) or {}
+    if "llama_4_scaling_beta" in rope_parameters:
+        # Mistral 3/4 blocks scale queries by position (Llama 4 scaling).
+        positions = mx.arange(calib_data.shape[1])
+        attn_scale = 1 + rope_parameters["llama_4_scaling_beta"] * mx.log(
+            1
+            + mx.floor(
+                positions / rope_parameters["original_max_position_embeddings"]
+            )
+        )
+        state = {
+            "kind": _LLAMA4_SCALED_LAYER_STATE_KIND,
+            "attn_scale": attn_scale[:, None].astype(inputs.dtype),
+        }
+        return inputs, masks, state
     return inputs, masks, position_ids
 
 
