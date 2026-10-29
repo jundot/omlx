@@ -640,6 +640,39 @@ class TestDetectModelType:
         assert detect_model_type(model_dir) == "decision"
         assert decision_kind(model_dir) == "d3"
 
+    def test_detect_d1_by_d1model_on_lfm3_config(self, tmp_path):
+        """LiquidAI d1 shares lfm3_vl / lfm3_omni configs with the LFM3 chat models."""
+        vision = {"hidden_size": 1024, "num_hidden_layers": 14}
+        chat = tmp_path / "LFM3-VL-2B"
+        d1_vl = tmp_path / "d1-2B"
+        d1_omni = tmp_path / "d1-Omni-2B"
+        configs = {
+            chat: {
+                "model_type": "lfm3_vl",
+                "architectures": ["Lfm3VlForConditionalGeneration"],
+                "vision_config": vision,
+            },
+            d1_vl: {
+                "model_type": "lfm3_vl",
+                "architectures": ["D1Model"],
+                "vision_config": vision,
+            },
+            d1_omni: {
+                "model_type": "lfm3_omni",
+                "auto_map": {"AutoModel": "modeling_d1_lfm3_omni.D1Model"},
+                "vision_config": vision,
+            },
+        }
+        for path, config in configs.items():
+            path.mkdir()
+            (path / "config.json").write_text(json.dumps(config))
+
+        assert detect_model_type(chat) == "vlm"
+        assert decision_kind(chat) is None
+        for path in (d1_vl, d1_omni):
+            assert detect_model_type(path) == "decision"
+            assert decision_kind(path) == "d1"
+
     def test_detect_openjev_by_helper_or_directory_name(self, tmp_path):
         config = {
             "model_type": "qwen3_5",

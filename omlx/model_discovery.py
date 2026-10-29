@@ -12,7 +12,7 @@ Supports:
 - Reranker models: Use RerankerEngine for document reranking
 - Audio STT models: Use STTEngine for speech-to-text (Whisper, Qwen3-ASR, ...)
 - Audio TTS models: Use TTSEngine for text-to-speech (Qwen3-TTS, Kokoro, ...)
-- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, Decision 3.0)
+- Decision models: Use DecisionEngine for /v1/systemone (Clef, OpenJev, d3, d1)
 """
 
 import contextlib
@@ -34,7 +34,7 @@ ModelType = Literal[
 EngineType = Literal[
     "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
 ]
-DecisionKind = Literal["clef", "openjev", "d3"]
+DecisionKind = Literal["clef", "openjev", "d3", "d1"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -493,7 +493,8 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
     """Return the decision-model family of a checkpoint, or None.
 
     Clef is identified by its joint head files and Decision 3.0 by its
-    readout and decision config. OpenJev is a plain Qwen3.5 checkpoint, so it
+    readout and decision config. LiquidAI d1 declares ``D1Model`` on an
+    LFM3-VL or LFM3-Omni config. OpenJev is a plain Qwen3.5 checkpoint, so it
     is identified by its helper directory or, for MLX conversions without the
     helper, by the directory name.
     """
@@ -511,7 +512,13 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
                 config = json.load(f)
         except (OSError, ValueError):
             return None
-    if config.get("model_type") != "qwen3_5":
+    model_type = config.get("model_type")
+    if model_type in {"lfm3_vl", "lfm3_omni"} and (
+        "D1Model" in (config.get("architectures") or ())
+        or str((config.get("auto_map") or {}).get("AutoModel", "")).endswith("D1Model")
+    ):
+        return "d1"
+    if model_type != "qwen3_5":
         return None
     if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
         model_path

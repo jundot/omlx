@@ -458,6 +458,10 @@ class D3Model:
         self._image_token_id = 0
         self._video_token_id = 0
 
+    @property
+    def has_vision(self) -> bool:
+        return self.backbone.has_vision
+
     def load(self) -> None:
         path = Path(self.model_path)
         config = json.loads((path / D3_DECISION_CONFIG).read_text())
