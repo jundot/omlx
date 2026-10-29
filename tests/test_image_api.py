@@ -140,7 +140,10 @@ def test_valid_structural_bundle_becomes_one_image(tmp_path):
         fixture.doCleanups()
 
 
-def test_pool_preserves_manifest_backed_image_without_chat_config(tmp_path):
+@pytest.mark.parametrize("marker_name", ["model_index.json", "omlx-pipeline.json"])
+def test_pool_preserves_manifest_backed_image_without_chat_config(
+    tmp_path, marker_name
+):
     from omlx.engine_pool import EngineEntry, EnginePool, ModelNotFoundError
 
     pool = EnginePool.__new__(EnginePool)
@@ -152,7 +155,7 @@ def test_pool_preserves_manifest_backed_image_without_chat_config(tmp_path):
         estimated_size=1,
     )
     pool._entries = {"image": entry}
-    marker = tmp_path / "omlx-pipeline.json"
+    marker = tmp_path / marker_name
     marker.write_text("{}")
     pool._raise_if_model_path_missing_locked("image", entry)
     assert pool._entries["image"] is entry
@@ -282,3 +285,40 @@ async def test_disconnect_seen_by_another_consumer_still_aborts_image_wait():
     await asyncio.wait_for(task, 1)
     assert closed.is_set()
     assert not signal._callbacks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker_name", ["model_index.json", "omlx-pipeline.json"])
+async def test_admin_lists_pipeline_without_chat_config_once(
+    tmp_path, monkeypatch, marker_name
+):
+    import json
+    from omlx.admin import routes
+
+    bundle = tmp_path / "image"
+    bundle.mkdir()
+    # Even an incomplete pipeline needs one actionable row with import errors;
+    # its owned components must not appear as standalone language models.
+    (bundle / marker_name).write_text(
+        json.dumps({"_class_name": "QwenImage21Pipeline"})
+    )
+    for name, cls in [
+        ("transformer", "QwenImage21Transformer2DModel"),
+        ("vae", "AutoencoderKLQwenImage21"),
+    ]:
+        component = bundle / name
+        component.mkdir()
+        (component / "config.json").write_text(json.dumps({"_class_name": cls}))
+    monkeypatch.setattr(
+        routes,
+        "_get_global_settings",
+        lambda: SimpleNamespace(get_effective_model_dirs=lambda: [tmp_path]),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: None)
+    result = await routes.list_hf_models(is_admin=True)
+    assert len(result["models"]) == 1
+    row = result["models"][0]
+    assert row["name"] == "image" and row["model_type"] == "image"
+    assert row["structural_status"] == "invalid" and row["import_errors"]
+    assert routes._is_listed_model_folder(bundle)
+    assert not routes._is_listed_model_folder(bundle / "transformer")
