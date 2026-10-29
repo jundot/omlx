@@ -293,6 +293,7 @@ async def test_admin_lists_pipeline_without_chat_config_once(
     tmp_path, monkeypatch, marker_name
 ):
     import json
+
     from omlx.admin import routes
 
     bundle = tmp_path / "image"
