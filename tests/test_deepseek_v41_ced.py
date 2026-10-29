@@ -14,7 +14,7 @@ from omlx.patches.deepseek_v41.language import Attention
 from omlx.patches.deepseek_v41.model import Model
 
 
-def make_model(mtp=False):
+def make_model(mtp=False, targets=(3, 4, 5)):
     kwargs = {}
     if mtp:
         kwargs = dict(
@@ -22,7 +22,7 @@ def make_model(mtp=False):
             n_mtp_layers=3,
             dspark_block_size=3,
             dspark_noise_token_id=2,
-            dspark_target_layer_ids=(3, 4, 5),
+            dspark_target_layer_ids=targets,
             dspark_n_routed_experts=2,
             dspark_n_activated_experts=1,
             dspark_markov_rank=32,
@@ -85,6 +85,31 @@ def test_skipped_decoder_tail_matches_running_it(follow):
         assert len(a.cache) == len(b.cache) == 7
         for x, y in zip(a.cache, b.cache):
             np.testing.assert_array_equal(x, y)
+
+
+@pytest.mark.parametrize("follow", [7, 2])
+def test_skipped_decoder_tail_keeps_dspark_priming(follow):
+    """With every DSpark target after the midpoint, a skipped chunk captures
+    nothing and a replay captures its window, so the draft context matches."""
+    model = make_model(mtp=True, targets=(4, 5)).language_model
+    first = mx.array([[5, 9, 3, 12, 20, 7, 4]])
+    nxt = mx.array([[8, 2, 11, 6, 13, 10, 1][:follow]])
+    runs = []
+    for announced in (7, 0):
+        cache = model.make_cache()
+        model._omlx_prefill(first, cache=cache, next_prefill_tokens=announced)
+        assert cache[3].has_pending() == bool(announced)
+        model._omlx_prefill(nxt, cache=cache)
+        context = model._omlx_mtp_prime_ctx
+        offset = context.expected_target_offset
+        keys = [np.asarray(c.keys.astype(mx.float32)) for c in context.caches]
+        logits = np.asarray(model(mx.array([[30]]), cache=cache))
+        runs.append((offset, keys, logits))
+    (offset, keys, logits), (expected_offset, expected_keys, expected) = runs
+    assert offset == expected_offset == 7 + follow
+    for a, b in zip(keys, expected_keys):
+        np.testing.assert_array_equal(a, b)
+    np.testing.assert_array_equal(logits, expected)
 
 
 def test_scoring_and_explicit_capture_are_full_depth():

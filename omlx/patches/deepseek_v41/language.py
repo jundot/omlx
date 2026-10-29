@@ -1099,9 +1099,10 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             return False
         return all(not item.empty() for item in cache) and self._stages_decode_fused()
 
-    def _replay_decoder(self, rc, stage, mid):
+    def _replay_decoder(self, rc, stage, mid, capture=False):
         """Run the decoder layers on the window a CED chunk skipped, so their
-        window caches match a chunk that ran them."""
+        window caches match a chunk that ran them. With ``capture``, returns the
+        DSpark target-layer hidden of that window."""
         h, pre, idx, candidates = rc[mid].pending()
         start = rc[mid].size() - h.shape[1]
         shared = {
@@ -1110,11 +1111,15 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             "idx": idx,
             "candidates": candidates,
         }
+        captured = {}
         for j in range(mid + 1, len(stage)):
-            layer = stage[j][1]
+            i, layer = stage[j]
+            if capture and i in self._config.dspark_target_layer_ids:
+                captured[i] = mx.mean(h, axis=2)
             h, pre = layer(h, pre, rc[j], shared, start, None, ced_tail=h.shape[1])
             mx.async_eval(h, pre)
         rc[mid].set_pending(None)
+        return captured
 
     def _stages_decode_fused(self):
         """Whether the fused decode supports the layers of every stage.
@@ -1241,7 +1246,7 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             raise ValueError(
                 "DSpark target capture currently requires one unpadded row"
             )
-        captured = {}
+        captured, replayed, skip_decoder = {}, None, False
         engram_ids = list(c.engram_layer_ids)
         results, rows = [], [[] for _ in stage]
         for row in range(input_ids.shape[0]):
@@ -1271,12 +1276,18 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                 and end - begin > c.window_size
             )
             mid = c.n_layers // 2 - self.start_idx
+            # DSpark prompt priming reads the decoder target layers. When they all
+            # follow the midpoint, a skipped chunk captures nothing (the next
+            # chunk restarts the draft context) and a replay captures its window.
+            targets = c.dspark_target_layer_ids
+            prime_decoder = bool(kwargs.get("_dspark_prime")) and bool(targets)
+            prime_decoder = prime_decoder and min(targets) > c.n_layers // 2
             if 0 <= mid < len(rc) and rc[mid].has_pending():
                 if ced_chunk:
                     # This chunk replaces every decoder window.
                     rc[mid].set_pending(None)
                 else:
-                    self._replay_decoder(rc, stage, mid)
+                    replayed = self._replay_decoder(rc, stage, mid, prime_decoder)
             if verify_states is not None:
                 for item, state in zip(rc, verify_states):
                     item._mtp_verify_state = state
@@ -1320,7 +1331,7 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # midpoint output of its window for a forward that needs the windows.
             skip_decoder = (
                 ced_tail is not None
-                and not capture
+                and (not capture or prime_decoder)
                 and image_mask is None
                 and self.pipeline_size == 1
                 and stage[0][1]._tensor_group is None
@@ -1358,7 +1369,11 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                                 self.layers[following].engram.embed,
                                 hashes[:, :, engram_ids.index(following)],
                             )
-                    if capture and i in c.dspark_target_layer_ids:
+                    if (
+                        capture
+                        and i in c.dspark_target_layer_ids
+                        and not (skip_decoder and i > ced_mid)
+                    ):
                         captured[i] = mx.mean(h, axis=2)
                     query_start = start
                     if ced_tail is not None and i > ced_mid:
@@ -1428,12 +1443,19 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             item.advance(input_ids.shape[1])
         logits = mx.concatenate(results, 0)
         if capture:
+            if skip_decoder:
+                return logits, None
             if not c.dspark_target_layer_ids or set(captured) != set(
                 c.dspark_target_layer_ids
             ):
                 raise ValueError("Incomplete DSpark target hidden capture")
-            return logits, mx.concatenate(
+            hidden = mx.concatenate(
                 [captured[i][:, -logits.shape[1] :] for i in c.dspark_target_layer_ids],
                 axis=-1,
             )
+            if replayed:
+                # The replayed window directly precedes this forward's rows.
+                before = [replayed[i] for i in c.dspark_target_layer_ids]
+                hidden = mx.concatenate([mx.concatenate(before, -1), hidden], 1)
+            return logits, hidden
         return logits

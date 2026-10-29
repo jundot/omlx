@@ -183,6 +183,7 @@ class DSparkMixin:
             token_types=token_types,
             return_dspark_hidden=capture or prime,
             mtp_verify_states=verify_states,
+            _dspark_prime=prime,
             **kwargs,
         )
         if verify:
@@ -191,7 +192,11 @@ class DSparkMixin:
             logits, hidden = result
             # The draft ring retains one window; reset across omitted spans
             # using the existing absolute-position prompt-capture contract.
-            capture_prompt(self, input_ids[:, -hidden.shape[1] :], hidden, cache)
+            # A chunk that skipped its decoder layers returns no hidden. The
+            # rows may start before input_ids when a skipped window was replayed;
+            # the capture only reads their count.
+            if hidden is not None:
+                capture_prompt(self, hidden[..., 0], hidden, cache)
             return logits
         if verify_only and return_hidden:
             return result, None
