@@ -49,8 +49,8 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
         'moe_expert_offload_resident_fraction',
-        'qwen35_oq_a8_enabled',
-        'qwen35_oq_a8_min_tokens',
+        'a8_prefill_enabled',
+        'a8_prefill_min_tokens',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -299,8 +299,8 @@
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
                 moe_expert_offload_resident_fraction: 0.25,
-                qwen35_oq_a8_enabled: false,
-                qwen35_oq_a8_min_tokens: 128,
+                a8_prefill_enabled: false,
+                a8_prefill_min_tokens: 128,
                 external_engine: '',
                 external_engines: [],
                 model_format: null,
@@ -2194,8 +2194,8 @@
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
                     moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
-                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
-                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
+                    a8_prefill_enabled: s.a8_prefill_enabled || false,
+                    a8_prefill_min_tokens: s.a8_prefill_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -3066,20 +3066,20 @@
                 return null;
             },
 
-            isQwenOqA8Model(model) {
+            isA8PrefillModel(model) {
                 const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
-                // qwen4_exp (Qwen3.8-Flash-Next) is an exact match: only that
-                // validated family has routed-expert A8, not every qwen4*.
-                return type === 'qwen4_exp'
+                // qwen4_exp (Qwen3.8-Flash-Next) and deepseek_v41 are exact
+                // matches: only those validated families have routed-expert A8.
+                return type === 'qwen4_exp' || type === 'deepseek_v41'
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
             // The kernels need native INT8 tensor ops (M5-series or newer).
             // A saved "on" keeps the toggle so it can be turned off.
-            showsQwenOqA8(model) {
-                return this.isQwenOqA8Model(model)
-                    && (model?.qwen35_oq_a8_supported === true
-                        || model?.settings?.qwen35_oq_a8_enabled === true);
+            showsA8Prefill(model) {
+                return this.isA8PrefillModel(model)
+                    && (model?.a8_prefill_supported === true
+                        || model?.settings?.a8_prefill_enabled === true);
             },
 
             validateGpuPowerLimit() {
@@ -3091,15 +3091,15 @@
                 return null;
             },
 
-            validateQwenOqA8Settings() {
-                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+            validateA8PrefillSettings() {
+                if (!this.modelSettings.a8_prefill_enabled) return null;
                 // Both wrap the same MLP call, so the combination silently
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
                 if (this.modelSettings.qwen35_ane_prefill_enabled) {
                     return window.t('js.error.ane_oq_a8_conflict');
                 }
-                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                const minTokens = Number(this.modelSettings.a8_prefill_min_tokens);
                 if (!Number.isInteger(minTokens) || minTokens < 1) {
                     return window.t('js.error.oq_a8_min_tokens_positive');
                 }
@@ -3271,8 +3271,8 @@
                         : 4,
                     moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
-                    qwen35_oq_a8_enabled: !!ms.qwen35_oq_a8_enabled,
-                    qwen35_oq_a8_min_tokens: Number(ms.qwen35_oq_a8_min_tokens) || 128,
+                    a8_prefill_enabled: !!ms.a8_prefill_enabled,
+                    a8_prefill_min_tokens: Number(ms.a8_prefill_min_tokens) || 128,
                     qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
                     // Validation only runs when the feature is enabled, so a
                     // blank numeric input must fall back to the server default
@@ -3416,9 +3416,9 @@
             async saveModelSettings() {
                 if (!this.selectedModel) return;
 
-                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
-                if (qwenOqA8ValidationError) {
-                    alert(qwenOqA8ValidationError);
+                const a8PrefillValidationError = this.validateA8PrefillSettings();
+                if (a8PrefillValidationError) {
+                    alert(a8PrefillValidationError);
                     return;
                 }
 

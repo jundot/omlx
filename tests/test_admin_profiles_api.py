@@ -1085,11 +1085,11 @@ def test_a8_profile_validation_preserves_settings(
     monkeypatch.setattr(
         admin_routes, "_oq_a8_kernels_available", lambda: reason != "hardware"
     )
-    settings = {"qwen35_oq_a8_enabled": True}
+    settings = {"a8_prefill_enabled": True}
     if reason == "conflict":
         settings["qwen35_ane_prefill_enabled"] = True
     if reason == "floor":
-        settings["qwen35_oq_a8_min_tokens"] = 0
+        settings["a8_prefill_min_tokens"] = 0
     mgr.set_settings("model-a", ModelSettings())
     if operation != "create":
         mgr.save_profile(
@@ -1116,11 +1116,11 @@ def test_a8_profile_apply_checks_merged_ane_conflict(client, monkeypatch):
     admin_routes._get_engine_pool().get_entry("model-a").config_model_type = "qwen3_5"
     monkeypatch.setattr(admin_routes, "_oq_a8_kernels_available", lambda: True)
     mgr.set_settings("model-a", ModelSettings(qwen35_ane_prefill_enabled=True))
-    mgr.save_profile("model-a", "a8", "A8", "", settings={"qwen35_oq_a8_enabled": True})
+    mgr.save_profile("model-a", "a8", "A8", "", settings={"a8_prefill_enabled": True})
     response = c.post("/admin/api/models/model-a/profiles/a8/apply")
     assert response.status_code == 400
     assert mgr.get_settings("model-a").qwen35_ane_prefill_enabled
-    assert not mgr.get_settings("model-a").qwen35_oq_a8_enabled
+    assert not mgr.get_settings("model-a").a8_prefill_enabled
 
 
 @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_6_moe", "qwen3_8"])
@@ -1135,13 +1135,13 @@ def test_a8_profile_roundtrip_supported_architectures(client, monkeypatch, model
             json={
                 "name": "a8",
                 "display_name": "A8",
-                "settings": {"qwen35_oq_a8_enabled": True},
+                "settings": {"a8_prefill_enabled": True},
             },
         ).status_code
         == 200
     )
     assert c.post(url + "/a8/apply").status_code == 200
-    assert mgr.get_settings("model-a").qwen35_oq_a8_enabled
+    assert mgr.get_settings("model-a").a8_prefill_enabled
 
 
 @pytest.mark.parametrize("operation", ["settings", "create", "update"])

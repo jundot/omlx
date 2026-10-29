@@ -3,7 +3,11 @@ import numpy as np
 import pytest
 
 from omlx.custom_kernels.attention import fast
+from omlx.patches.deepseek_v4.sparse_attention_nax import (
+    nax_sparse_attention_available,
+)
 from omlx.patches.deepseek_v41.kernels import packed_sparse_attention
+from omlx.patches.deepseek_v41.packed_attention import nax_packed_sparse_attention
 from omlx.patches.deepseek_v41.quantization import pack_activation
 
 pytestmark = pytest.mark.skipif(
@@ -152,3 +156,40 @@ def test_short_packed_attention_matches_independent_decode(length, pooled_count)
     assert mx.array_equal(actual, expected).item()
     assert mx.array_equal(actual, packed_sparse_attention(*args)).item()
     assert mx.all(mx.isfinite(actual)).item()
+
+
+@pytest.mark.skipif(
+    not nax_sparse_attention_available(), reason="needs M5 tensor units"
+)
+@pytest.mark.parametrize(
+    "start,length,pooled_count", [(0, 16, 3), (131, 300, 40), (4096, 64, 1024)]
+)
+def test_nax_packed_attention_matches_native(start, length, pooled_count):
+    """Decoded rows on the tensor units: masked, out-of-range and not yet
+    visible pooled rows, and the window, as the native kernel; P in one fp16
+    piece stays within the native kernel's BF16 P rounding."""
+    mx.random.seed(211)
+    q = mx.random.normal((1, length, 64, 512)).astype(mx.bfloat16)
+    old = min(start, 128)
+    window = pack_activation(mx.random.normal((1, old + length, 512)))
+    pooled = pack_activation(mx.random.normal((1, pooled_count, 512)), 4, 16, True)
+    picks = mx.random.randint(-1, pooled_count + 3, (1, length, 37))
+    ci = mx.sort(picks, axis=-1).astype(mx.int32)
+    sinks = mx.linspace(-4.123456, 4.234567, 64)
+    native = fast.packed_sparse_attention(
+        q.transpose(0, 2, 1, 3),
+        window[:, None],
+        pooled,
+        ci[:, None].astype(mx.uint32),
+        sinks,
+        512**-0.5,
+        start,
+        4,
+        128,
+    ).astype(mx.float32)
+    nax = nax_packed_sparse_attention(
+        q, window, pooled, ci, sinks, 512**-0.5, start, 4, 128
+    )
+    assert nax is not None
+    diff = mx.linalg.norm(nax.astype(mx.float32) - native) / mx.linalg.norm(native)
+    assert float(diff) < 5e-3

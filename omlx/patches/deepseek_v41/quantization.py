@@ -14,6 +14,7 @@ import mlx.nn as nn
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
 from ..deepseek_v4.switch_layers import _AFFINE_NATIVE_MIN_ROUTES, QuantizedSwitchLinear
+from .a8 import dense_a8
 from .activation import pack_fp8_activation, quantize_fp8_activation
 from .gemv import mxfp8_gemv
 
@@ -243,6 +244,10 @@ class QuantizedProjection(QuantizedSwitchLinear):
         return super()._native_block_kind(x, sorted_indices, dtype=dtype)
 
     def __call__(self, x, indices=None, sorted_indices=False, block_plan=None):
+        if indices is None:
+            y = dense_a8(self, x)
+            if y is not None:
+                return y
         if self.quantize_input:
             x = quantize_activation(x)
         return self.project_quantized(x, indices, sorted_indices, block_plan)

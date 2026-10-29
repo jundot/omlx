@@ -44,7 +44,7 @@ _QMM_VARIANT = 8
 _MIN_TOKENS = 2048
 _Q8_MIN_TOKENS = 16384
 # Decode and verify guard, not a profitability floor: the A8 backend applies
-# qwen35_oq_a8_min_tokens itself, and rows below this never ask it.
+# a8_prefill_min_tokens itself, and rows below this never ask it.
 _Q8_BACKEND_MIN_ROWS = 64
 
 

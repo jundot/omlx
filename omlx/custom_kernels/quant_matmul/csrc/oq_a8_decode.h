@@ -1,4 +1,4 @@
-// Register-resident decoders for the oQ mixed-bit (Q4/Q5/Q8, GS64, affine)
+// Register-resident decoders for the oQ mixed-bit (Q4-Q6/Q8, GS64, affine)
 // checkpoint layout, shared by the Stage-A/reference kernels and the NAX
 // INT8 GEMM.
 //
@@ -12,6 +12,7 @@
 //
 //     Q4: 64 codes * 4 bits = 256 bits = 8 uint32 words
 //     Q5: 64 codes * 5 bits = 320 bits = 10 uint32 words
+//     Q6: 64 codes * 6 bits = 384 bits = 12 uint32 words
 //
 // so every affine group starts and ends on a word boundary and no code stream
 // crosses a group boundary. A group can therefore be decoded in isolation.

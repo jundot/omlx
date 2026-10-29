@@ -18,10 +18,12 @@ from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
     MODEL_SPECIFIC_PROFILE_FIELDS,
+    RENAMED_FIELDS,
     UNIVERSAL_FIELDS_SET,
     filter_profile_fields,
     filter_universal_fields,
     normalize_turboquant_kv_bits,
+    rename_legacy_fields,
     slugify_profile_api_name,
     validate_profile_name,
     utcnow,
@@ -185,7 +187,7 @@ def resolve_vlm_mtp_conflicts(data: dict) -> tuple:
 
 
 def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
-    """Clear ``qwen35_oq_a8_enabled`` when ANE prefill is also on.
+    """Clear ``a8_prefill_enabled`` when ANE prefill is also on.
 
     Both wrap ``Qwen3_5MLP.__call__`` and claim the same projections, so
     enabling both leaves whichever patched last in charge -- with the other
@@ -194,10 +196,10 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
     dicts that predate the exclusivity rule so ``__post_init__`` does not
     reject the whole blob.
     """
-    if not (data.get("qwen35_oq_a8_enabled") and data.get("qwen35_ane_prefill_enabled")):
+    if not (data.get("a8_prefill_enabled") and data.get("qwen35_ane_prefill_enabled")):
         return data, []
     resolved = dict(data)
-    resolved["qwen35_oq_a8_enabled"] = False
+    resolved["a8_prefill_enabled"] = False
     return resolved, ["qwen35_ane_prefill_enabled"]
 
 
@@ -295,17 +297,18 @@ class ModelSettings:
             (zero lets Accelerate choose).
         qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
-        qwen35_oq_a8_enabled: Route eligible Qwen3.5/3.6/3.8 prefill matmuls
-            through the oQ mixed-bit INT8-activation (QxA8) tensor kernels.
+        a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8 and DeepSeek V4.1
+            prefill matmuls through the INT8-activation (QxA8) tensor kernels.
             Prefill only, and only a speed-up on hardware with native INT8
             tensor operations -- M5-series and newer. On anything older the
             kernels do not load and the setting is refused. Decode is
             unaffected. Changes numerics: activations are quantized to INT8.
             Also covers the routed-expert gate/up of Qwen3.8-Flash-Next
             (affine Q4 / GS64 experts); the MTP draft layer and the down
-            projection stay on the A16 path.
+            projection stay on the A16 path. DeepSeek V4.1 covers its affine
+            GS64 routed experts, shared expert and dense projections.
             Mutually exclusive with qwen35_ane_prefill_enabled.
-        qwen35_oq_a8_min_tokens: Shortest sequence routed to the kernels.
+        a8_prefill_min_tokens: Shortest sequence routed to the kernels.
         moe_expert_offload_enabled: Stream MoE expert weights from the
             checkpoint on demand instead of keeping them all resident (fits
             models larger than memory; costs decode speed). Requires reload.
@@ -457,8 +460,8 @@ class ModelSettings:
     # The kernel reads the checkpoint's own packed weight stream, so a routed
     # projection costs no extra weight memory and the module's arrays stay
     # readable by the decode path.
-    qwen35_oq_a8_enabled: bool = False
-    qwen35_oq_a8_min_tokens: int = 128
+    a8_prefill_enabled: bool = False
+    a8_prefill_min_tokens: int = 128
 
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool = False
@@ -549,16 +552,16 @@ class ModelSettings:
         # The ddtree verify mode was removed; stored settings run as adaptive.
         if self.dflash_verify_mode == "ddtree":
             self.dflash_verify_mode = "adaptive"
-        if self.qwen35_oq_a8_enabled and self.qwen35_oq_a8_min_tokens < 1:
-            raise ValueError("qwen35_oq_a8_min_tokens must be at least 1")
+        if self.a8_prefill_enabled and self.a8_prefill_min_tokens < 1:
+            raise ValueError("a8_prefill_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
         # Qwen3_5MLP.__call__, so enabling both leaves whichever patched last
         # in charge and the other silently inert -- with different numerics
         # depending on which won. Rejected at construction time so the clash
         # surfaces in the admin UI / API rather than as a silent no-op.
-        if self.qwen35_oq_a8_enabled and self.qwen35_ane_prefill_enabled:
+        if self.a8_prefill_enabled and self.qwen35_ane_prefill_enabled:
             raise ValueError(
-                "qwen35_oq_a8_enabled and qwen35_ane_prefill_enabled cannot "
+                "a8_prefill_enabled and qwen35_ane_prefill_enabled cannot "
                 "both be True; choose one Qwen3.5 prefill accelerator per model"
             )
         # Legacy TurboQuant bit values stay loadable; see normalize_turboquant_kv_bits.
@@ -638,7 +641,9 @@ class ModelSettings:
         valid_fields = {f.name for f in fields(cls)}
 
         # Filter to only valid keys
-        filtered_data = {k: v for k, v in data.items() if k in valid_fields}
+        filtered_data = {
+            k: v for k, v in rename_legacy_fields(data).items() if k in valid_fields
+        }
 
         return cls(**filtered_data)
 
@@ -815,6 +820,7 @@ class ModelSettingsManager:
             self._settings = {}
 
             for model_id, model_data in models_data.items():
+                model_data = rename_legacy_fields(model_data)
                 # Settings saved before the vlm_mtp exclusivity rule may
                 # combine vlm_mtp_enabled with processor-backed settings;
                 # __post_init__ would raise and the except below would drop
@@ -834,9 +840,9 @@ class ModelSettingsManager:
                 )
                 if prefill_conflicts:
                     logger.warning(
-                        "Model '%s': qwen35_oq_a8_enabled disabled on load; it "
+                        "Model '%s': a8_prefill_enabled disabled on load; it "
                         "cannot be combined with %s. Unset that setting to "
-                        "re-enable the oQ A8 prefill kernels.",
+                        "re-enable A8 prefill.",
                         model_id,
                         ", ".join(prefill_conflicts),
                     )
@@ -1099,6 +1105,9 @@ class ModelSettingsManager:
                         del settings["ttl_seconds"]
                         changed = True
                         model_changed = True
+                    if settings and settings.keys() & RENAMED_FIELDS.keys():
+                        profile["settings"] = settings = rename_legacy_fields(settings)
+                        changed = True
                     if settings:
                         normalized = _profile_settings_with_legacy_kv_scheme(settings)
                         if normalized is not settings:

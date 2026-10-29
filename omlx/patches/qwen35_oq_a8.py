@@ -144,7 +144,8 @@ _Q8_TILE_N = 64
 def _variant_for_bits(bits: int) -> int:
     # Q4 and Q5 are autotuned independently: Q5 reads a second plane per
     # weight row and costs more registers, so the best tile need not match.
-    return _DEFAULT_VARIANT_Q5 if bits == 5 else _DEFAULT_VARIANT_Q4
+    # Q6 reads the same three-word window as Q5.
+    return _DEFAULT_VARIANT_Q5 if bits in (5, 6) else _DEFAULT_VARIANT_Q4
 
 
 def classify_linear(linear: Any) -> OqA8Plan | None:
@@ -439,7 +440,7 @@ def oq_a8_gdn_projections(
 # Model-side routing
 # --------------------------------------------------------------------------
 #
-# Routed only for a model whose ``qwen35_oq_a8_enabled`` setting says so. Two
+# Routed only for a model whose ``a8_prefill_enabled`` setting says so. Two
 # entry points carry essentially all of the routable work in this checkpoint:
 # the SwiGLU MLP, and the linear-attention input projections.
 #

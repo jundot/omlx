@@ -138,7 +138,7 @@ FEATURE_GROUPS: tuple[FeatureGroup, ...] = (
     FeatureGroup(
         "ane_prefill", "qwen35_ane_prefill_enabled", prefixes=("qwen35_ane_prefill_",)
     ),
-    FeatureGroup("oq_a8", "qwen35_oq_a8_enabled", prefixes=("qwen35_oq_a8_",)),
+    FeatureGroup("a8_prefill", "a8_prefill_enabled", prefixes=("a8_prefill_",)),
     FeatureGroup(
         "moe_expert_offload",
         "moe_expert_offload_enabled",
@@ -186,7 +186,7 @@ def resolve_draft_reference(
 
 # Dataclass defaults for every ModelSettings field. Sending these instead of
 # null matters: the settings PUT handler rejects null for the ANE numeric
-# controls and for qwen35_oq_a8_min_tokens.
+# controls and for a8_prefill_min_tokens.
 DEFAULTS: dict[str, Any] = {
     f.name: getattr(ModelSettings(), f.name) for f in fields(ModelSettings)
 }

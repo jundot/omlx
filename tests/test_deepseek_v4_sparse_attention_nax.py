@@ -34,7 +34,7 @@ pytestmark = pytest.mark.skipif(not _nax_hardware(), reason="needs M5 tensor uni
 @pytest.fixture
 def nax(monkeypatch):
     monkeypatch.setattr(wsdpa, "_broken", False)
-    monkeypatch.setattr(nax_attn, "_BROKEN", False)
+    monkeypatch.setattr(nax_attn, "_BROKEN", set())
     return monkeypatch
 
 

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from omlx.model_profiles import filter_profile_fields, rename_legacy_fields
 from omlx.model_settings import (
     SETTINGS_VERSION,
     ModelSettings,
@@ -893,8 +894,8 @@ class TestVlmMtpProcessorExclusivity:
 def test_oq_a8_defaults_to_off():
     """It changes inference numerics, so it must be opt-in."""
     settings = ModelSettings()
-    assert settings.qwen35_oq_a8_enabled is False
-    assert settings.qwen35_oq_a8_min_tokens == 128
+    assert settings.a8_prefill_enabled is False
+    assert settings.a8_prefill_min_tokens == 128
 
 
 def test_oq_a8_and_ane_prefill_cannot_both_be_enabled():
@@ -902,10 +903,10 @@ def test_oq_a8_and_ane_prefill_cannot_both_be_enabled():
     whichever patches first rather than two accelerators stacking. Constructing
     the combination has to raise so the clash reaches the caller."""
     with pytest.raises(ValueError, match="cannot"):
-        ModelSettings(qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True)
+        ModelSettings(a8_prefill_enabled=True, qwen35_ane_prefill_enabled=True)
 
     # Either one alone is fine.
-    assert ModelSettings(qwen35_oq_a8_enabled=True).qwen35_oq_a8_enabled is True
+    assert ModelSettings(a8_prefill_enabled=True).a8_prefill_enabled is True
     assert (
         ModelSettings(qwen35_ane_prefill_enabled=True).qwen35_ane_prefill_enabled
         is True
@@ -918,25 +919,25 @@ def test_prefill_conflict_resolution_keeps_ane_and_reports_it():
     than turning the losing accelerator off and saying so."""
     resolved, conflicts = resolve_qwen35_prefill_conflicts(
         {
-            "qwen35_oq_a8_enabled": True,
+            "a8_prefill_enabled": True,
             "qwen35_ane_prefill_enabled": True,
             "max_tokens": 4096,
         }
     )
-    assert resolved["qwen35_oq_a8_enabled"] is False
+    assert resolved["a8_prefill_enabled"] is False
     assert resolved["qwen35_ane_prefill_enabled"] is True
     assert resolved["max_tokens"] == 4096
     assert conflicts == ["qwen35_ane_prefill_enabled"]
     # The resolved dict has to be constructible -- that is the whole point.
-    assert ModelSettings.from_dict(resolved).qwen35_oq_a8_enabled is False
+    assert ModelSettings.from_dict(resolved).a8_prefill_enabled is False
 
 
 def test_prefill_conflict_resolution_leaves_clean_dicts_alone():
     for data in (
         {},
-        {"qwen35_oq_a8_enabled": True},
+        {"a8_prefill_enabled": True},
         {"qwen35_ane_prefill_enabled": True},
-        {"qwen35_oq_a8_enabled": False, "qwen35_ane_prefill_enabled": True},
+        {"a8_prefill_enabled": False, "qwen35_ane_prefill_enabled": True},
     ):
         resolved, conflicts = resolve_qwen35_prefill_conflicts(data)
         assert conflicts == []
@@ -954,9 +955,9 @@ def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
                 "version": SETTINGS_VERSION,
                 "models": {
                     "clash/model": {
-                        "qwen35_oq_a8_enabled": True,
+                        "a8_prefill_enabled": True,
                         "qwen35_ane_prefill_enabled": True,
-                        "qwen35_oq_a8_min_tokens": 512,
+                        "a8_prefill_min_tokens": 512,
                     }
                 },
             }
@@ -965,9 +966,39 @@ def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
     manager = ModelSettingsManager(tmp_path)
     settings = manager.get_settings("clash/model")
     assert settings.qwen35_ane_prefill_enabled is True
-    assert settings.qwen35_oq_a8_enabled is False
+    assert settings.a8_prefill_enabled is False
     # The rest of the blob survives the downgrade.
-    assert settings.qwen35_oq_a8_min_tokens == 512
+    assert settings.a8_prefill_min_tokens == 512
+
+
+def test_old_a8_setting_names_still_load(tmp_path):
+    """Earlier releases stored the setting as qwen35_oq_a8_*; the rename must
+    not turn a saved opt-in off in settings, profiles or uploaded recipes."""
+    legacy = {"qwen35_oq_a8_enabled": True, "qwen35_oq_a8_min_tokens": 512}
+    current = {"a8_prefill_enabled": True, "a8_prefill_min_tokens": 512}
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps({"version": SETTINGS_VERSION, "models": {"m": legacy}})
+    )
+    profile = {
+        "name": "fast",
+        "display_name": "Fast",
+        "created_at": "2026-06-01T00:00:00+00:00",
+        "updated_at": "2026-06-01T00:00:00+00:00",
+        "settings": dict(legacy),
+    }
+    profiles_file = tmp_path / "model_profiles.json"
+    profiles_file.write_text(
+        json.dumps({"version": 1, "profiles": {"m": {"fast": profile}}})
+    )
+
+    settings = ModelSettingsManager(tmp_path).get_settings("m")
+    assert (settings.a8_prefill_enabled, settings.a8_prefill_min_tokens) == (True, 512)
+    persisted = json.loads(profiles_file.read_text())["profiles"]["m"]["fast"]
+    assert persisted["settings"] == current
+    assert filter_profile_fields(legacy) == current
+    # A record holding both names keeps the current one.
+    both = {"qwen35_oq_a8_enabled": True, "a8_prefill_enabled": False}
+    assert rename_legacy_fields(both) == {"a8_prefill_enabled": False}
 
 
 def test_oq_a8_exposes_no_kernel_choice():
@@ -988,36 +1019,36 @@ def test_a_stale_saved_variant_is_ignored_rather_than_fatal():
     """
     restored = ModelSettings.from_dict(
         {
-            "qwen35_oq_a8_enabled": True,
+            "a8_prefill_enabled": True,
             "qwen35_oq_a8_variant": 706,
-            "qwen35_oq_a8_min_tokens": 512,
+            "a8_prefill_min_tokens": 512,
         }
     )
-    assert restored.qwen35_oq_a8_enabled is True
-    assert restored.qwen35_oq_a8_min_tokens == 512
+    assert restored.a8_prefill_enabled is True
+    assert restored.a8_prefill_min_tokens == 512
     assert not hasattr(restored, "qwen35_oq_a8_variant")
 
 
 @pytest.mark.parametrize("value", [0, -1])
 def test_oq_a8_rejects_non_positive_min_tokens(value):
-    with pytest.raises(ValueError, match="qwen35_oq_a8_min_tokens"):
-        ModelSettings(qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=value)
+    with pytest.raises(ValueError, match="a8_prefill_min_tokens"):
+        ModelSettings(a8_prefill_enabled=True, a8_prefill_min_tokens=value)
 
 
 def test_oq_a8_round_trips_through_dict():
     settings = ModelSettings(
-        qwen35_oq_a8_enabled=True,
-        qwen35_oq_a8_min_tokens=1024,
+        a8_prefill_enabled=True,
+        a8_prefill_min_tokens=1024,
     )
     restored = ModelSettings.from_dict(settings.to_dict())
-    assert restored.qwen35_oq_a8_enabled is True
-    assert restored.qwen35_oq_a8_min_tokens == 1024
+    assert restored.a8_prefill_enabled is True
+    assert restored.a8_prefill_min_tokens == 1024
 
 
 def test_oq_a8_is_a_model_specific_profile_field():
     """Never a template field: it is tied to one checkpoint's quantization."""
     from omlx.model_profiles import MODEL_SPECIFIC_PROFILE_FIELDS, UNIVERSAL_FIELDS_SET
 
-    for name in ("qwen35_oq_a8_enabled", "qwen35_oq_a8_min_tokens"):
+    for name in ("a8_prefill_enabled", "a8_prefill_min_tokens"):
         assert name in MODEL_SPECIFIC_PROFILE_FIELDS
         assert name not in UNIVERSAL_FIELDS_SET

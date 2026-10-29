@@ -134,7 +134,7 @@ def make_quantized(n_out: int, K: int, bits: int, dtype=mx.float16, seed: int = 
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bits", [4, 5, 8])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
 def test_unpack_matches_mlx_dequantize(bits):
     """Tie the reference unpacker to MLX's affine semantics.
 
@@ -172,7 +172,7 @@ def test_group_words(bits):
 
 
 @requires_kernels
-@pytest.mark.parametrize("bits", [4, 5, 8])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
 def test_kernel_decode_is_bit_exact(bits):
     """Decoded codes match the reference unpacker (Q8 centered)."""
     fast = _kernels()
@@ -266,7 +266,7 @@ def test_stage_a_zero_row_is_not_nan():
 
 
 @requires_kernels
-@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("bits", [4, 5, 6])
 @pytest.mark.parametrize("act_mode", [0, 1])
 def test_qmm_matches_affine_reference(bits, act_mode):
     """FP32 affine accumulation against an independent implementation.
@@ -619,7 +619,7 @@ def test_v8_matches_w4a16_within_quantization_error(bits, act_mode, M):
 
 @requires_kernels
 @pytest.mark.parametrize("variant", [800, 801, 802, 803, 804, 805, 806])
-@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("bits", [4, 5, 6])
 def test_v8_tiles_agree_with_each_other(variant, bits):
     """Every tile computes the same thing; only the simdgroup grid differs."""
     fast = _kernels()

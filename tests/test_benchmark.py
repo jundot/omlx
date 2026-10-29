@@ -1136,16 +1136,16 @@ class TestFilterUploadedSettings:
     def test_shareable_performance_fields_are_kept(self):
         out = _filter_uploaded_settings(
             self._settings(
-                qwen35_oq_a8_enabled=True,
-                qwen35_oq_a8_min_tokens=64,
+                a8_prefill_enabled=True,
+                a8_prefill_min_tokens=64,
                 moe_expert_offload_enabled=True,
                 moe_expert_offload_resident_fraction=0.5,
                 dflash_draft_window_size=4096,
                 dflash_block_size=8,
             )
         )
-        assert out["qwen35_oq_a8_enabled"] is True
-        assert out["qwen35_oq_a8_min_tokens"] == 64
+        assert out["a8_prefill_enabled"] is True
+        assert out["a8_prefill_min_tokens"] == 64
         assert out["moe_expert_offload_enabled"] is True
         assert out["moe_expert_offload_resident_fraction"] == 0.5
         assert out["dflash_draft_window_size"] == 4096

@@ -162,4 +162,5 @@ template <int BITS>
 
 instantiate_oq_a8_decode_weights(4);
 instantiate_oq_a8_decode_weights(5);
+instantiate_oq_a8_decode_weights(6);
 instantiate_oq_a8_decode_weights(8);

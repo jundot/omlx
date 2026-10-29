@@ -1,10 +1,13 @@
 """Routing preserves row-local activation quantization and router inputs."""
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.patches.deepseek_v41 import language
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
+from omlx.patches.deepseek_v41 import a8, language
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.patches.deepseek_v41.quantization import QuantizedProjection
 
@@ -54,6 +57,83 @@ def test_moe_quantization_reuse_matches_per_expert_reference(length, routed, sha
     )
     np.testing.assert_array_equal(
         actual.astype(mx.float32), repeated.astype(mx.float32)
+    )
+
+
+def _a8_moe(a8_prefill, min_tokens=128):
+    """A MoE laid out like oQ3e: routed experts affine Q3 GS64 (the A8 gather)
+    and an affine Q8 shared expert (the dense A8 GEMM once tagged)."""
+    mx.random.seed(7)
+    config = ModelConfig(
+        dim=256,
+        moe_inter_dim=128,
+        n_routed_experts=8,
+        n_activated_experts=2,
+        a8_prefill=a8_prefill,
+        a8_prefill_min_tokens=min_tokens,
+    )
+    moe = language.MoE(config)
+    moe.gate.weight = mx.random.normal((8, 256))
+    for expert, switched in [(moe.experts, True), (moe.shared_experts, False)]:
+        for name, shape in (("w1", (128, 256)), ("w3", (128, 256)), ("w2", (256, 128))):
+            weight = mx.random.normal(((8,) if switched else ()) + shape) * 0.05
+            bits = 3 if switched else 8
+            packed, scales, biases = mx.quantize(
+                weight.astype(mx.bfloat16), bits=bits, group_size=64
+            )
+            setattr(
+                expert,
+                name,
+                QuantizedProjection(
+                    packed, scales, bits, "affine", biases=biases, group_size=64
+                ),
+            )
+    if a8_prefill:
+        a8.tag_dense_a8(SimpleNamespace(layers=[moe]), min_tokens)
+    return moe
+
+
+def test_moe_a8_declined_by_the_kernels_keeps_the_a16_result(monkeypatch):
+    monkeypatch.setattr(language, "routed_experts_a8", lambda *args: None)
+    x = mx.random.normal((1, 256, 256), key=mx.random.key(3)).astype(mx.bfloat16)
+    monkeypatch.setattr(language, "shared_expert_a8", lambda *args: None)
+    expected, actual = _a8_moe(False)(x, None), _a8_moe(True)(x, None)
+    np.testing.assert_array_equal(
+        expected.astype(mx.float32), actual.astype(mx.float32)
+    )
+
+
+@pytest.mark.skipif(
+    not quant_fast.oq_a8_available(), reason="needs INT8 tensor-unit kernels"
+)
+def test_moe_a8_prefill_runs_the_a8_gather_near_a16(monkeypatch):
+    calls = []
+    original = language.routed_experts_a8
+
+    def spy(*args):
+        out = original(*args)
+        calls.append(out is not None)
+        return out
+
+    monkeypatch.setattr(language, "routed_experts_a8", spy)
+    x = mx.random.normal((1, 256, 256), key=mx.random.key(3)).astype(mx.bfloat16)
+    moe = _a8_moe(True)
+    assert a8.shared_expert_a8(moe.shared_experts, x) is not None
+    expected, actual = _a8_moe(False)(x, None), moe(x, None)
+    assert calls == [True]
+    expected, actual = expected.astype(mx.float32), actual.astype(mx.float32)
+    assert float(mx.linalg.norm(actual - expected) / mx.linalg.norm(expected)) < 0.05
+
+
+@pytest.mark.skipif(
+    not quant_fast.oq_a8_available(), reason="needs INT8 tensor-unit kernels"
+)
+def test_moe_a8_keeps_a16_below_min_tokens():
+    x = mx.random.normal((1, 256, 256), key=mx.random.key(3)).astype(mx.bfloat16)
+    expected = _a8_moe(False)(x, None)
+    actual = _a8_moe(True, min_tokens=257)(x, None)
+    np.testing.assert_array_equal(
+        expected.astype(mx.float32), actual.astype(mx.float32)
     )
 
 

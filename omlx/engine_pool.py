@@ -1335,10 +1335,10 @@ class EnginePool:
         # process-wide projection backends, and caches a prepared plan and
         # metadata on every module it classifies. None of that can be undone
         # in place, so a change here has to land on a fresh engine.
-        oq_a8_active = bool(data.get("qwen35_oq_a8_enabled", False))
-        add("qwen35_oq_a8_enabled", oq_a8_active)
+        oq_a8_active = bool(data.get("a8_prefill_enabled", False))
+        add("a8_prefill_enabled", oq_a8_active)
         if oq_a8_active:
-            add("qwen35_oq_a8_min_tokens", data.get("qwen35_oq_a8_min_tokens", 128))
+            add("a8_prefill_min_tokens", data.get("a8_prefill_min_tokens", 128))
 
         ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
         model_type = entry.config_model_type if entry else None

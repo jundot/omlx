@@ -104,6 +104,10 @@ class ModelConfig:
     # window-size tokens; its global KV is produced by the midpoint CSA2
     # layer projecting the encoder-final hidden states.
     ced_prefill: bool = False
+    # Prefill chunks of at least a8_prefill_min_tokens tokens with INT8
+    # activations on GPUs with INT8 tensor units.
+    a8_prefill: bool = False
+    a8_prefill_min_tokens: int = 128
     dspark_block_size: int = 0
     dspark_noise_token_id: int = 0
     dspark_target_layer_ids: tuple[int, ...] = ()

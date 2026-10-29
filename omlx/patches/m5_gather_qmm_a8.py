@@ -43,9 +43,15 @@ Stage A runs once per token row and the kernel reads those rows through
 
 The kernel reads the checkpoint's ``[E, N, G]`` scale/bias in place. Each
 threadgroup stages the metadata of its 64 weight rows as ``[group][row]`` in
-threadgroup memory (2 x 64 x G x 2 bytes: 10 KiB for Flash-Next, 16 KiB at
-G = 64). A larger ``G``, or one that is not a multiple of 4, uses scalar loads
+threadgroup memory (2 x 64 x G x 2 bytes: 10 KiB for Flash-Next, 20 KiB at
+G = 80). A larger ``G``, or one that is not a multiple of 4, uses scalar loads
 of the same layout with identical bits.
+
+DeepSeek V4.1 variants (``sorted_gather_qmm_a8`` keyword arguments) add Q2/Q3
+codes, separate gate and up tensors, a clamped and route-weighted float
+SwiGLU, and GS64 activation scales:
+
+    correction   out = sum_g Sa[m, g] * (Sw_g * acc_g + Bw_g * Ra_g)
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ import logging
 import threading
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from . import m5_gather_qmm_nax as _nax
 from .m5_gather_qmm import _swiglu_limit
@@ -66,13 +73,22 @@ logger = logging.getLogger(__name__)
 _BN = 64
 _WN = 2
 _GROUP = 64
+_BITS = (2, 3, 4)
+# Stage A activation scaling: one scale per row, or one per GS64 group.
+_ACT_ROW = 0
+_ACT_G64 = 1
 # Largest G (= K / 64) whose tile metadata is staged in threadgroup memory:
-# 2 x 64 rows x 64 groups x 2 bytes = 16 KiB (see the module docstring).
-_STAGE_MAX_GROUPS = 64
+# 2 x 64 rows x 80 groups x 2 bytes = 20 KiB. Staging G = 80 (K = 5120) beat
+# the scalar loads by about 5% on M5 Max.
+_STAGE_MAX_GROUPS = 80
 
 # Tile height. On M5 Max with Flash-Next routes (10K-328K rows) BM32 was the
 # fastest or tied; the A16 planner's 64-128 rows lose up to 1.5x.
 _BM = 32
+# The DeepSeek V4.1 gate/up gather (K = 5120, about 128 rows per expert in an
+# 8K-token chunk) reuses each decoded weight tile over more rows: BM64 was 24%
+# faster than BM32 on M5 Max. Its down projection keeps BM32.
+_BM_SPLIT_SWIGLU = 64
 
 _lock = threading.RLock()
 _kernel = None
@@ -103,7 +119,24 @@ constant constexpr int kA8Steps = kA8Group / kA8FragK;
 //   1  the threadgroup's 64 weight rows are staged once in threadgroup memory
 //      as [group][local row] (G = SG, a multiple of 4, at most 64)
 //   0  scalar loads straight from the checkpoint layout
-template <typename T, int BITS, int WM, int WN, int EPI, int STAGED, int SG>
+//
+// BITS 4 reads Qa in the Stage A v8 slot order (nibble pairs); BITS 2 and 3
+// read it in checkpoint K order, decoding each lane's 16 consecutive codes.
+// ACT 1: Sa holds one scale per GS64 group ([G, n_tok], like Ra) instead of
+// one per row. SPLIT 1: gate and up are separate [E, N / 2, K] tensors (w and
+// wu). EPI 2: the paired epilogue clamps at `limit` and runs the SwiGLU in
+// float; RW 1 scales each sorted row by its route weight rw[m].
+template <
+    typename T,
+    int BITS,
+    int WM,
+    int WN,
+    int EPI,
+    int STAGED,
+    int SG,
+    int ACT,
+    int SPLIT,
+    int RW>
 METAL_FUNC void omlx_a8_gather_nax(
     const device int8_t* qa,
     const device float* sa,
@@ -111,12 +144,17 @@ METAL_FUNC void omlx_a8_gather_nax(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
+    const device uint32_t* wu,
+    const device T* su,
+    const device T* bu,
+    const device float* rw,
     const device uint32_t* rmap,
     const device uint32_t* tiles,
     const uint32_t tile_count,
     const int N,
     const int K,
     const int n_tok,
+    const float limit,
     device T* out,
     threadgroup T* meta_s,
     threadgroup T* meta_b,
@@ -133,7 +171,10 @@ METAL_FUNC void omlx_a8_gather_nax(
   // same 16 output columns, so every lane holds both projections of its
   // elements and the SwiGLU runs on the accumulators, writing [M, N / 2].
   constexpr bool kPair = EPI != 0;
+  constexpr bool kSplit = kPair && SPLIT != 0;
   const int half_n = N / 2;
+  // Weight rows per expert in each tensor.
+  const int rows_e = kSplit ? half_n : N;
 
   const int groups = K / kA8Group;
 
@@ -206,15 +247,20 @@ METAL_FUNC void omlx_a8_gather_nax(
 
   const int w_row = groups * words;
   const int n_lane = col_base + int(coord.y);
-  const device uint32_t* wbase =
-      w + size_t(expert) * size_t(N) * size_t(w_row) +
-      size_t(n_lane) * size_t(w_row);
+  const size_t w_exp = size_t(expert) * size_t(rows_e) * size_t(w_row);
+  const device uint32_t* wbase = w + w_exp + size_t(n_lane) * size_t(w_row);
   const int w_stride8 = 8 * w_row;
-  const size_t w_stride_frag = size_t(frag_n) * size_t(w_row);
+  // The second fragment's rows: the up tensor's same rows, or frag_n rows on.
+  const device uint32_t* wbase1 = kSplit
+      ? wu + w_exp + size_t(n_lane) * size_t(w_row)
+      : wbase + size_t(frag_n) * size_t(w_row);
 
-  // The checkpoint layout: one expert's scale/bias are N rows of G values.
-  const device T* s_exp = scales + size_t(expert) * size_t(groups) * size_t(N);
-  const device T* b_exp = biases + size_t(expert) * size_t(groups) * size_t(N);
+  // The checkpoint layout: one expert's scale/bias are rows_e rows of G values.
+  const size_t m_exp = size_t(expert) * size_t(groups) * size_t(rows_e);
+  const device T* s_exp = scales + m_exp;
+  const device T* b_exp = biases + m_exp;
+  const device T* su_exp = kSplit ? su + m_exp : s_exp;
+  const device T* bu_exp = kSplit ? bu + m_exp : b_exp;
 
   const int n_run0 = col_base + int(coord.x);
 
@@ -228,6 +274,8 @@ METAL_FUNC void omlx_a8_gather_nax(
     const int total = 64 * q4;
     const device uint2* s4 = reinterpret_cast<const device uint2*>(s_exp);
     const device uint2* b4 = reinterpret_cast<const device uint2*>(b_exp);
+    const device uint2* su4 = reinterpret_cast<const device uint2*>(su_exp);
+    const device uint2* bu4 = reinterpret_cast<const device uint2*>(bu_exp);
     for (int e0 = int(tl); e0 < total; e0 += kThreads * kU) {
       uint2 vs[kU];
       uint2 vb[kU];
@@ -237,13 +285,14 @@ METAL_FUNC void omlx_a8_gather_nax(
         if (e < total) {
           const int lr = e / q4;
           const int c = e - lr * q4;
+          const bool up_row = kPair && lr >= 32;
           const int wr = kPair
-              ? (lr >= 32 ? half_n + int(tid.x) * 32 + (lr - 32)
-                          : int(tid.x) * 32 + lr)
+              ? (up_row ? (kSplit ? 0 : half_n) + int(tid.x) * 32 + (lr - 32)
+                        : int(tid.x) * 32 + lr)
               : int(tid.x) * BN + lr;
           const size_t at = size_t(wr) * size_t(q4) + size_t(c);
-          vs[u] = s4[at];
-          vb[u] = b4[at];
+          vs[u] = (kSplit && up_row) ? su4[at] : s4[at];
+          vb[u] = (kSplit && up_row) ? bu4[at] : b4[at];
         }
       }
       STEEL_PRAGMA_UNROLL
@@ -282,12 +331,24 @@ METAL_FUNC void omlx_a8_gather_nax(
   }
 
   for (int g = 0; g < groups; ++g) {
+    // BITS 4: two words of nibbles in v8 slot order. BITS 2 / 3: the lane's 16
+    // consecutive codes k = 16 cx .. 16 cx + 15, right-aligned in 64 bits.
     uint2 wg[4];
+    ulong wl[4];
     STEEL_PRAGMA_UNROLL
     for (int q = 0; q < 4; ++q) {
-      const device uint32_t* wr = wbase + (q & 1) * w_stride8 +
-          (q >> 1) * w_stride_frag + size_t(g) * words;
-      wg[q] = reinterpret_cast<const device uint2*>(wr)[cx];
+      const device uint32_t* wr =
+          ((q >> 1) ? wbase1 : wbase) + (q & 1) * w_stride8 + size_t(g) * words;
+      if (BITS == 4) {
+        wg[q] = reinterpret_cast<const device uint2*>(wr)[cx];
+      } else if (BITS == 2) {
+        wl[q] = ulong(wr[cx]);
+      } else {
+        const int bit = 48 * cx;
+        const ulong pair =
+            ulong(wr[bit >> 5]) | (ulong(wr[(bit >> 5) + 1]) << 32);
+        wl[q] = pair >> (bit & 31);
+      }
     }
 
     STEEL_PRAGMA_UNROLL
@@ -303,6 +364,13 @@ METAL_FUNC void omlx_a8_gather_nax(
           ct_b[base + 1] = quad.y;
           ct_b[base + 2] = quad.z;
           ct_b[base + 3] = quad.w;
+        } else {
+          constexpr ulong mask = (1ul << BITS) - 1ul;
+          STEEL_PRAGMA_UNROLL
+          for (int j = 0; j < 4; ++j) {
+            ct_b[base + j] =
+                int8_t((wl[q] >> (BITS * (4 * t + j))) & mask);
+          }
         }
       }
 
@@ -351,22 +419,29 @@ METAL_FUNC void omlx_a8_gather_nax(
     } else {
       STEEL_PRAGMA_UNROLL
       for (int h = 0; h < 2; ++h) {
-        const size_t n0 = size_t(n_run0 + h * frag_n);
+        const bool up_t = kSplit && h != 0;
+        const size_t n0 = size_t(n_run0 + (up_t ? 0 : h * frag_n));
+        const device T* sp = up_t ? su_exp : s_exp;
+        const device T* bp = up_t ? bu_exp : b_exp;
         STEEL_PRAGMA_UNROLL
         for (int j = 0; j < 4; ++j) {
-          sv[h][j] = s_exp[(n0 + j) * size_t(groups) + size_t(g)];
-          bv[h][j] = b_exp[(n0 + j) * size_t(groups) + size_t(g)];
+          sv[h][j] = sp[(n0 + j) * size_t(groups) + size_t(g)];
+          bv[h][j] = bp[(n0 + j) * size_t(groups) + size_t(g)];
         }
       }
     }
 
+    // Per (row fragment, row half): the activation group scale (1 for row
+    // scaling, applied in the epilogue instead) and its product with Ra.
+    float s_g[TM][2];
     float r_g[TM][2];
     STEEL_PRAGMA_UNROLL
     for (int i = 0; i < TM; ++i) {
       STEEL_PRAGMA_UNROLL
       for (int r = 0; r < 2; ++r) {
-        r_g[i][r] =
-            float(ra[size_t(g) * size_t(n_tok) + size_t(mt_row[i][r])]);
+        const size_t at = size_t(g) * size_t(n_tok) + size_t(mt_row[i][r]);
+        s_g[i][r] = ACT ? sa[at] : 1.0f;
+        r_g[i][r] = float(ra[at]) * s_g[i][r];
       }
     }
 
@@ -375,18 +450,20 @@ METAL_FUNC void omlx_a8_gather_nax(
       const int r = ((e & 7) >> 2);
       const float swc = float(sv[e >> 3][e & 3]);
       const float bwc = float(bv[e >> 3][e & 3]);
-      Cf[0][e] =
-          metal::fma(swc, float(acc0[e]), metal::fma(bwc, r_g[0][r], Cf[0][e]));
-      Cf[1][e] =
-          metal::fma(swc, float(acc1[e]), metal::fma(bwc, r_g[1][r], Cf[1][e]));
+      Cf[0][e] = metal::fma(
+          swc * s_g[0][r], float(acc0[e]), metal::fma(bwc, r_g[0][r], Cf[0][e]));
+      Cf[1][e] = metal::fma(
+          swc * s_g[1][r], float(acc1[e]), metal::fma(bwc, r_g[1][r], Cf[1][e]));
     }
   }
 
   if (kPair) {
     // Gate is element e of fragment 0 and up element e of fragment 1 (e + 8).
-    // Each is rounded to T exactly as the plain store rounds it, then the
-    // unfused path's activation runs op for op in T (MLX's Sigmoid and
+    // EPI 1: each is rounded to T exactly as the plain store rounds it, then
+    // the unfused path's activation runs op for op in T (MLX's Sigmoid and
     // Multiply, as in the A16 epilogue): silu(gate) * up.
+    // EPI 2: the DeepSeek V4.1 activation in float -- gate clamped above and
+    // up clamped to +-limit (limit 0: none), silu(gate) * up, times rw[m].
     STEEL_PRAGMA_UNROLL
     for (int i = 0; i < TM; ++i) {
       STEEL_PRAGMA_UNROLL
@@ -396,11 +473,26 @@ METAL_FUNC void omlx_a8_gather_nax(
         if (ms < tile_rows) {
           const int n = col_base + int(coord.x) + (e & 3);
           const int m = row_start + ms;
-          const float sc = sa[mt_row[i][r]];
-          const T g = static_cast<T>(sc * Cf[i][e]);
-          const T u = static_cast<T>(sc * Cf[i][e + kA8Elems]);
-          out[size_t(m) * size_t(half_n) + size_t(n)] =
-              Multiply()(Multiply()(g, Sigmoid()(g)), u);
+          const float sc = ACT ? 1.0f : sa[mt_row[i][r]];
+          if (EPI == 2) {
+            float g = sc * Cf[i][e];
+            float u = sc * Cf[i][e + kA8Elems];
+            if (limit != 0.0f) {
+              g = metal::min(g, limit);
+              u = metal::clamp(u, -limit, limit);
+            }
+            const float neg = 1.0f / (1.0f + metal::precise::exp(metal::abs(g)));
+            float v = (g * (g < 0.0f ? neg : 1.0f - neg)) * u;
+            if (RW) {
+              v *= rw[m];
+            }
+            out[size_t(m) * size_t(half_n) + size_t(n)] = static_cast<T>(v);
+          } else {
+            const T g = static_cast<T>(sc * Cf[i][e]);
+            const T u = static_cast<T>(sc * Cf[i][e + kA8Elems]);
+            out[size_t(m) * size_t(half_n) + size_t(n)] =
+                Multiply()(Multiply()(g, Sigmoid()(g)), u);
+          }
         }
       }
     }
@@ -416,8 +508,8 @@ METAL_FUNC void omlx_a8_gather_nax(
           const int n =
               col_base + (e >> 3) * kA8FragM + int(coord.x) + (ee & 3);
           const int m = row_start + ms;
-          out[size_t(m) * size_t(N) + size_t(n)] =
-              static_cast<T>(sa[mt_row[i][r]] * Cf[i][e]);
+          const float sc = ACT ? 1.0f : sa[mt_row[i][r]];
+          out[size_t(m) * size_t(N) + size_t(n)] = static_cast<T>(sc * Cf[i][e]);
         }
       }
     }
@@ -428,10 +520,10 @@ METAL_FUNC void omlx_a8_gather_nax(
 _A8_SOURCE = """
     threadgroup T meta_s[STAGED ? SG * 64 : 1];
     threadgroup T meta_b[STAGED ? SG * 64 : 1];
-    omlx_a8_gather_nax<T, BITS, WM, WN, EPI, STAGED, SG>(
-        qa, sa, ra, w, scales, biases, rmap, tiles, tile_count[0],
-        params[0], params[1], params[2], out, meta_s, meta_b,
-        threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
+    omlx_a8_gather_nax<T, BITS, WM, WN, EPI, STAGED, SG, ACT, SPLIT, RW>(
+        qa, sa, ra, w, scales, biases, wu, su, bu, rw, rmap, tiles,
+        tile_count[0], params[0], params[1], params[2], limit[0], out, meta_s,
+        meta_b, threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
         thread_index_in_threadgroup);
 """
 
@@ -461,10 +553,15 @@ def _get_kernel():
                     "w",
                     "scales",
                     "biases",
+                    "wu",
+                    "su",
+                    "bu",
+                    "rw",
                     "rmap",
                     "tiles",
                     "tile_count",
                     "params",
+                    "limit",
                 ],
                 output_names=["out"],
                 header=mlx_src + _A8_HEADER,
@@ -491,12 +588,12 @@ def supports(
 ) -> bool:
     """Layout gate for the A8 gather.
 
-    Accepts affine Q4 with GS64 and metadata of the activation dtype, a fused
-    or plain expert weight ``[E, N, K * bits / 32]`` with ``N % 64 == 0`` and
-    ``K % 64 == 0``, scale/bias in the checkpoint layout ``[E, N, K / 64]``, and
-    a uint32 row map of the sorted rows onto the token rows.
+    Accepts affine Q2/Q3/Q4 with GS64 and metadata of the activation dtype, a
+    fused or plain expert weight ``[E, N, K * bits / 32]`` with ``N % 64 == 0``
+    and ``K % 64 == 0``, scale/bias in the checkpoint layout ``[E, N, K / 64]``,
+    and a uint32 row map of the sorted rows onto the token rows.
     """
-    if mode != "affine" or bits != 4 or group_size != _GROUP:
+    if mode != "affine" or bits not in _BITS or group_size != _GROUP:
         return False
     if x.dtype not in (mx.bfloat16, mx.float16):
         return False
@@ -523,10 +620,13 @@ def supports(
     return scales.shape == biases.shape and scales.shape == (E, N, K // _GROUP)
 
 
-def _stage_a(x):
+def _stage_a(x, bits, act):
+    """Q4 reads Qa in the v8 slot order; Q2/Q3 read it in K order. Ra (and
+    group-wise Sa) are group-major [G, T] either way."""
     from omlx.custom_kernels.quant_matmul import fast
 
-    return fast.oq_a8_stage_a_v8(x, 0)
+    stage = fast.oq_a8_stage_a_v8 if bits == 4 else fast.oq_a8_stage_a_natural
+    return stage(x, act)
 
 
 def _staged(groups: int) -> bool:
@@ -536,7 +636,21 @@ def _staged(groups: int) -> bool:
 
 
 def _launch(
-    x, w, scales, biases, indices, row_map, *, bm, swiglu, init_value=None
+    x,
+    w,
+    scales,
+    biases,
+    indices,
+    row_map,
+    *,
+    bm,
+    swiglu,
+    init_value=None,
+    bits=4,
+    up=None,
+    limit=None,
+    route_weights=None,
+    act=_ACT_ROW,
 ):
     """Stage A, the tile scan and the gather kernel; None when unavailable."""
     from omlx.custom_kernels.quant_matmul import fast
@@ -550,12 +664,22 @@ def _launch(
 
     T, K = int(x.shape[0]), int(x.shape[2])
     M = int(indices.shape[0])
-    E, N = int(w.shape[0]), int(w.shape[1])
+    # With a separate up tensor N counts both halves, as in the fused layout.
+    E, N = int(w.shape[0]), int(w.shape[1]) * (1 if up is None else 2)
     wm, wn = bm // 32, _WN
+    # The DeepSeek V4.1 epilogue for split, clamped or weighted SwiGLU.
+    epi = 0
+    if swiglu:
+        plain = up is None and limit is None and route_weights is None
+        epi = 1 if plain else 2
+    wu, su, bu = up if up is not None else (w, scales, biases)
 
     # Stage A is left lazy (no mx.eval): the kernel depends on it through the
     # graph, like the dense oQ A8 path.
-    qa, sa, ra = _stage_a(x)
+    qa, sa, ra = _stage_a(x, bits, act)
+    # Without route weights rw is unread; Sa stands in because a one-element
+    # array would be bound in the constant address space.
+    rw = route_weights.astype(mx.float32) if route_weights is not None else sa
 
     # The grid is sized by the *upper bound* on tiles and the kernel returns
     # early for tile indices past tile_count, so nothing is read back to the
@@ -583,19 +707,27 @@ def _launch(
             w,
             scales,
             biases,
+            wu,
+            su,
+            bu,
+            rw,
             row_map,
             tiles,
             tile_count,
             mx.array([N, K, T], dtype=mx.int32),
+            mx.array([float(limit or 0.0)], dtype=mx.float32),
         ],
         template=[
             ("T", x.dtype),
-            ("BITS", 4),
+            ("BITS", bits),
             ("WM", wm),
             ("WN", wn),
-            ("EPI", 1 if swiglu else 0),
+            ("EPI", epi),
             ("STAGED", 1 if staged else 0),
             ("SG", groups if staged else 0),
+            ("ACT", act),
+            ("SPLIT", 1 if up is not None else 0),
+            ("RW", 1 if route_weights is not None else 0),
         ],
         grid=((N // _BN) * 32, max_tiles * wn, bm // 32),
         threadgroup=(32, wn, bm // 32),
@@ -618,6 +750,10 @@ def sorted_gather_qmm_a8(
     mode="affine",
     swiglu=False,
     init_value=None,
+    up=None,
+    swiglu_limit=None,
+    route_weights=None,
+    group_scales=False,
 ):
     """``activation(x[row_map]) @ w[indices].T`` with an INT8 activation.
 
@@ -630,20 +766,79 @@ def sorted_gather_qmm_a8(
     ``swiglu=True``: ``w`` holds each expert's gate rows followed by its up
     rows (``[E, N, K]``, N = 2 * n) and the kernel returns the SwiGLU
     ``silu(gate) * up`` as ``[M, 1, n]`` (see the kernel header for the exact
-    rounding contract).
+    rounding contract). ``up`` instead passes the up projection as its own
+    ``(weight, scales, biases)`` with ``w`` holding the gate rows only.
+    ``swiglu_limit`` clamps gate above and up to +-limit, and ``route_weights``
+    (``[M]``, sorted rows) scales each output row; both, and ``up``, use the
+    float DeepSeek V4.1 epilogue.
+
+    ``group_scales=True`` scales activations per GS64 group instead of per
+    row, so an outlier sets the scale of its own group only.
 
     ``init_value`` pre-fills the output, so tests can detect unwritten
     elements.
     """
     if not supports(x, w, scales, biases, indices, group_size, bits, mode, row_map):
         return None
-    # One canary verdict per kernel instantiation (dtype and K).
-    if not _nax._checked(("a8", x.dtype, int(x.shape[2]) // _GROUP), _self_test):
+    if up is not None and not _supports_up(w, scales, biases, up, swiglu):
+        return None
+    if route_weights is not None and route_weights.shape != indices.shape:
+        return None
+    act = _ACT_G64 if group_scales else _ACT_ROW
+    groups = int(x.shape[2]) // _GROUP
+    extended = (
+        bits != 4
+        or act != _ACT_ROW
+        or up is not None
+        or swiglu_limit is not None
+        or route_weights is not None
+    )
+    # One canary verdict per kernel instantiation.
+    if extended:
+        key = (
+            "a8x",
+            x.dtype,
+            groups,
+            bits,
+            bool(swiglu),
+            up is not None,
+            swiglu_limit is not None,
+            route_weights is not None,
+            act,
+        )
+        if not _nax._checked(key, _self_test_extended):
+            return None
+    elif not _nax._checked(("a8", x.dtype, groups), _self_test):
         return None
     return _launch(
-        x, w, scales, biases, indices, row_map,
-        bm=_BM, swiglu=swiglu, init_value=init_value,
+        x,
+        w,
+        scales,
+        biases,
+        indices,
+        row_map,
+        bm=_BM_SPLIT_SWIGLU if up is not None else _BM,
+        swiglu=swiglu,
+        init_value=init_value,
+        bits=bits,
+        up=up,
+        limit=swiglu_limit,
+        route_weights=route_weights,
+        act=act,
     )
+
+
+def _supports_up(w, scales, biases, up, swiglu) -> bool:
+    """A separate up projection matching the gate tensor, for a paired SwiGLU
+    whose 64-row weight tiles take 32 rows from each."""
+    if not swiglu or len(up) != 3:
+        return False
+    wu, su, bu = up
+    if bu is None or wu.dtype != w.dtype or su.dtype != scales.dtype:
+        return False
+    if bu.dtype != biases.dtype or int(w.shape[1]) % (_BN // 2):
+        return False
+    return wu.shape == w.shape and su.shape == scales.shape and bu.shape == biases.shape
 
 
 # Canary: 2 experts, N = 128 (64 gate + 64 up rows), 64 sorted rows over 16
@@ -711,9 +906,106 @@ def _self_test(key: tuple):
     return ok
 
 
+_CANARY_LIMIT = 1.0  # small enough that the canary's gate and up hit the clamp
+
+
+def _self_test_extended(key: tuple):
+    """The canary of :func:`_self_test` for the Q2/Q3, group-scaled, split,
+    clamped and weighted instantiations, against an A16 float reference."""
+    _, dtype, groups, bits, swiglu, split, clamp, weighted, act = key
+    k_dim = groups * _GROUP
+    try:
+        n = _BN
+        experts = len(_CANARY_COUNTS)
+        keys = mx.random.split(mx.random.key(0xA8 + bits), 4)
+
+        def quant(shape, k):
+            wf = (mx.random.normal(shape, key=k) * 0.05).astype(dtype)
+            return mx.quantize(wf, group_size=_GROUP, bits=bits)
+
+        idx = mx.array(
+            [e for e, c in enumerate(_CANARY_COUNTS) for _ in range(c)],
+            dtype=mx.uint32,
+        )
+        rows = int(idx.shape[0])
+        x = (mx.random.normal((_CANARY_TOKENS, 1, k_dim), key=keys[0]) * 0.6).astype(
+            dtype
+        )
+        row_map = ((mx.arange(rows, dtype=mx.uint32) * 7 + 3) % _CANARY_TOKENS).astype(
+            mx.uint32
+        )
+        weights = (
+            mx.random.uniform(0.2, 1.5, (rows,), key=keys[3]) if weighted else None
+        )
+        limit = _CANARY_LIMIT if clamp else None
+        if swiglu and split:
+            gate_w, up_w = quant((experts, n, k_dim), keys[1]), quant(
+                (experts, n, k_dim), keys[2]
+            )
+            w, up = gate_w, up_w
+        else:
+            w, up = quant((experts, 2 * n, k_dim), keys[1]), None
+        out = _launch(
+            x,
+            *w,
+            idx,
+            row_map,
+            bm=_BM_SPLIT_SWIGLU if up is not None else _BM,
+            swiglu=swiglu,
+            bits=bits,
+            up=up,
+            limit=limit,
+            route_weights=weights,
+            act=act,
+        )
+        if out is None:
+            return False
+
+        def gather(value, packed):
+            return mx.gather_qmm(
+                value,
+                *packed,
+                rhs_indices=idx,
+                transpose=True,
+                group_size=_GROUP,
+                bits=bits,
+                sorted_indices=True,
+            ).astype(mx.float32)
+
+        if not swiglu:
+            ref = gather(x[row_map], w)
+        else:
+            if split:
+                gate, upv = gather(x[row_map], w), gather(x[row_map], up)
+            else:
+                gate, upv = mx.split(gather(x[row_map], w), 2, axis=-1)
+            if limit is not None:
+                gate = mx.minimum(gate, limit)
+                upv = mx.clip(upv, -limit, limit)
+            ref = nn.silu(gate) * upv
+            if weights is not None:
+                ref = ref * weights[:, None, None]
+        err = mx.abs(out.astype(mx.float32) - ref).max().item()
+        scale = mx.abs(ref).max().item()
+        ok = err <= _CANARY_TOLERANCE * scale
+    except Exception as e:  # noqa: BLE001
+        if "transformation" in str(e):
+            return None
+        logger.warning("routed A8 self-test raised for %s: %s", key[1:], e)
+        return False
+    if not ok:
+        logger.warning(
+            "routed A8 disabled for %s: canary max error %.3g (reference max %.3g)",
+            key[1:],
+            err,
+            scale,
+        )
+    return ok
+
+
 # -- routed MoE integration --------------------------------------------------
 #
-# ``apply_qwen35_oq_a8_patch`` (the ``qwen35_oq_a8_enabled`` setting) tags the
+# ``apply_qwen35_oq_a8_patch`` (the ``a8_prefill_enabled`` setting) tags the
 # backbone SwitchGLU modules of one loaded model. Untagged modules, including
 # the MTP draft layer, keep the A16 path.
 
@@ -723,7 +1015,7 @@ _TAG = "_omlx_routed_a8_min_tokens"
 # model class module path, as ``qwen35_moe_gate_up`` does).
 _MEASURED_FAMILIES = ("qwen4_exp",)
 
-# Decode and verify windows stay A16. ``qwen35_oq_a8_min_tokens`` can raise
+# Decode and verify windows stay A16. ``a8_prefill_min_tokens`` can raise
 # this floor but not lower it.
 _MIN_TOKENS_FLOOR = 128
 

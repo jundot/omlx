@@ -21,6 +21,7 @@ from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
 from ..deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
 from . import decode_fused, growth
+from .a8 import dense_a8_pair, routed_experts_a8, shared_expert_a8
 from .activation import (
     quantize_paired_swiglu_activation,
     quantize_swiglu_activation,
@@ -42,6 +43,7 @@ from .kernels import (
     packed_sparse_attention,
 )
 from .mtp import DSparkMixin
+from .packed_attention import nax_packed_sparse_attention
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 from .routing import combine_sorted_experts
 
@@ -342,6 +344,9 @@ class Attention(nn.Module):
             self.indexer = Indexer(c, layer)
 
     def _input_projections(self, x):
+        pair = dense_a8_pair(self.wq_a, self.wkv, x)
+        if pair is not None:
+            return pair
         if all(
             isinstance(p, QuantizedProjection) and p.quantize_input
             for p in (self.wq_a, self.wkv)
@@ -419,7 +424,20 @@ class Attention(nn.Module):
                     cache, 2, shared["kv"], compressed, kv_start // ratio
                 )
             ci, pooled = shared["idx"], shared["kv"]
-        if (
+        out = nax_packed_sparse_attention(
+            q,
+            kv,
+            pooled,
+            ci,
+            self.attn_sink,
+            c.head_dim**-0.5,
+            start,
+            ratio,
+            c.window_size,
+        )
+        if out is not None:
+            heads_major = True
+        elif (
             length > 8
             and c.n_heads == 64
             and c.head_dim == 512
@@ -708,6 +726,7 @@ class MoE(nn.Module):
             Expert(c, True),
             Expert(c),
         )
+        self._a8_min_tokens = c.a8_prefill_min_tokens if c.a8_prefill else None
 
     def __call__(self, x, image_mask):
         idx, weights = self.gate(x, image_mask)
@@ -723,19 +742,31 @@ class MoE(nn.Module):
             flat = idx.reshape(-1)
             order = mx.argsort(flat)
             inverse = mx.argsort(order)
-            selected = routed_input.reshape(-1, x.shape[-1])[order // shape[-1]][
-                :, None, :
-            ]
-            routed = self.experts(
-                selected,
-                flat[order],
-                weights.reshape(-1)[order],
-                sorted_indices=True,
-                input_quantized=routed_quantized,
+            a8 = self._a8_min_tokens is not None
+            routed = (
+                routed_experts_a8(
+                    self.experts, x, flat, order, weights, self._a8_min_tokens
+                )
+                if a8
+                else None
             )
-            shared = self.shared_experts(
-                quantized if shared_quantized else x, input_quantized=shared_quantized
-            )
+            if routed is None:
+                selected = routed_input.reshape(-1, x.shape[-1])[order // shape[-1]][
+                    :, None, :
+                ]
+                routed = self.experts(
+                    selected,
+                    flat[order],
+                    weights.reshape(-1)[order],
+                    sorted_indices=True,
+                    input_quantized=routed_quantized,
+                )
+            shared = shared_expert_a8(self.shared_experts, x) if a8 else None
+            if shared is None:
+                shared = self.shared_experts(
+                    quantized if shared_quantized else x,
+                    input_quantized=shared_quantized,
+                )
             combined = combine_sorted_experts(routed, inverse, shared)
             if combined is not None:
                 return combined

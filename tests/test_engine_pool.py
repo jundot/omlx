@@ -2110,11 +2110,9 @@ class TestEnginePoolAsync:
         from omlx.model_settings import ModelSettings
 
         pool = pool_with_mock_engines
-        off = ModelSettings(qwen35_oq_a8_enabled=False)
-        on = ModelSettings(qwen35_oq_a8_enabled=True)
-        other_floor = ModelSettings(
-            qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=1024
-        )
+        off = ModelSettings(a8_prefill_enabled=False)
+        on = ModelSettings(a8_prefill_enabled=True)
+        other_floor = ModelSettings(a8_prefill_enabled=True, a8_prefill_min_tokens=1024)
 
         sig = lambda s: pool._engine_runtime_signature("model-a", s)  # noqa: E731
         assert sig(off) != sig(on)
@@ -2128,7 +2126,7 @@ class TestEnginePoolAsync:
         pool = pool_with_mock_engines
         pool._entries["model-a"].config_model_type = "qwen4_exp"
         sig = lambda enabled: pool._engine_runtime_signature(  # noqa: E731
-            "model-a", ModelSettings(qwen35_oq_a8_enabled=enabled)
+            "model-a", ModelSettings(a8_prefill_enabled=enabled)
         )
         assert sig(False) != sig(True)
         assert sig(True) == sig(True)
@@ -2139,8 +2137,8 @@ class TestEnginePoolAsync:
         from omlx.model_settings import ModelSettings
 
         pool = pool_with_mock_engines
-        a = ModelSettings(qwen35_oq_a8_enabled=False, qwen35_oq_a8_min_tokens=512)
-        b = ModelSettings(qwen35_oq_a8_enabled=False, qwen35_oq_a8_min_tokens=2048)
+        a = ModelSettings(a8_prefill_enabled=False, a8_prefill_min_tokens=512)
+        b = ModelSettings(a8_prefill_enabled=False, a8_prefill_min_tokens=2048)
         assert pool._engine_runtime_signature(
             "model-a", a
         ) == pool._engine_runtime_signature("model-a", b)

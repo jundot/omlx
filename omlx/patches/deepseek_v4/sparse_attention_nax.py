@@ -19,6 +19,11 @@ running maximum advances per 128-slot tile instead of per row), so outputs
 agree to bf16 rounding. A top-k row counts when ``idx < (p + 1) // ratio``;
 with the indexer's temporally sorted rows that is the native kernel's
 break-at-first-invisible rule.
+
+DeepSeek V4.1 reuses the kernel on its decoded KV rows with two template
+switches: ``QT`` reads the query token-major ``[L, H, 512]`` instead of
+``[H, L, 512]``, and ``PLO = 0`` drops the low fp16 piece of P, since V4.1's
+reference already rounds P to bf16 before P V.
 """
 
 from __future__ import annotations
@@ -36,8 +41,9 @@ _HEADS_PER_GROUP = 32
 # Short verify blocks stay on the native kernel.
 MIN_ROWS = 16
 
-_BROKEN = False
-_READY = False
+# Per (QT, PLO) instantiation: compiled and run once, or failed.
+_BROKEN: set = set()
+_READY: set = set()
 
 _HEADER = """
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -56,6 +62,7 @@ _SOURCE = """
     const int NS = params[4];
     const int L = params[5];
     const int K = params[6];
+    const int H = params[7];
     const int SLOTS = W + K;
     const float scale = scalep[0];
     const int qi = int(threadgroup_position_in_grid.x);
@@ -120,8 +127,10 @@ _SOURCE = """
     float m_run[2] = {-INFINITY, -INFINITY};
     float l_run[2] = {0.0f, 0.0f};
 
-    const device T* qr0 = q + (ulong(head0 + fm) * L + qi) * D + fn;
-    const device T* qr1 = q + (ulong(head0 + fm + 8) * L + qi) * D + fn;
+    const device T* qr0 = q + (QT ? ulong(qi) * H + head0 + fm
+                                  : ulong(head0 + fm) * L + qi) * D + fn;
+    const device T* qr1 = q + (QT ? ulong(qi) * H + head0 + fm + 8
+                                  : ulong(head0 + fm + 8) * L + qi) * D + fn;
 
     // Slot s of the query: window row s for s < W, then top-k entry s - W.
     auto stage = [&](int t, int b) {
@@ -245,13 +254,15 @@ _SOURCE = """
                         : 0.0f;
                     const half hi = half(e);
                     h[i * 4 + j] = hi;
-                    lo[i * 4 + j] = half(e - float(hi));
+                    lo[i * 4 + j] = PLO ? half(e - float(hi)) : half(0.0f);
                     rs[i] += e;
                 }
             }
             const int ks = j4 * 2 + tn;
             *(threadgroup vec<half, 8>*)(&p_hi[hg][ks][lane * 8]) = h;
-            *(threadgroup vec<half, 8>*)(&p_lo[hg][ks][lane * 8]) = lo;
+            if (PLO) {
+                *(threadgroup vec<half, 8>*)(&p_lo[hg][ks][lane * 8]) = lo;
+            }
         }
         for (short i = 0; i < 2; ++i) {
             rs[i] += simd_shuffle_xor(rs[i], ushort(1));
@@ -282,10 +293,14 @@ _SOURCE = """
         const int n_ks = (tile_slots + 15) / 16;
         for (short ks = 0; ks < n_ks; ++ks) {
             const vec<half, 8> h = *(const threadgroup vec<half, 8>*)(&p_hi[hg][ks][lane * 8]);
-            const vec<half, 8> lo = *(const threadgroup vec<half, 8>*)(&p_lo[hg][ks][lane * 8]);
             for (short e = 0; e < 8; ++e) {
                 pa[e] = h[e];
-                pm[e] = lo[e];
+            }
+            if (PLO) {
+                const vec<half, 8> lo = *(const threadgroup vec<half, 8>*)(&p_lo[hg][ks][lane * 8]);
+                for (short e = 0; e < 8; ++e) {
+                    pm[e] = lo[e];
+                }
             }
             const int k0 = ks * 16 + fm;
             const int k1 = ks * 16 + fm + 8;
@@ -302,16 +317,24 @@ _SOURCE = """
                 }
                 if (np == 0) {
                     pv_op.run(pa, pb, o0);
-                    pv_op.run(pm, pb, o0);
+                    if (PLO) {
+                        pv_op.run(pm, pb, o0);
+                    }
                 } else if (np == 1) {
                     pv_op.run(pa, pb, o1);
-                    pv_op.run(pm, pb, o1);
+                    if (PLO) {
+                        pv_op.run(pm, pb, o1);
+                    }
                 } else if (np == 2) {
                     pv_op.run(pa, pb, o2);
-                    pv_op.run(pm, pb, o2);
+                    if (PLO) {
+                        pv_op.run(pm, pb, o2);
+                    }
                 } else {
                     pv_op.run(pa, pb, o3);
-                    pv_op.run(pm, pb, o3);
+                    if (PLO) {
+                        pv_op.run(pm, pb, o3);
+                    }
                 }
             }
         }
@@ -372,24 +395,28 @@ def sparse_topk_attention_nax(
     offset: int,
     window: int,
     ratio: int,
+    *,
+    q_token_major: bool = False,
+    p_lo: bool = True,
 ) -> Optional[mx.array]:
     """``wsdpa_topk_prefill`` on the tensor units, or None.
 
-    q: [1, H, L, 512] bf16 with H a multiple of 32; kv: [1, 1, S, 512] bf16
-    local rows (row 0 is absolute position ``offset + L - S``); pooled:
-    [1, P, 512] bf16; topk: [1, L, K] uint32, temporally sorted; sinks: [H].
-    Returns [1, H, L, 512] bf16.
+    q: [1, H, L, 512] bf16 with H a multiple of 32 ([1, L, H, 512] with
+    ``q_token_major``); kv: [1, 1, S, 512] bf16 local rows (row 0 is absolute
+    position ``offset + L - S``); pooled: [1, P, 512] bf16; topk: [1, L, K]
+    uint32, temporally sorted; sinks: [H]. ``p_lo=False`` feeds P V a single
+    fp16 piece of P. Returns [1, H, L, 512] bf16.
     """
-    global _BROKEN, _READY
-    if _BROKEN or not nax_sparse_attention_available():
+    key = (bool(q_token_major), bool(p_lo))
+    if key in _BROKEN or not nax_sparse_attention_available() or q.ndim != 4:
         return None
+    heads, length = (q.shape[2], q.shape[1]) if q_token_major else q.shape[1:3]
     if (
-        q.ndim != 4
-        or q.shape[0] != 1
-        or q.shape[1] % _HEADS_PER_GROUP
+        q.shape[0] != 1
+        or heads % _HEADS_PER_GROUP
         or q.shape[3] != _D
         or q.dtype != mx.bfloat16
-        or q.shape[2] < MIN_ROWS
+        or length < MIN_ROWS
         or kv.ndim != 4
         or kv.shape[:2] != (1, 1)
         or kv.shape[3] != _D
@@ -403,19 +430,27 @@ def sparse_topk_attention_nax(
         or pooled.dtype != mx.bfloat16
         or topk.dtype != mx.uint32
         or topk.ndim != 3
-        or topk.shape[:2] != (1, q.shape[2])
+        or topk.shape[:2] != (1, length)
         or topk.shape[2] == 0
-        or sinks.shape != (q.shape[1],)
+        or sinks.shape != (heads,)
         or window < 1
         or ratio < 1
         or offset < 0
         or not scale > 0
     ):
         return None
-    heads, length = q.shape[1], q.shape[2]
     try:
         params = mx.array(
-            [offset, window, ratio, pooled.shape[1], kv.shape[2], length, topk.shape[2]],
+            [
+                offset,
+                window,
+                ratio,
+                pooled.shape[1],
+                kv.shape[2],
+                length,
+                topk.shape[2],
+                heads,
+            ],
             dtype=mx.int32,
         )
         out = _kernel()(
@@ -428,18 +463,18 @@ def sparse_topk_attention_nax(
                 params,
                 mx.array([scale], dtype=mx.float32),
             ],
-            template=[("T", mx.bfloat16)],
+            template=[("T", mx.bfloat16), ("QT", key[0]), ("PLO", key[1])],
             grid=(length * 256, heads // _HEADS_PER_GROUP, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[(heads, length, _D)],
             output_dtypes=[mx.bfloat16],
         )[0]
-        if not _READY:
+        if key not in _READY:
             # Compile and run once here so a kernel failure falls back.
             mx.eval(out)
-            _READY = True
+            _READY.add(key)
     except Exception:  # noqa: BLE001
-        _BROKEN = True
+        _BROKEN.add(key)
         logger.warning(
             "DSV4 tensor-unit sparse attention kernel failed; using wsdpa topk",
             exc_info=True,

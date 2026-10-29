@@ -19,32 +19,33 @@ const state = create();
 
 for (const config_model_type of [
     'qwen3_5', 'qwen3_5_moe', 'qwen3_6', 'qwen3_8', 'Qwen3-8',
-    'qwen4_exp', 'Qwen4-Exp',
+    'qwen4_exp', 'Qwen4-Exp', 'deepseek_v41',
 ]) {
-    assert.equal(state.isQwenOqA8Model({config_model_type}), true);
+    assert.equal(state.isA8PrefillModel({config_model_type}), true);
 }
 for (const config_model_type of [
     '', 'qwen2', 'qwen3', 'qwen4', 'qwen4_exp_x', 'llama', 'gemma4', 'k2_horizon',
+    'deepseek_v4',
 ]) {
-    assert.equal(state.isQwenOqA8Model({config_model_type}), false);
+    assert.equal(state.isA8PrefillModel({config_model_type}), false);
 }
-assert.equal(state.isQwenOqA8Model(null), false);
+assert.equal(state.isA8PrefillModel(null), false);
 
 // Hidden where the kernels cannot run, unless already on.
-assert.equal(state.showsQwenOqA8({config_model_type: 'qwen3_5', qwen35_oq_a8_supported: false}), false);
-assert.equal(state.showsQwenOqA8({config_model_type: 'qwen3_5', qwen35_oq_a8_supported: true}), true);
-assert.equal(state.showsQwenOqA8({
+assert.equal(state.showsA8Prefill({config_model_type: 'qwen3_5', a8_prefill_supported: false}), false);
+assert.equal(state.showsA8Prefill({config_model_type: 'qwen3_5', a8_prefill_supported: true}), true);
+assert.equal(state.showsA8Prefill({
     config_model_type: 'qwen3_5',
-    qwen35_oq_a8_supported: false,
-    settings: {qwen35_oq_a8_enabled: true},
+    a8_prefill_supported: false,
+    settings: {a8_prefill_enabled: true},
 }), true);
-assert.equal(state.showsQwenOqA8({config_model_type: 'llama', qwen35_oq_a8_supported: true}), false);
+assert.equal(state.showsA8Prefill({config_model_type: 'llama', a8_prefill_supported: true}), false);
 
-state.modelSettings.qwen35_oq_a8_enabled = true;
+state.modelSettings.a8_prefill_enabled = true;
 state.modelSettings.qwen35_ane_prefill_enabled = true;
-assert.equal(state.validateQwenOqA8Settings(), 'js.error.ane_oq_a8_conflict');
+assert.equal(state.validateA8PrefillSettings(), 'js.error.ane_oq_a8_conflict');
 state.modelSettings.qwen35_ane_prefill_enabled = false;
-assert.equal(state.validateQwenOqA8Settings(), null);
+assert.equal(state.validateA8PrefillSettings(), null);
 console.log('oQ A8 visibility and ANE conflict checks passed');
 
 (async () => {
@@ -73,7 +74,7 @@ console.log('oQ A8 visibility and ANE conflict checks passed');
     const app = create();
     app.loadModels = async () => {};
     app.selectedModel = {id: 'flash', config_model_type: 'qwen4_exp'};
-    assert.equal(app.isQwenOqA8Model(app.selectedModel), true);
+    assert.equal(app.isA8PrefillModel(app.selectedModel), true);
     let payload;
     context.fetch = async (_url, init) => {
         payload = JSON.parse(init.body);
@@ -81,14 +82,14 @@ console.log('oQ A8 visibility and ANE conflict checks passed');
     };
     context.alert = message => { throw Error(message); };
     app.modelSettings = app.buildModelSettingsState(
-        app.selectedModel, {qwen35_oq_a8_enabled: true, qwen35_oq_a8_min_tokens: 256});
-    assert.equal(app.modelSettings.qwen35_oq_a8_enabled, true);
-    assert.equal(app.modelSettings.qwen35_oq_a8_min_tokens, 256);
+        app.selectedModel, {a8_prefill_enabled: true, a8_prefill_min_tokens: 256});
+    assert.equal(app.modelSettings.a8_prefill_enabled, true);
+    assert.equal(app.modelSettings.a8_prefill_min_tokens, 256);
     await app.saveModelSettings();
-    assert.equal(payload.qwen35_oq_a8_enabled, true);
-    assert.equal(payload.qwen35_oq_a8_min_tokens, 256);
+    assert.equal(payload.a8_prefill_enabled, true);
+    assert.equal(payload.a8_prefill_min_tokens, 256);
     const restored = app.buildModelSettingsState(app.selectedModel, payload);
-    assert.equal(restored.qwen35_oq_a8_enabled, true);
-    assert.equal(restored.qwen35_oq_a8_min_tokens, 256);
+    assert.equal(restored.a8_prefill_enabled, true);
+    assert.equal(restored.a8_prefill_min_tokens, 256);
     console.log('qwen4_exp oQ A8 toggle and minimum-token round-trip passed');
 }).catch(error => {console.error(error); process.exitCode = 1});

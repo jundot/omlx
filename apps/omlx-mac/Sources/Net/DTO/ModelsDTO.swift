@@ -77,7 +77,7 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     /// True for families whose MTP draft head stays resident while experts stream.
     var moeOffloadAllowsMtp: Bool? = nil
     /// True when this Mac can run the Qwen INT8 activation prefill kernels.
-    var qwen35OqA8Supported: Bool? = nil
+    var a8PrefillSupported: Bool? = nil
     /// True when this Mac's GPU accepts a power cap.
     var gpuPowerLimitSupported: Bool? = nil
     /// "hf_cache" for models found in the shared Hugging Face Hub cache.
@@ -181,8 +181,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let qwen35AnePrefillCpuThreads: Int?
     let qwen35AnePrefillCpuSharedResource: Bool?
     // Experimental: oQ mixed-bit INT8-activation prefill kernels
-    let qwen35OqA8Enabled: Bool?
-    let qwen35OqA8MinTokens: Int?
+    let a8PrefillEnabled: Bool?
+    let a8PrefillMinTokens: Int?
     // Experimental: IndexCache (DSA models only)
     let indexCacheFreq: Int?
     // Experimental: SpecPrefill
@@ -268,8 +268,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var qwen35AnePrefillCpuThreads: Int? = nil
     var qwen35AnePrefillCpuSharedResource: Bool? = nil
     // Experimental: oQ mixed-bit INT8-activation prefill kernels
-    var qwen35OqA8Enabled: Bool? = nil
-    var qwen35OqA8MinTokens: Int? = nil
+    var a8PrefillEnabled: Bool? = nil
+    var a8PrefillMinTokens: Int? = nil
     // Experimental: IndexCache
     var indexCacheFreq: Int? = nil
     // Experimental: SpecPrefill

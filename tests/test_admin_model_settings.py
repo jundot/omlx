@@ -380,9 +380,9 @@ async def test_qwen_ane_prefill_accepts_qwen38_config_type():
 @pytest.mark.parametrize(
     "initial, update",
     [
-        ({"qwen35_ane_prefill_enabled": True}, {"qwen35_oq_a8_enabled": True}),
-        ({"qwen35_oq_a8_enabled": True}, {"qwen35_ane_prefill_enabled": True}),
-        ({}, {"qwen35_oq_a8_enabled": True, "qwen35_ane_prefill_enabled": True}),
+        ({"qwen35_ane_prefill_enabled": True}, {"a8_prefill_enabled": True}),
+        ({"a8_prefill_enabled": True}, {"qwen35_ane_prefill_enabled": True}),
+        ({}, {"a8_prefill_enabled": True, "qwen35_ane_prefill_enabled": True}),
     ],
 )
 async def test_oq_a8_is_refused_while_ane_prefill_is_on(tmp_path, initial, update):
@@ -420,12 +420,12 @@ async def test_oq_a8_alone_is_persisted():
             pool,
             settings,
             admin_routes.ModelSettingsRequest(
-                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=256
+                a8_prefill_enabled=True, a8_prefill_min_tokens=256
             ),
         )
 
-    assert settings.qwen35_oq_a8_enabled is True
-    assert settings.qwen35_oq_a8_min_tokens == 256
+    assert settings.a8_prefill_enabled is True
+    assert settings.a8_prefill_min_tokens == 256
 
 
 @pytest.mark.asyncio
@@ -440,12 +440,12 @@ async def test_oq_a8_is_accepted_for_qwen4_exp_and_keeps_min_tokens():
             pool,
             settings,
             admin_routes.ModelSettingsRequest(
-                qwen35_oq_a8_enabled=True, qwen35_oq_a8_min_tokens=512
+                a8_prefill_enabled=True, a8_prefill_min_tokens=512
             ),
         )
 
-    assert settings.qwen35_oq_a8_enabled is True
-    assert settings.qwen35_oq_a8_min_tokens == 512
+    assert settings.a8_prefill_enabled is True
+    assert settings.a8_prefill_min_tokens == 512
 
 
 @pytest.mark.asyncio
@@ -463,12 +463,12 @@ async def test_oq_a8_is_refused_outside_validated_families(config_type):
             await _update_settings(
                 pool,
                 settings,
-                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+                admin_routes.ModelSettingsRequest(a8_prefill_enabled=True),
             )
 
     assert excinfo.value.status_code == 400
     assert "Flash-Next" in excinfo.value.detail
-    assert settings.qwen35_oq_a8_enabled is False
+    assert settings.a8_prefill_enabled is False
 
 
 @pytest.mark.asyncio
@@ -490,7 +490,7 @@ async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
         await admin_routes.update_model_settings(
             "ling",
             admin_routes.ModelSettingsRequest(
-                qwen35_oq_a8_enabled=True, qwen35_ane_prefill_enabled=True
+                a8_prefill_enabled=True, qwen35_ane_prefill_enabled=True
             ),
             is_admin=True,
         )
@@ -509,6 +509,8 @@ async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
         ("Qwen4-Exp", True),
         ("qwen4", False),
         ("qwen4_exp_x", False),
+        ("deepseek_v41", True),
+        ("deepseek_v4", False),
         ("llama", False),
         (None, False),
     ],
@@ -524,7 +526,7 @@ def test_oq_a8_model_supported(config_type, expected):
 def test_model_options_report_oq_a8_support(config_type, kernels, expected):
     with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=kernels):
         options = admin_routes._model_options({"config_model_type": config_type}, None)
-    assert options["qwen35_oq_a8_supported"] is expected
+    assert options["a8_prefill_supported"] is expected
 
 
 @pytest.mark.asyncio
@@ -540,12 +542,12 @@ async def test_oq_a8_needs_native_int8_kernels():
             await _update_settings(
                 pool,
                 settings,
-                admin_routes.ModelSettingsRequest(qwen35_oq_a8_enabled=True),
+                admin_routes.ModelSettingsRequest(a8_prefill_enabled=True),
             )
 
     assert excinfo.value.status_code == 400
     assert "M5-series or newer" in excinfo.value.detail
-    assert settings.qwen35_oq_a8_enabled is False
+    assert settings.a8_prefill_enabled is False
 
 
 @pytest.mark.asyncio

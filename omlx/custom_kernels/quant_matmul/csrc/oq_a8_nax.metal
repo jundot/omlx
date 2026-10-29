@@ -1,13 +1,13 @@
 // oQ mixed-bit QxA8 GEMM on the M5 NAX tensor units.
 //
-// Packed Q4/Q5 affine weights are decoded straight into INT8 tensor-op
+// Packed Q4/Q5/Q6 affine weights are decoded straight into INT8 tensor-op
 // fragment registers and multiplied against dynamically quantized INT8
 // activations through the int8 x int8 -> int32 datapath, with the affine
 // correction applied at every GS64 boundary.
 //
 //        Qa (INT8, device)  ------------------\
 //                                              >-- INT8 NAX matmul2d --> INT32
-//        packed Q4/Q5 uint32 -> register decode/
+//     packed Q4/Q5/Q6 uint32 -> register decode/
 //                                                        |
 //                                          GS64 affine correction (FP32)
 //                                                        |
@@ -54,22 +54,23 @@ constant constexpr int kPackedTileN = 128;
 
 using frag_i8 = BaseNAXFrag::dtype_frag_t<int8_t>;
 
-// One 5-bit code out of a lane's normalized 96-bit Q5 window.
+// One BITS-wide code out of a lane's normalized 96-bit Q5/Q6 window.
 //
 // OFF is a compile-time bit offset, so the word it lands in and whether it
 // crosses into the next one are both settled at compile time: the common case
-// is a single extract_bits, and only the four fields that straddle a word
-// boundary pay a shift-or.
-template <int OFF>
-inline int8_t oq_q5_window_code(uint3 w) {
+// is a single extract_bits, and only the fields that straddle a word boundary
+// pay a shift-or.
+template <int OFF, int BITS>
+inline int8_t oq_window_code(uint3 w) {
   constexpr int wi = OFF >> 5;
   constexpr int sh = OFF & 31;
   const uint32_t lo = (wi == 0) ? w.x : ((wi == 1) ? w.y : w.z);
-  if (sh <= 27) {
-    return static_cast<int8_t>(metal::extract_bits(lo, sh, 5));
+  if (sh <= 32 - BITS) {
+    return static_cast<int8_t>(metal::extract_bits(lo, sh, BITS));
   }
   const uint32_t hi = (wi == 0) ? w.y : w.z;
-  return static_cast<int8_t>(((lo >> sh) | (hi << (32 - sh))) & 0x1fu);
+  return static_cast<int8_t>(
+      ((lo >> sh) | (hi << (32 - sh))) & ((1u << BITS) - 1u));
 }
 
 template <typename T, int BITS, int ACT_MODE, int WM, int WN, bool PACKED>
@@ -189,6 +190,7 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN, bool PACKED>
     // words always cover (bit 80c lies at word 5c/2 rounded down, offset 0 or
     // 16). They are normalized here, once per group, so that bit 0 of `wq` is
     // code 16c and every per-step offset below is a compile-time constant.
+    // Q6: the 96 bits at bit 96c are exactly words 3c..3c+2 (offset 0).
     // The shift is spelled in two steps because a shift by the full width is
     // undefined and `sh` is 0 for even c.
     // Only one of these is live per instantiation. Both are declared at full
@@ -199,7 +201,7 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN, bool PACKED>
     // about before it drops them.
     uint2 wg[4];
     uint3 wq[4];
-    const int w5_bit = BITS == 5 ? 80 * cx : 0;
+    const int w5_bit = BITS == 4 ? 0 : 16 * BITS * cx;
     const int w5_word = w5_bit >> 5;
     const int w5_sh = w5_bit & 31;
     STEEL_PRAGMA_UNROLL
@@ -226,9 +228,9 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN, bool PACKED>
       // odd ones -- one mask, or a shift and a mask, and the result read as
       // char4 is the quad.
       //
-      // Q5: the same four codes are 5-bit fields 10 bits apart in the
-      // normalized window, at compile-time offsets, so each is one extract
-      // and only the four that straddle a word pay more.
+      // Q5/Q6: the same four codes are BITS-wide fields 2*BITS bits apart in
+      // the normalized window, at compile-time offsets, so each is one
+      // extract and only those that straddle a word pay more.
       STEEL_PRAGMA_UNROLL
       for (int q = 0; q < 4; ++q) {
         const int base = (q >> 1) * kElemsPerFrag + (q & 1) * 4;
@@ -241,30 +243,30 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN, bool PACKED>
           ct_b[base + 2] = quad.z;
           ct_b[base + 3] = quad.w;
         } else {
-          // Field j sits at bit 40*(t>>1) + 5*(t&1) + 10j of the window. The
-          // step is spelled out per t so that every offset reaches
-          // oq_q5_window_code() as a template argument.
+          // Field j sits at bit BITS * (8*(t>>1) + (t&1) + 2j) of the window.
+          // The step is spelled out per t so that every offset reaches
+          // oq_window_code() as a template argument.
           const uint3 wv = wq[q];
           if (t == 0) {
-            ct_b[base + 0] = oq_q5_window_code<0>(wv);
-            ct_b[base + 1] = oq_q5_window_code<10>(wv);
-            ct_b[base + 2] = oq_q5_window_code<20>(wv);
-            ct_b[base + 3] = oq_q5_window_code<30>(wv);
+            ct_b[base + 0] = oq_window_code<BITS * 0, BITS>(wv);
+            ct_b[base + 1] = oq_window_code<BITS * 2, BITS>(wv);
+            ct_b[base + 2] = oq_window_code<BITS * 4, BITS>(wv);
+            ct_b[base + 3] = oq_window_code<BITS * 6, BITS>(wv);
           } else if (t == 1) {
-            ct_b[base + 0] = oq_q5_window_code<5>(wv);
-            ct_b[base + 1] = oq_q5_window_code<15>(wv);
-            ct_b[base + 2] = oq_q5_window_code<25>(wv);
-            ct_b[base + 3] = oq_q5_window_code<35>(wv);
+            ct_b[base + 0] = oq_window_code<BITS * 1, BITS>(wv);
+            ct_b[base + 1] = oq_window_code<BITS * 3, BITS>(wv);
+            ct_b[base + 2] = oq_window_code<BITS * 5, BITS>(wv);
+            ct_b[base + 3] = oq_window_code<BITS * 7, BITS>(wv);
           } else if (t == 2) {
-            ct_b[base + 0] = oq_q5_window_code<40>(wv);
-            ct_b[base + 1] = oq_q5_window_code<50>(wv);
-            ct_b[base + 2] = oq_q5_window_code<60>(wv);
-            ct_b[base + 3] = oq_q5_window_code<70>(wv);
+            ct_b[base + 0] = oq_window_code<BITS * 8, BITS>(wv);
+            ct_b[base + 1] = oq_window_code<BITS * 10, BITS>(wv);
+            ct_b[base + 2] = oq_window_code<BITS * 12, BITS>(wv);
+            ct_b[base + 3] = oq_window_code<BITS * 14, BITS>(wv);
           } else {
-            ct_b[base + 0] = oq_q5_window_code<45>(wv);
-            ct_b[base + 1] = oq_q5_window_code<55>(wv);
-            ct_b[base + 2] = oq_q5_window_code<65>(wv);
-            ct_b[base + 3] = oq_q5_window_code<75>(wv);
+            ct_b[base + 0] = oq_window_code<BITS * 9, BITS>(wv);
+            ct_b[base + 1] = oq_window_code<BITS * 11, BITS>(wv);
+            ct_b[base + 2] = oq_window_code<BITS * 13, BITS>(wv);
+            ct_b[base + 3] = oq_window_code<BITS * 15, BITS>(wv);
           }
         }
       }
@@ -456,6 +458,7 @@ template <typename T, int BITS, int ACT_MODE, int WM, int WN, bool PACKED>
 
 instantiate_oq_a8_qmm_t_nax_v8_bits(4);
 instantiate_oq_a8_qmm_t_nax_v8_bits(5);
+instantiate_oq_a8_qmm_t_nax_v8_bits(6);
 
 // PackedLinear holds only Q4 GS64 with bfloat16 metadata.
 #define instantiate_oq_a8_qmm_t_nax_v8_packed_tiles(act_mode)                 \

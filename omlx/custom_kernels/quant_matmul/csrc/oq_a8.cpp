@@ -1,10 +1,10 @@
-// Host side of the oQ mixed-bit QxA8 prefill path (Q4, Q5 and Q8, GS64 affine).
+// Host side of the oQ mixed-bit QxA8 prefill path (Q4, Q5, Q6 and Q8, GS64 affine).
 //
 // Three ops:
 //
 //   oq_a8_quantize        BF16/FP16 X -> (Qa, Sa, Ra)          [Stage A]
-//   oq_a8_qmm_t           (Qa, Sa, Ra) x packed Q4/Q5/Q8 -> Y  [GEMM]
-//   oq_a8_decode_weights  packed Q4/Q5/Q8 -> INT8 codes        [tests]
+//   oq_a8_qmm_t           (Qa, Sa, Ra) x packed Q4-Q6/Q8 -> Y  [GEMM]
+//   oq_a8_decode_weights  packed Q4-Q6/Q8 -> INT8 codes        [tests]
 //
 // Stage A is separate so Python can share quantized activations between
 // projections of the same input.
@@ -99,7 +99,7 @@ OqA8NaxVariant oq_a8_nax_variant(int variant) {
 }
 
 bool oq_a8_bits_supported(int bits) {
-  return bits == 4 || bits == 5 || bits == 8;
+  return bits == 4 || bits == 5 || bits == 6 || bits == 8;
 }
 
 // Packed layout check, identical to the one oMLX already applies to affine
@@ -220,7 +220,7 @@ class OqA8QmmTPrimitive : public Primitive {
         packed_(packed) {
     if (!oq_a8_bits_supported(bits_)) {
       std::ostringstream msg;
-      msg << "Unsupported oQ A8 bits " << bits_ << " (expected 4, 5 or 8).";
+      msg << "Unsupported oQ A8 bits " << bits_ << " (expected 4, 5, 6 or 8).";
       throw std::invalid_argument(msg.str());
     }
     if (act_mode_ != 0 && act_mode_ != 1) {
@@ -325,7 +325,7 @@ class OqA8DecodeWeightsPrimitive : public Primitive {
       : Primitive(stream), bits_(bits), k_(k) {
     if (!oq_a8_bits_supported(bits_)) {
       std::ostringstream msg;
-      msg << "Unsupported oQ A8 bits " << bits_ << " (expected 4, 5 or 8).";
+      msg << "Unsupported oQ A8 bits " << bits_ << " (expected 4, 5, 6 or 8).";
       throw std::invalid_argument(msg.str());
     }
   }
@@ -452,7 +452,7 @@ array oq_a8_qmm_t(
   if (!oq_a8_bits_supported(bits)) {
     std::ostringstream msg;
     msg << "[quant_matmul.oq_a8_qmm_t] bits " << bits
-        << " unsupported (expected 4, 5 or 8).";
+        << " unsupported (expected 4, 5, 6 or 8).";
     throw std::invalid_argument(msg.str());
   }
   if (bits == 8 && packed) {
@@ -516,7 +516,7 @@ array oq_a8_qmm_t(
     throw std::invalid_argument(msg.str());
   }
   // Ra is [K/64, M].
-  // Q4/Q5 scales/biases are [K/64, N]; Q8 reads the checkpoint's [N, K/64].
+  // Q4/Q5/Q6 scales/biases are [K/64, N]; Q8 reads the checkpoint's [N, K/64].
   // Packed metadata holds the same N * K/64 values in the PackedLinear order.
   (void)oq_a8_nax_variant(variant);
   if (packed) {
@@ -595,7 +595,7 @@ array oq_a8_decode_weights(
   if (!oq_a8_bits_supported(bits)) {
     std::ostringstream msg;
     msg << "[quant_matmul.oq_a8_decode_weights] bits " << bits
-        << " unsupported (expected 4, 5 or 8).";
+        << " unsupported (expected 4, 5, 6 or 8).";
     throw std::invalid_argument(msg.str());
   }
   if (weight.dtype() != uint32 || weight.ndim() != 2 ||

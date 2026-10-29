@@ -237,20 +237,20 @@ print(deleted)
 
 
 def _oq_a8_model_supported(config_type: str | None) -> bool:
-    """True for the model families the oQ A8 prefill patch can route.
+    """True for the model families the A8 prefill paths can route.
 
-    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) matches
-    exactly: only that validated checkpoint family has routed-expert A8, so a
-    ``qwen4`` prefix would admit unvalidated models.
+    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) and
+    DeepSeek V4.1 match exactly: only those validated checkpoint families have
+    routed-expert A8, so a ``qwen4`` prefix would admit unvalidated models.
     """
     config_type = str(config_type or "").lower().replace("-", "_")
-    return config_type == "qwen4_exp" or config_type.startswith(
+    return config_type in ("qwen4_exp", "deepseek_v41") or config_type.startswith(
         ("qwen3_5", "qwen3_6", "qwen3_8")
     )
 
 
 def _oq_a8_kernels_available() -> bool:
-    """True when the oQ A8 prefill kernels can actually run on this host.
+    """True when the A8 prefill kernels can actually run on this host.
 
     Enabling the setting on a machine without tensor units would leave every
     projection falling back, so the save is refused rather than accepted into
@@ -414,9 +414,9 @@ class ModelSettingsRequest(BaseModel):
     qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
     qwen35_ane_prefill_cpu_threads: int | None = None
     qwen35_ane_prefill_cpu_shared_resource: bool | None = None
-    # oQ mixed-bit QxA8 prefill kernels (Qwen3.5/3.6/3.8 and Qwen3.8 Flash-Next)
-    qwen35_oq_a8_enabled: bool | None = None
-    qwen35_oq_a8_min_tokens: int | None = None
+    # INT8-activation (A8) prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1)
+    a8_prefill_enabled: bool | None = None
+    a8_prefill_min_tokens: int | None = None
     # MoE expert offload (stream non-resident experts from the checkpoint)
     moe_expert_offload_enabled: bool | None = None
     moe_expert_offload_resident_fraction: float | None = None
@@ -2314,7 +2314,7 @@ def _model_options(model_info: dict, settings) -> dict:
         "ane_prefill_shared_fractions": [0, 1 / 3, 1] if ane_backend == "k2" else [],
         "embedding_audio_supported": model_type == "embedding_gemma2",
         # Lets the settings UIs hide the toggle the save would reject.
-        "qwen35_oq_a8_supported": (
+        "a8_prefill_supported": (
             _oq_a8_model_supported(model_type) and _oq_a8_kernels_available()
         ),
         "gpu_power_limit_supported": gpu_power.gpu_power_cap_supported(),
@@ -3148,18 +3148,18 @@ async def update_model_settings(
         current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
             request.qwen35_ane_prefill_cpu_shared_resource
         )
-    # oQ mixed-bit QxA8 prefill. Load-time like the ANE controls above: the
+    # INT8-activation (A8) prefill. Load-time like the ANE controls above: the
     # runtime signature re-creates a loaded model when this changes.
-    if "qwen35_oq_a8_enabled" in sent:
-        current_settings.qwen35_oq_a8_enabled = bool(request.qwen35_oq_a8_enabled)
-    if "qwen35_oq_a8_min_tokens" in sent:
-        value = request.qwen35_oq_a8_min_tokens
+    if "a8_prefill_enabled" in sent:
+        current_settings.a8_prefill_enabled = bool(request.a8_prefill_enabled)
+    if "a8_prefill_min_tokens" in sent:
+        value = request.a8_prefill_min_tokens
         if value is None or value < 1:
             raise HTTPException(
                 status_code=400,
-                detail="oQ A8 min tokens must be at least 1.",
+                detail="A8 prefill min tokens must be at least 1.",
             )
-        current_settings.qwen35_oq_a8_min_tokens = int(value)
+        current_settings.a8_prefill_min_tokens = int(value)
     budget_error = _ane_prefill_budget_error(
         current_settings.to_dict(), entry.config_model_type
     )
@@ -3614,34 +3614,34 @@ def _validate_model_settings(entry, settings):
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
-    if "qwen35_oq_a8_min_tokens" in settings:
-        value = settings["qwen35_oq_a8_min_tokens"]
+    if "a8_prefill_min_tokens" in settings:
+        value = settings["a8_prefill_min_tokens"]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise HTTPException(
-                status_code=400, detail="oQ A8 min tokens must be at least 1."
+                status_code=400, detail="A8 prefill min tokens must be at least 1."
             )
-    if settings.get("qwen35_oq_a8_enabled"):
+    if settings.get("a8_prefill_enabled"):
         if not _oq_a8_model_supported(getattr(entry, "config_model_type", "")):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
-                    "Qwen3.8-Flash-Next models."
+                    "A8 prefill is available only for Qwen3.5/3.6/3.8, "
+                    "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
                 ),
             )
         if not _oq_a8_kernels_available():
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "oQ A8 prefill needs the native Qwen3.5 prefill kernels and "
-                    "a Metal device with native INT8 tensor operations "
-                    "(M5-series or newer)."
+                    "A8 prefill needs the native prefill kernels and a Metal "
+                    "device with native INT8 tensor operations (M5-series or "
+                    "newer)."
                 ),
             )
         if settings.get("qwen35_ane_prefill_enabled"):
             raise HTTPException(
                 status_code=400,
-                detail="ANE prefill and oQ A8 prefill cannot both be enabled.",
+                detail="ANE prefill and A8 prefill cannot both be enabled.",
             )
     if any(key.startswith("qwen35_ane_prefill_") for key in settings):
         try:
@@ -3960,16 +3960,16 @@ def _feature_problem(
         except ValueError as error:
             return str(error)
         return _ane_prefill_budget_error(snapshot, entry.config_model_type)
-    if name == "oq_a8":
+    if name == "a8_prefill":
         if not _oq_a8_model_supported(entry.config_model_type):
             return (
-                "oQ A8 prefill is available only for Qwen3.5/3.6/3.8 and "
-                "Qwen3.8-Flash-Next models."
+                "A8 prefill is available only for Qwen3.5/3.6/3.8, "
+                "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
             )
         if not _oq_a8_kernels_available():
             return (
-                "oQ A8 prefill needs the native Qwen3.5 prefill kernels and a "
-                "Metal device with native INT8 tensor operations."
+                "A8 prefill needs the native prefill kernels and a Metal "
+                "device with native INT8 tensor operations."
             )
         return None
     if name == "moe_expert_offload":
@@ -4033,7 +4033,7 @@ async def _apply_settings_snapshot(
     candidate, conflicts = resolve_vlm_mtp_conflicts(candidate)
     _note_conflict("vlm_mtp", conflicts, skipped)
     candidate, conflicts = resolve_qwen35_prefill_conflicts(candidate)
-    _note_conflict("oq_a8", conflicts, skipped)
+    _note_conflict("a8_prefill", conflicts, skipped)
     try:
         ModelSettings.from_dict(candidate)
         _validate_model_settings(entry, candidate)

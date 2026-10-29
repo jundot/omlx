@@ -491,7 +491,7 @@ def oq_a8_stage_a_natural(
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Stage A for the Q8 kernel: activations stay in checkpoint K order.
 
-    Q4/Q5 use :func:`oq_a8_stage_a_v8`. Only the group metadata is
+    Q4-Q6 use :func:`oq_a8_stage_a_v8`. Only the group metadata is
     transposed here, so there is no INT8 activation copy.
     """
     qa, sa, ra = oq_a8_quantize(x, act_mode, stream=stream)
@@ -508,7 +508,7 @@ def oq_a8_decode_weights(
     *,
     stream=None,
 ) -> mx.array:
-    """Unpack Q4/Q5/Q8 codes to INT8 (Q8 centered to q - 128).
+    """Unpack Q4-Q6/Q8 codes to INT8 (Q8 centered to q - 128).
 
     Test helper only: the production path never materializes unpacked weights
     in device memory.

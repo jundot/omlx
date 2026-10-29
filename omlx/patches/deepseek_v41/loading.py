@@ -13,7 +13,10 @@ from mlx.utils import tree_flatten
 from mlx_lm.generate import wired_limit
 from transformers import PreTrainedTokenizerFast
 
+from omlx.custom_kernels.quant_matmul import fast as quant_fast
+
 from ..mlx_lm_mtp import get_mtp_depth
+from .a8 import tag_dense_a8
 from .config import ModelConfig
 from .convert import iter_source_weights, source_engram_tables
 from .dspark import make_stages
@@ -86,6 +89,8 @@ def load(
     preserve_mtp=None,
     moe_expert_offload_resident_fraction=None,
     ced_prefill=False,
+    a8_prefill=False,
+    a8_prefill_min_tokens=128,
     stage=None,
     tensor=None,
     mtp_head=False,
@@ -153,6 +158,16 @@ def load(
             logger.warning(
                 "DeepSeek V4.1 CED prefill requested but layer layout is "
                 "unsupported; falling back to full decoder prefill"
+            )
+    if a8_prefill:
+        config.a8_prefill = quant_fast.oq_a8_available()
+        config.a8_prefill_min_tokens = a8_prefill_min_tokens
+        if config.a8_prefill:
+            logger.info("DeepSeek V4.1 A8 prefill enabled")
+        else:
+            logger.warning(
+                "DeepSeek V4.1 A8 prefill requested but this GPU has no INT8 "
+                "tensor kernels; keeping the A16 path"
             )
     model = Model(config)
     if whole_config is not None:
@@ -422,6 +437,9 @@ def load(
                 ):
                     layer.engram.embed.make_resident()
         mx.eval(model.parameters())
+        if config.a8_prefill:
+            tagged = tag_dense_a8(model.language_model, a8_prefill_min_tokens)
+            logger.info("DeepSeek V4.1 dense A8 prefill on %d projections", tagged)
         model.eval()
         return model, processor
     except BaseException:

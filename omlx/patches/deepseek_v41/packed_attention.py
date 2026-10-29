@@ -5,6 +5,12 @@ from functools import cache
 
 import mlx.core as mx
 
+from ..deepseek_v4.sparse_attention_nax import MIN_ROWS as NAX_MIN_ROWS
+from ..deepseek_v4.sparse_attention_nax import (
+    nax_sparse_attention_available,
+    sparse_topk_attention_nax,
+)
+
 _READ = r"""
 #include <metal_stdlib>
 using namespace metal;
@@ -196,6 +202,78 @@ _MERGE = r"""
     denominator += exp(float(sink[head]) - maximum);
     out[(query * H + head) * D + d] = T(acc / denominator);
 """
+
+
+# One thread per decoded value: window rows (512 FP8 + 16 exponent bytes) then
+# pooled rows (256 FP4 bytes + 32 FP8 scales), as the native prefill unpack.
+_UNPACK = r"""
+    const uint i = thread_position_in_grid.x;
+    const uint local_n = uint(meta[0]) * 512u;
+    const uint pooled_n = uint(meta[1]) * 512u;
+    if (i < local_n) {
+        const uint row = i / 512u, d = i % 512u;
+        const size_t base = size_t(row) * 528u;
+        local_out[i] = bfloat16_t(
+            ldexp(rounded_fp8(window[base + d]), int(window[base + 512u + d / 32u]) - 127));
+    } else if (i < local_n + pooled_n) {
+        const uint j = i - local_n, row = j / 512u, d = j % 512u;
+        const size_t base = size_t(row) * 288u;
+        const uchar code = (pooled[base + d / 2u] >> ((d % 2u) * 4u)) & 15u;
+        pooled_out[j] = bfloat16_t(rounded_fp4(code) * rounded_fp8(pooled[base + 256u + d / 16u]));
+    }
+"""
+
+
+@cache
+def _unpack_kernel():
+    return mx.fast.metal_kernel(
+        name="deepseek_v41_unpack_kv_rows",
+        input_names=["window", "pooled", "meta"],
+        output_names=["local_out", "pooled_out"],
+        source=_UNPACK,
+        header=_READ,
+    )
+
+
+def nax_packed_sparse_attention(q, window, pooled, ci, sink, scale, start, ratio, size):
+    """Prefill sparse attention on the tensor units, or None to keep the native kernel.
+
+    q: [1, L, H, 512] bf16; window: [1, S, 528] packed local rows; pooled:
+    [1, P, 288] packed compressed rows; ci: [1, L, K] selected pooled rows.
+    The packed rows are decoded once into BF16 (exact), then the DeepSeek V4
+    tensor-unit kernel attends with a single fp16 piece of P, finer than the
+    native kernel's BF16 P. Returns [1, H, L, 512] (heads-major).
+    """
+    if (
+        not nax_sparse_attention_available()
+        or q.shape[1] < NAX_MIN_ROWS
+        or window.shape[-1] != 528
+        or pooled.shape[-1] != 288
+        or not pooled.shape[1]
+        or not ci.shape[-1]
+    ):
+        return None
+    rows, pooled_rows = window.shape[1], pooled.shape[1]
+    local, pooled_bf16 = _unpack_kernel()(
+        inputs=[window, pooled, mx.array([rows, pooled_rows], mx.int32)],
+        grid=((rows + pooled_rows) * 512, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, 1, rows, 512), (1, pooled_rows, 512)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16],
+    )
+    return sparse_topk_attention_nax(
+        q,
+        local,
+        pooled_bf16,
+        ci.astype(mx.uint32),
+        sink,
+        scale,
+        start,
+        size,
+        max(ratio, 1),
+        q_token_major=True,
+        p_lo=False,
+    )
 
 
 @cache

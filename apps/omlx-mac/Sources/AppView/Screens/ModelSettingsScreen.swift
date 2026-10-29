@@ -2048,7 +2048,7 @@ private struct AccelerationSection: View {
                     sublabel: String(localized: "settings.acceleration.ced_prefill.sub",
                                      defaultValue: "Improves prefill speed by approximately 74–79% in tested configurations. Uses the model’s Causal Encoder–Decoder architecture to reduce decoder prefill computation.",
                                      comment: "Sublabel for the DeepSeek V4.1 CED prefill toggle"),
-                    isLast: !vm.isQwen4Exp && !vm.showsQwenOqA8) {
+                    isLast: !vm.isQwen4Exp && !vm.showsA8Prefill) {
                     RowSwitch(isOn: vm.bind($vm.deepseekV41CedPrefillEnabled, save: {
                         Task { await vm.save(.deepseekV41CedPrefill, client: client) }
                     }))
@@ -2061,25 +2061,25 @@ private struct AccelerationSection: View {
                     sublabel: String(localized: "settings.acceleration.qwen4_wide_decode.sub",
                                      defaultValue: "Speeds up decode on Qwen4 oQ2.5e, oQ2.7e, oQ6e, oQ8e and 8-bit community models (about 3-6% on an 8-bit model, up to 1.5 GiB more memory). No effect on oQ3e to oQ4e or fp16 builds, and little effect with Lightning MTP on.",
                                      comment: "Sublabel for the Qwen4 extended fused decode toggle"),
-                    isLast: !vm.showsQwenOqA8) {
+                    isLast: !vm.showsA8Prefill) {
                     RowSwitch(isOn: vm.bind($vm.qwen4GdnDecodeWideProj, save: {
                         Task { await vm.save(.qwen4GdnDecodeWideProj, client: client) }
                     }))
                 }
             }
-            // The oQ A8 rows do not depend on an ANE backend: Qwen3.8
-            // Flash-Next has none, but still supports oQ A8.
-            if vm.showsQwenOqA8 {
+            // The A8 rows do not depend on an ANE backend: Qwen3.8 Flash-Next
+            // and DeepSeek V4.1 have none, but still support A8.
+            if vm.showsA8Prefill {
                 Row(label: String(localized: "settings.experimental.qwen_oq_a8.label",
-                                  defaultValue: "Qwen INT8 Activation Prefill",
+                                  defaultValue: "INT8 Activation Prefill",
                                   comment: "Row label for the oQ INT8-activation prefill kernels"),
-                    sublabel: qwenOqA8Sublabel,
-                    isLast: !vm.qwen35OqA8Enabled) {
-                    RowSwitch(isOn: vm.bindProfile($vm.qwen35OqA8Enabled))
-                        .disabled(vm.qwen35OqA8ConflictReason != nil)
-                        .help(vm.qwen35OqA8ConflictReason ?? "")
+                    sublabel: a8PrefillSublabel,
+                    isLast: !vm.a8PrefillEnabled) {
+                    RowSwitch(isOn: vm.bindProfile($vm.a8PrefillEnabled))
+                        .disabled(vm.a8PrefillConflictReason != nil)
+                        .help(vm.a8PrefillConflictReason ?? "")
                 }
-                if vm.qwen35OqA8Enabled {
+                if vm.a8PrefillEnabled {
                     Row(label: String(localized: "settings.experimental.qwen_oq_a8.min_tokens.label",
                                       defaultValue: "Minimum Prompt Tokens",
                                       comment: "Row label for the oQ A8 minimum prompt length"),
@@ -2087,7 +2087,7 @@ private struct AccelerationSection: View {
                                          defaultValue: "Shorter prompts stay on the existing path, where the activation-quantization pass costs more than the faster matmul saves.",
                                          comment: "Sublabel explaining the oQ A8 minimum prompt length"),
                         isLast: true) {
-                        TextInput(text: vm.bindProfile($vm.qwen35OqA8MinTokens),
+                        TextInput(text: vm.bindProfile($vm.a8PrefillMinTokens),
                                   placeholder: "128", mono: true,
                                   isNumeric: true, range: 1...262_144,
                                   step: 64, width: .controlCompact)
@@ -2098,13 +2098,13 @@ private struct AccelerationSection: View {
     }
 
     private var hasFamilyRows: Bool {
-        vm.isDeepseekV41 || vm.isQwen4Exp || vm.showsQwenOqA8
+        vm.isDeepseekV41 || vm.isQwen4Exp || vm.showsA8Prefill
     }
 
-    private var qwenOqA8Sublabel: String {
-        if let reason = vm.qwen35OqA8ConflictReason { return reason }
+    private var a8PrefillSublabel: String {
+        if let reason = vm.a8PrefillConflictReason { return reason }
         return String(localized: "settings.experimental.qwen_oq_a8.sub",
-                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, and routed expert gate/up projections on Qwen3.8 Flash-Next. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
+                      defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, routed expert gate/up projections on Qwen3.8 Flash-Next, and the expert and attention projections of DeepSeek V4.1. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
     }
 
@@ -2197,7 +2197,7 @@ private struct ExperimentalSection: View {
                 }
             }
             if vm.model?.anePrefillBackend != nil {
-                if vm.isQwenOqA8Model {
+                if vm.isA8PrefillModel {
                     Row(label: String(localized: "settings.experimental.qwen_ane.label",
                                       defaultValue: "Qwen ANE Prefill",
                                       comment: "Row label for private Qwen ANE/GPU prefill acceleration"),

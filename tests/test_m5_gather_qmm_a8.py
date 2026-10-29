@@ -121,7 +121,8 @@ def _assert_close_to_contract(out, ref):
         256,  # G = 4: staged
         320,  # G = 5: scalar loads
         2560,  # G = 40: Qwen3.8-Flash-Next, staged, 10 KiB per tile
-        4352,  # G = 68: above the staging limit, scalar loads
+        5120,  # G = 80: DeepSeek V4.1, staged, 20 KiB per tile
+        5376,  # G = 84: above the staging limit, scalar loads
     ],
 )
 def test_checkpoint_layout_metadata_matches_the_contract(K, dtype):
@@ -178,6 +179,74 @@ def test_failed_canary_declines_to_a16(monkeypatch):
     assert _run(problem) is None
 
 
+def _v41_reference(x, gate, up, idx, rmap, bits, act, limit, rw):
+    """The DeepSeek V4.1 A8 contract in float32: Stage A codes times their row
+    or GS64 scales, against the dequantized experts, then the clamped,
+    route-weighted SwiGLU (or the plain projection when ``up`` is None)."""
+    from omlx.custom_kernels.quant_matmul import fast
+
+    qa, sa, _ = fast.oq_a8_quantize(x, act)
+    tokens, k_dim = x.shape[0], x.shape[-1]
+    scale = sa.reshape(tokens, -1, 1) if act else sa.reshape(tokens, 1, 1)
+    xa = (qa.reshape(tokens, -1, GROUP).astype(mx.float32) * scale).reshape(
+        tokens, k_dim
+    )
+
+    def project(packed):
+        wq, s, b = packed
+        wd = mx.dequantize(
+            wq, s.astype(mx.float32), b.astype(mx.float32), group_size=GROUP, bits=bits
+        )
+        idx_np = np.array(idx)
+        out = np.zeros((idx_np.shape[0], wd.shape[1]), np.float32)
+        for e in np.unique(idx_np):
+            rows = np.nonzero(idx_np == e)[0]
+            out[rows] = np.array(xa[rmap[mx.array(rows)]] @ wd[int(e)].T)
+        return out
+
+    if up is None:
+        return project(gate)
+    g = np.minimum(project(gate), limit)
+    u = np.clip(project(up), -limit, limit)
+    return g / (1 + np.exp(-g)) * u * np.array(rw)[:, None]
+
+
+@needs_a8
+@pytest.mark.parametrize("bits", [2, 3])
+@pytest.mark.parametrize("group_scales", [False, True])
+@pytest.mark.parametrize("swiglu", [False, True])
+def test_deepseek_v41_variants_match_the_contract(bits, group_scales, swiglu):
+    """Q2/Q3 codes in K order, row or GS64 activation scales, and the split,
+    clamped and route-weighted SwiGLU of DeepSeek V4.1 routed experts."""
+    tokens, idx, rmap = _routes("partial_tiles", 100, TOPK, E, 3)
+
+    def quant(seed, rows, k_dim):
+        w = mx.random.normal((E, rows, k_dim), key=mx.random.key(seed)) * 0.05
+        return mx.quantize(w.astype(mx.bfloat16), group_size=GROUP, bits=bits)
+
+    x = (mx.random.normal((tokens, 1, H), key=mx.random.key(5)) * 0.6).astype(
+        mx.bfloat16
+    )
+    gate = quant(11, INTER if swiglu else 2 * INTER, H)
+    up = quant(12, INTER, H) if swiglu else None
+    rw = mx.random.uniform(0.2, 1.5, idx.shape, key=mx.random.key(13))
+    kw = {"up": up, "swiglu_limit": 1.0, "route_weights": rw} if swiglu else {}
+    out = a8.sorted_gather_qmm_a8(
+        x,
+        *gate,
+        idx,
+        rmap,
+        group_size=GROUP,
+        bits=bits,
+        swiglu=swiglu,
+        group_scales=group_scales,
+        **kw,
+    )
+    assert out is not None
+    ref = _v41_reference(x, gate, up, idx, rmap, bits, int(group_scales), 1.0, rw)
+    _assert_close_to_contract(out, ref)
+
+
 def _operands(bits=4, group=64, dtype=mx.bfloat16, transposed_metadata=False):
     E, N, K, M = 4, 128, 256, 16
     x = mx.zeros((M, 1, K), dtype=dtype)
@@ -189,9 +258,10 @@ def _operands(bits=4, group=64, dtype=mx.bfloat16, transposed_metadata=False):
     return x, w, s, s, idx, rmap
 
 
-def test_supports_accepts_affine_q4_gs64_checkpoint_layout():
-    x, w, s, b, idx, rmap = _operands()
-    assert a8.supports(x, w, s, b, idx, 64, 4, "affine", rmap)
+@pytest.mark.parametrize("bits", [2, 3, 4])
+def test_supports_accepts_affine_gs64_checkpoint_layout(bits):
+    x, w, s, b, idx, rmap = _operands(bits=bits)
+    assert a8.supports(x, w, s, b, idx, 64, bits, "affine", rmap)
 
 
 @pytest.mark.parametrize(
@@ -497,7 +567,7 @@ def test_mtp_draft_head_is_excluded_by_identity(variant):
 
 def test_other_model_families_are_not_tagged():
     """Only families whose routed Gate+Up was measured are opted in, although
-    other Qwen MoE models can enable ``qwen35_oq_a8_enabled``."""
+    other Qwen MoE models can enable ``a8_prefill_enabled``."""
 
     class _OtherFamily(_Backbone):
         pass
@@ -509,7 +579,7 @@ def test_other_model_families_are_not_tagged():
 
 
 def test_the_per_model_a8_setting_tags_the_routed_modules(monkeypatch):
-    """``apply_qwen35_oq_a8_patch`` (called for ``qwen35_oq_a8_enabled``) is the
+    """``apply_qwen35_oq_a8_patch`` (called for ``a8_prefill_enabled``) is the
     only place that opts a model in, with the model's own ``min_tokens``."""
     monkeypatch.setattr(qwen35_oq_a8, "_kernels_available", lambda: True)
     monkeypatch.setattr(qwen35_oq_a8, "_MLP_PATCHED", True)
