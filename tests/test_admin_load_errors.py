@@ -14,10 +14,13 @@ from fastapi import HTTPException
 import omlx.admin.routes as admin_routes
 import omlx.server  # noqa: F401 — ensure server module is imported first
 from omlx.exceptions import (
+    EnginePoolError,
     InsufficientMemoryError,
     ModelBusyError,
+    ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    ModelUnavailableError,
 )
 
 
@@ -48,9 +51,15 @@ def _load(pool):
     "error, expected",
     [
         (ModelNotFoundError("m", ["a"]), 404),
-        (ModelTooLargeError("m", 100 << 30, 50 << 30, binding="final"), 413),
+        # "Cannot fit" is 507 on both load and inference (server.py maps
+        # ModelTooLargeError the same way).
+        (ModelTooLargeError("m", 100 << 30, 50 << 30, binding="final"), 507),
         (InsufficientMemoryError(100 << 30, 50 << 30, "need 100, have 50"), 507),
+        (ModelUnavailableError("m"), 409),
+        (ModelLoadingError("m"), 409),
         (ModelBusyError("m", "unload"), 409),
+        # Anything else from the pool is still a server-side fault.
+        (EnginePoolError("boom"), 500),
     ],
 )
 def test_load_error_maps_to_status(error, expected):
