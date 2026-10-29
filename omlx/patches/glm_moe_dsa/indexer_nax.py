@@ -18,6 +18,10 @@ Blocks that are entirely masked skip the matmuls.
 Only the fp32 summation order of each 128-wide dot product differs from
 the native kernel, so scores agree to bf16 rounding (a few ulp at most),
 and top-k selection can only differ at exact near-ties.
+
+DeepSeek V4.1 runs the same kernel with ``rounded=True``: each head's dot
+product and weighted term are rounded to bf16 like its reference, and the
+bf16-rounded head sum is returned as fp32 with -inf for masked keys.
 """
 
 from __future__ import annotations
@@ -139,15 +143,19 @@ _SOURCE = """
                 for (short tn = 0; tn < 2; ++tn) {
                     for (short j = 0; j < 4; ++j) {
                         const short e = tn * 8 + i * 4 + j;
-                        acc[0][e] += max(float(c0[e]), 0.0f) * w0;
-                        acc[1][e] += max(float(c1[e]), 0.0f) * w1;
+                        const float s0 = ROUNDED ? float(T(c0[e])) : float(c0[e]);
+                        const float s1 = ROUNDED ? float(T(c1[e])) : float(c1[e]);
+                        const float p0 = max(s0, 0.0f) * w0;
+                        const float p1 = max(s1, 0.0f) * w1;
+                        acc[0][e] += ROUNDED ? float(T(p0)) : p0;
+                        acc[1][e] += ROUNDED ? float(T(p1)) : p1;
                     }
                 }
             }
         }
     }
 
-    const T masked = T(-1e30f);
+    const O masked = ROUNDED ? O(-INFINITY) : O(-1e30f);
     for (short tm = 0; tm < 2; ++tm) {
         for (short i = 0; i < 2; ++i) {
             const int s = sm + tm * 16 + fm + i * 8;
@@ -161,7 +169,8 @@ _SOURCE = """
                         continue;
                     }
                     const bool valid = p < pool_len && (p + 1) * ratio - 1 <= before + s;
-                    out[ulong(s) * P + p] = valid ? T(acc[tm][tn * 8 + i * 4 + j]) : masked;
+                    const float value = acc[tm][tn * 8 + i * 4 + j];
+                    out[ulong(s) * P + p] = valid ? O(ROUNDED ? float(T(value)) : value) : masked;
                 }
             }
         }
@@ -209,14 +218,17 @@ def indexer_scores_nax(
     before: int,
     pool_len: int,
     ratio: int,
+    rounded: bool = False,
 ) -> Optional[mx.array]:
     """Masked head-summed indexer scores on the tensor units.
 
     q: [S, H, 128] (row-major), pool_keys: [P, 128], weights: [S, H] already
-    scaled, all bf16. Query row ``s`` sits at absolute position
-    ``before + s``; pooled key ``p`` is visible to it iff ``p < pool_len``
-    and ``(p + 1) * ratio - 1 <= before + s``. Returns [S, P] bf16 with
-    masked entries set to bf16(-1e30), or None for unsupported inputs.
+    scaled, all bf16 (fp32 weights with ``rounded``). Query row ``s`` sits at
+    absolute position ``before + s``; pooled key ``p`` is visible to it iff
+    ``p < pool_len`` and ``(p + 1) * ratio - 1 <= before + s``. Returns
+    [S, P] bf16 with masked entries set to bf16(-1e30), or with ``rounded``
+    the fp32 value of the bf16-rounded score and -inf; None for unsupported
+    inputs.
     """
     if (
         q.ndim != 3
@@ -227,7 +239,7 @@ def indexer_scores_nax(
         or weights.shape != q.shape[:2]
         or q.dtype != mx.bfloat16
         or pool_keys.dtype != mx.bfloat16
-        or weights.dtype != mx.bfloat16
+        or weights.dtype != (mx.float32 if rounded else mx.bfloat16)
         or ratio < 1
     ):
         return None
@@ -240,9 +252,15 @@ def indexer_scores_nax(
     tg_y = (S + 32 * _WM - 1) // (32 * _WM)
     return _kernel()(
         inputs=[q, pool_keys, weights, params],
-        template=[("T", mx.bfloat16), ("WM", _WM), ("WN", _WN)],
+        template=[
+            ("T", mx.bfloat16),
+            ("O", mx.float32 if rounded else mx.bfloat16),
+            ("ROUNDED", rounded),
+            ("WM", _WM),
+            ("WN", _WN),
+        ],
         grid=(tg_x * _WM * _WN * 32, tg_y, 1),
         threadgroup=(_WM * _WN * 32, 1, 1),
         output_shapes=[(S, P)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[mx.float32 if rounded else mx.bfloat16],
     )[0]

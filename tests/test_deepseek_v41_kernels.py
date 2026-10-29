@@ -653,3 +653,45 @@ def test_deep_prefill_candidate_source_matches_full_scores(
     assert calls and max(calls) <= 64 << 20
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(blocks, expected_blocks)
+
+
+@pytest.mark.skipif(not kernels.nax_indexer_available(), reason="needs M5 tensor units")
+@pytest.mark.parametrize("key_start", [0, 40])
+def test_nax_index_scores_match_reference_rounding(monkeypatch, key_start):
+    """Prefill source-key scores on the tensor units keep the reference rounding
+    points and the causal mask, also for a key slice that starts late."""
+    rng = np.random.default_rng(16)
+    length, heads, dim, n, start, ratio = 70, 32, 128, 300, 263, 2
+    q = quantize_activation(
+        mx.array(rng.normal(size=(1, length, heads, dim)).astype(np.float32)).astype(
+            mx.bfloat16
+        ),
+        bits=4,
+    )
+    keys = pack_activation(mx.array(rng.normal(size=(1, n, dim)).astype(np.float32)), 4)
+    weights = mx.array(rng.normal(size=(1, length, heads)).astype(np.float32)) / heads
+    calls = []
+    original = kernels._nax_index_scores
+    monkeypatch.setattr(
+        kernels, "_nax_index_scores", lambda *a: calls.append(1) or original(*a)
+    )
+    part = keys[:, key_start:]
+    actual = packed_index_scores(q, part, weights, start, ratio, key_start=key_start)
+    assert calls
+    expanded = unpack_activation(part, 4, dtype=mx.float32)
+    rnd = lambda v: v.astype(mx.bfloat16).astype(mx.float32)  # noqa: E731
+    terms = rnd(
+        mx.maximum(rnd(mx.einsum("bshd,btd->bsht", q.astype(mx.float32), expanded)), 0)
+        * weights[..., None]
+    )
+    expected, magnitude = rnd(mx.sum(terms, -2)), mx.sum(mx.abs(terms), -2)
+    rows = mx.arange(n - key_start) + key_start
+    valid = rows < ((start + mx.arange(length) + 1) // ratio)[:, None]
+    expected = np.asarray(mx.where(valid, expected, -float("inf")))
+    actual = np.asarray(actual)
+    finite = np.isfinite(expected)
+    np.testing.assert_array_equal(np.isfinite(actual), finite)
+    np.testing.assert_array_less(
+        np.abs(actual - expected)[finite],
+        (2 * 2.0**-7 * np.asarray(magnitude) + 3e-5)[finite],
+    )
