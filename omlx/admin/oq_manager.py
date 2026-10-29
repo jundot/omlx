@@ -186,7 +186,11 @@ class OQManager:
         """Scan all model dirs. Returns (source_models, all_models)."""
 
         def _scan() -> tuple[list[dict], list[dict]]:
-            from ..model_discovery import _resolve_hf_cache_entry
+            from ..model_discovery import (
+                _is_readable_dir,
+                _iter_readable_entries,
+                _resolve_hf_cache_entry,
+            )
             from ..oq import estimate_memory, validate_quantizable
             from ..utils.model_loading import (
                 _checkpoint_has_mtp_weights,
@@ -200,8 +204,13 @@ class OQManager:
             for model_dir in self._model_dirs:
                 if not model_dir.exists():
                     continue
-                for subdir in sorted(model_dir.iterdir()):
-                    if not subdir.is_dir():
+                # Hidden entries (.Trashes, .Spotlight-V100, ...) can be
+                # unreadable without Full Disk Access; skip them like
+                # discover_models does so one entry can't fail the whole scan.
+                for subdir in _iter_readable_entries(model_dir, "model directory"):
+                    if not _is_readable_dir(
+                        subdir, "model entry"
+                    ) or subdir.name.startswith("."):
                         continue
                     candidates = []
                     if (subdir / "config.json").exists():
@@ -218,8 +227,13 @@ class OQManager:
                                 )
                             )
                         else:
-                            for child in sorted(subdir.iterdir()):
-                                if child.is_dir() and (child / "config.json").exists():
+                            for child in _iter_readable_entries(subdir, "model group"):
+                                if child.name.startswith("."):
+                                    continue
+                                if (
+                                    _is_readable_dir(child, "model group entry")
+                                    and (child / "config.json").exists()
+                                ):
                                     candidates.append((child, child.name, None))
 
                     for path, display_name, source_repo_id in candidates:

@@ -902,3 +902,55 @@ async def test_preserve_ngram_table_is_rejected_outside_v41(tmp_path):
     with pytest.raises(ValueError, match="only available for DeepSeek V4.1"):
         await manager.start_quantization(str(source), 4, preserve_ngram_table=True)
     assert not manager._active_tasks
+
+
+class TestOQManagerUnreadableEntries:
+    """Unreadable entries in a model dir must not empty the source list."""
+
+    @staticmethod
+    def _deny_iterdir(monkeypatch, *denied: Path):
+        original_iterdir = Path.iterdir
+
+        def fake_iterdir(path):
+            if path in denied:
+                raise PermissionError("Operation not permitted")
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+    @pytest.mark.asyncio
+    async def test_unreadable_hidden_system_dir_is_skipped(
+        self, fp_model_dir, monkeypatch
+    ):
+        """A volume's .Spotlight-V100 / .Trashes is EPERM without Full Disk
+        Access; the scan should still list the real models."""
+        spotlight = fp_model_dir / ".Spotlight-V100"
+        spotlight.mkdir()
+        trashes = fp_model_dir / ".Trashes"
+        trashes.mkdir()
+        self._deny_iterdir(monkeypatch, spotlight, trashes)
+
+        manager = OQManager(model_dirs=[str(fp_model_dir)])
+        source_models, all_models = await manager.list_quantizable_models()
+
+        assert [m["name"] for m in source_models] == ["Llama-3B"]
+        assert [m["name"] for m in all_models] == ["Llama-3B"]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_model_group_and_root_are_skipped(
+        self, fp_model_dir, second_fp_model_dir, tmp_path, monkeypatch
+    ):
+        """An unreadable organization folder or model root is skipped while
+        models in readable directories are still listed."""
+        locked_group = fp_model_dir / "LockedOrg"
+        locked_group.mkdir()
+        locked_root = tmp_path / "locked_root"
+        locked_root.mkdir()
+        self._deny_iterdir(monkeypatch, locked_group, locked_root)
+
+        manager = OQManager(
+            model_dirs=[str(locked_root), str(fp_model_dir), str(second_fp_model_dir)]
+        )
+        source_models, _ = await manager.list_quantizable_models()
+
+        assert sorted(m["name"] for m in source_models) == ["Llama-3B", "Qwen-7B"]
