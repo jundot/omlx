@@ -603,10 +603,15 @@ class VLMModelAdapter(nn.Module):
             np.asarray(prompt_ids) if first_chunk and prompt_ids is not None else None
         )
 
-    def _omlx_prefill(self, input_ids, cache=None, **kwargs):
-        """Forward the scheduler's cache-only contract to DeepSeek V4.1."""
+    def _omlx_prefill(self, input_ids, cache=None, next_prefill_tokens=0, **kwargs):
+        """Forward the scheduler's cache-only contract to DeepSeek V4.1.
+
+        ``next_prefill_tokens`` is the size of the request's next prefill chunk
+        (0 when none follows).
+        """
         if self.model_type == "deepseek_v41":
             kwargs["_ced_prefill"] = True
+            kwargs["next_prefill_tokens"] = next_prefill_tokens
         return self(input_ids, cache=cache, **kwargs)
 
     def __call__(

@@ -1094,7 +1094,27 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             return False
         if masks is not None and not bool(np.all(np.asarray(masks))):
             return False
+        # A pending decoder replay runs on its row in the per-row path.
+        if any(item.has_pending() for item in cache):
+            return False
         return all(not item.empty() for item in cache) and self._stages_decode_fused()
+
+    def _replay_decoder(self, rc, stage, mid):
+        """Run the decoder layers on the window a CED chunk skipped, so their
+        window caches match a chunk that ran them."""
+        h, pre, idx, candidates = rc[mid].pending()
+        start = rc[mid].size() - h.shape[1]
+        shared = {
+            "kv": rc[mid][2],
+            "index_k": rc[mid][3],
+            "idx": idx,
+            "candidates": candidates,
+        }
+        for j in range(mid + 1, len(stage)):
+            layer = stage[j][1]
+            h, pre = layer(h, pre, rc[j], shared, start, None, ced_tail=h.shape[1])
+            mx.async_eval(h, pre)
+        rc[mid].set_pending(None)
 
     def _stages_decode_fused(self):
         """Whether the fused decode supports the layers of every stage.
@@ -1244,6 +1264,19 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                 raise ValueError("Prefill padding must be contiguous")
             rc = [item.extract(row) for item in cache]
             verify_states = kwargs.get("mtp_verify_states")
+            ced_chunk = (
+                c.ced_prefill
+                and kwargs.get("_ced_prefill", False)
+                and verify_states is None
+                and end - begin > c.window_size
+            )
+            mid = c.n_layers // 2 - self.start_idx
+            if 0 <= mid < len(rc) and rc[mid].has_pending():
+                if ced_chunk:
+                    # This chunk replaces every decoder window.
+                    rc[mid].set_pending(None)
+                else:
+                    self._replay_decoder(rc, stage, mid)
             if verify_states is not None:
                 for item, state in zip(rc, verify_states):
                     item._mtp_verify_state = state
@@ -1280,15 +1313,19 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # Only cache-only scheduler calls may omit decoder logits. A short
             # contiguous suffix retains its existing window rather than
             # pretending that a full replay window was present in this chunk.
-            ced_tail = (
-                c.window_size
-                if c.ced_prefill
-                and kwargs.get("_ced_prefill", False)
-                and verify_states is None
-                and end - begin > c.window_size
-                else None
-            )
+            ced_tail = c.window_size if ced_chunk else None
             ced_mid = c.n_layers // 2
+            # The next CED chunk replays the decoder layers from its own tail, so a
+            # cache-only chunk followed by one stops at the midpoint. It keeps the
+            # midpoint output of its window for a forward that needs the windows.
+            skip_decoder = (
+                ced_tail is not None
+                and not capture
+                and image_mask is None
+                and self.pipeline_size == 1
+                and stage[0][1]._tensor_group is None
+                and int(kwargs.get("next_prefill_tokens") or 0) > c.window_size
+            )
             prefetch = getattr(self, "_engram_prefetch", None)
             # The CPU enqueues a whole prefill chunk in ~1s while the GPU runs
             # ~15x longer; with the layer loop fully lazy every intermediate
@@ -1327,15 +1364,27 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                     if ced_tail is not None and i > ced_mid:
                         # The midpoint layer already advanced h to the tail.
                         query_start = start + end - begin - ced_tail
-                    h, pre = layer(
-                        h,
-                        pre,
-                        rc[j],
-                        shared,
-                        query_start,
-                        image_mask,
-                        ced_tail=ced_tail if ced_tail is not None and i >= ced_mid else None,
-                    )
+                    if skip_decoder and i > ced_mid:
+                        rc[j][1] = None
+                    else:
+                        h, pre = layer(
+                            h,
+                            pre,
+                            rc[j],
+                            shared,
+                            query_start,
+                            image_mask,
+                            ced_tail=ced_tail if i >= ced_mid else None,
+                        )
+                    if skip_decoder and i == ced_mid:
+                        rc[j].set_pending(
+                            (
+                                h,
+                                pre,
+                                shared["idx"],
+                                shared.get("candidates", mx.zeros((1, 0, 0), mx.int32)),
+                            )
+                        )
                     if prefill_backpressure:
                         mx.eval(h, pre)
                         mx.clear_cache()

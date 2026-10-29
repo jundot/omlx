@@ -27,6 +27,7 @@ except ImportError:
 
 from .deepseek_v41_delta import DELTA_CLASS as V41_DELTA_CLASS
 from .deepseek_v41_delta import compact_state as compact_v41_state
+from .deepseek_v41_delta import is_delta as is_v41_delta
 from .deepseek_v41_delta import restore_chain as restore_v41_chain
 from .hybrid_cache import ModelCacheConfig
 from .interface import CacheManager
@@ -2018,7 +2019,7 @@ class BlockAwarePrefixCache(CacheManager):
         for layer in cache_data:
             if layer.get("class_name") == "DeepseekV41Cache":
                 state = layer.get("state", ())
-                if len(state) in (7, 8) and state[0].shape == (1,):
+                if len(state) in (7, 8, 11, 12) and state[0].shape == (1,):
                     return int(state[0].item())
 
         # Non-sliceable cache types use sliding window or have no sequence dimension
@@ -2956,7 +2957,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 start_idx,
                                 end_idx,
                             )
-                            if len(state) == 8:
+                            if is_v41_delta(state):
                                 marker_class = V41_DELTA_CLASS
                         # Any arity but the legacy (conv, ssm) pair rides the
                         # N-tuple marker, including LFM2's lone conv state.

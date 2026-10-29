@@ -61,6 +61,32 @@ def test_short_suffix_preserves_positions_and_window(suffix, monkeypatch):
             np.testing.assert_array_equal(x, y)
 
 
+@pytest.mark.parametrize("follow", [7, 2])
+def test_skipped_decoder_tail_matches_running_it(follow):
+    """A cache-only chunk announced to be followed by another stops at the
+    midpoint. A longer next chunk replaces the decoder windows; a shorter one
+    than announced replays them. Later outputs and caches match running the
+    decoder."""
+    model = make_model().language_model
+    first = mx.array([[5, 9, 3, 12, 20, 7, 4]])
+    nxt = mx.array([[8, 2, 11, 6, 13, 10, 1][:follow]])
+    skipped, baseline = model.make_cache(), model.make_cache()
+    model._omlx_prefill(first, cache=skipped, next_prefill_tokens=7)
+    model._omlx_prefill(first, cache=baseline)
+    assert skipped[3].has_pending() and not baseline[3].has_pending()
+    model._omlx_prefill(nxt, cache=skipped)
+    model._omlx_prefill(nxt, cache=baseline)
+    assert not skipped[3].has_pending()
+    token = mx.array([[30]])
+    np.testing.assert_array_equal(
+        model(token, cache=skipped), model(token, cache=baseline)
+    )
+    for a, b in zip(skipped, baseline):
+        assert len(a.cache) == len(b.cache) == 7
+        for x, y in zip(a.cache, b.cache):
+            np.testing.assert_array_equal(x, y)
+
+
 def test_scoring_and_explicit_capture_are_full_depth():
     model = make_model(mtp=True)
     adapter = VLMModelAdapter(model)

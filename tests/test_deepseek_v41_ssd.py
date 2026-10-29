@@ -86,10 +86,12 @@ def test_legacy_anchor_and_invalid_metadata():
 @pytest.mark.parametrize("block_size", [3, 4])
 @pytest.mark.parametrize("engram", [False, True])
 @pytest.mark.parametrize("extend_prefix", [False, True])
-@pytest.mark.parametrize("decoder_replay", [False, True])
+@pytest.mark.parametrize("decoder_replay", [False, True, "skip"])
 def test_real_ssd_reopen_full_and_partial_prefix(
     tmp_path, block_size, engram, extend_prefix, decoder_replay
 ):
+    """With "skip", every boundary but the last skips its decoder tail, so
+    partial prefixes restore the replay slots and replay them."""
     apply_patch()
     mx.random.seed(18)
     cfg_args = (
@@ -143,11 +145,15 @@ def test_real_ssd_reopen_full_and_partial_prefix(
         prefix = open_prefix(ssd)
         assert not prefix._gdn_split_layout_supported(["DeepseekV41Cache"] * len(model.layers))
         for end in range(block_size, 13, block_size):
+            following = block_size if decoder_replay == "skip" and end < 12 else 0
             mx.eval(
                 model._omlx_prefill(
-                    mx.array([tokens[end - block_size : end]]), cache=state
+                    mx.array([tokens[end - block_size : end]]),
+                    cache=state,
+                    next_prefill_tokens=following,
                 )
             )
+            assert state[3].has_pending() == bool(following)
             assert store.save("probe", end, state, extract, block_size=block_size)
         _wait_empty(lambda: store._pending_writes)
         snapshots = {
