@@ -157,3 +157,21 @@ def test_hc_projection_large_row_dispatch_matches_fp64():
     )
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=5e-6)
     np.testing.assert_array_equal(actual, fused_hc_projection(x, fn, 1e-6))
+
+
+def test_hc_projection_tiled_rows_match_fp64():
+    """Prefill rows take the tiled simdgroup-matrix kernel; 300 rows also
+    cover a partial last tile."""
+    from omlx.patches.deepseek_v41.hyper_connection import fused_hc_projection
+
+    mx.random.seed(961)
+    x = mx.random.normal((1, 300, 4, 256)).astype(mx.bfloat16)
+    fn = mx.random.normal((24, 4 * 256)) * 0.01
+    actual = fused_hc_projection(x, fn, 1e-6)
+    flat = np.asarray(x.astype(mx.float32)).astype(np.float64).reshape(1, 300, -1)
+    expected = (flat @ np.asarray(fn).astype(np.float64).T) / np.sqrt(
+        np.mean(flat * flat, -1, keepdims=True) + 1e-6
+    )
+    # FP32 slice partials summed in a different order than the row kernels.
+    np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=1e-5)
+    np.testing.assert_array_equal(actual, fused_hc_projection(x, fn, 1e-6))
