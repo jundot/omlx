@@ -50,7 +50,9 @@ def reference(bundle, output):
             else x
         )
         z = conv(functional.silu(norm(x, name + ".norm1")), name + ".conv1")
-        return conv(functional.silu(norm(z, name + ".norm2")), name + ".conv2") + shortcut
+        return (
+            conv(functional.silu(norm(z, name + ".norm2")), name + ".conv2") + shortcut
+        )
 
     def attention(x, name):
         q, k, v = (
