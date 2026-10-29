@@ -59,7 +59,7 @@ The first oQe run of a model collects the imatrix and saves it in `.oqe_imatrix`
 
 - **Output head and embeddings:** 8-bit when the size budget allows.
 - **MoE routers:** kept at full precision. Shared-expert gates are 8-bit.
-- **Vision and audio encoders:** not quantized.
+- **Vision and audio encoders:** not quantized, and not counted in the size budget.
 - **Norms and recurrent state parameters** (SSM and linear attention): not quantized.
 - **Attention and other sensitive projections:** extra bits where the measurement says so.
 - **Routed experts:** stay at the base bits, because they are most of the model and the most expensive to raise. oQ3.5 gives their down projections one extra bit, and oQ2.5 and oQ2.7 raise whole expert layers to 3-bit.

@@ -263,6 +263,19 @@ class TestUniversalQuantPredicate:
         assert isinstance(result, dict)
         assert result["bits"] == 5
 
+    def test_qwen35_linear_attn_out_proj_keeps_planned_boost(
+        self, dense_config, module
+    ):
+        # The budget plan pays for the boost, so the writer must not drop it to 5.
+        path = "model.language_model.layers.0.linear_attn.out_proj"
+        boost = {"bits": 8, "group_size": 64, "mode": "affine"}
+        config = {
+            **dense_config,
+            "_oq_use_budget_plan": True,
+            "_oq_boost_map": {path: boost},
+        }
+        assert universal_quant_predicate(f"{path}.weight", module, config) == boost
+
     def test_qwen35_linear_attn_in_proj_qkv_quantized(self, dense_config, module):
         # Regression guard: existing behavior should still return a quant dict/True, not skip.
         path = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
@@ -1401,6 +1414,29 @@ class TestStreamingHelpers:
             )
 
         assert report["missing"] == [f"{base}.weights_proj"]
+
+    def test_vision_tensors_stay_outside_budget_plan(self):
+        from omlx.oq import _budgeted_shapes
+
+        # A vision width that group 64 does not divide is priced at 16 bits.
+        vision = "vision_tower.blocks.0.mlp.linear_fc2"
+        named_shapes = {
+            vision: (1152, 4300),
+            "language_model.model.embed_tokens": (4096, 1024),
+            "language_model.lm_head": (4096, 1024),
+        }
+        for i in range(8):
+            named_shapes[f"language_model.model.layers.{i}.mlp.down_proj"] = (
+                4096,
+                2048,
+            )
+        config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
+
+        budgeted = _budgeted_shapes(named_shapes, config)
+        plan = _build_quant_plan(budgeted, config, 3, target_bpw=3.6, hard_cap_bpw=3.8)
+
+        assert vision not in budgeted
+        assert plan.boost_map["language_model.lm_head"]["bits"] == 6
 
     def test_qwen4_ngram_table_stays_outside_budget_plan(self):
         from omlx.oq import _budgeted_shapes, _get_predicate_bits

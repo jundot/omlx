@@ -748,6 +748,10 @@ def universal_quant_predicate(
     if "conv1d" in path_l and "linear_attn" in path_l:
         return bits(8)
     if "linear_attn.out_proj" in path_l:
+        # 5-bit is a floor: the budget plan may already have paid for more.
+        planned = (config.get("_oq_boost_map") or {}).get(path)
+        if planned is not None and int(planned["bits"]) > 5:
+            return dict(planned)
         return bits(5)
 
     # Inkling short-conv weights (k/v/attn/mlp_sconv.conv.weight; the
@@ -1030,12 +1034,15 @@ def _budgeted_shapes(named_shapes: dict[str, tuple], config: dict) -> dict[str, 
 
     The Qwen4-Exp N-gram table is about 51B parameters. Pricing it would make
     a 4-bit table consume most of a sub-4-bit budget, so it is quantized by its
-    own table policy instead.
+    own table policy instead. Vision and audio tensors are never quantized, so
+    pricing them would only shrink the budget left for the decoder.
     """
     return {
         path: shape
         for path, shape in named_shapes.items()
         if not _is_qwen4_exp_ngram_embedding_tensor(path, config)
+        and not _is_vision_tensor(path)
+        and not _is_audio_tensor(path)
     }
 
 
