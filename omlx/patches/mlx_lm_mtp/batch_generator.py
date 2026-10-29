@@ -552,6 +552,23 @@ def _drafter_scope(model: Any, uids):
         yield
 
 
+# UIDs whose request opted out of MTP (X-oMLX-MTP: off). Maintained by the scheduler.
+MTP_OPT_OUT_UIDS: set[int] = set()
+
+
+def set_request_mtp_opt_out(uid: int, opted_out: bool) -> None:
+    """Record whether the request owning batch row ``uid`` opted out of MTP.
+
+    Batch uids are reused, so the scheduler calls this for every insertion
+    (and with ``False`` when the row is released) to keep a stale opt-out
+    from leaking into the next request on the same uid.
+    """
+    if opted_out:
+        MTP_OPT_OUT_UIDS.add(int(uid))
+    else:
+        MTP_OPT_OUT_UIDS.discard(int(uid))
+
+
 def _model_mtp_decode_enabled(model: Any) -> bool:
     """Return the MTP decode decision captured on the loaded model instance.
 
@@ -636,6 +653,8 @@ def _mtp_common_eligible(gen_batch: Any) -> bool:
         return False
     uids = getattr(gen_batch, "uids", None)
     if uids is None or len(uids) == 0:
+        return False
+    if MTP_OPT_OUT_UIDS and any(int(u) in MTP_OPT_OUT_UIDS for u in uids):
         return False
     if _has_grammar_processors(gen_batch):
         return False
@@ -814,6 +833,8 @@ def _ineligibility_reason(gen_batch: Any) -> str:
     uids = getattr(gen_batch, "uids", None)
     if uids is None:
         return "GenerationBatch has no uids"
+    if MTP_OPT_OUT_UIDS and any(int(u) in MTP_OPT_OUT_UIDS for u in uids):
+        return "request opted out of MTP (X-oMLX-MTP: off)"
     if _has_xtc_sampler(gen_batch):
         return "XTC sampling is not supported by Lightning MTP acceptance math"
     if len(uids) != 1:

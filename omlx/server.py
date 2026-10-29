@@ -2110,6 +2110,17 @@ def _cache_store_kwargs(http_request: FastAPIRequest | None) -> dict[str, bool]:
     return {"skip_cache_store": True} if value == "off" else {}
 
 
+_MTP_HEADER = "X-oMLX-MTP"
+
+
+def _mtp_kwargs(http_request: FastAPIRequest | None) -> dict[str, bool]:
+    """``X-oMLX-MTP: off`` turns Lightning MTP off for this request only."""
+    if http_request is None:
+        return {}
+    value = http_request.headers.get(_MTP_HEADER, "").strip().lower()
+    return {"mtp_opt_out": True} if value in ("off", "0", "false") else {}
+
+
 def get_model_settings_for_request(model_id: str | None):
     """Return settings for the requested API model name via ModelSettingsManager."""
     sm = _server_state.settings_manager
@@ -4707,6 +4718,7 @@ async def create_completion(
                 gen_kwargs["repetition_context_size"] = repetition_context_size
             gen_kwargs.update(_no_repeat_ngram_kwargs(request))
             gen_kwargs.update(_cache_store_kwargs(http_request))
+            gen_kwargs.update(_mtp_kwargs(http_request))
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -5202,6 +5214,7 @@ async def create_chat_completion(
             chat_kwargs["repetition_context_size"] = repetition_context_size
         chat_kwargs.update(_no_repeat_ngram_kwargs(request))
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_mtp_kwargs(http_request))
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -8061,6 +8074,7 @@ async def create_anthropic_message(
             chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_mtp_kwargs(http_request))
 
         # Validate context window before sending to model
         num_prompt_tokens, prepared_prompt = _count_anthropic_prompt(engine, prompt)
@@ -8814,6 +8828,7 @@ async def create_response(
             chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
+        chat_kwargs.update(_mtp_kwargs(http_request))
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.
