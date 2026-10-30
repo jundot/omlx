@@ -977,6 +977,30 @@ def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     return raw, dtype_str, shape
 
 
+def _extract_tensors_bytes(
+    arrays: dict[str, mx.array],
+) -> dict[str, tuple[bytes, str, list[int]]]:
+    """Materialize one SSD block's buffer views together, then copy host bytes.
+
+    BF16 needs a uint16 view for the buffer protocol. Evaluating those views
+    alongside the other tensors avoids a separate barrier for every tensor
+    and every BF16 view. No lazy array reaches the buffer protocol.
+    """
+    buffer_arrays = {
+        name: arr.view(mx.uint16) if arr.dtype == mx.bfloat16 else arr
+        for name, arr in arrays.items()
+    }
+    mx.eval(*buffer_arrays.values())
+    return {
+        name: (
+            bytes(memoryview(buffer_arrays[name])),
+            _MX_TO_ST_DTYPE[arr.dtype],
+            list(arr.shape),
+        )
+        for name, arr in arrays.items()
+    }
+
+
 def _restore_tensor_from_bytes(
     raw: bytes, dtype_str: str, shape: list[int]
 ) -> mx.array:
@@ -2210,9 +2234,7 @@ class PagedSSDCacheManager(CacheManager):
         Returns True when the entry was retained, False on failure.
         """
         try:
-            promoted_raw = {}
-            for name, arr in arrays.items():
-                promoted_raw[name] = _extract_tensor_bytes(arr)
+            promoted_raw = _extract_tensors_bytes(arrays)
             entry = {
                 "tensors_raw": promoted_raw,
                 "file_metadata": (
