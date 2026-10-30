@@ -10,6 +10,10 @@ class Omlx < Formula
   option "with-custom-kernel",
          "Build native custom kernels for Bonsai, GLM-5.2, MiniMax M3 and Qwen3.5/3.6/4 acceleration"
   option "with-grammar", "Install xgrammar for structured output (requires torch, ~2GB)"
+  option "with-mcp", "Install the MCP server extra (mcp)"
+  option "with-cluster", "Install mDNS peer discovery for clusters (zeroconf)"
+  option "with-modelscope", "Install ModelScope model downloads (modelscope)"
+  option "with-paroquant", "Install the ParoQuant runtime loader (paroquant)"
 
   depends_on "rust" => :build
   depends_on arch: :arm64
@@ -121,8 +125,11 @@ class Omlx < Formula
       ENV.append "CMAKE_ARGS", "-DPython_EXECUTABLE=#{libexec}/bin/python"
     end
 
-    # Install omlx (with optional grammar extra for structured output)
-    install_spec = build.with?("grammar") ? "#{buildpath}[grammar]" : buildpath.to_s
+    # Install omlx with the extras the options above ask for. Each option
+    # mirrors an omlx optional-dependencies group, so a Homebrew install can
+    # carry the same set a pip install would (`pip install 'omlx[mcp,modelscope]'`).
+    extras = %w[grammar mcp cluster modelscope paroquant].select { |extra| build.with?(extra) }
+    install_spec = extras.empty? ? buildpath.to_s : "#{buildpath}[#{extras.join(",")}]"
     system(*pip_install, install_spec)
 
     if build.with?("custom-kernel")
