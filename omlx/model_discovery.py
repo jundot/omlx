@@ -81,6 +81,7 @@ VLM_MODEL_TYPES = {
     "muse_spark",
     "glm5_next",
     "lfm3_audio",
+    "qwen3_omni_moe",
 }
 
 # Text-only model families that are implemented in mlx-vlm rather than
@@ -398,6 +399,15 @@ AUDIO_STS_ARCHITECTURES = {
     "SAMAudio",
     "LFM2AudioModel",
 }
+
+# Voice models with a /v1/realtime backend, served by the VLM engine.
+REALTIME_VOICE_MODEL_TYPES = frozenset({"lfm3_audio", "lfm3_omni", "qwen3_omni_moe"})
+
+
+def is_realtime_voice_model(config_model_type: str) -> bool:
+    """True when the model can hold a spoken conversation on /v1/realtime."""
+    return config_model_type in REALTIME_VOICE_MODEL_TYPES
+
 
 def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
     """True when an audio_stt model can serve the realtime WebSocket."""
@@ -834,10 +844,15 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
     # Text-only quants won't carry a vision sub-config. gemma4_unified,
-    # diffusion_gemma and lfm3_audio are exceptions: they are served by mlx-vlm
-    # regardless of vision_config presence in config.json.
+    # diffusion_gemma, lfm3_audio and qwen3_omni_moe are exceptions: they are
+    # served by mlx-vlm regardless of vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
-        if normalized_type in {"gemma4_unified", "diffusion_gemma", "lfm3_audio"}:
+        if normalized_type in {
+            "gemma4_unified",
+            "diffusion_gemma",
+            "lfm3_audio",
+            "qwen3_omni_moe",
+        }:
             logger.info(
                 f"{model_type} detected as VLM (mlx-vlm native model)"
             )

@@ -18,6 +18,7 @@ import math
 import os
 import re
 import tempfile
+import uuid
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
@@ -34,7 +35,15 @@ from fastapi.responses import Response, StreamingResponse
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
 from ..engine.lfm3_speech import SPEECH_MODEL_TYPES, VOICES
-from ..engine.vlm import VLMBatchedEngine
+from ..engine.realtime_voice import (
+    SAMPLE_RATE,
+    RealtimeVoiceError,
+    RealtimeVoiceSession,
+    ResponseResult,
+    pcm16_bytes,
+)
+from ..engine.vlm import VLMBatchedEngine, realtime_voice_names
+from ..exceptions import ModelNotFoundError
 from ..server_metrics import get_server_metrics
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
@@ -802,9 +811,440 @@ async def realtime_transcription(websocket: WebSocket) -> None:
         await session.release()
 
 
+REALTIME_IDLE_SECONDS = 600
+REALTIME_UNLOAD_POLL_SECONDS = 1.0
+_REALTIME_KEY_PROTOCOL = "openai-insecure-api-key."
+
+
+def _realtime_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:24]}"
+
+
+def _realtime_api_key(websocket: WebSocket) -> str | None:
+    """Read the key from the Authorization header or the browser subprotocol."""
+    auth = websocket.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    for protocol in websocket.scope.get("subprotocols") or []:
+        if protocol.startswith(_REALTIME_KEY_PROTOCOL):
+            return protocol[len(_REALTIME_KEY_PROTOCOL) :]
+    return None
+
+
+def _realtime_session_object(
+    session_id: str, model: str, session: RealtimeVoiceSession
+) -> dict:
+    pcm = {"type": "audio/pcm", "rate": SAMPLE_RATE}
+    return {
+        "object": "realtime.session",
+        "type": "realtime",
+        "id": session_id,
+        "model": model,
+        "output_modalities": ["audio"],
+        "instructions": session.instructions,
+        "audio": {
+            "input": {"format": pcm, "turn_detection": None},
+            "output": {"format": pcm, "voice": session.voice},
+        },
+        "max_output_tokens": session.max_output_tokens or "inf",
+    }
+
+
+def _check_realtime_format(value) -> None:
+    if value is None or value == "pcm16":
+        return
+    if (
+        isinstance(value, dict)
+        and value.get("type") == "audio/pcm"
+        and value.get("rate", SAMPLE_RATE) == SAMPLE_RATE
+    ):
+        return
+    raise RealtimeVoiceError("unsupported", "only 24 kHz PCM16 audio is supported")
+
+
+def _parse_session_update(config: dict) -> dict:
+    """Read the supported fields of an OpenAI Realtime session object."""
+    audio = config.get("audio") or {}
+    audio_in, audio_out = audio.get("input") or {}, audio.get("output") or {}
+    # The client commits each turn; the server never detects speech.
+    if (
+        config.get("turn_detection") is not None
+        or audio_in.get("turn_detection") is not None
+    ):
+        raise RealtimeVoiceError(
+            "unsupported",
+            "server turn detection is not supported; set turn_detection to null "
+            "and commit each turn",
+        )
+    for value in (
+        config.get("input_audio_format"),
+        config.get("output_audio_format"),
+        audio_in.get("format"),
+        audio_out.get("format"),
+    ):
+        _check_realtime_format(value)
+    max_tokens = config.get(
+        "max_output_tokens", config.get("max_response_output_tokens")
+    )
+    if max_tokens == "inf":
+        max_tokens = 0
+    if max_tokens is not None and (
+        not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 0
+    ):
+        raise RealtimeVoiceError(
+            "invalid_value", "max_output_tokens must be an integer"
+        )
+    return {
+        "instructions": config.get("instructions"),
+        "voice": config.get("voice") or audio_out.get("voice"),
+        "max_output_tokens": max_tokens,
+    }
+
+
+@realtime_router.websocket("/v1/realtime")
+async def realtime_voice(websocket: WebSocket, model: str | None = None) -> None:
+    """Spoken conversation over WebSocket, following the OpenAI Realtime API.
+
+    The client streams 24 kHz PCM16 with ``input_audio_buffer.append``, ends
+    each turn with ``input_audio_buffer.commit`` and asks for the spoken reply
+    with ``response.create``. There is no server turn detection; barge-in is
+    ``response.cancel`` followed by ``conversation.item.truncate``.
+    """
+    offered = websocket.scope.get("subprotocols") or []
+    await websocket.accept(subprotocol="realtime" if "realtime" in offered else None)
+    send_lock = asyncio.Lock()
+
+    async def send(event: dict) -> None:
+        event.setdefault("event_id", _realtime_id("event"))
+        async with send_lock:
+            await websocket.send_json(event)
+
+    async def send_error(code: str, message: str, client_event_id=None) -> None:
+        await send(
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": code,
+                    "message": message,
+                    "param": None,
+                    "event_id": client_event_id,
+                },
+            }
+        )
+
+    async def reject(code: str, message: str, close_code: int = 1008) -> None:
+        with contextlib.suppress(Exception):
+            await send_error(code, message)
+            await websocket.close(code=close_code)
+
+    try:
+        key_ok = _verify_ws_api_key(websocket, _realtime_api_key(websocket))
+    except HTTPException as exc:
+        await reject("invalid_api_key", str(exc.detail))
+        return
+    if not key_ok:
+        await reject("invalid_api_key", "Invalid API key")
+        return
+    if not model:
+        await reject("missing_model", "Pass the model as the 'model' query parameter")
+        return
+    resolved_model = _resolve_model(model)
+    try:
+        pool = _get_engine_pool()
+    except HTTPException as exc:
+        await reject("server_error", str(exc.detail), 1011)
+        return
+    try:
+        engine = await pool.get_engine(resolved_model, _lease=True)
+    except ModelNotFoundError:
+        await reject("model_not_found", f"Model '{model}' not found")
+        return
+    except Exception as exc:
+        await reject(
+            "model_load_failed", f"Failed to load model '{model}': {exc}", 1011
+        )
+        return
+
+    session: RealtimeVoiceSession | None = None
+    try:
+        if (
+            not isinstance(engine, VLMBatchedEngine)
+            or not engine.supports_realtime_voice
+        ):
+            await reject(
+                "unsupported_model", f"Model '{model}' does not support realtime voice"
+            )
+            return
+        try:
+            session = await engine.create_realtime_session()
+        except RealtimeVoiceError as exc:
+            await reject(
+                exc.code, str(exc), 1013 if exc.code == "session_limit" else 1008
+            )
+            return
+        session_id = _realtime_id("sess")
+        await send(
+            {
+                "type": "session.created",
+                "session": _realtime_session_object(session_id, model, session),
+            }
+        )
+        await _run_realtime_voice(
+            websocket,
+            send,
+            send_error,
+            session,
+            session_id,
+            model,
+            resolved_model,
+            pool,
+        )
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.exception("Realtime voice failed for %s", resolved_model)
+        with contextlib.suppress(Exception):
+            await send_error("server_error", str(exc))
+            await websocket.close(code=1011)
+    finally:
+        try:
+            if session is not None:
+                await session.close()
+        finally:
+            await pool.release_engine(resolved_model)
+
+
+async def _run_realtime_voice(
+    websocket: WebSocket,
+    send,
+    send_error,
+    session: RealtimeVoiceSession,
+    session_id: str,
+    model: str,
+    resolved_model: str,
+    pool,
+) -> None:
+    items: list[str] = []
+    last_reply: str | None = None
+
+    def reply_callbacks(response_id: str, item_id: str, announced: asyncio.Event):
+        ids = {"response_id": response_id, "item_id": item_id}
+        part = {"output_index": 0, "content_index": 0}
+        transcript: list[str] = []
+
+        async def on_text(delta: str) -> None:
+            await announced.wait()
+            transcript.append(delta)
+            await send(
+                {
+                    "type": "response.output_audio_transcript.delta",
+                    **ids,
+                    **part,
+                    "delta": delta,
+                }
+            )
+
+        async def on_audio(audio) -> None:
+            await announced.wait()
+            delta = base64.b64encode(pcm16_bytes(audio)).decode("ascii")
+            await send(
+                {"type": "response.output_audio.delta", **ids, **part, "delta": delta}
+            )
+
+        async def on_done(result: ResponseResult) -> None:
+            await announced.wait()
+            text = "".join(transcript)
+            item = {
+                "id": item_id,
+                "object": "realtime.item",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed" if result.status == "completed" else "incomplete",
+                "content": [{"type": "output_audio", "transcript": text}],
+            }
+            if result.error is not None:
+                await send_error(result.error.code, str(result.error))
+            await send({"type": "response.output_audio.done", **ids, **part})
+            await send(
+                {
+                    "type": "response.output_audio_transcript.done",
+                    **ids,
+                    **part,
+                    "transcript": text,
+                }
+            )
+            await send(
+                {
+                    "type": "response.output_item.done",
+                    "response_id": response_id,
+                    "output_index": 0,
+                    "item": item,
+                }
+            )
+            await send(
+                {
+                    "type": "response.done",
+                    "response": {
+                        "object": "realtime.response",
+                        "id": response_id,
+                        "status": result.status,
+                        "output": [item],
+                        "usage": {
+                            "input_tokens": result.input_tokens,
+                            "output_tokens": result.output_slots,
+                            "total_tokens": result.input_tokens + result.output_slots,
+                        },
+                    },
+                }
+            )
+            _record_audio_request(resolved_model)
+
+        return on_text, on_audio, on_done
+
+    async def watch_unload() -> None:
+        while True:
+            await asyncio.sleep(REALTIME_UNLOAD_POLL_SECONDS)
+            reason = pool.get_abort_requested_reason(resolved_model)
+            if reason:
+                with contextlib.suppress(Exception):
+                    await send_error(
+                        "model_unloaded", f"The model is being unloaded: {reason}"
+                    )
+                    await websocket.close(code=1012)
+                return
+
+    watcher = asyncio.create_task(watch_unload())
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    websocket.receive_json(), timeout=REALTIME_IDLE_SECONDS
+                )
+            except TimeoutError:
+                await send_error("session_expired", "The session was idle for too long")
+                await websocket.close(code=1000)
+                return
+            except ValueError:
+                await send_error("invalid_json", "Events must be JSON objects")
+                continue
+            if not isinstance(event, dict):
+                await send_error("invalid_json", "Events must be JSON objects")
+                continue
+            kind, client_event_id = event.get("type"), event.get("event_id")
+            try:
+                if kind == "session.update":
+                    session.update(**_parse_session_update(event.get("session") or {}))
+                    await send(
+                        {
+                            "type": "session.updated",
+                            "session": _realtime_session_object(
+                                session_id, model, session
+                            ),
+                        }
+                    )
+                elif kind == "input_audio_buffer.append":
+                    session.append(
+                        base64.b64decode(event.get("audio") or "", validate=True)
+                    )
+                elif kind == "input_audio_buffer.clear":
+                    session.clear()
+                    await send({"type": "input_audio_buffer.cleared"})
+                elif kind == "input_audio_buffer.commit":
+                    session.commit()
+                    item_id = _realtime_id("item")
+                    previous = items[-1] if items else None
+                    items.append(item_id)
+                    await send(
+                        {
+                            "type": "input_audio_buffer.committed",
+                            "item_id": item_id,
+                            "previous_item_id": previous,
+                        }
+                    )
+                elif kind == "response.create":
+                    response_id, item_id = _realtime_id("resp"), _realtime_id("item")
+                    announced = asyncio.Event()
+                    session.start_response(
+                        *reply_callbacks(response_id, item_id, announced)
+                    )
+                    items.append(item_id)
+                    last_reply = item_id
+                    # The reply callbacks wait for these two events; a failed send must
+                    # not leave them, and the session close behind them, waiting forever.
+                    try:
+                        await send(
+                            {
+                                "type": "response.created",
+                                "response": {
+                                    "object": "realtime.response",
+                                    "id": response_id,
+                                    "status": "in_progress",
+                                    "output": [],
+                                },
+                            }
+                        )
+                        await send(
+                            {
+                                "type": "response.output_item.added",
+                                "response_id": response_id,
+                                "output_index": 0,
+                                "item": {
+                                    "id": item_id,
+                                    "object": "realtime.item",
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "status": "in_progress",
+                                    "content": [],
+                                },
+                            }
+                        )
+                    finally:
+                        announced.set()
+                elif kind == "response.cancel":
+                    session.cancel()
+                elif kind == "conversation.item.truncate":
+                    if event.get("item_id") != last_reply:
+                        raise RealtimeVoiceError(
+                            "item_not_found",
+                            "only the latest assistant reply can be truncated",
+                        )
+                    audio_end_ms = event.get("audio_end_ms")
+                    if not isinstance(audio_end_ms, int) or isinstance(
+                        audio_end_ms, bool
+                    ):
+                        raise RealtimeVoiceError(
+                            "invalid_value", "audio_end_ms must be an integer"
+                        )
+                    await session.truncate(audio_end_ms)
+                    await send(
+                        {
+                            "type": "conversation.item.truncated",
+                            "item_id": last_reply,
+                            "content_index": event.get("content_index", 0),
+                            "audio_end_ms": audio_end_ms,
+                        }
+                    )
+                else:
+                    raise RealtimeVoiceError(
+                        "unknown_event", f"Unsupported event type {kind!r}"
+                    )
+            except RealtimeVoiceError as exc:
+                await send_error(exc.code, str(exc), client_event_id)
+            except ValueError as exc:
+                await send_error("invalid_value", str(exc), client_event_id)
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+
+
 @router.get("/v1/audio/voices")
-async def list_model_voices(model: Optional[str] = None):
+async def list_model_voices(model: Optional[str] = None, realtime: bool = False):
     """List built-in speaker/voice names for a TTS model.
+
+    With ``realtime=true`` it lists the voices a /v1/realtime session on the
+    model can pick, which can differ from its TTS voices.
 
     Reads static metadata only — a ``voices/`` directory (Kokoro-style)
     or the speaker table in ``config.json`` (Qwen3-TTS CustomVoice's
@@ -826,6 +1266,12 @@ async def list_model_voices(model: Optional[str] = None):
 
     model_dir = Path(entry.model_path)
     voices: list[str] = []
+    if realtime:
+        try:
+            config = json.loads((model_dir / "config.json").read_text())
+        except (OSError, ValueError):
+            config = {}
+        return {"model": resolved, "voices": realtime_voice_names(config)}
     voices_dir = model_dir / "voices"
     if voices_dir.is_dir():
         voices = sorted({

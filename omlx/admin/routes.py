@@ -2526,6 +2526,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            "realtime_voice": bool(model_info.get("realtime_voice")),
             # Native context window from the model's config.json — used by
             # the context bench UI to hide targets the model cannot reach.
             "model_context_length": model_info.get("model_context_length"),

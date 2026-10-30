@@ -71,6 +71,7 @@ from .model_discovery import (
     detect_model_type,
     format_size,
     is_realtime_stt_model,
+    is_realtime_voice_model,
 )
 from .model_settings import (
     ModelSettings,
@@ -4750,6 +4751,9 @@ class EnginePool:
                     "realtime_stt": is_realtime_stt_model(
                         e.model_type, e.config_model_type
                     ),
+                    # d1 decision checkpoints share lfm3_omni but run on the decision engine.
+                    "realtime_voice": e.engine_type == "vlm"
+                    and is_realtime_voice_model(e.config_model_type),
                     "model_context_length": e.model_context_length,
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,

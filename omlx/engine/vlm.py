@@ -81,9 +81,25 @@ from .base import (
     _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
+from .lfm3_realtime import LFM3VoiceBackend
 from .lfm3_speech import SPEECH_MODEL_TYPES, LFM3Speech
+from .qwen3_omni_realtime import Qwen3OmniVoiceBackend
+from .realtime_voice import RealtimeVoiceError, RealtimeVoiceSession
 
 logger = logging.getLogger(__name__)
+
+# Realtime voice backends by config model_type.
+_VOICE_BACKENDS = {
+    "lfm3_audio": LFM3VoiceBackend,
+    "lfm3_omni": LFM3VoiceBackend,
+    "qwen3_omni_moe": Qwen3OmniVoiceBackend,
+}
+
+
+def realtime_voice_names(config: dict) -> list[str]:
+    """Voices a /v1/realtime session on this checkpoint can pick."""
+    backend_class = _VOICE_BACKENDS.get(config.get("model_type"))
+    return backend_class.voice_names(config) if backend_class else []
 
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
@@ -311,17 +327,23 @@ def _patch_video_processor_bug():
        ProcessorMixin which passes ``video_processor`` as a kwarg. HF's
        own ProcessorMixin.__init__ rejects unexpected kwargs, so it is
        patched to silently drop ``video_processor``.
+
+    A processor built with a real video processor (mlx-vlm's Qwen3-Omni)
+    keeps it: the modality entry is restored while that processor initializes,
+    because ProcessorMixin derives its attribute list from the mapping.
     """
     global _video_processor_patched
     if _video_processor_patched:
         return
 
+    mapping = None
+    video_entry = None
     try:
         from transformers.processing_utils import MODALITY_TO_AUTOPROCESSOR_MAPPING
 
         mapping = MODALITY_TO_AUTOPROCESSOR_MAPPING._MAPPING_NAMES
-        if "video_processor" in mapping:
-            del mapping["video_processor"]
+        video_entry = mapping.pop("video_processor", None)
+        if video_entry is not None:
             logger.debug(
                 "Removed video_processor from MODALITY_TO_AUTOPROCESSOR_MAPPING"
             )
@@ -334,6 +356,17 @@ def _patch_video_processor_bug():
         _orig_pm_init = ProcessorMixin.__init__
 
         def _pm_init_drop_video(self, *args, **kwargs):
+            params = list(inspect.signature(type(self).__init__).parameters)[1:]
+            video = kwargs.get("video_processor")
+            if video is None and "video_processor" in params:
+                index = params.index("video_processor")
+                video = args[index] if index < len(args) else None
+            if video is not None and video_entry is not None:
+                mapping["video_processor"] = video_entry
+                try:
+                    return _orig_pm_init(self, *args, **kwargs)
+                finally:
+                    mapping.pop("video_processor", None)
             kwargs.pop("video_processor", None)
             return _orig_pm_init(self, *args, **kwargs)
 
@@ -1696,6 +1729,8 @@ class VLMBatchedEngine(BaseEngine):
         self._diffusion_cancel_events: set[threading.Event] = set()
         # LFM3 speech requests run outside the scheduler's output collectors.
         self._speech_active = 0
+        self._realtime_session: RealtimeVoiceSession | None = None
+        self._realtime_opening = False
 
     async def _preflight_or_raise_with_eviction(
         self,
@@ -1751,6 +1786,40 @@ class VLMBatchedEngine(BaseEngine):
             if hasattr(config, "model_type"):
                 return config.model_type
         return None
+
+    @property
+    def supports_realtime_voice(self) -> bool:
+        backend_class = _VOICE_BACKENDS.get(self.model_type)
+        return backend_class is not None and backend_class.supports(self._vlm_model)
+
+    async def create_realtime_session(self) -> RealtimeVoiceSession:
+        """Open the engine's one spoken conversation for /v1/realtime."""
+        backend_class = _VOICE_BACKENDS.get(self.model_type)
+        if not self.supports_realtime_voice or self._engine is None:
+            raise RealtimeVoiceError(
+                "unsupported_model", f"{self._model_name} has no realtime voice backend"
+            )
+        if self._realtime_session is not None or self._realtime_opening:
+            raise RealtimeVoiceError(
+                "session_limit", f"{self._model_name} already has a voice session"
+            )
+        self._realtime_opening = True
+        try:
+            loop = asyncio.get_running_loop()
+            backend = await loop.run_in_executor(
+                self._engine._mlx_executor,
+                backend_class,
+                self._vlm_model,
+                self._processor,
+            )
+            self._realtime_session = RealtimeVoiceSession(self, backend)
+        finally:
+            self._realtime_opening = False
+        return self._realtime_session
+
+    def release_realtime_session(self, session: RealtimeVoiceSession) -> None:
+        if self._realtime_session is session:
+            self._realtime_session = None
 
     @property
     def speech(self) -> LFM3Speech | None:
@@ -2857,6 +2926,7 @@ class VLMBatchedEngine(BaseEngine):
         self._diffusion_cancel_events = set()
         self._diffusion_active_requests = 0
         self._speech_active = 0
+        self._realtime_session = None
         logger.info("VLMBatchedEngine stopped")
         if cancelled:
             raise asyncio.CancelledError

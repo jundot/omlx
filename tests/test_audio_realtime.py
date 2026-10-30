@@ -1,20 +1,36 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for realtime STT: engine sessions and the WebSocket endpoint.
+"""Tests for realtime STT and realtime voice: engine sessions and WebSockets.
 
 All tests run with mocked models/engines — mlx-audio decode paths are not
 exercised here (that needs a real model; see the slow smoke procedure).
 """
 
 import asyncio
+import base64
 import struct
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mlx.core as mx
 import numpy as np
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from mlx_vlm.models.lfm3_audio import Model as Lfm3AudioModel
+from mlx_vlm.models.lfm3_audio import ModelConfig as Lfm3AudioConfig
+from mlx_vlm.models.lfm3_audio.codec import CodecConfig, LiquidCodec
 
+from omlx.api.audio_routes import _realtime_api_key, realtime_router
+from omlx.engine import lfm3_realtime
+from omlx.engine.realtime_voice import (
+    RealtimeVoiceError,
+    RealtimeVoiceSession,
+    VoiceBackend,
+    VoiceStep,
+)
 from omlx.engine.stt import (
     RealtimeTranscriptionSession,
     STTEngine,
@@ -23,7 +39,8 @@ from omlx.engine.stt import (
     _VoxtralRealtimeBackend,
     _WhisperRealtimeBackend,
 )
-from omlx.model_discovery import is_realtime_stt_model
+from omlx.engine.vlm import _VOICE_BACKENDS, VLMBatchedEngine
+from omlx.model_discovery import REALTIME_VOICE_MODEL_TYPES, is_realtime_stt_model
 
 
 class TestRealtimeSttClassification:
@@ -275,8 +292,6 @@ def _make_realtime_engine(stub):
 
 
 def _ws_client(engine):
-    from omlx.api.audio_routes import realtime_router
-
     app = FastAPI()
     app.include_router(realtime_router)
 
@@ -758,3 +773,414 @@ class TestSegmentedTranscribeStreamLanguage:
         ]
         assert seen["language"] == "ko"
         assert chunks[0]["text"] == " ok"
+
+
+# ---------------------------------------------------------------------------
+# Realtime voice WebSocket (/v1/realtime)
+# ---------------------------------------------------------------------------
+
+
+class _StubVoiceBackend(VoiceBackend):
+    """Backend stand-in: each reply is ``steps`` chunks of text and audio."""
+
+    voices = ("chelsie", "ethan")
+
+    def __init__(self, steps=2, delay=0.0, fail=None):
+        self.steps, self.delay, self.fail = steps, delay, fail
+        self.turns, self.truncated = [], []
+        self.stopped, self.closed, self._left = 0, False, 0
+
+    def begin_turn(self, audio, instructions, voice):
+        if self.fail is not None:
+            raise self.fail
+        self.turns.append((len(audio), instructions, voice))
+        self._left = self.steps
+        return 7
+
+    def step(self, seconds, cancel):
+        time.sleep(self.delay)
+        self._left -= 1
+        audio = np.full(240, 0.5, np.float32)
+        return VoiceStep(text="hi ", audio=audio, slots=3, done=self._left <= 0)
+
+    def stop(self):
+        self.stopped += 1
+
+    def truncate(self, played_seconds):
+        self.truncated.append(played_seconds)
+
+    def close(self):
+        self.closed = True
+
+
+def _voice_engine(backend, executor):
+    engine = MagicMock(spec=VLMBatchedEngine)
+    engine._engine = SimpleNamespace(_mlx_executor=executor)
+    engine._speech_active = 0
+    engine.supports_realtime_voice = True
+    session = RealtimeVoiceSession(engine, backend)
+    engine.create_realtime_session = AsyncMock(return_value=session)
+    return engine
+
+
+def _voice_client(engine, key_ok=True):
+    app = FastAPI()
+    app.include_router(realtime_router)
+    pool = MagicMock()
+    pool.get_engine = AsyncMock(return_value=engine)
+    pool.release_engine = AsyncMock()
+    pool.get_abort_requested_reason = MagicMock(return_value=None)
+    patches = (
+        patch("omlx.api.audio_routes._get_engine_pool", return_value=pool),
+        patch("omlx.api.audio_routes._verify_ws_api_key", return_value=key_ok),
+        patch("omlx.api.audio_routes._resolve_model", side_effect=lambda m: m),
+    )
+    return patches, pool, TestClient(app)
+
+
+def _pcm(seconds):
+    samples = np.zeros(int(24000 * seconds), dtype="<i2").tobytes()
+    return base64.b64encode(samples).decode()
+
+
+def _eventually(check, timeout=2.0):
+    # The server finishes cleanup after the test client closes the socket.
+    deadline = time.monotonic() + timeout
+    while not check() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return check()
+
+
+def _until(ws, kind):
+    events = []
+    while True:
+        events.append(ws.receive_json())
+        if events[-1]["type"] in (kind, "error"):
+            return events
+
+
+VOICE_PATH = "/v1/realtime?model=voice"
+
+
+class TestRealtimeVoiceWebSocket:
+    def setup_method(self):
+        self.executor = ThreadPoolExecutor(1, thread_name_prefix="mlx-engine-test")
+
+    def teardown_method(self):
+        self.executor.shutdown()
+
+    def test_spoken_turn_round_trip(self):
+        backend = _StubVoiceBackend()
+        engine = _voice_engine(backend, self.executor)
+        (p1, p2, p3), pool, client = _voice_client(engine)
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            created = ws.receive_json()
+            assert created["type"] == "session.created"
+            assert created["session"]["audio"]["input"]["turn_detection"] is None
+            ws.send_json(
+                {
+                    "type": "session.update",
+                    "session": {"instructions": "Be brief.", "voice": "ethan"},
+                }
+            )
+            updated = ws.receive_json()
+            assert updated["session"]["audio"]["output"]["voice"] == "ethan"
+            ws.send_json({"type": "input_audio_buffer.append", "audio": _pcm(0.2)})
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            committed = ws.receive_json()
+            assert committed["type"] == "input_audio_buffer.committed"
+            ws.send_json({"type": "response.create"})
+            events = _until(ws, "response.done")
+        kinds = [e["type"] for e in events]
+        assert kinds[:2] == ["response.created", "response.output_item.added"]
+        audio = [e for e in events if e["type"] == "response.output_audio.delta"]
+        pcm = np.frombuffer(base64.b64decode(audio[0]["delta"]), dtype="<i2")
+        assert len(pcm) == 240 and pcm[0] == 16383
+        done = events[-1]["response"]
+        assert done["status"] == "completed"
+        assert done["output"][0]["content"][0]["transcript"] == "hi hi "
+        assert done["usage"]["input_tokens"] == 7
+        assert done["usage"]["output_tokens"] == 6
+        assert backend.turns == [(4800, "Be brief.", "ethan")]
+        assert _eventually(lambda: pool.release_engine.await_count == 1)
+        pool.release_engine.assert_awaited_once_with("voice")
+        assert backend.closed
+        engine.release_realtime_session.assert_called_once()
+        assert engine._speech_active == 0
+
+    def test_failed_reply_reports_its_error(self):
+        full = RealtimeVoiceError("conversation_too_long", "the context is full")
+        engine = _voice_engine(_StubVoiceBackend(fail=full), self.executor)
+        (p1, p2, p3), _, client = _voice_client(engine)
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            ws.receive_json()
+            ws.send_json({"type": "input_audio_buffer.append", "audio": _pcm(0.2)})
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            ws.receive_json()
+            ws.send_json({"type": "response.create"})
+            error = _until(ws, "response.done")[-1]["error"]
+            assert error["code"] == "conversation_too_long"
+            done = _until(ws, "response.done")[-1]
+        assert done["response"]["status"] == "failed"
+
+    def test_rejects_server_vad_and_missing_turn(self):
+        engine = _voice_engine(_StubVoiceBackend(), self.executor)
+        (p1, p2, p3), _, client = _voice_client(engine)
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            ws.receive_json()
+            ws.send_json(
+                {
+                    "type": "session.update",
+                    "session": {"turn_detection": {"type": "server_vad"}},
+                }
+            )
+            assert ws.receive_json()["error"]["code"] == "unsupported"
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            assert (
+                ws.receive_json()["error"]["code"] == "input_audio_buffer_commit_empty"
+            )
+            ws.send_json({"type": "response.create"})
+            assert ws.receive_json()["error"]["code"] == "input_audio_buffer_empty"
+
+    def test_cancel_truncate_and_locked_voice(self):
+        backend = _StubVoiceBackend(steps=10**6, delay=0.01)
+        engine = _voice_engine(backend, self.executor)
+        (p1, p2, p3), _, client = _voice_client(engine)
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            ws.receive_json()
+            ws.send_json({"type": "input_audio_buffer.append", "audio": _pcm(0.2)})
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            ws.receive_json()
+            ws.send_json({"type": "response.create"})
+            created = _until(ws, "response.output_item.added")
+            item_id = created[-1]["item"]["id"]
+            ws.send_json({"type": "response.create"})
+            ws.send_json({"type": "response.cancel"})
+            events = _until(ws, "response.done")
+            errors = [e for e in events if e["type"] == "error"]
+            if errors:
+                assert (
+                    errors[0]["error"]["code"]
+                    == "conversation_already_has_active_response"
+                )
+                events = _until(ws, "response.done")
+            assert events[-1]["response"]["status"] == "cancelled"
+            ws.send_json(
+                {
+                    "type": "conversation.item.truncate",
+                    "item_id": item_id,
+                    "audio_end_ms": 500,
+                }
+            )
+            truncated = _until(ws, "conversation.item.truncated")[-1]
+            assert truncated["audio_end_ms"] == 500
+            ws.send_json({"type": "session.update", "session": {"voice": "ethan"}})
+            assert ws.receive_json()["error"]["code"] == "session_locked"
+        assert backend.stopped == 1
+        assert backend.truncated == [0.5]
+
+    def test_rejected_connections(self):
+        engine = _voice_engine(_StubVoiceBackend(), self.executor)
+        (p1, p2, p3), _, client = _voice_client(engine, key_ok=False)
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            assert ws.receive_json()["error"]["code"] == "invalid_api_key"
+
+        stt = MagicMock(spec=STTEngine)
+        (p1, p2, p3), pool, client = _voice_client(stt)
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            assert ws.receive_json()["error"]["code"] == "unsupported_model"
+        assert _eventually(lambda: pool.release_engine.await_count == 1)
+
+        busy = _voice_engine(_StubVoiceBackend(), self.executor)
+        busy.create_realtime_session = AsyncMock(
+            side_effect=RealtimeVoiceError("session_limit", "busy")
+        )
+        (p1, p2, p3), _, client = _voice_client(busy)
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            assert ws.receive_json()["error"]["code"] == "session_limit"
+
+    def test_api_key_from_header_or_subprotocol(self):
+        header = SimpleNamespace(headers={"authorization": "Bearer k1"}, scope={})
+        protocol = SimpleNamespace(
+            headers={},
+            scope={"subprotocols": ["realtime", "openai-insecure-api-key.k2"]},
+        )
+        assert _realtime_api_key(header) == "k1"
+        assert _realtime_api_key(protocol) == "k2"
+
+    def test_voice_backends_cover_discovery_types(self):
+        assert set(_VOICE_BACKENDS) == REALTIME_VOICE_MODEL_TYPES
+
+
+# ---------------------------------------------------------------------------
+# LFM3 voice backend on a tiny random LFM3-Audio
+# ---------------------------------------------------------------------------
+
+_TINY_IDS = {
+    "audio_token_id": 250,
+    "audio_out_token_id": 251,
+    "audio_start_token_id": 252,
+    "text_end_token_id": 253,
+    "mixed_start_token_id": 254,
+    "eos_token_id": [255, 253],
+}
+
+
+def _tiny_lfm(layer_types, hidden, **extra):
+    return {
+        "hidden_size": hidden,
+        "intermediate_size": 2 * hidden,
+        "num_hidden_layers": len(layer_types),
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "vocab_size": 260,
+        "layer_types": layer_types,
+        **extra,
+    }
+
+
+@pytest.fixture(scope="module")
+def tiny_lfm3():
+    # With these weights the reply ends on its own before the slot limit.
+    mx.random.seed(3)
+    config = Lfm3AudioConfig(
+        lfm=_tiny_lfm(
+            ["conv", "full_attention", "conv", "sliding_attention"],
+            64,
+            sliding_window=8,
+        ),
+        encoder={
+            "lfm": _tiny_lfm(
+                ["conv", "full_attention"],
+                32,
+                model_type="lfm2",
+                max_position_embeddings=128,
+                norm_eps=1e-5,
+                conv_bias=False,
+                conv_L_cache=3,
+                block_multiple_of=16,
+                block_ffn_dim_multiplier=1.0,
+                block_auto_adjust_ff_dim=True,
+            ),
+            "dim_conv": 16,
+            "dim_out": 32,
+            "dim_in": 128,
+            "sliding_window": 32,
+        },
+        depthformer=_tiny_lfm(["full_attention"], 32, head_dim=8, vocab_size=1),
+        **_TINY_IDS,
+    )
+    model = Lfm3AudioModel(config)
+    codec = LiquidCodec(CodecConfig(encoder_dim=64, quantizer_dim=32))
+    codec.decoder.istft.window = mx.array(np.hanning(1281)[:-1], dtype=mx.float32)
+    mx.eval(model.parameters(), codec.parameters())
+    object.__setattr__(model, "_codec", codec)
+    return model
+
+
+class _Tokenizer:
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(chr(65 + i % 26) for i in ids)
+
+
+def _tiny_backend(model, *turns):
+    backend = lfm3_realtime.LFM3VoiceBackend(
+        model, SimpleNamespace(tokenizer=_Tokenizer())
+    )
+    queue = iter(turns)
+    backend._turn_inputs = lambda audio, system: (list(next(queue)), {})
+    return backend
+
+
+def _slots(slots):
+    return [
+        (token, None if codes is None else codes.tolist()) for token, codes in slots
+    ]
+
+
+def _finish(backend, seconds):
+    while not backend.step(seconds, threading.Event()).done:
+        pass
+
+
+def test_lfm3_voice_loop_matches_stream_slots(tiny_lfm3, monkeypatch):
+    monkeypatch.setattr(lfm3_realtime, "MAX_REPLY_SLOTS", 90)
+    ids = [*range(10, 30), 254]
+    mx.random.seed(0)
+    reference = _slots(
+        tiny_lfm3.stream_slots(
+            mx.array([ids]), max_tokens=90, **tiny_lfm3.audio_sampling
+        )
+    )
+    assert any(codes is not None for _, codes in reference)
+    for seconds in (0.0, 0.01, 10.0):
+        backend = _tiny_backend(tiny_lfm3, ids)
+        backend.begin_turn(np.zeros(2400, np.float32), "", None)
+        mx.random.seed(0)
+        _finish(backend, seconds)
+        assert _slots(backend.reply) == reference
+
+
+def test_lfm3_truncate_then_next_turn_matches_fresh_prefill(tiny_lfm3, monkeypatch):
+    monkeypatch.setattr(lfm3_realtime, "MAX_REPLY_SLOTS", 60)
+    # The next turn is shorter than the sliding window and the conv state,
+    # so every restored cache layer shows in its last hidden state.
+    turn1, turn2 = [*range(10, 30), 254], [40, 254]
+    eos_code = tiny_lfm3.config.audio_eos_code
+    backend = _tiny_backend(tiny_lfm3, turn1, turn2)
+    backend.begin_turn(np.zeros(2400, np.float32), "", None)
+    mx.random.seed(1)
+    _finish(backend, 0.01)
+    spoken = [c for _, c in backend.reply if c is not None and c[0].item() != eos_code]
+    assert len(spoken) > 2
+    backend.truncate(2 * lfm3_realtime.FRAME_SECONDS)
+    heard = backend.pending
+    assert sum(c is not None and c[0].item() != eos_code for _, c in heard) == 2
+    assert heard[-2][1][0].item() == eos_code and heard[-1][0] == 255
+    backend.truncate(0.0)
+    pending = list(backend.pending)
+    assert _slots(pending) == [(255, None)]
+    backend.begin_turn(np.zeros(2400, np.float32), "", None)
+
+    plain = backend._embed
+    embeds = mx.concatenate(
+        [
+            plain([(t, None) for t in turn1]),
+            plain(pending),
+            plain([(t, None) for t in turn2]),
+        ]
+    )
+    fresh = tiny_lfm3.language_model.model(None, tiny_lfm3.make_cache(), embeds[None])
+    assert np.allclose(np.array(backend.hidden), np.array(fresh[:, -1]), atol=1e-4)
+
+
+def test_lfm3_truncate_before_any_frame_drops_the_reply(tiny_lfm3):
+    backend = _tiny_backend(tiny_lfm3, [*range(10, 30), 254])
+    backend.begin_turn(np.zeros(2400, np.float32), "", None)
+    prefill = backend._offset()
+    mx.random.seed(1)
+    # An interleaved reply opens with text slots, before any speech frame.
+    for _ in range(3):
+        backend._slot()
+    assert not backend.frames and backend._offset() > prefill
+    backend.stop()
+    backend.truncate(0.0)
+    assert backend._offset() == prefill
+    assert _slots(backend.pending) == [(255, None)]
+
+
+def test_codec_stream_matches_full_decode(tiny_lfm3):
+    codec = tiny_lfm3.codec()
+    mx.random.seed(2)
+    codes = mx.random.randint(0, 2016, (12, 24)).astype(mx.int32)
+    full = np.asarray(codec.decode(codes))
+    for chunks in ([24], [1] * 24, [2, 7, 15]):
+        stream = lfm3_realtime.CodecStream(codec)
+        parts, start = [], 0
+        for size in chunks:
+            parts.append(stream.push([codes[:, i] for i in range(start, start + size)]))
+            start += size
+        parts.append(stream.flush())
+        pcm = np.concatenate(parts)
+        assert pcm.shape == full.shape
+        assert np.abs(pcm - full).max() < 1e-4
