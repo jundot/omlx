@@ -2824,6 +2824,30 @@
         }
       }
     },
+    "askai.prompt.preset.sub" : {
+      "comment" : "Explains that a preset prompt replaces the default system prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Used instead of the default system prompt while this preset runs, so add the date or other placeholders here if the preset needs them."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Используется вместо системного промпта по умолчанию, пока работает этот пресет, поэтому добавьте сюда дату или другие подстановки, если они нужны."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "运行此预设时会替代默认系统提示词，如需日期或其他占位符，请在这里添加。"
+          }
+        }
+      }
+    },
     "askai.prompt.reset" : {
       "comment" : "Button that puts the default Ask AI system prompt back",
       "extractionState" : "manual",
@@ -2848,6 +2872,30 @@
         }
       }
     },
+    "askai.restart_app" : {
+      "comment" : "Button that quits and reopens oMLX so a new permission applies",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Restart oMLX"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Перезапустить oMLX"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新启动 oMLX"
+          }
+        }
+      }
+    },
     "askai.row.model.sub" : {
       "comment" : "Sublabel for the Ask AI default model picker",
       "extractionState" : "manual",
@@ -2868,6 +2916,126 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "用于不以预设命令开头的问题。"
+          }
+        }
+      }
+    },
+    "askai.screen.guide.later" : {
+      "comment" : "Button that closes the screen recording permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Not Now"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не сейчас"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "以后再说"
+          }
+        }
+      }
+    },
+    "askai.screen.guide.open_settings" : {
+      "comment" : "Button that opens the macOS screen recording privacy settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open System Settings"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открыть Системные настройки"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开系统设置"
+          }
+        }
+      }
+    },
+    "askai.screen.guide.step1" : {
+      "comment" : "First step of the screen recording permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Click Open System Settings, then turn on oMLX in Screen & System Audio Recording."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нажмите «Открыть Системные настройки» и включите oMLX в разделе «Запись экрана и системного звука»."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "点击“打开系统设置”，然后在“录屏与系统录音”中打开 oMLX。"
+          }
+        }
+      }
+    },
+    "askai.screen.guide.step2" : {
+      "comment" : "Second step of the screen recording permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The permission applies after oMLX restarts. Choose Quit & Reopen when macOS asks, or click Restart oMLX next to the warning."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разрешение вступит в силу после перезапуска oMLX. Выберите «Завершить и открыть снова», когда macOS спросит, или нажмите «Перезапустить oMLX» рядом с предупреждением."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "权限在 oMLX 重新启动后生效。macOS 询问时选择“退出并重新打开”，或点击警告旁的“重新启动 oMLX”。"
+          }
+        }
+      }
+    },
+    "askai.screen.guide.title" : {
+      "comment" : "Title of the screen recording permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow Screen Recording"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разрешите запись экрана"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许屏幕录制"
           }
         }
       }
@@ -2916,6 +3084,486 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "文字提问"
+          }
+        }
+      }
+    },
+    "askai.tool.read.done" : {
+      "comment" : "Ask AI tool line after a web page was fetched; the argument is the site",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Read %@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Прочитано: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已读取 %@"
+          }
+        }
+      }
+    },
+    "askai.tool.read.failed" : {
+      "comment" : "Ask AI tool line after a page fetch failed; the argument is the site",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Couldn't read %@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось прочитать %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法读取 %@"
+          }
+        }
+      }
+    },
+    "askai.tool.read.running" : {
+      "comment" : "Ask AI tool line while a web page is fetched; the argument is the site",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reading %@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Чтение %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在读取 %@"
+          }
+        }
+      }
+    },
+    "askai.tool.screen.done" : {
+      "comment" : "Ask AI tool line after a screenshot was sent to the model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Looked at your screen"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Экран просмотрен"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已查看你的屏幕"
+          }
+        }
+      }
+    },
+    "askai.tool.screen.failed" : {
+      "comment" : "Ask AI tool line after a screenshot failed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Couldn't capture the screen"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось сделать снимок экрана"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法截取屏幕"
+          }
+        }
+      }
+    },
+    "askai.tool.screen.running" : {
+      "comment" : "Ask AI tool line while a screenshot is taken",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Looking at your screen"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Смотрю на ваш экран"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在查看你的屏幕"
+          }
+        }
+      }
+    },
+    "askai.tool.search.done" : {
+      "comment" : "Ask AI tool line after a web search; the argument is the query",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Searched the web: %@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Поиск в интернете выполнен: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已搜索网络：%@"
+          }
+        }
+      }
+    },
+    "askai.tool.search.failed" : {
+      "comment" : "Ask AI tool line after a failed web search; the argument is the query",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Web search failed: %@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось выполнить поиск: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "网络搜索失败：%@"
+          }
+        }
+      }
+    },
+    "askai.tool.search.running" : {
+      "comment" : "Ask AI tool line while a web search runs; the argument is the query",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Searching the web: %@"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Поиск в интернете: %@"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在搜索网络：%@"
+          }
+        }
+      }
+    },
+    "askai.tools.read_links" : {
+      "comment" : "Checkbox for the Ask AI tool that reads web pages",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Read Links"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Чтение ссылок"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "读取链接"
+          }
+        }
+      }
+    },
+    "askai.tools.read_links.sub" : {
+      "comment" : "Description of the Ask AI read links tool",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reads web pages, including links you put in a question."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Читает веб-страницы, в том числе по ссылкам из вашего вопроса."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "读取网页，包括你在问题中附上的链接。"
+          }
+        }
+      }
+    },
+    "askai.tools.row" : {
+      "comment" : "Row label for the Ask AI tool calling switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tool Calling"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вызов инструментов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "工具调用"
+          }
+        }
+      }
+    },
+    "askai.tools.row.sub" : {
+      "comment" : "Sublabel for the Ask AI tool calling switch",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lets the model search the web, read links and look at your screen when it needs to."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модель сможет при необходимости искать в интернете, читать ссылки и смотреть на ваш экран."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "让模型在需要时搜索网络、读取链接并查看你的屏幕。"
+          }
+        }
+      }
+    },
+    "askai.tools.screen" : {
+      "comment" : "Checkbox for the Ask AI screen capture tool",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Screen Capture"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Снимок экрана"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "屏幕截图"
+          }
+        }
+      }
+    },
+    "askai.tools.screen.allow" : {
+      "comment" : "Button that opens the screen recording permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разрешить…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许…"
+          }
+        }
+      }
+    },
+    "askai.tools.screen.needs_vision" : {
+      "comment" : "Shown under the screen capture tool when the model cannot read images",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Needs a vision (VLM) model."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нужна модель с поддержкой изображений (VLM)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要视觉（VLM）模型。"
+          }
+        }
+      }
+    },
+    "askai.tools.screen.sub" : {
+      "comment" : "Description of the Ask AI screen capture tool",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Takes a screenshot when you ask about something on your screen. oMLX windows are left out."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Делает снимок экрана, когда вы спрашиваете о том, что на нём. Окна oMLX в снимок не попадают."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "当你询问屏幕上的内容时截取屏幕，不包含 oMLX 窗口。"
+          }
+        }
+      }
+    },
+    "askai.tools.screen.warning" : {
+      "comment" : "Warning shown while oMLX has no screen recording permission",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Screen recording permission is off, so Ask AI can't see your screen."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запись экрана не разрешена, поэтому Ask AI не видит ваш экран."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "屏幕录制权限未开启，Ask AI 无法查看你的屏幕。"
+          }
+        }
+      }
+    },
+    "askai.tools.web_search" : {
+      "comment" : "Checkbox for the Ask AI web search tool",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Web Search"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Поиск в интернете"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "网络搜索"
+          }
+        }
+      }
+    },
+    "askai.tools.web_search.sub" : {
+      "comment" : "Description of the Ask AI web search tool",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Uses the search provider set in Dashboard Settings > Integrations."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использует поисковую службу из «Настройки панели > Интеграции»."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用控制面板设置 > 集成中设定的搜索服务。"
           }
         }
       }
@@ -31257,6 +31905,126 @@
         }
       }
     },
+    "talkai.prompt.general" : {
+      "comment" : "Label above the prompt used with every voice model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "General Prompt"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Общий промпт"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "通用提示词"
+          }
+        }
+      }
+    },
+    "talkai.prompt.general.sub" : {
+      "comment" : "Explains the voice general prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Used with every voice model, after the model prompt."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Используется со всеми голосовыми моделями, после промпта модели."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用于所有语音模型，位于模型提示词之后。"
+          }
+        }
+      }
+    },
+    "talkai.prompt.model" : {
+      "comment" : "Label above the prompt used only with the selected voice model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model Prompt"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Промпт модели"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型提示词"
+          }
+        }
+      }
+    },
+    "talkai.prompt.model.none" : {
+      "comment" : "Placeholder for the voice model prompt when the model has no default",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optional. This model has no recommended prompt."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Необязательно. У этой модели нет рекомендованного промпта."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可选。此模型没有推荐的提示词。"
+          }
+        }
+      }
+    },
+    "talkai.prompt.model.sub" : {
+      "comment" : "Explains the voice model prompt; the argument is the model name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Used only with %@, before the general prompt. Reset to Default puts back the model's recommended prompt."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Используется только с %@, перед общим промптом. «Сбросить» возвращает рекомендованный промпт модели."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "仅用于 %@，位于通用提示词之前。“恢复默认”会还原该模型推荐的提示词。"
+          }
+        }
+      }
+    },
     "talkai.prompt.placeholder" : {
       "comment" : "Placeholder for the Talk with AI system prompt",
       "extractionState" : "manual",
@@ -31325,6 +32093,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在任意应用中通过全局快捷键与语音模型对话。"
+          }
+        }
+      }
+    },
+    "talkai.row.gpu_power_limit.sub" : {
+      "comment" : "Sublabel for the Ask AI voice GPU power limit",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Caps GPU power for the whole Mac during a voice conversation (2 to 1000 W). Low limits can make replies start late or stutter. If the model also has a limit, the lower one applies."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ограничивает мощность GPU всего Mac во время голосового разговора (от 2 до 1000 Вт). При низком пределе ответы могут начинаться позже или прерываться. Если у модели есть свой предел, действует меньший."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "语音对话期间限制整台 Mac 的 GPU 功率（2 至 1000 W）。限制过低可能使回复开始变慢或断断续续。若模型也设有限制，则以较低者为准。"
           }
         }
       }

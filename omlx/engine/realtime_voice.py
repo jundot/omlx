@@ -56,6 +56,8 @@ class VoiceBackend(ABC):
     """One conversation with a voice model. Every method runs on the executor."""
 
     voices: tuple[str, ...] = ()
+    # System prompt a session starts with; instructions from the client replace it.
+    default_instructions = ""
 
     @classmethod
     def supports(cls, model) -> bool:
@@ -116,7 +118,7 @@ class RealtimeVoiceSession:
         self._backend = backend
         self._executor = engine._engine._mlx_executor
         self._activity_key = f"realtime:{id(self):x}"
-        self.instructions = ""
+        self.instructions = backend.default_instructions
         self.voice = backend.default_voice
         self.max_output_tokens: int | None = None
         self._buffer = bytearray()

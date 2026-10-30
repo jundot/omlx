@@ -120,6 +120,8 @@ class TestVoicesEndpoint:
         )
         assert tts.json()["voices"] == ["female", "male"]
         assert realtime.json()["voices"] == []
+        # The interleaved-output line stays server-side, so clients see no default.
+        assert realtime.json()["instructions"] == ""
 
         config.write_text(json.dumps({
             "model_type": "qwen3_omni_moe",
@@ -129,3 +131,4 @@ class TestVoicesEndpoint:
             "/v1/audio/voices", params={"model": "omni", "realtime": "true"}
         )
         assert realtime.json()["voices"] == ["chelsie", "ethan"]
+        assert realtime.json()["instructions"].startswith("You are Qwen-Omni")

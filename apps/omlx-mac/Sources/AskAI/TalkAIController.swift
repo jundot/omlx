@@ -249,10 +249,13 @@ final class TalkAIController {
     }
 
     private func connect(_ prefs: TalkPrefs) {
+        var query = [URLQueryItem(name: "model", value: prefs.model)]
+        if let watts = prefs.requestGPUPowerLimit {
+            query.append(URLQueryItem(name: "gpu_power_limit_w", value: String(watts)))
+        }
         guard let config = services?.config,
               let url = AppConfig.webSocketURL(
-                  host: config.host, port: config.port, path: "/v1/realtime",
-                  query: [URLQueryItem(name: "model", value: prefs.model)]
+                  host: config.host, port: config.port, path: "/v1/realtime", query: query
               )
         else {
             fail(TalkAIStrings.disconnected, action: .none)
@@ -276,9 +279,9 @@ final class TalkAIController {
             return
         }
         switch event {
-        case .sessionCreated:
+        case .sessionCreated(let modelDefault):
             connectAttempts = 0
-            startListening()
+            startListening(modelDefault: modelDefault)
         case .responseStarted(let itemID):
             guard dropNextReply else {
                 replyItemID = itemID
@@ -340,7 +343,7 @@ final class TalkAIController {
         "input_audio_buffer_too_large",
     ]
 
-    private func startListening() {
+    private func startListening(modelDefault: String) {
         let prefs = store.prefs.talk
         var output: [String: Any] = [:]
         if !prefs.voice.isEmpty { output["voice"] = prefs.voice }
@@ -349,10 +352,10 @@ final class TalkAIController {
             "audio": ["input": ["turn_detection": NSNull()], "output": output],
         ]
         // Filled once: the session keeps its instructions for the whole conversation.
-        let prompt = PromptPlaceholders.fill(
-            prefs.systemPrompt, context: PromptContext(app: sourceApp, model: prefs.model)
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
-        if !prompt.isEmpty { session["instructions"] = prompt }
+        // Always sent, so a model prompt cleared on purpose stays cleared.
+        session["instructions"] = prefs.instructions(
+            modelDefault: modelDefault, context: PromptContext(app: sourceApp, model: prefs.model)
+        )
         client?.send(["type": "session.update", "session": session])
 
         let audio = VoiceAudioEngine()

@@ -20,6 +20,7 @@ import re
 import tempfile
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import AsyncIterator, Optional
 
 from fastapi import (
@@ -42,9 +43,14 @@ from ..engine.realtime_voice import (
     ResponseResult,
     pcm16_bytes,
 )
-from ..engine.vlm import VLMBatchedEngine, realtime_voice_names
+from ..engine.vlm import (
+    VLMBatchedEngine,
+    realtime_voice_instructions,
+    realtime_voice_names,
+)
 from ..exceptions import ModelNotFoundError
 from ..server_metrics import get_server_metrics
+from ..utils import gpu_power
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
 logger = logging.getLogger(__name__)
@@ -131,6 +137,24 @@ def _get_settings_manager():
     except Exception:
         return None
     return getattr(_server_state, "settings_manager", None)
+
+
+def _get_gpu_power_limiter():
+    """Return the server's GPU power limiter, or None outside a full server."""
+    try:
+        from omlx.server import _server_state
+    except Exception:
+        return None
+    return getattr(_server_state, "gpu_power_limiter", None)
+
+
+def _realtime_gpu_power_limit(requested: int | None, model_id: str) -> int | None:
+    """Return the lower of the session's and the model settings' GPU power caps."""
+    from omlx.server import _resolve_gpu_power_limit
+
+    return _resolve_gpu_power_limit(
+        SimpleNamespace(gpu_power_limit_w=requested), model_id
+    )
 
 
 def _record_audio_request(model_id: str) -> None:
@@ -949,6 +973,20 @@ async def realtime_voice(websocket: WebSocket, model: str | None = None) -> None
     if not model:
         await reject("missing_model", "Pass the model as the 'model' query parameter")
         return
+    raw_limit = websocket.query_params.get("gpu_power_limit_w")
+    requested_limit = None
+    if raw_limit is not None:
+        try:
+            requested_limit = int(raw_limit)
+        except ValueError:
+            requested_limit = 0
+        if not gpu_power.MIN_WATTS <= requested_limit <= gpu_power.MAX_WATTS:
+            await reject(
+                "invalid_value",
+                f"gpu_power_limit_w must be an integer from {gpu_power.MIN_WATTS} "
+                f"to {gpu_power.MAX_WATTS}",
+            )
+            return
     resolved_model = _resolve_model(model)
     try:
         pool = _get_engine_pool()
@@ -967,6 +1005,8 @@ async def realtime_voice(websocket: WebSocket, model: str | None = None) -> None
         return
 
     session: RealtimeVoiceSession | None = None
+    limiter = None
+    gpu_limit = None
     try:
         if (
             not isinstance(engine, VLMBatchedEngine)
@@ -983,6 +1023,11 @@ async def realtime_voice(websocket: WebSocket, model: str | None = None) -> None
                 exc.code, str(exc), 1013 if exc.code == "session_limit" else 1008
             )
             return
+        # The cap holds for the whole conversation, like a capped chat request.
+        gpu_limit = _realtime_gpu_power_limit(requested_limit, resolved_model)
+        limiter = _get_gpu_power_limiter() if gpu_limit is not None else None
+        if limiter is not None:
+            limiter.acquire(gpu_limit)
         session_id = _realtime_id("sess")
         await send(
             {
@@ -1012,7 +1057,11 @@ async def realtime_voice(websocket: WebSocket, model: str | None = None) -> None
             if session is not None:
                 await session.close()
         finally:
-            await pool.release_engine(resolved_model)
+            try:
+                if limiter is not None:
+                    limiter.release(gpu_limit)
+            finally:
+                await pool.release_engine(resolved_model)
 
 
 async def _run_realtime_voice(
@@ -1244,7 +1293,8 @@ async def list_model_voices(model: Optional[str] = None, realtime: bool = False)
     """List built-in speaker/voice names for a TTS model.
 
     With ``realtime=true`` it lists the voices a /v1/realtime session on the
-    model can pick, which can differ from its TTS voices.
+    model can pick, which can differ from its TTS voices, and adds the
+    session's default ``instructions``.
 
     Reads static metadata only — a ``voices/`` directory (Kokoro-style)
     or the speaker table in ``config.json`` (Qwen3-TTS CustomVoice's
@@ -1271,7 +1321,11 @@ async def list_model_voices(model: Optional[str] = None, realtime: bool = False)
             config = json.loads((model_dir / "config.json").read_text())
         except (OSError, ValueError):
             config = {}
-        return {"model": resolved, "voices": realtime_voice_names(config)}
+        return {
+            "model": resolved,
+            "voices": realtime_voice_names(config),
+            "instructions": realtime_voice_instructions(config),
+        }
     voices_dir = model_dir / "voices"
     if voices_dir.is_dir():
         voices = sorted({

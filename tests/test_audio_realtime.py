@@ -784,6 +784,7 @@ class _StubVoiceBackend(VoiceBackend):
     """Backend stand-in: each reply is ``steps`` chunks of text and audio."""
 
     voices = ("chelsie", "ethan")
+    default_instructions = "Speak briefly."
 
     def __init__(self, steps=2, delay=0.0, fail=None):
         self.steps, self.delay, self.fail = steps, delay, fail
@@ -877,6 +878,8 @@ class TestRealtimeVoiceWebSocket:
             created = ws.receive_json()
             assert created["type"] == "session.created"
             assert created["session"]["audio"]["input"]["turn_detection"] is None
+            # Client instructions replace this default for the whole session.
+            assert created["session"]["instructions"] == "Speak briefly."
             ws.send_json(
                 {
                     "type": "session.update",
@@ -922,6 +925,27 @@ class TestRealtimeVoiceWebSocket:
             assert error["code"] == "conversation_too_long"
             done = _until(ws, "response.done")[-1]
         assert done["response"]["status"] == "failed"
+
+    def test_gpu_power_limit_holds_for_the_session(self):
+        engine = _voice_engine(_StubVoiceBackend(), self.executor)
+        (p1, p2, p3), pool, client = _voice_client(engine)
+        limiter = MagicMock()
+        p4 = patch("omlx.api.audio_routes._get_gpu_power_limiter", return_value=limiter)
+        p5 = patch(
+            "omlx.api.audio_routes._realtime_gpu_power_limit",
+            side_effect=lambda watts, model: watts,
+        )
+        with p1, p2, p3, p4, p5, client:
+            with client.websocket_connect(f"{VOICE_PATH}&gpu_power_limit_w=12") as ws:
+                ws.receive_json()
+                limiter.acquire.assert_called_once_with(12)
+                limiter.release.assert_not_called()
+            assert _eventually(lambda: limiter.release.call_count == 1)
+            limiter.release.assert_called_once_with(12)
+            with client.websocket_connect(f"{VOICE_PATH}&gpu_power_limit_w=1") as ws:
+                assert ws.receive_json()["error"]["code"] == "invalid_value"
+        # The bad value is refused before the model is leased.
+        assert pool.get_engine.await_count == 1
 
     def test_rejects_server_vad_and_missing_turn(self):
         engine = _voice_engine(_StubVoiceBackend(), self.executor)

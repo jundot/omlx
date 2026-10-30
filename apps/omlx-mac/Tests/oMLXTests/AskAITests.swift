@@ -30,6 +30,10 @@ final class AskAITests: XCTestCase {
             ChatStreamLine.errorMessage(fromBody: Data(#"{"error":{"message":"Model not found"}}"#.utf8)),
             "Model not found"
         )
+        XCTAssertEqual(
+            try ChatStreamLine.parse(#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","type":"function","function":{"name":"web_search","arguments":"{\"query\":"}}]}}]}"#),
+            .toolCalls([ChatToolCallDelta(index: 1, id: "c1", name: "web_search", arguments: #"{"query":"#)])
+        )
     }
 
     func testSlashCommandParsing() {
@@ -93,6 +97,85 @@ final class AskAITests: XCTestCase {
         XCTAssertEqual(parts.map { $0["type"] as? String }, ["image_url", "text"])
         XCTAssertEqual((parts[0]["image_url"] as? [String: String])?["url"], "data:image/jpeg;base64,AAAA")
         XCTAssertEqual(parts[1]["text"] as? String, "What is this?")
+        XCTAssertNil(body["tools"])
+
+        let call = ChatToolCall(id: "c1", name: "web_search", arguments: #"{"query":"mlx"}"#)
+        let toolBody = try JSONSerialization.jsonObject(with: ChatCompletionBody(
+            model: "m",
+            messages: [ChatMessage(role: .assistant, content: "", toolCalls: [call]),
+                       ChatMessage(role: .tool, content: #"{"ok":true}"#, toolCallID: "c1")],
+            allowThinking: false, tools: [AskAITool.webSearch]
+        ).encoded()) as! [String: Any]
+        let sent = toolBody["messages"] as! [[String: Any]]
+        let sentCall = (sent[0]["tool_calls"] as! [[String: Any]])[0]
+        XCTAssertEqual(sentCall["id"] as? String, "c1")
+        XCTAssertEqual(sentCall["type"] as? String, "function")
+        XCTAssertEqual((sentCall["function"] as? [String: String])?["arguments"], #"{"query":"mlx"}"#)
+        XCTAssertEqual(sent[1]["tool_call_id"] as? String, "c1")
+        let function = (toolBody["tools"] as! [[String: Any]])[0]["function"] as! [String: Any]
+        let parameters = function["parameters"] as! [String: Any]
+        XCTAssertEqual(function["name"] as? String, "web_search")
+        XCTAssertEqual(parameters["required"] as? [String], ["query"])
+    }
+
+    @MainActor
+    func testConversationRunsToolCallsAndKeepsThemForFollowUps() async throws {
+        let chat = ScriptedChat([
+            [.content("Let me check."),
+             .toolCall(ChatToolCallDelta(index: 0, id: "c1", name: "web_search", arguments: #"{"query":"#)),
+             .toolCall(ChatToolCallDelta(index: 0, arguments: #""mlx"}"#))],
+            [.content("Answer.")],
+            [.content("Follow-up answer.")],
+        ])
+        let profile = AskAIProfile(model: "m", systemPrompt: "", allowThinking: false, autoCopy: false)
+        let conversation = AskAIConversation()
+        conversation.begin(profile: profile, command: nil)
+        XCTAssertTrue(conversation.send("q1", tools: [AskAITool.webSearch], using: chat, runner: StubToolRunner()))
+        try await waitUntilDone(conversation)
+
+        let turn = try XCTUnwrap(conversation.turns.first)
+        XCTAssertNil(turn.error)
+        XCTAssertEqual(turn.activities, [AskAIToolActivity(kind: .search, detail: "mlx", isRunning: false)])
+        XCTAssertEqual(turn.answer, "Let me check.\n\nAnswer.")
+        XCTAssertEqual(turn.reply, "Answer.")
+        let second = chat.bodies[1]["messages"] as! [[String: Any]]
+        XCTAssertEqual(second.map { $0["role"] as? String }, ["user", "assistant", "tool"])
+        XCTAssertEqual(second[1]["content"] as? String, "Let me check.")
+        XCTAssertEqual(second[2]["tool_call_id"] as? String, "c1")
+
+        // The follow-up resends the calls and results, then the final reply.
+        XCTAssertTrue(conversation.send("q2", tools: [AskAITool.webSearch], using: chat, runner: StubToolRunner()))
+        try await waitUntilDone(conversation)
+        let third = chat.bodies[2]["messages"] as! [[String: Any]]
+        XCTAssertEqual(third.map { $0["role"] as? String }, ["user", "assistant", "tool", "assistant", "user"])
+        XCTAssertEqual(third[3]["content"] as? String, "Answer.")
+    }
+
+    @MainActor
+    func testToolRoundsEndWithARoundWithoutTools() async throws {
+        let chat = ScriptedChat([
+            [.toolCall(ChatToolCallDelta(index: 0, id: "c", name: "web_search", arguments: "{}"))],
+        ])
+        let conversation = AskAIConversation()
+        conversation.begin(profile: AskAIProfile(model: "m", systemPrompt: "", allowThinking: false,
+                                                 autoCopy: false), command: nil)
+        conversation.send("q", tools: [AskAITool.webSearch], using: chat, runner: StubToolRunner())
+        try await waitUntilDone(conversation)
+        XCTAssertEqual(chat.bodies.count, AskAIConversation.maxToolRounds + 1)
+        XCTAssertNotNil(chat.bodies[AskAIConversation.maxToolRounds - 1]["tools"])
+        XCTAssertNil(chat.bodies[AskAIConversation.maxToolRounds]["tools"])
+    }
+
+    func testToolPrefsDecodeAndScreenCaptureNeedsVision() throws {
+        let json = #"{"defaultTools":{"enabled":true,"screenCapture":true,"readLinks":"no"}}"#
+        let prefs = try JSONDecoder().decode(AskAIPrefs.self, from: Data(json.utf8))
+        XCTAssertEqual(prefs.defaultProfile.tools,
+                       { var t = AskAIToolPrefs(); t.enabled = true; t.screenCapture = true; return t }())
+        XCTAssertEqual(AskAITool.tools(for: prefs.defaultTools, vision: false).map(\.name),
+                       ["web_search", "fetch_url"])
+        XCTAssertEqual(AskAITool.tools(for: prefs.defaultTools, vision: true).map(\.name),
+                       ["web_search", "fetch_url", "capture_screen"])
+        XCTAssertEqual(AskAITool.tools(for: AskAIToolPrefs(), vision: true), [])
     }
 
     func testPrefsDecodeFillsMissingKeys() throws {
@@ -223,7 +306,9 @@ final class AskAITests: XCTestCase {
 
     func testRealtimeEventDecoding() {
         func decode(_ json: String) -> RealtimeVoiceEvent? { RealtimeVoiceEvent.decode(json) }
-        XCTAssertEqual(decode(#"{"type":"session.created","session":{}}"#), .sessionCreated)
+        XCTAssertEqual(decode(#"{"type":"session.created","session":{}}"#), .sessionCreated(instructions: ""))
+        XCTAssertEqual(decode(#"{"type":"session.created","session":{"instructions":"Speak briefly."}}"#),
+                       .sessionCreated(instructions: "Speak briefly."))
         XCTAssertEqual(decode(#"{"type":"response.output_item.added","item":{"id":"item_1"}}"#),
                        .responseStarted(itemID: "item_1"))
         XCTAssertEqual(decode(#"{"type":"response.output_audio.delta","item_id":"item_1","delta":"AAEC"}"#),
@@ -369,15 +454,75 @@ final class AskAITests: XCTestCase {
         XCTAssertEqual(conversation.profile?.systemPrompt, "At 01:00:00")
     }
 
+    func testVoiceInstructionsPutTheModelPromptFirst() throws {
+        let json = #"""
+        {"model":"omni","systemPrompt":"Today is {weekday}.","modelPrompts":{"lfm":"Be calm."},
+         "gpuPowerLimitEnabled":true,"gpuPowerLimitWatts":1}
+        """#
+        var talk = try JSONDecoder().decode(TalkPrefs.self, from: Data(json.utf8))
+        var context = PromptContext()
+        context.now = Date(timeIntervalSince1970: 0)
+        context.timeZone = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        XCTAssertEqual(talk.instructions(modelDefault: "Speak briefly.", context: context),
+                       "Speak briefly.\n\nToday is Thursday.")
+        // An edited model prompt replaces the server's default for that model only.
+        talk.model = "lfm"
+        XCTAssertEqual(talk.instructions(modelDefault: "", context: context), "Be calm.\n\nToday is Thursday.")
+        talk.modelPrompts["lfm"] = ""
+        talk.systemPrompt = ""
+        XCTAssertEqual(talk.instructions(modelDefault: "Speak briefly.", context: context), "")
+        XCTAssertEqual(talk.requestGPUPowerLimit, 2)
+    }
+
     func testEmptyPromptsGetTheDefaultOnce() throws {
         let old = #"{"defaultSystemPrompt":"","talk":{"systemPrompt":""}}"#
         let migrated = try JSONDecoder().decode(AskAIPrefs.self, from: Data(old.utf8))
         XCTAssertEqual(migrated.defaultSystemPrompt, AskAIPrefs.defaultPrompt)
-        XCTAssertEqual(migrated.talk.systemPrompt, AskAIPrefs.defaultPrompt)
+        XCTAssertEqual(migrated.talk.systemPrompt, TalkPrefs.defaultPrompt)
         // Cleared after the default arrived: stays empty.
         let cleared = #"{"defaultSystemPrompt":"","talk":{"systemPrompt":""},"promptDefaultsApplied":true}"#
         let kept = try JSONDecoder().decode(AskAIPrefs.self, from: Data(cleared.utf8))
         XCTAssertEqual(kept.defaultSystemPrompt, "")
         XCTAssertEqual(kept.talk.systemPrompt, "")
+    }
+
+    @MainActor
+    private func waitUntilDone(_ conversation: AskAIConversation) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while conversation.isStreaming, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertFalse(conversation.isStreaming)
+    }
+}
+
+/// Replies with the next scripted events per request; the last script repeats.
+private final class ScriptedChat: ChatStreaming, @unchecked Sendable {
+    private let lock = NSLock()
+    private var scripts: [[ChatStreamEvent]]
+    private var sent: [[String: Any]] = []
+
+    init(_ scripts: [[ChatStreamEvent]]) {
+        self.scripts = scripts
+    }
+
+    var bodies: [[String: Any]] { lock.withLock { sent } }
+
+    func stream(_ body: ChatCompletionBody) -> AsyncThrowingStream<ChatStreamEvent, Error> {
+        let json = (try? body.encoded()).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let events = lock.withLock {
+            sent.append(json ?? [:])
+            return scripts.count > 1 ? scripts.removeFirst() : scripts[0]
+        }
+        return AsyncThrowingStream { continuation in
+            events.forEach { continuation.yield($0) }
+            continuation.finish()
+        }
+    }
+}
+
+private struct StubToolRunner: AskAIToolRunning {
+    func run(_ call: ChatToolCall) async -> AskAIToolResult {
+        AskAIToolResult(text: #"{"ok":true,"results":[]}"#)
     }
 }

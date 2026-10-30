@@ -37,6 +37,8 @@ struct AskAIScreen: View {
     @State private var models: [String]?
     /// Models with a realtime voice backend, for Ask via Voice.
     @State private var voiceModels: [String]?
+    /// Models that read images, for the screen capture tool.
+    @State private var visionModels: Set<String>?
     @State private var modelsUnavailable = false
     /// Nil until the server answers; every model reports the same host value.
     @State private var gpuPowerLimitSupported: Bool?
@@ -57,6 +59,7 @@ struct AskAIScreen: View {
                 }
                 if prefs.talk.enabled {
                     VoiceSection(controller: askAI, store: askAI.store, models: voiceModels,
+                                 gpuPowerLimitSupported: gpuPowerLimitSupported,
                                  microphone: microphone, showsMicrophoneGuide: $showsMicrophoneGuide)
                 }
                 if modelsUnavailable, prefs.enabled || prefs.talk.enabled {
@@ -69,9 +72,9 @@ struct AskAIScreen: View {
                     .padding(.top, 6)
                 }
             case .presets:
-                PresetsSection(store: askAI.store, models: models)
+                PresetsSection(store: askAI.store, models: models, visionModels: visionModels)
             case .textAdvanced:
-                TextAdvancedSection(store: askAI.store)
+                TextAdvancedSection(store: askAI.store, visionModels: visionModels)
             case .voiceAdvanced:
                 VoiceAdvancedSection(store: askAI.store)
             }
@@ -116,12 +119,20 @@ struct AskAIScreen: View {
                 return (type.isEmpty || type == "llm" || type == "vlm") && model.virtual != true
             }.map(\.id)
             voiceModels = all.filter { $0.realtimeVoice == true && $0.virtual != true }.map(\.id)
+            visionModels = Set(all.filter { $0.modelType == "vlm" }.map(\.id))
             modelsUnavailable = false
         } catch {
             models = nil
             voiceModels = nil
+            visionModels = nil
             modelsUnavailable = true
         }
+    }
+
+    /// False only when the list loaded and `model` is not a vision model.
+    static func readsImages(_ model: String, in visionModels: Set<String>?) -> Bool {
+        guard let visionModels, !model.isEmpty else { return true }
+        return visionModels.contains(model)
     }
 
     /// Popup options with a placeholder first. A saved model missing from
@@ -200,7 +211,6 @@ private struct TextSection: View {
     @Bindable var store: AskAIStore
     let models: [String]?
     let gpuPowerLimitSupported: Bool?
-    @State private var gpuPowerLimitText = ""
 
     @Environment(AppServices.self) private var services
     @Environment(\.omlxTheme) private var theme
@@ -238,34 +248,13 @@ private struct TextSection: View {
                 Popup(selection: $store.prefs.defaultModel, width: .controlWide,
                       options: AskAIScreen.modelOptions(models, current: store.prefs.defaultModel))
             }
-            Row(
-                label: String(localized: "askai.row.gpu_power_limit",
-                              defaultValue: "GPU Power Limit",
-                              comment: "Row label for the GPU power limit while Ask AI answers"),
-                sublabel: gpuPowerLimitSupported == false
-                    ? GPUPowerGuide.unsupportedText
-                    : String(localized: "askai.row.gpu_power_limit.sub",
-                             defaultValue: "Caps GPU power for the whole Mac while Ask AI answers, to save battery (2 to 1000 W). If the model also has a limit, the lower one applies.",
-                             comment: "Sublabel for the Ask AI GPU power limit"),
-                isLast: true
-            ) {
-                HStack(spacing: 8) {
-                    if store.prefs.gpuPowerLimitEnabled {
-                        // Text state so a cleared field shows the range placeholder.
-                        TextInput(text: $gpuPowerLimitText,
-                                  placeholder: "2-1000", mono: true, isNumeric: true,
-                                  range: 2...1000, step: 1, suffix: "W",
-                                  width: .controlCompact)
-                            .onAppear { gpuPowerLimitText = String(store.prefs.gpuPowerLimitWatts) }
-                            .onChange(of: gpuPowerLimitText) { _, text in
-                                if let watts = Int(text) { store.prefs.gpuPowerLimitWatts = watts }
-                            }
-                    }
-                    GPUPowerGuideButton()
-                    RowSwitch(isOn: $store.prefs.gpuPowerLimitEnabled)
-                        .disabled(gpuPowerLimitSupported == false && !store.prefs.gpuPowerLimitEnabled)
-                }
-            }
+            GPUPowerLimitRow(
+                isOn: $store.prefs.gpuPowerLimitEnabled, watts: $store.prefs.gpuPowerLimitWatts,
+                supported: gpuPowerLimitSupported,
+                sublabel: String(localized: "askai.row.gpu_power_limit.sub",
+                                 defaultValue: "Caps GPU power for the whole Mac while Ask AI answers, to save battery (2 to 1000 W). If the model also has a limit, the lower one applies.",
+                                 comment: "Sublabel for the Ask AI GPU power limit")
+            )
         }
 
         // System Settings style: rows that open a page.
@@ -286,6 +275,7 @@ private struct TextSection: View {
 
 private struct TextAdvancedSection: View {
     @Bindable var store: AskAIStore
+    let visionModels: Set<String>?
 
     var body: some View {
         Group {
@@ -323,6 +313,203 @@ private struct TextAdvancedSection: View {
                                 defaultText: AskAIPrefs.defaultPrompt)
                 }
             }
+            ListGroup {
+                ToolRows(tools: $store.prefs.defaultTools,
+                         modelReadsImages: AskAIScreen.readsImages(store.prefs.defaultModel, in: visionModels),
+                         isLast: true)
+            }
+            .padding(.top, 14)
+        }
+    }
+}
+
+/// The tool calling switch and the tools it offers.
+private struct ToolRows: View {
+    @Binding var tools: AskAIToolPrefs
+    let modelReadsImages: Bool
+    var isLast = false
+
+    @State private var screenGranted = ScreenCaptureAccess.isGranted
+    @State private var showsScreenGuide = false
+    @Environment(AppServices.self) private var services
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        Row(label: AskAIScreenStrings.toolCalling,
+            sublabel: String(localized: "askai.tools.row.sub",
+                             defaultValue: "Lets the model search the web, read links and look at your screen when it needs to.",
+                             comment: "Sublabel for the Ask AI tool calling switch"),
+            isLast: isLast && !tools.enabled) {
+            RowSwitch(isOn: $tools.enabled)
+        }
+        if tools.enabled {
+            FreeRow(isLast: isLast) {
+                VStack(alignment: .leading, spacing: 10) {
+                    toolToggle($tools.webSearch,
+                               title: String(localized: "askai.tools.web_search", defaultValue: "Web Search",
+                                             comment: "Checkbox for the Ask AI web search tool"),
+                               detail: String(localized: "askai.tools.web_search.sub",
+                                              defaultValue: "Uses the search provider set in Dashboard Settings > Integrations.",
+                                              comment: "Description of the Ask AI web search tool"))
+                    toolToggle($tools.readLinks,
+                               title: String(localized: "askai.tools.read_links", defaultValue: "Read Links",
+                                             comment: "Checkbox for the Ask AI tool that reads web pages"),
+                               detail: String(localized: "askai.tools.read_links.sub",
+                                              defaultValue: "Reads web pages, including links you put in a question.",
+                                              comment: "Description of the Ask AI read links tool"))
+                    toolToggle($tools.screenCapture,
+                               title: String(localized: "askai.tools.screen", defaultValue: "Screen Capture",
+                                             comment: "Checkbox for the Ask AI screen capture tool"),
+                               detail: modelReadsImages
+                                   ? String(localized: "askai.tools.screen.sub",
+                                            defaultValue: "Takes a screenshot when you ask about something on your screen. oMLX windows are left out.",
+                                            comment: "Description of the Ask AI screen capture tool")
+                                   : String(localized: "askai.tools.screen.needs_vision",
+                                            defaultValue: "Needs a vision (VLM) model.",
+                                            comment: "Shown under the screen capture tool when the model cannot read images"))
+                        .disabled(!modelReadsImages)
+                    if tools.screenCapture && modelReadsImages && !screenGranted {
+                        HStack(spacing: 10) {
+                            Label(String(localized: "askai.tools.screen.warning",
+                                         defaultValue: "Screen recording permission is off, so Ask AI can't see your screen.",
+                                         comment: "Warning shown while oMLX has no screen recording permission"),
+                                  systemImage: "exclamationmark.triangle.fill")
+                                .font(.omlxText(DesignTokens.FontSize.callout))
+                                .foregroundStyle(theme.amberDot)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer()
+                            Button(AskAIScreenStrings.restartApp) {
+                                services.relaunchApp()
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
+                            Button(String(localized: "askai.tools.screen.allow", defaultValue: "Allow…",
+                                          comment: "Button that opens the screen recording permission guide")) {
+                                showsScreenGuide = true
+                            }
+                            .buttonStyle(.omlx(.normal, size: .small))
+                        }
+                    }
+                }
+                .sheet(isPresented: $showsScreenGuide) {
+                    ScreenCaptureGuideSheet()
+                        .environment(\.omlxTheme, theme)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    screenGranted = ScreenCaptureAccess.isGranted
+                }
+            }
+        }
+    }
+
+    private func toolToggle(_ isOn: Binding<Bool>, title: String, detail: String) -> some View {
+        Toggle(isOn: isOn) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                    .foregroundStyle(theme.text)
+                Text(detail)
+                    .font(.omlxText(11.5))
+                    .foregroundStyle(theme.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .toggleStyle(.checkbox)
+    }
+}
+
+/// macOS applies a new screen recording permission only after oMLX restarts.
+/// The sheet closes before System Settings opens, because an open sheet
+/// blocks its Quit & Reopen.
+private struct ScreenCaptureGuideSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(String(localized: "askai.screen.guide.title",
+                        defaultValue: "Allow Screen Recording",
+                        comment: "Title of the screen recording permission guide"))
+                .font(.omlxText(DesignTokens.FontSize.title3, weight: .semibold))
+                .foregroundStyle(theme.text)
+            step(1, String(localized: "askai.screen.guide.step1",
+                           defaultValue: "Click Open System Settings, then turn on oMLX in Screen & System Audio Recording.",
+                           comment: "First step of the screen recording permission guide"))
+            step(2, String(localized: "askai.screen.guide.step2",
+                           defaultValue: "The permission applies after oMLX restarts. Choose Quit & Reopen when macOS asks, or click Restart oMLX next to the warning.",
+                           comment: "Second step of the screen recording permission guide"))
+            HStack {
+                Spacer()
+                Button(String(localized: "askai.screen.guide.later",
+                              defaultValue: "Not Now",
+                              comment: "Button that closes the screen recording permission guide")) {
+                    dismiss()
+                }
+                .buttonStyle(.omlx(.normal, size: .small))
+                Button(String(localized: "askai.screen.guide.open_settings",
+                              defaultValue: "Open System Settings",
+                              comment: "Button that opens the macOS screen recording privacy settings")) {
+                    // Only the first request shows the macOS prompt; it also lists oMLX in System Settings.
+                    ScreenCaptureAccess.request()
+                    ScreenCaptureAccess.openSystemSettings()
+                    dismiss()
+                }
+                .buttonStyle(.omlx(.primary, size: .small))
+            }
+            .padding(.top, 6)
+        }
+        .padding(22)
+        .frame(width: 420)
+    }
+
+    private func step(_ number: Int, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("\(number)")
+                .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
+                .foregroundStyle(theme.accentText)
+                .frame(width: 20, height: 20)
+                .background(Circle().fill(theme.accent))
+            Text(text)
+                .font(.omlxText(DesignTokens.FontSize.body))
+                .foregroundStyle(theme.text)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// GPU power cap switch with its watt field. The server applies the lower
+/// of this and the model's own limit.
+private struct GPUPowerLimitRow: View {
+    @Binding var isOn: Bool
+    @Binding var watts: Int
+    let supported: Bool?
+    let sublabel: String
+
+    /// Text state so a cleared field shows the range placeholder.
+    @State private var text = ""
+
+    var body: some View {
+        Row(
+            label: String(localized: "askai.row.gpu_power_limit",
+                          defaultValue: "GPU Power Limit",
+                          comment: "Row label for the GPU power limit while Ask AI answers"),
+            sublabel: supported == false ? GPUPowerGuide.unsupportedText : sublabel,
+            isLast: true
+        ) {
+            HStack(spacing: 8) {
+                if isOn {
+                    TextInput(text: $text,
+                              placeholder: "2-1000", mono: true, isNumeric: true,
+                              range: 2...1000, step: 1, suffix: "W",
+                              width: .controlCompact)
+                        .onAppear { text = String(watts) }
+                        .onChange(of: text) { _, text in
+                            if let value = Int(text) { watts = value }
+                        }
+                }
+                GPUPowerGuideButton()
+                RowSwitch(isOn: $isOn)
+                    .disabled(supported == false && !isOn)
+            }
         }
     }
 }
@@ -333,6 +520,7 @@ private struct VoiceSection: View {
     let controller: AskAIController
     @Bindable var store: AskAIStore
     let models: [String]?
+    let gpuPowerLimitSupported: Bool?
     let microphone: MicrophoneAccess.State
     @Binding var showsMicrophoneGuide: Bool
 
@@ -403,12 +591,18 @@ private struct VoiceSection: View {
                               comment: "Row label for the Talk with AI reply playback speed"),
                 sublabel: String(localized: "talkai.row.speed.sub",
                                  defaultValue: "Plays replies faster or slower without changing the pitch.",
-                                 comment: "Sublabel for the Talk with AI reply playback speed"),
-                isLast: true
+                                 comment: "Sublabel for the Talk with AI reply playback speed")
             ) {
                 Popup(selection: $store.prefs.talk.speechSpeed, width: .controlCompact,
                       options: speedOptions)
             }
+            GPUPowerLimitRow(
+                isOn: $store.prefs.talk.gpuPowerLimitEnabled, watts: $store.prefs.talk.gpuPowerLimitWatts,
+                supported: gpuPowerLimitSupported,
+                sublabel: String(localized: "talkai.row.gpu_power_limit.sub",
+                                 defaultValue: "Caps GPU power for the whole Mac during a voice conversation (2 to 1000 W). Low limits can make replies start late or stutter. If the model also has a limit, the lower one applies.",
+                                 comment: "Sublabel for the Ask AI voice GPU power limit")
+            )
         }
         // Voices belong to one model, so a choice never carries over.
         .onChange(of: store.prefs.talk.model) { store.prefs.talk.voice = "" }
@@ -451,8 +645,11 @@ private struct VoiceAdvancedSection: View {
     @Environment(AppServices.self) private var services
     /// Voices the selected model's realtime session can pick; empty hides the row.
     @State private var voices: [String] = []
+    /// The selected model's default prompt; nil until the server reports it.
+    @State private var modelDefault: String?
 
     var body: some View {
+        let model = store.prefs.talk.model
         ListGroup {
             if !voices.isEmpty {
                 Row(label: String(localized: "talkai.row.voice",
@@ -462,17 +659,50 @@ private struct VoiceAdvancedSection: View {
                           options: voiceOptions)
                 }
             }
+            if !model.isEmpty {
+                FreeRow {
+                    PromptField(text: modelPrompt(model),
+                                placeholder: modelDefault == ""
+                                    ? String(localized: "talkai.prompt.model.none",
+                                             defaultValue: "Optional. This model has no recommended prompt.",
+                                             comment: "Placeholder for the voice model prompt when the model has no default")
+                                    : "",
+                                defaultText: modelDefault,
+                                label: String(localized: "talkai.prompt.model",
+                                              defaultValue: "Model Prompt",
+                                              comment: "Label above the prompt used only with the selected voice model"),
+                                caption: String(localized: "talkai.prompt.model.sub",
+                                                defaultValue: "Used only with \(model), before the general prompt. Reset to Default puts back the model's recommended prompt.",
+                                                comment: "Explains the voice model prompt; the argument is the model name"))
+                }
+            }
             FreeRow(isLast: true) {
                 PromptField(text: $store.prefs.talk.systemPrompt,
                             placeholder: String(localized: "talkai.prompt.placeholder",
                                                 defaultValue: "Optional. For example: Keep answers short and friendly.",
                                                 comment: "Placeholder for the Talk with AI system prompt"),
-                            defaultText: AskAIPrefs.defaultPrompt)
+                            defaultText: TalkPrefs.defaultPrompt,
+                            label: String(localized: "talkai.prompt.general",
+                                          defaultValue: "General Prompt",
+                                          comment: "Label above the prompt used with every voice model"),
+                            caption: String(localized: "talkai.prompt.general.sub",
+                                            defaultValue: "Used with every voice model, after the model prompt.",
+                                            comment: "Explains the voice general prompt"))
             }
         }
-        .task(id: [store.prefs.talk.model, String(services.serverState.isRunningLike)]) {
-            await loadVoices()
+        .task(id: [model, String(services.serverState.isRunningLike)]) {
+            await loadModelInfo()
         }
+    }
+
+    /// The model's own prompt until the user edits it; matching the default again forgets the edit.
+    private func modelPrompt(_ model: String) -> Binding<String> {
+        Binding(
+            get: { store.prefs.talk.modelPrompts[model] ?? modelDefault ?? "" },
+            set: { text in
+                store.prefs.talk.modelPrompts[model] = text == modelDefault ? nil : text
+            }
+        )
     }
 
     private var voiceOptions: [(String, String)] {
@@ -487,7 +717,8 @@ private struct VoiceAdvancedSection: View {
         return options
     }
 
-    private func loadVoices() async {
+    /// Voices and default prompt of the selected model's realtime session.
+    private func loadModelInfo() async {
         let model = store.prefs.talk.model
         let config = services.config
         guard !model.isEmpty,
@@ -496,8 +727,11 @@ private struct VoiceAdvancedSection: View {
                   .flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) })
         else {
             voices = []
+            modelDefault = nil
             return
         }
+        // Another model's default must not show while this one loads.
+        modelDefault = nil
         components.queryItems = [URLQueryItem(name: "model", value: model),
                                  URLQueryItem(name: "realtime", value: "true")]
         guard let url = components.url else { return }
@@ -505,15 +739,20 @@ private struct VoiceAdvancedSection: View {
         if let key = config.apiKey, !key.isEmpty {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
-        struct Voices: Decodable { let voices: [String] }
+        struct Info: Decodable {
+            let voices: [String]
+            let instructions: String?
+        }
         guard let (data, _) = try? await URLSession.shared.data(for: request),
-              let decoded = try? JSONDecoder().decode(Voices.self, from: data)
+              let decoded = try? JSONDecoder().decode(Info.self, from: data)
         else {
             // Another model's voices would be rejected by this one.
             voices = []
+            modelDefault = nil
             return
         }
         voices = decoded.voices
+        modelDefault = decoded.instructions
     }
 }
 
@@ -592,6 +831,7 @@ private struct MicrophoneGuideSheet: View {
 private struct PresetsSection: View {
     @Bindable var store: AskAIStore
     let models: [String]?
+    let visionModels: Set<String>?
 
     /// Id of the preset being edited; not in the list yet for a new one.
     /// The editor binds to the non-optional `draft`, so clearing this id
@@ -688,7 +928,8 @@ private struct PresetsSection: View {
     }
 
     private func editor(isLast: Bool) -> some View {
-        PresetEditor(preset: $draft, models: models, error: editError, isLast: isLast) {
+        PresetEditor(preset: $draft, models: models, visionModels: visionModels, error: editError,
+                     isLast: isLast) {
             editingID = nil
             editError = nil
         } onSave: {
@@ -729,6 +970,7 @@ private struct PresetRow: View {
         var parts = [preset.model.isEmpty ? AskAIScreenStrings.noModel : preset.model]
         if preset.allowThinking { parts.append(AskAIScreenStrings.thinking) }
         if preset.autoCopy { parts.append(AskAIScreenStrings.autoCopy) }
+        if preset.tools.enabled { parts.append(AskAIScreenStrings.toolCalling) }
         return parts.joined(separator: " · ")
     }
 
@@ -778,6 +1020,7 @@ private struct PresetRow: View {
 private struct PresetEditor: View {
     @Binding var preset: AskAIPreset
     let models: [String]?
+    let visionModels: Set<String>?
     let error: String?
     let isLast: Bool
     let onCancel: () -> Void
@@ -813,11 +1056,16 @@ private struct PresetEditor: View {
         Row(label: AskAIScreenStrings.autoCopy, sublabel: AskAIScreenStrings.autoCopySub) {
             RowSwitch(isOn: $preset.autoCopy)
         }
+        ToolRows(tools: $preset.tools,
+                 modelReadsImages: AskAIScreen.readsImages(preset.model, in: visionModels))
         FreeRow {
             PromptField(text: $preset.systemPrompt,
                         placeholder: String(localized: "askai.prompt.preset_placeholder",
                                             defaultValue: "For example: Translate the text into English in a concise, professional Slack tone. Output only the translation.",
-                                            comment: "Placeholder for an Ask AI preset system prompt"))
+                                            comment: "Placeholder for an Ask AI preset system prompt"),
+                        caption: String(localized: "askai.prompt.preset.sub",
+                                        defaultValue: "Used instead of the default system prompt while this preset runs, so add the date or other placeholders here if the preset needs them.",
+                                        comment: "Explains that a preset prompt replaces the default system prompt"))
         }
         FreeRow(isLast: isLast) {
             HStack(spacing: 6) {
@@ -846,6 +1094,11 @@ private struct PromptField: View {
     let placeholder: String
     /// Offered as Reset to Default while the text differs from it.
     var defaultText: String?
+    var label = String(localized: "askai.row.system_prompt",
+                       defaultValue: "System Prompt",
+                       comment: "Label above the Ask AI system prompt editor")
+    /// How the prompt is used, under the label.
+    var caption: String?
 
     @Environment(\.omlxTheme) private var theme
     @State private var clipboardNeedsPermission = ClipboardAccess.needsPermission
@@ -853,12 +1106,18 @@ private struct PromptField: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(String(localized: "askai.row.system_prompt",
-                            defaultValue: "System Prompt",
-                            comment: "Label above the Ask AI system prompt editor"))
-                    .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
-                    .foregroundStyle(theme.text)
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(label)
+                        .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                        .foregroundStyle(theme.text)
+                    if let caption {
+                        Text(caption)
+                            .font(.omlxText(11.5))
+                            .foregroundStyle(theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 Spacer()
                 if let defaultText, text != defaultText {
                     Button(String(localized: "askai.prompt.reset",
@@ -1073,6 +1332,14 @@ private enum AskAIScreenStrings {
     static var autoCopy: String {
         String(localized: "askai.row.auto_copy", defaultValue: "Auto Copy",
                comment: "Row label for the Ask AI auto copy switch")
+    }
+    static var restartApp: String {
+        String(localized: "askai.restart_app", defaultValue: "Restart oMLX",
+               comment: "Button that quits and reopens oMLX so a new permission applies")
+    }
+    static var toolCalling: String {
+        String(localized: "askai.tools.row", defaultValue: "Tool Calling",
+               comment: "Row label for the Ask AI tool calling switch")
     }
     static var autoCopySub: String {
         String(localized: "askai.row.auto_copy.sub",

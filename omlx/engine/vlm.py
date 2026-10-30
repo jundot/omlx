@@ -101,6 +101,12 @@ def realtime_voice_names(config: dict) -> list[str]:
     backend_class = _VOICE_BACKENDS.get(config.get("model_type"))
     return backend_class.voice_names(config) if backend_class else []
 
+
+def realtime_voice_instructions(config: dict) -> str:
+    """System prompt a /v1/realtime session on this checkpoint starts with."""
+    backend_class = _VOICE_BACKENDS.get(config.get("model_type"))
+    return backend_class.default_instructions if backend_class else ""
+
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
 # unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to

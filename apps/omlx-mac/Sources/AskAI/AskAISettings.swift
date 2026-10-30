@@ -11,6 +11,26 @@ struct AskAIProfile: Equatable, Sendable {
     var systemPrompt: String
     var allowThinking: Bool
     var autoCopy: Bool
+    var tools = AskAIToolPrefs()
+}
+
+/// Tools the model may call while it answers. Off until tool calling is on.
+struct AskAIToolPrefs: Codable, Equatable, Sendable {
+    var enabled = false
+    var webSearch = true
+    var readLinks = true
+    var screenCapture = false
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = AskAIToolPrefs()
+        enabled = c.lenient(Bool.self, .enabled) ?? fallback.enabled
+        webSearch = c.lenient(Bool.self, .webSearch) ?? fallback.webSearch
+        readLinks = c.lenient(Bool.self, .readLinks) ?? fallback.readLinks
+        screenCapture = c.lenient(Bool.self, .screenCapture) ?? fallback.screenCapture
+    }
 }
 
 struct AskAIPreset: Codable, Equatable, Identifiable, Sendable {
@@ -21,6 +41,7 @@ struct AskAIPreset: Codable, Equatable, Identifiable, Sendable {
     var systemPrompt: String
     var allowThinking: Bool
     var autoCopy: Bool
+    var tools: AskAIToolPrefs
 
     init(
         id: UUID = UUID(),
@@ -28,7 +49,8 @@ struct AskAIPreset: Codable, Equatable, Identifiable, Sendable {
         model: String = "",
         systemPrompt: String = "",
         allowThinking: Bool = false,
-        autoCopy: Bool = false
+        autoCopy: Bool = false,
+        tools: AskAIToolPrefs = AskAIToolPrefs()
     ) {
         self.id = id
         self.command = command
@@ -36,6 +58,7 @@ struct AskAIPreset: Codable, Equatable, Identifiable, Sendable {
         self.systemPrompt = systemPrompt
         self.allowThinking = allowThinking
         self.autoCopy = autoCopy
+        self.tools = tools
     }
 
     init(from decoder: Decoder) throws {
@@ -46,11 +69,12 @@ struct AskAIPreset: Codable, Equatable, Identifiable, Sendable {
         systemPrompt = c.lenient(String.self, .systemPrompt) ?? ""
         allowThinking = c.lenient(Bool.self, .allowThinking) ?? false
         autoCopy = c.lenient(Bool.self, .autoCopy) ?? false
+        tools = c.lenient(AskAIToolPrefs.self, .tools) ?? AskAIToolPrefs()
     }
 
     var profile: AskAIProfile {
         AskAIProfile(model: model, systemPrompt: systemPrompt,
-                     allowThinking: allowThinking, autoCopy: autoCopy)
+                     allowThinking: allowThinking, autoCopy: autoCopy, tools: tools)
     }
 
     /// First non-blank line of the prompt, capped for one-line previews.
@@ -69,14 +93,25 @@ struct AskAIPanelPosition: Codable, Equatable, Sendable {
 
 /// Ask AI voice mode: a spoken conversation with a voice model over /v1/realtime.
 struct TalkPrefs: Codable, Equatable, Sendable {
+    /// The voice models bring their own speaking style, so the general
+    /// prompt only adds what they cannot know.
+    static let defaultPrompt = "Current date and time: {weekday}, {datetime} ({timezone})."
+
     var enabled = false
     var hotKey = HotKeyCombo.optionShiftSpace
     var model = ""
-    var systemPrompt = AskAIPrefs.defaultPrompt
+    /// Sent with every voice model, after the model prompt.
+    var systemPrompt = TalkPrefs.defaultPrompt
+    /// Model prompts the user edited, by model id. A model without one uses
+    /// the default the server reports for it.
+    var modelPrompts: [String: String] = [:]
     /// Empty uses the model's default voice.
     var voice = ""
     /// Reply playback rate; pitch stays the same.
     var speechSpeed = 1.0
+    /// System-wide GPU power cap for the whole conversation.
+    var gpuPowerLimitEnabled = false
+    var gpuPowerLimitWatts = 10
 
     init() {}
 
@@ -87,8 +122,24 @@ struct TalkPrefs: Codable, Equatable, Sendable {
         hotKey = c.lenient(HotKeyCombo.self, .hotKey) ?? fallback.hotKey
         model = c.lenient(String.self, .model) ?? fallback.model
         systemPrompt = c.lenient(String.self, .systemPrompt) ?? fallback.systemPrompt
+        modelPrompts = c.lenient([String: String].self, .modelPrompts) ?? fallback.modelPrompts
         voice = c.lenient(String.self, .voice) ?? fallback.voice
         speechSpeed = c.lenient(Double.self, .speechSpeed).map(TalkPrefs.clampedSpeed) ?? fallback.speechSpeed
+        gpuPowerLimitEnabled = c.lenient(Bool.self, .gpuPowerLimitEnabled) ?? fallback.gpuPowerLimitEnabled
+        gpuPowerLimitWatts = c.lenient(Int.self, .gpuPowerLimitWatts) ?? fallback.gpuPowerLimitWatts
+    }
+
+    var requestGPUPowerLimit: Int? {
+        AskAIPrefs.requestGPUPowerLimit(enabled: gpuPowerLimitEnabled, watts: gpuPowerLimitWatts)
+    }
+
+    /// The session instructions: the model prompt, then the general prompt.
+    /// `modelDefault` is the prompt the server opened the session with.
+    func instructions(modelDefault: String, context: PromptContext) -> String {
+        [modelPrompts[model] ?? modelDefault, systemPrompt]
+            .map { PromptPlaceholders.fill($0, context: context).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
     }
 
     static let speechSpeeds = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5]
@@ -100,8 +151,16 @@ struct TalkPrefs: Codable, Equatable, Sendable {
 
 struct AskAIPrefs: Codable, Equatable, Sendable {
     static let defaultPanelWidth: Double = 680
-    /// Gives the model today's date, which it cannot know on its own.
-    static let defaultPrompt = "Current date and time: {weekday}, {datetime} ({timezone})."
+    static let defaultPrompt = """
+        You are Ask AI, a quick assistant the user opens over any app on their Mac.
+        Current date and time: {weekday}, {datetime} ({timezone}). The app in front: {app}.
+
+        In user messages, "I/me/my" refer to the user and "you/your" refer to you; keep that perspective in your replies.
+        Put the answer first and keep it short. Add detail only when it helps or the user asks for it.
+        Use Markdown lists, tables, or code blocks only when they make the answer clearer.
+        Reply in the language the user writes in unless they ask otherwise.
+        If the request is unclear and none of your tools can settle it, ask one short question.
+        """
 
     var enabled = false
     var hotKey = HotKeyCombo.optionSpace
@@ -109,6 +168,7 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
     var defaultSystemPrompt = AskAIPrefs.defaultPrompt
     var defaultAllowThinking = false
     var defaultAutoCopy = false
+    var defaultTools = AskAIToolPrefs()
     /// Idle time after which reopening the panel starts a new conversation.
     var newConversationAfter: TimeInterval = 300
     var presets: [AskAIPreset] = []
@@ -137,6 +197,7 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
         defaultSystemPrompt = c.lenient(String.self, .defaultSystemPrompt) ?? fallback.defaultSystemPrompt
         defaultAllowThinking = c.lenient(Bool.self, .defaultAllowThinking) ?? fallback.defaultAllowThinking
         defaultAutoCopy = c.lenient(Bool.self, .defaultAutoCopy) ?? fallback.defaultAutoCopy
+        defaultTools = c.lenient(AskAIToolPrefs.self, .defaultTools) ?? fallback.defaultTools
         newConversationAfter = c.lenient(TimeInterval.self, .newConversationAfter)
             ?? fallback.newConversationAfter
         presets = c.lenient([Lossy<AskAIPreset>].self, .presets)?.compactMap(\.value) ?? fallback.presets
@@ -148,19 +209,24 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
         promptDefaultsApplied = c.lenient(Bool.self, .promptDefaultsApplied) ?? false
         if !promptDefaultsApplied {
             if defaultSystemPrompt.isEmpty { defaultSystemPrompt = Self.defaultPrompt }
-            if talk.systemPrompt.isEmpty { talk.systemPrompt = Self.defaultPrompt }
+            if talk.systemPrompt.isEmpty { talk.systemPrompt = TalkPrefs.defaultPrompt }
             promptDefaultsApplied = true
         }
     }
 
-    /// The `gpu_power_limit_w` to send, clamped to what the server accepts.
     var requestGPUPowerLimit: Int? {
-        gpuPowerLimitEnabled ? min(max(gpuPowerLimitWatts, 2), 1000) : nil
+        Self.requestGPUPowerLimit(enabled: gpuPowerLimitEnabled, watts: gpuPowerLimitWatts)
+    }
+
+    /// The `gpu_power_limit_w` to send, clamped to what the server accepts.
+    static func requestGPUPowerLimit(enabled: Bool, watts: Int) -> Int? {
+        enabled ? min(max(watts, 2), 1000) : nil
     }
 
     var defaultProfile: AskAIProfile {
         AskAIProfile(model: defaultModel, systemPrompt: defaultSystemPrompt,
-                     allowThinking: defaultAllowThinking, autoCopy: defaultAutoCopy)
+                     allowThinking: defaultAllowThinking, autoCopy: defaultAutoCopy,
+                     tools: defaultTools)
     }
 }
 

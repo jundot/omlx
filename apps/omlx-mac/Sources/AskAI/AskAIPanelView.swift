@@ -376,15 +376,24 @@ private struct TurnView: View {
                     .textSelection(.enabled)
             }
 
+            if !turn.activities.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(turn.activities.enumerated()), id: \.offset) { _, activity in
+                        ToolActivityRow(activity: activity)
+                    }
+                }
+            }
+
             if !turn.reasoning.isEmpty {
-                ThinkingView(text: turn.reasoning, isThinking: turn.isStreaming && turn.answer.isEmpty)
+                ThinkingView(text: turn.reasoning,
+                             isThinking: turn.isStreaming && turn.answer.isEmpty && !toolRunning)
             }
 
             if !turn.answer.isEmpty {
                 Markdown(turn.answer)
                     .markdownTheme(.askAI)
                     .textSelection(.enabled)
-            } else if turn.isStreaming && turn.reasoning.isEmpty {
+            } else if turn.isStreaming && turn.reasoning.isEmpty && !toolRunning {
                 ProgressView()
                     .controlSize(.small)
             }
@@ -398,7 +407,7 @@ private struct TurnView: View {
                     .help(error)
             }
 
-            if !turn.isStreaming && !turn.answer.isEmpty {
+            if !turn.isStreaming && !turn.reply.isEmpty {
                 HStack(spacing: 8) {
                     if turn.wasStopped {
                         Text(String(localized: "askai.turn.stopped", defaultValue: "Stopped",
@@ -411,12 +420,80 @@ private struct TurnView: View {
                     }
                     Spacer(minLength: 0)
                     CopyIconButton(
-                        value: turn.answer.trimmingCharacters(in: .whitespacesAndNewlines),
+                        value: turn.reply.trimmingCharacters(in: .whitespacesAndNewlines),
                         helpText: AskAIStrings.copyAnswer
                     )
                 }
                 .font(.omlxText(DesignTokens.FontSize.subheadline))
             }
+        }
+    }
+}
+
+private extension TurnView {
+    var toolRunning: Bool { turn.activities.contains(where: \.isRunning) }
+}
+
+private struct ToolActivityRow: View {
+    let activity: AskAIToolActivity
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if activity.isRunning {
+                ProgressView().controlSize(.mini)
+            } else {
+                Image(systemName: activity.failed ? "exclamationmark.triangle" : icon)
+                    .foregroundStyle(activity.failed ? theme.redDot : theme.textTertiary)
+            }
+            Text(text)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .font(.omlxText(DesignTokens.FontSize.callout))
+        .foregroundStyle(theme.textSecondary)
+        .help(activity.detail)
+    }
+
+    private var icon: String {
+        switch activity.kind {
+        case .search: "magnifyingglass"
+        case .read: "link"
+        case .screen: "camera.viewfinder"
+        }
+    }
+
+    private var text: String {
+        let detail = activity.detail
+        switch (activity.kind, activity.isRunning, activity.failed) {
+        case (.search, true, _):
+            return String(localized: "askai.tool.search.running", defaultValue: "Searching the web: \(detail)",
+                          comment: "Ask AI tool line while a web search runs; the argument is the query")
+        case (.search, false, false):
+            return String(localized: "askai.tool.search.done", defaultValue: "Searched the web: \(detail)",
+                          comment: "Ask AI tool line after a web search; the argument is the query")
+        case (.search, false, true):
+            return String(localized: "askai.tool.search.failed", defaultValue: "Web search failed: \(detail)",
+                          comment: "Ask AI tool line after a failed web search; the argument is the query")
+        case (.read, true, _):
+            return String(localized: "askai.tool.read.running", defaultValue: "Reading \(detail)",
+                          comment: "Ask AI tool line while a web page is fetched; the argument is the site")
+        case (.read, false, false):
+            return String(localized: "askai.tool.read.done", defaultValue: "Read \(detail)",
+                          comment: "Ask AI tool line after a web page was fetched; the argument is the site")
+        case (.read, false, true):
+            return String(localized: "askai.tool.read.failed", defaultValue: "Couldn't read \(detail)",
+                          comment: "Ask AI tool line after a page fetch failed; the argument is the site")
+        case (.screen, true, _):
+            return String(localized: "askai.tool.screen.running", defaultValue: "Looking at your screen",
+                          comment: "Ask AI tool line while a screenshot is taken")
+        case (.screen, false, false):
+            return String(localized: "askai.tool.screen.done", defaultValue: "Looked at your screen",
+                          comment: "Ask AI tool line after a screenshot was sent to the model")
+        case (.screen, false, true):
+            return String(localized: "askai.tool.screen.failed", defaultValue: "Couldn't capture the screen",
+                          comment: "Ask AI tool line after a screenshot failed")
         }
     }
 }

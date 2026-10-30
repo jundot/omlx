@@ -92,6 +92,8 @@ def talker_sample(logits: mx.array, history: list[int], eos: int) -> mx.array:
 class Qwen3OmniVoiceBackend(VoiceBackend):
     """A spoken conversation with Qwen3-Omni (thinker, talker and code2wav)."""
 
+    default_instructions = SYSTEM_PROMPT
+
     @classmethod
     def supports(cls, model) -> bool:
         # Thinker-only conversions drop the talker and code2wav.
@@ -165,10 +167,9 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
     def begin_turn(
         self, audio: np.ndarray, instructions: str, voice: str | None
     ) -> int:
-        system = f"{SYSTEM_PROMPT}\n\n{instructions}" if instructions else SYSTEM_PROMPT
         clip = np.asarray(resample_audio(audio, SAMPLE_RATE, INPUT_RATE), np.float32)
         inputs = self.processor(
-            text=[self._turn_text(system)], audio=[clip], sampling_rate=INPUT_RATE
+            text=[self._turn_text(instructions)], audio=[clip], sampling_rate=INPUT_RATE
         )
         if self.cache is None:
             self.cache = make_prompt_cache(self.thinker)

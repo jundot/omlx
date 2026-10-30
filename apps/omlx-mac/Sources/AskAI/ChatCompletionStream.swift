@@ -5,16 +5,54 @@
 import Foundation
 
 struct ChatMessage: Equatable, Sendable {
-    enum Role: String, Sendable { case system, user, assistant }
+    enum Role: String, Sendable { case system, user, assistant, tool }
     let role: Role
     let content: String
     /// `data:` image URLs, sent as image parts before the text.
     var imageURLs: [String] = []
+    /// Calls made by an assistant message, whose content may be empty.
+    var toolCalls: [ChatToolCall] = []
+    /// The call a tool message answers.
+    var toolCallID: String?
+}
+
+/// A function call the model asked for, with its arguments as JSON text.
+struct ChatToolCall: Equatable, Sendable {
+    var id: String
+    var name: String
+    var arguments: String
+}
+
+/// A function the model may call; every argument is a required string.
+struct ChatTool: Equatable, Sendable {
+    struct Argument: Equatable, Sendable {
+        let name: String
+        let description: String
+    }
+
+    let name: String
+    let description: String
+    var arguments: [Argument] = []
+}
+
+/// One streamed piece of a tool call. The first piece of a call carries its
+/// id and name; later pieces with the same index add to its arguments.
+struct ChatToolCallDelta: Equatable, Sendable {
+    let index: Int
+    var id: String?
+    var name: String?
+    var arguments: String?
 }
 
 enum ChatStreamEvent: Equatable, Sendable {
     case content(String)
     case reasoning(String)
+    case toolCall(ChatToolCallDelta)
+}
+
+/// Streams one chat completion; tests script the replies through it.
+protocol ChatStreaming: Sendable {
+    func stream(_ body: ChatCompletionBody) -> AsyncThrowingStream<ChatStreamEvent, Error>
 }
 
 enum ChatStreamError: LocalizedError, Equatable {
@@ -42,8 +80,20 @@ struct ChatCompletionBody: Encodable {
         let role: String
         let content: String
         let imageURLs: [String]
+        var toolCalls: [ChatToolCall] = []
+        var toolCallID: String?
 
-        private enum CodingKeys: String, CodingKey { case role, content }
+        private enum CodingKeys: String, CodingKey { case role, content, toolCalls, toolCallId }
+
+        private struct Call: Encodable {
+            struct Function: Encodable {
+                let name: String
+                let arguments: String
+            }
+            let id: String
+            let type = "function"
+            let function: Function
+        }
 
         private struct Part: Encodable {
             struct ImageURL: Encodable { let url: String }
@@ -55,6 +105,12 @@ struct ChatCompletionBody: Encodable {
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(role, forKey: .role)
+            if !toolCalls.isEmpty {
+                try container.encode(toolCalls.map {
+                    Call(id: $0.id, function: .init(name: $0.name, arguments: $0.arguments))
+                }, forKey: .toolCalls)
+            }
+            try container.encodeIfPresent(toolCallID, forKey: .toolCallId)
             guard !imageURLs.isEmpty else {
                 try container.encode(content, forKey: .content)
                 return
@@ -71,22 +127,55 @@ struct ChatCompletionBody: Encodable {
         let enableThinking: Bool
     }
 
+    /// OpenAI function tool with string arguments.
+    struct Tool: Encodable {
+        struct Function: Encodable {
+            struct Parameters: Encodable {
+                struct Property: Encodable {
+                    let type = "string"
+                    let description: String
+                }
+                let type = "object"
+                let properties: [String: Property]
+                let required: [String]
+            }
+            let name: String
+            let description: String
+            let parameters: Parameters
+        }
+        let type = "function"
+        let function: Function
+
+        init(_ tool: ChatTool) {
+            let properties = Dictionary(uniqueKeysWithValues: tool.arguments.map {
+                ($0.name, Function.Parameters.Property(description: $0.description))
+            })
+            function = Function(name: tool.name, description: tool.description,
+                                parameters: .init(properties: properties,
+                                                  required: tool.arguments.map(\.name)))
+        }
+    }
+
     let model: String
     let messages: [Message]
     let stream = true
     let chatTemplateKwargs: TemplateKwargs?
     let gpuPowerLimitW: Int?
+    let tools: [Tool]?
 
     /// Thinking off sends `enable_thinking: false`. Thinking on sends nothing,
     /// so the model's own setting applies. The server ignores the value for
     /// models whose template forces it.
-    init(model: String, messages: [ChatMessage], allowThinking: Bool, gpuPowerLimitW: Int? = nil) {
+    init(model: String, messages: [ChatMessage], allowThinking: Bool, gpuPowerLimitW: Int? = nil,
+         tools: [ChatTool] = []) {
         self.model = model
         self.messages = messages.map {
-            Message(role: $0.role.rawValue, content: $0.content, imageURLs: $0.imageURLs)
+            Message(role: $0.role.rawValue, content: $0.content, imageURLs: $0.imageURLs,
+                    toolCalls: $0.toolCalls, toolCallID: $0.toolCallID)
         }
         self.chatTemplateKwargs = allowThinking ? nil : TemplateKwargs(enableThinking: false)
         self.gpuPowerLimitW = gpuPowerLimitW
+        self.tools = tools.isEmpty ? nil : tools.map(Tool.init)
     }
 
     func encoded() throws -> Data {
@@ -100,13 +189,24 @@ struct ChatCompletionBody: Encodable {
 enum ChatStreamLine: Equatable {
     case ignore
     case delta(content: String, reasoning: String)
+    case toolCalls([ChatToolCallDelta])
     case done
 
     private struct Chunk: Decodable {
         struct Choice: Decodable {
             struct Delta: Decodable {
+                struct ToolCall: Decodable {
+                    struct Function: Decodable {
+                        let name: String?
+                        let arguments: String?
+                    }
+                    let index: Int?
+                    let id: String?
+                    let function: Function?
+                }
                 let content: String?
                 let reasoningContent: String?
+                let toolCalls: [ToolCall]?
             }
             let delta: Delta?
         }
@@ -133,6 +233,12 @@ enum ChatStreamLine: Equatable {
             throw ChatStreamError.server(error.message ?? "Unknown server error")
         }
         let delta = chunk.choices?.first?.delta
+        if let calls = delta?.toolCalls, !calls.isEmpty {
+            return .toolCalls(calls.enumerated().map { position, call in
+                ChatToolCallDelta(index: call.index ?? position, id: call.id,
+                                  name: call.function?.name, arguments: call.function?.arguments)
+            })
+        }
         let content = delta?.content ?? ""
         let reasoning = delta?.reasoningContent ?? ""
         if content.isEmpty && reasoning.isEmpty { return .ignore }
@@ -151,7 +257,7 @@ enum ChatStreamLine: Equatable {
     }
 }
 
-struct ChatCompletionClient: Sendable {
+struct ChatCompletionClient: ChatStreaming {
     let url: URL
     let apiKey: String?
 
@@ -200,6 +306,8 @@ struct ChatCompletionClient: Sendable {
                         case let .delta(content, reasoning):
                             if !reasoning.isEmpty { continuation.yield(.reasoning(reasoning)) }
                             if !content.isEmpty { continuation.yield(.content(content)) }
+                        case .toolCalls(let calls):
+                            for call in calls { continuation.yield(.toolCall(call)) }
                         }
                     }
                     continuation.finish()

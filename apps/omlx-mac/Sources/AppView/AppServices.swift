@@ -35,6 +35,8 @@ final class AppServices: NSObject {
     /// `ScrollViewReader` observes this, scrolls, then nils it. Extend the
     /// enum as more deep links land.
     var requestedServerAnchor: ServerAnchor?
+    /// Quits and reopens oMLX. Set by AppDelegate.
+    @ObservationIgnored var relaunchApp: @MainActor () -> Void = {}
 
     let client: OMLXClient
     let updates: UpdateController

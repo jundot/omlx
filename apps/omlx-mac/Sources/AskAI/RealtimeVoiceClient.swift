@@ -5,7 +5,8 @@
 import Foundation
 
 enum RealtimeVoiceEvent: Equatable {
-    case sessionCreated
+    /// Carries the model's default instructions, which the session update replaces.
+    case sessionCreated(instructions: String)
     case responseStarted(itemID: String)
     case audio(itemID: String, pcm: Data)
     case transcript(itemID: String, text: String)
@@ -22,7 +23,8 @@ extension RealtimeVoiceEvent {
         else { return nil }
         switch type {
         case "session.created":
-            return .sessionCreated
+            let session = event["session"] as? [String: Any]
+            return .sessionCreated(instructions: session?["instructions"] as? String ?? "")
         case "response.output_item.added":
             let item = event["item"] as? [String: Any]
             return (item?["id"] as? String).map { .responseStarted(itemID: $0) }

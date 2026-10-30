@@ -238,18 +238,25 @@ final class AskAIController {
         let images = attachments
         let submittedDraft = draft
         guard let pending = resolveSend(hasImages: !images.isEmpty) else { return }
-        guard !images.isEmpty else {
+        let model = pending.profile.model
+        // Screen capture is offered only to models known to read images.
+        let needsModelType = pending.profile.tools.enabled && pending.profile.tools.screenCapture
+            && modelTypes[model] == nil
+        guard !images.isEmpty || needsModelType else {
             start(pending, images: [], submittedDraft: submittedDraft)
             return
         }
-        // The server drops image parts for text-only models without an
-        // error, so refuse before sending, like the web chat does.
         isSubmitting = true
         Task {
             defer { isSubmitting = false }
-            if let refusal = await imageRefusal(model: pending.profile.model) {
+            // The server drops image parts for text-only models without an
+            // error, so refuse before sending, like the web chat does.
+            if !images.isEmpty, let refusal = await imageRefusal(model: model) {
                 notice = refusal
                 return
+            }
+            if modelTypes[model] == nil {
+                await refreshModelTypes()
             }
             start(pending, images: images, submittedDraft: submittedDraft)
         }
@@ -314,11 +321,17 @@ final class AskAIController {
         } else {
             conversation.updateProfile(pending.profile, context: PromptContext(app: sourceApp))
         }
+        let tools = AskAITool.tools(for: pending.profile.tools,
+                                    vision: modelTypes[pending.profile.model] == "vlm")
+        let runner = tools.isEmpty ? nil : AskAIToolRunner(host: config.host, port: config.port,
+                                                           apiKey: config.apiKey)
         // A reset during the image check leaves nothing to follow up on.
         // Keep the input so the user can send again.
         guard conversation.send(pending.text, images: images,
                                 gpuPowerLimitW: store.prefs.requestGPUPowerLimit,
-                                using: ChatCompletionClient(url: url, apiKey: config.apiKey))
+                                tools: tools,
+                                using: ChatCompletionClient(url: url, apiKey: config.apiKey),
+                                runner: runner)
         else { return }
         if draft == submittedDraft { draft = "" }
         attachments.removeAll { images.contains($0) }
