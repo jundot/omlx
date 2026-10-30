@@ -267,6 +267,8 @@
   "models.downloader.hf_token": "HF 토큰",
   "models.downloader.hf_token_optional": "(선택사항)",
   "models.downloader.hf_token_placeholder": "hf_...",
+  "models.downloader.exclude_patterns": "제외 패턴",
+  "models.downloader.exclude_patterns_hint": "선택 사항이며 쉼표로 구분된 glob입니다(예: *.gguf). 저장소의 나머지 파일은 그대로 다운로드됩니다.",
   "models.downloader.download_button": "다운로드",
   "models.downloader.token_warning": "Your stored Hugging Face token was rejected, so results are shown without authentication. Run 'hf auth logout' or set a valid HF_TOKEN to clear this warning.",
   "models.downloader.ms_download_section": "ModelScope에서 다운로드",
