@@ -312,6 +312,28 @@ def test_top_p_top_k_matches_sequential_filters(scale, top_p, top_k):
     assert mx.array_equal(mx.where(kept, expected, 0), mx.where(kept, actual, 0)).item()
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize(
+    "probabilities, top_p, top_k",
+    [
+        ([0.5, 0.2, 0.2, 0.1], 0.6, 3),
+        ([0.4, 0.2, 0.2, 0.2], 0.5, 3),
+        ([0.25, 0.25, 0.25, 0.25], 0.1, 3),
+    ],
+)
+def test_top_p_top_k_keeps_cutoff_ties(dtype, probabilities, top_p, top_k):
+    from omlx.utils.sampling import apply_top_p_top_k
+
+    lp = mx.log(mx.array([probabilities], dtype=dtype))
+    expected = apply_top_k(apply_top_p(lp, top_p), top_k)
+    actual = apply_top_p_top_k(lp, top_p, top_k)
+    assert mx.array_equal(mx.isfinite(expected), mx.isfinite(actual)).item()
+    assert mx.array_equal(
+        mx.where(mx.isfinite(expected), expected, 0),
+        mx.where(mx.isfinite(actual), actual, 0),
+    ).item()
+
+
 @pytest.mark.parametrize("vocab, top_k", [(16384, 20), (16384, 64), (1000, 20)])
 def test_top_k_indices_matches_full_sort(vocab, top_k):
     from omlx.utils.sampling import top_k_indices
