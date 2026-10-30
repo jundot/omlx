@@ -495,6 +495,68 @@ def test_worker_rank_skips_vocab_projection_when_adapter_declares_contract(
     assert batch._next_logprobs[0].shape == (32,)
 
 
+@pytest.mark.parametrize("group", [_Group(), _WorkerGroup()])
+def test_token_all_sum_is_scheduled_after_the_logprob_graph(monkeypatch, group):
+    """#4743: with the token all-sum scheduled first, a CUDA rank deadlocks.
+    The CPU stream finishes the collective, but its event-signal kernel launch
+    blocks while the GPU spins waiting for that signal."""
+
+    class Cache:
+        state = mx.array([0])
+
+    class LogitsModel:
+        def __init__(self):
+            self.model = _ValidatedPipeline()
+            self.model.pipeline_rank = group.rank()
+
+        def __call__(self, value, cache=None):
+            value = self.model(value, cache=cache)
+            return mx.zeros((*value.shape, 32))
+
+    class Batch:
+        def __init__(self, model):
+            self.model = model
+            self.uids = [1]
+            self.prompt_cache = [Cache()]
+            self.tokens = [[]]
+            self.samplers = [None]
+            self.fallback_sampler = lambda value: mx.argmax(value, axis=-1)
+            self.logits_processors = [[]]
+            self.state_machines = []
+            self.max_tokens = [2]
+            self._current_tokens = None
+            self._current_logprobs = []
+            self._next_tokens = mx.array([3], dtype=mx.uint32)
+            self._next_logprobs = []
+            self._token_context = []
+            self._num_tokens = [0]
+            self._matcher_states = []
+
+    scheduled = []
+    batch = Batch(LogitsModel())
+    settings = replace(
+        execution_profile("balanced"),
+        sampling_rank_only=True,
+    )
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda value, group=None: value)
+    monkeypatch.setattr(mx.distributed, "send", lambda value, *_a, **_k: value)
+    monkeypatch.setattr(mx.distributed, "all_gather", lambda value, **_k: value)
+    monkeypatch.setattr(mx, "async_eval", lambda *values: scheduled.append(values))
+
+    with install_runtime_optimizations(
+        batch.model,
+        group,
+        settings,
+        batchable=True,
+    ) as capabilities:
+        assert capabilities["sampling_rank_only"]["active"] is True
+        mlx_generate.GenerationBatch._step(batch)
+
+    assert len(scheduled) == 1
+    assert scheduled[0][0] is batch._next_logprobs
+    assert scheduled[0][-1] is batch._next_tokens
+
+
 def test_pipeline_prefill_schedule_has_equal_fill_and_drain_timeline():
     schedules = [
         pipeline_prefill_schedule(10, 4, rank=rank, world_size=3)

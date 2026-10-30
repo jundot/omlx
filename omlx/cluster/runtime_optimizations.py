@@ -609,10 +609,15 @@ def install_runtime_optimizations(
         sampled = mx.distributed.all_sum(sampled, group=group)
         instance._next_tokens = sampled
         instance._next_logprobs = list(logprobs)
+        # Schedule the logprob graph (and with it this rank's lazy stage
+        # transfer) before the token all-sum. With the all-sum first, a CUDA
+        # rank deadlocks: the CPU stream finishes the collective but its
+        # event-signal kernel launch blocks while the GPU spins waiting for
+        # that signal (#4743).
         mx.async_eval(
-            instance._next_tokens,
             instance._next_logprobs,
             token_context,
+            instance._next_tokens,
         )
 
         mx.eval(inputs, instance._current_logprobs)
