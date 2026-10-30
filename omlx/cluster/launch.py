@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import platform
+import random
 import re
 import secrets
 import shlex
@@ -1110,10 +1111,25 @@ def reap_orphaned_launches(
     return report
 
 
+# Rendezvous ports live below the OS ephemeral window. macOS hands
+# 49152-65535 to every bind(0) and to every outbound connection's source
+# port — including runtimes unrelated to oMLX sharing the machine — so a
+# span taken from that range is re-stolen the moment its reservation is
+# released, and the peer's half of the span was never verified at all.
+_SAFE_PORT_RANGE = (20000, 46000)
+
+
 def _available_launch_ports(
     deployment: ClusterDeployment,
 ) -> tuple[int, int]:
-    """Choose one private API port and a collision-free collective span."""
+    """Choose one private API port and a collision-free collective span.
+
+    Both are drawn from below the ephemeral window and verified by holding
+    a loopback listener on every port of the choice, so a collision with a
+    fixed-port service forces a redraw instead of a rank bind failure. A
+    stolen rendezvous port is otherwise visible only as a ring connect
+    timeout on whichever peer nobody is listening for.
+    """
 
     collective_count = (
         sum(len(host.ips) for host in deployment.hosts)
@@ -1123,28 +1139,26 @@ def _available_launch_ports(
     )
     if not 1 <= collective_count <= 1024:
         raise ValueError("collective port span is out of range")
+    low, high = _SAFE_PORT_RANGE
+    if collective_count > high - low:
+        raise ValueError("collective port span is out of range")
 
     for _ in range(128):
         listeners: list[socket.socket] = []
         try:
-            first = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            first.bind(("127.0.0.1", 0))
-            listeners.append(first)
-            collective_port = int(first.getsockname()[1])
-            if collective_port + collective_count - 1 > 65535:
-                continue
-            for port in range(
-                collective_port + 1,
-                collective_port + collective_count,
-            ):
+            candidate = random.randint(low, high - collective_count)
+            for port in range(candidate, candidate + collective_count):
                 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 listener.bind(("127.0.0.1", port))
                 listeners.append(listener)
+            # Held span listeners make an in-span API candidate fail to
+            # bind, so the OS itself enforces the distinctness the argv
+            # builder requires.
             api_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            api_listener.bind(("127.0.0.1", 0))
+            api_listener.bind(("127.0.0.1", random.randint(low, high)))
             listeners.append(api_listener)
             api_port = int(api_listener.getsockname()[1])
-            return api_port, collective_port
+            return api_port, candidate
         except OSError:
             continue
         finally:

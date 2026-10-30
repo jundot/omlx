@@ -4,6 +4,7 @@ import io
 import json
 import platform
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -300,6 +301,34 @@ def test_ring_launch_reserves_full_collective_port_span():
         collective_port,
         collective_port + sum(len(host.ips) for host in deployment.hosts),
     )
+
+
+def test_launch_ports_stay_below_the_ephemeral_window():
+    deployment = _deployment()
+
+    for _ in range(8):
+        api_port, collective_port = _available_launch_ports(deployment)
+        low, high = launch._SAFE_PORT_RANGE
+        for port in (api_port, collective_port):
+            assert low <= port < high
+
+
+def test_launch_ports_redraw_when_the_safe_range_is_occupied(monkeypatch):
+    deployment = _deployment()
+    squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    squatter.bind(("127.0.0.1", launch._SAFE_PORT_RANGE[0]))
+    squatter.listen(1)
+    try:
+        monkeypatch.setattr(
+            launch.random,
+            "randint",
+            lambda _low, _high: launch._SAFE_PORT_RANGE[0],
+        )
+
+        with pytest.raises(launch.DistributedLaunchError, match="could not reserve"):
+            _available_launch_ports(deployment)
+    finally:
+        squatter.close()
 
 
 def test_rendezvous_addresses_mirror_mlx_launch_ring_assignment():
