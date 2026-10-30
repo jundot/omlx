@@ -2340,6 +2340,8 @@ class TestEnginePoolAsync:
             model_name=str(model_path),
             trust_remote_code=False,
             scheduler_config=pool._scheduler_config,
+            model_settings=pool._settings_manager.get_settings.return_value,
+            memory_ceiling=pool._current_ceiling,
         )
 
     @pytest.mark.asyncio

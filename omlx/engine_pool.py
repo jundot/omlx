@@ -79,6 +79,7 @@ from .model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from .models.decision import ane_memory_reservation as decision_ane_memory_reservation
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
 from .scheduler import SchedulerConfig
@@ -654,6 +655,12 @@ class EnginePool:
                 format_size(extra),
                 entry.model_id,
             )
+        if (
+            include_ane_reservation
+            and entry.engine_type == "decision"
+            and getattr(runtime_settings, "ane_prefill_enabled", False)
+        ):
+            extra += decision_ane_memory_reservation(entry.model_path, runtime_settings)
         if (
             include_ane_reservation
             and getattr(runtime_settings, "ane_prefill_enabled", False)
@@ -4245,6 +4252,8 @@ class EnginePool:
                         model_name=entry.model_path,
                         trust_remote_code=trc,
                         scheduler_config=self._scheduler_config,
+                        model_settings=model_settings,
+                        memory_ceiling=self._current_ceiling,
                     )
                 elif effective_type == "vlm":
                     engine = VLMBatchedEngine(

@@ -25,6 +25,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, field_validator
 
+from ..engine.decision import DecisionEngine
 from .benchmark import (
     BenchmarkContextProfile,
     _generate_prompt,
@@ -578,9 +579,10 @@ def _observed_operations(traces: list[dict[str, Any] | None]) -> dict[str, int]:
 
 
 def _ane_is_active(engine: Any) -> bool:
-    model = getattr(engine, "_model", None)
-    if model is None:
-        model = getattr(engine, "_vlm_model", None)
+    try:
+        model = _loaded_model(engine)
+    except RuntimeError:
+        return False
     return bool(
         getattr(model, "_omlx_ane_mlp_prefill_count", 0)
         or getattr(model, "_omlx_ane_gdn_prefill_count", 0)
@@ -624,21 +626,56 @@ async def _measure_candidate(
         warmup = run.evaluation_prompts.setdefault("warmup", [warmup])[0]
         prompt = run.evaluation_prompts.setdefault("long", [prompt])[0]
 
+    profile_enabled = False
+    fast = None
+
+    async def measure_decision(tokens: list[int]) -> dict[str, Any]:
+        plan = await engine.encode(
+            {
+                "state": tokenizer.decode(tokens),
+                "questions": {
+                    "code": {
+                        "type": "noul",
+                        "instructions": "Does the state contain source code?",
+                    }
+                },
+            }
+        )
+        before = fast.ane_profile_snapshot() if profile_enabled else {}
+        started = time.perf_counter()
+        result = await engine.systemone(plan)
+        elapsed = time.perf_counter() - started
+        after = fast.ane_profile_snapshot() if profile_enabled else {}
+        return {
+            "processing_tps": result["input_tokens"] / elapsed,
+            "ane_trace": {
+                "profiling_available": profile_enabled,
+                "categories": {
+                    kind: {
+                        "operations": values.get("operations", 0)
+                        - before.get(kind, {}).get("operations", 0)
+                    }
+                    for kind, values in after.items()
+                },
+            },
+        }
+
     run.message = f"Warming {candidate.label}…"
     _check_k2_budget(run)
-    async for _ in engine.stream_generate(
-        prompt=warmup,
-        max_tokens=2,
-        temperature=0.0,
-        top_p=1.0,
-        skip_cache_store=True,
-    ):
-        pass
+    if isinstance(engine, DecisionEngine):
+        await measure_decision(warmup)
+    else:
+        async for _ in engine.stream_generate(
+            prompt=warmup,
+            max_tokens=2,
+            temperature=0.0,
+            top_p=1.0,
+            skip_cache_store=True,
+        ):
+            pass
     if candidate.backend == "k2":
         run.current += 1
 
-    profile_enabled = False
-    fast = None
     if candidate.enabled:
         try:
             from ..custom_kernels.quant_matmul import ane as profile_fast
@@ -664,24 +701,28 @@ async def _measure_candidate(
         )
         for sample_index in range(measurement_repeats):
             _check_k2_budget(run)
-            metrics = await _run_single_test(
-                engine=engine,
-                prompt=prompt,
-                max_tokens=2,
-                pp_len=measure_length,
-                ane_trace_config=(
-                    {
-                        "sequence_length": run.request.sequence_length,
-                        "mlp_layers": int(settings.ane_prefill_max_layers),
-                        "gdn_layers": (
-                            int(settings.ane_prefill_gdn_max_layers)
-                            if candidate.gdn_enabled
-                            else 0
-                        ),
-                    }
-                    if candidate.enabled and candidate.backend == "qwen"
-                    else None
-                ),
+            metrics = (
+                await measure_decision(prompt)
+                if isinstance(engine, DecisionEngine)
+                else await _run_single_test(
+                    engine=engine,
+                    prompt=prompt,
+                    max_tokens=2,
+                    pp_len=measure_length,
+                    ane_trace_config=(
+                        {
+                            "sequence_length": run.request.sequence_length,
+                            "mlp_layers": int(settings.ane_prefill_max_layers),
+                            "gdn_layers": (
+                                int(settings.ane_prefill_gdn_max_layers)
+                                if candidate.gdn_enabled
+                                else 0
+                            ),
+                        }
+                        if candidate.enabled and candidate.backend == "qwen"
+                        else None
+                    ),
+                )
             )
             samples.append(float(metrics["processing_tps"]))
             if candidate.backend == "k2" and (
@@ -719,7 +760,11 @@ async def _measure_candidate(
     ]
     # Reject only a positive observation that compiled programs remained idle.
     # If profiling was unavailable, the result is unknown and stays eligible.
-    if candidate.enabled and any(o is False for o in observations) and not any(observations):
+    if (
+        candidate.enabled
+        and any(o is False for o in observations)
+        and not any(observations)
+    ):
         operations = _observed_operations(traces)
         step = _prefill_step_size(engine)
         if any(operations.values()):
@@ -732,8 +777,7 @@ async def _measure_candidate(
             )
         elif step is None:
             cause = (
-                "sequence_length must not exceed the scheduler's prefill "
-                "chunk width."
+                "sequence_length must not exceed the scheduler's prefill chunk width."
             )
         elif run.request.sequence_length > step:
             cause = (
@@ -896,7 +940,11 @@ def _profile_refinement(
 
 
 def _loaded_model(engine: Any) -> Any:
-    model = getattr(engine, "_model", None)
+    model = (
+        engine.backbone_model
+        if isinstance(engine, DecisionEngine)
+        else getattr(engine, "_model", None)
+    )
     if model is None:
         model = getattr(engine, "_vlm_model", None)
     if model is None:

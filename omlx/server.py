@@ -3476,6 +3476,8 @@ def _ane_prefill_status(pool) -> dict:
             )
             if mdl is None:
                 continue
+            if isinstance(engine, DecisionEngine):
+                mdl = engine.backbone_model
             st = qwen35_ane_prefill_status(mdl)
             if not st["attempted"]:
                 continue

@@ -90,6 +90,27 @@ async def _update_settings(
 
 
 @pytest.mark.asyncio
+async def test_neutral_names_are_saved_and_legacy_updates_still_work(tmp_path):
+    (tmp_path / "joint_head.safetensors").touch()
+    (tmp_path / "joint_head_config.json").write_text("{}")
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.model_type = entry.engine_type = "decision"
+    entry.config_model_type = "qwen3_5"
+    settings = ModelSettings()
+    await _update_settings(pool, settings, admin_routes.ModelSettingsRequest(
+        ane_prefill_enabled=True, ane_prefill_sequence_length=1024,
+        ane_prefill_fraction=0.25, ane_prefill_dual_ane=False,
+        ane_prefill_gdn=False, ane_prefill_cpu_enabled=False,
+    ))
+    assert settings.ane_prefill_enabled is True
+    assert settings.ane_prefill_cpu_enabled is False
+    assert entry.load_failed is False
+    await _update_settings(pool, settings, admin_routes.ModelSettingsRequest.model_validate({"qwen35_ane_prefill_enabled": False}))
+    assert settings.ane_prefill_enabled is False
+
+
+@pytest.mark.asyncio
 async def test_neutral_names_configure_a_qwen_chat_model():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
@@ -108,6 +129,19 @@ def test_settings_api_normalizes_legacy_payload_names_and_preserves_explicit_neu
     assert request.ane_prefill_enabled is False
     assert request.ane_prefill_cpu_enabled is False
     assert request.model_fields_set == {"ane_prefill_enabled", "ane_prefill_cpu_enabled"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [2000, None])
+async def test_clef_block_size_is_validated_before_save(tmp_path, value):
+    (tmp_path / "joint_head.safetensors").touch()
+    (tmp_path / "joint_head_config.json").write_text("{}")
+    pool, entry = _failed_pool()
+    entry.model_path = str(tmp_path)
+    entry.model_type = entry.engine_type = "decision"
+    entry.config_model_type = "qwen3_5"
+    with pytest.raises(HTTPException):
+        await _update_settings(pool, ModelSettings(), admin_routes.ModelSettingsRequest(ane_prefill_sequence_length=value))
 
 
 @pytest.mark.asyncio

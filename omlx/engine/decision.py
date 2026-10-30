@@ -12,7 +12,7 @@ import asyncio
 import gc
 import logging
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +20,16 @@ import mlx.core as mx
 
 from ..engine_core import get_mlx_executor
 from ..model_discovery import decision_kind
+from ..model_settings import (
+    ModelSettings,
+    ane_prefill_fraction,
+    validate_ane_prefill,
+)
 from ..models.clef import ClefModel
 from ..models.d3 import D3Model
 from ..models.openjev import OpenJevModel
 from ..scheduler import _CONTENDED_CHUNK_FLOOR, SchedulerConfig
+from ..utils.proc_memory import get_phys_footprint
 from .base import BaseNonStreamingEngine
 from .forward_fairness import ForwardFairnessGate
 
@@ -40,10 +46,15 @@ class DecisionEngine(BaseNonStreamingEngine):
         model_name: str,
         trust_remote_code: bool = False,
         scheduler_config: SchedulerConfig | None = None,
+        model_settings: ModelSettings | None = None,
+        memory_ceiling: Callable[[], int] | None = None,
     ):
         super().__init__()
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
+        self._model_settings = model_settings
+        self._memory_ceiling = memory_ceiling
+        self._scheduler_config = scheduler_config
         self._prefill_step = max(
             1, int(getattr(scheduler_config, "prefill_step_size", 0) or 2048)
         )
@@ -67,6 +78,14 @@ class DecisionEngine(BaseNonStreamingEngine):
     def kind(self) -> str | None:
         return self._kind
 
+    @property
+    def backbone_model(self) -> Any:
+        return self._model.backbone.model if self._model is not None else None
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._require_model().backbone.tokenizer
+
     async def start(self) -> None:
         """Load the model on the global MLX executor."""
         if self._model is not None:
@@ -82,10 +101,66 @@ class DecisionEngine(BaseNonStreamingEngine):
             self._model_name, trust_remote_code=self._trust_remote_code
         )
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), model.load)
+        await loop.run_in_executor(get_mlx_executor(), self._load, model)
         self._model = model
         self._kind = kind
         logger.info(f"Decision engine started: {self._model_name}")
+
+    def _load(self, model: Any) -> None:
+        try:
+            model.load()
+            settings = self._model_settings
+            if settings is None or not settings.ane_prefill_enabled:
+                return
+            model_type = model.backbone.config.get("model_type")
+            validate_ane_prefill(settings.to_dict(), model_type)
+            from ..patches.qwen35_ane_prefill import (
+                enable_qwen35_ane_prefill,
+                release_qwen35_ane_prefill,
+            )
+
+            fraction = ane_prefill_fraction(
+                settings.ane_prefill_fraction, model_type
+            )
+            try:
+                enable_qwen35_ane_prefill(
+                    model.backbone.model,
+                    sequence_length=settings.ane_prefill_sequence_length,
+                    fraction=fraction,
+                    max_layers=settings.ane_prefill_max_layers,
+                    dual_ane=settings.ane_prefill_dual_ane,
+                    gdn=settings.ane_prefill_gdn,
+                    gdn_fraction=settings.ane_prefill_gdn_fraction,
+                    gdn_max_layers=settings.ane_prefill_gdn_max_layers,
+                    tail_padding_min_tokens=settings.ane_prefill_tail_padding_min_tokens,
+                    fused_down=settings.ane_prefill_fused_down,
+                    ane_down_fraction=(
+                        fraction if settings.ane_prefill_fused_down else 0.0
+                    ),
+                    cpu_fraction=(
+                        settings.ane_prefill_cpu_fraction
+                        if settings.ane_prefill_cpu_enabled
+                        else 0.0
+                    ),
+                    cpu_down_fraction=(
+                        settings.ane_prefill_cpu_down_fraction
+                        if settings.ane_prefill_cpu_enabled
+                        else 0.0
+                    ),
+                    cpu_gdn_fraction=(
+                        settings.ane_prefill_cpu_gdn_fraction
+                        if settings.ane_prefill_cpu_enabled
+                        else 0.0
+                    ),
+                    cpu_threads=settings.ane_prefill_cpu_threads,
+                    cpu_shared_resource=settings.ane_prefill_cpu_shared_resource,
+                )
+            except Exception:
+                release_qwen35_ane_prefill(model.backbone.model)
+                logger.warning("Decision ANE setup failed; using GPU", exc_info=True)
+        except BaseException:
+            model.close()
+            raise
 
     async def stop(self) -> None:
         if self._model is None:
@@ -155,6 +230,7 @@ class DecisionEngine(BaseNonStreamingEngine):
         start = time.perf_counter()
         tokens = 0
         try:
+            self._check_ane_headroom()
             tokens = next(steps)
             return False, tokens
         except StopIteration as stop:
@@ -163,11 +239,44 @@ class DecisionEngine(BaseNonStreamingEngine):
             mx.synchronize()
             self._fairness.settle(time.perf_counter() - start, tokens, contended)
 
+    def _check_ane_headroom(self) -> None:
+        if self._memory_ceiling is None or self.backbone_model is None:
+            return
+        from ..patches.qwen35_ane_prefill import (
+            ane_prefill_transient_bytes,
+            release_qwen35_ane_prefill,
+        )
+
+        reserved = ane_prefill_transient_bytes(self.backbone_model)
+        ceiling = self._memory_ceiling()
+        if not reserved or ceiling <= 0:
+            return
+        usage = max(mx.get_active_memory(), get_phys_footprint())
+        if usage + reserved > ceiling:
+            mx.synchronize()
+            release_qwen35_ane_prefill(self.backbone_model)
+            mx.clear_cache()
+            logger.warning(
+                "Decision ANE banks released for memory headroom; using GPU until reload"
+            )
+
+    def ane_status(self) -> dict[str, Any]:
+        from ..patches.qwen35_ane_prefill import (
+            ane_prefill_transient_bytes,
+            qwen35_ane_prefill_status,
+        )
+
+        return {
+            **qwen35_ane_prefill_status(self.backbone_model),
+            "driver_weight_bytes": ane_prefill_transient_bytes(self.backbone_model),
+        }
+
     def get_stats(self) -> dict[str, Any]:
         return {
             "model_name": self._model_name,
             "loaded": self._model is not None,
             "decision_kind": self._kind,
+            "ane_prefill": self.ane_status(),
         }
 
     def get_model_info(self) -> dict[str, Any]:

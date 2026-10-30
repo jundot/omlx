@@ -24,6 +24,11 @@ import numpy as np
 from mlx_vlm.utils import load as vlm_load
 
 from ..model_discovery import DECISION_SIDECAR_WEIGHTS, _vision_weight_bytes
+from ..model_settings import (
+    ModelSettings,
+    ane_prefill_fraction,
+    validate_ane_prefill,
+)
 from ..utils.image import load_image
 from ..utils.model_loading import (
     lm_load_compat,
@@ -34,6 +39,58 @@ from ..utils.model_loading import (
 logger = logging.getLogger(__name__)
 
 ChunkSize = Callable[[], int]
+
+
+def ane_memory_reservation(model_path: str, settings: ModelSettings | None) -> int:
+    """Conservative load allowance for ANE weights, surfaces and staging.
+
+    Decision forwards have no scheduler to reserve driver-wired weights later,
+    so admission must include them even though phys_footprint cannot see them.
+    """
+    if settings is None or not settings.ane_prefill_enabled:
+        return 0
+    config = json.loads((Path(model_path) / "config.json").read_text())
+    validate_ane_prefill(settings.to_dict(), config.get("model_type"))
+    if (
+        settings.ane_prefill_max_layers < 1
+        or settings.ane_prefill_gdn_max_layers < 0
+    ):
+        raise ValueError("ANE decision layer limits are invalid")
+    text = config.get("text_config") or config
+    hidden = int(text["hidden_size"])
+    intermediate = int(text["intermediate_size"])
+    depth = int(text["num_hidden_layers"])
+    if min(hidden, intermediate, depth) <= 0:
+        raise ValueError("ANE decision model dimensions must be positive")
+    instances = 2 if settings.ane_prefill_dual_ane else 1
+    alignment = 64 * instances
+    fraction = ane_prefill_fraction(
+        settings.ane_prefill_fraction, config.get("model_type")
+    )
+    rows = int(intermediate * fraction) // alignment * alignment
+    layers = min(depth, settings.ane_prefill_max_layers)
+    width = settings.ane_prefill_sequence_length
+    fused = settings.ane_prefill_fused_down and instances == 2
+    weights = layers * rows * hidden * (6 * instances if fused else 2)
+    surfaces = layers * 2 * width * (instances * hidden + 2 * rows)
+    if fused:
+        surfaces += layers * 2 * width * instances * hidden
+    staging = 4 * hidden * max(intermediate, 2 * rows)
+    if fused:
+        staging *= 3
+    if settings.ane_prefill_gdn:
+        schedule = text.get("layer_types")
+        gdn_layers = (
+            sum("linear" in str(kind) for kind in schedule) if schedule else depth
+        )
+        gdn_layers = min(gdn_layers, settings.ane_prefill_gdn_max_layers)
+        z = int(text["linear_num_value_heads"]) * int(text["linear_value_head_dim"])
+        weights += gdn_layers * z * hidden
+        surfaces += gdn_layers * 2 * width * (instances * hidden + z)
+        qk = 2 * int(text["linear_num_key_heads"]) * int(text["linear_key_head_dim"])
+        staging = max(staging, 4 * hidden * (qk + 2 * z))
+    # shortcut: compiler scratch is estimated; use native preflight sizes when exposed.
+    return int(1.5 * (weights + surfaces + staging))
 
 
 class DecisionRequestError(ValueError):
@@ -122,6 +179,10 @@ class DecisionBackbone:
             self._lm_head = self._text_model.embed_tokens
 
     def close(self) -> None:
+        if self.model is not None:
+            from ..patches.qwen35_ane_prefill import release_qwen35_ane_prefill
+
+            release_qwen35_ane_prefill(self.model)
         self.model = None
         self.tokenizer = None
         self.image_processor = None

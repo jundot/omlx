@@ -74,7 +74,7 @@ the native q8 tile is not profitable.
 
 These model-neutral `ane_prefill_*` controls live inside the selected
 `models[model_id]` record in `model_settings.json`. The same names apply to
-other supported models, including K2; each model ID has its own values.
+other supported models, including Clef; each model ID has its own values.
 Older Qwen-prefixed settings are accepted on input and saved using neutral
 names. Explicit neutral keys take precedence when both forms are present.
 

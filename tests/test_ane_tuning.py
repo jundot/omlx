@@ -13,6 +13,52 @@ from omlx.model_settings import ModelSettings
 _REAL_BANK_COMPILER_AVAILABLE = fast.ane_bank_compiler_available
 
 
+@pytest.mark.asyncio
+async def test_decision_candidate_scores_questions_and_checks_native_execution(
+    monkeypatch,
+):
+    from unittest.mock import AsyncMock
+
+    calls = []
+    counters = {"operations": 0}
+    backbone = SimpleNamespace(_omlx_ane_mlp_prefill_count=4)
+
+    class Decision:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "source code")
+        backbone_model = backbone
+
+        async def encode(self, request):
+            assert request["questions"]["code"]["type"] == "noul"
+            calls.append("encode")
+            return object()
+
+        async def systemone(self, plan):
+            calls.append("decide")
+            counters["operations"] += 4
+            return {"input_tokens": 4096, "answers": {}}
+
+    engine = Decision()
+    monkeypatch.setattr(ane_tuning, "DecisionEngine", Decision)
+    monkeypatch.setattr(ane_tuning, "_generate_prompt", lambda *args: [1])
+    monkeypatch.setattr(fast, "ane_profile_set_enabled", lambda enabled: True)
+    monkeypatch.setattr(
+        fast, "ane_profile_reset", lambda: counters.update(operations=0)
+    )
+    monkeypatch.setattr(fast, "ane_profile_snapshot", lambda: {"mlp": dict(counters)})
+    pool = SimpleNamespace(get_engine=AsyncMock(return_value=engine))
+    run = ane_tuning.create_run(
+        ane_tuning.ANETuningRequest(model_id="clef", sequence_length=1024)
+    )
+    candidate = ane_tuning._Candidate("ANE", True, 0.25)
+
+    result = await ane_tuning._measure_candidate(run, pool, ModelSettings(), candidate)
+
+    assert ane_tuning._loaded_model(engine) is backbone
+    assert calls == ["encode", "decide"] * 4  # Warmup plus three measured runs.
+    assert result["_profile"]["mlp"]["operations"] == 12
+    assert len(result["samples"]) == 3
+
+
 @pytest.fixture(autouse=True)
 def _clear_runs(monkeypatch):
     ane_tuning._runs.clear()

@@ -43,6 +43,8 @@ Each package has:
 - `_ext*.so` and `omlx_<package>_kernels.metallib`: the build output.
 
 ANE offload is off by default. See [Qwen ANE/GPU prefill](experimental/qwen35_ane_prefill.md).
+For decision-model quantization, ANE tests and endpoint setup, see
+[Clef-Flash ANE/GPU serving](experimental/decision-model-ane.md).
 
 Some kernels are not in this directory. Small JIT kernels (`mx.fast.metal_kernel`) live next to the model code in `omlx/patches`. They compile at runtime and need no build.
 
