@@ -2038,7 +2038,10 @@ def discover_models(
 
     models: dict[str, DiscoveredModel] = {}
     if image_boundary(model_dir):
-        logger.warning("Skipping image pipeline/component %s: image serving is unavailable", model_dir)
+        logger.warning(
+            "Skipping image pipeline/component %s: image serving is unavailable",
+            model_dir,
+        )
         return models
 
     for subdir in _iter_readable_entries(model_dir, "model directory"):
@@ -2048,7 +2051,10 @@ def discover_models(
             continue
 
         if image_boundary(subdir):
-            logger.warning("Skipping image pipeline/component %s: image serving is unavailable", subdir)
+            logger.warning(
+                "Skipping image pipeline/component %s: image serving is unavailable",
+                subdir,
+            )
             continue
         if _is_adapter_dir(subdir):
             logger.info(
@@ -2065,7 +2071,10 @@ def discover_models(
             hf_resolved = _resolve_hf_cache_entry(subdir)
             if hf_resolved is not None:
                 if image_boundary(hf_resolved.snapshot_path):
-                    logger.warning("Skipping image pipeline/component %s: image serving is unavailable", hf_resolved.snapshot_path)
+                    logger.warning(
+                        "Skipping image pipeline/component %s: image serving is unavailable",
+                        hf_resolved.snapshot_path,
+                    )
                     continue
                 if _register_gguf_folder(
                     models,
@@ -2100,7 +2109,10 @@ def discover_models(
                 ):
                     continue
                 if image_boundary(child):
-                    logger.warning("Skipping image pipeline/component %s: image serving is unavailable", child)
+                    logger.warning(
+                        "Skipping image pipeline/component %s: image serving is unavailable",
+                        child,
+                    )
                     has_children = True
                     continue
                 if _is_adapter_dir(child):
