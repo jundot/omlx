@@ -446,6 +446,41 @@ class TestCheckAndEnforce:
         engine.abort_all_requests.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_no_evictable_reclaim_backs_off(self, enforcer):
+        """Pinned-only models: the idle reclaim re-issue backs off (#4651)."""
+        pool = enforcer._engine_pool
+        pool._find_lru_victim.return_value = None
+        pool._find_lru_busy_non_pinned_victim_locked = MagicMock(return_value=None)
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=0)
+        sched = MagicMock()
+        engine.scheduler = sched
+        pool._entries = {
+            "pinned-model": _make_entry("pinned-model", engine=engine, is_pinned=True)
+        }
+        # Hard but not emergency, so the pinned-only branch is taken instead of
+        # aborting in-flight requests.
+        enforcer._get_abort_limit_bytes = lambda: 100 * 1024**3
+        enforcer._request_scheduler_cache_reclaim = MagicMock(return_value=0)
+
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            for _ in range(10):
+                await enforcer._check_and_enforce()
+
+            # Ladder (1, 2, 5, ...): only the 1st, 4th and 10th ticks re-issue;
+            # the rest are cooldown ticks that no longer re-ask or log.
+            assert sched.request_idle_reclaim.call_count == 3
+            assert enforcer._no_evictable_reclaim_streak == 3
+
+            # Pressure back to ok restarts the ladder.
+            mock_mx.get_active_memory.return_value = 5 * 1024**3
+            await enforcer._check_and_enforce()
+        assert enforcer._no_evictable_reclaim_streak == 0
+        assert enforcer._no_evictable_reclaim_cooldown == 0
+        assert sched.request_idle_reclaim.call_count == 3
+
+    @pytest.mark.asyncio
     async def test_evicts_multiple_models(self, enforcer):
         """Evicts multiple models in sequence until under limit."""
         # Need 3 loaded non-pinned models for sequential eviction
