@@ -1567,6 +1567,7 @@
                                         <option value="duckduckgo">{{ t('settings.integrations.websearch.provider_duckduckgo') }}</option>
                                         <option value="brave">{{ t('settings.integrations.websearch.provider_brave') }}</option>
                                         <option value="searxng">{{ t('settings.integrations.websearch.provider_searxng') }}</option>
+                                        <option value="keenable">{{ t('settings.integrations.websearch.provider_keenable') }}</option>
                                     </select>
                                 </div>
                                 <div x-show="globalSettings.integrations.web_search_provider === 'ddgs_custom'"
@@ -1609,6 +1610,18 @@
                                            x-model="globalSettings.integrations.web_search_searxng_url"
                                            @change="saveIntegrationSettings()"
                                            placeholder="http://localhost:8888"
+                                           class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                </div>
+                                <div x-show="globalSettings.integrations.web_search_provider === 'keenable'"
+                                     class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.websearch.keenable_api_key') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.websearch.keenable_api_key_hint') }}</p>
+                                    </div>
+                                    <input type="password"
+                                           x-model="globalSettings.integrations.web_search_keenable_api_key"
+                                           @change="saveIntegrationSettings()"
+                                           autocomplete="off"
                                            class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                 </div>
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">

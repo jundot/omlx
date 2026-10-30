@@ -794,6 +794,7 @@ class GlobalSettingsRequest(BaseModel):
     web_search_brave_api_key: str | None = None
     web_search_searxng_url: str | None = None
     web_search_ddgs_backends: str | None = None
+    web_search_keenable_api_key: str | None = None
     web_search_max_results: int | None = None
     web_search_content_mode: str | None = None
     web_search_content_truncate: bool | None = None
@@ -4740,6 +4741,7 @@ def _global_settings_response(global_settings):
             "web_search_brave_api_key": global_settings.integrations.web_search_brave_api_key,
             "web_search_searxng_url": global_settings.integrations.web_search_searxng_url,
             "web_search_ddgs_backends": global_settings.integrations.web_search_ddgs_backends,
+            "web_search_keenable_api_key": global_settings.integrations.web_search_keenable_api_key,
             "web_search_max_results": global_settings.integrations.web_search_max_results,
             "web_search_content_mode": global_settings.integrations.web_search_content_mode,
             "web_search_content_truncate": global_settings.integrations.web_search_content_truncate,
@@ -5759,6 +5761,11 @@ async def update_global_settings(
             dict.fromkeys(requested)
         )
         integrations_changed = True
+    if "web_search_keenable_api_key" in request.model_fields_set:
+        global_settings.integrations.web_search_keenable_api_key = (
+            request.web_search_keenable_api_key or ""
+        ).strip()
+        integrations_changed = True
     if "web_search_max_results" in request.model_fields_set:
         if (
             request.web_search_max_results is None
@@ -6094,6 +6101,7 @@ class WebSearchTestRequest(BaseModel):
     brave_api_key: str = ""
     searxng_url: str = ""
     ddgs_backends: str = ""
+    keenable_api_key: str = ""
     max_results: int = Field(default=DEFAULT_MAX_RESULTS, ge=1, le=10)
 
 
@@ -6114,6 +6122,7 @@ async def test_web_search(
         brave_api_key=request.brave_api_key,
         searxng_url=request.searxng_url,
         ddgs_backends=request.ddgs_backends,
+        keenable_api_key=request.keenable_api_key,
         max_results=request.max_results,
     )
 

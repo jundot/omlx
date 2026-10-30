@@ -970,11 +970,12 @@ class IntegrationSettings:
     markitdown_max_file_size_mb: int = 25
     markitdown_max_files_per_request: int = 5
     markitdown_pdf_processing_engine: str = "markitdown"
-    # "ddgs" (all engines) | "ddgs_custom" | "duckduckgo" | "brave" | "searxng"
+    # "ddgs" (all engines) | "ddgs_custom" | "duckduckgo" | "brave" | "searxng" | "keenable"
     web_search_provider: str = "ddgs"
     web_search_brave_api_key: str = ""
     web_search_searxng_url: str = ""
     web_search_ddgs_backends: str = ""  # comma-separated, used by ddgs_custom
+    web_search_keenable_api_key: str = ""  # optional, keenable works without it
     web_search_max_results: int = 3  # 1..10
     web_search_content_mode: str = "snippet"  # "snippet" | "full"
     web_search_content_truncate: bool = True
@@ -1008,6 +1009,7 @@ class IntegrationSettings:
             "web_search_brave_api_key": self.web_search_brave_api_key,
             "web_search_searxng_url": self.web_search_searxng_url,
             "web_search_ddgs_backends": self.web_search_ddgs_backends,
+            "web_search_keenable_api_key": self.web_search_keenable_api_key,
             "web_search_max_results": self.web_search_max_results,
             "web_search_content_mode": self.web_search_content_mode,
             "web_search_content_truncate": self.web_search_content_truncate,
@@ -1045,6 +1047,7 @@ class IntegrationSettings:
             web_search_brave_api_key=data.get("web_search_brave_api_key", ""),
             web_search_searxng_url=data.get("web_search_searxng_url", ""),
             web_search_ddgs_backends=data.get("web_search_ddgs_backends", ""),
+            web_search_keenable_api_key=data.get("web_search_keenable_api_key", ""),
             web_search_max_results=data.get("web_search_max_results", 3),
             web_search_content_mode=data.get("web_search_content_mode", "snippet"),
             web_search_content_truncate=data.get(
