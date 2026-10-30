@@ -27,6 +27,67 @@ def _mark_assignment_contract(method: Any) -> Any:
     return method
 
 
+def model_type_of(model_path: str | Path) -> str:
+    """The architecture a checkpoint declares, or "" when it cannot be read."""
+
+    try:
+        config = json.loads(
+            (Path(model_path).expanduser() / "config.json").read_text()
+        )
+        model_type = config["model_type"]
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    return model_type if isinstance(model_type, str) else ""
+
+
+def _pipeline_module(model_path: str | Path) -> Any | None:
+    """The mlx-lm module that would slice this checkpoint's layers.
+
+    Cluster ranks load through mlx-lm, so a model type with no module there -
+    an mlx-vlm-native architecture whose oMLX adapter was never registered -
+    has nothing that could hold a stage boundary. That is a different answer
+    from "the model has a pipeline method and ignores the plan", and the two
+    need different words: one is a plan to fix, the other is a capability the
+    loader does not have.
+    """
+
+    model_type = model_type_of(model_path)
+    if not model_type:
+        return None
+    try:
+        return importlib.import_module(f"mlx_lm.models.{model_type}")
+    except ImportError:
+        return None
+
+
+def pipeline_support(model_path: str | Path) -> str:
+    """How far this architecture can be split across ranks at all.
+
+    ``"honored"``  an installed hook consumes the plan's own stage boundary.
+    ``"even"``     a pipeline contract exists, but derives an even split and
+                   ignores the plan - which is what the pre-load memory guard
+                   recomputes and refuses against.
+    ``"none"``     no loader here can slice the layers, so a plan of more than
+                   one rank cannot run however the layers are divided.
+
+    Splitting this question out is what makes the refusal truthful: telling an
+    operator to "give this node fewer layers" when the architecture cannot be
+    divided at all sends them editing a plan that was never the problem.
+    """
+
+    module = _pipeline_module(model_path)
+    if module is None:
+        return "none"
+    if _module_honors_pipeline_assignment(module, seen=frozenset()):
+        return "honored"
+    for candidate in vars(module).values():
+        if isinstance(candidate, type) and callable(
+            getattr(candidate, "pipeline", None)
+        ):
+            return "even"
+    return "none"
+
+
 def pipeline_assignment_is_honored(model_path: str | Path) -> bool:
     """Whether this model's installed pipeline hook explicitly consumes the plan.
 
@@ -38,16 +99,9 @@ def pipeline_assignment_is_honored(model_path: str | Path) -> bool:
     Anything unmarked remains fail-closed.
     """
 
-    config_path = Path(model_path).expanduser() / "config.json"
-    try:
-        config = json.loads(config_path.read_text())
-        model_type = config["model_type"]
-        if not isinstance(model_type, str):
-            return False
-        module = importlib.import_module(f"mlx_lm.models.{model_type}")
-    except (ImportError, KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+    module = _pipeline_module(model_path)
+    if module is None:
         return False
-
     return _module_honors_pipeline_assignment(module, seen=frozenset())
 
 
