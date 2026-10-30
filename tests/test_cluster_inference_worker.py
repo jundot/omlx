@@ -877,6 +877,16 @@ def _run_rank(
         "pipeline_assignment_is_honored",
         lambda _model: assignment_honored,
     )
+    # The capability probe asks the loader what it can divide, and a harness
+    # that stubs out the pre-load patches has by construction never registered
+    # the oMLX adapter behind that answer. Stub the probe alongside the honour
+    # check it belongs to, or every rank here reads as an architecture with no
+    # pipeline at all - true of the harness, false of the launch it imitates.
+    monkeypatch.setattr(
+        inference_worker,
+        "pipeline_support",
+        lambda _model: "honored" if assignment_honored else "even",
+    )
     monkeypatch.setattr(inference_worker, "_install_signal_handlers", lambda: None)
     monkeypatch.setattr(
         inference_worker,
@@ -1208,6 +1218,47 @@ def test_the_stage_guard_answers_the_same_question_from_either_side_of_the_pin(
         assert pipeline_patch.assigned_stage() == (46, 60), "the pin was not restored"
     finally:
         pipeline_patch.clear_assigned_stage()
+
+
+def test_an_undividable_architecture_is_refused_before_the_byte_estimate(
+    tmp_path,
+    monkeypatch,
+):
+    """Say what is actually missing: a capability, not a plan.
+
+    The rank that died here got "planned 10 layers but the loader will take 24,
+    give this node fewer layers" - advice for a plan that could be rebalanced,
+    while the architecture had no pipeline implementation to rebalance *into*.
+    The operator then edits a deployment that cannot work in any division, and
+    the 100 GiB checkpoint has already been read twice by the time that is
+    understood. Refusing before the estimate also keeps the estimate honest:
+    scaling one stage's bytes by a layer count the loader never had is a number
+    about nothing.
+    """
+
+    model = tmp_path / "qwen4_exp"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+
+    asked: list[int] = []
+    monkeypatch.setattr(
+        inference_worker,
+        "check_rank_fits",
+        lambda required, **_kwargs: asked.append(required),
+    )
+    assignments = _uneven_plan()
+
+    with pytest.raises(RuntimeError, match="no pipeline implementation"):
+        inference_worker._guard_effective_stage(
+            assignments[0],
+            assignments,
+            rank=0,
+            world_size=2,
+            role="workstation",
+            model_path=model,
+        )
+
+    assert asked == [], "the memory guard was asked about a plan that cannot run"
 
 
 # --- finding 9: the wired limit --------------------------------------------

@@ -40,7 +40,9 @@ from .mtp_sync import ClusterMtpSync
 from .performance import ExecutionSettings
 from .pipeline_compat import (
     install_pipeline_compatibility,
+    model_type_of,
     pipeline_assignment_is_honored,
+    pipeline_support,
 )
 from .planner import PipelineAssignment
 from .prefill_guard import build_guard
@@ -1176,6 +1178,7 @@ def _guard_effective_stage(
     memory_guard_tier: str = "balanced",
     safety: float | None = None,
     assignment_honored: bool = False,
+    model_path: str | Path | None = None,
 ) -> None:
     """Refuse the stage mlx-lm will really load, not the one that was planned.
 
@@ -1195,6 +1198,21 @@ def _guard_effective_stage(
 
     if assignment_honored:
         return
+
+    # Nothing to divide: one rank holds every layer, so there is no boundary for
+    # a loader to ignore, whatever the architecture can otherwise do.
+    if world_size < 2:
+        return
+
+    if model_path is not None and pipeline_support(model_path) == "none":
+        raise RuntimeError(
+            f"{model_type_of(model_path) or 'this architecture'} has no pipeline "
+            "implementation in the loader, so this deployment cannot be divided "
+            "across Macs at all - the rank would either take every layer or "
+            "none. Serve this checkpoint on a single Mac, or choose a "
+            "cluster-capable architecture; a stage boundary in the plan is not "
+            "the problem being reported here."
+        )
 
     layer_count = max((int(item.end_layer) for item in assignments), default=0)
     if layer_count <= 0:
@@ -1479,6 +1497,7 @@ def run_worker(args: argparse.Namespace) -> int:
                     tensor_parallel_size > 1
                     or pipeline_assignment_is_honored(args.model)
                 ),
+                model_path=args.model,
             )
             set_assigned_stage(assignment.start_layer, assignment.end_layer)
             provider = ModelProvider(
