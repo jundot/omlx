@@ -394,6 +394,27 @@ def write_gguf():
 
 
 @pytest.fixture
+def write_z_image_checkpoint():
+    """Write a weightless Z-Image layout that mlx-vlm recognizes."""
+    pytest.importorskip("mlx_vlm")
+
+    def write(path: Path, weight_size: int = 100) -> Path:
+        (path / "model_index.json").parent.mkdir(parents=True, exist_ok=True)
+        (path / "model_index.json").write_text('{"_class_name": "ZImagePipeline"}')
+        for component in ("transformer", "text_encoder", "vae"):
+            (path / component).mkdir()
+            (path / component / "config.json").write_text("{}")
+            (path / component / "model.safetensors").write_bytes(b"0" * weight_size)
+        (path / "scheduler").mkdir()
+        (path / "scheduler" / "scheduler_config.json").write_text("{}")
+        (path / "tokenizer").mkdir()
+        (path / "tokenizer" / "tokenizer.json").write_text("{}")
+        return path
+
+    return write
+
+
+@pytest.fixture
 def tmp_cache_dir(tmp_path: Path) -> Path:
     """Provide a temporary cache directory for tests."""
     cache_dir = tmp_path / "cache"

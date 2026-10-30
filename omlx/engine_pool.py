@@ -21,13 +21,14 @@ import logging
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from .cluster.deployment import ClusterDeployment
     from .cluster.registry import ClusterRegistry
+    from .engine.image import ImageEngine
     from .model_settings import ModelSettingsManager
 
 import mlx.core as mx
@@ -68,6 +69,7 @@ from .exceptions import (
 )
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
+    _is_model_dir,
     detect_model_type,
     format_size,
     is_realtime_stt_model,
@@ -355,6 +357,7 @@ class EngineEntry:
         "audio_tts",
         "audio_sts",
         "decision",
+        "image",
     ]  # Model type
     engine_type: Literal[
         "batched",
@@ -366,6 +369,7 @@ class EngineEntry:
         "audio_tts",
         "audio_sts",
         "decision",
+        "image",
     ]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
@@ -392,6 +396,8 @@ class EngineEntry:
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
     model_format: str | None = None  # "gguf": served by an external engine only
     source_path: str | None = None  # The GGUF file a generated folder links to
+    capabilities: list[str] = field(default_factory=list)
+    tasks: list[str] = field(default_factory=list)
     engine: (
         BaseEngine
         | EmbeddingEngine
@@ -400,6 +406,7 @@ class EngineEntry:
         | STTEngine
         | STSEngine
         | TTSEngine
+        | ImageEngine
         | None
     ) = None  # Loaded engine instance
     last_access: float = 0.0  # Latest load/acquire/release for LRU and TTL
@@ -1571,6 +1578,8 @@ class EnginePool:
                     is_helper=getattr(info, "is_helper", False),
                     model_format=getattr(info, "model_format", None),
                     source_path=getattr(info, "source_path", None),
+                    capabilities=info.capabilities,
+                    tasks=info.tasks,
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -1614,6 +1623,7 @@ class EnginePool:
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
         "decision": "decision",
+        "image": "image",
     }
 
     @staticmethod
@@ -1915,7 +1925,7 @@ class EnginePool:
         source = entry.source_path
         if (
             model_path.exists()
-            and (model_path / "config.json").exists()
+            and _is_model_dir(model_path)
             and (source is None or Path(source).exists())
         ):
             return
@@ -2674,6 +2684,7 @@ class EnginePool:
         | STTEngine
         | STSEngine
         | TTSEngine
+        | ImageEngine
     ):
         """
         Get or load engine for the specified model.
@@ -4274,6 +4285,16 @@ class EnginePool:
                         model_name=entry.model_path,
                         config_model_type=entry.config_model_type,
                     )
+                elif entry.engine_type == "image":
+                    from .engine.image import ImageEngine
+
+                    engine = ImageEngine(
+                        model_name=entry.model_path,
+                        model_id=entry.model_id,
+                        model_path=entry.model_path,
+                        tasks=entry.tasks,
+                        model_settings=model_settings,
+                    )
                 else:
                     engine = BatchedEngine(
                         model_name=entry.model_path,
@@ -4747,6 +4768,8 @@ class EnginePool:
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
+                    "capabilities": e.capabilities,
+                    "tasks": e.tasks,
                     "realtime_stt": is_realtime_stt_model(
                         e.model_type, e.config_model_type
                     ),

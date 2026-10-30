@@ -20,7 +20,7 @@ import json
 import logging
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -29,10 +29,26 @@ from . import gguf
 logger = logging.getLogger(__name__)
 
 ModelType = Literal[
-    "llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+    "llm",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "decision",
+    "image",
 ]
 EngineType = Literal[
-    "batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts", "decision"
+    "batched",
+    "vlm",
+    "embedding",
+    "reranker",
+    "audio_stt",
+    "audio_tts",
+    "audio_sts",
+    "decision",
+    "image",
 ]
 DecisionKind = Literal["clef", "openjev", "d3"]
 
@@ -420,6 +436,51 @@ class DiscoveredModel:
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
     model_format: str | None = None  # "gguf": served by an external engine only
     source_path: str | None = None  # The GGUF file a generated folder links to
+    capabilities: list[str] = field(default_factory=list)
+    tasks: list[str] = field(default_factory=list)
+
+
+def _has_image_checkpoint_layout(model_path: Path) -> bool:
+    """Cheaply skip directories that cannot hold a diffusion checkpoint."""
+    if (model_path / "model_index.json").exists() or (
+        model_path / "manifest.json"
+    ).exists():
+        return True
+    try:
+        return any(
+            child.is_dir() and child.name.startswith("transformer")
+            for child in model_path.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def detect_image_tasks(model_path: Path) -> list[str]:
+    """Return the image tasks mlx-vlm can serve from a local checkpoint."""
+    if not _has_image_checkpoint_layout(model_path):
+        return []
+    try:
+        from mlx_vlm.generate.edit_image import is_image_edit_model
+        from mlx_vlm.generate.image import is_image_generation_model
+    except ImportError:
+        return []
+    path = str(model_path)
+    try:
+        tasks = []
+        if is_image_generation_model(path):
+            tasks.append("generation")
+        if is_image_edit_model(path):
+            tasks.append("edit")
+        return tasks
+    except Exception as exc:
+        logger.warning("Could not inspect image model at %s: %s", model_path, exc)
+        return []
+
+
+def estimate_image_model_size(model_path: Path) -> int:
+    """Estimate image model memory from its local safetensors weights."""
+    total_size = sum(path.stat().st_size for path in model_path.rglob("*.safetensors"))
+    return int(total_size * 1.05)
 
 
 @dataclass(frozen=True)
@@ -705,6 +766,8 @@ def detect_model_type(model_path: Path) -> ModelType:
         Model type: "llm", "vlm", "embedding", "reranker", "audio_stt",
         "audio_tts", "audio_sts", or "decision"
     """
+    if detect_image_tasks(model_path):
+        return "image"
     config_path = model_path / "config.json"
     if not config_path.exists():
         return "llm"
@@ -1228,8 +1291,10 @@ def _is_adapter_dir(path: Path) -> bool:
 
 
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check for a model config or supported image metadata."""
+    return not _is_adapter_dir(path) and (
+        (path / "config.json").exists() or bool(detect_image_tasks(path))
+    )
 
 
 _SHARD_FILE_RE = re.compile(r"-(\d+)-of-(\d+)\.safetensors$")
@@ -1593,6 +1658,8 @@ def _is_hf_cache_mlx_compatible(model_dir: Path, source_repo_id: str) -> bool:
     """Heuristic for HF cache entries that can be loaded without conversion."""
     if not _is_model_dir(model_dir):
         return False
+    if detect_image_tasks(model_dir):
+        return True
     try:
         config = json.loads((model_dir / "config.json").read_text())
     except (OSError, ValueError):
@@ -1683,6 +1750,22 @@ def _register_model(
         )
         return
     try:
+        tasks = detect_image_tasks(model_dir)
+        if tasks:
+            models[model_id] = DiscoveredModel(
+                model_id=model_id,
+                model_path=str(model_dir),
+                model_type="image",
+                engine_type="image",
+                estimated_size=estimate_image_model_size(model_dir),
+                config_model_type="mlx-vlm",
+                capabilities=tasks.copy(),
+                tasks=tasks,
+                source_type=source_type,
+                source_repo_id=source_repo_id,
+            )
+            logger.info("Discovered image model: %s", model_id)
+            return
         if _is_unsupported_model(model_dir):
             logger.info(f"Skipping unsupported model: {model_id}")
             return

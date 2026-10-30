@@ -34,6 +34,54 @@ from omlx.model_discovery import (
 )
 
 
+class TestImageModelDiscovery:
+    def test_mlx_vlm_image_layout_is_discovered(
+        self, tmp_path, write_z_image_checkpoint
+    ):
+        write_z_image_checkpoint(tmp_path / "custom-folder")
+
+        discovered = discover_models(tmp_path)["custom-folder"]
+
+        assert discovered.model_type == discovered.engine_type == "image"
+        assert discovered.config_model_type == "mlx-vlm"
+        assert discovered.capabilities == discovered.tasks == ["generation", "edit"]
+
+    def test_unrecognized_diffusion_layout_is_not_an_image_model(self, tmp_path):
+        model = tmp_path / "unknown-pipeline"
+        model.mkdir()
+        (model / "model_index.json").write_text('{"_class_name": "UnknownPipeline"}')
+        (model / "transformer").mkdir()
+        (model / "transformer" / "model.safetensors").write_bytes(b"0" * 100)
+
+        assert "unknown-pipeline" not in discover_models(tmp_path)
+
+    def test_diffusion_gemma_stays_on_text_path(self, tmp_path):
+        model = tmp_path / "diffusion-gemma"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps({"model_type": "diffusion_gemma"})
+        )
+        (model / "model.safetensors").write_bytes(b"0" * 100)
+
+        discovered = discover_models(tmp_path)[model.name]
+
+        assert discovered.model_type != "image"
+        assert discovered.engine_type != "image"
+
+    def test_hf_cache_accepts_image_component_layout(
+        self, tmp_path, write_z_image_checkpoint
+    ):
+        write_z_image_checkpoint(
+            tmp_path / "models--Tongyi-MAI--Z-Image" / "snapshots" / "abc"
+        )
+
+        discovered = discover_models(tmp_path)["Tongyi-MAI--Z-Image"]
+
+        assert discovered.model_type == "image"
+        assert discovered.source_type == "hf_cache"
+        assert discovered.source_repo_id == "Tongyi-MAI/Z-Image"
+
+
 def _write_safetensors(path, tensors):
     """Write a minimal valid safetensors file: name -> (dtype, shape)."""
     dtype_bytes = {"F16": 2, "BF16": 2, "F32": 4, "U32": 4}
