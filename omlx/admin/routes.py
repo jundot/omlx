@@ -6076,7 +6076,7 @@ async def claude_desktop_restore(
     if global_settings is not None and global_settings.claude_code.desktop_enabled:
         global_settings.claude_code.desktop_enabled = False
         try:
-            global_settings.save()
+            await _save_global_settings_async(global_settings)
         except Exception as e:
             logger.warning("Failed to persist desktop_enabled after restore: %s", e)
     return {
