@@ -123,6 +123,31 @@ def test_generation_returns_one_png_per_image_with_incrementing_seed(
     assert engine.pool.in_use == 0
 
 
+@pytest.mark.parametrize("task", ["generation", "edit"])
+@pytest.mark.parametrize("seed", [None, 0])
+def test_batch_preserves_optional_seed(image_client, monkeypatch, task, seed):
+    engine = _install_pool(monkeypatch, [task])
+    fields = {"n": 2}
+    if seed is not None:
+        fields["seed"] = seed
+
+    if task == "generation":
+        response = image_client.post(
+            "/v1/images/generations",
+            json={"model": "alias", "prompt": "a square", **fields},
+        )
+        calls = engine.generate_calls
+    else:
+        response = _post_edit(image_client, "json", [_png_bytes()], **fields)
+        calls = engine.edit_calls
+
+    assert response.status_code == 200
+    assert len(response.json()["data"]) == 2
+    assert [call["seed"] for call in calls] == (
+        [None, None] if seed is None else [seed, seed + 1]
+    )
+
+
 @pytest.mark.parametrize(
     "tasks,entry,detail",
     [

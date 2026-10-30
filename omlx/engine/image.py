@@ -199,7 +199,7 @@ class ImageEngine(BaseNonStreamingEngine):
                 }
                 request = api.ImageGenerationRequest(
                     prompt=prompt,
-                    seed=0 if seed is None else int(seed),
+                    seed=None if seed is None else int(seed),
                     steps=None if steps is None else int(steps),
                     guidance=None if guidance is None else float(guidance),
                     output_format="png",
@@ -253,7 +253,7 @@ class ImageEngine(BaseNonStreamingEngine):
                 request = api.ImageEditRequest(
                     prompt=prompt,
                     image_paths=tuple(image_paths),
-                    seed=0 if seed is None else int(seed),
+                    seed=None if seed is None else int(seed),
                     steps=None if steps is None else int(steps),
                     width=None if width is None else int(width),
                     height=None if height is None else int(height),

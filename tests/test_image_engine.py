@@ -54,6 +54,21 @@ async def test_edit_forwards_inputs_and_strength_for_every_family(api):
     assert request.extra["image_strength"] == request.extra["strength"] == 0.55
 
 
+@pytest.mark.parametrize("task", ["generation", "edit"])
+@pytest.mark.parametrize("seed", [None, 0, 123])
+async def test_requests_preserve_optional_seed(api, task, seed):
+    engine = ImageEngine(model_name="image-model", tasks=[task])
+    await engine.start()
+    kwargs = {} if seed is None else {"seed": seed}
+
+    if task == "generation":
+        await engine.generate("a cat", **kwargs)
+    else:
+        await engine.edit("a cat", image_paths=["input.png"], **kwargs)
+
+    assert api.requests[-1][1].seed == seed
+
+
 async def test_dual_task_engine_swaps_variants_instead_of_holding_both(api):
     engine = ImageEngine(model_name="dual-task", tasks=["generation", "edit"])
     await engine.start()

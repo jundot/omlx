@@ -683,11 +683,9 @@ def _request_engine_kwargs(
     return kwargs
 
 
-def _seed_for_output(seed: int | None, n: int, index: int) -> int | None:
+def _seed_for_output(seed: int | None, index: int) -> int | None:
     if seed is not None:
         return int(seed) + index
-    if n > 1:
-        return index
     return None
 
 
@@ -752,7 +750,7 @@ async def _run_generation(
             request.prompt,
             width=width,
             height=height,
-            seed=_seed_for_output(request.seed, request.n, index),
+            seed=_seed_for_output(request.seed, index),
             steps=request.steps,
             guidance=request.guidance,
             output_format=request.output_format,
@@ -784,7 +782,7 @@ async def _run_edit(
             mask_path=mask_path,
             width=width,
             height=height,
-            seed=_seed_for_output(request.seed, request.n, index),
+            seed=_seed_for_output(request.seed, index),
             steps=request.steps,
             guidance=request.guidance,
             output_format=request.output_format,
