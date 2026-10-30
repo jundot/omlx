@@ -2281,7 +2281,8 @@ class Scheduler:
             self._minimax_m3_adaptive_prefill = _minimax_m3_adaptive_prefill_config(
                 model,
                 self.config.prefill_step_size,
-                getattr(self.config, "model_name", None),
+                getattr(self.config, "model_path", None)
+                or getattr(self.config, "model_name", None),
             )
         except Exception:
             logger.debug(
