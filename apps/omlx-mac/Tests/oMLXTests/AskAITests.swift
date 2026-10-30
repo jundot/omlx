@@ -1,6 +1,8 @@
 // Ask AI pure logic: SSE line parsing, slash-command parsing, request body
-// shape, and tolerant preference decoding.
+// shape, tolerant preference decoding, and Talk with AI turn detection and
+// realtime event decoding.
 
+@preconcurrency import AVFoundation
 import Carbon.HIToolbox
 import XCTest
 @testable import oMLX
@@ -105,6 +107,8 @@ final class AskAITests: XCTestCase {
         XCTAssertEqual(prefs.presets.first?.allowThinking, false)
         XCTAssertFalse(prefs.gpuPowerLimitEnabled)
         XCTAssertNil(prefs.requestGPUPowerLimit)
+        XCTAssertEqual(prefs.talk, TalkPrefs())
+        XCTAssertEqual(prefs.talk.hotKey, .optionShiftSpace)
     }
 
     func testGPUPowerLimitIsClampedToTheServerRange() throws {
@@ -121,7 +125,8 @@ final class AskAITests: XCTestCase {
         let json = #"""
         {"enabled":true,"hotKey":{"keyCode":49},"panelPosition":"left","gpuPowerLimitWatts":"ten",
          "presets":[{"id":"not-a-uuid","command":"tldr","model":"qwen"},{"command":7},
-                    {"command":"번역","model":"gemma"}]}
+                    {"command":"번역","model":"gemma"}],
+         "talk":{"enabled":true,"hotKey":7,"model":"lfm3","voice":["ethan"],"speechSpeed":9}}
         """#
         let prefs = try JSONDecoder().decode(AskAIPrefs.self, from: Data(json.utf8))
         XCTAssertTrue(prefs.enabled)
@@ -129,6 +134,11 @@ final class AskAITests: XCTestCase {
         XCTAssertNil(prefs.panelPosition)
         XCTAssertEqual(prefs.gpuPowerLimitWatts, 10)
         XCTAssertEqual(prefs.presets.map(\.command), ["tldr", "", "번역"])
+        XCTAssertTrue(prefs.talk.enabled)
+        XCTAssertEqual(prefs.talk.hotKey, .optionShiftSpace)
+        XCTAssertEqual(prefs.talk.model, "lfm3")
+        XCTAssertEqual(prefs.talk.voice, "")
+        XCTAssertEqual(prefs.talk.speechSpeed, 2.0)
     }
 
     @MainActor
@@ -183,5 +193,139 @@ final class AskAITests: XCTestCase {
         XCTAssertEqual(check("a b"), .invalidCommand)
         XCTAssertEqual(check("tldr"), .duplicateCommand)
         XCTAssertEqual(check("new", model: ""), .missingModel)
+    }
+
+    func testVoiceActivityDetectorTurns() {
+        func feed(_ vad: inout VoiceActivityDetector, _ level: Double, frames: Int,
+                  replying: Bool = false) -> [VoiceActivityDetector.Event] {
+            (0..<frames).compactMap { _ in vad.process(level: level, assistantSpeaking: replying) }
+        }
+        var vad = VoiceActivityDetector()
+        XCTAssertEqual(feed(&vad, -70, frames: 200), [])
+        // A 100 ms click starts speech but is too short to be a turn.
+        XCTAssertEqual(feed(&vad, -30, frames: 5), [.speechStarted])
+        XCTAssertEqual(feed(&vad, -70, frames: 40), [.discarded])
+        // 400 ms of speech ends the turn after the end silence.
+        let silenceFrames = VoiceActivityDetector.endSilenceMs / VoiceActivityDetector.frameMs
+        XCTAssertEqual(feed(&vad, -30, frames: 20), [.speechStarted])
+        XCTAssertEqual(feed(&vad, -70, frames: silenceFrames - 1), [])
+        XCTAssertEqual(feed(&vad, -70, frames: 1), [.speechEnded])
+
+        // Over the reply, a level that starts a turn in silence does not interrupt.
+        var noisy = VoiceActivityDetector()
+        _ = feed(&noisy, -50, frames: 200)
+        var silent = noisy
+        XCTAssertEqual(feed(&silent, -36, frames: 3), [.speechStarted])
+        XCTAssertEqual(feed(&noisy, -36, frames: 15, replying: true), [])
+        XCTAssertEqual(feed(&noisy, -20, frames: 9, replying: true), [])
+        XCTAssertEqual(feed(&noisy, -20, frames: 1, replying: true), [.interrupted])
+    }
+
+    func testRealtimeEventDecoding() {
+        func decode(_ json: String) -> RealtimeVoiceEvent? { RealtimeVoiceEvent.decode(json) }
+        XCTAssertEqual(decode(#"{"type":"session.created","session":{}}"#), .sessionCreated)
+        XCTAssertEqual(decode(#"{"type":"response.output_item.added","item":{"id":"item_1"}}"#),
+                       .responseStarted(itemID: "item_1"))
+        XCTAssertEqual(decode(#"{"type":"response.output_audio.delta","item_id":"item_1","delta":"AAEC"}"#),
+                       .audio(itemID: "item_1", pcm: Data([0, 1, 2])))
+        XCTAssertEqual(decode(#"{"type":"response.output_audio_transcript.delta","item_id":"item_1","delta":"Hi"}"#),
+                       .transcript(itemID: "item_1", text: "Hi"))
+        XCTAssertEqual(decode(#"{"type":"response.done","response":{"status":"cancelled","output":[{"id":"item_1"}]}}"#),
+                       .responseDone(itemID: "item_1", status: "cancelled"))
+        XCTAssertEqual(decode(#"{"type":"error","error":{"code":"session_limit","message":"busy"}}"#),
+                       .error(code: "session_limit", message: "busy"))
+        XCTAssertNil(decode(#"{"type":"response.created","response":{}}"#))
+        XCTAssertNil(decode("not json"))
+    }
+
+    func testMicrophoneTapBlockRunsOnAnAudioThread() throws {
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 1))
+        let frames = expectation(description: "20 ms frames at 24 kHz")
+        frames.expectedFulfillmentCount = 5
+        frames.assertForOverFulfill = false
+        let tap = try XCTUnwrap(MicrophoneTap(input: format) { data, _ in
+            if data.count == MicrophoneTap.frameSamples * 2 { frames.fulfill() }
+        })
+        // 200 ms in; resampler latency holds back part of the first call.
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 9600))
+        buffer.frameLength = 9600
+        nonisolated(unsafe) let block = VoiceAudioEngine.tapBlock(for: tap)
+        DispatchQueue.global().async { block(buffer, AVAudioTime(sampleTime: 0, atRate: 48000)) }
+        wait(for: [frames], timeout: 5)
+    }
+
+    func testReplyPacingSizesTheNextStartBuffer() {
+        XCTAssertNil(ReplyPacing().startBuffer(sampleRate: 24000, speed: 1))
+        // Faster than real time keeps the shortest start.
+        var fast = ReplyPacing()
+        for step in 0..<10 { fast.add(seconds: 0.08, at: Double(step) * 0.04, speed: 1) }
+        XCTAssertEqual(fast.startBuffer(sampleRate: 24000, speed: 1), ReplyPacing.minimumStartBuffer)
+        // Each 0.5 s chunk lands 0.25 s after the audio before it ran out.
+        var slow = ReplyPacing()
+        slow.add(seconds: 0.25, at: 0, speed: 1)
+        for step in 1...3 { slow.add(seconds: 0.5, at: Double(step) * 0.5, speed: 1) }
+        XCTAssertEqual(slow.startBuffer(sampleRate: 24000, speed: 1), 7500)
+        // Faster playback needs more lead, bounded by the cap.
+        XCTAssertEqual(slow.startBuffer(sampleRate: 24000, speed: 4), ReplyPacing.maximumStartBuffer)
+    }
+
+    func testCaptionFollowsPlayback() {
+        func caption(_ text: String, played: Double, received: Double, done: Bool = true) -> String {
+            TalkAIController.caption(text, played: played, received: received, done: done,
+                                     secondsPerChar: TalkAIController.defaultSecondsPerChar(text))
+        }
+        let text = "The capital of France is Paris."
+        XCTAssertEqual(caption(text, played: 0, received: 3), "")
+        // A third of the audio shows a third of the text, finishing the word.
+        XCTAssertEqual(caption(text, played: 1, received: 3), "The capital")
+        XCTAssertEqual(caption(text, played: 3, received: 3), text)
+        // Before the reply is done, text that arrived early waits for its estimated speech time.
+        XCTAssertEqual(caption(text, played: 0.3, received: 0.5, done: false), "The capital")
+        XCTAssertEqual(caption("프랑스의 수도는 파리입니다", played: 1.5, received: 4), "프랑스의 수도는")
+        XCTAssertEqual(caption("フランスの首都はパリです", played: 1, received: 4), "フラン")
+    }
+
+    func testCaptionLinesBreakAtSentenceEnds() {
+        func lines(_ text: String) -> [String] { TalkAIController.captionLines(text) }
+        XCTAssertEqual(lines("Hi there.\nHow are you? I'm fine"), ["Hi there.", "How are you?", "I'm fine"])
+        XCTAssertEqual(lines("Well... it costs 3.5 dollars."), ["Well... it costs 3.5 dollars."])
+        XCTAssertEqual(lines("One. Two. Three. Four"), ["Two.", "Three.", "Four"])
+        XCTAssertEqual(lines("He said \"Wow!\" Then left."), ["He said \"Wow!\"", "Then left."])
+        XCTAssertEqual(lines("안녕하세요.반가워요"), ["안녕하세요.반가워요"])
+        XCTAssertEqual(lines("こんにちは。元気？うん"), ["こんにちは。", "元気？", "うん"])
+    }
+
+    func testForcedTurnEndTakesTheSoundAsBackground() {
+        var vad = VoiceActivityDetector()
+        for _ in 0..<200 { _ = vad.process(level: -70, assistantSpeaking: false) }
+        // A fan starts while the user talks, so the turn never ends on its own.
+        var events: [VoiceActivityDetector.Event] = []
+        for _ in 0..<100 { vad.process(level: -35, assistantSpeaking: false).map { events.append($0) } }
+        XCTAssertEqual(events, [.speechStarted])
+        vad.forceEnd()
+        XCTAssertFalse(vad.isSpeaking)
+        // The same fan over the reply does not interrupt it.
+        for _ in 0..<100 { XCTAssertNil(vad.process(level: -35, assistantSpeaking: true)) }
+
+        // Space pressed by mistake mid-sentence: the pauses between words keep the floor low.
+        var talking = VoiceActivityDetector()
+        for _ in 0..<200 { _ = talking.process(level: -70, assistantSpeaking: false) }
+        for frame in 0..<100 { _ = talking.process(level: frame % 25 < 15 ? -25 : -70, assistantSpeaking: false) }
+        XCTAssertTrue(talking.isSpeaking)
+        talking.forceEnd()
+        XCTAssertLessThan(talking.noiseFloor, -60)
+        let next = (0..<3).compactMap { _ in talking.process(level: -30, assistantSpeaking: false) }
+        XCTAssertEqual(next, [.speechStarted])
+    }
+
+    func testReplyEchoDoesNotRaiseTheNoiseFloor() {
+        var vad = VoiceActivityDetector()
+        for _ in 0..<200 { _ = vad.process(level: -70, assistantSpeaking: false) }
+        // Five seconds of leftover echo under the interrupt threshold.
+        for _ in 0..<250 { XCTAssertNil(vad.process(level: -50, assistantSpeaking: true)) }
+        XCTAssertLessThan(vad.noiseFloor, -65)
+        // Quiet speech right after the reply still opens a turn.
+        let next = (0..<3).compactMap { _ in vad.process(level: -42, assistantSpeaking: false) }
+        XCTAssertEqual(next, [.speechStarted])
     }
 }

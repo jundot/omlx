@@ -22,6 +22,9 @@ final class AppServices: NSObject {
     /// Sub-page shown inside the per-model settings; nil is its top page.
     /// AppView resets it whenever `modelDetailID` changes.
     var modelDetailPage: ModelSettingsPage?
+    /// Sub-page shown inside the Ask AI screen; nil is its top page.
+    /// AppView resets it when another section is selected.
+    var askAIPage: AskAIPage?
     /// When set, AppView pulls the sidebar selection to this section on
     /// the next runloop tick and clears the request. Lets a screen
     /// imperatively navigate the user (e.g. the Profiles tab's

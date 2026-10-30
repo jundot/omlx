@@ -67,6 +67,37 @@ struct AskAIPanelPosition: Codable, Equatable, Sendable {
     var y: Double
 }
 
+/// Ask AI voice mode: a spoken conversation with a voice model over /v1/realtime.
+struct TalkPrefs: Codable, Equatable, Sendable {
+    var enabled = false
+    var hotKey = HotKeyCombo.optionShiftSpace
+    var model = ""
+    var systemPrompt = ""
+    /// Empty uses the model's default voice.
+    var voice = ""
+    /// Reply playback rate; pitch stays the same.
+    var speechSpeed = 1.0
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = TalkPrefs()
+        enabled = c.lenient(Bool.self, .enabled) ?? fallback.enabled
+        hotKey = c.lenient(HotKeyCombo.self, .hotKey) ?? fallback.hotKey
+        model = c.lenient(String.self, .model) ?? fallback.model
+        systemPrompt = c.lenient(String.self, .systemPrompt) ?? fallback.systemPrompt
+        voice = c.lenient(String.self, .voice) ?? fallback.voice
+        speechSpeed = c.lenient(Double.self, .speechSpeed).map(TalkPrefs.clampedSpeed) ?? fallback.speechSpeed
+    }
+
+    static let speechSpeeds = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5]
+
+    static func clampedSpeed(_ speed: Double) -> Double {
+        min(max(speed, 0.5), 2.0)
+    }
+}
+
 struct AskAIPrefs: Codable, Equatable, Sendable {
     static let defaultPanelWidth: Double = 680
 
@@ -86,6 +117,7 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
     /// lower of this and the model's own limit.
     var gpuPowerLimitEnabled = false
     var gpuPowerLimitWatts = 10
+    var talk = TalkPrefs()
 
     init() {}
 
@@ -107,6 +139,7 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
         panelWidth = c.lenient(Double.self, .panelWidth) ?? fallback.panelWidth
         gpuPowerLimitEnabled = c.lenient(Bool.self, .gpuPowerLimitEnabled) ?? fallback.gpuPowerLimitEnabled
         gpuPowerLimitWatts = c.lenient(Int.self, .gpuPowerLimitWatts) ?? fallback.gpuPowerLimitWatts
+        talk = c.lenient(TalkPrefs.self, .talk) ?? fallback.talk
     }
 
     /// The `gpu_power_limit_w` to send, clamped to what the server accepts.

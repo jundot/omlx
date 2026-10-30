@@ -59,6 +59,7 @@ struct AppView: View {
             // the menubar while AppView had never been opened).
             if let requested {
                 if requested != .models { services.modelDetailID = nil }
+                if requested != .askAI { services.askAIPage = nil }
                 selection = requested
                 services.requestedSection = nil
             }
@@ -99,6 +100,7 @@ struct AppView: View {
             set: { newValue in
                 guard let newValue else { return }
                 if newValue != .models { services.modelDetailID = nil }
+                if newValue != .askAI { services.askAIPage = nil }
                 selection = newValue
             }
         )
@@ -112,11 +114,18 @@ struct AppView: View {
         if selectedSection == .models, let id = services.modelDetailID, !id.isEmpty {
             return services.modelDetailPage?.title ?? id
         }
+        if selectedSection == .askAI, let page = services.askAIPage {
+            return page.title
+        }
         return nil
     }
 
-    /// A model settings sub-page keeps the model id visible under its title.
+    /// A sub-page keeps its parent visible under its title: the section on
+    /// Ask AI pages, the model id on model settings pages.
     private var detailSubtitle: String? {
+        if selectedSection == .askAI, let page = services.askAIPage {
+            return page.sectionTitle
+        }
         guard selectedSection == .models, services.modelDetailPage != nil else { return nil }
         return services.modelDetailID
     }

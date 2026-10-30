@@ -49,6 +49,8 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var anePrefillMlpFractions: [Double]? = nil
     var anePrefillSharedFractions: [Double]? = nil
     var embeddingAudioSupported: Bool? = nil
+    /// True when the model can hold a spoken conversation on /v1/realtime.
+    var realtimeVoice: Bool? = nil
     /// External engines that could serve this model, with why not when they
     /// cannot. Empty for models only oMLX's own engines run.
     var externalEngines: [ExternalEngineOption]? = nil

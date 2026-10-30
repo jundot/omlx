@@ -203,6 +203,14 @@ final class AppConfigTests: XCTestCase {
         XCTAssertEqual(url.absoluteString, "http://[::1]:9000/health")
     }
 
+    func testWebSocketURLKeepsHostAndQuery() throws {
+        let url = try XCTUnwrap(AppConfig.webSocketURL(
+            host: "::1", port: 9000, path: "/v1/realtime",
+            query: [URLQueryItem(name: "model", value: "Qwen3 Omni")]
+        ))
+        XCTAssertEqual(url.absoluteString, "ws://[::1]:9000/v1/realtime?model=Qwen3%20Omni")
+    }
+
     func testLoadAcceptsBindAddressFallback() throws {
         let url = AppConfig.settingsURL(basePath: tempBase)
         let original: [String: Any] = [

@@ -121,6 +121,18 @@ struct AskAIPanelView: View {
                 )
                 .frame(height: inputHeight)
             }
+            if !conversation.isStreaming, controller.store.prefs.talk.enabled {
+                Button {
+                    controller.switchToVoice()
+                } label: {
+                    Image(systemName: "mic")
+                        .font(.system(size: 16))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .help(String(localized: "askai.voice.help", defaultValue: "Talk Instead",
+                             comment: "Tooltip on the Ask AI bar button that switches to the voice card"))
+            }
             if conversation.isStreaming {
                 Button {
                     controller.handle(.stop)

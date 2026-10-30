@@ -29,6 +29,8 @@
 	  runtime switch causes Tahoe ControlCenter to silently block the
 	  status item (see app.py:189-200 + issue #725 from the Python menubar).
 	-->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Ask AI uses the microphone so you can ask by voice.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 oMLX. All rights reserved.</string>
 	<key>NSSupportsAutomaticTermination</key>

@@ -16,6 +16,8 @@ final class AskAIController {
 
     let store: AskAIStore
     let conversation = AskAIConversation()
+    /// Voice mode shares this store and hears about its preference changes.
+    let talk: TalkAIController
 
     var draft = "" {
         didSet {
@@ -52,6 +54,9 @@ final class AskAIController {
 
     init(store: AskAIStore = AskAIStore()) {
         self.store = store
+        talk = TalkAIController(store: store)
+        talk.willOpen = { [weak self] in self?.panel?.hide(animated: true) }
+        talk.openText = { [weak self] in self?.showPanel(animated: true) }
     }
 
     func start(services: AppServices, openSettings: @escaping () -> Void) {
@@ -65,11 +70,16 @@ final class AskAIController {
             if !new.enabled {
                 self.hidePanel()
             }
+            if old.talk != new.talk {
+                self.talk.prefsChanged(old: old.talk, new: new.talk)
+            }
         }
         applyHotKey()
+        talk.start(services: services, openSettings: openSettings)
     }
 
     func shutdown() {
+        talk.shutdown()
         store.flush()
         hotKey.invalidate()
     }
@@ -79,6 +89,7 @@ final class AskAIController {
     func setHotKeySuspended(_ suspended: Bool) {
         hotKeySuspended = suspended
         applyHotKey()
+        talk.setHotKeySuspended(suspended)
     }
 
     private func applyHotKey() {
@@ -103,6 +114,11 @@ final class AskAIController {
     var isPanelVisible: Bool { panel?.isVisible == true }
 
     func togglePanel() {
+        // The text hotkey over the voice card switches to the bar.
+        if talk.isActive {
+            talk.switchToText()
+            return
+        }
         if isPanelVisible {
             hidePanel()
         } else {
@@ -110,7 +126,11 @@ final class AskAIController {
         }
     }
 
-    func showPanel() {
+    func switchToVoice() {
+        talk.open()
+    }
+
+    func showPanel(animated: Bool = false) {
         guard store.prefs.enabled else { return }
         // Idle time counts from the last send, answer, or close.
         let lastUse = max(conversation.lastActivity, lastClosedAt)
@@ -121,7 +141,7 @@ final class AskAIController {
         notice = nil
         let panel = self.panel ?? AskAIPanelController(controller: self)
         self.panel = panel
-        panel.show()
+        panel.show(animated: animated)
         inputFocus.focus()
         // Model types only feed the image check and rarely change; a miss
         // refreshes on demand.
