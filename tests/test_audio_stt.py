@@ -9,9 +9,11 @@ tests build a tiny local checkpoint. Integration tests (marked
 @pytest.mark.slow) need a real model.
 """
 
+import asyncio
 import io
 import json
 import wave
+from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -66,6 +68,7 @@ def _make_mock_stt_engine(transcript: str = "hello world") -> MagicMock:
 def _make_mock_pool(stt_engine=None, model_id: str = "whisper-tiny") -> MagicMock:
     """Build a mock EnginePool that returns the given STT engine."""
     pool = MagicMock()
+    pool.release_engine = AsyncMock()
     pool.get_engine = AsyncMock(return_value=stt_engine or _make_mock_stt_engine())
     pool.get_entry = MagicMock(return_value=MagicMock(
         model_type="audio_stt",
@@ -1284,7 +1287,7 @@ class TestSTTModelAliasResolution:
                 )
                 assert response.status_code == 200
                 mock_pool.get_engine.assert_awaited_once_with(
-                    "Qwen3-ASR-1.7B-bf16"
+                    "Qwen3-ASR-1.7B-bf16", _lease=True
                 )
 
     def test_transcription_direct_model_id(self):
@@ -1318,7 +1321,7 @@ class TestSTTModelAliasResolution:
                 )
                 assert response.status_code == 200
                 mock_pool.get_engine.assert_awaited_once_with(
-                    "Qwen3-ASR-1.7B-bf16"
+                    "Qwen3-ASR-1.7B-bf16", _lease=True
                 )
 
 
@@ -1608,3 +1611,152 @@ class TestSTTIntegration:
             asyncio.run(engine.stop())
         except Exception as e:
             pytest.skip(f"Could not run integration test: {e}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,stream", [("stt", False), ("stt", True), ("sts", False)])
+async def test_audio_upload_survives_competing_model_load(
+    tmp_path, monkeypatch, kind, stream
+):
+    """Disk upload I/O must not make the selected model an idle LRU victim."""
+    import httpx
+    from fastapi import FastAPI
+    from starlette.datastructures import UploadFile
+
+    from omlx.api import audio_routes
+    from omlx.engine.sts import _FAMILY_PROCESSORS, STSEngine
+    from omlx.engine_pool import EngineEntry, EnginePool
+    from omlx.exceptions import InsufficientMemoryError
+
+    class Backend:
+        def generate(self, *args, **kwargs):
+            return SimpleNamespace(
+                text="transcribed", language="en", segments=[], total_time=1.0
+            )
+
+    pool = EnginePool()
+    pool._get_final_ceiling = lambda: 1
+    engine = STTEngine("fixture") if kind == "stt" else STSEngine("deepfilternet")
+    engine._model = Backend()
+    monkeypatch.setitem(
+        _FAMILY_PROCESSORS, "deepfilternet", lambda *args, **kwargs: TINY_WAV
+    )
+    for name in ("audio", "other"):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "config.json").write_text("{}")
+        pool._entries[name] = EngineEntry(
+            model_id=name,
+            model_path=str(path),
+            model_type="audio_" + kind,
+            engine_type="audio_" + kind,
+            estimated_size=1,
+            engine=engine if name == "audio" else None,
+        )
+    pool._current_model_memory = 1
+
+    async def load(model_id, **kwargs):
+        assert model_id == "other"
+        other = STTEngine("other")
+        other._model = Backend()
+        pool._entries[model_id].engine = other
+        pool._current_model_memory += 1
+
+    monkeypatch.setattr(pool, "_load_engine", load)
+    monkeypatch.setattr(audio_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(audio_routes, "_resolve_model", lambda model: model)
+    monkeypatch.setattr(audio_routes, "_get_settings_manager", lambda: None)
+    monkeypatch.setattr("omlx.engine_pool.mx.get_active_memory", lambda: 0)
+    monkeypatch.setattr("omlx.engine_pool._settled_phys_footprint", lambda: 0)
+    monkeypatch.setattr("omlx.engine_pool.get_phys_footprint", lambda: 0)
+    reading, resume = asyncio.Event(), asyncio.Event()
+    original_read = UploadFile.read
+
+    async def disk_read(file, size=-1):
+        if not reading.is_set():
+            assert not file._in_memory
+            reading.set()
+            await resume.wait()
+        return await original_read(file, size)
+
+    monkeypatch.setattr(UploadFile, "read", disk_read)
+    app = FastAPI()
+    app.include_router(audio_routes.router)
+    url = "/v1/audio/transcriptions" if kind == "stt" else "/v1/audio/process"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        pending = asyncio.create_task(
+            client.post(
+                url,
+                data={"model": "audio", "stream": str(stream).lower()},
+                files={"file": ("audio.wav", _make_wav_bytes(66), "audio/wav")},
+            )
+        )
+        try:
+            await asyncio.wait_for(reading.wait(), timeout=5)
+            with suppress(InsufficientMemoryError):
+                await pool.get_engine("other")
+            resume.set()
+            response = await asyncio.wait_for(pending, timeout=5)
+            assert response.status_code == 200, response.text
+            if kind == "stt":
+                assert "transcribed" in response.text
+            else:
+                assert response.content == TINY_WAV
+            assert pool._entries["audio"].in_use == 0
+            assert not engine.has_active_requests()
+            await pool.get_engine("other")
+            assert pool._entries["audio"].engine is None
+        finally:
+            resume.set()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["stt", "sts"])
+@pytest.mark.parametrize("failure", ["wrong_type", "oversize", "inference", "cancel"])
+async def test_audio_upload_failure_releases_resolved_model(monkeypatch, kind, failure):
+    import httpx
+    from fastapi import FastAPI, HTTPException
+
+    from omlx.api import audio_routes
+    from omlx.engine.sts import STSEngine
+
+    engine = MagicMock(spec=STTEngine if kind == "stt" else STSEngine)
+    operation = AsyncMock(side_effect=RuntimeError("backend failure"))
+    setattr(engine, "transcribe" if kind == "stt" else "process", operation)
+    pool = _make_mock_pool(engine)
+    if failure == "wrong_type":
+        pool.get_engine.return_value = object()
+    read_upload = AsyncMock(return_value=TINY_WAV)
+    if failure == "oversize":
+        read_upload.side_effect = HTTPException(status_code=413, detail="too large")
+    elif failure == "cancel":
+        read_upload.side_effect = asyncio.CancelledError()
+    monkeypatch.setattr(audio_routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(audio_routes, "_resolve_model", lambda model: "resolved-model")
+    monkeypatch.setattr(audio_routes, "_get_settings_manager", lambda: None)
+    monkeypatch.setattr(audio_routes, "_read_upload", read_upload)
+    app = FastAPI()
+    app.include_router(audio_routes.router)
+    url = "/v1/audio/transcriptions" if kind == "stt" else "/v1/audio/process"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        request = client.post(
+            url,
+            data={"model": "alias"},
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+        )
+        if failure == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await request
+        else:
+            response = await request
+            assert (
+                response.status_code
+                == {"wrong_type": 400, "oversize": 413, "inference": 500}[failure]
+            )
+    pool.get_engine.assert_awaited_once_with("resolved-model", _lease=True)
+    pool.release_engine.assert_awaited_once_with("resolved-model")
