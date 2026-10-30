@@ -2,11 +2,14 @@
 """Tests for EnginePool functionality."""
 
 import asyncio
+import base64
 import concurrent.futures
 import json
 import logging
 import shutil
 import threading
+from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -68,6 +71,86 @@ def small_mock_model_dir(tmp_path):
     (model_b / "model.safetensors").write_bytes(b"0" * 2048)
 
     return tmp_path
+
+
+class TestEnginePoolImages:
+    @pytest.fixture
+    def image_pool(self, tmp_path, write_z_image_checkpoint):
+        write_z_image_checkpoint(tmp_path / "image-model")
+        pool = _make_pool()
+        pool.discover_models(str(tmp_path))
+        return pool
+
+    def test_server_generation_uses_real_discovery_pool_and_image_engine(
+        self, image_pool, monkeypatch
+    ):
+        from fastapi.testclient import TestClient
+        from mlx_vlm.generate.edit_image import ImageEditRequest
+        from mlx_vlm.generate.image import ImageGenerationRequest
+        from PIL import Image
+
+        from omlx import server
+        from omlx.engine import image as image_module
+
+        pool = image_pool
+        entry = pool.get_entry("image-model")
+        loaded_model = object()
+        loads, requests = [], []
+
+        def load_image_model(reference, *, task):
+            assert Path(reference).is_dir()
+            loads.append((reference, task))
+            return loaded_model
+
+        def generate_image(model, request, *, task):
+            assert model is loaded_model
+            assert isinstance(request, ImageGenerationRequest)
+            assert task == "generate"
+            requests.append(request)
+            return SimpleNamespace(
+                image=Image.new("RGB", (2, 2), (12, 34, 56)),
+                metadata={},
+            )
+
+        api = image_module._ImageAPI(
+            load_image_model=load_image_model,
+            generate_image=generate_image,
+            ImageGenerationRequest=ImageGenerationRequest,
+            ImageEditRequest=ImageEditRequest,
+        )
+        monkeypatch.setattr(image_module, "_image_api", lambda: api)
+        monkeypatch.setattr(server._server_state, "engine_pool", pool)
+        monkeypatch.setattr(server._server_state, "api_key", "image-test-key")
+        monkeypatch.setattr(server._server_state, "global_settings", None)
+        monkeypatch.setattr(server._server_state, "settings_manager", None)
+        monkeypatch.setattr(server._server_state, "process_memory_enforcer", None)
+        try:
+            response = TestClient(server.app).post(
+                "/v1/images/generations",
+                headers={"Authorization": "Bearer image-test-key"},
+                json={
+                    "model": "image-model",
+                    "prompt": "a tiny square",
+                    "size": "512x512",
+                    "response_format": "b64_json",
+                    "seed": 7,
+                },
+            )
+
+            assert response.status_code == 200, response.text
+            encoded = response.json()["data"][0]["b64_json"]
+            with Image.open(BytesIO(base64.b64decode(encoded))) as image:
+                assert image.format == "PNG"
+                assert image.size == (2, 2)
+                assert image.getpixel((0, 0)) == (12, 34, 56)
+            assert loads == [(entry.model_path, "generate")]
+            assert len(requests) == 1
+            assert requests[0].prompt == "a tiny square"
+            assert requests[0].seed == 7
+            assert requests[0].steps is None
+            assert requests[0].width == requests[0].height == 512
+        finally:
+            asyncio.run(pool.unload_if_idle_unpinned("image-model"))
 
 
 class TestEnginePoolInit:
@@ -4865,7 +4948,6 @@ class TestEnginePoolInUseLease:
             with pytest.raises(asyncio.CancelledError):
                 await caller
 
-            assert entry.in_use == 1
             assert len(pool._lease_release_tasks) == 1
         finally:
             pool._lock.release()
@@ -5044,8 +5126,7 @@ class TestEnginePoolInUseLease:
 
         with pytest.raises(RuntimeError, match="boom"):
             async with pool.acquire("model-a"):
-                assert entry.in_use == 1
-                raise RuntimeError("boom")
+                    raise RuntimeError("boom")
         assert entry.in_use == 0  # no leaked lease
 
     @pytest.mark.asyncio

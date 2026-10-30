@@ -59,6 +59,7 @@ from ..exceptions import ModelBusyError
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
     _is_hf_cache_mlx_compatible,
+    _is_model_dir,
     _resolve_hf_cache_entry,
 )
 from ..model_discovery import model_display_name as _model_display_name
@@ -2526,6 +2527,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            "capabilities": model_info.get("capabilities", []),
+            "tasks": model_info.get("tasks", []),
             # Native context window from the model's config.json — used by
             # the context bench UI to hide targets the model cannot reach.
             "model_context_length": model_info.get("model_context_length"),
@@ -2893,6 +2896,7 @@ async def update_model_settings(
             "audio_tts",
             "audio_sts",
             "decision",
+            "image",
         }
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
@@ -2917,6 +2921,7 @@ async def update_model_settings(
             "audio_tts": "audio_tts",
             "audio_sts": "audio_sts",
             "decision": "decision",
+            "image": "image",
         }
         if override_value:
             entry.model_type = override_value
@@ -8152,7 +8157,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
             if gguf.is_gguf_folder(subdir):
                 gguf_folders.append((subdir, subdir.name, "local"))
-            elif (subdir / "config.json").exists():
+            elif _is_model_dir(subdir):
                 # Level 1: direct model folder
                 _add_model(subdir, subdir.name)
             else:
@@ -8179,7 +8184,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
                         continue
                     if gguf.is_gguf_folder(child):
                         gguf_folders.append((child, child.name, "local"))
-                    elif (child / "config.json").exists():
+                    elif _is_model_dir(child):
                         _add_model(
                             child, child.name, repo_id=f"{subdir.name}/{child.name}"
                         )
@@ -8239,7 +8244,7 @@ async def list_hf_models(is_admin: bool = Depends(require_admin)):
 
 def _is_listed_model_folder(path: Path) -> bool:
     """A folder /api/hf/models lists whole: a checkpoint or a GGUF folder."""
-    return (path / "config.json").exists() or gguf.is_gguf_folder(path)
+    return _is_model_dir(path) or gguf.is_gguf_folder(path)
 
 
 @router.delete("/api/hf/models/{model_name}")

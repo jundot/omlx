@@ -11,7 +11,7 @@ These models define the request and response schemas for:
 """
 
 import json
-from typing import Annotated, Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
@@ -676,6 +676,15 @@ class ModelInfo(BaseModel):
     anthropic_family_tier: str | None = Field(default=None, exclude=True)
     is_family_default: bool | None = Field(default=None, exclude=True)
     max_tokens: int | None = Field(default=None, exclude=True)
+
+
+class ImageModelInfo(ModelInfo):
+    """Image-specific capabilities exposed through the model listing."""
+
+    model_type: Literal["image"] = "image"
+    engine_type: Literal["image"] = "image"
+    capabilities: list[str] = Field(default_factory=list)
+    tasks: list[str] = Field(default_factory=list)
 
 
 class ClaudeTierModelInfo(ModelInfo):

@@ -108,6 +108,7 @@ from .api.embedding_utils import (
     normalize_input,
     truncate_embedding,
 )
+from .api.image_routes import router as image_router
 from .api.markitdown import (
     MARKITDOWN_MODEL_ID,
     MarkItDownRequestError,
@@ -137,6 +138,7 @@ from .api.openai_models import (
     CompletionTokensDetails,
     DetokenizeRequest,
     DetokenizeResponse,
+    ImageModelInfo,
     ModelInfo,
     ModelsResponse,
     PromptTokensDetails,
@@ -820,6 +822,8 @@ from .api.websearch_routes import set_global_settings_getter as _set_websearch_s
 
 _set_websearch_settings(lambda: _server_state.global_settings)
 app.include_router(websearch_router, dependencies=[Depends(verify_inference_api_key)])
+
+app.include_router(image_router, dependencies=[Depends(verify_inference_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
@@ -3799,6 +3803,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                         referenced_drafts.add(ref)
 
         excluded_model_ids: set[str] = set()
+        image_models: dict[str, dict] = {}
         for m in status["models"]:
             model_id = m["id"]
             display_id = model_id
@@ -3827,13 +3832,21 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                 continue
             if ms is not None and ms.is_favorite:
                 favorite_ids.add(display_id)
-            models.append(
-                ModelInfo(
+            if m.get("model_type") == "image" or m.get("engine_type") == "image":
+                image_models[model_id] = m
+                model_info = ImageModelInfo(
+                    id=display_id,
+                    owned_by="omlx",
+                    capabilities=m.get("capabilities", []),
+                    tasks=m.get("tasks", []),
+                )
+            else:
+                model_info = ModelInfo(
                     id=display_id,
                     owned_by="omlx",
                     max_model_len=get_max_context_window(model_id),
                 )
-            )
+            models.append(model_info)
         # Both sets are needed by the exposed-profile and Claude tier-alias
         # blocks below, and the latter runs with or without a settings manager,
         # so they are built here rather than inside the settings guard.
@@ -3849,13 +3862,21 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                     or profile_model_id in existing_ids
                 ):
                     continue
-                models.append(
-                    ModelInfo(
+                image_source = image_models.get(source_model_id)
+                if image_source is not None:
+                    model_info = ImageModelInfo(
+                        id=profile_model_id,
+                        owned_by="omlx",
+                        capabilities=image_source.get("capabilities", []),
+                        tasks=image_source.get("tasks", []),
+                    )
+                else:
+                    model_info = ModelInfo(
                         id=profile_model_id,
                         owned_by="omlx",
                         max_model_len=get_max_context_window(profile_model_id),
                     )
-                )
+                models.append(model_info)
                 existing_ids.add(profile_model_id)
 
         # Claude Desktop tier aliases: derived, non-persisted slot IDs

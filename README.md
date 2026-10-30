@@ -274,12 +274,44 @@ Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stat
 | `POST /v1/completions` | Text completions (streaming) |
 | `POST /v1/messages` | Anthropic Messages API |
 | `POST /v1/embeddings` | Text embeddings |
+| `POST /v1/images/generations` | Image generation |
+| `POST /v1/images/edits` | Image editing with JSON references or multipart uploads |
 | `POST /v1/rerank` | Document reranking |
 | `POST /v1/systemone` | Typed decisions with decision models or chat models (TypeSafe System One) |
 | `GET /v1/models` | List available models |
 | `POST /tokenize`, `POST /detokenize` | vLLM-compatible tokenizer API (also under `/v1`) |
 
 The admin API for settings, models, downloads, quantization, and benchmarks takes the main API key as a Bearer token and also works in headless mode. See [Admin API](docs/admin-api.md).
+
+### Image generation and editing
+
+Image models use the bundled mlx-vlm dependency and the same model pool as other
+models. The dashboard lists them for model management, not for chat or text
+benchmarks.
+
+Place a checkpoint that mlx-vlm can load under your model directory. oMLX asks
+mlx-vlm whether the checkpoint supports generation, editing, or both, so new
+mlx-vlm image models work without oMLX changes. Use its directory name or
+configured alias as `model`.
+
+```bash
+curl http://localhost:8000/v1/images/generations \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"flux2-klein-4b","prompt":"A fox in a snowy forest","size":"1024x1024"}'
+
+curl http://localhost:8000/v1/images/edits \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -F model=flux2-klein-4b \
+  -F prompt="Change the snow to autumn leaves" \
+  -F image=@input.png
+```
+
+Responses contain base64-encoded images in `data[].b64_json`. PNG, JPEG, and WebP
+output are supported. Streaming, URL output, file-id inputs, masks, and LoRA
+requests are not supported. Editing tasks and multiple input images depend on the
+model. Request fields include `seed`, `steps`, and `guidance`; omitted fields use
+the model's mlx-vlm defaults.
 
 ### Tool Calling & Structured Output
 
@@ -324,6 +356,7 @@ Models are auto-detected by type. You can also download models directly from the
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
 | Decision | Clef, Clef-Flash, OpenJev, Decision 3.0 (d3, d3-flash, d3-mini, d3-nano, d3-lite, d3-edge) |
+| Image | FLUX.2 Klein, Mage-Flow, Ming-Image, Z-Image, ERNIE-Image, Ideogram 4, and Bonsai Ternary |
 
 ## CLI Configuration
 
