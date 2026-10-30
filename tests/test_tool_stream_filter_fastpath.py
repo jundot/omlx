@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Differential check: the prose fast path must be byte-identical.
 
 Runs the real ``ToolCallStreamFilter`` twice over the same chunking — once
@@ -52,32 +53,29 @@ def run(parts: list[str], *, guard: bool) -> list[str]:
     if not guard:
         # Neutralise the guard: every character becomes a trigger, so the
         # condition can never hold and the slow path always runs.
-        f._marker_trigger_chars = frozenset(
-            chr(c) for c in range(0x20, 0x7F)
-        ) | {"\n", "\t", "<", "["}
+        f._marker_trigger_chars = frozenset(chr(c) for c in range(0x20, 0x7F)) | {
+            "\n",
+            "\t",
+            "<",
+            "[",
+        }
     out = [f.feed(p) for p in parts]
     out.append(f.finish())
     return out
 
 
-def main() -> int:
-    mismatches = 0
+def test_fast_path_matches_slow_path() -> None:
+    """Every chunking emits the same fragments through both paths."""
+    mismatches: list[tuple[str, int, int, list[str], list[str]]] = []
     total = 0
     for case in CASES:
         for n in (1, 2, 3, 5):
             for offset in (0, 1):
                 parts = [case[i::n] for i in range(n)][offset:] or [case]
                 total += 1
-                a = run(parts, guard=True)
-                b = run(parts, guard=False)
-                if a != b:
-                    mismatches += 1
-                    print("MISMATCH", repr(case), "n=", n, "offset=", offset)
-                    print("  guard:", a)
-                    print("  ref  :", b)
-    print(f"{total} chunkings compared, {mismatches} mismatches")
-    return 1 if mismatches else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+                guarded = run(parts, guard=True)
+                reference = run(parts, guard=False)
+                if guarded != reference:
+                    mismatches.append((case, n, offset, guarded, reference))
+    assert total == len(CASES) * 8
+    assert not mismatches, mismatches[:3]
