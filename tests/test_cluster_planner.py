@@ -7,6 +7,7 @@ import struct
 import pytest
 from mlx_lm.models.pipeline import PipelineMixin
 
+from omlx.cluster.deployment import _assignment_from_dict
 from omlx.cluster.planner import (
     ModelLayout,
     NodeBudget,
@@ -775,6 +776,109 @@ def test_tensor_plan_leaves_ssd_tables_out_of_rank_memory():
     assert [item.layer_weight_bytes for item in tensor.assignments] == [150, 150]
     assert sum(item.layer_weight_bytes for item in pipeline.assignments) == 500
     assert ModelLayout.from_dict(layout.to_dict()) == layout
+
+
+def test_pipeline_plans_hold_offloaded_tables_out_of_rank_memory():
+    """An offloaded Engram stage is admitted by its resident weights."""
+
+    layout = ModelLayout(
+        source="tables",
+        fixed_weight_bytes=10,
+        layer_weight_bytes=(100, 300, 100),
+        tensor_parallel_ssd_layer_bytes=(0, 200, 0),
+        supports_pipeline=True,
+    )
+    nodes = [
+        NodeBudget(node_id=n, capacity_bytes=1000, rank=i) for i, n in enumerate("ab")
+    ]
+
+    plan = plan_unequal_pipeline(layout, nodes, engram_ssd_offload=True)
+
+    assert sum(item.layer_weight_bytes for item in plan.assignments) == 500
+    assert sum(item.ssd_weight_bytes for item in plan.assignments) == 200
+    # planned_weight_bytes is what the guard admits: the mmap'd table is not
+    # part of this rank's wired budget.
+    for item in plan.assignments:
+        assert item.planned_weight_bytes == (
+            item.fixed_weight_bytes
+            + item.layer_weight_bytes
+            - item.ssd_weight_bytes
+            + item.kv_cache_bytes
+        )
+        assert item.headroom_bytes >= 0
+    assert "ssd_weight_bytes" in plan.assignments[0].to_dict()
+
+
+def test_offloaded_tables_make_a_stage_fit_that_resident_tables_cannot():
+    """The Ultra arithmetic: 512 GiB of weights fit 600 GiB only offloaded."""
+
+    layout = ModelLayout(
+        source="tables",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(100, 300, 100),
+        tensor_parallel_ssd_layer_bytes=(0, 200, 0),
+        supports_pipeline=True,
+    )
+    # One 320-byte Mac holds 500 bytes of weights only when layer 1's
+    # 200-byte table is mmap'd instead of resident.
+    node = [
+        NodeBudget(node_id="studio", capacity_bytes=320, rank=0),
+    ]
+
+    with pytest.raises(PlanningError, match="does not fit"):
+        plan_unequal_pipeline(layout, node)
+
+    plan = plan_unequal_pipeline(layout, node, engram_ssd_offload=True)
+    assignment = plan.assignments[0]
+    assert assignment.layer_weight_bytes == 500
+    assert assignment.ssd_weight_bytes == 200
+    assert assignment.planned_weight_bytes == 300
+    assert assignment.headroom_bytes >= 0
+
+
+def test_ssd_weight_bytes_survive_the_worker_plan_and_are_validated():
+    with pytest.raises(ValueError, match="must not exceed"):
+        PipelineAssignment(
+            node_id="studio",
+            rank=0,
+            start_layer=0,
+            end_layer=1,
+            layer_weight_bytes=100,
+            fixed_weight_bytes=0,
+            reserve_bytes=0,
+            capacity_bytes=1000,
+            engram_ssd_offload=True,
+            ssd_weight_bytes=101,
+        )
+    with pytest.raises(ValueError, match="requires engram_ssd_offload"):
+        PipelineAssignment(
+            node_id="studio",
+            rank=0,
+            start_layer=0,
+            end_layer=1,
+            layer_weight_bytes=100,
+            fixed_weight_bytes=0,
+            reserve_bytes=0,
+            capacity_bytes=1000,
+            ssd_weight_bytes=50,
+        )
+
+    assignment = PipelineAssignment(
+        node_id="studio",
+        rank=0,
+        start_layer=0,
+        end_layer=1,
+        layer_weight_bytes=100,
+        fixed_weight_bytes=0,
+        reserve_bytes=0,
+        capacity_bytes=1000,
+        engram_ssd_offload=True,
+        ssd_weight_bytes=50,
+    )
+    decoded = _assignment_from_dict(assignment.to_dict())
+
+    assert decoded == assignment
+    assert decoded.planned_weight_bytes == 50
 
 
 def test_complete_model_layout_cache_invalidates_on_shard_overwrite(

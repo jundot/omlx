@@ -302,6 +302,7 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             role=role,
             memory_guard_tier=memory_guard_tier,
             engram_ssd_offload=bool(payload.get("engram_ssd_offload", False)),
+            ssd_weight_bytes=int(payload.get("ssd_weight_bytes", 0)),
             tensor_parallel_rank=int(payload.get("tensor_parallel_rank", 0)),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             sharded_weight_bytes=int(payload.get("sharded_weight_bytes", 0)),
@@ -331,10 +332,13 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             assignment.kv_cache_bytes,
             assignment.kv_bytes_per_token,
             assignment.max_context_tokens,
+            assignment.ssd_weight_bytes,
         )
         < 0
     ):
         raise ValueError("pipeline assignment byte counts must be non-negative")
+    if assignment.ssd_weight_bytes > assignment.layer_weight_bytes:
+        raise ValueError("pipeline assignment SSD bytes exceed its layer weights")
     if assignment.capacity_bytes <= assignment.reserve_bytes:
         raise ValueError("pipeline assignment reserve must be below capacity")
     if assignment.headroom_bytes < 0:
