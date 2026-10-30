@@ -1577,6 +1577,80 @@ class TestQwen3ASRAudioQuantization:
             await engine.stop()
 
 
+class TestSTTHfCacheSnapshot:
+    """STT models without ``model_type`` served from the HF Hub cache.
+
+    Parakeet configs carry no ``model_type``, so mlx-audio falls back to the
+    model name. oMLX passes the snapshot path as a string, whose last segment
+    is the commit hash: ``Model type <hash> not supported for stt``.
+    """
+
+    COMMIT = "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15"
+
+    @staticmethod
+    def _checkpoint(model_dir):
+        model_dir.mkdir(parents=True)
+        # Parakeet-style config: NeMo keys, no model_type / architecture.
+        (model_dir / "config.json").write_text(
+            json.dumps({"sample_rate": 16000, "encoder": {}, "decoder": {}})
+        )
+        return model_dir
+
+    @staticmethod
+    def _resolved_model_type(monkeypatch, model_path):
+        """Run the real mlx-audio loader up to model class resolution."""
+        import asyncio
+
+        import mlx_audio.utils as audio_utils
+
+        class _ResolvedError(Exception):
+            pass
+
+        resolved = {}
+        real_get_model_class = audio_utils.get_model_class
+
+        def _capture(*args, **kwargs):
+            _, resolved["model_type"] = real_get_model_class(*args, **kwargs)
+            raise _ResolvedError
+
+        monkeypatch.setattr(audio_utils, "get_model_class", _capture)
+        with pytest.raises(_ResolvedError):
+            asyncio.run(STTEngine(str(model_path)).start())
+        return resolved["model_type"]
+
+    def test_snapshot_resolves_model_type_from_repo_name(
+        self, tmp_path, monkeypatch
+    ):
+        snapshot = self._checkpoint(
+            tmp_path / "hub" / "models--mlx-community--parakeet-tdt-0.6b-v3"
+            / "snapshots" / self.COMMIT
+        )
+        assert self._resolved_model_type(monkeypatch, snapshot) == "parakeet"
+
+    def test_named_local_directory_still_resolves(self, tmp_path, monkeypatch):
+        model_dir = self._checkpoint(
+            tmp_path / "models" / "mlx-community" / "parakeet-tdt-0.6b-v3"
+        )
+        assert self._resolved_model_type(monkeypatch, model_dir) == "parakeet"
+
+    @pytest.mark.parametrize(
+        "path, expected",
+        [
+            (
+                "/hub/models--mlx-community--parakeet-tdt-0.6b-v3/snapshots/abc",
+                "mlx-community/parakeet-tdt-0.6b-v3",
+            ),
+            ("/models/mlx-community/parakeet-tdt-0.6b-v3", None),
+            ("/models/snapshots/abc", None),
+            ("mlx-community/whisper-tiny", None),
+        ],
+    )
+    def test_hf_cache_repo_id(self, path, expected):
+        from omlx.engine.stt import _hf_cache_repo_id
+
+        assert _hf_cache_repo_id(path) == expected
+
+
 # ---------------------------------------------------------------------------
 # Integration test (slow, requires mlx-audio)
 # ---------------------------------------------------------------------------
