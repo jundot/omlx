@@ -1453,6 +1453,124 @@
                                 </div>
                             </div>
                         </div>
+                        <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden"
+                             x-data="{ open: false }">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="volume-2" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.speech.section_label') }}</span>
+                                </div>
+                                <span class="badge bg-neutral-200 text-neutral-600 border-neutral-300"
+                                      x-text="sayBadgeText()"></span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.speech.enabled') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.speech.enabled_hint') }}</p>
+                                    </div>
+                                    <button type="button"
+                                            @click="toggleSayEnabled()"
+                                            :disabled="!globalSettings.integrations.say_supported"
+                                            role="switch"
+                                            :aria-checked="globalSettings.integrations.say_enabled ? 'true' : 'false'"
+                                            :class="globalSettings.integrations.say_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black disabled:opacity-40 disabled:cursor-not-allowed">
+                                        <span :class="globalSettings.integrations.say_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div x-show="!globalSettings.integrations.say_supported"
+                                     class="px-4 sm:px-6 py-4 text-xs text-neutral-500">
+                                    {{ t('settings.integrations.speech.unsupported') }}
+                                </div>
+                                <div x-show="globalSettings.integrations.say_supported && globalSettings.integrations.say_enabled"
+                                     class="px-4 sm:px-6 py-4 text-xs text-neutral-500">
+                                    {{ t('settings.integrations.speech.usage_hint') }}
+                                </div>
+                                <template x-if="globalSettings.integrations.say_supported && globalSettings.integrations.say_enabled">
+                                    <div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                            <div>
+                                                <label class="text-sm text-neutral-700">{{ t('settings.integrations.speech.long_label') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.speech.long_hint') }}</p>
+                                            </div>
+                                            <select x-model="globalSettings.integrations.say_long_input"
+                                                    @change="saveSayLongInput()"
+                                                    class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                <option value="speak">{{ t('settings.integrations.speech.long_speak') }}</option>
+                                                <option value="reject">{{ t('settings.integrations.speech.long_reject') }}</option>
+                                            </select>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                            <div>
+                                                <label class="text-sm text-neutral-700">{{ t('settings.integrations.speech.chunk_label') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.speech.chunk_hint') }}</p>
+                                            </div>
+                                            <input type="number" min="0" max="20000" step="100"
+                                                   x-model.number="globalSettings.integrations.say_chunk_chars"
+                                                   @change="saveSayLimits()"
+                                                   class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                        </div>
+                                        </div>
+                                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                            <div>
+                                                <label class="text-sm text-neutral-700">{{ t('settings.integrations.speech.voices') }}</label>
+                                                <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.speech.voices_hint') }}</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="loadMacosSayVoices(true)"
+                                                    :disabled="macosSay.loading"
+                                                    class="px-4 py-2 text-sm font-medium border border-neutral-200 rounded-full hover:bg-neutral-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed shrink-0">
+                                                <span x-show="!macosSay.loading">{{ t('settings.integrations.speech.reload') }}</span>
+                                                <span x-show="macosSay.loading">{{ t('settings.integrations.speech.reloading') }}</span>
+                                            </button>
+                                        </div>
+                                        <p x-show="macosSay.loading && !macosSay.languages.length"
+                                           class="px-4 sm:px-6 py-3 text-xs text-neutral-400">
+                                            {{ t('settings.integrations.speech.loading') }}
+                                        </p>
+                                        <p x-show="macosSay.error"
+                                           class="px-4 sm:px-6 py-3 text-xs text-red-500 break-words"
+                                           x-text="macosSay.error"></p>
+                                        <p x-show="!macosSay.loading && !macosSay.languages.length"
+                                           class="px-4 sm:px-6 py-3 text-xs text-neutral-400">
+                                            {{ t('settings.integrations.speech.no_voices') }}
+                                        </p>
+                                        <template x-for="lang in (open ? macosSay.languages : macosSay.languages.slice(0, sayVisibleLimit))"
+                                                  :key="lang.locale">
+                                            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-3">
+                                                <div class="min-w-0">
+                                                    <label class="text-sm text-neutral-700"
+                                                           x-text="sayLanguageLabel(lang.locale)"></label>
+                                                    <p class="text-xs text-neutral-400 font-mono mt-0.5"
+                                                       x-text="lang.locale + ' · ' + sayVoiceCount(lang)"></p>
+                                                </div>
+                                                <select @change="setSayVoice(lang, $event.target.value)"
+                                                        class="w-full sm:w-64 px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
+                                                    <option value="" :selected="!lang.configured"
+                                                            x-text="sayDefaultLabel(lang)"></option>
+                                                    <template x-for="v in lang.voices" :key="v.value">
+                                                        <option :value="v.value"
+                                                                :selected="v.value === lang.configured"
+                                                                x-text="v.name"></option>
+                                                    </template>
+                                                </select>
+                                            </div>
+                                        </template>
+                                        <div x-show="macosSay.languages.length > sayVisibleLimit"
+                                             class="px-4 sm:px-6 py-3">
+                                            <button type="button"
+                                                    @click="open = !open"
+                                                    class="text-sm font-medium text-neutral-500 hover:bg-neutral-50 rounded-full px-4 py-2 transition-colors"
+                                                    x-text="open
+                                                            ? window.t('settings.integrations.speech.show_less')
+                                                            : window.t('settings.integrations.speech.show_more').replace('{count}', macosSay.languages.length - sayVisibleLimit)">
+                                            </button>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">

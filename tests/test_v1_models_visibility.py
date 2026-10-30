@@ -52,9 +52,15 @@ def _state(models: list[dict], tmp_path, *, hide_helpers: bool = False) -> Serve
 
 
 def _list_ids(state) -> list[str]:
+    # This suite is about pool-derived rows: which models the list shows, and in
+    # which order. Model-less engines answer from the host rather than from the
+    # pool stub above, so the macOS speech row is pinned off here - without it
+    # the same assertions pass on Linux and fail on a Mac that has `say`.
+    # test_tts_macos_say.py covers that row, including both gates.
     with (
         patch("omlx.server._server_state", state),
         patch("omlx.server.get_max_context_window", return_value=None),
+        patch("omlx.api.audio_routes.say_model_visible", return_value=False),
     ):
         client = TestClient(app, raise_server_exceptions=False)
         response = client.get("/v1/models")

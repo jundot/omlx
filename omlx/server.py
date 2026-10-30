@@ -3916,6 +3916,14 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
     ):
         models.append(ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx"))
 
+    # The macOS system speech engine, named exactly as the speech endpoint
+    # addresses it. Same reason MarkItDown is listed: it serves real requests
+    # without ever occupying a pool slot, so the pool cannot name it.
+    from .api.audio_routes import say_model_visible
+
+    if say_model_visible() and not any(m.id == "say" for m in models):
+        models.append(ModelInfo(id="say", owned_by="omlx"))
+
     # Favorites first; stable sort keeps alphabetical order within groups.
     if favorite_ids:
         models.sort(key=lambda m: m.id not in favorite_ids)
