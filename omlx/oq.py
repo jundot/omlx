@@ -639,7 +639,7 @@ def _is_token_embedding_tensor(path: str) -> bool:
 
 
 def universal_quant_predicate(
-    path: str, module, config: dict, oq_level: int = 4
+    path: str, module, config: dict, oq_level: float = 4
 ) -> bool | dict:
     """Per-tensor quantization decision based on GGUF/unsloth/llama.cpp rules.
 
@@ -963,7 +963,7 @@ def _normalize_quant_path(path: str) -> str:
     return path
 
 
-def _base_bits_for_level(oq_level: int) -> int:
+def _base_bits_for_level(oq_level: float) -> int:
     return int(_LEVEL_BITS.get(oq_level, oq_level))
 
 
@@ -1205,6 +1205,7 @@ def _apply_routed_layer_boosts(
     named_shapes: dict[str, tuple],
     config: dict,
     oq_level: float,
+    group_size: int,
     boost_map: dict[str, dict],
     fixed_overrides: dict[str, dict],
     base_bits: int,
@@ -1250,7 +1251,7 @@ def _apply_routed_layer_boosts(
         delta = 0
         updates = []
         cand_bits = 3
-        cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+        cand_gs = _gs_for_mode(cand_bits, group_size)
         cand_mode = _mode_for_bits(cand_bits)
         for path, shape in items:
             cur = boost_map.get(path)
@@ -1301,11 +1302,12 @@ def _apply_routed_layer_boosts(
 def _build_quant_plan(
     named_shapes: dict[str, tuple],
     config: dict,
-    oq_level: int,
+    oq_level: float,
     target_bpw: float = 4.6,
     hard_cap_bpw: float = 4.7,
     fixed_overrides: dict[str, dict] | None = None,
     supported_bits: tuple[int, ...] = _VALID_QUANT_BITS,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
 ) -> QuantPlan:
     """Allocate byte-budgeted boosts using sensitivity-driven allocation.
 
@@ -1344,6 +1346,7 @@ def _build_quant_plan(
             hard_cap_bpw=hard_cap_bpw,
             fixed_overrides=fixed_overrides,
             supported_bits=supported_bits,
+            group_size=group_size,
         )
         return _plan_mtp_head(
             plan,
@@ -1353,13 +1356,14 @@ def _build_quant_plan(
             oq_level,
             fixed_overrides or {},
             supported_bits,
+            group_size,
         )
 
     base_bits = _base_bits_for_level(oq_level)
     if base_bits not in supported_bits:
         raise ValueError("Base quantization width is not supported by this model")
     base_mode = _mode_for_bits(base_bits)
-    base_group_size = _gs_for_mode(base_bits, _OQ_DEFAULT_GROUP_SIZE)
+    base_group_size = _gs_for_mode(base_bits, group_size)
     boost_map: dict[str, dict] = {}
     fixed_overrides = fixed_overrides or {}
 
@@ -1421,7 +1425,7 @@ def _build_quant_plan(
                 )
                 if cand_bits <= base_bits:
                     break
-                cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_gs = _gs_for_mode(cand_bits, group_size)
                 cand_mode = _mode_for_bits(cand_bits)
                 base_cost = _tensor_quantized_bytes(
                     shape, base_bits, base_group_size, base_mode
@@ -1466,7 +1470,7 @@ def _build_quant_plan(
                 continue
             delta = 8 * (
                 _tensor_quantized_bytes(
-                    shape, cand_bits, _OQ_DEFAULT_GROUP_SIZE, "affine"
+                    shape, cand_bits, group_size, "affine"
                 )
                 - _tensor_quantized_bytes(shape, base_bits, base_group_size, base_mode)
             )
@@ -1475,7 +1479,7 @@ def _build_quant_plan(
                 continue
             boost_map[path] = {
                 "bits": cand_bits,
-                "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                "group_size": group_size,
                 "mode": "affine",
             }
             total_bits_f += delta
@@ -1495,7 +1499,7 @@ def _build_quant_plan(
             cand_bits = base_bits + _down_boost
             if cand_bits not in _VALID_QUANT_BITS:
                 continue
-            cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+            cand_gs = _gs_for_mode(cand_bits, group_size)
             cand_mode = _mode_for_bits(cand_bits)
             base_cost = _tensor_quantized_bytes(
                 shape, base_bits, base_group_size, base_mode
@@ -1520,9 +1524,11 @@ def _build_quant_plan(
         ):
             if path in boost_map:
                 continue
-            floor_gs = _DENSE_FLOOR_GROUP_SIZE
-            if shape[-1] % floor_gs:
-                floor_gs = _OQ_DEFAULT_GROUP_SIZE
+            floor_gs = _OQ_DEFAULT_GROUP_SIZE
+            for gs in (_DENSE_FLOOR_GROUP_SIZE, group_size):
+                if shape[-1] % gs == 0:
+                    floor_gs = gs
+                    break
             old_cost = _tensor_quantized_bytes(
                 shape, base_bits, base_group_size, base_mode
             )
@@ -1559,7 +1565,7 @@ def _build_quant_plan(
             continue
         floor_gs = int(
             floor_pred.get(
-                "group_size", _gs_for_mode(floor_bits, _OQ_DEFAULT_GROUP_SIZE)
+                "group_size", _gs_for_mode(floor_bits, group_size)
             )
         )
         floor_mode = floor_pred.get("mode", _mode_for_bits(floor_bits))
@@ -1606,7 +1612,7 @@ def _build_quant_plan(
                 bits = steps[0]
                 delta = 8 * (
                     _tensor_quantized_bytes(
-                        shape, bits, _OQ_DEFAULT_GROUP_SIZE, "affine"
+                        shape, bits, group_size, "affine"
                     )
                     - _tensor_quantized_bytes(
                         shape, cur["bits"], cur["group_size"], cur["mode"]
@@ -1617,7 +1623,7 @@ def _build_quant_plan(
                     continue
                 boost_map[path] = {
                     "bits": bits,
-                    "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                    "group_size": group_size,
                     "mode": "affine",
                 }
                 total_bits_f += delta
@@ -1643,9 +1649,9 @@ def _build_quant_plan(
         # Current bits (floor or base)
         cur_bits = boost_map[path]["bits"] if path in boost_map else base_bits
         cur_gs = (
-            int(boost_map[path].get("group_size", _OQ_DEFAULT_GROUP_SIZE))
+            int(boost_map[path].get("group_size", group_size))
             if path in boost_map
-            else _gs_for_mode(cur_bits, _OQ_DEFAULT_GROUP_SIZE)
+            else _gs_for_mode(cur_bits, group_size)
         )
         cur_mode = _mode_for_bits(cur_bits)
         cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
@@ -1667,7 +1673,7 @@ def _build_quant_plan(
         for cand_bits in range(max_target, cur_bits, -1):
             if cand_bits not in supported_bits or cand_bits <= cur_bits:
                 continue
-            cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+            cand_gs = _gs_for_mode(cand_bits, group_size)
             cand_mode = _mode_for_bits(cand_bits)
             cand_cost = _tensor_quantized_bytes(shape, cand_bits, cand_gs, cand_mode)
             delta = 8 * (cand_cost - cur_cost)
@@ -1701,7 +1707,7 @@ def _build_quant_plan(
             cur_bits = cur["bits"]
             if cur_bits >= 8:
                 continue
-            cur_gs = int(cur.get("group_size", _OQ_DEFAULT_GROUP_SIZE))
+            cur_gs = int(cur.get("group_size", group_size))
             cur_mode = _mode_for_bits(cur_bits)
             cur_cost = _tensor_quantized_bytes(shape, cur_bits, cur_gs, cur_mode)
             layer_idx = _extract_layer_index(path)
@@ -1716,7 +1722,7 @@ def _build_quant_plan(
                     continue
                 if cand_bits <= cur_bits:
                     continue
-                cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+                cand_gs = _gs_for_mode(cand_bits, group_size)
                 cand_mode = _mode_for_bits(cand_bits)
                 cand_cost = _tensor_quantized_bytes(
                     shape, cand_bits, cand_gs, cand_mode
@@ -1746,7 +1752,7 @@ def _build_quant_plan(
         if cur["bits"] >= 8 or not any(p in path for p in _MANDATORY_BOOST_PATTERNS):
             continue
         shape = named_shapes[path]
-        full_gs = _gs_for_mode(8, _OQ_DEFAULT_GROUP_SIZE)
+        full_gs = _gs_for_mode(8, group_size)
         delta = 8 * (
             _tensor_quantized_bytes(shape, 8, full_gs, _mode_for_bits(8))
             - _tensor_quantized_bytes(
@@ -1765,6 +1771,7 @@ def _build_quant_plan(
             named_shapes,
             config,
             oq_level,
+            group_size,
             boost_map,
             fixed_overrides,
             base_bits,
@@ -1833,9 +1840,10 @@ def _plan_mtp_head(
     backbone_shapes: dict[str, tuple],
     head_shapes: dict[str, tuple],
     config: dict,
-    oq_level,
+    oq_level: float,
     fixed_overrides: dict[str, dict],
     supported_bits: tuple[int, ...],
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
 ) -> QuantPlan:
     """Add the MTP head to a backbone plan without moving the backbone.
 
@@ -1847,7 +1855,7 @@ def _plan_mtp_head(
     base_bits = _base_bits_for_level(oq_level)
     base = {
         "bits": base_bits,
-        "group_size": _gs_for_mode(base_bits, _OQ_DEFAULT_GROUP_SIZE),
+        "group_size": _gs_for_mode(base_bits, group_size),
         "mode": _mode_for_bits(base_bits),
     }
     floor_bits = _mtp_bits_override(base_bits)
@@ -1869,7 +1877,7 @@ def _plan_mtp_head(
         if floor_bits > base_bits:
             boost_map[path] = {
                 "bits": floor_bits,
-                "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                "group_size": group_size,
                 "mode": _mode_for_bits(floor_bits),
             }
         if not _is_routed_expert(path):
@@ -1895,7 +1903,7 @@ def _plan_mtp_head(
                 continue
             new = {
                 "bits": steps[0],
-                "group_size": _OQ_DEFAULT_GROUP_SIZE,
+                "group_size": group_size,
                 "mode": _mode_for_bits(steps[0]),
             }
             delta = 8 * (
@@ -1926,7 +1934,7 @@ def _plan_mtp_head(
 
 def resolve_output_name(
     model_name: str,
-    oq_level: int,
+    oq_level: float,
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
     enhanced: bool = False,
@@ -3925,7 +3933,7 @@ def _sensitivity_lm_config_override(
     return None
 
 
-def make_predicate(config: dict, oq_level: int = 4) -> Callable:
+def make_predicate(config: dict, oq_level: float = 4) -> Callable:
     """Create a quant_predicate closure for mlx-lm's quantize_model."""
 
     def predicate(path: str, module) -> bool | dict:
@@ -3936,7 +3944,7 @@ def make_predicate(config: dict, oq_level: int = 4) -> Callable:
 
 def estimate_bpw_and_size(
     model_path: str,
-    oq_level: int,
+    oq_level: float,
     group_size: int = 64,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
@@ -4129,6 +4137,7 @@ def estimate_bpw_and_size(
             target_bpw=_level_targets[0],
             hard_cap_bpw=_level_targets[1],
             fixed_overrides=fixed_overrides,
+            group_size=group_size,
         )
         config["_oq_boost_map"] = plan.boost_map
     else:
@@ -5232,7 +5241,7 @@ def _is_mtp_protected_tensor(name: str) -> bool:
 
 
 def _get_predicate_bits(
-    tensor_name: str, config: dict, oq_level: int, group_size: int
+    tensor_name: str, config: dict, oq_level: float, group_size: int
 ) -> tuple:
     """Get quantization bits, group_size, and mode for a tensor.
 
@@ -6849,8 +6858,8 @@ def _resolve_stream_calibration(
 def quantize_oq_streaming(
     model_path: str,
     output_path: str,
-    oq_level: int,
-    group_size: int = 64,
+    oq_level: float,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
     progress_callback: Callable[[str, float], None] | None = None,
     text_only: bool = False,
     target_bpw: float | None = None,
@@ -7250,6 +7259,7 @@ def quantize_oq_streaming(
                 sensitivity_num_samples=_SENS_NUM_SAMPLES,
                 sensitivity_seq_length=_SENS_SEQ_LENGTH,
                 require_mtp_entries=preserve_mtp,
+                group_size=group_size,
             )
         except BaseException:
             _cleanup_ram_safe_proxy()
@@ -7327,6 +7337,7 @@ def quantize_oq_streaming(
                 num_samples=_SENS_NUM_SAMPLES,
                 seq_length=_SENS_SEQ_LENGTH,
                 trust_remote_code=trust_remote_code,
+                group_size=group_size,
             )
         elif not _model_requires_proxy and _uses_quantized_source_sensitivity(config):
             # Native FP8/MXFP8 sources load as quantized modules. The raw QDQ
@@ -7395,6 +7406,7 @@ def quantize_oq_streaming(
                 num_samples=128,
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
+                group_size=group_size,
             )
 
     # Single enforcement point. Inner measurement helpers may return {} on
@@ -7535,6 +7547,7 @@ def quantize_oq_streaming(
             target_bpw=_t,
             hard_cap_bpw=_c,
             fixed_overrides=fixed_overrides,
+            group_size=group_size,
         )
         config["_oq_boost_map"] = plan.boost_map
         logger.info(
@@ -10281,7 +10294,12 @@ def _streamed_sensitivity_state(
 
 
 def _streamed_sensitivity_layer(
-    state: dict[str, Any], layer_idx: int, block, config, oq_level
+    state: dict[str, Any],
+    layer_idx: int,
+    block,
+    config: dict,
+    oq_level: float,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
 ) -> None:
     """Measure one layer's qdq sensitivity while its block is resident.
 
@@ -10310,7 +10328,7 @@ def _streamed_sensitivity_layer(
             f"no output for {type(block).__name__}"
         )
     saved = _temporary_quantize_block(
-        block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer_idx
+        block, config, oq_level, group_size, layer_idx=layer_idx
     )
     try:
         out_quant, _ = _forward_layer_result(
@@ -10456,6 +10474,7 @@ def _collect_imatrix_streaming(
     sensitivity_seq_length: int = 256,
     sensitivity_calib_seed: int = _OQE_STREAM_CALIB_SEED,
     require_mtp_entries: bool = True,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
 ) -> tuple[dict[str, OQImatrixEntry], dict[str, Any]]:
     """Collect the oQe imatrix with one decoder layer resident at a time.
 
@@ -10698,7 +10717,12 @@ def _collect_imatrix_streaming(
                 # sensitivity forwards ride the same residency. Sensitivity
                 # is a single pass; escalation rounds skip it.
                 _streamed_sensitivity_layer(
-                    sens_state, layer_idx, block, config, sensitivity_oq_level
+                    sens_state,
+                    layer_idx,
+                    block,
+                    config,
+                    sensitivity_oq_level,
+                    group_size,
                 )
             # The generator owns the other reference and releases it when
             # resumed, before sourcing the next layer.
@@ -11029,6 +11053,7 @@ def _load_or_collect_imatrix(
     sensitivity_num_samples: int = 32,
     sensitivity_seq_length: int = 256,
     require_mtp_entries: bool = True,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
 ) -> OQImatrixData:
     source = Path(model_path)
     path = Path(cache_path)
@@ -11112,6 +11137,7 @@ def _load_or_collect_imatrix(
             sensitivity_num_samples=sensitivity_num_samples,
             sensitivity_seq_length=sensitivity_seq_length,
             require_mtp_entries=require_mtp_entries,
+            group_size=group_size,
         )
     else:
         # ``load_path_factory`` swaps in an alternate checkpoint for the
@@ -11169,11 +11195,12 @@ def _load_or_collect_imatrix(
 def _measure_sensitivity_from_model(
     model,
     tokenizer,
-    config,
-    oq_level,
-    calib_dataset="code_multilingual",
-    num_samples=32,
-    seq_length=256,
+    config: dict,
+    oq_level: float,
+    calib_dataset: str = "code_multilingual",
+    num_samples: int = 32,
+    seq_length: int = 256,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
 ):
     """Measure per-layer quantization sensitivity on an already-loaded model.
 
@@ -11233,7 +11260,7 @@ def _measure_sensitivity_from_model(
             continue
 
         saved = _temporary_quantize_block(
-            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer_idx
+            block, config, oq_level, group_size, layer_idx=layer_idx
         )
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
@@ -11275,11 +11302,12 @@ def _measure_sensitivity_from_model(
 def _measure_sensitivity(
     model_path: str,
     config: dict,
-    oq_level,
-    calib_dataset="code_multilingual",
-    num_samples=32,
-    seq_length=256,
+    oq_level: float,
+    calib_dataset: str = "code_multilingual",
+    num_samples: int = 32,
+    seq_length: int = 256,
     trust_remote_code: bool = False,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
 ):
     """Measure sensitivity by loading model temporarily. Used by streaming path."""
     from omlx.utils.model_loading import (
@@ -11373,6 +11401,7 @@ def _measure_sensitivity(
         calib_dataset,
         num_samples,
         seq_length,
+        group_size,
     )
 
     del model, tokenizer
@@ -11392,6 +11421,7 @@ def _measure_sensitivity_streaming(
     seq_length: int = 256,
     trust_remote_code: bool = False,
     calib_seed: int = _OQE_STREAM_CALIB_SEED,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
 ) -> dict[int, float]:
     """Measure per-layer qdq sensitivity with one decoder layer resident.
 
@@ -11428,7 +11458,8 @@ def _measure_sensitivity_streaming(
     for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
         source, config, trust_remote_code=trust_remote_code
     ):
-        _streamed_sensitivity_layer(state, layer_idx, block, config, oq_level)
+        _streamed_sensitivity_layer(
+            state, layer_idx, block, config, oq_level, group_size=group_size)
         del block
         mx.synchronize()
         mx.clear_cache()
@@ -11748,10 +11779,10 @@ def _build_streaming_proxy_for_sensitivity(
 def _measure_sensitivity_from_quantized_model(
     model_path: str,
     config: dict,
-    oq_level,
-    calib_dataset="code_multilingual",
-    num_samples=32,
-    seq_length=256,
+    oq_level: float,
+    calib_dataset: str = "code_multilingual",
+    num_samples: int = 32,
+    seq_length: int = 256,
     trust_remote_code: bool = False,
 ):
     """Measure sensitivity via re-quantization on a quantized model.
@@ -11927,7 +11958,7 @@ def _measure_sensitivity_from_quantized_model(
             if not hasattr(m, "scales") or not hasattr(m, "weight"):
                 continue
             bits = getattr(m, "bits", 4)
-            gs = getattr(m, "group_size", 64)
+            gs = getattr(m, "group_size", _OQ_DEFAULT_GROUP_SIZE)
             mode = getattr(m, "mode", "affine")
             # Perturb at the closest valid bit-width below the module's own
             # bits (8→6, 4→3, ...). bits-1 alone silently skipped every
