@@ -425,6 +425,9 @@ class ModelSettingsRequest(BaseModel):
     specprefill_draft_model: str | None = None
     specprefill_keep_pct: float | None = None
     specprefill_threshold: int | None = None
+    # "Active for every request": request-time default when the drafter is
+    # loaded. Field of models AND aliases (universal profile field).
+    specprefill_auto_enabled: bool | None = None
     # External engine (omlx/engine/splash.py); null runs the model in-process
     external_engine: str | None = None
     # DFlash (block diffusion speculative decoding)
@@ -3194,6 +3197,9 @@ async def update_model_settings(
         current_settings.specprefill_keep_pct = request.specprefill_keep_pct or None
     if "specprefill_threshold" in sent:
         current_settings.specprefill_threshold = request.specprefill_threshold or None
+    if "specprefill_auto_enabled" in sent:
+        # None = unset: active for every request (the default).
+        current_settings.specprefill_auto_enabled = request.specprefill_auto_enabled
     if "external_engine" in sent:
         engine_id = None if is_diffusion_model else request.external_engine or None
         # Check only a change: a client may resend the stored value, and a

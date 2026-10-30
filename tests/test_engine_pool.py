@@ -2198,6 +2198,24 @@ class TestEnginePoolAsync:
         assert pool._engine_runtime_signature("model-a", dflash) != pure_signature
         assert pool._engine_runtime_signature("model-a", vlm_mtp) != pure_signature
 
+        # SPEC-1 v3: the drafter IDENTITY is engine material; keep rate and
+        # threshold apply per request and must not fork a variant.
+        base_sp = ModelSettings(
+            specprefill_enabled=True, specprefill_draft_model="/draft"
+        )
+        tuned_sp = ModelSettings(
+            specprefill_enabled=True,
+            specprefill_draft_model="/draft",
+            specprefill_keep_pct=0.4,
+            specprefill_threshold=4096,
+        )
+        sp_signature = pool._engine_runtime_signature("model-a", base_sp)
+        assert pool._engine_runtime_signature("model-a", tuned_sp) == sp_signature
+        other_drafter = ModelSettings(
+            specprefill_enabled=True, specprefill_draft_model="/other"
+        )
+        assert pool._engine_runtime_signature("model-a", other_drafter) != sp_signature
+
     @pytest.mark.asyncio
     async def test_base_request_reloads_after_profile_variant(
         self, pool_with_mock_engines

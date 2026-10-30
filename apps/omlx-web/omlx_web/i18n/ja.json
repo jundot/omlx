@@ -1429,6 +1429,8 @@
   "modal.model_settings.index_cache_hint": "DSAレイヤーで冗長なインデクサー計算をスキップします（DeepSeek V3/GLM-5）。",
   "modal.model_settings.index_cache_freq": "頻度（N番目のレイヤーごとにインデクサーを保持）",
   "modal.model_settings.specprefill": "SpecPrefill",
+  "modal.model_settings.specprefill_auto": "すべてのリクエストで有効",
+  "modal.model_settings.specprefill_auto_hint": "閾値を超えるすべてのリクエストにSpecPrefillを適用します。オフの場合、ドラフトモデルは読み込まれたまま待機します：リクエストごとにオプトインでき、モデルエイリアスで有効化できます。",
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "強制サンプリング",
   "modal.model_settings.force_sampling_hint": "クライアントやエージェントが別の値を要求しても、ここで設定した Temperature、Top P、Top K を使用します。",

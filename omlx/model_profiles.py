@@ -40,6 +40,16 @@ UNIVERSAL_PROFILE_FIELDS = (
     "max_tool_result_tokens",
     "chat_template_kwargs",
     "forced_ct_kwargs",
+    # SpecPrefill activation: request-time default for the loaded drafter.
+    # An alias may toggle it without changing the engine's runtime identity.
+    "specprefill_auto_enabled",
+    # SPEC-1 v3: keep rate and threshold are request-time too. Upstream
+    # classified them model-specific, which routes them through the transient
+    # engine-variant lane (reload per alias); they left the runtime signature
+    # (engine_pool._engine_runtime_signature) and the universal lane carries
+    # them to the server's per-request forward instead.
+    "specprefill_keep_pct",
+    "specprefill_threshold",
 )
 
 # Model-specific fields — eligible for per-model profiles only (never templates).
@@ -83,10 +93,6 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
-    "specprefill_enabled",
-    "specprefill_draft_model",
-    "specprefill_keep_pct",
-    "specprefill_threshold",
     "index_cache_freq",
 )
 
@@ -120,6 +126,13 @@ EXCLUDED_FROM_PROFILES = frozenset(
         # Memory residency of an embedding model's audio tower; explicit per model.
         "embedding_audio_enabled",
         "embedding_audio_max_seconds",
+        # SpecPrefill's master switch and drafter decide the engine's runtime
+        # identity. Letting an alias override them would fork an engine
+        # variant per alias and reload on every switch; an alias tunes
+        # activation with specprefill_auto_enabled and the request-time
+        # keep_pct / threshold instead.
+        "specprefill_enabled",
+        "specprefill_draft_model",
     }
 )
 

@@ -1750,6 +1750,141 @@ def test_chat_completion_returns_token_logprobs(
     ]
 
 
+@pytest.mark.parametrize(
+    "body_flag,auto,expect_kwarg",
+    [
+        (None, None, True),     # unset = active for every request
+        (None, False, False),   # alias keeps the loaded drafter idle
+        (None, True, True),     # alias is active for every request
+        (True, False, True),    # the body flag wins over the alias default
+        (False, True, False),
+    ],
+)
+def test_chat_completion_specprefill_activation_default(
+    monkeypatch, prepared_chat_engine, body_flag, auto, expect_kwarg
+):
+    """Without a body flag the model/alias activation flag is the default."""
+    engine = prepared_chat_engine
+    engine.preflight_chat = AsyncMock()
+    engine.chat = AsyncMock(return_value=GenerationOutput(text="Hello"))
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = None
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    ms = ModelSettings(
+        specprefill_enabled=True,
+        specprefill_draft_model="/some/draft",
+        specprefill_auto_enabled=auto,
+    )
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: ms)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+
+    body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+    }
+    if body_flag is not None:
+        body["specprefill"] = body_flag
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    assert engine.chat.call_args.kwargs["specprefill"] is expect_kwarg
+
+
+def test_chat_completion_omits_specprefill_without_drafter(
+    monkeypatch, prepared_chat_engine
+):
+    """Master off: the server must not send any specprefill decision."""
+    engine = prepared_chat_engine
+    engine.preflight_chat = AsyncMock()
+    engine.chat = AsyncMock(return_value=GenerationOutput(text="Hello"))
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = None
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    ms = ModelSettings(specprefill_auto_enabled=False)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: ms)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+
+    body = {"model": "test-model", "messages": [{"role": "user", "content": "Hi"}]}
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post("/v1/chat/completions", json=body)
+
+    assert response.status_code == 200, response.text
+    assert "specprefill" not in engine.chat.call_args.kwargs
+
+
+def test_chat_completion_forwards_effective_specprefill_knobs(
+    monkeypatch, prepared_chat_engine
+):
+    """SPEC-1 v3: profile-merged keep/threshold ride the per-request channel
+    (they left the engine signature); a body value still wins."""
+    engine = prepared_chat_engine
+    engine.preflight_chat = AsyncMock()
+    engine.chat = AsyncMock(return_value=GenerationOutput(text="Hello"))
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = None
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    ms = ModelSettings(
+        specprefill_enabled=True,
+        specprefill_draft_model="/some/draft",
+        specprefill_keep_pct=0.4,
+        specprefill_threshold=4096,
+    )
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: ms)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    base_body = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hi"}],
+    }
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        r = client.post("/v1/chat/completions", json=base_body)
+        assert r.status_code == 200, r.text
+        kw = engine.chat.call_args.kwargs
+        assert kw["specprefill_keep_pct"] == 0.4
+        assert kw["specprefill_threshold"] == 4096
+        # activation unset -> active for every request
+        assert kw["specprefill"] is True
+
+        r = client.post(
+            "/v1/chat/completions",
+            json=base_body | {"specprefill_keep_pct": 0.1},
+        )
+        assert r.status_code == 200, r.text
+        kw = engine.chat.call_args.kwargs
+        assert kw["specprefill_keep_pct"] == 0.1
+        assert kw["specprefill_threshold"] == 4096
+
+
 @pytest.mark.parametrize("subclass", [False, True])
 def test_prepare_chat_prompt_for_request_keeps_other_engine_count_path(subclass):
     class OtherBatchedEngine(BatchedEngine):

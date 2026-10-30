@@ -1052,3 +1052,44 @@ def test_oq_a8_is_a_model_specific_profile_field():
     for name in ("a8_prefill_enabled", "a8_prefill_min_tokens"):
         assert name in MODEL_SPECIFIC_PROFILE_FIELDS
         assert name not in UNIVERSAL_FIELDS_SET
+
+
+def test_specprefill_classifications_after_activation_split():
+    """Master switch and drafter ride the model, not the alias.
+
+    An alias overriding them would fork an engine variant and reload on every
+    switch. Activation per alias is specprefill_auto_enabled (universal);
+    keep rate and threshold stay model-specific profile fields but left the
+    engine runtime signature, so they apply per request without a reload.
+    """
+    from omlx.model_profiles import (
+        EXCLUDED_FROM_PROFILES,
+        MODEL_SPECIFIC_PROFILE_FIELDS,
+        UNIVERSAL_FIELDS_SET,
+    )
+
+    for name in ("specprefill_enabled", "specprefill_draft_model"):
+        assert name in EXCLUDED_FROM_PROFILES
+        assert name not in MODEL_SPECIFIC_PROFILE_FIELDS
+        assert name not in UNIVERSAL_FIELDS_SET
+    for name in (
+        "specprefill_keep_pct",
+        "specprefill_threshold",
+        "specprefill_auto_enabled",
+    ):
+        assert name in UNIVERSAL_FIELDS_SET
+        assert name not in MODEL_SPECIFIC_PROFILE_FIELDS
+        assert name not in EXCLUDED_FROM_PROFILES
+
+
+def test_specprefill_auto_enabled_round_trips():
+    """None = the default (active for every request); False persists."""
+    legacy = ModelSettings.from_dict(
+        {"specprefill_enabled": True, "specprefill_draft_model": "/draft"}
+    )
+    assert legacy.specprefill_auto_enabled is None
+    assert "specprefill_auto_enabled" not in legacy.to_dict()
+
+    off = ModelSettings.from_dict(legacy.to_dict() | {"specprefill_auto_enabled": False})
+    assert off.specprefill_auto_enabled is False
+    assert ModelSettings.from_dict(off.to_dict()).specprefill_auto_enabled is False

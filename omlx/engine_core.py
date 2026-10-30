@@ -786,8 +786,12 @@ class EngineCore:
         # The scheduler checks _specprefill_enabled to decide whether to score.
         if specprefill is not None:
             request._specprefill_enabled = specprefill
-        elif self.scheduler._specprefill_draft_model is not None:
-            # Draft model is loaded → enable by default
+        elif (
+            self.scheduler._specprefill_draft_model is not None
+            and getattr(self.scheduler, "_specprefill_auto_enabled", True)
+        ):
+            # Draft model is loaded and the model keeps SpecPrefill active
+            # for every request → enable by default.
             request._specprefill_enabled = True
         if specprefill_keep_pct is not None:
             request._specprefill_keep_pct = specprefill_keep_pct

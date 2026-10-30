@@ -1429,6 +1429,8 @@
   "modal.model_settings.index_cache_hint": "Pular computação redundante do indexador em camadas DSA (DeepSeek V3/GLM-5).",
   "modal.model_settings.index_cache_freq": "Frequência (a cada N-ésima camada mantém o indexador)",
   "modal.model_settings.specprefill": "SpecPrefill",
+  "modal.model_settings.specprefill_auto": "Ativo para cada solicitação",
+  "modal.model_settings.specprefill_auto_hint": "Aplica o SpecPrefill a toda solicitação acima do limite. Desativado, o modelo rascunho permanece carregado, mas ocioso: as solicitações podem ativá-lo individualmente e os apelidos de modelo podem habilitá-lo.",
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Forçar Amostragem",
   "modal.model_settings.force_sampling_hint": "Usa estes valores de Temperature, Top P e Top K mesmo quando um cliente ou agente solicita outros.",

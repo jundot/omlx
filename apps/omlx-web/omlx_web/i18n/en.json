@@ -1429,6 +1429,8 @@
   "modal.model_settings.index_cache_hint": "Skip redundant indexer computation in DSA layers (DeepSeek V3/GLM-5).",
   "modal.model_settings.index_cache_freq": "Frequency (every Nth layer keeps indexer)",
   "modal.model_settings.specprefill": "SpecPrefill",
+  "modal.model_settings.specprefill_auto": "Active for Every Request",
+  "modal.model_settings.specprefill_auto_hint": "Use SpecPrefill on every request above the threshold. When off, the drafter stays loaded but idle — requests can opt in individually and model aliases can turn it on.",
   "modal.model_settings.dflash": "DFlash",
   "modal.model_settings.force_sampling": "Force Sampling",
   "modal.model_settings.force_sampling_hint": "Uses these Temperature, Top P and Top K values even when a client or agent requests different ones.",
