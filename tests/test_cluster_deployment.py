@@ -289,20 +289,29 @@ def test_jaccl_requires_complete_matrix_with_null_diagonal():
         )
 
 
-def test_rank_zero_must_be_local_launcher_process():
+def test_rank_zero_may_be_spawned_over_ssh():
+    """MLX's local-child launch cannot join the ring on macOS Tahoe.
+
+    The identical hostfile joins when rank 0 is spawned over ssh to the
+    machine's own address, so a remote rank-0 target must be accepted; only
+    an empty one is rejected (``ClusterHost`` refuses that already).
+    """
+
     deployment = _deployment("ring")
-    with pytest.raises(ValueError, match="rank 0"):
-        ClusterDeployment(
-            deployment_id=deployment.deployment_id,
-            model=deployment.model,
-            backend=deployment.backend,
-            hosts=(
-                ClusterHost("large", "large.local", ("192.168.20.1",)),
-                deployment.hosts[1],
-            ),
-            assignments=deployment.assignments,
-            plan_hash=deployment.plan_hash,
-        )
+
+    remote_rank_zero = ClusterDeployment(
+        deployment_id=deployment.deployment_id,
+        model=deployment.model,
+        backend=deployment.backend,
+        hosts=(
+            ClusterHost("large", "large.local", ("192.168.20.1",)),
+            deployment.hosts[1],
+        ),
+        assignments=deployment.assignments,
+        plan_hash=deployment.plan_hash,
+    )
+
+    assert remote_rank_zero.hosts[0].ssh == "large.local"
 
 
 def test_decode_worker_plan_rejects_trailing_compressed_payload():
