@@ -857,7 +857,9 @@ class TestModelFallback:
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
 
         if found_model:
-            mock_engine = MagicMock()
+            from omlx.engine.base import BaseEngine
+
+            mock_engine = MagicMock(spec=BaseEngine)
 
             async def mock_get_engine(model_id):
                 if model_id == found_model:
