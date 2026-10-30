@@ -1597,7 +1597,9 @@ Example directory structure:
         help="Emit machine-readable JSON",
     )
 
-    image_parser = subparsers.add_parser("inspect-image", help="Inspect a native image bundle without loading weights")
+    image_parser = subparsers.add_parser(
+        "inspect-image", help="Inspect a native image bundle without loading weights"
+    )
     image_parser.add_argument("path")
     image_parser.add_argument("--json", action="store_true")
     image_parser.add_argument("--verify-hashes", action="store_true")
@@ -1632,6 +1634,7 @@ Example directory structure:
             sys.exit(lifecycle_command(args))
         elif args.command == "inspect-image":
             from .image_inspect import inspect_command
+
             sys.exit(inspect_command(args))
         elif args.command == "diagnose":
             sys.exit(diagnose_command(args))
