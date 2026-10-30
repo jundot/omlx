@@ -49,6 +49,26 @@ class RequestStatus(enum.IntEnum):
         return None
 
 
+@dataclass(frozen=True)
+class DryParams:
+    """DRY repetition penalty settings (see omlx/utils/dry.py).
+
+    Field names follow llama.cpp's ``dry_*`` options. ``penalty_last_n``
+    counts tokens generated in the current response, not the whole context;
+    -1 means everything generated so far. ``exclude_reasoning`` turns the
+    penalty off inside the model's thinking block. The default breakers are
+    llama.cpp's plus "/": without it, parallel tool calls on files under one
+    directory get their shared path prefix penalized into misspellings.
+    """
+
+    multiplier: float
+    base: float = 1.75
+    allowed_length: int = 2
+    penalty_last_n: int = 4096
+    sequence_breakers: Tuple[str, ...] = ("\n", ":", '"', "*", "/")
+    exclude_reasoning: bool = False
+
+
 @dataclass
 class SamplingParams:
     """Sampling parameters for text generation."""
@@ -71,6 +91,8 @@ class SamplingParams:
     ngram_window: int = 0
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+    # DRY repetition penalty (None = disabled)
+    dry: Optional[DryParams] = None
     stop: Optional[List[str]] = None
     stop_token_ids: Optional[List[int]] = None
     # Forced-length generation (benchmark use): when True the model's own
