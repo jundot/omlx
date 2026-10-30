@@ -1995,7 +1995,8 @@
             isDraftModelBaseCandidate(model) {
                 if (!model || model.virtual) return false;
                 if (model.id === this.selectedModel?.id) return false;
-                return model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type;
+                return model.engine_type !== 'image' &&
+                    (model.model_type === 'llm' || model.model_type === 'vlm' || !model.model_type);
             },
 
             isDflashDraftModel(model) {
@@ -3889,7 +3890,8 @@
             },
 
             get llmModels() {
-                return this.models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type);
+                return this.models.filter(m => m.engine_type !== 'image' &&
+                    (m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type));
             },
 
             shellQuote(value) {

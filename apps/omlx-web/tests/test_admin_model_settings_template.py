@@ -21,6 +21,49 @@ def _dashboard_script() -> str:
     return (root / "omlx_web/static/js/dashboard.js").read_text()
 
 
+def test_image_model_type_option_is_localized():
+    html = _model_settings_template()
+    assert (
+        "<option value=\"image\">{{ t('modal.model_settings.model_type_image') }}</option>"
+        in html
+    )
+    root = Path(__file__).resolve().parents[1]
+    for locale in (root / "omlx_web/i18n").glob("*.json"):
+        assert json.loads(locale.read_text())["modal.model_settings.model_type_image"]
+
+
+def test_image_models_are_excluded_from_benchmark_and_draft_candidates():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required to exercise dashboard state")
+    script = (
+        """
+const assert = require('node:assert/strict');
+globalThis.localStorage = {getItem: () => null};
+globalThis.window = {t: key => key};
+"""
+        + _dashboard_script()
+        + """
+const app = dashboard();
+app.models = [
+    {id: 'chat', model_type: 'llm', engine_type: 'batched'},
+    {id: 'vision', model_type: 'vlm', engine_type: 'vlm'},
+    {id: 'image', model_type: 'image', engine_type: 'image'},
+    {id: 'image-engine', model_type: 'llm', engine_type: 'image'},
+    {id: 'legacy'},
+];
+assert.deepEqual(app.llmModels.map(model => model.id), ['chat', 'vision', 'legacy']);
+app.selectedModel = {id: 'selected'};
+assert.equal(app.isDraftModelBaseCandidate(app.models[2]), false);
+assert.equal(app.isDraftModelBaseCandidate(app.models[3]), false);
+assert.equal(app.isDraftModelBaseCandidate(app.models[0]), true);
+"""
+    )
+    result = subprocess.run([node], input=script, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+
 def _section(html: str, start_marker: str, end_marker: str) -> str:
     after = html.split(start_marker, 1)[1]
     assert end_marker in after, f"{end_marker!r} must follow {start_marker!r}"
