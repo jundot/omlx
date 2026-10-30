@@ -595,6 +595,91 @@ def _rank_marker_matches(
     )
 
 
+def _rendezvous_addresses(
+    deployment: ClusterDeployment,
+    collective_port: int,
+) -> dict[int, list[str]]:
+    """Per-rank ring listener addresses exactly as ``mlx.launch`` assigns them.
+
+    ``launch_ring`` walks the hostfile in rank order and increments one port
+    counter for every ``(ip, connection)`` pair, so rank ``i`` listens on the
+    slice of the span that follows the slices of all lower ranks. Mirroring
+    that arithmetic here lets a failure name the addresses each rank should
+    have been serving, which is the difference between debugging a ring
+    timeout and guessing at one.
+    """
+
+    connections = (
+        deployment.execution.ring_connections_per_ip
+        if deployment.backend == "ring"
+        else 1
+    )
+    addresses: dict[int, list[str]] = {}
+    port = int(collective_port)
+    for rank, host in enumerate(deployment.hosts):
+        addresses[rank] = [
+            f"{ip}:{port + offset}" for ip in host.ips for offset in range(connections)
+        ]
+        port += len(host.ips) * connections
+    return addresses
+
+
+def _reap_stale_remote_workers(
+    deployment: ClusterDeployment,
+    *,
+    kill_grace: float = 5.0,
+    runner: SSHRunner = subprocess.run,
+) -> list[dict[str, Any]]:
+    """Kill peer rank workers an earlier launch left behind.
+
+    ``reap_orphaned_launches`` only acts when the *coordinator* died (G8). A
+    failed launch whose teardown could not be verified leaves its manifest
+    looking active, so a remote rank that survived SIGKILL keeps running with
+    the *previous* launch's rendezvous ports and a slice of wired memory.
+    Deployment identities are stable across reloads, so before this launch
+    has spawned a single rank, every live ``omlx.cluster.inference_worker``
+    with this deployment id on a peer is by definition stale. Finding it here
+    turns a 36-second opaque ring connect timeout into a fast, named failure.
+    """
+
+    failures: list[str] = []
+    reaped: list[dict[str, Any]] = []
+    for rank, host in enumerate(deployment.hosts):
+        if host.ssh in _LOOPBACK_SSH_TARGETS:
+            continue
+        pids, scan_error = _remote_deployment_worker_pids(
+            host.ssh,
+            deployment.deployment_id,
+            runner=runner,
+        )
+        if scan_error:
+            raise DistributedLaunchError(
+                f"could not scan {host.node_id} for stale rank workers of "
+                f"{deployment.deployment_id}: {scan_error}"
+            )
+        for pid in pids or ():
+            if _kill_remote_pid(host.ssh, pid, grace=kill_grace, runner=runner):
+                logger.warning(
+                    "Reaped stale remote rank worker pid %d of deployment %s on %s",
+                    pid,
+                    deployment.deployment_id,
+                    host.node_id,
+                )
+                reaped.append({"rank": rank, "node_id": host.node_id, "pid": pid})
+            else:
+                failures.append(
+                    f"stale rank worker pid {pid} on {host.node_id} survived " "SIGKILL"
+                )
+    if failures:
+        raise DistributedLaunchError(
+            f"previous launch of {deployment.deployment_id} left rank workers "
+            "that could not be killed: "
+            + "; ".join(failures)
+            + f". {_REBOOT_REQUIRED_GUIDANCE}"
+        )
+    return reaped
+
+
 def _sweep_rank_processes(
     deployment_id: str,
     hosts: list[dict[str, Any]],
@@ -2013,9 +2098,11 @@ def probe_remote_system_host(
         [str(item) for item in raw_evidence] if isinstance(raw_evidence, list) else []
     )
     payload["warnings"] = [
-        "oMLX is installed on this node but its worker runtime could not be run."
-        if evidence
-        else "oMLX worker runtime is not installed on this node."
+        (
+            "oMLX is installed on this node but its worker runtime could not be run."
+            if evidence
+            else "oMLX worker runtime is not installed on this node."
+        )
     ]
     return {
         "ok": False,
@@ -2690,6 +2777,7 @@ class DistributedJobSupervisor:
         self.process: subprocess.Popen[str] | None = None
         self.port: int | None = None
         self.collective_port: int | None = None
+        self._rendezvous: dict[int, list[str]] = {}
         self.control_port: int | None = None
         self.control_token: str | None = None
         self.ready_event: dict[str, Any] | None = None
@@ -2726,6 +2814,16 @@ class DistributedJobSupervisor:
                 self.deployment,
                 python_executable=self.python_executable,
             )
+        # Called before this launch owns a single rank: anything found here
+        # belongs to a predecessor whose teardown never verified exit.
+        stale = _reap_stale_remote_workers(self.deployment)
+        if stale:
+            logger.warning(
+                "Reaped %d stale remote rank worker(s) before launching %s: %s",
+                len(stale),
+                self.deployment.deployment_id,
+                stale,
+            )
         # A deployment ID and plan hash are stable across reloads. Remove the
         # prior launch's gate before any rank can mistake it for this launch's
         # release signal.
@@ -2743,6 +2841,12 @@ class DistributedJobSupervisor:
             encoding="utf-8",
         )
         self.port, self.collective_port = _available_launch_ports(self.deployment)
+        self._rendezvous = _rendezvous_addresses(self.deployment, self.collective_port)
+        logger.info(
+            "Distributed rendezvous for %s: %s",
+            self.deployment.deployment_id,
+            self._rendezvous_description(),
+        )
         control_host = self.deployment.hosts[0].ips[0]
         self.control_port = _available_control_port(control_host)
         # The plan hash is public deployment identity, not authentication.
@@ -3142,6 +3246,7 @@ class DistributedJobSupervisor:
         self.process = None
         self.port = None
         self.collective_port = None
+        self._rendezvous = {}
         self.control_port = None
         self.control_token = None
         self.ready_event = None
@@ -3305,16 +3410,35 @@ class DistributedJobSupervisor:
                     completed.returncode,
                 )
 
+    def _rendezvous_description(self) -> str:
+        """One line naming every address each rank should be listening on."""
+
+        if not self._rendezvous or self.collective_port is None:
+            return "rendezvous unknown (job not launched)"
+        parts = []
+        for rank, host in enumerate(self.deployment.hosts):
+            addresses = self._rendezvous.get(rank)
+            if not addresses:
+                continue
+            parts.append(
+                f"rank {rank} ({host.node_id}) listens " + ", ".join(addresses)
+            )
+        return "; ".join(parts) or "rendezvous unknown (job not launched)"
+
     def _exit_detail(self, returncode: int | None) -> str:
         failure_reason = self._failure_reason() or self._runtime_failure_reason()
         if failure_reason:
             return (
                 f"distributed launcher exited with code {returncode}: {failure_reason}"
+                f" ({self._rendezvous_description()})"
             )
         lines = tuple(self._stderr)[-20:] or tuple(self._stdout)[-20:]
         detail = "\n".join(lines)
         suffix = f": {detail}" if detail else ""
-        return f"distributed launcher exited with code {returncode}{suffix}"
+        return (
+            f"distributed launcher exited with code {returncode}{suffix}"
+            f" ({self._rendezvous_description()})"
+        )
 
     def _runtime_failure_reason(self) -> str | None:
         """Recover the rank exception MLX's SSH cleanup can otherwise hide.
@@ -3383,6 +3507,7 @@ class DistributedJobSupervisor:
         detail = (
             f"distributed worker reported {event_type}: {reason or 'unknown failure'}"
         )
+        detail += f" ({self._rendezvous_description()})"
         if event_type == "rank_exit":
             # A rank that fails before its marker exists leaves only launcher
             # output. Remote ranks run under ``ssh -tt``, so their stderr

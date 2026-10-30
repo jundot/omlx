@@ -302,6 +302,88 @@ def test_ring_launch_reserves_full_collective_port_span():
     )
 
 
+def test_rendezvous_addresses_mirror_mlx_launch_ring_assignment():
+    deployment = _deployment()
+
+    addresses = launch._rendezvous_addresses(deployment, 51834)
+
+    assert addresses == {
+        0: ["10.0.0.1:51834", "10.0.0.1:51835"],
+        1: ["10.0.0.2:51836", "10.0.0.2:51837"],
+    }
+
+
+def test_supervisor_exit_detail_names_expected_ring_listeners():
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    supervisor.collective_port = 51834
+    supervisor._rendezvous = launch._rendezvous_addresses(_deployment(), 51834)
+
+    detail = supervisor._exit_detail(1)
+
+    assert "10.0.0.1:51834" in detail
+    assert "10.0.0.2:51837" in detail
+
+
+def test_reap_stale_remote_workers_kills_predecessor_ranks(monkeypatch):
+    deployment = _deployment()
+    scanned = []
+
+    def fake_scan(ssh_target, deployment_id, *, runner):
+        scanned.append((ssh_target, deployment_id))
+        return [4711, 4712], ""
+
+    killed = []
+
+    def fake_kill(ssh_target, pid, *, grace, runner):
+        killed.append((ssh_target, pid))
+        return True
+
+    monkeypatch.setattr(launch, "_remote_deployment_worker_pids", fake_scan)
+    monkeypatch.setattr(launch, "_kill_remote_pid", fake_kill)
+
+    reaped = launch._reap_stale_remote_workers(deployment)
+
+    # Rank 0 is loopback and never scanned; only the peer is.
+    assert scanned == [("user@studio.local", "cluster-test")]
+    assert killed == [
+        ("user@studio.local", 4711),
+        ("user@studio.local", 4712),
+    ]
+    assert reaped == [
+        {"rank": 1, "node_id": "studio", "pid": 4711},
+        {"rank": 1, "node_id": "studio", "pid": 4712},
+    ]
+
+
+def test_reap_stale_remote_workers_fails_fast_when_a_worker_survives(monkeypatch):
+    monkeypatch.setattr(
+        launch,
+        "_remote_deployment_worker_pids",
+        lambda *_args, **_kwargs: ([4711], ""),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_kill_remote_pid",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with pytest.raises(
+        launch.DistributedLaunchError, match=r"survived SIGKILL.*Reboot"
+    ):
+        launch._reap_stale_remote_workers(_deployment())
+
+
+def test_reap_stale_remote_workers_fails_fast_when_the_scan_fails(monkeypatch):
+    monkeypatch.setattr(
+        launch,
+        "_remote_deployment_worker_pids",
+        lambda *_args, **_kwargs: (None, "ssh transport broken"),
+    )
+
+    with pytest.raises(launch.DistributedLaunchError, match="ssh transport broken"):
+        launch._reap_stale_remote_workers(_deployment())
+
+
 def test_supervisor_preserves_structured_peer_loss_reason():
     supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
     reason = "rank 1 on studio stopped reporting"
@@ -2516,7 +2598,6 @@ def test_local_only_teardown_never_contacts_remote_peer(
         )
         assert result["ranks_checked"] == 1
     assert calls == [[{"rank": 0, "node_id": "local", "ssh": "127.0.0.1"}]]
-
 
 
 def test_supervisor_local_stop_skips_remote_reaping(tmp_path, monkeypatch):
