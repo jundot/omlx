@@ -417,6 +417,7 @@ class EngineCore:
             tokenizer=tokenizer,
             config=scheduler_config,
             stream=self._mlx_stream,
+            wake_callback=self._wake_engine_loop,
         )
 
         # Output collectors for low-latency streaming (vLLM pattern)
@@ -576,6 +577,12 @@ class EngineCore:
                     self._last_reap = now
                     self._reap_orphaned_collectors(now)
 
+                # Keep notifications arriving during a step visible to its
+                # subsequent throttled wait.
+                event = self._wake_event
+                if event is not None:
+                    event.clear()
+
                 if self.scheduler.has_requests():
                     step_outputs = await loop.run_in_executor(
                         self._mlx_executor, self._step_burst
@@ -665,23 +672,18 @@ class EngineCore:
                         # intentionally throttled by async cache cleanup. Avoid
                         # spinning the engine loop, but still let new requests
                         # wake the wait immediately.
-                        event = self._wake_event
                         if event is None:
                             await asyncio.sleep(step_interval)
                         else:
-                            event.clear()
                             with suppress(TimeoutError):
                                 await asyncio.wait_for(
                                     event.wait(), timeout=step_interval
                                 )
                 else:
-                    event = self._wake_event
                     if event is None:
                         await asyncio.sleep(step_interval)
                     else:
-                        event.clear()
-                        # Avoid losing a request that arrived between
-                        # has_requests() and clear().
+                        # Recheck work queued after the idle decision.
                         if self.scheduler.has_requests():
                             continue
                         with suppress(TimeoutError):
