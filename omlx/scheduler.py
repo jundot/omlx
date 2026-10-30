@@ -2248,7 +2248,13 @@ class Scheduler:
 
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
+        # Scheme the KV cache is actually built with ("turboquant", "affine4",
+        # "affine8"); the engine overwrites it once it picks one.
         self._turboquant_kv_scheme = "turboquant"
+        # Layers converted from fp16 to TurboQuant for served requests.
+        # Arming alone proves nothing before the first request, so this is
+        # what /api/status publishes as evidence that a conversion ran.
+        self._turboquant_kv_converted_layers: int = 0
         self._turboquant_skip_last: bool = True
         # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
         self._mla_model: bool | None = None
@@ -3839,7 +3845,12 @@ class Scheduler:
                 pass
 
         if detected:
-            logger.info(
+            # WARNING, not INFO: this detector is only reachable through
+            # _turboquant_eligible(), whose callers all gate on
+            # ``self._turboquant_kv_bits is not None`` — i.e. the user
+            # explicitly requested quantized KV and is silently getting fp16
+            # instead (#2859).
+            logger.warning(
                 "TurboQuant disabled: model uses Multi-head Latent Attention "
                 "(MLA), which is incompatible with quantized KV cache states; "
                 "keeping fp16 KV cache (#1613)."
@@ -3893,7 +3904,9 @@ class Scheduler:
                 pass
 
         if detected:
-            logger.info(
+            # WARNING for the same reason as the MLA veto above: reaching this
+            # detector means TurboQuant was armed for an explicit request.
+            logger.warning(
                 "TurboQuant disabled: model uses attention sinks, which are "
                 "not supported by TurboQuant's quantized attention kernels; "
                 "keeping fp16 KV cache."
@@ -4068,6 +4081,11 @@ class Scheduler:
                         new_caches.append(c)
                 cache_obj.caches = tuple(new_caches)
         if converted > 0:
+            # Created lazily: this helper is also called unbound on
+            # duck-typed schedulers that never ran __init__.
+            self._turboquant_kv_converted_layers = (
+                getattr(self, "_turboquant_kv_converted_layers", 0) + converted
+            )
             skip_msg = ", skipped last KVCache layer" if skip_last else ""
             logger.info(
                 f"{scheme}: converted {converted}/{len(prompt_cache)} "
