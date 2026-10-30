@@ -987,6 +987,23 @@ class TestBatchedEngineSpecPrefillForwarding:
         assert kwargs["request_id"] == "req-1"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("ignore_eos", [False, True])
+    async def test_generate_forwards_ignore_eos(self, ignore_eos):
+        """The non-streaming path must decode to max_tokens as the streaming one does."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+
+        await engine.generate("a prompt", ignore_eos=ignore_eos)
+
+        params = engine._engine.generate.call_args.kwargs["sampling_params"]
+        assert params.ignore_eos is ignore_eos
+
+    @pytest.mark.asyncio
     async def test_generate_forwards_tools(self):
         from omlx.engine.batched import BatchedEngine
 

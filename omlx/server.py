@@ -2099,6 +2099,10 @@ def _no_repeat_ngram_kwargs(request) -> dict[str, int]:
     return {"no_repeat_ngram_size": size, "ngram_window": window}
 
 
+def _ignore_eos_kwargs(request) -> dict[str, bool]:
+    return {"ignore_eos": True} if getattr(request, "ignore_eos", False) else {}
+
+
 # `off` keeps a one-shot request out of the prefix cache; lookups still run.
 _CACHE_STORE_HEADER = "X-oMLX-Cache-Store"
 
@@ -4706,6 +4710,7 @@ async def create_completion(
             if repetition_context_size is not None:
                 gen_kwargs["repetition_context_size"] = repetition_context_size
             gen_kwargs.update(_no_repeat_ngram_kwargs(request))
+            gen_kwargs.update(_ignore_eos_kwargs(request))
             gen_kwargs.update(_cache_store_kwargs(http_request))
 
             # First prompt's first-token timestamp only: later prompts start
@@ -5201,6 +5206,7 @@ async def create_chat_completion(
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
         chat_kwargs.update(_no_repeat_ngram_kwargs(request))
+        chat_kwargs.update(_ignore_eos_kwargs(request))
         chat_kwargs.update(_cache_store_kwargs(http_request))
 
         # Add seed for reproducible generation (best-effort)
@@ -6097,6 +6103,7 @@ async def stream_completion(
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
     gen_kwargs.update(_no_repeat_ngram_kwargs(request))
+    gen_kwargs.update(_ignore_eos_kwargs(request))
     if skip_cache_store:
         gen_kwargs["skip_cache_store"] = True
     outputs = engine.stream_generate(

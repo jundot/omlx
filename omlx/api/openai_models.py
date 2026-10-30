@@ -342,6 +342,10 @@ class ChatCompletionRequest(BaseModel):
     repetition_context_size: Optional[int] = Field(default=None, gt=0)
     no_repeat_ngram_size: int | None = Field(default=None, ge=0)
     ngram_window: int | None = Field(default=None, ge=0)
+    # Not in OpenAI's API; vLLM and llama.cpp's server take the same field.
+    # The model's own stop tokens don't end generation: only max_tokens and the
+    # request's stop strings do.
+    ignore_eos: bool = False
     max_tokens: Optional[int] = Field(
         default=None,
         gt=0,
@@ -531,6 +535,10 @@ class CompletionRequest(BaseModel):
     repetition_context_size: Optional[int] = Field(default=None, gt=0)
     no_repeat_ngram_size: int | None = Field(default=None, ge=0)
     ngram_window: int | None = Field(default=None, ge=0)
+    # Not in OpenAI's API; vLLM and llama.cpp's server take the same field.
+    # The model's own stop tokens don't end generation: only max_tokens and the
+    # request's stop strings do.
+    ignore_eos: bool = False
     max_tokens: Optional[int] = Field(default=None, gt=0)
     stream: bool = False
     stream_options: Optional[StreamOptions] = None

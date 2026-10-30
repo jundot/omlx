@@ -815,6 +815,15 @@ class TestCompletionModels:
         with pytest.raises(ValidationError):
             CompletionRequest.model_validate({"model": "m", "prompt": "hi"} | fields)
 
+    def test_ignore_eos_defaults_off_and_parses(self):
+        chat = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        completion = {"model": "m", "prompt": "hi"}
+        assert ChatCompletionRequest.model_validate(chat).ignore_eos is False
+        assert CompletionRequest.model_validate(completion).ignore_eos is False
+        on = {"ignore_eos": True}
+        assert ChatCompletionRequest.model_validate(chat | on).ignore_eos is True
+        assert CompletionRequest.model_validate(completion | on).ignore_eos is True
+
     def test_completion_request(self):
         """Test creating completion request."""
         req = CompletionRequest(
