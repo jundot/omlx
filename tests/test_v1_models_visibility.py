@@ -67,6 +67,47 @@ def test_lists_all_models_by_default(tmp_path):
     assert _list_ids(state) == ["chat-a", "chat-b"]
 
 
+def test_image_listing_exposes_tasks(tmp_path):
+    state = _state(
+        [
+            _model("chat-a"),
+            _model(
+                "image-a",
+                model_type="image",
+                engine_type="image",
+                capabilities=["generation", "edit"],
+                tasks=["generation", "edit"],
+            ),
+        ],
+        tmp_path,
+    )
+    state.settings_manager.set_settings(
+        "image-a", ModelSettings(model_alias="image-alias")
+    )
+    state.settings_manager.save_profile(
+        "image-a",
+        "fast",
+        "Fast",
+        None,
+        {"temperature": 0.1},
+        expose_as_model=True,
+    )
+    with (
+        patch("omlx.server._server_state", state),
+        patch("omlx.server.get_max_context_window", return_value=None),
+    ):
+        response = TestClient(app).get("/v1/models")
+    assert response.status_code == 200
+    chat, image, profile = response.json()["data"]
+    assert "model_type" not in chat
+    assert "tasks" not in chat
+    assert image["id"] == "image-alias"
+    assert image["model_type"] == image["engine_type"] == "image"
+    assert image["capabilities"] == image["tasks"] == ["generation", "edit"]
+    assert profile["model_type"] == profile["engine_type"] == "image"
+    assert profile["tasks"] == ["generation", "edit"]
+
+
 def test_per_model_hidden_excluded(tmp_path):
     state = _state([_model("chat-a"), _model("chat-b")], tmp_path)
     state.settings_manager.set_settings("chat-b", ModelSettings(is_hidden=True))
