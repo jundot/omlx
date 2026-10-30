@@ -3,6 +3,7 @@
 import base64
 import json
 import zlib
+from dataclasses import replace
 
 import pytest
 
@@ -72,6 +73,31 @@ def _deployment(backend: str = "jaccl") -> ClusterDeployment:
         assignments=_assignments(),
         plan_hash="a" * 64,
     )
+
+
+def test_worker_plan_carries_the_engram_ssd_offload_decision():
+    """The rank's only channel for a per-model setting is the signed plan."""
+
+    deployment = replace(
+        _deployment(),
+        assignments=tuple(
+            replace(item, engram_ssd_offload=True) for item in _assignments()
+        ),
+    )
+
+    plan_hash, decoded = decode_worker_plan(deployment.encode_worker_plan())
+
+    assert plan_hash == deployment.plan_hash
+    assert all(item.engram_ssd_offload for item in decoded)
+    # A plan from before the field keeps the resident default instead of
+    # failing to launch.
+    old_payload = deployment.to_dict()
+    old_payload["assignments"] = [
+        {key: value for key, value in item.items() if key != "engram_ssd_offload"}
+        for item in old_payload["assignments"]
+    ]
+    restored = ClusterDeployment.from_dict(old_payload)
+    assert not any(item.engram_ssd_offload for item in restored.assignments)
 
 
 def test_deployment_round_trip_and_worker_plan_are_json_only():

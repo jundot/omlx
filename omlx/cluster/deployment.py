@@ -301,6 +301,7 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             manual_memory_limit=bool(payload.get("manual_memory_limit", False)),
             role=role,
             memory_guard_tier=memory_guard_tier,
+            engram_ssd_offload=bool(payload.get("engram_ssd_offload", False)),
             tensor_parallel_rank=int(payload.get("tensor_parallel_rank", 0)),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             sharded_weight_bytes=int(payload.get("sharded_weight_bytes", 0)),

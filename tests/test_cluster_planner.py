@@ -214,6 +214,42 @@ def test_lightning_mtp_head_is_measured_apart_and_charged_to_rank_zero(
         with_mtp_head(ModelLayout("plain", 0, (1,)))
 
 
+def test_pipeline_plans_carry_the_engram_ssd_offload_flag():
+    """One argv runs on every host, so the flag rides the signed plan."""
+
+    model = synthetic_model_layout(
+        total_weight_bytes=300 * GIB,
+        layer_count=80,
+    )
+    nodes = [
+        NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
+        NodeBudget(node_id="mobile", capacity_bytes=128 * GIB, rank=1),
+    ]
+
+    resident = plan_unequal_pipeline(model, nodes)
+    offloaded = plan_unequal_pipeline(model, nodes, engram_ssd_offload=True)
+    proportional = plan_proportional_pipeline(
+        synthetic_model_layout(total_weight_bytes=300 * GIB, layer_count=80),
+        nodes,
+        engram_ssd_offload=True,
+    )
+    hybrid = plan_hybrid(
+        model,
+        nodes,
+        tensor_parallel_size=1,
+        engram_ssd_offload=True,
+    )
+
+    for plan in (offloaded, proportional, hybrid):
+        assert all(item.engram_ssd_offload for item in plan.assignments)
+    assert not any(item.engram_ssd_offload for item in resident.assignments)
+    # Identity: the same layers on the same Macs with a different table
+    # residency must not share a plan hash, or a staleness check would
+    # accept a resident launch of an offloaded plan.
+    assert offloaded.plan_hash != resident.plan_hash
+    assert "engram_ssd_offload" in offloaded.assignments[0].to_dict()
+
+
 def test_unequal_planner_gives_more_layers_to_larger_mac():
     model = synthetic_model_layout(
         total_weight_bytes=300 * GIB,
@@ -523,9 +559,10 @@ def test_the_planner_puts_each_nodes_memory_tier_on_its_own_assignment():
         plan_unequal_pipeline(model, nodes),
         plan_hybrid(model, nodes, tensor_parallel_size=1),
     ):
-        assert {
-            item.node_id: item.memory_guard_tier for item in plan.assignments
-        } == {"studio": "aggressive", "macbook": "safe"}
+        assert {item.node_id: item.memory_guard_tier for item in plan.assignments} == {
+            "studio": "aggressive",
+            "macbook": "safe",
+        }
 
 
 def test_a_memory_tier_changes_the_plan_hash_and_typos_are_refused():
@@ -575,7 +612,9 @@ def test_a_node_role_changes_the_plan_hash():
             model,
             [
                 NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
-                NodeBudget(node_id="macbook", capacity_bytes=200 * GIB, rank=1, role=role),
+                NodeBudget(
+                    node_id="macbook", capacity_bytes=200 * GIB, rank=1, role=role
+                ),
             ],
         )
 
@@ -623,9 +662,12 @@ def test_a_misspelled_role_is_refused_rather_than_quietly_made_headless():
             role="laptop",
         )
     # Case and padding are the UI's business, not a reason to refuse a launch.
-    assert NodeBudget(
-        node_id="macbook", capacity_bytes=100 * GIB, role=" WorkStation "
-    ).role == "workstation"
+    assert (
+        NodeBudget(
+            node_id="macbook", capacity_bytes=100 * GIB, role=" WorkStation "
+        ).role
+        == "workstation"
+    )
 
 
 def test_nemotron_h_quant_group_divisors_cap_tp_degree():
@@ -744,9 +786,7 @@ def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
     from omlx.cluster import planner
 
     (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 1}))
-    _write_safetensors(
-        tmp_path / "model.safetensors", [("model.layers.0.weight", 100)]
-    )
+    _write_safetensors(tmp_path / "model.safetensors", [("model.layers.0.weight", 100)])
 
     calls = []
     real_inspect = planner.inspect_safetensors_layout
@@ -761,9 +801,7 @@ def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
     planner.complete_model_layout(tmp_path)
     assert len(calls) == 1  # second read served from the cache
 
-    _write_safetensors(
-        tmp_path / "model.safetensors", [("model.layers.0.weight", 200)]
-    )
+    _write_safetensors(tmp_path / "model.safetensors", [("model.layers.0.weight", 200)])
     layout = planner.complete_model_layout(tmp_path)
     assert len(calls) == 2  # overwrite invalidated the cached entry
     assert layout.layer_weight_bytes == (200,)

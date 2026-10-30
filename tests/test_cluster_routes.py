@@ -722,6 +722,90 @@ def test_new_cluster_plans_follow_the_saved_lightning_mtp_setting(monkeypatch):
         routes._cluster_mtp(True, plain, None)
 
 
+def test_new_cluster_plans_follow_the_saved_engram_ssd_offload_setting(monkeypatch):
+    saved = {"v41": True}
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [{"id": "v41", "model_path": "/models/v41", "model_type": "llm"}]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: SimpleNamespace(
+            deepseek_v41_engram_ssd_offload=saved[model_id]
+        ),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+
+    assert routes._saved_engram_ssd_offload("/models/v41") is True
+    saved["v41"] = False
+    assert routes._saved_engram_ssd_offload("/models/v41") is False
+    assert routes._saved_engram_ssd_offload("/models/unknown") is None
+    # No settings manager (CLI planning, tests): keep the resident default.
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: None)
+    assert routes._saved_engram_ssd_offload("/models/v41") is None
+
+
+def test_cluster_plan_carries_the_saved_engram_ssd_offload(monkeypatch):
+    """Preview and activation must agree, so /plan resolves the setting too."""
+
+    gib = 1024**3
+
+    from omlx.cluster.planner import ModelLayout
+
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(gib,) * 8,
+            supports_pipeline=True,
+        ),
+    )
+    saved = {"offload": True}
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {
+                    "id": "offload",
+                    "model_path": "/models/offload",
+                    "model_type": "llm",
+                }
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: SimpleNamespace(
+            deepseek_v41_engram_ssd_offload=saved[model_id]
+        ),
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    body = {
+        "model_path": "/models/offload",
+        "nodes": [
+            {
+                "node_id": "local",
+                "capacity_bytes": 128 * gib,
+                "reserve_bytes": 2 * gib,
+            }
+        ],
+    }
+
+    on = _client().post("/admin/api/cluster/plan", json=body)
+    saved["offload"] = False
+    off = _client().post("/admin/api/cluster/plan", json=body)
+
+    assert on.status_code == off.status_code == 200
+    assert all(item["engram_ssd_offload"] for item in on.json()["assignments"])
+    assert not any(item["engram_ssd_offload"] for item in off.json()["assignments"])
+    # Identity: residency is part of what the user approves.
+    assert on.json()["placement_signature"] != off.json()["placement_signature"]
+
+
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
     from omlx.cluster.planner import ModelLayout
 
@@ -2610,7 +2694,6 @@ def test_forget_cluster_with_unreachable_peer(monkeypatch, local_only):
         assert response.json()["local_only"] is True
 
 
-
 def test_forget_cluster_preserves_setup_when_local_stop_fails(monkeypatch):
     from omlx.cluster.launch import DistributedTeardownError
 
@@ -2686,6 +2769,7 @@ def test_forget_member_preserves_other_pairings_or_leaves_cluster(monkeypatch, n
 @pytest.mark.parametrize("status", [409, 503])
 def test_forget_member_does_not_unpair_when_local_teardown_fails(monkeypatch, status):
     from fastapi import HTTPException
+
     from omlx.cluster import pairing_routes
 
     removed = []

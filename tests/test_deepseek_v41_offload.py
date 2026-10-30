@@ -926,3 +926,44 @@ def test_slow_warm_gather_rearms_page_prefetch(tmp_path, monkeypatch):
         assert reader._seen_pages is not None
     finally:
         reader.close()
+
+
+def test_cluster_stage_loader_forwards_the_plan_offload_decision(monkeypatch):
+    """The worker's last hop: the plan's decision reaches ``loading.load``."""
+
+    from omlx.patches.deepseek_v41_mlx_lm import model as cluster_model
+
+    calls = []
+
+    def fake_load(path, **kwargs):
+        calls.append(kwargs)
+        return object(), None
+
+    monkeypatch.setattr(cluster_model, "load", fake_load)
+    monkeypatch.setattr(cluster_model, "_as_cluster_rank", lambda model, group: model)
+    group = SimpleNamespace(rank=lambda: 0)
+
+    cluster_model.load_pipeline_stage(
+        "/models/v41",
+        group,
+        settings=SimpleNamespace(engram_ssd_offload=True),
+    )
+    cluster_model.load_pipeline_stage("/models/v41", group)
+    cluster_model.load_pipeline_stage(
+        "/models/v41",
+        group,
+        settings=SimpleNamespace(engram_ssd_offload=False),
+    )
+
+    assert calls[0]["engram_ssd_offload"] is True
+    # A plan from before the field keeps the resident tables.
+    assert calls[1]["engram_ssd_offload"] is False
+    assert calls[2]["engram_ssd_offload"] is False
+
+    # Tensor-parallel ranks read every Engram row, so they always mmap.
+    cluster_model.load_tensor_shard(
+        "/models/v41",
+        group,
+        settings=SimpleNamespace(engram_ssd_offload=False),
+    )
+    assert calls[-1]["engram_ssd_offload"] is True

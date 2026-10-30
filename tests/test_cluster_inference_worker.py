@@ -1019,8 +1019,8 @@ def test_worker_refuses_excess_resident_weights_before_ready(monkeypatch, tmp_pa
     assert len(markers) == 1
     failure = json.loads(markers[0].read_text())
     assert failure["phase"] == "failed"
-    assert (
-        "RuntimeError: loaded model retains more parameter memory" in (failure["error"])
+    assert "RuntimeError: loaded model retains more parameter memory" in (
+        failure["error"]
     )
 
 
@@ -1111,9 +1111,9 @@ def test_the_stage_guard_fires_in_the_order_the_launch_path_runs(monkeypatch, tm
 
     record = _run_rank(monkeypatch, tmp_path, rank=0)
 
-    assert len(record["stage_guard_calls"]) == 1, (
-        "the loader's own split gives this rank 30 layers, not the planned 14"
-    )
+    assert (
+        len(record["stage_guard_calls"]) == 1
+    ), "the loader's own split gives this rank 30 layers, not the planned 14"
     call = record["stage_guard_calls"][0]
     # fixed 2 GiB + 30 layers x 4 GiB each: the 122 GiB from the incident.
     assert call["required"] == 122 * GiB
@@ -1240,13 +1240,13 @@ def test_the_wired_limit_asks_for_the_admission_budget_not_apples_maximum(
 
     expected = admission_budget(107 * GiB, role="workstation")
     assert record["wired_calls"] == [expected]
-    assert record["watch_budget"] == expected, (
-        "the load watcher and the wired limit must agree on the same budget"
-    )
+    assert (
+        record["watch_budget"] == expected
+    ), "the load watcher and the wired limit must agree on the same budget"
     assert expected < 107 * GiB, "a rank must not wire the whole ceiling"
-    assert expected < admission_budget(107 * GiB, role="headless"), (
-        "a Mac someone is working on must wire less than a headless one"
-    )
+    assert expected < admission_budget(
+        107 * GiB, role="headless"
+    ), "a Mac someone is working on must wire less than a headless one"
 
 
 def test_an_unmeasurable_host_leaves_the_allocator_alone(monkeypatch, tmp_path):
@@ -1427,9 +1427,7 @@ def test_cancel_request_epoch_advances_past_an_existing_clock_jump(tmp_path):
     path = tmp_path / "dep-9-cancel.json"
     path.write_text(json.dumps({"epoch": 9_999_999_999_999}), encoding="utf-8")
 
-    _write_cancel_request(
-        str(tmp_path), "dep-9", "new event", plan_hash="f" * 64
-    )
+    _write_cancel_request(str(tmp_path), "dep-9", "new event", plan_hash="f" * 64)
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["epoch"] == 10_000_000_000_000
@@ -1745,8 +1743,7 @@ def test_install_thinking_budget_support_does_not_need_the_http_stack():
     """CUDA worker venvs ship without FastAPI (#3519), so the rank's budget hook
     must not import it. Run in a fresh interpreter where the HTTP stack cannot be
     imported, because this test process already has FastAPI loaded."""
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import importlib.abc
         import sys
 
@@ -1788,8 +1785,7 @@ def test_install_thinking_budget_support_does_not_need_the_http_stack():
             pass
         loaded = sorted(m for m in sys.modules if m.partition(".")[0] in HTTP_STACK)
         assert not loaded, loaded
-        """
-    )
+        """)
     result = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,
@@ -1836,3 +1832,30 @@ def test_install_thinking_budget_support_is_noop_without_think_tokens():
     with inference_worker._install_thinking_budget_support(server, Tokenizer()):
         assert server._make_logits_processors(None) == ["base-processor"]
     assert server._make_logits_processors is FakeServer._make_logits_processors
+
+
+def test_bool_settings_resolve_the_flag_then_the_plan_then_the_default():
+    """One argv, per-rank truth: the plan decides unless a flag overrides it."""
+
+    plan = SimpleNamespace(engram_ssd_offload=True)
+    empty_plan = SimpleNamespace()
+
+    assert inference_worker._resolve_bool_setting(
+        SimpleNamespace(engram_ssd_offload=False),
+        plan,
+        flag="engram_ssd_offload",
+        field="engram_ssd_offload",
+    )
+    assert inference_worker._resolve_bool_setting(
+        SimpleNamespace(engram_ssd_offload=True),
+        SimpleNamespace(engram_ssd_offload=False),
+        flag="engram_ssd_offload",
+        field="engram_ssd_offload",
+    )
+    # A plan from before the field keeps the resident default.
+    assert not inference_worker._resolve_bool_setting(
+        SimpleNamespace(),
+        empty_plan,
+        flag="engram_ssd_offload",
+        field="engram_ssd_offload",
+    )

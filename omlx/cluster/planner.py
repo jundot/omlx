@@ -381,6 +381,13 @@ class PipelineAssignment:
     # the guard reads as headless.
     role: str = ""
     memory_guard_tier: str = "balanced"
+    # Whether this rank holds its Engram tables via mmap instead of Metal
+    # buffers. One argv runs unchanged on every host, so a per-model setting
+    # cannot travel as a flag; the plan is already per-rank, signed into the
+    # plan hash, and indexed by rank on arrival — the same channel
+    # ``role`` and ``memory_guard_tier`` use. False (also for plans that
+    # predate the field) keeps the tables resident.
+    engram_ssd_offload: bool = False
     tensor_parallel_rank: int = 0
     tensor_parallel_size: int = 1
     sharded_weight_bytes: int = 0
@@ -447,6 +454,7 @@ class PipelineAssignment:
             "utilization": self.utilization,
             "role": self.role,
             "memory_guard_tier": self.memory_guard_tier,
+            "engram_ssd_offload": self.engram_ssd_offload,
             "tensor_parallel_rank": self.tensor_parallel_rank,
             "tensor_parallel_size": self.tensor_parallel_size,
             "sharded_weight_bytes": self.sharded_weight_bytes,
@@ -1025,9 +1033,7 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
         text_config = config.get("text_config")
         layer_config = text_config if isinstance(text_config, dict) else config
         layer_types = layer_config.get("layer_types")
-        if config.get("model_type") == "glm5_next" and isinstance(
-            layer_types, list
-        ):
+        if config.get("model_type") == "glm5_next" and isinstance(layer_types, list):
             num_layers = _config_int(config, "num_hidden_layers", 0)
             sparse_layers = sum(
                 layer_type != "linear_attention" for layer_type in layer_types
@@ -1743,6 +1749,7 @@ def plan_unequal_pipeline(
     workload_profile: ExecutionProfileName = "balanced",
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+    engram_ssd_offload: bool = False,
 ) -> ShardPlan:
     """Assign contiguous layers in MLX pipeline order across unequal nodes."""
 
@@ -1783,6 +1790,7 @@ def plan_unequal_pipeline(
         microbatch_size=microbatch_size,
         context_tokens=context_tokens,
         optimization="performance" if performance_aware else "memory",
+        engram_ssd_offload=engram_ssd_offload,
     )
 
 
@@ -1838,6 +1846,7 @@ def plan_proportional_pipeline(
     workload_profile: ExecutionProfileName = "balanced",
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
+    engram_ssd_offload: bool = False,
 ) -> ShardPlan:
     """RAM-proportional N-node pipeline plan (largest-remainder, exo-style).
 
@@ -1891,6 +1900,7 @@ def plan_proportional_pipeline(
         microbatch_size=microbatch_size,
         context_tokens=context_tokens,
         optimization="ram-proportional",
+        engram_ssd_offload=engram_ssd_offload,
     )
 
 
@@ -1904,6 +1914,7 @@ def _finish_pipeline_plan(
     microbatch_size: int,
     context_tokens: int,
     optimization: str,
+    engram_ssd_offload: bool = False,
 ) -> ShardPlan:
     """Assignments, per-node fit checks, and the signed hash for a partition."""
 
@@ -1940,6 +1951,7 @@ def _finish_pipeline_plan(
                 manual_memory_limit=node.manual_memory_limit,
                 role=node.role,
                 memory_guard_tier=node.memory_guard_tier,
+                engram_ssd_offload=engram_ssd_offload,
                 kv_cache_bytes=kv_bytes,
                 kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start),
                 max_context_tokens=_max_context_for_stage(
@@ -1988,6 +2000,11 @@ def _finish_pipeline_plan(
                 # workstation plan look identical to every staleness check.
                 "role": item.role,
                 "memory_guard_tier": item.memory_guard_tier,
+                # Identity, like role: two plans that differ only in whether
+                # the tables are mmap'd must not share a hash, or a plan
+                # approved for offloaded tables would satisfy a staleness
+                # check against a resident launch of the same layers.
+                "engram_ssd_offload": item.engram_ssd_offload,
             }
             for item in assignments
         ],
@@ -2238,6 +2255,7 @@ def plan_hybrid(
     microbatch_size: int = 1,
     context_tokens: int = _DEFAULT_CONTEXT_TOKENS,
     head_rank_extra_bytes: int = 0,
+    engram_ssd_offload: bool = False,
 ) -> ShardPlan:
     """Plan hybrid pipeline + tensor parallelism across nodes.
 
@@ -2284,6 +2302,7 @@ def plan_hybrid(
             workload_profile=workload_profile,
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,
+            engram_ssd_offload=engram_ssd_offload,
         )
         return replace(
             pipeline,
@@ -2421,6 +2440,7 @@ def plan_hybrid(
                     layer_weight_bytes=held_layer_bytes,
                     fixed_weight_bytes=fixed_bytes,
                     reserve_bytes=node.reserve_bytes,
+                    engram_ssd_offload=engram_ssd_offload,
                     capacity_bytes=node.capacity_bytes,
                     manual_memory_limit=node.manual_memory_limit,
                     role=node.role,
