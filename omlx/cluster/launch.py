@@ -823,6 +823,42 @@ def _sweep_rank_processes(
                 f"remote rank {rank} ({node_id}) pid {pid} could not be killed"
             )
 
+    # The same argv evidence must close the remote gap (G9): a swept or
+    # overwritten marker names no pid, while the worker it belonged to is
+    # still resident on the peer. Local survivors are caught below from the
+    # process table; a peer's table can only be read over SSH.
+    remote_targets = sorted(
+        {
+            host.get("ssh")
+            for host in hosts
+            if isinstance(host.get("ssh"), str)
+            and host.get("ssh") not in _LOOPBACK_SSH_TARGETS
+        }
+    )
+    for ssh_target in remote_targets:
+        pids, scan_error = _remote_deployment_worker_pids(
+            ssh_target, deployment_id, runner=runner
+        )
+        if scan_error:
+            failures.append(
+                f"could not scan {ssh_target} for rank workers of "
+                f"{deployment_id}: {scan_error}"
+            )
+            continue
+        for pid in pids or ():
+            if _kill_remote_pid(ssh_target, pid, grace=kill_grace, runner=runner):
+                logger.warning(
+                    "Reaped markerless remote rank pid %d of deployment %s on %s",
+                    pid,
+                    deployment_id,
+                    ssh_target,
+                )
+            else:
+                failures.append(
+                    f"markerless remote rank pid {pid} on {ssh_target} "
+                    "could not be killed"
+                )
+
     # Markers and successful signal calls are not exit evidence. Sweep any
     # markerless local worker by its exact deployment argv, then require a
     # fresh process-table snapshot to contain neither its PID nor launch group.
@@ -976,19 +1012,55 @@ def stop_deployment_processes(
     }
 
 
+def _mark_launch_manifest_failed(
+    state_dir: str | Path,
+    deployment_id: str,
+    reason: str,
+) -> None:
+    """Record that a teardown could not prove exit, keeping the evidence.
+
+    ``reap_orphaned_launches`` skips manifests with a live coordinator, which
+    is right for healthy jobs and wrong for a launch whose teardown raised:
+    the coordinator moved on, but its ranks may still be resident. The flag
+    flips that manifest from "active" to reapable at the next server start
+    while preserving the launcher identity and marker directory for
+    diagnosis instead of erasing them.
+    """
+
+    path = _launch_manifest_path(state_dir, deployment_id)
+    manifest = _read_launch_manifest(path)
+    if manifest is None:
+        return
+    manifest["failed"] = True
+    manifest["failure_reason"] = reason[:_LOG_LINE_LIMIT]
+    manifest["failed_at"] = time.time()
+    temporary = path.with_name(path.name + ".tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(temporary, path)
+
+
 def reap_orphaned_launches(
     state_dir: str | Path = "~/.omlx/cluster/runtime",
     *,
     kill_grace: float = 5.0,
     runner: SSHRunner = subprocess.run,
 ) -> dict[str, Any]:
-    """Reap jobs whose coordinator died without tearing them down (G8).
+    """Reap jobs whose coordinator died or whose teardown failed (G8, G9).
 
     Every launch writes a manifest next to the runtime markers. A manifest
     whose coordinator *and* launcher group are both gone belongs to a
     crashed predecessor: any rank processes its markers still name are
     orphans holding unified memory, so kill them and retire the manifest.
-    A manifest with a live coordinator is an active job and is left alone.
+    A manifest with a live coordinator is an active job and is left alone —
+    unless it is marked failed, because that launch's coordinator already
+    gave up on it after a teardown it could not verify.
 
     Returns ``{"reaped": [...], "failures": [...], "active": [...]}``.
     """
@@ -1010,10 +1082,11 @@ def reap_orphaned_launches(
         deployment_id = manifest["deployment_id"]
         coordinator_pid = manifest["coordinator_pid"]
         launcher_pid = manifest["launcher_pid"]
-        if _pid_alive(coordinator_pid):
+        if _pid_alive(coordinator_pid) and not manifest.get("failed"):
             report["active"].append(deployment_id)
             continue
-        # The coordinator is gone. Kill the launcher group if it somehow
+        # The coordinator is gone, or it marked this launch failed after a
+        # teardown it could not verify. Kill the launcher group if it somehow
         # survived, then sweep rank processes by their marker pids.
         if _process_group_alive(launcher_pid):
             with suppress(ProcessLookupError, PermissionError):
@@ -3226,6 +3299,15 @@ class DistributedJobSupervisor:
                         else f"process group {process_group} survived SIGKILL twice"
                     )
                 problems.extend(leftovers)
+                # Keep the manifest, but mark it reapable: the coordinator of
+                # this launch is alive and would otherwise shield the leftover
+                # ranks from the next start's reaper (G9).
+                with suppress(OSError):
+                    _mark_launch_manifest_failed(
+                        self.state_dir,
+                        self.deployment.deployment_id,
+                        "; ".join(problems),
+                    )
                 raise DistributedTeardownError(
                     f"distributed teardown of "
                     f"{self.deployment.deployment_id} could not be verified: "
