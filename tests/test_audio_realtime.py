@@ -7,6 +7,8 @@ exercised here (that needs a real model; see the slow smoke procedure).
 
 import asyncio
 import base64
+import io
+import json
 import struct
 import threading
 import time
@@ -22,14 +24,18 @@ from fastapi.testclient import TestClient
 from mlx_vlm.models.lfm3_audio import Model as Lfm3AudioModel
 from mlx_vlm.models.lfm3_audio import ModelConfig as Lfm3AudioConfig
 from mlx_vlm.models.lfm3_audio.codec import CodecConfig, LiquidCodec
+from PIL import Image
 
 from omlx.api.audio_routes import _realtime_api_key, realtime_router
 from omlx.engine import lfm3_realtime
 from omlx.engine.realtime_voice import (
+    FunctionCall,
     RealtimeVoiceError,
     RealtimeVoiceSession,
     VoiceBackend,
     VoiceStep,
+    VoiceTurn,
+    turn_messages,
 )
 from omlx.engine.stt import (
     RealtimeTranscriptionSession,
@@ -343,7 +349,8 @@ class TestRealtimeWebSocket:
             p1,
             patch("omlx.api.audio_routes._verify_ws_api_key", return_value=False),
             p3,
-            client,client.websocket_connect(WS_PATH) as ws
+            client,
+            client.websocket_connect(WS_PATH) as ws,
         ):
             ws.send_json({"type": "start", "model": "m", "api_key": "bad"})
             msg = ws.receive_json()
@@ -374,7 +381,9 @@ class TestRealtimeWebSocket:
         engine = MagicMock(spec=STTEngine)
         engine.supports_realtime_stt.return_value = True
         engine.create_realtime_session = AsyncMock(
-            side_effect=RuntimeError("A realtime transcription session is already active")
+            side_effect=RuntimeError(
+                "A realtime transcription session is already active"
+            )
         )
         p1, p2, p3, client = _ws_client(engine)
         with p1, p2, p3, client, client.websocket_connect(WS_PATH) as ws:
@@ -407,7 +416,7 @@ class TestRealtimeWebSocket:
         with p1, p2, p3, client, client.websocket_connect(WS_PATH) as ws:
             ws.send_json({"type": "start", "model": "whisper", "api_key": "k"})
             assert ws.receive_json() == {"type": "ready"}
-                # Context-manager exit closes the socket without a stop message
+            # Context-manager exit closes the socket without a stop message
         assert stub.released
 
 
@@ -438,7 +447,7 @@ class TestSplitAudioSegments:
         # Loud signal with a silent gap at 27..28s: the 30 s boundary should
         # move back into the gap.
         samples = np.ones(40 * SR, dtype=np.float32)
-        samples[27 * SR: 28 * SR] = 0.0
+        samples[27 * SR : 28 * SR] = 0.0
         segments = _split_audio_segments(
             samples, SR, segment_seconds=30.0, search_seconds=5.0
         )
@@ -480,8 +489,7 @@ class TestWhisperEmitStableDelta:
         backend = self._backend()
         assert backend._emit_stable_delta(["hello"], is_last=False) == "hello"
         assert (
-            backend._emit_stable_delta(["hello", " world"], is_last=False)
-            == " world"
+            backend._emit_stable_delta(["hello", " world"], is_last=False) == " world"
         )
         # Unchanged hypothesis emits nothing
         assert backend._emit_stable_delta(["hello", " world"], is_last=False) == ""
@@ -531,9 +539,7 @@ class TestWhisperEmitStableDelta:
         assert backend._emit_stable_delta(["hello world"], is_last=False)
         # Hypothesis still in flux: dropping avoids duplicated spam
         assert (
-            backend._emit_stable_delta(
-                ["completely different text"], is_last=False
-            )
+            backend._emit_stable_delta(["completely different text"], is_last=False)
             == ""
         )
 
@@ -566,7 +572,7 @@ class TestWhisperWindowRotation:
 
     def test_rotates_before_mel_cap(self):
         backend, calls = self._backend_with_stub_decode()
-        loud = (np.ones(SR, dtype=np.float32) * 0.5)
+        loud = np.ones(SR, dtype=np.float32) * 0.5
         for _ in range(40):
             backend.feed(loud.copy())
             backend.poll_sync()
@@ -579,7 +585,7 @@ class TestWhisperWindowRotation:
 
     def test_quiet_chunk_triggers_early_rotation(self):
         backend, calls = self._backend_with_stub_decode()
-        loud = (np.ones(SR, dtype=np.float32) * 0.5)
+        loud = np.ones(SR, dtype=np.float32) * 0.5
         quiet = np.zeros(SR, dtype=np.float32)
         for _ in range(23):
             backend.feed(loud.copy())
@@ -637,7 +643,8 @@ class TestSegmentedTranscribeStream:
 
         samples = np.random.default_rng(1).standard_normal(65 * SR)
         monkeypatch.setattr(
-            stt_mod, "_load_audio_samples",
+            stt_mod,
+            "_load_audio_samples",
             lambda path: samples.astype(np.float32),
         )
 
@@ -653,6 +660,7 @@ class TestSegmentedTranscribeStream:
         assert [c["language"] for c in chunks[:2]] == ["ko", "en"]
         assert "".join(c["text"] for c in chunks).startswith(" segment 1 segment 2")
 
+
 class _FakeQwen3Model:
     """Fake matching the qwen3_asr contract driven by the token-id path."""
 
@@ -667,8 +675,8 @@ class _FakeQwen3Model:
     def extract_language(self, text):
         if "<asr_text>" in text and text.startswith("language "):
             return (
-                text[len("language "): text.find("<asr_text>")].strip(),
-                text[text.find("<asr_text>") + len("<asr_text>"):],
+                text[len("language ") : text.find("<asr_text>")].strip(),
+                text[text.find("<asr_text>") + len("<asr_text>") :],
             )
         return "English", text
 
@@ -705,7 +713,8 @@ class TestQwen3TokenIdStreaming:
         import omlx.engine.stt as stt_mod
 
         monkeypatch.setattr(
-            stt_mod, "_load_audio_samples",
+            stt_mod,
+            "_load_audio_samples",
             lambda path: np.zeros(3 * SR, dtype=np.float32),
         )
         model = _FakeQwen3Model([1, 2, 3, 4, 5], _decode_with_split_char)
@@ -728,19 +737,16 @@ class TestQwen3TokenIdStreaming:
         import omlx.engine.stt as stt_mod
 
         monkeypatch.setattr(
-            stt_mod, "_load_audio_samples",
+            stt_mod,
+            "_load_audio_samples",
             lambda path: np.zeros(3 * SR, dtype=np.float32),
         )
         table = {2: "안", 5: " 하세요"}
-        model = _FakeQwen3Model(
-            [2, 5], lambda ids: "".join(table[i] for i in ids)
-        )
+        model = _FakeQwen3Model([2, 5], lambda ids: "".join(table[i] for i in ids))
         engine = STTEngine("qwen3-test")
         engine._model = model
 
-        chunks = [
-            c async for c in engine.transcribe_stream("/fake.wav", language="ko")
-        ]
+        chunks = [c async for c in engine.transcribe_stream("/fake.wav", language="ko")]
         # ISO hint mapped to the full name qwen3 expects
         assert model.calls[0]["language"] == "korean"
         assert "".join(c["text"] for c in chunks) == "안 하세요"
@@ -762,15 +768,14 @@ class TestSegmentedTranscribeStreamLanguage:
                 return SimpleNamespace(text=" ok", language="ko", segments=[])
 
         monkeypatch.setattr(
-            stt_mod, "_load_audio_samples",
+            stt_mod,
+            "_load_audio_samples",
             lambda path: np.zeros(5 * SR, dtype=np.float32),
         )
         engine = STTEngine("whisper-test")
         engine._model = FakeWhisperModel()
 
-        chunks = [
-            c async for c in engine.transcribe_stream("/fake.wav", language="ko")
-        ]
+        chunks = [c async for c in engine.transcribe_stream("/fake.wav", language="ko")]
         assert seen["language"] == "ko"
         assert chunks[0]["text"] == " ok"
 
@@ -785,16 +790,22 @@ class _StubVoiceBackend(VoiceBackend):
 
     voices = ("chelsie", "ethan")
     default_instructions = "Speak briefly."
+    supports_tools = True
+    input_image = True
 
-    def __init__(self, steps=2, delay=0.0, fail=None):
+    def __init__(self, steps=2, delay=0.0, fail=None, calls=()):
         self.steps, self.delay, self.fail = steps, delay, fail
-        self.turns, self.truncated = [], []
+        # Function calls that end each reply, one entry per reply.
+        self.calls = list(calls)
+        self.turns, self.inputs, self.truncated = [], [], []
         self.stopped, self.closed, self._left = 0, False, 0
 
-    def begin_turn(self, audio, instructions, voice):
+    def begin_turn(self, turn, instructions, voice, tools):
         if self.fail is not None:
             raise self.fail
-        self.turns.append((len(audio), instructions, voice))
+        audio = 0 if turn.audio is None else len(turn.audio)
+        self.turns.append((audio, instructions, voice))
+        self.inputs.append((turn, tools))
         self._left = self.steps
         return 7
 
@@ -802,7 +813,10 @@ class _StubVoiceBackend(VoiceBackend):
         time.sleep(self.delay)
         self._left -= 1
         audio = np.full(240, 0.5, np.float32)
-        return VoiceStep(text="hi ", audio=audio, slots=3, done=self._left <= 0)
+        step = VoiceStep(text="hi ", audio=audio, slots=3, done=self._left <= 0)
+        if step.done and self.calls:
+            step.function_calls = self.calls.pop(0)
+        return step
 
     def stop(self):
         self.stopped += 1
@@ -842,6 +856,27 @@ def _voice_client(engine, key_ok=True):
 def _pcm(seconds):
     samples = np.zeros(int(24000 * seconds), dtype="<i2").tobytes()
     return base64.b64encode(samples).decode()
+
+
+def _png_url():
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+def test_turn_puts_tool_images_in_the_last_tool_response():
+    tool_turn = VoiceTurn(images=["shot"], tool_outputs=['{"ok": true}', "page"])
+    assert turn_messages(tool_turn) == [
+        {"role": "tool", "content": '{"ok": true}'},
+        {
+            "role": "tool",
+            "content": [{"type": "text", "text": "page"}, {"type": "image"}],
+        },
+    ]
+    spoken = VoiceTurn(audio=np.zeros(1), images=["shot"])
+    assert turn_messages(spoken) == [
+        {"role": "user", "content": [{"type": "image"}, {"type": "audio"}]}
+    ]
 
 
 def _eventually(check, timeout=2.0):
@@ -925,6 +960,109 @@ class TestRealtimeVoiceWebSocket:
             assert error["code"] == "conversation_too_long"
             done = _until(ws, "response.done")[-1]
         assert done["response"]["status"] == "failed"
+
+    def test_image_and_function_call_round_trip(self):
+        call = FunctionCall("web_search", '{"query": "mlx"}')
+        backend = _StubVoiceBackend(calls=[[call]])
+        engine = _voice_engine(backend, self.executor)
+        (p1, p2, p3), _, client = _voice_client(engine)
+        tool = {"type": "function", "name": "web_search", "parameters": {}}
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            created = ws.receive_json()
+            assert created["session"]["capabilities"] == {
+                "input_image": True,
+                "tools": True,
+            }
+            ws.send_json({"type": "session.update", "session": {"tools": [tool]}})
+            assert ws.receive_json()["session"]["tools"] == [tool]
+            ws.send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_image", "image_url": _png_url()}],
+                    },
+                }
+            )
+            assert ws.receive_json()["type"] == "conversation.item.added"
+            ws.send_json({"type": "input_audio_buffer.append", "audio": _pcm(0.2)})
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            ws.receive_json()
+            ws.send_json({"type": "response.create"})
+            events = _until(ws, "response.done")
+            args = next(
+                e
+                for e in events
+                if e["type"] == "response.function_call_arguments.done"
+            )
+            assert args["name"] == "web_search" and args["arguments"] == call.arguments
+            output = events[-1]["response"]["output"]
+            assert [item["type"] for item in output] == ["message", "function_call"]
+            assert output[1]["call_id"] == args["call_id"]
+
+            ws.send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": "call_unknown",
+                        "output": "{}",
+                    },
+                }
+            )
+            assert ws.receive_json()["error"]["code"] == "item_not_found"
+            ws.send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": args["call_id"],
+                        "output": '{"ok": true}',
+                    },
+                }
+            )
+            assert ws.receive_json()["type"] == "conversation.item.added"
+            # A tool output alone opens the next reply.
+            ws.send_json({"type": "response.create"})
+            assert _until(ws, "response.done")[-1]["response"]["status"] == "completed"
+        (first, tools), (second, _) = backend.inputs
+        assert len(first.images) == 1 and first.audio is not None
+        assert tools == [
+            {"type": "function", "function": {"name": "web_search", "parameters": {}}}
+        ]
+        assert second.audio is None and second.tool_outputs == ['{"ok": true}']
+
+    def test_images_and_tools_need_a_capable_model(self):
+        backend = _StubVoiceBackend()
+        backend.input_image = backend.supports_tools = False
+        engine = _voice_engine(backend, self.executor)
+        (p1, p2, p3), _, client = _voice_client(engine)
+        image = {"type": "input_image", "image_url": _png_url()}
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            ws.receive_json()
+            ws.send_json(
+                {
+                    "type": "session.update",
+                    "session": {"tools": [{"type": "function", "name": "f"}]},
+                }
+            )
+            assert ws.receive_json()["error"]["code"] == "unsupported"
+            ws.send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {"type": "message", "role": "user", "content": [image]},
+                }
+            )
+            assert ws.receive_json()["error"]["code"] == "unsupported"
+            # A malformed part is refused without closing the session.
+            ws.send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {"type": "message", "role": "user", "content": ["x"]},
+                }
+            )
+            assert ws.receive_json()["error"]["code"] == "unsupported"
 
     def test_gpu_power_limit_holds_for_the_session(self):
         engine = _voice_engine(_StubVoiceBackend(), self.executor)
@@ -1103,8 +1241,14 @@ def tiny_lfm3():
 
 
 class _Tokenizer:
+    # Special tokens a test maps onto ids of the tiny vocabulary.
+    special: dict = {}
+
     def decode(self, ids, skip_special_tokens=True):
         return "".join(chr(65 + i % 26) for i in ids)
+
+    def convert_tokens_to_ids(self, token):
+        return self.special.get(token, -1)
 
 
 def _tiny_backend(model, *turns):
@@ -1112,8 +1256,62 @@ def _tiny_backend(model, *turns):
         model, SimpleNamespace(tokenizer=_Tokenizer())
     )
     queue = iter(turns)
-    backend._turn_inputs = lambda audio, system: (list(next(queue)), {})
+    backend._turn_inputs = lambda turn, system, tools: (list(next(queue)), {})
     return backend
+
+
+TOOLS = [{"type": "function", "function": {"name": "web_search"}}]
+
+
+def _first_choice(model, ids):
+    cache = model.make_cache()
+    embeds = model.get_input_embeddings(mx.array([ids])).inputs_embeds
+    hidden = model.language_model.model(None, cache, embeds)[:, -1]
+    logits = model.language_model.model.embed_tokens.as_linear(hidden)
+    return int(mx.argmax(logits, axis=-1).item())
+
+
+def test_lfm3_tools_open_speech_like_the_plain_prompt(tiny_lfm3):
+    ids = list(range(10, 30))
+    plain = _tiny_backend(tiny_lfm3, [*ids, 254])
+    plain.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, [])
+    # With tools and a first choice other than <tool_call>, the opener is fed after the prompt.
+    tooled = _tiny_backend(tiny_lfm3, ids)
+    tooled.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, TOOLS)
+    assert tooled.mode == lfm3_realtime.INTERLEAVED and not tooled.reply
+    assert np.allclose(np.array(tooled.hidden), np.array(plain.hidden), atol=1e-4)
+    assert tooled._offset() == plain._offset()
+
+
+def test_lfm3_tool_reply_writes_calls_without_speech(tiny_lfm3, monkeypatch):
+    monkeypatch.setattr(lfm3_realtime, "MAX_REPLY_SLOTS", 30)
+    ids = list(range(10, 30))
+    first = _first_choice(tiny_lfm3, ids)
+    backend = _tiny_backend(tiny_lfm3, ids)
+    monkeypatch.setattr(_Tokenizer, "special", {"<tool_call>": first})
+    backend.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, TOOLS)
+    texts, audio = [], 0
+    while True:
+        step = backend.step(0.01, threading.Event())
+        texts.append(step.text)
+        audio += step.audio.size
+        if step.done:
+            break
+    assert backend.call_ids[0] == first and audio == 0 and not "".join(texts)
+    assert all(codes is None for _, codes in backend.reply)
+    # Nothing of a call reply was heard, so a cut drops all of it.
+    backend.truncate(0.0)
+    assert backend._offset() == len(ids)
+    assert _slots(backend.pending) == [(255, None)]
+
+
+def test_lfm3_reads_its_xml_tool_call(tiny_lfm3):
+    backend = _tiny_backend(tiny_lfm3)
+    xml = "<tool_call>\n<function=web_search>\n<parameter=query>\nmlx\n</parameter>\n</function>\n</tool_call>"
+    backend.tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens: xml)
+    backend.tools, backend.call_ids, backend.call_done = TOOLS, [1], True
+    (call,) = backend._function_calls()
+    assert call.name == "web_search" and json.loads(call.arguments) == {"query": "mlx"}
 
 
 def _slots(slots):
@@ -1139,7 +1337,7 @@ def test_lfm3_voice_loop_matches_stream_slots(tiny_lfm3, monkeypatch):
     assert any(codes is not None for _, codes in reference)
     for seconds in (0.0, 0.01, 10.0):
         backend = _tiny_backend(tiny_lfm3, ids)
-        backend.begin_turn(np.zeros(2400, np.float32), "", None)
+        backend.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, [])
         mx.random.seed(0)
         _finish(backend, seconds)
         assert _slots(backend.reply) == reference
@@ -1152,7 +1350,7 @@ def test_lfm3_truncate_then_next_turn_matches_fresh_prefill(tiny_lfm3, monkeypat
     turn1, turn2 = [*range(10, 30), 254], [40, 254]
     eos_code = tiny_lfm3.config.audio_eos_code
     backend = _tiny_backend(tiny_lfm3, turn1, turn2)
-    backend.begin_turn(np.zeros(2400, np.float32), "", None)
+    backend.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, [])
     mx.random.seed(1)
     _finish(backend, 0.01)
     spoken = [c for _, c in backend.reply if c is not None and c[0].item() != eos_code]
@@ -1164,7 +1362,7 @@ def test_lfm3_truncate_then_next_turn_matches_fresh_prefill(tiny_lfm3, monkeypat
     backend.truncate(0.0)
     pending = list(backend.pending)
     assert _slots(pending) == [(255, None)]
-    backend.begin_turn(np.zeros(2400, np.float32), "", None)
+    backend.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, [])
 
     plain = backend._embed
     embeds = mx.concatenate(
@@ -1180,7 +1378,7 @@ def test_lfm3_truncate_then_next_turn_matches_fresh_prefill(tiny_lfm3, monkeypat
 
 def test_lfm3_truncate_before_any_frame_drops_the_reply(tiny_lfm3):
     backend = _tiny_backend(tiny_lfm3, [*range(10, 30), 254])
-    backend.begin_turn(np.zeros(2400, np.float32), "", None)
+    backend.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, [])
     prefill = backend._offset()
     mx.random.seed(1)
     # An interleaved reply opens with text slots, before any speech frame.

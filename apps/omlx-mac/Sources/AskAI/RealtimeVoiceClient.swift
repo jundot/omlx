@@ -4,10 +4,18 @@
 
 import Foundation
 
+/// What a voice model's realtime backend accepts besides speech.
+struct RealtimeVoiceCapabilities: Equatable, Sendable {
+    var inputImage = false
+    var tools = false
+}
+
 enum RealtimeVoiceEvent: Equatable {
     /// Carries the model's default instructions, which the session update replaces.
-    case sessionCreated(instructions: String)
+    case sessionCreated(instructions: String, capabilities: RealtimeVoiceCapabilities)
     case responseStarted(itemID: String)
+    /// A tool call that ends the current reply; `arguments` is JSON text.
+    case functionCall(callID: String, name: String, arguments: String)
     case audio(itemID: String, pcm: Data)
     case transcript(itemID: String, text: String)
     case responseDone(itemID: String, status: String)
@@ -24,9 +32,22 @@ extension RealtimeVoiceEvent {
         switch type {
         case "session.created":
             let session = event["session"] as? [String: Any]
-            return .sessionCreated(instructions: session?["instructions"] as? String ?? "")
+            let capabilities = session?["capabilities"] as? [String: Any]
+            return .sessionCreated(
+                instructions: session?["instructions"] as? String ?? "",
+                capabilities: RealtimeVoiceCapabilities(
+                    inputImage: capabilities?["input_image"] as? Bool ?? false,
+                    tools: capabilities?["tools"] as? Bool ?? false
+                )
+            )
+        case "response.function_call_arguments.done":
+            guard let callID = event["call_id"] as? String, let name = event["name"] as? String
+            else { return nil }
+            return .functionCall(callID: callID, name: name, arguments: event["arguments"] as? String ?? "")
         case "response.output_item.added":
+            // Function call items arrive as their own events at the end of a reply.
             let item = event["item"] as? [String: Any]
+            guard item?["type"] as? String ?? "message" == "message" else { return nil }
             return (item?["id"] as? String).map { .responseStarted(itemID: $0) }
         case "response.output_audio.delta":
             let itemID = event["item_id"] as? String ?? ""

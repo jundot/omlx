@@ -447,7 +447,7 @@ private struct ToolActivityRow: View {
                 Image(systemName: activity.failed ? "exclamationmark.triangle" : icon)
                     .foregroundStyle(activity.failed ? theme.redDot : theme.textTertiary)
             }
-            Text(text)
+            Text(activity.text)
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
@@ -464,38 +464,6 @@ private struct ToolActivityRow: View {
         }
     }
 
-    private var text: String {
-        let detail = activity.detail
-        switch (activity.kind, activity.isRunning, activity.failed) {
-        case (.search, true, _):
-            return String(localized: "askai.tool.search.running", defaultValue: "Searching the web: \(detail)",
-                          comment: "Ask AI tool line while a web search runs; the argument is the query")
-        case (.search, false, false):
-            return String(localized: "askai.tool.search.done", defaultValue: "Searched the web: \(detail)",
-                          comment: "Ask AI tool line after a web search; the argument is the query")
-        case (.search, false, true):
-            return String(localized: "askai.tool.search.failed", defaultValue: "Web search failed: \(detail)",
-                          comment: "Ask AI tool line after a failed web search; the argument is the query")
-        case (.read, true, _):
-            return String(localized: "askai.tool.read.running", defaultValue: "Reading \(detail)",
-                          comment: "Ask AI tool line while a web page is fetched; the argument is the site")
-        case (.read, false, false):
-            return String(localized: "askai.tool.read.done", defaultValue: "Read \(detail)",
-                          comment: "Ask AI tool line after a web page was fetched; the argument is the site")
-        case (.read, false, true):
-            return String(localized: "askai.tool.read.failed", defaultValue: "Couldn't read \(detail)",
-                          comment: "Ask AI tool line after a page fetch failed; the argument is the site")
-        case (.screen, true, _):
-            return String(localized: "askai.tool.screen.running", defaultValue: "Looking at your screen",
-                          comment: "Ask AI tool line while a screenshot is taken")
-        case (.screen, false, false):
-            return String(localized: "askai.tool.screen.done", defaultValue: "Looked at your screen",
-                          comment: "Ask AI tool line after a screenshot was sent to the model")
-        case (.screen, false, true):
-            return String(localized: "askai.tool.screen.failed", defaultValue: "Couldn't capture the screen",
-                          comment: "Ask AI tool line after a screenshot failed")
-        }
-    }
 }
 
 private struct ThinkingView: View {

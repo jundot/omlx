@@ -31401,6 +31401,54 @@
         }
       }
     },
+    "talkai.button.share_screen" : {
+      "comment" : "Help text for the voice card button that sends a screenshot with each turn",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Share Screen"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Показать экран"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "共享屏幕"
+          }
+        }
+      }
+    },
+    "talkai.button.stop_sharing" : {
+      "comment" : "Help text for the voice card button while the screen is being shared",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stop Sharing Screen"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Прекратить показ экрана"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "停止共享屏幕"
+          }
+        }
+      }
+    },
     "talkai.button.type_instead" : {
       "comment" : "Help text for the button that switches from the voice card to the Ask AI text bar",
       "extractionState" : "manual",
@@ -36965,6 +37013,54 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在 Ask AI 回答期间限制整台 Mac 的 GPU 功率以节省电量（2 到 1000 W）。如果模型也设置了限制，则采用较低的值。"
+          }
+        }
+      }
+    },
+    "talkai.share.permission" : {
+      "comment" : "Shown in the voice card when screen sharing needs the screen recording permission",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow oMLX in System Settings > Screen & System Audio Recording, then restart oMLX."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разрешите oMLX в «Системные настройки > Запись экрана и системного звука», затем перезапустите oMLX."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请在“系统设置 > 录屏与系统录音”中允许 oMLX，然后重新启动 oMLX。"
+          }
+        }
+      }
+    },
+    "talkai.tools.unsupported" : {
+      "comment" : "Hint under the voice settings when the selected model has no tool calling",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This voice model can't call tools."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Эта голосовая модель не умеет вызывать инструменты."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此语音模型无法调用工具。"
           }
         }
       }

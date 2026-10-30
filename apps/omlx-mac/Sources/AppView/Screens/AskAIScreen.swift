@@ -647,6 +647,8 @@ private struct VoiceAdvancedSection: View {
     @State private var voices: [String] = []
     /// The selected model's default prompt; nil until the server reports it.
     @State private var modelDefault: String?
+    /// What the selected model's realtime backend accepts; nil until known.
+    @State private var capabilities: RealtimeVoiceCapabilities?
 
     var body: some View {
         let model = store.prefs.talk.model
@@ -693,6 +695,22 @@ private struct VoiceAdvancedSection: View {
         .task(id: [model, String(services.serverState.isRunningLike)]) {
             await loadModelInfo()
         }
+
+        if let capabilities {
+            if capabilities.tools {
+                ListGroup {
+                    ToolRows(tools: $store.prefs.talk.tools, modelReadsImages: capabilities.inputImage,
+                             isLast: true)
+                }
+                .padding(.top, 14)
+            } else {
+                HintLine(text: String(localized: "talkai.tools.unsupported",
+                                      defaultValue: "This voice model can't call tools.",
+                                      comment: "Hint under the voice settings when the selected model has no tool calling"))
+                    .padding(.horizontal, 28)
+                    .padding(.top, 8)
+            }
+        }
     }
 
     /// The model's own prompt until the user edits it; matching the default again forgets the edit.
@@ -728,10 +746,12 @@ private struct VoiceAdvancedSection: View {
         else {
             voices = []
             modelDefault = nil
+            capabilities = nil
             return
         }
         // Another model's default must not show while this one loads.
         modelDefault = nil
+        capabilities = nil
         components.queryItems = [URLQueryItem(name: "model", value: model),
                                  URLQueryItem(name: "realtime", value: "true")]
         guard let url = components.url else { return }
@@ -740,11 +760,18 @@ private struct VoiceAdvancedSection: View {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
         struct Info: Decodable {
+            struct Capabilities: Decodable {
+                let inputImage: Bool
+                let tools: Bool
+            }
             let voices: [String]
             let instructions: String?
+            let capabilities: Capabilities?
         }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
         guard let (data, _) = try? await URLSession.shared.data(for: request),
-              let decoded = try? JSONDecoder().decode(Info.self, from: data)
+              let decoded = try? decoder.decode(Info.self, from: data)
         else {
             // Another model's voices would be rejected by this one.
             voices = []
@@ -753,6 +780,9 @@ private struct VoiceAdvancedSection: View {
         }
         voices = decoded.voices
         modelDefault = decoded.instructions
+        capabilities = decoded.capabilities.map {
+            RealtimeVoiceCapabilities(inputImage: $0.inputImage, tools: $0.tools)
+        }
     }
 }
 

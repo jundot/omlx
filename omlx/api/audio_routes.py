@@ -33,6 +33,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import Response, StreamingResponse
+from PIL import Image
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
 from ..engine.lfm3_speech import SPEECH_MODEL_TYPES, VOICES
@@ -45,6 +46,7 @@ from ..engine.realtime_voice import (
 )
 from ..engine.vlm import (
     VLMBatchedEngine,
+    realtime_voice_capabilities,
     realtime_voice_instructions,
     realtime_voice_names,
 )
@@ -837,6 +839,9 @@ async def realtime_transcription(websocket: WebSocket) -> None:
 
 REALTIME_IDLE_SECONDS = 600
 REALTIME_UNLOAD_POLL_SECONDS = 1.0
+MAX_REALTIME_IMAGE_BYTES = 20 * 1024 * 1024
+# Larger images only cost prefill time in a spoken reply.
+MAX_REALTIME_IMAGE_SIDE = 2048
 _REALTIME_KEY_PROTOCOL = "openai-insecure-api-key."
 
 
@@ -866,6 +871,10 @@ def _realtime_session_object(
         "model": model,
         "output_modalities": ["audio"],
         "instructions": session.instructions,
+        "tools": [{"type": "function", **tool["function"]} for tool in session.tools],
+        "tool_choice": "auto",
+        # Not in the OpenAI session object: what this model's backend accepts.
+        "capabilities": session.capabilities,
         "audio": {
             "input": {"format": pcm, "turn_detection": None},
             "output": {"format": pcm, "voice": session.voice},
@@ -918,11 +927,73 @@ def _parse_session_update(config: dict) -> dict:
         raise RealtimeVoiceError(
             "invalid_value", "max_output_tokens must be an integer"
         )
+    tool_choice = config.get("tool_choice")
+    if tool_choice not in (None, "auto", "none"):
+        raise RealtimeVoiceError("unsupported", "tool_choice must be auto or none")
+    tools = config.get("tools")
+    if tools is not None:
+        if not isinstance(tools, list):
+            raise RealtimeVoiceError("invalid_value", "tools must be a list")
+        tools = [_chat_tool(tool) for tool in tools]
+    if tool_choice == "none":
+        tools = []
     return {
         "instructions": config.get("instructions"),
         "voice": config.get("voice") or audio_out.get("voice"),
         "max_output_tokens": max_tokens,
+        "tools": tools,
     }
+
+
+def _chat_tool(tool) -> dict:
+    """A Realtime function tool in the chat-completions shape the templates read."""
+    if (
+        not isinstance(tool, dict)
+        or tool.get("type") != "function"
+        or not isinstance(tool.get("name"), str)
+    ):
+        raise RealtimeVoiceError(
+            "invalid_value", "each tool must be a function tool with a name"
+        )
+    function = {"name": tool["name"]}
+    for key in ("description", "parameters"):
+        if key in tool:
+            function[key] = tool[key]
+    return {"type": "function", "function": function}
+
+
+def _realtime_images(item: dict) -> list:
+    """Decode the input_image parts of a user message item."""
+    if item.get("role") != "user":
+        raise RealtimeVoiceError("unsupported", "only user messages can be added")
+    images = []
+    for part in item.get("content") or []:
+        if not isinstance(part, dict):
+            part = {}
+        url = part.get("image_url")
+        if part.get("type") != "input_image" or not isinstance(url, str):
+            raise RealtimeVoiceError(
+                "unsupported", "a user message item can only carry input_image parts"
+            )
+        header, _, payload = url.partition(",")
+        if not header.startswith("data:image/") or ";base64" not in header:
+            raise RealtimeVoiceError(
+                "invalid_value", "image_url must be a base64 data URL"
+            )
+        if len(payload) > MAX_REALTIME_IMAGE_BYTES:
+            raise RealtimeVoiceError("invalid_value", "the image is too large")
+        try:
+            image = Image.open(io.BytesIO(base64.b64decode(payload, validate=True)))
+            image = image.convert("RGB")
+        except Exception as exc:
+            raise RealtimeVoiceError(
+                "invalid_value", "the image could not be decoded"
+            ) from exc
+        image.thumbnail((MAX_REALTIME_IMAGE_SIDE, MAX_REALTIME_IMAGE_SIDE))
+        images.append(image)
+    if not images:
+        raise RealtimeVoiceError("invalid_value", "the message item has no image")
+    return images
 
 
 @realtime_router.websocket("/v1/realtime")
@@ -1101,6 +1172,41 @@ async def _run_realtime_voice(
                 {"type": "response.output_audio.delta", **ids, **part, "delta": delta}
             )
 
+        async def send_function_calls(result: ResponseResult) -> list[dict]:
+            calls = []
+            for index, call in enumerate(result.function_calls, start=1):
+                item = {
+                    "id": _realtime_id("item"),
+                    "object": "realtime.item",
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }
+                where = {"response_id": response_id, "output_index": index}
+                await send(
+                    {
+                        "type": "response.output_item.added",
+                        **where,
+                        "item": {**item, "status": "in_progress", "arguments": ""},
+                    }
+                )
+                await send(
+                    {
+                        "type": "response.function_call_arguments.done",
+                        **where,
+                        "item_id": item["id"],
+                        "call_id": call.call_id,
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    }
+                )
+                await send({"type": "response.output_item.done", **where, "item": item})
+                items.append(item["id"])
+                calls.append(item)
+            return calls
+
         async def on_done(result: ResponseResult) -> None:
             await announced.wait()
             text = "".join(transcript)
@@ -1131,6 +1237,7 @@ async def _run_realtime_voice(
                     "item": item,
                 }
             )
+            calls = await send_function_calls(result)
             await send(
                 {
                     "type": "response.done",
@@ -1138,7 +1245,7 @@ async def _run_realtime_voice(
                         "object": "realtime.response",
                         "id": response_id,
                         "status": result.status,
-                        "output": [item],
+                        "output": [item, *calls],
                         "usage": {
                             "input_tokens": result.input_tokens,
                             "output_tokens": result.output_slots,
@@ -1250,6 +1357,45 @@ async def _run_realtime_voice(
                         )
                     finally:
                         announced.set()
+                elif kind == "conversation.item.create":
+                    item = event.get("item")
+                    if not isinstance(item, dict):
+                        raise RealtimeVoiceError(
+                            "invalid_value", "item must be an object"
+                        )
+                    added = {
+                        "id": item.get("id") or _realtime_id("item"),
+                        "object": "realtime.item",
+                        "type": item.get("type"),
+                    }
+                    if item.get("type") == "function_call_output":
+                        call_id, output = item.get("call_id"), item.get("output")
+                        if not isinstance(call_id, str) or not isinstance(output, str):
+                            raise RealtimeVoiceError(
+                                "invalid_value",
+                                "function_call_output needs call_id and output strings",
+                            )
+                        session.add_tool_output(call_id, output)
+                        added["call_id"] = call_id
+                    elif item.get("type") == "message":
+                        for image in await asyncio.to_thread(_realtime_images, item):
+                            session.add_image(image)
+                        added["role"] = "user"
+                    else:
+                        raise RealtimeVoiceError(
+                            "unsupported",
+                            "only user image messages and function_call_output items "
+                            "can be added",
+                        )
+                    previous = items[-1] if items else None
+                    items.append(added["id"])
+                    await send(
+                        {
+                            "type": "conversation.item.added",
+                            "previous_item_id": previous,
+                            "item": added,
+                        }
+                    )
                 elif kind == "response.cancel":
                     session.cancel()
                 elif kind == "conversation.item.truncate":
@@ -1294,7 +1440,7 @@ async def list_model_voices(model: Optional[str] = None, realtime: bool = False)
 
     With ``realtime=true`` it lists the voices a /v1/realtime session on the
     model can pick, which can differ from its TTS voices, and adds the
-    session's default ``instructions``.
+    session's default ``instructions`` and its ``capabilities``.
 
     Reads static metadata only — a ``voices/`` directory (Kokoro-style)
     or the speaker table in ``config.json`` (Qwen3-TTS CustomVoice's
@@ -1325,6 +1471,7 @@ async def list_model_voices(model: Optional[str] = None, realtime: bool = False)
             "model": resolved,
             "voices": realtime_voice_names(config),
             "instructions": realtime_voice_instructions(config),
+            "capabilities": realtime_voice_capabilities(config),
         }
     voices_dir = model_dir / "voices"
     if voices_dir.is_dir():

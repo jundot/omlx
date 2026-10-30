@@ -40,7 +40,7 @@ enum ScreenCapture {
     /// The display under the pointer without oMLX's own windows, encoded
     /// like a pasted image.
     @MainActor
-    static func capture() async throws -> AskAIImage {
+    static func capture(maxPixelSize: Int = AskAIImage.maxPixelSize) async throws -> AskAIImage {
         guard ScreenCaptureAccess.isGranted else { throw ScreenCaptureError.permission }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         let mouse = NSEvent.mouseLocation
@@ -54,12 +54,12 @@ enum ScreenCapture {
         // Capture near the final size; AskAIImage only downscales.
         let config = SCStreamConfiguration()
         let longSide = Double(max(display.width, display.height))
-        let scale = min(2.0, Double(AskAIImage.maxPixelSize) / longSide)
+        let scale = min(2.0, Double(maxPixelSize) / longSide)
         config.width = Int(Double(display.width) * scale)
         config.height = Int(Double(display.height) * scale)
         config.showsCursor = false
         let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        guard let png = png(image), let out = await AskAIImage.make(from: .data(png))
+        guard let png = png(image), let out = await AskAIImage.make(from: .data(png), maxPixelSize: maxPixelSize)
         else { throw ScreenCaptureError.encoding }
         return out
     }

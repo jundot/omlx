@@ -7,6 +7,9 @@ of six text tokens and twelve speech frames until ``<|text_end|>``, then
 speech until an end-of-speech frame. Unlike ``stream_slots`` it keeps the
 cache across turns, stops between executor calls, and decodes speech frames
 incrementally.
+
+With tools, the reply's first token decides: ``<tool_call>`` writes the calls
+in text mode without speech, anything else opens the interleaved reply.
 """
 
 import time
@@ -23,14 +26,18 @@ from mlx_vlm.models.lfm3_audio.depth import (
     sample_frame,
 )
 
+from ..api.tool_calling import parse_tool_calls
 from .lfm3_speech import REPLY_PROMPT
 from .realtime_voice import (
     SAMPLE_RATE,
+    FunctionCall,
     RealtimeVoiceError,
     TranscriptStream,
     VoiceBackend,
     VoiceStep,
+    VoiceTurn,
     continuation_turn_text,
+    turn_messages,
 )
 
 INPUT_RATE = 16000
@@ -141,8 +148,15 @@ class LFM3VoiceBackend(VoiceBackend):
 
     # Voice chat speaks with the checkpoint's one built-in voice.
     voices = ()
+    supports_tools = True
+
+    @classmethod
+    def accepts_images(cls, config: dict) -> bool:
+        return config.get("model_type") == "lfm3_omni"
 
     def __init__(self, model, processor):
+        # LFM3-Omni adds a vision tower to LFM3-Audio.
+        self.input_image = hasattr(model, "vision_tower")
         self.model = model
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -161,21 +175,24 @@ class LFM3VoiceBackend(VoiceBackend):
         self.snapshot = None
         self.pending: list[tuple[int, mx.array | None]] = []
         self.reply: list[tuple[int, mx.array | None]] = []
+        self.tools: list[dict] = []
         self.finished = True
 
     def _offset(self) -> int:
         return next(c.offset for c in self.cache if isinstance(c, KVCache))
 
-    def _turn_text(self, system: str) -> str:
-        """The chat-template text of one user turn up to the assistant prompt."""
-        user = {"role": "user", "content": [{"type": "audio"}]}
-        messages = [{"role": "system", "content": system}, user]
+    def _turn_text(self, system: str, turn: list[dict], tools: list[dict]) -> str:
+        """The chat-template text of one turn up to the assistant prompt."""
+        messages = [{"role": "system", "content": system}, *turn]
         if self.cache is None:
             return self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False
+                messages,
+                tools=tools or None,
+                add_generation_prompt=True,
+                tokenize=False,
             )
         im_end = self.tokenizer.convert_ids_to_tokens(self.config.eos_token_id[0])
-        return continuation_turn_text(self.tokenizer, messages, im_end)
+        return continuation_turn_text(self.tokenizer, messages, im_end, turn=len(turn))
 
     def _embed(self, slots: list[tuple[int, mx.array | None]]) -> mx.array:
         rows = [
@@ -188,23 +205,40 @@ class LFM3VoiceBackend(VoiceBackend):
         ]
         return mx.stack(rows)
 
-    def _turn_inputs(self, audio: np.ndarray, system: str) -> tuple[list[int], dict]:
-        """Token ids of one user turn, opened as an interleaved reply, and its features."""
-        clip = np.asarray(resample_audio(audio, SAMPLE_RATE, INPUT_RATE), np.float32)
-        inputs = self.processor(text=self._turn_text(system), audio=[clip])
+    def _turn_inputs(
+        self, turn: VoiceTurn, system: str, tools: list[dict]
+    ) -> tuple[list[int], dict]:
+        """Token ids of one turn and its features. Without tools the ids open the
+        interleaved reply; with tools the reply's first token is still open."""
+        clips = None
+        if turn.audio is not None:
+            clips = [
+                np.asarray(
+                    resample_audio(turn.audio, SAMPLE_RATE, INPUT_RATE), np.float32
+                )
+            ]
+        inputs = self.processor(
+            text=self._turn_text(system, turn_messages(turn), tools),
+            images=turn.images or None,
+            audio=clips,
+        )
         ids = np.asarray(inputs["input_ids"]).reshape(-1).tolist()
-        ids.append(self.config.mixed_start_token_id)
+        if not tools:
+            ids.append(self.config.mixed_start_token_id)
         features = {
-            "input_features": inputs["input_features"],
-            "feature_attention_mask": inputs["feature_attention_mask"],
+            key: value
+            for key, value in inputs.items()
+            if key not in ("input_ids", "attention_mask")
         }
         return ids, features
 
     def begin_turn(
-        self, audio: np.ndarray, instructions: str, voice: str | None
+        self, turn: VoiceTurn, instructions: str, voice: str | None, tools: list[dict]
     ) -> int:
         system = f"{REPLY_PROMPT}\n\n{instructions}" if instructions else REPLY_PROMPT
-        ids, features = self._turn_inputs(audio, system)
+        if self.cache is None:
+            self.tools = tools
+        ids, features = self._turn_inputs(turn, system, tools)
         if self.cache is None:
             self.cache = self.model.make_cache()
         prompt_tokens = len(self.pending) + len(ids)
@@ -219,7 +253,6 @@ class LFM3VoiceBackend(VoiceBackend):
             turn = mx.concatenate([self._embed(self.pending), turn])
         self.hidden = self.backbone(None, self.cache, turn[None])[:, -1]
         self.pending = []
-        self.snapshot = self._snapshot()
         self.mode = INTERLEAVED
         self.slots_left = self.config.interleaved_n_text
         self.speaking = self.text_done = False
@@ -228,10 +261,35 @@ class LFM3VoiceBackend(VoiceBackend):
         self.reply = []
         self.frames: list[mx.array] = []
         self.text_ids: list[int] = []
+        # Tokens of the calls a tool reply writes, from its <tool_call>.
+        self.call_ids: list[int] = []
+        self.call_done = False
         self.transcript = TranscriptStream(self.tokenizer)
         self.finished = False
         self.codec.reset()
+        if tools:
+            self._open_reply()
+        else:
+            self.snapshot = self._snapshot()
         return prompt_tokens
+
+    def _open_reply(self) -> None:
+        """Start a call reply when the model's first choice is <tool_call>, else speech."""
+        logits = self.backbone.embed_tokens.as_linear(self.hidden)
+        first = int(mx.argmax(logits, axis=-1).item())
+        tool_start = self.tokenizer.convert_tokens_to_ids("<tool_call>")
+        if first == tool_start:
+            self.snapshot = self._snapshot()
+            self.mode = TEXT
+            self.call_ids = [first]
+            slot = (first, None)
+            self.reply.append(slot)
+        else:
+            # The interleaved opener belongs to the prompt, as it does without tools.
+            slot = (self.config.mixed_start_token_id, None)
+        self.hidden = self.backbone(None, self.cache, self._embed([slot])[None])[:, -1]
+        if first != tool_start:
+            self.snapshot = self._snapshot()
 
     def _slot(self) -> None:
         """Sample one slot and feed it back, as one ``stream_slots`` iteration."""
@@ -270,7 +328,14 @@ class LFM3VoiceBackend(VoiceBackend):
                 s["min_p"],
             ).item()
             self.text_history.append(token)
-            if token == config.text_end_token_id:
+            if self.call_ids:
+                # A tool reply ends with its calls; it never speaks.
+                self.call_ids.append(token)
+                self.call_done = token == self.tokenizer.convert_tokens_to_ids(
+                    "</tool_call>"
+                )
+                finished = self.call_done or token in self.eos_ids
+            elif token == config.text_end_token_id:
                 if interleaving:
                     self.text_done = self.speaking = True
                 else:
@@ -327,8 +392,19 @@ class LFM3VoiceBackend(VoiceBackend):
         if self.finished:
             audio = np.concatenate([audio, self.codec.flush()])
             out.done = True
+            out.function_calls = self._function_calls()
         out.audio = audio
         return out
+
+    def _function_calls(self) -> list[FunctionCall]:
+        if not self.call_done:
+            return []
+        text = self.tokenizer.decode(self.call_ids, skip_special_tokens=False)
+        _, calls = parse_tool_calls(text, self.tokenizer, self.tools)
+        return [
+            FunctionCall(call.function.name, call.function.arguments)
+            for call in calls or []
+        ]
 
     def _closing(self, slots: list[tuple[int, mx.array | None]]) -> list:
         """Close a cut reply: end open speech with an EOS frame, then <|im_end|>."""

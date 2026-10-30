@@ -15,6 +15,41 @@ struct AskAIToolActivity: Equatable, Sendable {
     var failed = false
 }
 
+extension AskAIToolActivity {
+    /// One line for the panel or the voice card.
+    var text: String {
+        switch (kind, isRunning, failed) {
+        case (.search, true, _):
+            return String(localized: "askai.tool.search.running", defaultValue: "Searching the web: \(detail)",
+                          comment: "Ask AI tool line while a web search runs; the argument is the query")
+        case (.search, false, false):
+            return String(localized: "askai.tool.search.done", defaultValue: "Searched the web: \(detail)",
+                          comment: "Ask AI tool line after a web search; the argument is the query")
+        case (.search, false, true):
+            return String(localized: "askai.tool.search.failed", defaultValue: "Web search failed: \(detail)",
+                          comment: "Ask AI tool line after a failed web search; the argument is the query")
+        case (.read, true, _):
+            return String(localized: "askai.tool.read.running", defaultValue: "Reading \(detail)",
+                          comment: "Ask AI tool line while a web page is fetched; the argument is the site")
+        case (.read, false, false):
+            return String(localized: "askai.tool.read.done", defaultValue: "Read \(detail)",
+                          comment: "Ask AI tool line after a web page was fetched; the argument is the site")
+        case (.read, false, true):
+            return String(localized: "askai.tool.read.failed", defaultValue: "Couldn't read \(detail)",
+                          comment: "Ask AI tool line after a page fetch failed; the argument is the site")
+        case (.screen, true, _):
+            return String(localized: "askai.tool.screen.running", defaultValue: "Looking at your screen",
+                          comment: "Ask AI tool line while a screenshot is taken")
+        case (.screen, false, false):
+            return String(localized: "askai.tool.screen.done", defaultValue: "Looked at your screen",
+                          comment: "Ask AI tool line after a screenshot was sent to the model")
+        case (.screen, false, true):
+            return String(localized: "askai.tool.screen.failed", defaultValue: "Couldn't capture the screen",
+                          comment: "Ask AI tool line after a screenshot failed")
+        }
+    }
+}
+
 struct AskAIToolResult: Sendable {
     /// Content of the tool message.
     let text: String
@@ -78,6 +113,25 @@ enum AskAITool {
         return out
     }
 
+    /// The same tools in the flat shape of an OpenAI Realtime `session.update`.
+    static func realtimeTools(_ tools: [ChatTool]) -> [[String: Any]] {
+        tools.map { tool in
+            let properties = Dictionary(uniqueKeysWithValues: tool.arguments.map {
+                ($0.name, ["type": "string", "description": $0.description])
+            })
+            return [
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": [
+                    "type": "object",
+                    "properties": properties,
+                    "required": tool.arguments.map(\.name),
+                ] as [String: Any],
+            ]
+        }
+    }
+
     /// Nil for a name the app does not offer.
     static func activity(for call: ChatToolCall) -> AskAIToolActivity? {
         let args = arguments(call.arguments)
@@ -116,6 +170,7 @@ struct AskAIToolRunner: AskAIToolRunning {
     let host: String
     let port: Int
     let apiKey: String?
+    var screenshotPixels = AskAIImage.maxPixelSize
 
     // A search with full page content fetches several pages in turn.
     private static let session: URLSession = {
@@ -166,7 +221,7 @@ struct AskAIToolRunner: AskAIToolRunning {
 
     private func screen() async -> AskAIToolResult {
         do {
-            let image = try await ScreenCapture.capture()
+            let image = try await ScreenCapture.capture(maxPixelSize: screenshotPixels)
             return AskAIToolResult(text: #"{"ok":true,"note":"The screenshot follows as an image."}"#,
                                    image: image)
         } catch ScreenCaptureError.permission {

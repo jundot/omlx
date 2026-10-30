@@ -306,9 +306,19 @@ final class AskAITests: XCTestCase {
 
     func testRealtimeEventDecoding() {
         func decode(_ json: String) -> RealtimeVoiceEvent? { RealtimeVoiceEvent.decode(json) }
-        XCTAssertEqual(decode(#"{"type":"session.created","session":{}}"#), .sessionCreated(instructions: ""))
-        XCTAssertEqual(decode(#"{"type":"session.created","session":{"instructions":"Speak briefly."}}"#),
-                       .sessionCreated(instructions: "Speak briefly."))
+        XCTAssertEqual(decode(#"{"type":"session.created","session":{}}"#),
+                       .sessionCreated(instructions: "", capabilities: RealtimeVoiceCapabilities()))
+        XCTAssertEqual(
+            decode(#"{"type":"session.created","session":{"instructions":"Speak briefly.","capabilities":{"input_image":true,"tools":true}}}"#),
+            .sessionCreated(instructions: "Speak briefly.",
+                            capabilities: RealtimeVoiceCapabilities(inputImage: true, tools: true))
+        )
+        XCTAssertEqual(
+            decode(#"{"type":"response.function_call_arguments.done","call_id":"call_1","name":"web_search","arguments":"{\"query\":\"mlx\"}"}"#),
+            .functionCall(callID: "call_1", name: "web_search", arguments: #"{"query":"mlx"}"#)
+        )
+        // The function call item itself is not a reply to play.
+        XCTAssertNil(decode(#"{"type":"response.output_item.added","item":{"id":"item_2","type":"function_call"}}"#))
         XCTAssertEqual(decode(#"{"type":"response.output_item.added","item":{"id":"item_1"}}"#),
                        .responseStarted(itemID: "item_1"))
         XCTAssertEqual(decode(#"{"type":"response.output_audio.delta","item_id":"item_1","delta":"AAEC"}"#),
@@ -457,7 +467,7 @@ final class AskAITests: XCTestCase {
     func testVoiceInstructionsPutTheModelPromptFirst() throws {
         let json = #"""
         {"model":"omni","systemPrompt":"Today is {weekday}.","modelPrompts":{"lfm":"Be calm."},
-         "gpuPowerLimitEnabled":true,"gpuPowerLimitWatts":1}
+         "gpuPowerLimitEnabled":true,"gpuPowerLimitWatts":1,"tools":{"enabled":true}}
         """#
         var talk = try JSONDecoder().decode(TalkPrefs.self, from: Data(json.utf8))
         var context = PromptContext()
@@ -472,6 +482,13 @@ final class AskAITests: XCTestCase {
         talk.systemPrompt = ""
         XCTAssertEqual(talk.instructions(modelDefault: "Speak briefly.", context: context), "")
         XCTAssertEqual(talk.requestGPUPowerLimit, 2)
+        XCTAssertTrue(talk.tools.enabled)
+
+        let tools = AskAITool.realtimeTools([AskAITool.webSearch, AskAITool.captureScreen])
+        XCTAssertEqual(tools.map { $0["name"] as? String }, ["web_search", "capture_screen"])
+        let search = try XCTUnwrap(tools[0]["parameters"] as? [String: Any])
+        XCTAssertEqual(search["required"] as? [String], ["query"])
+        XCTAssertEqual((tools[1]["parameters"] as? [String: Any])?["required"] as? [String], [])
     }
 
     func testEmptyPromptsGetTheDefaultOnce() throws {

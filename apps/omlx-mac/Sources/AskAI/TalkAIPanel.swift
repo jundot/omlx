@@ -164,6 +164,16 @@ struct TalkAIPanelView: View {
                         .foregroundStyle(theme.redDot)
                         .multilineTextAlignment(.center)
                         .lineLimit(3)
+                } else if let notice = controller.notice {
+                    Text(notice)
+                        .foregroundStyle(theme.amberDot)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(3)
+                } else if let activity = controller.toolActivity, controller.phase == .thinking {
+                    Text(activity.text)
+                        .foregroundStyle(theme.textSecondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
                 } else {
                     captionLines
                 }
@@ -171,7 +181,7 @@ struct TalkAIPanelView: View {
             .font(.omlxText(DesignTokens.FontSize.callout))
             .frame(maxWidth: .infinity, minHeight: 54, alignment: .top)
             .padding(.horizontal, 20)
-            HStack(spacing: 16) {
+            HStack(spacing: controller.capabilities.inputImage ? 12 : 16) {
                 if failure != nil, controller.failureAction != .none {
                     Button(TalkAIPanelStrings.openSettings) { controller.performFailureAction() }
                         .buttonStyle(.omlx(.normal, size: .small))
@@ -180,6 +190,16 @@ struct TalkAIPanelView: View {
                                 tint: controller.isMuted ? theme.redDot : theme.text,
                                 help: controller.isMuted ? TalkAIPanelStrings.unmute : TalkAIPanelStrings.mute) {
                         controller.toggleMute()
+                    }
+                    .disabled(failure != nil)
+                }
+                if controller.capabilities.inputImage {
+                    // Same symbol as the text panel's screen capture line; the tint shows sharing.
+                    roundButton("camera.viewfinder",
+                                tint: controller.isSharingScreen ? theme.accent : theme.text,
+                                help: controller.isSharingScreen
+                                    ? TalkAIPanelStrings.stopSharing : TalkAIPanelStrings.shareScreen) {
+                        controller.toggleScreenShare()
                     }
                     .disabled(failure != nil)
                 }
@@ -340,6 +360,16 @@ private enum TalkAIPanelStrings {
     static var end: String {
         String(localized: "talkai.button.end", defaultValue: "End",
                comment: "Help text for the button that ends the Talk with AI conversation")
+    }
+
+    static var shareScreen: String {
+        String(localized: "talkai.button.share_screen", defaultValue: "Share Screen",
+               comment: "Help text for the voice card button that sends a screenshot with each turn")
+    }
+
+    static var stopSharing: String {
+        String(localized: "talkai.button.stop_sharing", defaultValue: "Stop Sharing Screen",
+               comment: "Help text for the voice card button while the screen is being shared")
     }
 
     static var typeInstead: String {

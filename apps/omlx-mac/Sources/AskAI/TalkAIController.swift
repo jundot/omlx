@@ -1,7 +1,8 @@
 // Owns Ask AI voice mode at runtime: its hotkey, the voice panel, and one spoken
 // conversation over /v1/realtime. The app decides when a turn ends: speech
 // followed by silence commits the turn, and speech over the reply stops the
-// reply and trims it to what was heard.
+// reply and trims it to what was heard. A reply that calls tools ends with the
+// calls; the app runs them, sends their outputs, and asks for the next reply.
 
 import AppKit
 import AVFoundation
@@ -32,6 +33,8 @@ final class TalkAIController {
     static let preRollFrames = 15  // 300 ms
     /// A turn this long ends on its own; the server holds at most 120 s per turn.
     static let maxTurnFrames = 3000  // 60 s
+    /// Long side of a voice screenshot; larger ones only delay the spoken reply.
+    static let screenshotPixels = 1024
     /// Retries while the server still closes the previous conversation's session.
     static let maxConnectAttempts = 10
 
@@ -46,6 +49,14 @@ final class TalkAIController {
     private(set) var hotKeyError: String?
     /// True once a reply of this conversation can be copied.
     private(set) var canCopyReplies = false
+    /// What the session's model accepts; known once the session opens.
+    private(set) var capabilities = RealtimeVoiceCapabilities()
+    /// While on, each turn carries a screenshot taken when the user starts speaking.
+    private(set) var isSharingScreen = false
+    /// The tool the model is using, shown until the next reply speaks.
+    private(set) var toolActivity: AskAIToolActivity?
+    /// A short message in place of the caption, such as a missing permission.
+    private(set) var notice: String?
 
     /// Hides the Ask AI bar before the card takes its place.
     @ObservationIgnored var willOpen: (() -> Void)?
@@ -64,6 +75,17 @@ final class TalkAIController {
     @ObservationIgnored private var micLevel = -120.0
     /// Set from commit until the reply's response.done arrives.
     @ObservationIgnored private var awaitingReply = false
+    /// Set once response.create went out for the awaited reply.
+    @ObservationIgnored private var replyRequested = false
+    /// Counts turns, so work for a turn the user has moved past is dropped.
+    @ObservationIgnored private var turnToken = 0
+    @ObservationIgnored private var screenshot: Task<AskAIImage?, Never>?
+    /// Calls of the current reply, run when it finishes.
+    @ObservationIgnored private var pendingCalls: [ChatToolCall] = []
+    /// Tool rounds since the user last spoke, capped like a text answer's.
+    @ObservationIgnored private var toolRounds = 0
+    @ObservationIgnored private var toolTask: Task<Void, Never>?
+    @ObservationIgnored private var noticeToken = 0
     /// The reply being played; events of other items belong to a stopped reply.
     @ObservationIgnored private var replyItemID: String?
     /// Set when the user talks over a reply that the server has not announced yet.
@@ -211,6 +233,34 @@ final class TalkAIController {
         }
     }
 
+    func toggleScreenShare() {
+        guard capabilities.inputImage else { return }
+        if isSharingScreen {
+            isSharingScreen = false
+            screenshot?.cancel()
+            screenshot = nil
+            return
+        }
+        guard ScreenCaptureAccess.isGranted else {
+            // The first request lists oMLX in System Settings.
+            ScreenCaptureAccess.request()
+            showNotice(TalkAIStrings.screenPermission)
+            return
+        }
+        isSharingScreen = true
+    }
+
+    private func showNotice(_ text: String) {
+        noticeToken += 1
+        let token = noticeToken
+        notice = text
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            guard self.noticeToken == token else { return }
+            self.notice = nil
+        }
+    }
+
     /// Ends the user's turn now, for when ongoing sound keeps it open.
     func finishTurn() {
         guard phase == .userSpeaking else { return }
@@ -279,9 +329,12 @@ final class TalkAIController {
             return
         }
         switch event {
-        case .sessionCreated(let modelDefault):
+        case .sessionCreated(let modelDefault, let capabilities):
             connectAttempts = 0
+            self.capabilities = capabilities
             startListening(modelDefault: modelDefault)
+        case .functionCall(let callID, let name, let arguments):
+            pendingCalls.append(ChatToolCall(id: callID, name: name, arguments: arguments))
         case .responseStarted(let itemID):
             guard dropNextReply else {
                 replyItemID = itemID
@@ -293,7 +346,10 @@ final class TalkAIController {
         case .audio(let itemID, let pcm):
             guard itemID == replyItemID else { return }
             audio?.enqueue(pcm)
-            if phase == .thinking { phase = .speaking }
+            if phase == .thinking {
+                phase = .speaking
+                toolActivity = nil
+            }
         case .transcript(let itemID, let delta):
             guard itemID == replyItemID else { return }
             replyText += delta
@@ -305,7 +361,13 @@ final class TalkAIController {
                 secondsPerChar = secondsPerChar.map { ($0 + measured) / 2 } ?? measured
             }
             replyDone = true
-            replyFinished()
+            if !pendingCalls.isEmpty, toolRounds < AskAIConversation.maxToolRounds {
+                runTools()
+            } else {
+                // Calls past the cap stay unanswered; the next turn moves on.
+                pendingCalls = []
+                replyFinished()
+            }
             updateCaption()
         case .error(let code, _) where code == "session_limit" && phase == .connecting
             && connectAttempts < Self.maxConnectAttempts:
@@ -332,8 +394,73 @@ final class TalkAIController {
 
     private func replyFinished() {
         awaitingReply = false
+        replyRequested = false
         audio?.finishReply()
         if phase == .thinking { phase = .listening }
+    }
+
+    /// Runs the calls that ended the reply, then asks for the reply that uses
+    /// their outputs. The reply stays awaited meanwhile, so speech counts as an
+    /// interruption.
+    private func runTools() {
+        let calls = pendingCalls
+        pendingCalls = []
+        toolRounds += 1
+        replyRequested = false
+        audio?.finishReply()
+        guard let config = services?.config else {
+            replyFinished()
+            return
+        }
+        let runner = AskAIToolRunner(host: config.host, port: config.port, apiKey: config.apiKey,
+                                     screenshotPixels: Self.screenshotPixels)
+        toolTask = Task {
+            for call in calls {
+                self.toolActivity = AskAITool.activity(for: call)
+                let result = await runner.run(call)
+                guard !Task.isCancelled else { return }
+                self.toolActivity?.isRunning = false
+                self.toolActivity?.failed = result.failed
+                self.client?.send([
+                    "type": "conversation.item.create",
+                    "item": ["type": "function_call_output", "call_id": call.id, "output": result.text],
+                ])
+                if let image = result.image { self.sendImage(image) }
+            }
+            // Let the words before the calls finish before the next reply starts.
+            while self.audio?.isPlayingReply == true {
+                try? await Task.sleep(for: .milliseconds(50))
+                guard !Task.isCancelled else { return }
+            }
+            self.toolTask = nil
+            self.finishPlayedReply()
+            self.resetCaption()
+            self.phase = .thinking
+            self.requestReply()
+        }
+    }
+
+    private func cancelTools() {
+        toolTask?.cancel()
+        toolTask = nil
+        pendingCalls = []
+        toolActivity = nil
+    }
+
+    private func requestReply() {
+        client?.send(["type": "response.create"])
+        replyRequested = true
+    }
+
+    private func sendImage(_ image: AskAIImage) {
+        client?.send([
+            "type": "conversation.item.create",
+            "item": [
+                "type": "message",
+                "role": "user",
+                "content": [["type": "input_image", "image_url": image.dataURL]],
+            ],
+        ])
     }
 
     private static let turnErrors: Set<String> = [
@@ -356,6 +483,10 @@ final class TalkAIController {
         session["instructions"] = prefs.instructions(
             modelDefault: modelDefault, context: PromptContext(app: sourceApp, model: prefs.model)
         )
+        if capabilities.tools, prefs.tools.enabled {
+            let tools = AskAITool.tools(for: prefs.tools, vision: capabilities.inputImage)
+            if !tools.isEmpty { session["tools"] = AskAITool.realtimeTools(tools) }
+        }
         client?.send(["type": "session.update", "session": session])
 
         let audio = VoiceAudioEngine()
@@ -414,6 +545,13 @@ final class TalkAIController {
         // Speech can start between the end of playback and the next tick.
         if !interrupting, phase == .speaking { finishPlayedReply() }
         turnFrames = 0
+        turnToken += 1
+        toolRounds = 0
+        // Speaking over a tool run drops it; the server forgets unanswered calls.
+        cancelTools()
+        if isSharingScreen {
+            screenshot = Task { try? await ScreenCapture.capture(maxPixelSize: Self.screenshotPixels) }
+        }
         if interrupting {
             // Keep the caption at what was heard.
             updateCaption()
@@ -421,9 +559,13 @@ final class TalkAIController {
             if awaitingReply || audio?.isPlayingReply == true { keepReply(transcript) }
             let heardMs = audio?.stopPlayback() ?? 0
             if awaitingReply {
-                client?.send(["type": "response.cancel"])
+                // A reply still waiting for its screenshot was never requested.
+                if replyRequested {
+                    client?.send(["type": "response.cancel"])
+                    dropNextReply = replyItemID == nil
+                }
                 awaitingReply = false
-                dropNextReply = replyItemID == nil
+                replyRequested = false
             }
             if let replyItemID { truncate(replyItemID, heardMs: heardMs) }
         }
@@ -458,10 +600,22 @@ final class TalkAIController {
     private func commitTurn() {
         flushAudio()
         client?.send(["type": "input_audio_buffer.commit"])
-        client?.send(["type": "response.create"])
         awaitingReply = true
         resetCaption()
         phase = .thinking
+        guard let shot = screenshot else {
+            requestReply()
+            return
+        }
+        screenshot = nil
+        let token = turnToken
+        Task {
+            let image = await shot.value
+            // Speech that started meanwhile belongs to the next turn.
+            guard token == self.turnToken, self.awaitingReply else { return }
+            if let image { self.sendImage(image) }
+            self.requestReply()
+        }
     }
 
     private func tick() {
@@ -469,9 +623,14 @@ final class TalkAIController {
         case .speaking:
             level = Self.normalized(audio?.outputLevel ?? -120)
             updateCaption()
-            if !awaitingReply, audio?.isPlayingReply != true {
-                finishPlayedReply()
-                phase = .listening
+            if audio?.isPlayingReply != true {
+                if !awaitingReply {
+                    finishPlayedReply()
+                    phase = .listening
+                } else if toolTask != nil {
+                    // The words before the calls are done; the tools still run.
+                    phase = .thinking
+                }
             }
         case .listening, .userSpeaking:
             level = Self.normalized(micLevel)
@@ -587,15 +746,28 @@ final class TalkAIController {
         audio?.stop()
         audio = nil
         awaitingReply = false
+        replyRequested = false
         replyItemID = nil
         dropNextReply = false
         pendingAudio = Data()
         preRoll = []
         level = 0
+        cancelTools()
+        screenshot?.cancel()
+        screenshot = nil
+        isSharingScreen = false
+        capabilities = RealtimeVoiceCapabilities()
+        notice = nil
     }
 }
 
 enum TalkAIStrings {
+    static var screenPermission: String {
+        String(localized: "talkai.share.permission",
+               defaultValue: "Allow oMLX in System Settings > Screen & System Audio Recording, then restart oMLX.",
+               comment: "Shown in the voice card when screen sharing needs the screen recording permission")
+    }
+
     static var noModel: String {
         String(localized: "talkai.error.no_model",
                defaultValue: "Choose a voice model in Ask AI settings.",

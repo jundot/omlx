@@ -112,6 +112,8 @@ struct TalkPrefs: Codable, Equatable, Sendable {
     /// System-wide GPU power cap for the whole conversation.
     var gpuPowerLimitEnabled = false
     var gpuPowerLimitWatts = 10
+    /// Tools the voice model may call, when its backend can call tools.
+    var tools = AskAIToolPrefs()
 
     init() {}
 
@@ -127,6 +129,7 @@ struct TalkPrefs: Codable, Equatable, Sendable {
         speechSpeed = c.lenient(Double.self, .speechSpeed).map(TalkPrefs.clampedSpeed) ?? fallback.speechSpeed
         gpuPowerLimitEnabled = c.lenient(Bool.self, .gpuPowerLimitEnabled) ?? fallback.gpuPowerLimitEnabled
         gpuPowerLimitWatts = c.lenient(Int.self, .gpuPowerLimitWatts) ?? fallback.gpuPowerLimitWatts
+        tools = c.lenient(AskAIToolPrefs.self, .tools) ?? fallback.tools
     }
 
     var requestGPUPowerLimit: Int? {

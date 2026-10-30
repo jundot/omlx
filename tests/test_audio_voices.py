@@ -122,6 +122,7 @@ class TestVoicesEndpoint:
         assert realtime.json()["voices"] == []
         # The interleaved-output line stays server-side, so clients see no default.
         assert realtime.json()["instructions"] == ""
+        assert realtime.json()["capabilities"] == {"input_image": False, "tools": True}
 
         config.write_text(json.dumps({
             "model_type": "qwen3_omni_moe",
@@ -132,3 +133,4 @@ class TestVoicesEndpoint:
         )
         assert realtime.json()["voices"] == ["chelsie", "ethan"]
         assert realtime.json()["instructions"].startswith("You are Qwen-Omni")
+        assert realtime.json()["capabilities"] == {"input_image": True, "tools": True}

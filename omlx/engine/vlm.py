@@ -107,6 +107,17 @@ def realtime_voice_instructions(config: dict) -> str:
     backend_class = _VOICE_BACKENDS.get(config.get("model_type"))
     return backend_class.default_instructions if backend_class else ""
 
+
+def realtime_voice_capabilities(config: dict) -> dict:
+    """Whether a /v1/realtime session on this checkpoint reads images and calls tools."""
+    backend_class = _VOICE_BACKENDS.get(config.get("model_type"))
+    if backend_class is None:
+        return {"input_image": False, "tools": False}
+    return {
+        "input_image": backend_class.accepts_images(config),
+        "tools": backend_class.supports_tools,
+    }
+
 # OCR model types that require special handling.
 # unlimited-ocr keeps its dashed config model_type (mlx-vlm resolves it to the
 # unlimited_ocr package via MODEL_REMAPPING), so key it in the dashed form to

@@ -13,6 +13,7 @@ import contextlib
 import logging
 import threading
 import time
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 SAMPLE_RATE = 24000
 MAX_INPUT_SECONDS = 120
 MIN_COMMIT_SECONDS = 0.1
+MAX_TURN_IMAGES = 4
 # Generation time per executor call; chat steps on the same model run between calls.
 STEP_SECONDS = 0.04
 
@@ -43,6 +45,28 @@ class RealtimeVoiceError(Exception):
 
 
 @dataclass
+class FunctionCall:
+    """A tool call that ended a reply; ``arguments`` is JSON text."""
+
+    name: str
+    arguments: str
+    call_id: str = ""
+
+
+@dataclass
+class VoiceTurn:
+    """What a reply answers: tool outputs, images, and the user's speech.
+
+    A turn without speech answers the outputs of the previous reply's calls;
+    its images belong to the last output, as a screenshot a tool took.
+    """
+
+    audio: np.ndarray | None = None
+    images: list = field(default_factory=list)
+    tool_outputs: list[str] = field(default_factory=list)
+
+
+@dataclass
 class VoiceStep:
     """Output of one executor call: transcript text, 24 kHz audio, slots used."""
 
@@ -50,6 +74,8 @@ class VoiceStep:
     audio: np.ndarray = field(default_factory=lambda: np.zeros(0, np.float32))
     slots: int = 0
     done: bool = False
+    # Set on the last step of a reply that called tools.
+    function_calls: list[FunctionCall] = field(default_factory=list)
 
 
 class VoiceBackend(ABC):
@@ -58,6 +84,13 @@ class VoiceBackend(ABC):
     voices: tuple[str, ...] = ()
     # System prompt a session starts with; instructions from the client replace it.
     default_instructions = ""
+    supports_tools = False
+    input_image = False
+
+    @classmethod
+    def accepts_images(cls, config: dict) -> bool:
+        """True when the checkpoint's config.json describes a vision tower."""
+        return cls.input_image
 
     @classmethod
     def supports(cls, model) -> bool:
@@ -75,9 +108,13 @@ class VoiceBackend(ABC):
 
     @abstractmethod
     def begin_turn(
-        self, audio: np.ndarray, instructions: str, voice: str | None
+        self, turn: VoiceTurn, instructions: str, voice: str | None, tools: list[dict]
     ) -> int:
-        """Prefill one user turn (24 kHz float32) and return its prompt tokens."""
+        """Prefill one turn (speech is 24 kHz float32) and return its prompt tokens.
+
+        ``tools`` are chat-completions tool definitions; they join the system
+        prompt, which only the first turn renders.
+        """
 
     @abstractmethod
     def step(self, seconds: float, cancel: threading.Event) -> VoiceStep:
@@ -103,6 +140,7 @@ class ResponseResult:
     output_slots: int = 0
     # Why a failed reply failed, for the client's error event.
     error: RealtimeVoiceError | None = None
+    function_calls: list[FunctionCall] = field(default_factory=list)
 
 
 TextCallback = Callable[[str], Awaitable[None]]
@@ -120,9 +158,14 @@ class RealtimeVoiceSession:
         self._activity_key = f"realtime:{id(self):x}"
         self.instructions = backend.default_instructions
         self.voice = backend.default_voice
+        self.tools: list[dict] = []
         self.max_output_tokens: int | None = None
         self._buffer = bytearray()
         self._pending: np.ndarray | None = None
+        self._images: list = []
+        self._tool_outputs: list[str] = []
+        # Calls of the last reply that still wait for their output.
+        self._open_calls: list[str] = []
         self._locked = False
         self._cancel = threading.Event()
         self._task: asyncio.Task | None = None
@@ -136,21 +179,32 @@ class RealtimeVoiceSession:
     def responding(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    @property
+    def capabilities(self) -> dict:
+        return {
+            "input_image": self._backend.input_image,
+            "tools": self._backend.supports_tools,
+        }
+
     def update(
         self,
         instructions: str | None = None,
         voice: str | None = None,
         max_output_tokens: int | None = None,
+        tools: list[dict] | None = None,
     ) -> None:
-        # The system prompt and voice open the conversation cache.
+        # The system prompt, its tools and the voice open the conversation cache.
         if self._locked and (
             (instructions is not None and instructions != self.instructions)
             or (voice is not None and voice != self.voice)
+            or (tools is not None and tools != self.tools)
         ):
             raise RealtimeVoiceError(
                 "session_locked",
-                "instructions and voice cannot change after the first turn",
+                "instructions, tools and voice cannot change after the first turn",
             )
+        if tools and not self._backend.supports_tools:
+            raise RealtimeVoiceError("unsupported", "this model cannot call tools")
         if voice is not None and voice not in self.voices:
             raise RealtimeVoiceError(
                 "invalid_value",
@@ -158,6 +212,8 @@ class RealtimeVoiceSession:
             )
         if instructions is not None:
             self.instructions = instructions
+        if tools is not None:
+            self.tools = tools
         if voice is not None:
             self.voice = voice
         if max_output_tokens is not None:
@@ -173,6 +229,24 @@ class RealtimeVoiceSession:
 
     def clear(self) -> None:
         self._buffer.clear()
+
+    def add_image(self, image) -> None:
+        """Attach an image to the next turn."""
+        if not self._backend.input_image:
+            raise RealtimeVoiceError("unsupported", "this model does not read images")
+        if len(self._images) >= MAX_TURN_IMAGES:
+            raise RealtimeVoiceError(
+                "invalid_value", f"a turn holds at most {MAX_TURN_IMAGES} images"
+            )
+        self._images.append(image)
+
+    def add_tool_output(self, call_id: str, output: str) -> None:
+        if call_id not in self._open_calls:
+            raise RealtimeVoiceError(
+                "item_not_found", f"no function call {call_id!r} waits for output"
+            )
+        self._open_calls.remove(call_id)
+        self._tool_outputs.append(output)
 
     def commit(self) -> None:
         if len(self._buffer) < MIN_COMMIT_SECONDS * SAMPLE_RATE * 2:
@@ -203,22 +277,25 @@ class RealtimeVoiceSession:
                 "conversation_already_has_active_response",
                 "a response is already in progress",
             )
-        if self._pending is None:
+        if self._pending is None and not self._tool_outputs:
             raise RealtimeVoiceError(
                 "input_audio_buffer_empty",
-                "commit a spoken turn before response.create",
+                "commit a spoken turn or a function call output before response.create",
             )
-        audio, self._pending = self._pending, None
+        turn = VoiceTurn(self._pending, self._images, self._tool_outputs)
+        self._pending, self._images, self._tool_outputs = None, [], []
+        # A new reply leaves the previous reply's unanswered calls behind.
+        self._open_calls = []
         self._locked = True
         self._cancel.clear()
         self._task = asyncio.create_task(
-            self._respond(audio, on_text, on_audio, on_done)
+            self._respond(turn, on_text, on_audio, on_done)
         )
         return self._task
 
     async def _respond(
         self,
-        audio: np.ndarray,
+        turn: VoiceTurn,
         on_text: TextCallback,
         on_audio: AudioCallback,
         on_done: DoneCallback,
@@ -235,9 +312,10 @@ class RealtimeVoiceSession:
             result.input_tokens = await loop.run_in_executor(
                 self._executor,
                 self._backend.begin_turn,
-                audio,
+                turn,
                 self.instructions,
                 self.voice,
+                self.tools,
             )
             while True:
                 if self._cancel.is_set():
@@ -258,6 +336,10 @@ class RealtimeVoiceSession:
                     sent_seconds += step.audio.size / SAMPLE_RATE
                     await on_audio(step.audio)
                 if step.done:
+                    for call in step.function_calls:
+                        call.call_id = f"call_{uuid.uuid4().hex[:24]}"
+                    result.function_calls = step.function_calls
+                    self._open_calls = [call.call_id for call in step.function_calls]
                     break
                 if (
                     self.max_output_tokens is not None
@@ -319,6 +401,8 @@ class RealtimeVoiceSession:
                 "invalid_value", "audio_end_ms must not be negative"
             )
         await self._settle()
+        # The cut drops any call the reply made.
+        self._open_calls = []
         logger.info("Realtime voice reply truncated after %d ms", audio_end_ms)
         loop = asyncio.get_running_loop()
         self._engine._speech_active += 1
@@ -357,13 +441,33 @@ class TranscriptStream:
         return delta
 
 
+def turn_messages(turn: VoiceTurn) -> list[dict]:
+    """Chat messages of one turn: tool outputs, then the user's images and speech.
+
+    Without speech the images are what the last tool returned, so they go
+    inside that tool's response.
+    """
+    messages = [{"role": "tool", "content": output} for output in turn.tool_outputs]
+    images = [{"type": "image"} for _ in turn.images]
+    if turn.audio is not None:
+        messages.append({"role": "user", "content": [*images, {"type": "audio"}]})
+    elif images:
+        text = messages[-1]["content"]
+        messages[-1]["content"] = [{"type": "text", "text": text}, *images]
+    return messages
+
+
 def continuation_turn_text(
-    tokenizer, messages: list[dict], im_end: str, **template_kwargs
+    tokenizer, messages: list[dict], im_end: str, turn: int = 1, **template_kwargs
 ) -> str:
-    """Template text of a later user turn, after a reply that ended with ``im_end``."""
+    """Template text of a later turn, after a reply that ended with ``im_end``.
+
+    The last ``turn`` messages make up the turn, such as tool outputs followed
+    by the user's message.
+    """
     sentinel = "\x00"
     text = tokenizer.apply_chat_template(
-        [*messages, {"role": "assistant", "content": sentinel}, messages[-1]],
+        [*messages, {"role": "assistant", "content": sentinel}, *messages[-turn:]],
         add_generation_prompt=True,
         tokenize=False,
         **template_kwargs,
