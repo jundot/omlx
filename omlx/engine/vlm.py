@@ -2011,7 +2011,10 @@ class VLMBatchedEngine(BaseEngine):
                     load_kwargs = {
                         "trust_remote_code": self._trust_remote_code,
                     }
-                    if model_type == QWEN4_EXP_MODEL_TYPE:
+                    if (
+                        model_type == QWEN4_EXP_MODEL_TYPE
+                        or model_type in MINIMAX_M3_MODEL_TYPES
+                    ):
                         load_kwargs["lazy"] = True
                     # Expert offload wraps BEFORE materialization so non-resident
                     # experts never load; keep the load lazy only when the feature
