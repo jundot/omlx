@@ -26,14 +26,23 @@ from typing import Any, Dict, List, Tuple, Union
 logger = logging.getLogger(__name__)
 
 # Head-norm suffix -> backbone counterpart suffix. Only norms whose raw mean
-# can plausibly exceed the old heuristic's 0.5 cutoff are listed; the rest
-# (input_layernorm, pre_fc_norm_*) have strongly negative raw means and were
-# always converted correctly.
+# can plausibly exceed the old heuristic's 0.5 cutoff were listed at first;
+# input_layernorm joined them because MTP side-cars imported from OptiQ ship
+# their whole head zero-centered.
 _REPAIR_GROUPS = {
     ".self_attn.q_norm.weight": ".self_attn.q_norm.weight",
     ".self_attn.k_norm.weight": ".self_attn.k_norm.weight",
+    ".input_layernorm.weight": ".input_layernorm.weight",
     ".post_attention_layernorm.weight": ".post_attention_layernorm.weight",
     "mtp.norm.weight": "model.norm.weight",
+}
+
+# Head norms with no backbone counterpart. A converted gamma is raw + 1, so a
+# negative mean always means the raw convention is still stored (converted
+# pre_fc_norm_* values measure 0.27-0.49). Anchorless repair: +1 when mean < 0.
+_NEGATIVE_MEAN_GROUPS = {
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
 }
 
 # Minimum gap below the backbone anchor that marks a missing +1. Correct
@@ -61,14 +70,18 @@ def repair_legacy_head_norms(
     items = list(weights.items()) if isinstance(weights, dict) else list(weights)
 
     head_indices: List[Tuple[int, str]] = []  # (item index, head suffix)
+    negative_mean_indices: List[int] = []
     for i, (k, v) in enumerate(items):
         if "mtp." not in k or getattr(v, "ndim", 0) != 1:
+            continue
+        if any(k.endswith(sfx) for sfx in _NEGATIVE_MEAN_GROUPS):
+            negative_mean_indices.append(i)
             continue
         for head_sfx in _REPAIR_GROUPS:
             if k.endswith(head_sfx):
                 head_indices.append((i, head_sfx))
                 break
-    if not head_indices:
+    if not head_indices and not negative_mean_indices:
         return weights, 0
 
     # Backbone anchors: mean-of-means over counterpart tensors.
@@ -101,6 +114,14 @@ def repair_legacy_head_norms(
         if gap > _REPAIR_MARGIN:
             items[i] = (k, v + 1.0)
             fixed += 1
+    for i in negative_mean_indices:
+        k, v = items[i]
+        try:
+            if _mean(v) < 0:
+                items[i] = (k, v + 1.0)
+                fixed += 1
+        except Exception:
+            continue
     if fixed:
         logger.info(
             "Repaired %d MTP-head norms (+1 zero-centered gamma shift)",
