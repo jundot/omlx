@@ -250,6 +250,14 @@ def attach_drafter(language_model: Any, drafter: DFlashDrafter) -> None:
     language_model._omlx_mtp_chain = True
     language_model._omlx_mtp_depth = drafter.depth
     language_model._omlx_mtp_head_clone = False
+    # DFlash2 drafts from the mean of the target's hyper-connection streams;
+    # the v1/Laguna/Muse drafters use the mixer's mixed representation.
+    # Older/simplified drafter objects may not carry ``kind``; only dflash2
+    # opts into the mean capture.
+    mean_capture = getattr(drafter, "kind", None) == "dflash2"
+    for target in (language_model, getattr(language_model, "model", None)):
+        if target is not None:
+            target._omlx_dflash_capture_mean = mean_capture
 
 
 def detach_drafter(language_model: Any) -> DFlashDrafter | None:
@@ -259,6 +267,9 @@ def detach_drafter(language_model: Any) -> DFlashDrafter | None:
     drafter.clear()
     language_model._omlx_drafter = None
     language_model._omlx_mtp_decode_enabled = False
+    for target in (language_model, getattr(language_model, "model", None)):
+        if target is not None:
+            target._omlx_dflash_capture_mean = False
     return drafter
 
 

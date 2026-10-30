@@ -2197,6 +2197,27 @@ def _call_backbone_captured(
     return _call_backbone_impl(model, inputs, cache, n_confirmed, capture_layer_ids)
 
 
+def _forwards_gdn_sink(model: Any) -> bool:
+    """Whether the target's forward consumes the ``gdn_sink`` capture list.
+
+    The drafter-target wrapper declares whether it forwards the keyword to
+    the model it wraps; unwrapped targets are read from ``__call__``. A
+    forward taking ``**kwargs`` may consume it, an explicit signature that
+    omits it raises TypeError.
+    """
+    declared = getattr(model, "_omlx_forwards_gdn_sink", None)
+    if declared is not None:
+        return bool(declared)
+    try:
+        params = inspect.signature(model.__call__).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == "gdn_sink" or p.kind is inspect.Parameter.VAR_KEYWORD
+        for p in params
+    )
+
+
 def _call_backbone_impl(
     model: Any,
     inputs: Any,
@@ -2233,6 +2254,12 @@ def _call_backbone_impl(
         kwargs["n_confirmed"] = n_confirmed
     if capture_layer_ids:
         kwargs["capture_layer_ids"] = list(capture_layer_ids)
+        # qwen4's language model only captures GDN rollback state when
+        # ``gdn_sink`` is present; the block drafter needs it to trim the
+        # verify window. Plain-attention targets take explicit keywords, so
+        # only forward it to a forward that consumes it.
+        if _forwards_gdn_sink(model):
+            kwargs["gdn_sink"] = []
     # Decode-exact verify: embedded DSpark hosts and Lightning heads on
     # deepseek_v4 (see _exact_verify_host) run every projection and attention
     # row with one-row decode arithmetic, so greedy MTP output equals MTP-off.

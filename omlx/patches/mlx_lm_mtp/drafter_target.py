@@ -16,11 +16,23 @@ rollback.
 
 from __future__ import annotations
 
+import inspect
 import threading
 from types import SimpleNamespace
 from typing import Any
 
 _CAPTURE = threading.local()
+
+
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """Whether ``fn`` declares ``name`` or swallows arbitrary keywords."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return True  # opaque callable: let the call itself decide
+    return any(
+        p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in params
+    )
 
 
 class _Sink:
@@ -67,6 +79,10 @@ def _patch_model(model_cls: Any) -> None:
     if getattr(model_cls, "_omlx_drafter_target", False):
         return
     original_call = model_cls.__call__
+    # The MTP verify path passes ``gdn_sink`` for qwen4/qwen3.5's GDN capture.
+    # These plain-attention targets have no GDN stream and their ``__call__``
+    # takes explicit keywords, so forwarding it raises TypeError.
+    forwards_gdn_sink = _accepts_kwarg(original_call, "gdn_sink")
 
     def __call__(
         self,
@@ -135,6 +151,7 @@ def _patch_model(model_cls: Any) -> None:
     model_cls.rollback_speculative_cache = rollback_speculative_cache
     model_cls._omlx_drafter_single_row = True
     model_cls._omlx_drafter_target = True
+    model_cls._omlx_forwards_gdn_sink = forwards_gdn_sink
 
 
 def apply(model: Any) -> bool:

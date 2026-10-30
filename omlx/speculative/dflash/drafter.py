@@ -321,6 +321,11 @@ class DFlashDrafter:
             row.end = start + int(row.restored.shape[1])
         else:
             row.end = start
+        if start is not None:
+            # ``fed`` is the absolute position of the first retained context
+            # row. Seeded prefills start at keep_from, not at zero; keeping it
+            # relative shifts every draft-cache position by keep_from.
+            row.fed = start
         for seed in seeds or ():
             self._queue(row, seed)
         self._bound_pending(row)
