@@ -54,17 +54,17 @@ def test_k2_ane_setting_roundtrip_and_reservation(models, tmp_path):
     from omlx.patches.k2_horizon.ane_prefill import prefill_memory_reservation
 
     base = models
-    assert ModelSettings(qwen35_ane_prefill_enabled=True).qwen35_ane_prefill_enabled
+    assert ModelSettings(ane_prefill_enabled=True).ane_prefill_enabled
     pool = EnginePool()
     pool.discover_models(str(tmp_path))
     ordinary = ModelSettings()
-    ane = ModelSettings(qwen35_ane_prefill_enabled=True)
+    ane = ModelSettings(ane_prefill_enabled=True)
     manager = ModelSettingsManager(tmp_path / "settings")
     manager.set_settings(base.name, ane)
     assert (
         ModelSettingsManager(tmp_path / "settings")
         .get_settings(base.name)
-        .qwen35_ane_prefill_enabled
+        .ane_prefill_enabled
     )
     assert pool._engine_runtime_signature(
         base.name, ordinary
@@ -108,7 +108,7 @@ async def test_k2_unload_checks_weights_not_ane_admission_reserve(
     engine.start = AsyncMock(side_effect=start)
     engine.stop = AsyncMock(side_effect=stop)
     engine.has_active_requests.return_value = False
-    settings = ModelSettings(qwen35_ane_prefill_enabled=ane_enabled)
+    settings = ModelSettings(ane_prefill_enabled=ane_enabled)
     reservation = 20 * gib if ane_enabled else 0
     with (
         patch("omlx.engine_pool.BatchedEngine", return_value=engine),
@@ -153,26 +153,26 @@ async def test_admin_rejects_invalid_k2_ane_settings(
     monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
     monkeypatch.setattr(routes, "_get_server_state", lambda: None)
     for values in (
-        {"qwen35_ane_prefill_fraction": 0},
-        {"qwen35_ane_prefill_sequence_length": 7},
+        {"ane_prefill_fraction": 0},
+        {"ane_prefill_sequence_length": 7},
     ):
         request = routes.ModelSettingsRequest(
-            qwen35_ane_prefill_enabled=enabled, **values
+            ane_prefill_enabled=enabled, **values
         )
         with pytest.raises(HTTPException) as error:
             await routes.update_model_settings(base.name, request, is_admin=True)
         assert error.value.status_code == 400
-        assert not manager.get_settings(base.name).qwen35_ane_prefill_enabled
+        assert not manager.get_settings(base.name).ane_prefill_enabled
 
 
 def test_k2_ane_profile_persists_without_becoming_a_global_template(tmp_path):
     from omlx.model_profiles import filter_universal_fields
 
     fields = dict(
-        qwen35_ane_prefill_enabled=True,
-        qwen35_ane_prefill_fraction=0.5,
-        qwen35_ane_prefill_shared_fraction=1.0,
-        qwen35_ane_prefill_sequence_length=2048,
+        ane_prefill_enabled=True,
+        ane_prefill_fraction=0.5,
+        ane_prefill_shared_fraction=1.0,
+        ane_prefill_sequence_length=2048,
     )
     manager = ModelSettingsManager(tmp_path)
     manager.save_profile("mova", "ane", "ANE", None, fields)
@@ -231,16 +231,16 @@ def test_helper_model_does_not_offer_k2_ane():
 def test_shared_ane_defaults_and_explicit_settings(model_type, default):
     from omlx.model_settings import ane_prefill_fraction, validate_ane_prefill
 
-    settings = ModelSettings(qwen35_ane_prefill_enabled=True)
+    settings = ModelSettings(ane_prefill_enabled=True)
     validate_ane_prefill(settings.to_dict(), model_type)
     assert (
-        ane_prefill_fraction(settings.qwen35_ane_prefill_fraction, model_type)
+        ane_prefill_fraction(settings.ane_prefill_fraction, model_type)
         == default
     )
-    settings.qwen35_ane_prefill_fraction = 0.53
+    settings.ane_prefill_fraction = 0.53
     restored = ModelSettings.from_dict(settings.to_dict())
     assert (
-        ane_prefill_fraction(restored.qwen35_ane_prefill_fraction, model_type) == 0.53
+        ane_prefill_fraction(restored.ane_prefill_fraction, model_type) == 0.53
     )
     assert not any(key.startswith("k2_ane_") for key in restored.to_dict())
 
@@ -253,31 +253,31 @@ def test_shared_ane_signature_uses_only_effective_backend_controls(
 
     pool = EnginePool()
     pool.discover_models(str(tmp_path))
-    settings = ModelSettings(qwen35_ane_prefill_enabled=enabled)
+    settings = ModelSettings(ane_prefill_enabled=enabled)
     signature = lambda value: pool._engine_runtime_signature(models.name, value)
     original = signature(settings)
     assert (
         signature(
             replace(
                 settings,
-                qwen35_ane_prefill_cpu_enabled=True,
-                qwen35_ane_prefill_gdn=False,
+                ane_prefill_cpu_enabled=True,
+                ane_prefill_gdn=False,
             )
         )
         == original
     )
     for change in (
-        {"qwen35_ane_prefill_fraction": 0.5},
-        {"qwen35_ane_prefill_shared_fraction": 0},
-        {"qwen35_ane_prefill_sequence_length": 4096},
+        {"ane_prefill_fraction": 0.5},
+        {"ane_prefill_shared_fraction": 0},
+        {"ane_prefill_sequence_length": 4096},
     ):
         assert (signature(replace(settings, **change)) != original) is enabled
     pool.get_entry(models.name).config_model_type = "qwen3_5"
     qwen = signature(settings)
     assert (qwen != original) is enabled
-    assert signature(replace(settings, qwen35_ane_prefill_shared_fraction=0)) == qwen
+    assert signature(replace(settings, ane_prefill_shared_fraction=0)) == qwen
     assert (
-        signature(replace(settings, qwen35_ane_prefill_gdn=False)) != qwen
+        signature(replace(settings, ane_prefill_gdn=False)) != qwen
     ) is enabled
 
 
@@ -299,17 +299,17 @@ async def test_shared_ane_manual_enable_and_profile_validation(
     monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
     monkeypatch.setattr(routes, "_get_server_state", lambda: None)
     request = routes.ModelSettingsRequest(
-        qwen35_ane_prefill_enabled=True,
-        qwen35_ane_prefill_sequence_length=width,
-        qwen35_ane_prefill_fraction=fraction,
+        ane_prefill_enabled=True,
+        ane_prefill_sequence_length=width,
+        ane_prefill_fraction=fraction,
     )
     await routes.update_model_settings(models.name, request, is_admin=True)
     saved = manager.get_settings(models.name)
-    assert saved.qwen35_ane_prefill_enabled
-    assert saved.qwen35_ane_prefill_sequence_length == width
-    assert saved.qwen35_ane_prefill_fraction == fraction
+    assert saved.ane_prefill_enabled
+    assert saved.ane_prefill_sequence_length == width
+    assert saved.ane_prefill_fraction == fraction
     manager.save_profile(
-        models.name, "bad", "Bad", None, {"qwen35_ane_prefill_fraction": 2}
+        models.name, "bad", "Bad", None, {"ane_prefill_fraction": 2}
     )
     with pytest.raises(HTTPException) as error:
         await routes.apply_model_profile(models.name, "bad", is_admin=True)
@@ -323,6 +323,6 @@ async def test_shared_ane_manual_enable_and_profile_validation(
 def test_k2_ane_conflicts_checked_with_model_metadata(flag):
     from omlx.model_settings import validate_ane_prefill
 
-    settings = ModelSettings(qwen35_ane_prefill_enabled=True, **{flag: True})
+    settings = ModelSettings(ane_prefill_enabled=True, **{flag: True})
     with pytest.raises(ValueError, match=flag):
         validate_ane_prefill(settings.to_dict(), "k2_horizon")

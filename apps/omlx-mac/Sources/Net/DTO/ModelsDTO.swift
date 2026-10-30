@@ -163,23 +163,23 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     let turboquantKvScheme: String?
     let turboquantKvBits: Double?
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
-    var qwen35AnePrefillSharedFraction: Double? = nil
-    let qwen35AnePrefillEnabled: Bool?
-    let qwen35AnePrefillSequenceLength: Int?
-    let qwen35AnePrefillTailPaddingMinTokens: Int?
-    let qwen35AnePrefillFraction: Double?
-    let qwen35AnePrefillFusedDown: Bool?
-    let qwen35AnePrefillMaxLayers: Int?
-    let qwen35AnePrefillDualAne: Bool?
-    let qwen35AnePrefillGdn: Bool?
-    let qwen35AnePrefillGdnFraction: Double?
-    let qwen35AnePrefillGdnMaxLayers: Int?
-    let qwen35AnePrefillCpuEnabled: Bool?
-    let qwen35AnePrefillCpuFraction: Double?
-    let qwen35AnePrefillCpuDownFraction: Double?
-    let qwen35AnePrefillCpuGdnFraction: Double?
-    let qwen35AnePrefillCpuThreads: Int?
-    let qwen35AnePrefillCpuSharedResource: Bool?
+    var anePrefillSharedFraction: Double? = nil
+    let anePrefillEnabled: Bool?
+    let anePrefillSequenceLength: Int?
+    let anePrefillTailPaddingMinTokens: Int?
+    let anePrefillFraction: Double?
+    let anePrefillFusedDown: Bool?
+    let anePrefillMaxLayers: Int?
+    let anePrefillDualAne: Bool?
+    let anePrefillGdn: Bool?
+    let anePrefillGdnFraction: Double?
+    let anePrefillGdnMaxLayers: Int?
+    let anePrefillCpuEnabled: Bool?
+    let anePrefillCpuFraction: Double?
+    let anePrefillCpuDownFraction: Double?
+    let anePrefillCpuGdnFraction: Double?
+    let anePrefillCpuThreads: Int?
+    let anePrefillCpuSharedResource: Bool?
     // Experimental: oQ mixed-bit INT8-activation prefill kernels
     let qwen35OqA8Enabled: Bool?
     let qwen35OqA8MinTokens: Int?
@@ -250,23 +250,23 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var turboquantKvScheme: String? = nil
     var turboquantKvBits: Double? = nil
     // Experimental: private Qwen3.5/3.6/3.8 ANE/GPU prefill
-    var qwen35AnePrefillSharedFraction: Double? = nil
-    var qwen35AnePrefillEnabled: Bool? = nil
-    var qwen35AnePrefillSequenceLength: Int? = nil
-    var qwen35AnePrefillTailPaddingMinTokens: Int? = nil
-    var qwen35AnePrefillFraction: Double? = nil
-    var qwen35AnePrefillFusedDown: Bool? = nil
-    var qwen35AnePrefillMaxLayers: Int? = nil
-    var qwen35AnePrefillDualAne: Bool? = nil
-    var qwen35AnePrefillGdn: Bool? = nil
-    var qwen35AnePrefillGdnFraction: Double? = nil
-    var qwen35AnePrefillGdnMaxLayers: Int? = nil
-    var qwen35AnePrefillCpuEnabled: Bool? = nil
-    var qwen35AnePrefillCpuFraction: Double? = nil
-    var qwen35AnePrefillCpuDownFraction: Double? = nil
-    var qwen35AnePrefillCpuGdnFraction: Double? = nil
-    var qwen35AnePrefillCpuThreads: Int? = nil
-    var qwen35AnePrefillCpuSharedResource: Bool? = nil
+    var anePrefillSharedFraction: Double? = nil
+    var anePrefillEnabled: Bool? = nil
+    var anePrefillSequenceLength: Int? = nil
+    var anePrefillTailPaddingMinTokens: Int? = nil
+    var anePrefillFraction: Double? = nil
+    var anePrefillFusedDown: Bool? = nil
+    var anePrefillMaxLayers: Int? = nil
+    var anePrefillDualAne: Bool? = nil
+    var anePrefillGdn: Bool? = nil
+    var anePrefillGdnFraction: Double? = nil
+    var anePrefillGdnMaxLayers: Int? = nil
+    var anePrefillCpuEnabled: Bool? = nil
+    var anePrefillCpuFraction: Double? = nil
+    var anePrefillCpuDownFraction: Double? = nil
+    var anePrefillCpuGdnFraction: Double? = nil
+    var anePrefillCpuThreads: Int? = nil
+    var anePrefillCpuSharedResource: Bool? = nil
     // Experimental: oQ mixed-bit INT8-activation prefill kernels
     var qwen35OqA8Enabled: Bool? = nil
     var qwen35OqA8MinTokens: Int? = nil
