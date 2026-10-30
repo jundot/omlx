@@ -4,7 +4,9 @@ Native Qwen2 embedding adapter for omlx.
 
 Serves Qwen2-decoder embedding models (``architectures=["Qwen2ForCausalLM"]``,
 ``model_type="qwen2"``) such as ``jinaai/jina-code-embeddings-1.5b`` (causal)
-and ``Alibaba-NLP/gte-Qwen2-1.5B-instruct`` (bidirectional), without depending
+and ``Alibaba-NLP/gte-Qwen2-1.5B-instruct`` (bidirectional), and bare-key
+``architectures=["Qwen2Model"]`` exports such as ``nomic-ai/nomic-embed-code``
+(causal), without depending
 on mlx-embeddings, which has no ``qwen2`` module and raises
 ``ValueError("Model type qwen2 not supported.")`` for these checkpoints.
 
@@ -305,7 +307,8 @@ class Model(nn.Module):
 
     def sanitize(self, weights: dict) -> dict:
         """
-        Map a HuggingFace Qwen2ForCausalLM checkpoint onto this module tree.
+        Map a HuggingFace Qwen2ForCausalLM or bare-key Qwen2Model checkpoint
+        onto this module tree.
 
         Drops the unused LM head (and any precomputed rotary inverse-frequency
         buffers) and normalizes the transformer prefix to ``model.``.
