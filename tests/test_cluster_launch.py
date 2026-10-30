@@ -413,6 +413,30 @@ def test_reap_stale_remote_workers_fails_fast_when_the_scan_fails(monkeypatch):
         launch._reap_stale_remote_workers(_deployment())
 
 
+def test_remote_worker_scan_quotes_peer_stderr_when_output_is_not_json():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="",
+            stderr="No user exists for uid 501",
+        )
+
+    pids, error = launch._remote_deployment_worker_pids(
+        "user@spark-a", "cluster-test", runner=runner
+    )
+
+    assert pids is None
+    # The JSON parse error alone points nowhere; the peer's stderr names
+    # the real cause (#4968).
+    assert "No user exists for uid 501" in error
+    assert "invalid" in error
+    assert len(calls) == 1
+
+
 def test_supervisor_preserves_structured_peer_loss_reason():
     supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
     reason = "rank 1 on studio stopped reporting"

@@ -569,10 +569,17 @@ def _remote_deployment_worker_pids(
     try:
         payload = json.loads(completed.stdout)
     except json.JSONDecodeError as exc:
-        return None, f"remote worker scan response was invalid: {exc}"
+        # The scan script dying on the peer (missing interpreter, no account
+        # for the login uid) leaves stderr as the only explanation; without
+        # it the operator sees a bare JSON parse error (#4968).
+        detail = (completed.stderr.strip() or completed.stdout.strip())[:200]
+        suffix = f": {detail}" if detail else ""
+        return None, f"remote worker scan response was invalid ({exc}){suffix}"
     pids = payload.get("pids")
     if payload.get("returncode") != 0 or not isinstance(pids, list):
-        return None, "remote worker process table could not be read"
+        detail = completed.stderr.strip()[:200]
+        suffix = f": {detail}" if detail else ""
+        return None, f"remote worker process table could not be read{suffix}"
     if any(
         isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 for pid in pids
     ):
