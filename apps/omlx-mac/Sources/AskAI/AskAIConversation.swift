@@ -30,6 +30,9 @@ final class AskAIConversation {
 
     @ObservationIgnored private var streamTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
+    /// The profile's prompt before its placeholders were filled, to tell an
+    /// edited prompt from the same prompt at a later time.
+    @ObservationIgnored private var promptTemplate = ""
 
     var isStreaming: Bool { turns.last?.isStreaming == true }
     var isEmpty: Bool { turns.isEmpty }
@@ -38,16 +41,33 @@ final class AskAIConversation {
         turns.last(where: { !$0.answer.isEmpty })?.answer
     }
 
-    func begin(profile: AskAIProfile, command: String?) {
+    func begin(profile: AskAIProfile, command: String?, context: PromptContext = PromptContext()) {
         reset()
-        self.profile = profile
+        promptTemplate = profile.systemPrompt
+        self.profile = Self.filled(profile, context: context)
         self.command = command
     }
 
-    /// Applies settings changed during the conversation to the next turn.
-    func updateProfile(_ profile: AskAIProfile) {
-        guard self.profile != nil else { return }
-        self.profile = profile
+    /// Applies settings changed during the conversation to the next turn. An
+    /// unchanged prompt keeps its filled text, so the prefix cache still matches.
+    func updateProfile(_ profile: AskAIProfile, context: PromptContext = PromptContext()) {
+        guard let current = self.profile else { return }
+        var next = profile
+        if profile.systemPrompt == promptTemplate {
+            next.systemPrompt = current.systemPrompt
+        } else {
+            promptTemplate = profile.systemPrompt
+            next = Self.filled(profile, context: context)
+        }
+        self.profile = next
+    }
+
+    private static func filled(_ profile: AskAIProfile, context: PromptContext) -> AskAIProfile {
+        var context = context
+        context.model = profile.model
+        var out = profile
+        out.systemPrompt = PromptPlaceholders.fill(profile.systemPrompt, context: context)
+        return out
     }
 
     func reset() {

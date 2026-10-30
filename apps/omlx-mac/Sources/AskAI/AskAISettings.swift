@@ -72,7 +72,7 @@ struct TalkPrefs: Codable, Equatable, Sendable {
     var enabled = false
     var hotKey = HotKeyCombo.optionShiftSpace
     var model = ""
-    var systemPrompt = ""
+    var systemPrompt = AskAIPrefs.defaultPrompt
     /// Empty uses the model's default voice.
     var voice = ""
     /// Reply playback rate; pitch stays the same.
@@ -100,11 +100,13 @@ struct TalkPrefs: Codable, Equatable, Sendable {
 
 struct AskAIPrefs: Codable, Equatable, Sendable {
     static let defaultPanelWidth: Double = 680
+    /// Gives the model today's date, which it cannot know on its own.
+    static let defaultPrompt = "Current date and time: {weekday}, {datetime} ({timezone})."
 
     var enabled = false
     var hotKey = HotKeyCombo.optionSpace
     var defaultModel = ""
-    var defaultSystemPrompt = ""
+    var defaultSystemPrompt = AskAIPrefs.defaultPrompt
     var defaultAllowThinking = false
     var defaultAutoCopy = false
     /// Idle time after which reopening the panel starts a new conversation.
@@ -118,6 +120,9 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
     var gpuPowerLimitEnabled = false
     var gpuPowerLimitWatts = 10
     var talk = TalkPrefs()
+    /// False in settings saved before prompts had a default; their empty
+    /// prompts get the default once, and a prompt cleared later stays empty.
+    var promptDefaultsApplied = true
 
     init() {}
 
@@ -140,6 +145,12 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
         gpuPowerLimitEnabled = c.lenient(Bool.self, .gpuPowerLimitEnabled) ?? fallback.gpuPowerLimitEnabled
         gpuPowerLimitWatts = c.lenient(Int.self, .gpuPowerLimitWatts) ?? fallback.gpuPowerLimitWatts
         talk = c.lenient(TalkPrefs.self, .talk) ?? fallback.talk
+        promptDefaultsApplied = c.lenient(Bool.self, .promptDefaultsApplied) ?? false
+        if !promptDefaultsApplied {
+            if defaultSystemPrompt.isEmpty { defaultSystemPrompt = Self.defaultPrompt }
+            if talk.systemPrompt.isEmpty { talk.systemPrompt = Self.defaultPrompt }
+            promptDefaultsApplied = true
+        }
     }
 
     /// The `gpu_power_limit_w` to send, clamped to what the server accepts.

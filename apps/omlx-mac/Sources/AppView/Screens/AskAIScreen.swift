@@ -319,7 +319,8 @@ private struct TextAdvancedSection: View {
                     PromptField(text: $store.prefs.defaultSystemPrompt,
                                 placeholder: String(localized: "askai.prompt.default_placeholder",
                                                     defaultValue: "Optional. For example: Answer briefly.",
-                                                    comment: "Placeholder for the Ask AI default system prompt"))
+                                                    comment: "Placeholder for the Ask AI default system prompt"),
+                                defaultText: AskAIPrefs.defaultPrompt)
                 }
             }
         }
@@ -465,7 +466,8 @@ private struct VoiceAdvancedSection: View {
                 PromptField(text: $store.prefs.talk.systemPrompt,
                             placeholder: String(localized: "talkai.prompt.placeholder",
                                                 defaultValue: "Optional. For example: Keep answers short and friendly.",
-                                                comment: "Placeholder for the Talk with AI system prompt"))
+                                                comment: "Placeholder for the Talk with AI system prompt"),
+                            defaultText: AskAIPrefs.defaultPrompt)
             }
         }
         .task(id: [store.prefs.talk.model, String(services.serverState.isRunningLike)]) {
@@ -842,16 +844,31 @@ private struct PresetEditor: View {
 private struct PromptField: View {
     @Binding var text: String
     let placeholder: String
+    /// Offered as Reset to Default while the text differs from it.
+    var defaultText: String?
 
     @Environment(\.omlxTheme) private var theme
+    @State private var clipboardNeedsPermission = ClipboardAccess.needsPermission
+    @State private var showsClipboardGuide = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(String(localized: "askai.row.system_prompt",
-                        defaultValue: "System Prompt",
-                        comment: "Label above the Ask AI system prompt editor"))
-                .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
-                .foregroundStyle(theme.text)
+            HStack {
+                Text(String(localized: "askai.row.system_prompt",
+                            defaultValue: "System Prompt",
+                            comment: "Label above the Ask AI system prompt editor"))
+                    .font(.omlxText(DesignTokens.FontSize.body, weight: .medium))
+                    .foregroundStyle(theme.text)
+                Spacer()
+                if let defaultText, text != defaultText {
+                    Button(String(localized: "askai.prompt.reset",
+                                  defaultValue: "Reset to Default",
+                                  comment: "Button that puts the default Ask AI system prompt back")) {
+                        text = defaultText
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                }
+            }
             TextEditor(text: $text)
                 .font(.omlxText(DesignTokens.FontSize.callout))
                 .scrollContentBackground(.hidden)
@@ -872,6 +889,149 @@ private struct PromptField: View {
                     RoundedRectangle(cornerRadius: 6, style: .continuous)
                         .strokeBorder(theme.inputBorder, lineWidth: 0.5)
                 )
+            if text.contains(PromptPlaceholder.clipboard.token), clipboardNeedsPermission {
+                HStack(spacing: 10) {
+                    Label(String(localized: "askai.clipboard.warning",
+                                 defaultValue: "macOS asks before oMLX reads the clipboard for {clipboard}.",
+                                 comment: "Warning shown while the clipboard placeholder needs a paste permission"),
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.omlxText(DesignTokens.FontSize.callout))
+                        .foregroundStyle(theme.amberDot)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button(String(localized: "askai.clipboard.how",
+                                  defaultValue: "How to Allow…",
+                                  comment: "Button that opens the clipboard permission guide")) {
+                        showsClipboardGuide = true
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                }
+            }
+            PlaceholderList { token in
+                let separator = text.isEmpty || text.last?.isWhitespace == true ? "" : " "
+                text += separator + token
+            }
+        }
+        .sheet(isPresented: $showsClipboardGuide) {
+            ClipboardGuideSheet()
+                .environment(\.omlxTheme, theme)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            clipboardNeedsPermission = ClipboardAccess.needsPermission
+        }
+    }
+}
+
+/// The placeholders a prompt can use, with the value each would get now.
+private struct PlaceholderList: View {
+    let add: (String) -> Void
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        let context = PromptContext()
+        VStack(alignment: .leading, spacing: 4) {
+            Text(String(localized: "askai.placeholders.help",
+                        defaultValue: "Placeholders are filled in when a conversation starts. Click one to add it.",
+                        comment: "Help text above the list of Ask AI prompt placeholders"))
+                .font(.omlxText(11.5))
+                .foregroundStyle(theme.textSecondary)
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 2) {
+                ForEach(PromptPlaceholder.allCases, id: \.self) { placeholder in
+                    GridRow {
+                        Button(placeholder.token) { add(placeholder.token) }
+                            .buttonStyle(.plain)
+                            .font(.omlxMono(11.5, weight: .medium))
+                            .foregroundStyle(theme.accent)
+                        Text(Self.example(placeholder, context))
+                            .font(.omlxText(11.5))
+                            .foregroundStyle(theme.textTertiary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    /// Live values, except for those that depend on when and where Ask AI opens.
+    /// The clipboard is never read here.
+    private static func example(_ placeholder: PromptPlaceholder, _ context: PromptContext) -> String {
+        switch placeholder {
+        case .app:
+            String(localized: "askai.placeholders.app",
+                   defaultValue: "The app in front when Ask AI opens",
+                   comment: "Description of the {app} prompt placeholder")
+        case .model:
+            String(localized: "askai.placeholders.model",
+                   defaultValue: "The model that answers",
+                   comment: "Description of the {model} prompt placeholder")
+        case .clipboard:
+            String(localized: "askai.placeholders.clipboard",
+                   defaultValue: "Text on the clipboard, up to 4,000 characters",
+                   comment: "Description of the {clipboard} prompt placeholder")
+        default:
+            PromptPlaceholders.value(of: placeholder, context: context)
+        }
+    }
+}
+
+/// Step-by-step guide for the paste permission that {clipboard} needs.
+private struct ClipboardGuideSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(String(localized: "askai.clipboard.guide.title",
+                        defaultValue: "Allow Clipboard Access",
+                        comment: "Title of the clipboard permission guide"))
+                .font(.omlxText(DesignTokens.FontSize.title3, weight: .semibold))
+                .foregroundStyle(theme.text)
+            step(1, String(localized: "askai.clipboard.guide.step1",
+                           defaultValue: "Click Test, then choose Allow when macOS asks to paste from another app.",
+                           comment: "First step of the clipboard permission guide"))
+            step(2, String(localized: "askai.clipboard.guide.step2",
+                           defaultValue: "To stop the question on every conversation, open System Settings > Privacy & Security and choose Always Allow for oMLX.",
+                           comment: "Second step of the clipboard permission guide"))
+            HStack {
+                Button(String(localized: "askai.clipboard.guide.open_settings",
+                              defaultValue: "Open System Settings",
+                              comment: "Button that opens the macOS Privacy & Security settings")) {
+                    ClipboardAccess.openSystemSettings()
+                }
+                .buttonStyle(.omlx(.normal, size: .small))
+                Spacer()
+                Button(String(localized: "askai.clipboard.guide.test",
+                              defaultValue: "Test",
+                              comment: "Button that reads the clipboard once so macOS asks for permission")) {
+                    _ = NSPasteboard.general.string(forType: .string)
+                }
+                .buttonStyle(.omlx(.normal, size: .small))
+                Button(String(localized: "askai.clipboard.guide.done",
+                              defaultValue: "Done",
+                              comment: "Button that closes the clipboard permission guide")) {
+                    dismiss()
+                }
+                .buttonStyle(.omlx(.primary, size: .small))
+            }
+            .padding(.top, 6)
+        }
+        .padding(22)
+        .frame(width: 420)
+    }
+
+    private func step(_ number: Int, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("\(number)")
+                .font(.omlxText(DesignTokens.FontSize.callout, weight: .semibold))
+                .foregroundStyle(theme.accentText)
+                .frame(width: 20, height: 20)
+                .background(Circle().fill(theme.accent))
+            Text(text)
+                .font(.omlxText(DesignTokens.FontSize.body))
+                .foregroundStyle(theme.text)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }

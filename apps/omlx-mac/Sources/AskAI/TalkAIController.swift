@@ -81,6 +81,8 @@ final class TalkAIController {
     /// Start buffer each model settled on, so the next conversation begins with it.
     @ObservationIgnored private var startBuffers: [String: AVAudioFrameCount] = [:]
     @ObservationIgnored private var sessionModel = ""
+    /// The app in front when the card opened, for the `{app}` placeholder.
+    @ObservationIgnored private var sourceApp: String?
 
     init(store: AskAIStore) {
         self.store = store
@@ -144,6 +146,7 @@ final class TalkAIController {
 
     func open() {
         guard store.prefs.talk.enabled, !isActive else { return }
+        sourceApp = NSWorkspace.shared.frontmostApplication?.localizedName
         willOpen?()
         beginConversation()
     }
@@ -345,7 +348,10 @@ final class TalkAIController {
             "type": "realtime",
             "audio": ["input": ["turn_detection": NSNull()], "output": output],
         ]
-        let prompt = prefs.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Filled once: the session keeps its instructions for the whole conversation.
+        let prompt = PromptPlaceholders.fill(
+            prefs.systemPrompt, context: PromptContext(app: sourceApp, model: prefs.model)
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
         if !prompt.isEmpty { session["instructions"] = prompt }
         client?.send(["type": "session.update", "session": session])
 

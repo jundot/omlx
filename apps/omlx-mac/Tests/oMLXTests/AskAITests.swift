@@ -328,4 +328,56 @@ final class AskAITests: XCTestCase {
         let next = (0..<3).compactMap { _ in vad.process(level: -42, assistantSpeaking: false) }
         XCTAssertEqual(next, [.speechStarted])
     }
+
+    func testPromptPlaceholdersFill() throws {
+        var reads = 0
+        var context = PromptContext()
+        context.now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-30T05:05:09Z"))
+        context.timeZone = try XCTUnwrap(TimeZone(identifier: "Asia/Seoul"))
+        context.language = "ko-KR"
+        context.app = "Safari"
+        context.model = "qwen"
+        context.readClipboard = { reads += 1; return String(repeating: "x", count: 5000) }
+
+        let filled = PromptPlaceholders.fill(
+            #"{weekday}, {datetime} ({timezone}) {date} {time} {language} {app} {model} {"a": 1} {unknown}"#,
+            context: context)
+        XCTAssertEqual(filled, #"Friday, 2026-10-30 14:05:09 (Asia/Seoul (UTC+09:00)) 2026-10-30 14:05:09 Korean (ko-KR) Safari qwen {"a": 1} {unknown}"#)
+        XCTAssertEqual(reads, 0)
+        XCTAssertEqual(PromptPlaceholders.fill("{clipboard}", context: context).count, PromptPlaceholders.clipboardLimit)
+        XCTAssertEqual(reads, 1)
+    }
+
+    @MainActor
+    func testConversationFillsThePromptOnce() throws {
+        var first = PromptContext()
+        first.now = Date(timeIntervalSince1970: 0)
+        first.timeZone = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        var later = first
+        later.now = Date(timeIntervalSince1970: 3600)
+        let profile = AskAIProfile(model: "m", systemPrompt: "Now {time}", allowThinking: false, autoCopy: false)
+
+        let conversation = AskAIConversation()
+        conversation.begin(profile: profile, command: nil, context: first)
+        XCTAssertEqual(conversation.profile?.systemPrompt, "Now 00:00:00")
+        // A follow-up keeps the prompt text, so the server's prefix cache matches.
+        conversation.updateProfile(profile, context: later)
+        XCTAssertEqual(conversation.profile?.systemPrompt, "Now 00:00:00")
+        var edited = profile
+        edited.systemPrompt = "At {time}"
+        conversation.updateProfile(edited, context: later)
+        XCTAssertEqual(conversation.profile?.systemPrompt, "At 01:00:00")
+    }
+
+    func testEmptyPromptsGetTheDefaultOnce() throws {
+        let old = #"{"defaultSystemPrompt":"","talk":{"systemPrompt":""}}"#
+        let migrated = try JSONDecoder().decode(AskAIPrefs.self, from: Data(old.utf8))
+        XCTAssertEqual(migrated.defaultSystemPrompt, AskAIPrefs.defaultPrompt)
+        XCTAssertEqual(migrated.talk.systemPrompt, AskAIPrefs.defaultPrompt)
+        // Cleared after the default arrived: stays empty.
+        let cleared = #"{"defaultSystemPrompt":"","talk":{"systemPrompt":""},"promptDefaultsApplied":true}"#
+        let kept = try JSONDecoder().decode(AskAIPrefs.self, from: Data(cleared.utf8))
+        XCTAssertEqual(kept.defaultSystemPrompt, "")
+        XCTAssertEqual(kept.talk.systemPrompt, "")
+    }
 }

@@ -47,6 +47,8 @@ final class AskAIController {
     @ObservationIgnored private var modelTypes: [String: String] = [:]
     @ObservationIgnored private var isSubmitting = false
     @ObservationIgnored private var lastClosedAt = Date.distantPast
+    /// The app in front when the panel opened, for the `{app}` placeholder.
+    @ObservationIgnored private var sourceApp: String?
     /// Pastes whose images are still being checked or encoded.
     @ObservationIgnored private var loadingAttachments = 0
     @ObservationIgnored private var submitAfterAttachments = false
@@ -139,6 +141,8 @@ final class AskAIController {
             conversation.reset()
         }
         notice = nil
+        // The panel never activates oMLX, so the user's app is still in front.
+        sourceApp = NSWorkspace.shared.frontmostApplication?.localizedName
         let panel = self.panel ?? AskAIPanelController(controller: self)
         self.panel = panel
         panel.show(animated: animated)
@@ -305,9 +309,10 @@ final class AskAIController {
                                           path: "/v1/chat/completions")
         else { return }
         if pending.startsConversation {
-            conversation.begin(profile: pending.profile, command: pending.command)
+            conversation.begin(profile: pending.profile, command: pending.command,
+                               context: PromptContext(app: sourceApp))
         } else {
-            conversation.updateProfile(pending.profile)
+            conversation.updateProfile(pending.profile, context: PromptContext(app: sourceApp))
         }
         // A reset during the image check leaves nothing to follow up on.
         // Keep the input so the user can send again.

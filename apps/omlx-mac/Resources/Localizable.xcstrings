@@ -2512,6 +2512,198 @@
         }
       }
     },
+    "askai.clipboard.guide.done" : {
+      "comment" : "Button that closes the clipboard permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Done"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Готово"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "完成"
+          }
+        }
+      }
+    },
+    "askai.clipboard.guide.open_settings" : {
+      "comment" : "Button that opens the macOS Privacy & Security settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open System Settings"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Открыть Системные настройки"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开系统设置"
+          }
+        }
+      }
+    },
+    "askai.clipboard.guide.step1" : {
+      "comment" : "First step of the clipboard permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Click Test, then choose Allow when macOS asks to paste from another app."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нажмите «Проверить», затем выберите «Разрешить», когда macOS спросит о вставке из другого приложения."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "点按“测试”，然后在 macOS 询问是否从其他应用粘贴时选择“允许”。"
+          }
+        }
+      }
+    },
+    "askai.clipboard.guide.step2" : {
+      "comment" : "Second step of the clipboard permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "To stop the question on every conversation, open System Settings > Privacy & Security and choose Always Allow for oMLX."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Чтобы вопрос не появлялся в каждом разговоре, откройте Системные настройки > Конфиденциальность и безопасность и выберите «Всегда разрешать» для oMLX."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "若不想每次对话都被询问，请打开“系统设置 > 隐私与安全性”，为 oMLX 选择“始终允许”。"
+          }
+        }
+      }
+    },
+    "askai.clipboard.guide.test" : {
+      "comment" : "Button that reads the clipboard once so macOS asks for permission",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Test"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Проверить"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "测试"
+          }
+        }
+      }
+    },
+    "askai.clipboard.guide.title" : {
+      "comment" : "Title of the clipboard permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allow Clipboard Access"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Разрешите доступ к буферу обмена"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "允许访问剪贴板"
+          }
+        }
+      }
+    },
+    "askai.clipboard.how" : {
+      "comment" : "Button that opens the clipboard permission guide",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "How to Allow…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Как разрешить…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "如何允许…"
+          }
+        }
+      }
+    },
+    "askai.clipboard.warning" : {
+      "comment" : "Warning shown while the clipboard placeholder needs a paste permission",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS asks before oMLX reads the clipboard for {clipboard}."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS спрашивает разрешение, прежде чем oMLX прочитает буфер обмена для {clipboard}."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX 为 {clipboard} 读取剪贴板前，macOS 会先询问。"
+          }
+        }
+      }
+    },
     "askai.page.back" : {
       "comment" : "Back button label on an Ask AI settings sub-page",
       "extractionState" : "manual",
@@ -2532,6 +2724,126 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "返回 Ask AI"
+          }
+        }
+      }
+    },
+    "askai.placeholders.app" : {
+      "comment" : "Description of the {app} prompt placeholder",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The app in front when Ask AI opens"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Приложение на переднем плане при открытии Ask AI"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开 Ask AI 时位于前台的应用"
+          }
+        }
+      }
+    },
+    "askai.placeholders.clipboard" : {
+      "comment" : "Description of the {clipboard} prompt placeholder",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Text on the clipboard, up to 4,000 characters"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Текст из буфера обмена, до 4000 символов"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "剪贴板中的文字，最多 4000 个字符"
+          }
+        }
+      }
+    },
+    "askai.placeholders.help" : {
+      "comment" : "Help text above the list of Ask AI prompt placeholders",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Placeholders are filled in when a conversation starts. Click one to add it."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Заполнители подставляются в начале разговора. Нажмите, чтобы добавить."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "占位符会在对话开始时填入。点按即可添加。"
+          }
+        }
+      }
+    },
+    "askai.placeholders.model" : {
+      "comment" : "Description of the {model} prompt placeholder",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The model that answers"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модель, которая отвечает"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "回答所用的模型"
+          }
+        }
+      }
+    },
+    "askai.prompt.reset" : {
+      "comment" : "Button that puts the default Ask AI system prompt back",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reset to Default"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сбросить к стандартному"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "恢复默认"
           }
         }
       }
