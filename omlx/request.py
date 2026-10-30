@@ -92,6 +92,8 @@ class SamplingParams:
 
     # Seed for reproducible generation (best-effort, per OpenAI spec)
     seed: Optional[int] = None
+    # Explicit chat-template thinking mode. None preserves model-native behavior.
+    enable_thinking: Optional[bool] = None
 
     # Stop strings skip the leading think block. Set by the APIs that return
     # reasoning separately; /v1/completions returns it inline.
