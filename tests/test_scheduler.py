@@ -4933,6 +4933,23 @@ class TestPeriodicClearGating:
         scheduler._memory_limit_bytes = 0
         assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
 
+    def test_early_kv_growth_waits_for_the_deferred_clear(
+        self, mock_model, mock_tokenizer, monkeypatch
+    ):
+        """One early-grown bank at a time: the next waits for the #435-delayed clear."""
+        from omlx.patches import vlm_batch_kv_capacity as capacity
+
+        monkeypatch.setattr(capacity, "_early_growth", {"allowed": False, "grown": True})
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._pace_early_kv_growth()
+        assert scheduler._deferred_clear_at == (
+            scheduler._step_counter + Scheduler._DEFERRED_CLEAR_DELAY
+        )
+        assert capacity._early_growth == {"allowed": False, "grown": False}
+        scheduler._deferred_clear_at = None
+        scheduler._pace_early_kv_growth()
+        assert capacity._early_growth["allowed"] is True
+
 
 class TestExtractCacheStatesCacheList:
     """Tests for CacheList handling in _extract_cache_states."""

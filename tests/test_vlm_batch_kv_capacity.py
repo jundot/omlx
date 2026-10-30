@@ -11,6 +11,7 @@ from mlx_vlm.models import cache as vlm_cache
 
 import omlx.scheduler  # noqa: F401
 from omlx.cache.type_handlers import KVCacheHandler
+from omlx.patches import vlm_batch_kv_capacity as capacity
 from omlx.patches.mlx_vlm_qwen4_exp_compat import (
     apply_mlx_vlm_qwen4_exp_compat_patch,
 )
@@ -63,8 +64,6 @@ def equal(a, b):
     assert a._idx == b._idx
     if a.keys is None:
         return
-    # A refill keeps spare rows only while live rows fill over half the bank.
-    assert b._keys.shape[0] < 2 * b.keys.shape[0]
     assert b._logical_width() == a.keys.shape[2]
     assert mx.array_equal(a.keys, b.keys[..., : b._logical_width(), :]).item()
     assert mx.array_equal(a.values, b.values[..., : b._logical_width(), :]).item()
@@ -213,6 +212,62 @@ def test_join_fills_a_freed_row_and_shifts_live_rows_in_place(backend):
         assert b._keys is bank
         equal(a, b)
     assert b._idx == 700
+
+
+def test_rows_freed_down_to_one_stay_for_the_next_joins(backend):
+    stock, patched = backend
+    lengths = [300, 290, 299, 280]
+    a, b = make(stock, lengths), make(patched, lengths)
+    for c in (a, b):
+        c.filter(_refill_order([2]))
+    bank = b._keys
+    assert bank.shape[0] == 4 and b.keys.shape[0] == 1
+    a.extend(make(stock, [250, 310]))
+    b.extend(make(patched, [250, 310]))
+    assert b._keys is bank
+    equal(a, b)
+
+
+def test_join_that_needs_more_columns_keeps_the_spare_rows(backend):
+    stock, patched = backend
+    lengths = [300, 290, 299, 280]
+    a, b = make(stock, lengths), make(patched, lengths)
+    for c in (a, b):
+        c.filter(_refill_order([0, 1]))
+    a.extend(make(stock, [2000]))
+    b.extend(make(patched, [2000]))
+    bank = b._keys
+    assert bank.shape[0] == 4 and b.keys.shape[0] == 3
+    equal(a, b)
+    a.extend(make(stock, [500]))
+    b.extend(make(patched, [500]))
+    assert b._keys is bank
+    equal(a, b)
+
+
+@pytest.mark.parametrize("kept, rows", [([0, 1], 4), ([2], 1)])
+def test_early_growth_moves_one_bank_per_allowance(backend, monkeypatch, kept, rows):
+    stock, patched = backend
+    monkeypatch.setattr(capacity, "_EARLY_GROWTH_MIN_BYTES", 0)
+    monkeypatch.setattr(capacity, "_early_growth", {"allowed": True, "grown": False})
+    lengths = [20000, 19990, 19999, 19980]
+    a, b, other = make(stock, lengths), make(patched, lengths), make(patched, lengths)
+    for c in (a, b, other):
+        c.filter(_refill_order(kept))
+    x = mx.ones((len(kept), 2, 64, 8), mx.bfloat16)
+    for _ in range(100):
+        banks = b._keys, other._keys
+        for c in (a, b, other):
+            c.update_and_fetch(x, x)
+        if capacity.take_early_kv_growth():
+            break
+    else:
+        pytest.fail("no bank grew early")
+    # Only the first bank to need columns grew; the next waits for an allowance.
+    assert b._keys is not banks[0] and other._keys is banks[1]
+    assert b._keys.shape[0] == rows and b._keys.shape[2] > banks[0].shape[2]
+    equal(a, b)
+    equal(a, other)
 
 
 def test_finish_of_the_longest_row_drops_the_padding_in_place(backend):

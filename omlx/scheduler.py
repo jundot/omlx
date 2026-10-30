@@ -68,7 +68,11 @@ from .exceptions import (
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
-from .patches.vlm_batch_kv_capacity import apply_batch_kv_capacity_patch
+from .patches.vlm_batch_kv_capacity import (
+    allow_early_kv_growth,
+    apply_batch_kv_capacity_patch,
+    take_early_kv_growth,
+)
 from .prefill.packed import (
     PackedRow,
     install_packed_prefill,
@@ -14508,6 +14512,15 @@ class Scheduler:
         if self._deferred_clear_at is None or target > self._deferred_clear_at:
             self._deferred_clear_at = target
 
+    def _pace_early_kv_growth(self) -> None:
+        """Clear each early-grown KV bank before the next one grows.
+
+        The deferred clear keeps the #435 delay, and the pool holds one old bank at a time.
+        """
+        if take_early_kv_growth():
+            self._schedule_deferred_metal_clear()
+        allow_early_kv_growth(self._deferred_clear_at is None)
+
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
         return is_cache_corruption_error(error)
@@ -15499,6 +15512,7 @@ class Scheduler:
             # event-loop thread, so publish a fresh executor-owned sample once
             # the deferred pool reclaim has completed.
             self._current_usage_bytes()
+        self._pace_early_kv_growth()
         if (
             self.config.gc_cleanup_interval > 0
             and self._step_counter % self.config.gc_cleanup_interval == 0
