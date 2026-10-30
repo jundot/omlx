@@ -35,8 +35,8 @@ import mlx.core as mx
 from . import gguf
 from .engine import BaseEngine, BatchedEngine
 from .engine.decision import DecisionEngine
-from .engine.image import ImageEngine
 from .engine.embedding import EmbeddingEngine
+from .engine.image import ImageEngine
 from .engine.reranker import RerankerEngine
 from .engine.splash import (
     EXTERNAL_ENGINES,
