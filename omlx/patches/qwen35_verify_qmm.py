@@ -1524,6 +1524,29 @@ def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
     return None
 
 
+def run_route(layer, x2, route: str, *, sums=None):
+    """``layer`` applied to the (rows, K) input ``x2`` through the ``route`` kernel.
+
+    Returns None when the route cannot read the layer's scales dtype.
+    """
+    if route in ("m1", "m1_mma") and layer.scales.dtype != x2.dtype:
+        return None
+    args = (x2, layer.weight, layer.scales, layer.biases)
+    if route == "m1":
+        return m1_verify_qmv.m1_qmm(*args, bits=layer.bits, group_size=layer.group_size)
+    if route == "m1_mma":
+        return m1_verify_mma.m1_mma_qmm(
+            *args, bits=layer.bits, group_size=layer.group_size
+        )
+    if route == "sg8":
+        return vk_qmm_sg8(
+            *args, group_size=layer.group_size, bits=layer.bits, sums=sums
+        )
+    if route == "mma":
+        return vk_qmm_mma(*args, group_size=layer.group_size, bits=layer.bits)
+    return vk_qmm(*args, bits=layer.bits, group_size=layer.group_size)
+
+
 def takes_verify_route(layer, rows: int, dtype) -> bool:
     """Whether a ``rows``-row call of ``layer`` (an ``nn.QuantizedLinear``)
     now leaves the stock qmm: row-exact mode, or an armed verify route."""
@@ -1550,7 +1573,6 @@ def apply_verify_qmm_patch() -> bool:
     if _QL_PATCHED:
         return True
 
-    import mlx.core as mx
     import mlx.nn as nn
 
     cls = nn.QuantizedLinear
@@ -1580,55 +1602,9 @@ def apply_verify_qmm_patch() -> bool:
             return orig_call(self, x)
         try:
             # Batched verify rows (requests x block) share one weight pass.
-            x2 = x.reshape(rows, K)
-            if route in ("m1", "m1_mma") and self.scales.dtype != x.dtype:
+            y = run_route(self, x.reshape(rows, K), route, sums=group_sums_for(x))
+            if y is None:
                 return orig_call(self, x)
-            if route == "m1":
-                y = m1_verify_qmv.m1_qmm(
-                    x2,
-                    self.weight,
-                    self.scales,
-                    self.biases,
-                    bits=self.bits,
-                    group_size=self.group_size,
-                )
-            elif route == "m1_mma":
-                y = m1_verify_mma.m1_mma_qmm(
-                    x2,
-                    self.weight,
-                    self.scales,
-                    self.biases,
-                    bits=self.bits,
-                    group_size=self.group_size,
-                )
-            elif route == "sg8":
-                y = vk_qmm_sg8(
-                    x2,
-                    self.weight,
-                    self.scales,
-                    self.biases,
-                    group_size=self.group_size,
-                    bits=self.bits,
-                    sums=group_sums_for(x),
-                )
-            elif route == "mma":
-                y = vk_qmm_mma(
-                    x2,
-                    self.weight,
-                    self.scales,
-                    self.biases,
-                    group_size=self.group_size,
-                    bits=self.bits,
-                )
-            else:
-                y = vk_qmm(
-                    x2,
-                    self.weight,
-                    self.scales,
-                    self.biases,
-                    bits=self.bits,
-                    group_size=self.group_size,
-                )
             if hasattr(self, "bias"):
                 y = y + self.bias
             return y.reshape(batch, length, N)

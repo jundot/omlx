@@ -480,6 +480,22 @@ def _reset_vlm_mtp_attach():
 
 
 @pytest.fixture(autouse=True)
+def _reset_batched_decode_qmm():
+    """Keep the process-global batched decode routing off between tests.
+
+    Pre-load patches enable it, and it changes multi-row decode numerics for
+    every later test in the worker.
+    """
+    module = sys.modules.get("omlx.patches.batched_decode_qmm")
+    if module is not None:
+        module.remove_batched_decode_qmm_patch()
+    yield
+    module = sys.modules.get("omlx.patches.batched_decode_qmm")
+    if module is not None:
+        module.remove_batched_decode_qmm_patch()
+
+
+@pytest.fixture(autouse=True)
 def _reset_api_key_failures():
     """Keep the process-global wrong API key budget hermetic per test."""
     auth = sys.modules.get("omlx.admin.auth")

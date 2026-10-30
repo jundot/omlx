@@ -629,6 +629,10 @@ def maybe_apply_pre_load_patches(
 
     apply_arrays_cache_extract_guard()
 
+    from ..patches.batched_decode_qmm import apply_batched_decode_qmm_patch
+
+    apply_batched_decode_qmm_patch()
+
     # Model-independent: unused ArraysCache padding metadata otherwise grows
     # lazy graphs until a long-lived BatchGenerator hits the Metal resource limit.
     apply_arrays_cache_metadata_patch()
