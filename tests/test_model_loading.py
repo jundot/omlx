@@ -747,9 +747,21 @@ class TestCheckpointHasMtpWeights:
     def _write_index(self, tmp_path, weight_map: dict) -> None:
         import json as _json
 
+        import numpy as np
+        from safetensors.numpy import save_file
+
         (tmp_path / "model.safetensors.index.json").write_text(
             _json.dumps({"metadata": {}, "weight_map": weight_map})
         )
+        for shard in set(weight_map.values()):
+            save_file(
+                {
+                    key: np.zeros((1,), dtype=np.float32)
+                    for key, filename in weight_map.items()
+                    if filename == shard
+                },
+                str(tmp_path / shard),
+            )
 
     def test_returns_true_when_index_has_language_model_mtp(self, tmp_path):
         self._write_index(

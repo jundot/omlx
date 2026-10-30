@@ -553,6 +553,9 @@ def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplo
         json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
         encoding="utf-8",
     )
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), {"mtp.fc_hidden.weight": mx.ones((1,))}
+    )
     configure_mtp_runtime(tmp_path, enabled=True)
     try:
         model, modules, canonical, target_keys = _qwen4_rmsnorm_sanitize_fixture(
@@ -1477,6 +1480,9 @@ def test_qwen4_lightning_mtp_fusion_and_runtime_attachment(tmp_path):
         json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
         encoding="utf-8",
     )
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), {"mtp.fc_hidden.weight": mx.ones((1,))}
+    )
     configure_mtp_runtime(tmp_path, enabled=True)
     try:
         model = Model(config)
@@ -1516,6 +1522,9 @@ def test_qwen4_sanitize_dequantizes_and_stacks_fp8_experts(tmp_path, mtp_num_exp
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
         encoding="utf-8",
+    )
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), {"mtp.fc_hidden.weight": mx.ones((1,))}
     )
     configure_mtp_runtime(tmp_path, enabled=True)
     try:

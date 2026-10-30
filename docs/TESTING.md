@@ -99,6 +99,21 @@ Run `python -m pytest -q tests/test_qwen4_verify_attention_rows.py` to check tha
 
 `test_mlx_vlm_qwen4_exp_compat.py::test_qwen4_mtp_one_row_step_is_the_serial_decode_step` checks that a one-row Lightning MTP window (the activation step and depth-0 cycles) runs the serial decode step: equal logits and cache state, no speculative transaction, and a following verify window that rolls back as usual.
 
+# Qwen4 standalone MTP loading
+
+Run `python -m pytest -q tests/test_vlm_qwen4_exp_loader.py` for Qwen4 loading.
+The synthetic checkpoint cases run on CPU and cover embedded heads and standalone
+`mtp/model.safetensors` heads with `mtp/config.json` declaring
+`model_type=qwen4_exp_mtp` and the same `text_config` as the target. They verify
+loaded values, independent RMSNorm conventions for target and sidecar, native
+MLX quantization recipes, prefixed and indexed heads, embedded precedence,
+MTP-off behavior, incompatible sidecars and strict missing/unexpected/shape
+errors. Native sidecars use zero-centered norms; a legacy direct-gamma sidecar
+can declare `rms_norm_weight_format=ones_centered` in its config. No checkpoint
+assets are downloaded or rewritten. The same fixtures check conservative
+discovery/residency accounting, admin toggles, indexed embedded shards in oQ,
+and that oQ does not advertise preservation of standalone Qwen4 heads.
+
 # Prefill memory accounting tests
 
 Run `python -m pytest -q tests/test_scheduler_prefill_eviction_progress.py` to check usage after prefill pauses. Cold and warm requests retain token progress across repeated pauses, report only restored prefix tokens as cached, and include locally computed tokens in prompt throughput.

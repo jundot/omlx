@@ -33,6 +33,9 @@ def _failed_pool() -> tuple[EnginePool, EngineEntry]:
 
 
 def _write_qwen4_mtp_checkpoint(tmp_path, *, embedded_mtp: bool) -> None:
+    import numpy as np
+    from safetensors.numpy import save_file
+
     config = {
         "model_type": "qwen4_exp",
         "text_config": {
@@ -49,6 +52,10 @@ def _write_qwen4_mtp_checkpoint(tmp_path, *, embedded_mtp: bool) -> None:
     )
     (tmp_path / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {weight_key: "model.safetensors"}})
+    )
+    save_file(
+        {weight_key: np.zeros((1,), dtype=np.float32)},
+        str(tmp_path / "model.safetensors"),
     )
 
 

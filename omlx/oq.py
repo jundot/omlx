@@ -4287,6 +4287,16 @@ def _metal_available_memory_bytes() -> int:
 
 def _source_weight_files(model_path: str | Path) -> list[Path]:
     source = Path(model_path)
+    # Match mlx-vlm's selected shard set and merge order for Qwen4, while
+    # excluding an independently configured MTP sidecar.
+    from .utils.model_loading import _config_model_type, _qwen4_embedded_shards
+
+    if _config_model_type(source) == "qwen4_exp":
+        return [
+            shard
+            for shard in _qwen4_embedded_shards(source)
+            if shard.name not in DECISION_SIDECAR_WEIGHTS
+        ]
     files = sorted(
         f
         for f in source.glob("*.safetensors")

@@ -8049,6 +8049,9 @@ class TestQwen4ExpLayerWalk:
             json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
             encoding="utf-8",
         )
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"), {"mtp.fc_hidden.weight": mx.ones((1,))}
+        )
         configure_mtp_runtime(tmp_path, enabled=True)
         try:
             model = Model(config)
@@ -8709,6 +8712,9 @@ class TestStreamedCalibration:
         index.write_text(
             json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}})
         )
+        mx.save_safetensors(
+            str(source / "model.safetensors"), {"mtp.fc_hidden.weight": mx.ones((1,))}
+        )
         configure_ple_runtime(source, mode="resident")
         configure_mtp_runtime(source, enabled=True)
         mx.random.seed(7)
@@ -8809,8 +8815,9 @@ class TestStreamedCalibration:
         assert not first.reused and second.reused
 
     @pytest.mark.parametrize("keep_mtp", [False, True])
+    @pytest.mark.parametrize("nested_mtp", [False, True])
     def test_output_preserves_ple_scale_and_reloads(
-        self, checkpoint, tmp_path, monkeypatch, keep_mtp
+        self, checkpoint, tmp_path, monkeypatch, keep_mtp, nested_mtp
     ):
         from mlx.utils import tree_flatten
         from mlx_vlm.utils import load_model
@@ -8818,6 +8825,22 @@ class TestStreamedCalibration:
         import omlx.oq as oq
 
         source, config, model, tokens, scale_key = checkpoint
+        if nested_mtp:
+            root_path = source / "model.safetensors"
+            root = mx.load(str(root_path))
+            mtp = {key: root.pop(key) for key in list(root) if key.startswith("mtp.")}
+            mx.eval(root, mtp)
+            mx.save_safetensors(str(root_path), root)
+            nested = source / "nested"
+            nested.mkdir()
+            mx.save_safetensors(str(nested / "embedded.safetensors"), mtp)
+            index = {
+                "weight_map": {
+                    **{key: "model.safetensors" for key in root},
+                    **{key: "nested/embedded.safetensors" for key in mtp},
+                }
+            }
+            (source / "model.safetensors.index.json").write_text(json.dumps(index))
 
         def unexpected_measurement(*args, **kwargs):
             raise AssertionError("explicit sensitivity override must skip measurement")

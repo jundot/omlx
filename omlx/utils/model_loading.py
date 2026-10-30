@@ -855,11 +855,11 @@ def maybe_apply_pre_load_patches(
         mtp_requested = bool(
             model_settings is not None and getattr(model_settings, "mtp_enabled", False)
         )
-        has_mtp_weights = _checkpoint_has_mtp_weights(model_name)
+        has_mtp_weights = _checkpoint_has_qwen4_mtp_weights(model_name)
         mtp_active = mtp_requested and has_mtp_weights
         if mtp_requested and not has_mtp_weights:
             logger.warning(
-                "Qwen4-Exp Lightning MTP was requested for %s, but no embedded "
+                "Qwen4-Exp Lightning MTP was requested for %s, but no compatible "
                 "MTP tensors were found",
                 model_name,
             )
@@ -1245,8 +1245,8 @@ def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
         return ()
     if config.get("model_type") == "qwen4_exp":
         # The dedicated Qwen4 runtime constructs a root-level MTP module and
-        # can bind only the embedded mtp.* layouts. Extra nextn decoder layers
-        # must not make generic callers report this checkpoint as compatible.
+        # binds embedded mtp.* layouts or a standalone head, not nextn layers.
+        # Extra nextn layers must not make generic callers report compatibility.
         return ()
     return _nextn_weight_prefixes_from_config(config)
 
@@ -1272,7 +1272,15 @@ def _checkpoint_weight_prefix(
         except Exception as e:
             logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
 
-    shards = sorted(p.glob("*.safetensors"))
+    return _checkpoint_weight_prefix_in_shards(
+        sorted(p.glob("*.safetensors")), prefixes
+    )
+
+
+def _checkpoint_weight_prefix_in_shards(
+    shards: list[Path], prefixes: tuple[str, ...]
+) -> str | None:
+    """Inspect physical shard headers without loading their tensor data."""
     if not shards:
         return None
     try:
@@ -1293,18 +1301,114 @@ def _checkpoint_weight_prefix(
     return None
 
 
+def _qwen4_checkpoint_shards(model_path: str | Path) -> list[Path]:
+    """Select physical files using the same index/fallback rule as mlx-vlm."""
+    model_path = Path(model_path)
+    index = model_path / "model.safetensors.index.json"
+    if index.exists():
+        try:
+            weight_map = json.loads(index.read_text()).get("weight_map", {})
+            shards = [
+                model_path / name
+                for name in sorted(set(weight_map.values()))
+                if (model_path / name).exists()
+            ]
+            if shards:
+                return shards
+        except (ValueError, OSError):
+            pass
+    return sorted(
+        path
+        for path in model_path.glob("*.safetensors")
+        if path.name != "consolidated.safetensors"
+    )
+
+
+def _qwen4_mtp_sidecar_candidate(model_path: str | Path) -> Path | None:
+    """Identify a declared standalone head even if other metadata is invalid."""
+    sidecar = Path(model_path) / "mtp" / "model.safetensors"
+    if not sidecar.is_file():
+        return None
+    try:
+        config = json.loads((sidecar.parent / "config.json").read_text())
+        model_type = config.get("model_type")
+        # A declared but incompatible drafter is not an embedded target shard.
+        # Unrelated metadata beside a genuine shard does not establish a head.
+        if isinstance(model_type, str) and "mtp" in model_type.lower().split("_"):
+            return sidecar
+    except (ValueError, OSError, AttributeError):
+        pass
+    return None
+
+
+def _qwen4_embedded_shards(model_path: str | Path) -> list[Path]:
+    """Exclude an independently configured head from mlx-vlm's shard set."""
+    sidecar = _qwen4_mtp_sidecar_candidate(model_path)
+    return [
+        shard
+        for shard in _qwen4_checkpoint_shards(model_path)
+        if sidecar is None or shard.resolve() != sidecar.resolve()
+    ]
+
+
 def _checkpoint_qwen4_mtp_weight_prefix(model_path: str | Path) -> str | None:
     """Return the embedded MTP prefix supported by the Qwen4 runtime."""
-    return _checkpoint_weight_prefix(model_path, _MTP_WEIGHT_PREFIXES)
+    return _checkpoint_weight_prefix_in_shards(
+        _qwen4_embedded_shards(model_path), _MTP_WEIGHT_PREFIXES
+    )
+
+
+def _checkpoint_qwen4_mtp_sidecar(model_path: str | Path) -> Path | None:
+    """Recognize a standalone Qwen4 head; strict loading validates its tensors."""
+    model_path = Path(model_path)
+    sidecar = model_path / "mtp" / "model.safetensors"
+    if not sidecar.is_file():
+        return None
+    try:
+        config = json.loads((model_path / "config.json").read_text())
+        mtp_config = json.loads((sidecar.parent / "config.json").read_text())
+        if (
+            config.get("model_type") != "qwen4_exp"
+            or mtp_config.get("model_type") != "qwen4_exp_mtp"
+            or not isinstance(config.get("text_config"), dict)
+            or not config["text_config"]
+            or mtp_config.get("text_config") != config["text_config"]
+        ):
+            return None
+        norm_format = mtp_config.get("rms_norm_weight_format", "zero_centered")
+        if norm_format not in ("zero_centered", "ones_centered"):
+            logger.warning(
+                "Ignoring Qwen4 MTP sidecar %s: invalid rms_norm_weight_format %r; "
+                "use zero_centered or ones_centered",
+                sidecar.parent,
+                norm_format,
+            )
+            return None
+        import safetensors
+
+        with safetensors.safe_open(str(sidecar), framework="numpy") as f:
+            if f.keys():
+                return sidecar
+    except Exception as exc:
+        logger.debug("Failed to inspect Qwen4 MTP sidecar %s: %s", sidecar, exc)
+    return None
+
+
+def _checkpoint_has_qwen4_mtp_weights(model_path: str | Path) -> bool:
+    """Match only layouts that the dedicated Qwen4 runtime can bind."""
+    return (
+        _checkpoint_qwen4_mtp_weight_prefix(model_path) is not None
+        or _checkpoint_qwen4_mtp_sidecar(model_path) is not None
+    )
 
 
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
-    """True iff the checkpoint at *model_path* ships any MTP weight tensor.
+    """Whether a checkpoint exposes MTP weights to generic loaders and oQ.
 
     Matches both the ``mtp.*`` naming and compatible nextn layouts (extra
     decoder layers past ``num_hidden_layers``, see ``_nextn_weight_prefixes``).
-    Qwen4-Exp is intentionally restricted to ``mtp.*`` because its dedicated
-    runtime cannot bind native nextn layers.
+    Qwen4-Exp only uses embedded ``mtp.*`` here: its standalone heads are
+    handled by the dedicated runtime but cannot yet be preserved by oQ.
 
     Some Qwen3.6 MoE VLM exports declare ``mtp_num_hidden_layers > 0`` in
     ``config.json`` but strip the MTP weights during conversion (e.g.
@@ -1318,6 +1422,10 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     ``mtp/model_mtp.safetensors`` sidecar. If neither contains MTP weights,
     callers skip attaching the MTP module.
     """
+    if _config_model_type(model_path) == "qwen4_exp":
+        return _checkpoint_weight_prefix_in_shards(
+            _qwen4_embedded_shards(model_path), _MTP_WEIGHT_PREFIXES
+        ) is not None
     prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
     if _checkpoint_weight_prefix(model_path, prefixes) is not None:
         return True
@@ -1445,9 +1553,8 @@ def lightning_mtp_supported(model_path: str | Path) -> bool:
         return False
     model_type = config.get("model_type")
     if model_type == "qwen4_exp":
-        if not _has_mtp_heads(config):
-            return False
-    elif not _is_mtp_compatible(config, model_type):
+        return _has_mtp_heads(config) and _checkpoint_has_qwen4_mtp_weights(model_path)
+    if not _is_mtp_compatible(config, model_type):
         return False
     return _checkpoint_has_mtp_weights(model_path)
 
