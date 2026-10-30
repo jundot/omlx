@@ -108,7 +108,6 @@ from .api.embedding_utils import (
     normalize_input,
     truncate_embedding,
 )
-from .api.image_routes import router as image_router
 from .api.markitdown import (
     MARKITDOWN_MODEL_ID,
     MarkItDownRequestError,
@@ -187,6 +186,7 @@ from .api.decisions import (
     to_systemone,
 )
 from .api.decisions_models import DecisionRequest
+from .api.image_routes import router as image_router
 from .api.systemone_models import SystemOneRequest
 from .api.thinking import (
     ThinkingParser,
@@ -223,9 +223,9 @@ from .engine import BaseEngine, BatchedEngine, GenerationOutput, VLMBatchedEngin
 from .engine.distributed import DistributedInferenceError
 from .engine.vlm import MINIMAX_M3_MODEL_TYPES
 from .engine.embedding import EmbeddingEngine
+from .engine.image import ImageEngine
 from .engine.reranker import RerankerEngine
 from .engine.decision import DecisionEngine
-from .engine.image import ImageEngine
 from .engine_pool import (
     CLAUDE_DESKTOP_TIER_FAMILY,
     EnginePool,
