@@ -1772,7 +1772,7 @@ class TestEmbeddingsEndpoint:
         assert len(data["data"]) == 2
 
     def test_embeddings_use_discovered_context_length(self, client, mock_engine_pool):
-        """Embedding requests should not fall back to mlx-embeddings' 512 default."""
+        """Embedding requests should not fall back to a 512-token default."""
         mock_engine_pool._models.append(
             {"id": "test-embed-model", "loaded": True, "pinned": False, "size": 500000}
         )

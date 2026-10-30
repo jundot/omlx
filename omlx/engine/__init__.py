@@ -5,7 +5,7 @@ Engine abstraction for oMLX inference.
 Provides multiple engine implementations:
 - BatchedEngine: Continuous batching for multiple concurrent users
 - VLMBatchedEngine: Vision-language model engine with image support
-- EmbeddingEngine: Batch embedding generation using mlx-embeddings
+- EmbeddingEngine: Batch embedding generation using mlx-vlm
 - RerankerEngine: Document reranking using SequenceClassification models
 - DecisionEngine: Typed decisions for /v1/systemone (Clef, OpenJev, Decision 3.0, d1)
 

@@ -6,9 +6,10 @@ This module provides a wrapper for document reranking using SequenceClassificati
 and CausalLM-based reranker models on Apple's MLX framework.
 
 Supports:
-- ModernBertForSequenceClassification (via mlx-embeddings)
+- ModernBertForSequenceClassification (via mlx-vlm)
 - XLMRobertaForSequenceClassification (omlx native implementation)
 - CausalLM-based rerankers (e.g., Qwen3-Reranker) via yes/no logit scoring
+- Qwen3-VL-Reranker (via mlx-vlm)
 """
 
 import gc
@@ -16,9 +17,13 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Tuple
 
 import mlx.core as mx
+from mlx_vlm.encoder_loader import load_encoder_model
+from mlx_vlm.reranker_loader import SEQUENCE_CLASSIFIER_MODEL_REMAPPING, load_reranker
+from mlx_vlm.server.reranking import RerankItem, ensure_chat_template, score_documents
+from mlx_vlm.utils import get_model_path, load_config, load_processor
 
 from ..model_discovery import (
     _TOKENIZER_MAX_LENGTH_SENTINEL,
@@ -30,13 +35,31 @@ from ..model_discovery import (
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
 from ..utils.image import load_image
-from .base_model import ENCODER_BATCH_TOKEN_BUDGET, token_budget_batches
-from .mlx_embeddings_compat import (
-    patch_qwen3_vl_position_ids_recompute,
-    patch_qwen3_vl_processor_for_torch_free_image_loading,
+from ..utils.model_loading import (
+    ensure_model_code_trusted,
+    normalize_encoder_quantization_config,
 )
+from .base_model import ENCODER_BATCH_TOKEN_BUDGET, token_budget_batches
 
 logger = logging.getLogger(__name__)
+
+
+def _classifier_scores(outputs: Any, is_regression: bool = False) -> mx.array:
+    """Return classifier scores, preserving raw logits for regression heads."""
+    pooled = getattr(outputs, "pooler_output", None)
+    if pooled is not None:
+        return pooled
+    logits = getattr(outputs, "logits", None)
+    if logits is not None:
+        if is_regression:
+            return logits
+        if logits.shape[-1] > 1:
+            return mx.softmax(logits, axis=-1)
+        return mx.sigmoid(logits)
+    raise ValueError(
+        "Model output contains neither pooler_output nor logits. "
+        "Ensure the model is a SequenceClassification model."
+    )
 
 
 def _coerce_item_to_text(item: Any) -> str:
@@ -73,7 +96,7 @@ class MLXRerankerModel:
     Supports two reranking paradigms:
 
     1. SequenceClassification models (encoder-based):
-       - ModernBertForSequenceClassification (via mlx-embeddings)
+       - ModernBertForSequenceClassification (via mlx-vlm)
        - XLMRobertaForSequenceClassification (omlx native implementation)
 
     2. CausalLM-based rerankers (decoder-based):
@@ -113,9 +136,11 @@ class MLXRerankerModel:
         self.processor = None
         self._loaded = False
         self._num_labels: int | None = None
+        self._is_regression = False
         self._is_causal_lm = False
         self._is_jina_reranker = False
         self._is_vl_reranker = False
+        self._vl_config: dict[str, Any] | None = None
         self._token_true_id: int | None = None
         self._token_false_id: int | None = None
         self._doc_embed_token_id: int | None = None
@@ -235,80 +260,47 @@ class MLXRerankerModel:
 
         return model, tokenizer
 
-    def _load_vl_reranker(self) -> Tuple[Any, Any]:
-        """Load a multimodal reranker (e.g., Qwen3-VL-Reranker) via mlx-embeddings.
+    def _build_vl_item(self, item: "str | dict[str, Any]") -> RerankItem:
+        """Normalize a rerank input into an mlx-vlm RerankItem.
 
-        mlx-embeddings exposes a unified `load()` + `model.process()` API that
-        handles both embedding and reranking variants of Qwen3-VL. Reranker vs
-        embedder is decided by the input dict shape at inference time.
-        """
-        patch_qwen3_vl_processor_for_torch_free_image_loading()
-        patch_qwen3_vl_position_ids_recompute()
-        from mlx_embeddings import load as mlx_emb_load
-
-        return mlx_emb_load(
-            str(self.model_name),
-            tokenizer_config={"trust_remote_code": self.trust_remote_code},
-        )
-
-    def _build_vl_item(self, item: "str | dict[str, Any]") -> Dict[str, Any]:
-        """Normalize a rerank input into the mlx-embeddings VL item format.
-
-        Accepts either a bare string (text) or a dict with 'text' and/or
-        'image' keys. Request-facing image strings must be base64 data URIs and
-        get loaded via omlx's shared image loader.
+        Request-facing image strings must be base64 data URIs. They are decoded
+        here so mlx-vlm never resolves a file path or URL from a request.
         """
         if isinstance(item, str):
-            return {"text": item}
+            return RerankItem(text=item)
         if not isinstance(item, dict):
-            return {"text": str(item)}
+            return RerankItem(text=str(item))
 
-        result: Dict[str, Any] = {}
-        text = item.get("text")
-        if text:
-            result["text"] = text
+        text = item.get("text") or None
         image_ref = item.get("image")
+        image = None
         if image_ref:
-            if isinstance(image_ref, str):
-                result["image"] = load_image(image_ref, field="image")
-            else:
-                # Already a PIL image or similar — pass through
-                result["image"] = image_ref
-        if not result:
+            image = (
+                load_image(image_ref, field="image")
+                if isinstance(image_ref, str)
+                else image_ref
+            )
+        if text is None and image is None:
             raise ValueError("VL reranker item must have at least 'text' or 'image'.")
-        return result
+        return RerankItem(text=text, image=image)
 
     def _rerank_vl(
         self,
         query: "str | dict[str, Any]",
         documents: "list[str] | list[dict[str, Any]]",
-        max_length: int,
         instruction: str | None = None,
     ) -> RerankOutput:
-        """Rerank using mlx-embeddings' multimodal model.process() API."""
-        query_item = self._build_vl_item(query)
-        doc_items = [self._build_vl_item(d) for d in documents]
-
-        inputs = {
-            "instruction": instruction or self._CAUSAL_LM_DEFAULT_INSTRUCTION,
-            "query": query_item,
-            "documents": doc_items,
-        }
-
-        scores = self.model.process(inputs, processor=self.processor)
-        mx.eval(scores)
-        scores_list = [float(s) for s in scores.tolist()]
-        indices = sorted(
-            range(len(scores_list)),
-            key=lambda i: scores_list[i],
-            reverse=True,
+        """Rerank with mlx-vlm's generative yes/no scoring."""
+        scores, total_tokens = score_documents(
+            self.model,
+            self.processor,
+            self._vl_config,
+            self._build_vl_item(query),
+            [self._build_vl_item(d) for d in documents],
+            instruction or self._CAUSAL_LM_DEFAULT_INSTRUCTION,
         )
-
-        return RerankOutput(
-            scores=scores_list,
-            indices=indices,
-            total_tokens=0,
-        )
+        indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        return RerankOutput(scores=scores, indices=indices, total_tokens=total_tokens)
 
     def _load_causal_lm(self) -> Tuple[Any, Any]:
         """Load a CausalLM-based reranker model using mlx-lm."""
@@ -810,8 +802,17 @@ class MLXRerankerModel:
 
         try:
             if arch in MULTIMODAL_RERANKER_ARCHITECTURES:
-                # Multimodal reranker (e.g., Qwen3-VL-Reranker) via mlx-embeddings
-                self.model, self.processor = self._load_vl_reranker()
+                model_path = get_model_path(self.model_name)
+                self._vl_config = load_config(model_path)
+                ensure_model_code_trusted(
+                    self._vl_config,
+                    model_path=model_path,
+                    trust_remote_code=self.trust_remote_code,
+                )
+                self.model, self.processor = load_reranker(
+                    model_path, trust_remote_code=self.trust_remote_code
+                )
+                ensure_chat_template(self.processor, model_path)
                 self._is_vl_reranker = True
                 self._num_labels = 1
             elif arch == "JinaForRanking":
@@ -829,25 +830,43 @@ class MLXRerankerModel:
                 self.model, self.processor = self._load_xlm_roberta()
                 self._num_labels = getattr(self.model.config, "num_labels", None)
             else:
-                # Use mlx-embeddings for other architectures (ModernBert, etc.)
-                patch_qwen3_vl_processor_for_torch_free_image_loading()
-                patch_qwen3_vl_position_ids_recompute()
-                from mlx_embeddings import load
-
-                self.model, self.processor = load(
-                    self.model_name,
-                    tokenizer_config={"trust_remote_code": self.trust_remote_code},
+                model_path = get_model_path(self.model_name)
+                config = load_config(model_path)
+                ensure_model_code_trusted(
+                    config,
+                    model_path=model_path,
+                    trust_remote_code=self.trust_remote_code,
                 )
-                # Stock mlx-embeddings masks with -1e9 overflow to -inf in fp16,
-                # so a fully padded (short) query produces NaN. The embedding
-                # path already applies this finite-mask patch; the reranker's
-                # mlx-embeddings branch must do the same (issue #3507).
+                pipeline_config = config.get("pipeline_config")
+                binary_sigmoid = isinstance(pipeline_config, dict) and bool(
+                    pipeline_config.get("binary_sigmoid")
+                )
+                self._is_regression = bool(config.get("is_regression"))
+                id2label = config.get("id2label")
+                if self._is_regression or binary_sigmoid:
+                    self._num_labels = 1
+                else:
+                    self._num_labels = int(
+                        config.get("num_labels")
+                        or (len(id2label) if isinstance(id2label, dict) else 0)
+                        or 1
+                    )
+                # The public reranker loader rejects multi-label classifiers.
+                normalize_encoder_quantization_config(config)
+                self.model = load_encoder_model(
+                    model_path,
+                    model_remapping=SEQUENCE_CLASSIFIER_MODEL_REMAPPING,
+                    model_class_name="SequenceClassificationModel",
+                    config=config,
+                    config_overrides={"num_labels": self._num_labels},
+                )
+                self.processor = load_processor(
+                    model_path,
+                    add_detokenizer=False,
+                    trust_remote_code=self.trust_remote_code,
+                )
+                self.processor = getattr(self.processor, "tokenizer", self.processor)
                 patch_modernbert_attention(self.model)
-
-                # Get num_labels from model config
-                if hasattr(self.model, "config"):
-                    config = self.model.config
-                    self._num_labels = getattr(config, "num_labels", None)
 
             # Try mx.compile for persistent Metal kernel caching
             self._is_compiled = self._try_compile()
@@ -862,8 +881,8 @@ class MLXRerankerModel:
 
         except ImportError as e:
             raise ImportError(
-                "mlx-lm, mlx-embeddings, or transformers is required for reranking. "
-                "Install with: pip install mlx-lm mlx-embeddings transformers"
+                "mlx-lm, mlx-vlm, or transformers is required for reranking. "
+                "Install with: pip install mlx-lm mlx-vlm transformers"
             ) from e
         except FileNotFoundError:
             raise FileNotFoundError(
@@ -885,9 +904,8 @@ class MLXRerankerModel:
         - Compile a narrow function that returns logits only.
         """
         if self._is_causal_lm or self._is_vl_reranker:
-            # CausalLM / VL reranker paths use custom scoring (yes/no logits or
-            # mlx-embeddings model.process). VL forward needs pixel_values and
-            # lacks pooler_output, so the compile wrapper here wouldn't apply.
+            # CausalLM / VL reranker paths use custom yes/no logit scoring, so
+            # the sequence-classifier compile wrapper does not apply.
             logger.info(f"mx.compile skipped for {self.model_name}")
             self._compiled_seq_logits = None
             return False
@@ -898,15 +916,8 @@ class MLXRerankerModel:
         try:
 
             def _compiled_seq_logits(inputs):
-                outputs = base_model(**inputs)
-                if (
-                    hasattr(outputs, "pooler_output")
-                    and outputs.pooler_output is not None
-                ):
-                    return outputs.pooler_output
-                raise ValueError(
-                    "Model output does not contain pooler_output. "
-                    "Ensure the model is a SequenceClassification model."
+                return _classifier_scores(
+                    base_model(**inputs), is_regression=self._is_regression
                 )
 
             # NOTE: use default compile mode. shapeless=True can fail shape
@@ -939,9 +950,11 @@ class MLXRerankerModel:
         self.processor = None
         self._loaded = False
         self._num_labels = None
+        self._is_regression = False
         self._is_causal_lm = False
         self._is_jina_reranker = False
         self._is_vl_reranker = False
+        self._vl_config = None
         self._token_true_id = None
         self._token_false_id = None
         self._doc_embed_token_id = None
@@ -999,14 +1012,7 @@ class MLXRerankerModel:
             return RerankOutput(scores=[], indices=[], total_tokens=0)
 
         if self._is_vl_reranker:
-            effective_max_length = (
-                max_length
-                if max_length is not None
-                else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
-            )
-            return self._rerank_vl(
-                query, documents, effective_max_length, instruction=instruction
-            )
+            return self._rerank_vl(query, documents, instruction=instruction)
 
         # Text-only paths: coerce dict inputs down to text so existing
         # _rerank_* methods keep their str-only contract.
@@ -1368,20 +1374,9 @@ class MLXRerankerModel:
             total_tokens=total_tokens,
         )
 
-    def _seq_classification_tokenizer(self) -> Any:
-        """Return the tokenizer behind the SequenceClassification processor."""
-        # Unwrap only mlx-embeddings' TokenizerWrapper. transformers
-        # tokenizers also have a _tokenizer attribute.
-        processor = self.processor
-        if type(processor).__name__ == "TokenizerWrapper" and hasattr(
-            processor, "_tokenizer"
-        ):
-            return processor._tokenizer
-        return processor
-
     def _tokenizer_max_length(self, default: int) -> int:
         """Return the tokenizer's declared input limit, or default."""
-        limit = getattr(self._seq_classification_tokenizer(), "model_max_length", None)
+        limit = getattr(self.processor, "model_max_length", None)
         # transformers uses int(1e30) when the tokenizer declares no limit.
         if isinstance(limit, int) and 0 < limit < _TOKENIZER_MAX_LENGTH_SENTINEL:
             return limit
@@ -1406,13 +1401,9 @@ class MLXRerankerModel:
 
         if not callable(self.model):
             raise ValueError("SequenceClassification model is not initialized.")
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-        # pooler_output shape: (batch_size, num_labels)
-        if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
-            return outputs.pooler_output
-        raise ValueError(
-            "Model output does not contain pooler_output. "
-            "Ensure the model is a SequenceClassification model."
+        return _classifier_scores(
+            self.model(input_ids=input_ids, attention_mask=attention_mask),
+            is_regression=self._is_regression,
         )
 
     def _rerank_seq_classification(
@@ -1422,7 +1413,7 @@ class MLXRerankerModel:
         max_length: int = 512,
     ) -> RerankOutput:
         """Rerank using SequenceClassification models (encoder-based)."""
-        processor = self._seq_classification_tokenizer()
+        processor = self.processor
         if not callable(processor):
             raise ValueError("SequenceClassification processor is not initialized.")
 
@@ -1448,7 +1439,7 @@ class MLXRerankerModel:
             # Evaluate per batch so peak memory stays at one batch.
             mx.eval(logits)
 
-            # Binary heads already apply sigmoid. Multi-class heads use the
+            # Scores are already activated. Multi-class heads use the
             # last column (typically the "relevant" class).
             if logits.shape[-1] == 1:
                 batch_scores = logits.squeeze(-1).tolist()
@@ -1482,7 +1473,7 @@ class MLXRerankerModel:
         """
         config_path = Path(self.model_name) / "config.json"
         if not config_path.exists():
-            # If no config.json, let mlx-embeddings handle validation
+            # If no config.json, let the loader handle validation
             return
 
         try:

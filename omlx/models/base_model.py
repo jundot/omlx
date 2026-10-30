@@ -3,7 +3,7 @@
 Base model utilities for omlx custom model implementations.
 
 This module provides common utilities for implementing custom models
-that are not yet supported by mlx-embeddings.
+that are not yet supported by mlx-vlm.
 """
 
 from dataclasses import dataclass

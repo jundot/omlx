@@ -3,7 +3,7 @@
 Embedding engine for oMLX.
 
 This module provides an engine for generating text embeddings using
-mlx-embeddings. Unlike LLM engines, embedding engines don't support
+mlx-vlm. Unlike LLM engines, embedding engines don't support
 streaming or chat completion.
 """
 

@@ -12,7 +12,7 @@ import pytest
 class _MaskBranchingModel:
     """Forward with a Python `if` on a mask-dependent lazy comparison.
 
-    Mirrors mlx-embeddings qwen3's last_token_pool: with attention_mask=None
+    Mirrors mlx-vlm qwen3_embedding's last_token_pool: with attention_mask=None
     the default mask is built from the (static) shape, so it is a tracing
     constant and legal to eval; with a traced attention_mask input the same
     `if` forces an eval during tracing and mx.compile raises (issue #2447).

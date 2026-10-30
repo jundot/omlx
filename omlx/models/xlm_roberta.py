@@ -3,7 +3,7 @@
 XLM-RoBERTa model implementation for omlx.
 
 This module provides XLM-RoBERTa model with SequenceClassification support
-for reranking tasks. Based on mlx-embeddings implementation with added
+for reranking tasks. Based on the mlx-embeddings implementation with added
 classifier head for ForSequenceClassification architectures.
 
 Supports:
