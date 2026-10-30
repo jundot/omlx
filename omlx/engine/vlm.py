@@ -2036,7 +2036,7 @@ class VLMBatchedEngine(BaseEngine):
 
         restored = restore_bonsai_quantized_modules(self._vlm_model)
         if restored:
-            logger.info("Restored oMLX Bonsai kernel paths for %d modules", restored)
+            logger.info("Rebound %d mlx-vlm 1-bit modules to stock MLX", restored)
 
         if self.model_type in NATIVE_VIDEO_MODEL_TYPES:
             self._native_video = attach_native_video_processor(

@@ -658,8 +658,9 @@ def maybe_apply_pre_load_patches(
     # wrapper chain bypasses us entirely.
     quant_cfg = config.get("quantization") or {}
     quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
-    # Ordinary 2-bit affine checkpoints do not need the t5 loading shim.
-    if quant_bits == 1 or (quant_bits == 2 and _checkpoint_has_t5_weights(model_name)):
+    # Ordinary 1-bit and 2-bit affine checkpoints run on stock MLX kernels.
+    has_t5_weights = quant_bits == 2 and _checkpoint_has_t5_weights(model_name)
+    if has_t5_weights:
         try:
             from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
         except Exception as e:
@@ -669,24 +670,6 @@ def maybe_apply_pre_load_patches(
                 logger.info(
                     "Bonsai t5 load patch applied for %s "
                     "(t5 uint8 weights allowed past strict shape check)",
-                    model_name,
-                )
-
-    # Bonsai 1-bit construction patch: stock mlx-lm calls
-    # nn.quantize(model, bits=1) before our inference patches hook in,
-    # and mx.quantize(bits=1) is rejected at the C++ level.  Patch
-    # mx.quantize to emit uint32-packed placeholder tensors in the 1-bit
-    # shape (K//32 values per uint32); real weights bind via load_weights.
-    # bits=2 needs no shim (stock mx.quantize handles it).
-    if quant_bits == 1:
-        try:
-            from ..patches.bonsai_qmv import apply_bonsai_construct_patch
-        except Exception as e:
-            logger.debug("bonsai construct patch import failed: %s", e)
-        else:
-            if apply_bonsai_construct_patch():
-                logger.info(
-                    "Bonsai 1-bit construct patch applied for %s",
                     model_name,
                 )
 
@@ -1184,32 +1167,6 @@ def maybe_apply_pre_load_patches(
             if apply_qwen3_6_nested_visual_patch():
                 logger.info(
                     "qwen3_6 nested-visual sanitize wrap applied for %s",
-                    model_name,
-                )
-
-    # Bonsai 1-bit / 2-bit affine quantized decode patch.
-    # Applies to any model whose top-level ``quantization`` config declares
-    # bits=1 or bits=2 (the keys written by the Bonsai MLX conversion).
-    # The patch is a no-op for stock 4/8-bit models so it is safe to install
-    # globally once for the process lifetime.
-    quant_cfg = config.get("quantization") or {}
-    quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
-    if quant_bits in (1, 2):
-        try:
-            from ..patches.bonsai_qmv import apply_bonsai_qmv_patch
-        except Exception as e:
-            logger.debug("1/2-bit affine decode optimization import failed: %s", e)
-        else:
-            if apply_bonsai_qmv_patch():
-                logger.info(
-                    "%d-bit affine decode optimization enabled for %s",
-                    quant_bits,
-                    model_name,
-                )
-            else:
-                logger.debug(
-                    "1/2-bit affine decode optimization skipped for %s "
-                    "(native extension not available; stock mlx fallback active)",
                     model_name,
                 )
 
