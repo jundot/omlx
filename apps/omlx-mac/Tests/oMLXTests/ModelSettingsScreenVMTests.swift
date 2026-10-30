@@ -42,6 +42,20 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertEqual(ModelSettingsScreenVM.appliedJSON(nil), "{}")
     }
 
+    func testImageModelOnlyShowsSupportedSettings() {
+        let vm = ModelSettingsScreenVM()
+        vm.model = makeModel(id: "image", configModelType: "qwen_image_2_1_turbo", modelType: "image")
+        XCTAssertTrue(vm.isImageGeneration)
+        XCTAssertFalse(vm.showsGenerationSection)
+        XCTAssertFalse(vm.showsEnginePages)
+        XCTAssertFalse(vm.showsChatProfiles)
+        XCTAssertFalse(vm.showsAdvancedSection)
+        XCTAssertFalse(vm.showsModelTypeOverride)
+        vm.model = makeModel(id: "future", configModelType: "future", modelType: "future_type")
+        XCTAssertFalse(vm.isImageGeneration)
+        XCTAssertTrue(vm.showsChatProfiles)
+    }
+
     func testModelTypeOptionsMatchServerValues() {
         let values = ModelSettingsScreenVM.modelTypeOptions.map(\.0)
 

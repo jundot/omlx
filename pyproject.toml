@@ -243,6 +243,7 @@ include = ["omlx*"]
 
 [tool.setuptools.package-data]
 "omlx" = ["oq_calibration_data.json", "oqe_calibration_data.json"]
+"omlx.image" = ["LICENSE", "vae_config.json"]
 "omlx.admin" = ["bench_corpora/*"]
 "omlx_web" = ["templates/**/*.html", "static/**/*", "i18n/*.json"]
 "omlx.eval" = ["data/*.jsonl"]

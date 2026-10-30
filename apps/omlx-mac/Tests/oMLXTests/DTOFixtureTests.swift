@@ -21,6 +21,17 @@ import XCTest
 @testable import oMLX
 
 final class DTOFixtureTests: XCTestCase {
+    func testImageAndFutureModelTypesDecodeWithoutSchemaChanges() throws {
+        for type in ["image", "future_type"] {
+            let json = """
+            {"id":"bundle","loaded":false,"is_loading":false,"estimated_size":123,"model_type":"\(type)"}
+            """
+            let model = try Self.makeDecoder().decode(ModelDTO.self, from: Data(json.utf8))
+            XCTAssertEqual(model.modelType, type)
+            XCTAssertEqual(model.isImageGeneration, type == "image")
+        }
+    }
+
 
     // Matches the JSONDecoder config in OMLXClient: snake_case keys → camelCase
     // Codable members. Any DTO that the real client decodes must round-trip

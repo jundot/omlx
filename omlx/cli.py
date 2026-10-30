@@ -1591,6 +1591,13 @@ Example directory structure:
         help="Emit machine-readable JSON",
     )
 
+    image_parser = subparsers.add_parser(
+        "inspect-image", help="Inspect a native image bundle without loading weights"
+    )
+    image_parser.add_argument("path")
+    image_parser.add_argument("--json", action="store_true")
+    image_parser.add_argument("--verify-hashes", action="store_true")
+
     # Split launch's forwarding separator before argparse. parse_known_args()
     # inconsistently retains it when known options precede it, and stripping it
     # afterward cannot distinguish it from a separator intended for the tool.
@@ -1619,6 +1626,10 @@ Example directory structure:
             serve_command(args)
         elif args.command in {"start", "stop", "restart"}:
             sys.exit(lifecycle_command(args))
+        elif args.command == "inspect-image":
+            from .image_inspect import inspect_command
+
+            sys.exit(inspect_command(args))
         elif args.command == "diagnose":
             sys.exit(diagnose_command(args))
         elif args.command == "cluster":
