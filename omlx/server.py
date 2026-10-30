@@ -218,6 +218,7 @@ from .api.utils import (
     cache_reasoning_output,
     uses_native_reasoning_content,
 )
+from .client_identity import ClientIdentityMiddleware
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
 from .engine.vlm import MINIMAX_M3_MODEL_TYPES
@@ -377,7 +378,8 @@ async def verify_api_key(
     Checks the provided Bearer token against the main API key and all sub keys.
     Also accepts the x-api-key header as a fallback (Anthropic SDK compatibility).
     """
-    from .admin.auth import check_api_key, fingerprint_key, verify_any_api_key
+    from .admin.auth import check_api_key, fingerprint_key, identify_api_key
+    from .client_identity import set_key_identity
     from .utils.network import is_loopback_bind
 
     global_settings = _server_state.global_settings
@@ -419,10 +421,15 @@ async def verify_api_key(
         if global_settings is not None
         else []
     )
-    if not check_api_key(
-        request,
-        lambda: verify_any_api_key(api_key_value, _server_state.api_key, sub_keys),
-    ):
+
+    def verify_client_key() -> bool:
+        identity = identify_api_key(api_key_value, _server_state.api_key, sub_keys)
+        if identity is None:
+            return False
+        set_key_identity(*identity)
+        return True
+
+    if not check_api_key(request, verify_client_key):
         logger.warning("Rejected API key (fp=%s)", fingerprint_key(api_key_value))
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -1436,6 +1443,8 @@ class ClientDisconnectTrackingMiddleware:
 # passes through the same one-shot disconnect fan-out.
 app.add_middleware(ClientDisconnectTrackingMiddleware)
 app.add_middleware(DebugRequestLoggingMiddleware)
+# Per-request client label for opt-in per-client usage history.
+app.add_middleware(ClientIdentityMiddleware)
 # Outermost so oversized bodies are rejected before any buffering below
 # (the debug middleware caches the whole textual body at trace level).
 app.add_middleware(RequestBodySizeLimitMiddleware)
@@ -2684,6 +2693,9 @@ def init_server(
         stats_path=stats_path,
         usage_history_enabled=getattr(
             getattr(global_settings, "usage", None), "usage_history", True
+        ),
+        usage_by_client=getattr(
+            getattr(global_settings, "usage", None), "usage_by_client", False
         ),
     )
 
