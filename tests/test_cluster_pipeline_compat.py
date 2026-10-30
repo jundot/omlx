@@ -6,7 +6,9 @@ import pytest
 
 from omlx.cluster.pipeline_compat import (
     install_pipeline_compatibility,
+    model_type_of,
     pipeline_assignment_is_honored,
+    pipeline_support,
 )
 from omlx.cluster.planner import PipelineAssignment
 from tests.test_deepseek_v41 import run_two_ranks
@@ -32,6 +34,48 @@ def _model_config(tmp_path, model_type):
     model.mkdir()
     (model / "config.json").write_text(json.dumps({"model_type": model_type}))
     return model
+
+
+def test_a_checkpoint_without_a_readable_config_supports_no_split(tmp_path):
+    """Unknown is answered as "cannot divide", never as a guess.
+
+    An unreadable config is the state a half-copied checkpoint leaves behind on
+    a peer, and a plan that assumes a pipeline contract there would be built
+    from nothing.
+    """
+
+    assert model_type_of(tmp_path) == ""
+    assert pipeline_support(tmp_path) == "none"
+
+
+def test_an_architecture_the_loader_has_no_module_for_reports_none(tmp_path):
+    """Qwen4-Exp is mlx-vlm-native: mlx-lm has no module to hold a stage.
+
+    Calling that an "even split" would describe a mechanism that does not exist,
+    and the refusal an operator gets would tell them to move layers between Macs
+    when no arrangement of layers can run.
+    """
+
+    model = _model_config(tmp_path, "qwen4_exp")
+
+    assert pipeline_support(model) == "none"
+    assert not pipeline_assignment_is_honored(model)
+
+
+def test_a_pipeline_model_is_even_split_before_the_pin_and_honoured_after(
+    tmp_path,
+):
+    """The two fail-closed states have to stay distinguishable.
+
+    "even" means the plan is worth rebalancing; "honored" means the installed
+    hook consumes it as written.
+    """
+
+    model = _model_config(tmp_path, "deepseek_v3")
+
+    assert pipeline_support(model) == "even"
+    with install_pipeline_compatibility(_assignment()):
+        assert pipeline_support(model) == "honored"
 
 
 def test_standard_pipeline_mixin_has_an_explicit_assignment_contract(tmp_path):
