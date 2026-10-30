@@ -26,6 +26,47 @@ def _append_package_path(package: Any, path: Path) -> None:
         package_path.insert(0, path_string)
 
 
+def _accept_mtp_tail_in_transformers_config() -> bool:
+    """Accept a declared MTP tail in the Transformers processor config only.
+
+    MTP checkpoints can list 46 MLP layers for 45 backbone layers and one
+    nextn layer. Transformers validates the backbone length, so remove exactly
+    that tail on its config instance. The vendored model config and checkpoint
+    retain the full list needed by the MTP runtime; other mismatches still fail.
+    """
+    try:
+        from transformers.models.glm5_next import configuration_glm5_next
+    except Exception:  # noqa: BLE001 - older Transformers may lack glm5_next
+        return False
+
+    config_cls = configuration_glm5_next.Glm5NextTextConfig
+    original = config_cls.__post_init__
+    if getattr(original, "_omlx_mtp_tail", False):
+        return False
+
+    def post_init(self, **kwargs: Any) -> None:
+        mlp_layer_types = self.mlp_layer_types
+        num_layers = self.num_hidden_layers
+        num_mtp = kwargs.get(
+            "num_nextn_predict_layers",
+            getattr(self, "num_nextn_predict_layers", 0),
+        )
+        if (
+            isinstance(mlp_layer_types, list)
+            and num_layers is not None
+            and isinstance(num_mtp, int)
+            and not isinstance(num_mtp, bool)
+            and num_mtp > 0
+            and len(mlp_layer_types) == num_layers + num_mtp
+        ):
+            self.mlp_layer_types = mlp_layer_types[:num_layers]
+        original(self, **kwargs)
+
+    post_init._omlx_mtp_tail = True  # type: ignore[attr-defined]
+    config_cls.__post_init__ = post_init  # type: ignore[method-assign]
+    return True
+
+
 def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
     """Expose ``mlx_vlm.models.glm5_next`` from oMLX's vendor tree."""
     global _APPLIED
@@ -71,6 +112,7 @@ def apply_mlx_vlm_glm5_next_compat_patch() -> bool:
         from mlx_vlm.prompt_utils import MODEL_CONFIG, MessageFormat
 
         MODEL_CONFIG.setdefault("glm5_next", MessageFormat.LIST_WITH_IMAGE_FIRST)
+        _accept_mtp_tail_in_transformers_config()
     except Exception as exc:  # noqa: BLE001
         logger.warning("GLM-5.3 mlx-vlm registration failed: %s", exc)
         return False
