@@ -2236,7 +2236,7 @@
                                             @keydown.arrow-down.prevent="stepThinkingBudgetTokens(-1)"
                                             @input="onThinkingBudgetTokensInput($event)"
                                             @change="clampThinkingBudgetTokens()"
-                                            placeholder="4096" min="0" step="1024"
+                                            placeholder="4096" min="1" step="1"
                                             class="flex-1 px-3 py-1.5 text-xs border border-line rounded-lg bg-surface-muted thinking-budget-input"
                                             style="color: var(--text-primary);">
                                         <span class="text-caption" style="color: var(--text-tertiary);">{{ t('chat.thinking_tokens') }}</span>
@@ -3028,14 +3028,13 @@
                 let v = Number(this.modelSettings.thinking_budget_tokens);
                 if (!Number.isFinite(v) || v <= 0) v = 0;
 
+                // Step to the next/previous multiple of `step`, so 1 -> 1024 -> 2048
+                // (not 1 -> 1025) and 1500 -> 2048 / 1024.
                 if (direction > 0) {
-                    this.modelSettings.thinking_budget_tokens = v <= 0 ? 1 : v + step;
-                } else if (v <= 1) {
-                    this.modelSettings.thinking_budget_tokens = 1;
-                } else if (v <= step) {
-                    this.modelSettings.thinking_budget_tokens = 1;
+                    this.modelSettings.thinking_budget_tokens = (Math.floor(v / step) + 1) * step;
                 } else {
-                    this.modelSettings.thinking_budget_tokens = v - step;
+                    const lower = (Math.ceil(v / step) - 1) * step;
+                    this.modelSettings.thinking_budget_tokens = lower >= step ? lower : 1;
                 }
                 this.onModelSettingsChange();
             },
