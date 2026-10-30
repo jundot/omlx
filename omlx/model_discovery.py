@@ -440,25 +440,8 @@ class DiscoveredModel:
     tasks: list[str] = field(default_factory=list)
 
 
-def _has_image_checkpoint_layout(model_path: Path) -> bool:
-    """Cheaply skip directories that cannot hold a diffusion checkpoint."""
-    if (model_path / "model_index.json").exists() or (
-        model_path / "manifest.json"
-    ).exists():
-        return True
-    try:
-        return any(
-            child.is_dir() and child.name.startswith("transformer")
-            for child in model_path.iterdir()
-        )
-    except OSError:
-        return False
-
-
 def detect_image_tasks(model_path: Path) -> list[str]:
     """Return the image tasks mlx-vlm can serve from a local checkpoint."""
-    if not _has_image_checkpoint_layout(model_path):
-        return []
     try:
         from mlx_vlm.generate.edit_image import is_image_edit_model
         from mlx_vlm.generate.image import is_image_generation_model

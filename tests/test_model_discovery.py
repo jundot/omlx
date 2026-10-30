@@ -35,6 +35,31 @@ from omlx.model_discovery import (
 
 
 class TestImageModelDiscovery:
+    def test_native_flux3_root_config_is_discovered(self, tmp_path):
+        pytest.importorskip("mlx_vlm")
+        model = tmp_path / "native-flux3"
+        model.mkdir()
+        (model / "config.json").write_text(
+            json.dumps(
+                {
+                    "model": "flux-3-image-klein",
+                    "dit": {
+                        "in_channels": {
+                            "image": 128,
+                            "image_cond": 128,
+                            "text": 20480,
+                        }
+                    },
+                }
+            )
+        )
+        (model / "model.safetensors").write_bytes(b"0" * 100)
+
+        discovered = discover_models(tmp_path)[model.name]
+
+        assert discovered.model_type == discovered.engine_type == "image"
+        assert discovered.capabilities == discovered.tasks == ["generation", "edit"]
+
     def test_mlx_vlm_image_layout_is_discovered(
         self, tmp_path, write_z_image_checkpoint
     ):
