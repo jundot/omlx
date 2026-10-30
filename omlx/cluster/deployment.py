@@ -393,8 +393,15 @@ class ClusterDeployment:
             raise ValueError("target_context_tokens must be between 1 and 1,048,576")
         if len(self.assignments) != len(self.hosts):
             raise ValueError("host count must match pipeline assignment count")
-        if self.hosts[0].ssh != "127.0.0.1":
-            raise ValueError("rank 0 must use SSH target 127.0.0.1")
+        # Rank 0 is normally spawned as a local child ("127.0.0.1"). On macOS
+        # Tahoe that child cannot join the ring: the identical hostfile joins
+        # in 27 s when rank 0 is spawned over ssh to the machine's own LAN
+        # address, and fails with "[ring] Couldn't connect (error: 60)" on
+        # every run when it is spawned locally. Both targets are accepted here
+        # so the launcher can use the one that works; the address still has to
+        # be non-empty, which is what the check is really about.
+        if not self.hosts[0].ssh:
+            raise ValueError("rank 0 needs an SSH target")
         if len({host.node_id for host in self.hosts}) != len(self.hosts):
             raise ValueError("cluster node IDs must be unique")
         object.__setattr__(
