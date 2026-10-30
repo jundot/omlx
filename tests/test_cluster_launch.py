@@ -2451,6 +2451,133 @@ def test_teardown_sweep_reports_an_unkillable_rank(tmp_path, monkeypatch):
     assert any("Reboot this Mac" in failure for failure in failures)
 
 
+def test_teardown_sweep_annotates_an_unkillable_local_rank_marker(
+    tmp_path, monkeypatch
+):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    marker_path = tmp_path / "cluster-test-rank-0.json"
+    marker_path.write_text(
+        json.dumps(_rank_marker(424242, 0, phase="loading")), encoding="utf-8"
+    )
+    process = launch._LocalProcessState(
+        424242,
+        1,
+        424242,
+        "D",
+        1024,
+        "python -m omlx.cluster.inference_worker --deployment-id cluster-test",
+    )
+    monkeypatch.setattr(
+        launch,
+        "_read_local_process_table",
+        lambda: ((process,), ""),
+    )
+    monkeypatch.setattr(launch, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(launch, "marker_owner_is_live", lambda _marker: True)
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (None, None, None, ""),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_remote_deployment_worker_pids",
+        lambda *_a, **_k: ([], ""),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_kill_local_pid",
+        lambda *_args, **_kwargs: False,
+    )
+
+    supervisor._sweep_rank_leftovers(kill_grace=0.01)
+
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["phase"] == "unkillable"
+    assert "424242" in marker["error"]
+    assert "survived SIGKILL" in marker["error"]
+
+
+def test_teardown_sweep_annotates_an_unkillable_remote_rank_marker(
+    tmp_path, monkeypatch
+):
+    supervisor = launch.DistributedJobSupervisor(
+        _deployment(),
+        preflight=False,
+        state_dir=str(tmp_path),
+    )
+    annotations = []
+
+    def fake_annotate(
+        ssh_target,
+        marker_path,
+        *,
+        deployment_id,
+        rank,
+        phase,
+        error,
+        runner,
+    ):
+        annotations.append((ssh_target, marker_path, deployment_id, rank, phase))
+
+    monkeypatch.setattr(
+        launch,
+        "read_remote_marker",
+        lambda *_a, **_k: (_rank_marker(535353, 1), True, 0.0, ""),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_remote_deployment_worker_pids",
+        lambda *_a, **_k: ([], ""),
+    )
+    monkeypatch.setattr(
+        launch,
+        "_kill_remote_pid",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        launch,
+        "_annotate_remote_rank_marker",
+        fake_annotate,
+    )
+
+    failures = supervisor._sweep_rank_leftovers(kill_grace=0.01)
+
+    assert any("pid 535353" in failure for failure in failures)
+    assert annotations == [
+        (
+            "user@studio.local",
+            f"{tmp_path}/cluster-test-rank-1.json",
+            "cluster-test",
+            1,
+            "unkillable",
+        )
+    ]
+
+
+def test_remote_rank_reap_script_annotates_an_unkillable_rank(monkeypatch):
+    supervisor = launch.DistributedJobSupervisor(_deployment(), preflight=False)
+    commands = []
+
+    def fake_ssh(target, command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            [], 0, stdout='{"rank": 1, "action": "kill-failed"}', stderr=""
+        )
+
+    monkeypatch.setattr(launch, "_run_cluster_ssh", fake_ssh)
+    supervisor._reap_remote_ranks()
+
+    assert len(commands) == 1
+    # The kill script itself must rewrite the marker when SIGKILL fails.
+    assert "'unkillable'" in commands[0]
+    assert "survived SIGKILL during teardown" in commands[0]
+
+
 def test_teardown_sweep_kills_live_remote_rank_over_ssh(tmp_path, monkeypatch):
     supervisor = launch.DistributedJobSupervisor(
         _deployment(),

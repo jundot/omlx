@@ -27,6 +27,7 @@ from collections import deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -681,6 +682,118 @@ def _reap_stale_remote_workers(
     return reaped
 
 
+def _annotate_rank_marker(
+    state_dir: str | Path,
+    deployment_id: str,
+    rank: int,
+    *,
+    phase: str,
+    error: str,
+) -> None:
+    """Rewrite one rank's marker with a coordinator-side terminal phase.
+
+    A rank stuck in a Metal wait cannot record its own end, so its marker
+    keeps advertising the last healthy phase — a GUI reading it later sees
+    a rank "loading" or "serving" that is in fact unkillable. Rewriting the
+    marker keeps the post-mortem on the node that owns it instead of
+    leaving the only per-rank evidence to the coordinator log.
+    """
+
+    path = Path(state_dir).expanduser() / f"{deployment_id}-rank-{rank}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    if payload.get("deployment_id") != deployment_id or payload.get("rank") != rank:
+        return
+    payload["phase"] = phase
+    payload["error"] = error[:1000]
+    payload["updated_at"] = datetime.now(UTC).isoformat()
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+        os.replace(temporary, path)
+    except OSError:
+        logger.warning("Could not annotate rank marker %s", path, exc_info=True)
+
+
+_REMOTE_MARKER_ANNOTATE_SCRIPT = (
+    "import json,os,pathlib,sys\n"
+    "p=pathlib.Path(sys.argv[1]).expanduser()\n"
+    "dep=sys.argv[2]\n"
+    "rank=int(sys.argv[3])\n"
+    "phase=sys.argv[4]\n"
+    "error=sys.argv[5][:1000]\n"
+    "try:\n"
+    "  d=json.loads(p.read_text(encoding='utf-8'))\n"
+    "except Exception:\n"
+    "  raise SystemExit(0)\n"
+    "if not isinstance(d,dict) or d.get('deployment_id')!=dep or d.get('rank')!=rank:\n"
+    "  raise SystemExit(0)\n"
+    "d['phase']=phase\n"
+    "d['error']=error\n"
+    "d['updated_at']=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).isoformat()\n"
+    "tmp=p.with_name(p.name+'.tmp')\n"
+    "fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)\n"
+    "with os.fdopen(fd,'w',encoding='utf-8') as s:\n"
+    "  json.dump(d,s,sort_keys=True,separators=(',',':'))\n"
+    "  s.write('\\n')\n"
+    "os.replace(tmp,p)\n"
+)
+
+
+def _annotate_remote_rank_marker(
+    ssh_target: str,
+    marker_path: str,
+    *,
+    deployment_id: str,
+    rank: int,
+    phase: str,
+    error: str,
+    runner: SSHRunner = subprocess.run,
+) -> None:
+    """Annotate a peer rank's marker; best effort, never blocks a teardown."""
+
+    command = " ".join(
+        ["/usr/bin/python3", "-c", shlex.quote(_REMOTE_MARKER_ANNOTATE_SCRIPT)]
+        + [
+            shlex.quote(item)
+            for item in (
+                marker_path,
+                deployment_id,
+                str(rank),
+                phase,
+                error[:1000],
+            )
+        ]
+    )
+    try:
+        completed = _run_cluster_ssh(
+            ssh_target,
+            command,
+            timeout=10.0,
+            runner=runner,
+        )
+    except DistributedLaunchError as exc:
+        logger.warning("Marker annotation on %s failed: %s", ssh_target, exc)
+        return
+    if completed.returncode != 0:
+        logger.warning(
+            "Marker annotation on %s exited with %d",
+            ssh_target,
+            completed.returncode,
+        )
+
+
 def _sweep_rank_processes(
     deployment_id: str,
     hosts: list[dict[str, Any]],
@@ -770,6 +883,15 @@ def _sweep_rank_processes(
                 )
             else:
                 failures.append(f"rank {rank} ({node_id}) pid {pid} survived SIGKILL")
+                # The stuck rank cannot update its own marker; record why
+                # it will keep appearing in every liveness view.
+                _annotate_rank_marker(
+                    local_root,
+                    deployment_id,
+                    rank,
+                    phase="unkillable",
+                    error=(f"pid {pid} survived SIGKILL during the teardown sweep"),
+                )
             continue
         # Remote rank: its marker lives on the peer.
         marker, process_live, _, error = read_remote_marker(
@@ -822,6 +944,15 @@ def _sweep_rank_processes(
         else:
             failures.append(
                 f"remote rank {rank} ({node_id}) pid {pid} could not be killed"
+            )
+            _annotate_remote_rank_marker(
+                ssh_target,
+                f"{remote_root}/{filename}",
+                deployment_id=deployment_id,
+                rank=rank,
+                phase="unkillable",
+                error=f"pid {pid} survived SIGKILL during the teardown sweep",
+                runner=runner,
             )
 
     # The same argv evidence must close the remote gap (G9): a swept or
@@ -3452,6 +3583,21 @@ class DistributedJobSupervisor:
                 "  if is_dead(pid):\n"
                 "    out('killed'); raise SystemExit(0)\n"
                 "  time.sleep(0.05)\n"
+                # The rank is unkillable: record that in its own marker
+                # before reporting, because a stuck rank can never say so
+                # itself and the next liveness read must not show a healthy
+                # phase for it.
+                "try:\n"
+                "  d['phase']='unkillable'\n"
+                "  d['error']='pid %d survived SIGKILL during teardown' % pid\n"
+                "  tmp=p.with_name(p.name+'.tmp')\n"
+                "  fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)\n"
+                "  with os.fdopen(fd,'w',encoding='utf-8') as s:\n"
+                "    json.dump(d,s,sort_keys=True,separators=(',',':'))\n"
+                "    s.write('\\n')\n"
+                "  os.replace(tmp,p)\n"
+                "except Exception:\n"
+                "  pass\n"
                 "out('kill-failed')\n"
             )
             try:
