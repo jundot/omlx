@@ -579,7 +579,7 @@ class PagedCacheManager(CacheManager):
         # Tail blocks by chain parent (None for a root). A tail is shorter
         # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
-        # Tails shared across conversations; ordinary tails are evicted first.
+        # Tails shared across conversations, capped apart from ordinary tails.
         self._shared_tails: set[BlockHash] = set()
 
         logger.info(

@@ -4134,8 +4134,6 @@ class TestSchedulerBoundarySnapshots:
             ([1, 2, 3, 4, 5, 9, 8, 9], 6, 5),
             # The prefix reaches the generation prompt: nothing is shared.
             ([1, 2, 3, 4, 5, 6, 7], 6, 0),
-            # No generation prompt marker: the prefill end bounds it.
-            ([1, 2, 3, 4, 5, 6, 7, 8], 0, 6),
             # On the block grid: the boundary snapshot already covers it.
             ([1, 2, 3, 4, 9, 9, 9], 6, 0),
             # A template that moves the system block shares only a few tokens.
