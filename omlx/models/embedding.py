@@ -11,7 +11,8 @@ import inspect
 import io
 import json
 import logging
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -19,6 +20,9 @@ import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
 from mlx_vlm.embedding_loader import load_embedding_model
+from mlx_vlm.models.lfm2_colbert import Model as Lfm2Colbert
+from mlx_vlm.models.pooling import EmbeddingOutput as VlmEmbeddingOutput
+from mlx_vlm.models.pooling import normalize_embeddings as normalize_token_embeddings
 from mlx_vlm.utils import get_model_path, load_audio, load_config, load_processor
 
 from ..patches.modernbert_attention import patch_modernbert_attention
@@ -80,6 +84,62 @@ _EMBEDDING_MODEL_TYPE_OVERRIDES = {"qwen3_vl": "qwen3_vl_embedding"}
 _PAD_TO_MAX_LENGTH_MODEL_TYPES = frozenset({"siglip"})
 
 
+def _colqwen_loader_config(config: dict[str, Any]) -> dict[str, Any]:
+    from mlx_vlm.models.colqwen2_5 import TextConfig
+
+    vlm = config["vlm_config"]
+    text = vlm.get("text_config")
+    text = text if isinstance(text, dict) else {}
+    effective = deepcopy(config)
+    effective.update(deepcopy(vlm))
+    for field in fields(TextConfig):
+        if field.name != "model_type" and field.name in text:
+            effective[field.name] = deepcopy(text[field.name])
+    effective["model_type"] = config["model_type"]
+    if "embedding_dim" in config:
+        effective["embedding_dim"] = config["embedding_dim"]
+    else:
+        effective.pop("embedding_dim", None)
+
+    aliases = ("quantization", "quantization_config")
+    for key in aliases:
+        effective.pop(key, None)
+    for source in (config, vlm, text):
+        if any(key in source for key in aliases):
+            effective.update(
+                {key: deepcopy(source[key]) for key in aliases if key in source}
+            )
+            recipe = effective.get("quantization_config")
+            if "quantization" not in effective:
+                if recipe is None:
+                    effective["quantization"] = None
+                elif (
+                    isinstance(recipe, dict) and {"bits", "group_size"} <= recipe.keys()
+                ):
+                    effective["quantization"] = deepcopy(recipe)
+            break
+    return effective
+
+
+def _is_cls_only_pooling(config: dict[str, Any]) -> bool:
+    flags = {
+        key: value for key, value in config.items() if key.startswith("pooling_mode_")
+    }
+    if any(not isinstance(value, bool) for value in flags.values()):
+        return False
+    declared = config.get("pooling_mode")
+    if "pooling_mode" in config:
+        if not isinstance(declared, str) or declared.strip().lower() != "cls":
+            return False
+        if "pooling_mode_cls_token" in config and not config["pooling_mode_cls_token"]:
+            return False
+    elif not config.get("pooling_mode_cls_token"):
+        return False
+    return not any(
+        value for key, value in flags.items() if key != "pooling_mode_cls_token"
+    )
+
+
 @dataclass
 class EmbeddingOutput:
     """Output from embedding generation."""
@@ -116,7 +176,14 @@ class _ChatTemplateEmbeddingInputs:
             else {}
         )
 
-    def prepare_embedding_inputs(self, inputs, return_tensors: str = "mlx"):
+    def prepare_embedding_inputs(
+        self,
+        inputs,
+        return_tensors: str = "mlx",
+        *,
+        max_length: int | None = None,
+        truncation: bool = True,
+    ):
         family = self.family
         conversations = []
         for item in inputs:
@@ -145,19 +212,78 @@ class _ChatTemplateEmbeddingInputs:
                 )
             conversations.append(messages)
         has_audio = any(item.get("audio") for item in inputs)
-        batch = self._processor.apply_chat_template(
-            conversations,
-            tokenize=True,
-            return_dict=True,
-            return_tensors=return_tensors,
-            padding=True,
-            add_generation_prompt=family.add_generation_prompt,
-            **(
-                {"audio_kwargs": self._audio_kwargs}
-                if has_audio and self._audio_kwargs
-                else {}
-            ),
-        )
+
+        def prepare(messages, with_audio=False):
+            processor_kwargs = {"padding": True, "truncation": False}
+            if with_audio and self._audio_kwargs:
+                processor_kwargs["audio_kwargs"] = self._audio_kwargs
+            return self._processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_dict=True,
+                return_tensors=return_tensors,
+                add_generation_prompt=family.add_generation_prompt,
+                processor_kwargs=processor_kwargs,
+            )
+
+        def lengths(batch, count):
+            mask = batch.get("attention_mask")
+            if mask is None:
+                return [batch["input_ids"].shape[1]] * count
+            return np.asarray(mask).sum(axis=1).tolist()
+
+        batch = prepare(conversations, has_audio)
+        if family.template_text and truncation:
+            limit = max_length if max_length is not None else self._max_length
+            counts = lengths(batch, len(conversations))
+            changed = False
+            for index, (item, count) in enumerate(zip(inputs, counts)):
+                if item.get("image") or item.get("audio") or count <= limit:
+                    continue
+                conversation = conversations[index]
+                original = item.get("text") or ""
+                side = getattr(self._processor.tokenizer, "truncation_side", "right")
+
+                def set_text(
+                    size, original=original, side=side, conversation=conversation
+                ):
+                    if side == "left":
+                        text = original[-size:] if size else ""
+                    else:
+                        text = original[:size]
+                    conversation[-1]["content"] = (
+                        [{"type": "text", "text": text}] if text else []
+                    )
+
+                set_text(0)
+                overhead = lengths(prepare([conversation]), 1)[0]
+                if overhead > limit:
+                    raise ValueError(
+                        f"Embedding chat template requires {overhead} tokens, "
+                        f"which exceeds the {limit}-token limit"
+                    )
+                best = 0
+                low, high = 1, len(original) - 1
+                while low <= high:
+                    size = (low + high) // 2
+                    set_text(size)
+                    if lengths(prepare([conversation]), 1)[0] <= limit:
+                        best = size
+                        low = size + 1
+                    else:
+                        high = size - 1
+                set_text(best)
+                changed = True
+            if changed:
+                batch = prepare(conversations, has_audio)
+                counts = lengths(batch, len(conversations))
+                if any(
+                    count > limit and not (item.get("image") or item.get("audio"))
+                    for item, count in zip(inputs, counts)
+                ):
+                    raise ValueError(
+                        f"Embedding text exceeds the {limit}-token limit after rendering"
+                    )
         # Truncation can cut media placeholders, so reject long inputs instead.
         length = batch["input_ids"].shape[1]
         if length > self._max_length:
@@ -221,6 +347,8 @@ class MLXEmbeddingModel:
         self._pooling_config: Optional[Dict[str, Any]] = None
         self._media_processor = None
         self._supports_audio = False
+        self._right_pad_text = False
+        self._cls_prompt_exclusion_compatible = False
 
     # (hidden_size, num_hidden_layers) of Qwen3-Embedding-0.6B and -8B.
     _FP16_PROMOTE_SHAPES = {(1024, 28), (4096, 36)}
@@ -489,6 +617,27 @@ class MLXEmbeddingModel:
         model_type = str(config.get("model_type", "")).lower().replace("-", "_")
         model_type = _EMBEDDING_MODEL_TYPE_OVERRIDES.get(model_type, model_type)
         config["model_type"] = model_type
+        original_config = config
+        vlm_config = config.get("vlm_config")
+        nested_colqwen = model_type == "colqwen2_5" and isinstance(vlm_config, dict)
+        if nested_colqwen:
+            pending = [config]
+            while pending:
+                nested = pending.pop()
+                ensure_model_code_trusted(
+                    nested,
+                    model_path=model_path,
+                    trust_remote_code=self.trust_remote_code,
+                )
+                pending.extend(
+                    value for value in nested.values() if isinstance(value, dict)
+                )
+            config = _colqwen_loader_config(config)
+            ensure_model_code_trusted(
+                config,
+                model_path=model_path,
+                trust_remote_code=self.trust_remote_code,
+            )
         # The audio tower is resident even for text-only requests, so it loads
         # only when the model's embedding_audio_enabled setting asks for it.
         # mlx-vlm defaults a missing audio_config to {}, which builds the tower.
@@ -497,8 +646,42 @@ class MLXEmbeddingModel:
         normalize_encoder_quantization_config(config)
         logger.info(f"Loading embedding model via mlx-vlm: {self.model_name}")
         model = load_embedding_model(model_path, config=config)
+        if nested_colqwen:
+            from mlx_vlm.models.colqwen2_5 import ModelConfig
+
+            text = vlm_config.get("text_config")
+            text = text if isinstance(text, dict) else {}
+            text_type = text.get("model_type") or vlm_config.get("model_type")
+            if text_type is not None:
+                model.config.text_config.model_type = text_type
+                model.language_model.model_type = text_type
+            model.config.vocab_size = original_config.get(
+                "vocab_size",
+                vlm_config.get(
+                    "vocab_size", ModelConfig.__dataclass_fields__["vocab_size"].default
+                ),
+            )
+        processor = load_processor(
+            model_path,
+            add_detokenizer=False,
+            trust_remote_code=self.trust_remote_code,
+        )
+        text_processor = getattr(processor, "tokenizer", processor)
+        family = _CHAT_EMBEDDING_FAMILIES.get(model_type)
         if self._pooling_config is not None:
             pooling_config = dict(self._pooling_config)
+            if (
+                pooling_config.get("include_prompt") is False
+                and _is_cls_only_pooling(pooling_config)
+                and not any(
+                    pooling_config.get(key) is not None
+                    for key in ("prompt_length", "prompt_mask", "prompt_token_mask")
+                )
+                and family is None
+                and not self._uses_custom_embedding_inputs(text_processor)
+            ):
+                pooling_config["include_prompt"] = True
+                self._cls_prompt_exclusion_compatible = True
             # mlx-vlm matches string modes exactly, while omlx accepts aliases.
             if (
                 isinstance(pooling_config.get("pooling_mode"), str)
@@ -510,17 +693,11 @@ class MLXEmbeddingModel:
             model.pooling_config = {"pooling_mode": self._pooling_mode}
         patch_modernbert_attention(model)
         self._promote_bf16_to_fp16(model)
-        processor = load_processor(
-            model_path,
-            add_detokenizer=False,
-            trust_remote_code=self.trust_remote_code,
-        )
 
         self.model = model
         # Text requests use the tokenizer path. Multimodal processors take
         # images as their first positional argument.
-        self.processor = getattr(processor, "tokenizer", processor)
-        family = _CHAT_EMBEDDING_FAMILIES.get(model_type)
+        self.processor = text_processor
         if family is not None:
             model.max_input_length = family.context_length
             self._media_processor = _ChatTemplateEmbeddingInputs(
@@ -528,6 +705,7 @@ class MLXEmbeddingModel:
             )
         self._supports_audio = getattr(model, "audio_tower", None) is not None
         self._pad_to_max_length = model_type in _PAD_TO_MAX_LENGTH_MODEL_TYPES
+        self._right_pad_text = model_type == "colqwen2_5"
         if self._pad_to_max_length:
             model.max_input_length = model.config.text_config.max_position_embeddings
         self._hidden_size = self._embedding_dimension(model.config)
@@ -610,10 +788,12 @@ class MLXEmbeddingModel:
                     mean_pooling(last_hidden, attention_mask)
                 )
 
+        is_image = False
         if hasattr(outputs, "text_embeds") and outputs.text_embeds is not None:
             embeddings = outputs.text_embeds
         elif getattr(outputs, "image_embeds", None) is not None:
             embeddings = outputs.image_embeds
+            is_image = True
         elif hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
             embeddings = outputs.pooler_output
         elif (
@@ -631,7 +811,22 @@ class MLXEmbeddingModel:
         # per-token features with shape (batch, seq_len, hidden). Mean pool so
         # /v1/embeddings always emits one vector per input.
         if embeddings.ndim == 3:
-            embeddings = mx.mean(embeddings, axis=1)
+            if attention_mask is not None and not is_image:
+                if not isinstance(attention_mask, mx.array):
+                    attention_mask = mx.array(attention_mask)
+                if (
+                    attention_mask.ndim != 2
+                    or attention_mask.shape != embeddings.shape[:2]
+                ):
+                    raise ValueError(
+                        "Attention mask shape does not match the token embeddings"
+                    )
+                mask = attention_mask.astype(mx.bool_)[:, :, None]
+                values = mx.where(mask, embeddings, mx.zeros_like(embeddings))
+                count = mx.maximum(mx.sum(mask.astype(mx.float32), axis=1), 1)
+                embeddings = mx.sum(values, axis=1) / count
+            else:
+                embeddings = mx.mean(embeddings, axis=1)
         return embeddings
 
     def _validate_native_weights(
@@ -782,6 +977,14 @@ class MLXEmbeddingModel:
         """Prepare inputs for embedding inference."""
         normalized_inputs = self._normalize_embedding_inputs(inputs)
 
+        if isinstance(processor, _ChatTemplateEmbeddingInputs):
+            return processor.prepare_embedding_inputs(
+                normalized_inputs,
+                return_tensors="mlx",
+                max_length=max_length,
+                truncation=truncation,
+            )
+
         if self._uses_custom_embedding_inputs(processor):
             if hasattr(processor, "prepare_embedding_inputs"):
                 return processor.prepare_embedding_inputs(
@@ -806,6 +1009,16 @@ class MLXEmbeddingModel:
         )
         if self._pad_to_max_length:
             encoded = self._pad_to_position_table(encoded, processor, truncation)
+        if self._right_pad_text:
+            if "attention_mask" not in encoded:
+                raise ValueError("ColQwen text inputs require an attention mask")
+            mask = np.asarray(encoded["attention_mask"])
+            order = np.argsort(mask == 0, axis=1, kind="stable")
+            for key in ("input_ids", "attention_mask", "token_type_ids"):
+                if key in encoded:
+                    encoded[key] = np.take_along_axis(
+                        np.asarray(encoded[key]), order, axis=1
+                    )
         return {
             key: mx.array(encoded[key])
             for key in ("input_ids", "attention_mask", "token_type_ids")
@@ -859,6 +1072,17 @@ class MLXEmbeddingModel:
             language_model._position_ids = None
             language_model._rope_deltas = None
         try:
+            if isinstance(self.model, Lfm2Colbert):
+                hidden, _ = self.model._encode(
+                    inputs["input_ids"],
+                    inputs.get("attention_mask"),
+                    mask_convolutions=True,
+                )
+                projected = self.model.projection(hidden).astype(mx.float32)
+                return VlmEmbeddingOutput(
+                    last_hidden_state=hidden,
+                    text_embeds=normalize_token_embeddings(projected),
+                )
             return self.model(**inputs)
         finally:
             if resets_rope:
@@ -875,6 +1099,7 @@ class MLXEmbeddingModel:
         - We compile a narrower function that returns only the final embedding array.
         """
         try:
+
             def _compiled_embed(inputs):
                 outputs = self._forward(inputs)
                 # The mask travels with the request; mask-aware pooling needs it.
@@ -933,6 +1158,8 @@ class MLXEmbeddingModel:
         self._loaded = False
         self._using_native = False
         self._pad_to_max_length = False
+        self._right_pad_text = False
+        self._cls_prompt_exclusion_compatible = False
 
         gc.collect()
         mx.synchronize()
@@ -969,6 +1196,13 @@ class MLXEmbeddingModel:
             max_length = min(max_length, position_limit)
         normalized_inputs = self._normalize_embedding_inputs(inputs)
         for item in normalized_inputs:
+            if self._cls_prompt_exclusion_compatible and any(
+                item.get(key) is not None
+                for key in ("prompt_length", "prompt_mask", "prompt_token_mask")
+            ):
+                raise NotImplementedError(
+                    "Explicit prompt boundaries are not supported for CLS pooling"
+                )
             image_ref = item.get("image")
             if isinstance(image_ref, str):
                 item["image"] = validate_image_data_uri(
