@@ -2637,7 +2637,16 @@ class VLMBatchedEngine(BaseEngine):
 
         # Flint MoE decode: sigmoid top-k routing and the weighted combine
         # (plus shared expert and residual) in one launch each per layer.
+        # float16 packs: SwiGLU products past float16's range (#4784).
         if self.model_type == "flint":
+            try:
+                from ..patches.flint_fp16_activation import (
+                    apply_flint_fp16_activation_patch,
+                )
+
+                apply_flint_fp16_activation_patch(self._vlm_model)
+            except Exception:
+                logger.debug("Flint fp16 activation patch not applied", exc_info=True)
             try:
                 from ..patches.flint_decode import apply_flint_decode_patch
 
