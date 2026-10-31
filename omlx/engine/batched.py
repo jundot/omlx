@@ -1089,6 +1089,7 @@ class BatchedEngine(BaseEngine):
             "specprefill_system_end",
             "generation_prompt_text",
             "generation_prompt_persists",
+            "system_prefix_ids",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -1447,6 +1448,9 @@ class BatchedEngine(BaseEngine):
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(messages, template_tools, ct_kwargs)
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         return await self.generate(
             prompt=prepared[1] if prepared is not None else prompt,
@@ -1611,6 +1615,9 @@ class BatchedEngine(BaseEngine):
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(messages, template_tools, ct_kwargs)
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         async for output in self.stream_generate(
             prompt=prepared[1] if prepared is not None else prompt,

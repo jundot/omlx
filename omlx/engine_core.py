@@ -733,6 +733,7 @@ class EngineCore:
         specprefill_system_end: Optional[int] = None,
         generation_prompt_text: Optional[str] = None,
         generation_prompt_persists: bool = False,
+        system_prefix_ids: Optional[List[int]] = None,
         skip_cache_store: bool = False,
         preserve_reasoning: bool = False,
         benchmark_trace: bool = False,
@@ -798,6 +799,8 @@ class EngineCore:
         if generation_prompt_text:
             request.generation_prompt_text = generation_prompt_text
             request.generation_prompt_persists = bool(generation_prompt_persists)
+        if system_prefix_ids:
+            request.system_prefix_ids = system_prefix_ids
 
         # Setup output collector with stream_interval from config
         self._output_collectors[request_id] = RequestOutputCollector(aggregate=True)

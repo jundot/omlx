@@ -1052,12 +1052,20 @@ class TestPagedCacheManager:
         # A full-block prompt with no matching full block still finds the tail.
         _, num_tokens = manager.get_computed_blocks([1, 2, 3, 9, 9])
         assert num_tokens == 3
-        # The per-parent index stays bounded as tails accumulate.
+        # The per-parent index stays bounded as tails accumulate. Shared tails
+        # have their own cap of half the slots and are never evicted by
+        # one-off tails.
         from omlx.cache.paged_cache import _TAIL_INDEX_PER_PARENT
 
+        shared = [bytes([100 + i]) * 4 for i in range(_TAIL_INDEX_PER_PARENT)]
+        for tail_hash in shared:
+            manager.register_tail_block(None, tail_hash, 4, shared=True)
         for i in range(_TAIL_INDEX_PER_PARENT + 2):
             manager.register_tail_block(None, bytes([i]) * 4, i + 4)
-        assert len(manager._tail_index[None]) == _TAIL_INDEX_PER_PARENT
+        tails = manager._tail_index[None]
+        half = _TAIL_INDEX_PER_PARENT // 2
+        assert len(tails) == _TAIL_INDEX_PER_PARENT + half
+        assert [h for h in tails if manager.is_shared_tail(h)] == shared[-half:]
 
     def test_get_computed_blocks_tail_cold_registration_and_stale_pruning(self):
         """Indexed tails are verified against the tiers on every lookup."""

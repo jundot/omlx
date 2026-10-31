@@ -960,6 +960,7 @@ class BlockAwarePrefixCache(CacheManager):
         hot_cache_write_back: bool = True,
         _store_exact_terminal: bool = False,
         _store_tail_terminal: bool = False,
+        _store_shared_tail: bool = False,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -987,6 +988,8 @@ class BlockAwarePrefixCache(CacheManager):
                 ordinary prefix matching.
             _store_tail_terminal: Persist the trailing partial block as a tail
                 block; ``tokens`` must end on a snapshot in ``boundary_snapshots``.
+            _store_shared_tail: The tail serves many conversations, so keep it
+                out of the tip lineage that discards superseded tails.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -1374,6 +1377,13 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.block_ids.append(existing_block.block_id)
                     block_table.num_tokens += len(block_tokens)
                     if is_tail_terminal:
+                        # The tail can age out of the index while still cached.
+                        self.paged_cache.register_tail_block(
+                            parent_hash,
+                            existing_block.block_hash,
+                            len(block_tokens),
+                            shared=_store_shared_tail,
+                        )
                         tail_in_table = True
                     continue
 
@@ -1646,7 +1656,10 @@ class BlockAwarePrefixCache(CacheManager):
                             tip_block_saved = True
                         if is_tail_terminal:
                             self.paged_cache.register_tail_block(
-                                parent_hash, block.block_hash, len(block_tokens)
+                                parent_hash,
+                                block.block_hash,
+                                len(block_tokens),
+                                shared=_store_shared_tail,
                             )
                             self._tail_hashes.add(block.block_hash)
                             if len(self._tail_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
@@ -1693,7 +1706,8 @@ class BlockAwarePrefixCache(CacheManager):
             CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types
         )
         if (
-            tip_block_saved
+            not _store_shared_tail
+            and tip_block_saved
             and first_new_block_idx is not None
             and first_new_block_idx < len(block_table.block_ids)
             and (rotating_layout or tail_in_table)
@@ -5522,10 +5536,19 @@ class BlockAwarePrefixCache(CacheManager):
         if tip is None or snapshot is None:
             return False
         with self._mtp_prefix_snapshot_lock:
-            self._mtp_prefix_snapshots[tip] = (int(boundary_tokens), snapshot)
-            self._mtp_prefix_snapshots.move_to_end(tip)
-            while len(self._mtp_prefix_snapshots) > _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES:
-                self._mtp_prefix_snapshots.popitem(last=False)
+            snapshots = self._mtp_prefix_snapshots
+            snapshots[tip] = (int(boundary_tokens), snapshot)
+            snapshots.move_to_end(tip)
+            # As in the tail index, sidecars of shared tails have their own cap.
+            while len(snapshots) > _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES:
+                shared = [t for t in snapshots if self.paged_cache.is_shared_tail(t)]
+                if len(snapshots) - len(shared) > _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES:
+                    victim = next(t for t in snapshots if t not in shared)
+                elif len(shared) > _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES // 2:
+                    victim = shared[0]
+                else:
+                    break
+                del snapshots[victim]
         return True
 
     def restore_mtp_prefix_snapshot(
