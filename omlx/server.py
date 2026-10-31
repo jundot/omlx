@@ -165,6 +165,7 @@ from .api.responses_utils import (
     ResponseStateNotFoundError,
     ResponseStore,
     apply_namespace_tool_aliases,
+    assistant_message_phase,
     build_function_call_output_item,
     build_message_output_item,
     build_reasoning_output_item,
@@ -8973,7 +8974,13 @@ async def create_response(
             if reasoning_text:
                 output_items.append(build_reasoning_output_item(reasoning_text))
             output_items.append(
-                build_message_output_item(cleaned_text.strip() if cleaned_text else "")
+                build_message_output_item(
+                    cleaned_text.strip() if cleaned_text else "",
+                    phase=assistant_message_phase(
+                        has_tools=bool(request.tools),
+                        has_tool_calls=bool(tool_calls),
+                    ),
+                )
             )
 
             if tool_calls:
@@ -9624,27 +9631,25 @@ async def stream_responses_api(
     )
 
     # response.output_item.done (message)
-    seq = stream_state.next_sequence()
-    yield format_sse_event(
-        "response.output_item.done",
-        {
-            "type": "response.output_item.done",
-            "output_index": msg_output_index,
-            "item": {
-                "type": "message",
-                "id": msg_id,
-                "status": "completed",
-                "role": "assistant",
-                "content": [
-                    {"type": "output_text", "text": final_text, "annotations": []}
-                ],
-            },
-            "sequence_number": seq,
-        },
+    # The message phase is only knowable once this turn's tool calls are
+    # resolved, so the message item.done is emitted after the function_call
+    # items and carries the same phase as the stored output items.
+    message_phase = assistant_message_phase(
+        has_tools=has_tools,
+        has_tool_calls=bool(tool_calls),
     )
+    message_item: dict = {
+        "type": "message",
+        "id": msg_id,
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": final_text, "annotations": []}],
+    }
+    if message_phase is not None:
+        message_item["phase"] = message_phase
 
     # Build output items for final response
-    output_items = []
+    output_items: list[dict] = []
     reasoning_text = accumulated_reasoning
     if reasoning_text:
         output_items.append(
@@ -9655,15 +9660,7 @@ async def stream_responses_api(
                 "summary": [{"type": "summary_text", "text": reasoning_text}],
             }
         )
-    output_items.append(
-        {
-            "type": "message",
-            "id": msg_id,
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": final_text, "annotations": []}],
-        }
-    )
+    output_items.append(message_item)
 
     # Emit function call items if present
     if tool_calls:
@@ -9758,6 +9755,19 @@ async def stream_responses_api(
             output_items.append(completed_fc)
             output_index += 1
             next_output_index = output_index
+
+    # Close the message item last so its phase can name the turn the tool
+    # calls belong to; clients group the reasoning and call blocks under it.
+    seq = stream_state.next_sequence()
+    yield format_sse_event(
+        "response.output_item.done",
+        {
+            "type": "response.output_item.done",
+            "output_index": msg_output_index,
+            "item": message_item,
+            "sequence_number": seq,
+        },
+    )
 
     if tool_failure:
         seq = stream_state.next_sequence()
