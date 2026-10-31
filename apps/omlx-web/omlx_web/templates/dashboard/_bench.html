@@ -115,7 +115,7 @@
                                                    x-model="benchPromptLengths[pp]"
                                                    :disabled="benchRunning"
                                                    class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
-                                            <span class="text-sm text-neutral-600" x-text="'pp' + pp"></span>
+                                            <span class="text-sm text-neutral-600" x-text="'PP' + pp"></span>
                                         </label>
                                     </template>
                                 </div>
@@ -411,7 +411,7 @@
                             </div>
                             <template x-for="r in benchUploadResults" :key="r.context_length">
                                 <div class="flex items-center justify-between py-2 border-b border-neutral-100 last:border-0">
-                                    <span class="text-sm font-medium text-neutral-700" x-text="'pp' + r.context_length"></span>
+                                    <span class="text-sm font-medium text-neutral-700" x-text="'PP' + r.context_length"></span>
                                     <div class="flex items-center gap-2">
                                         <!-- Success -->
                                         <template x-if="r.url && !r.duplicate">
