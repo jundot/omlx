@@ -79,7 +79,7 @@
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('bench.config.model') }}</label>
                                 <select x-model="benchModelId"
-                                        :disabled="benchRunning || benchExternalEnabled"
+                                        :disabled="benchExternalEnabled"
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="">{{ t('bench.config.model_placeholder') }}</option>
                                     <template x-for="m in models.filter(m => m.model_type === 'llm' || m.model_type === 'vlm' || !m.model_type)" :key="m.id">
@@ -94,7 +94,6 @@
                             <div>
                                 <label class="block text-sm font-medium text-neutral-700 mb-2">{{ t('bench.config.context_profile') }}</label>
                                 <select x-model="benchContextProfile"
-                                        :disabled="benchRunning"
                                         class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                     <option value="code_python">{{ t('bench.config.context.code_python') }}</option>
                                     <option value="code_mixed">{{ t('bench.config.context.code_mixed') }}</option>
@@ -113,7 +112,6 @@
                                         <label class="flex items-center gap-2 cursor-pointer">
                                             <input type="checkbox"
                                                    x-model="benchPromptLengths[pp]"
-                                                   :disabled="benchRunning"
                                                    class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
                                             <span class="text-sm text-neutral-600" x-text="'pp' + pp"></span>
                                         </label>
@@ -123,7 +121,6 @@
                                 <label class="inline-flex items-start gap-2 cursor-pointer mt-3">
                                     <input type="checkbox"
                                            x-model="benchAlignPromptToAne"
-                                           :disabled="benchRunning"
                                            class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
                                     <span>
                                         <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.ane_aligned_prompt') }}</span>
@@ -140,7 +137,6 @@
                                         <label class="flex items-center gap-2 cursor-pointer">
                                             <input type="checkbox"
                                                    x-model="benchBatchSizes[bs]"
-                                                   :disabled="benchRunning"
                                                    class="w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900">
                                             <span class="text-sm text-neutral-600" x-text="window.t('bench.config.batch_option').replace('{count}', bs)"></span>
                                         </label>
@@ -153,7 +149,6 @@
                             <div class="pt-2 border-t border-neutral-100">
                                 <button type="button"
                                         @click="benchAdvancedOptionsOpen = !benchAdvancedOptionsOpen"
-                                        :disabled="benchRunning"
                                         :aria-expanded="benchAdvancedOptionsOpen.toString()"
                                         class="flex items-center gap-2 text-sm font-medium text-neutral-600 hover:text-neutral-900 transition-colors disabled:opacity-50">
                                     <i data-lucide="sliders-horizontal" class="w-4 h-4"></i>
@@ -166,7 +161,7 @@
                                     <label class="inline-flex items-start gap-2 cursor-pointer">
                                         <input type="checkbox"
                                                x-model="benchForceLmEngine"
-                                               :disabled="benchRunning || benchExternalEnabled"
+                                               :disabled="benchExternalEnabled"
                                                class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
                                         <span>
                                             <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.force_lm_engine') }}</span>
@@ -178,7 +173,6 @@
                                         <label class="inline-flex items-start gap-2 cursor-pointer">
                                             <input type="checkbox"
                                                    x-model="benchExternalEnabled"
-                                                   :disabled="benchRunning"
                                                    class="mt-0.5 w-4 h-4 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-900 disabled:opacity-50">
                                             <span>
                                                 <span class="block text-sm font-medium text-neutral-700">{{ t('bench.config.external') }}</span>
@@ -191,7 +185,6 @@
                                                 <input type="url"
                                                        x-model="externalBaseUrl"
                                                        @change="saveExternalEndpoint()"
-                                                       :disabled="benchRunning"
                                                        placeholder="https://api.openai.com/v1"
                                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                             </div>
@@ -201,7 +194,6 @@
                                                        autocomplete="off"
                                                        x-model="externalApiKey"
                                                        @change="saveExternalEndpoint()"
-                                                       :disabled="benchRunning"
                                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                             </div>
                                             <div>
@@ -209,7 +201,6 @@
                                                 <input type="text"
                                                        x-model="externalModel"
                                                        @change="saveExternalEndpoint()"
-                                                       :disabled="benchRunning"
                                                        placeholder="gpt-4o-mini"
                                                        class="w-full max-w-md px-3 py-2 text-sm border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent bg-white disabled:opacity-50">
                                             </div>
@@ -220,15 +211,32 @@
 
                             <!-- Run / Cancel Button -->
                             <div class="flex items-center gap-3 pt-2">
-                                <button x-show="!benchRunning"
-                                        @click="requestBenchConfirm('throughput')"
+                                <button @click="requestBenchConfirm('throughput')"
                                         :disabled="(benchExternalEnabled ? !externalConfigValid() : !benchModelId) || Object.values(benchPromptLengths).every(v => !v) || benchOtherActive !== null"
                                         :title="benchOtherActive ? window.t('bench.other_active.already_running') : ''"
                                         class="px-6 py-2.5 bg-neutral-900 text-white text-sm font-medium rounded-full hover:bg-neutral-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2">
                                     <i data-lucide="play" class="w-4 h-4"></i>
-                                    {{ t('bench.config.run_button') }}
+                                    <span x-text="benchRunning ? window.t('bench.config.add_to_queue') : window.t('bench.config.run_button')"></span>
                                 </button>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Queue -->
+                    <div x-show="benchQueue.length > 0" x-cloak class="mb-6">
+                        <div class="flex items-center gap-2 mb-2">
+                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-400">{{ t('bench.queue.section_label') }}</span>
+                        </div>
+                        <div class="flex flex-wrap gap-2">
+                            <template x-for="(q, idx) in benchQueue" :key="idx">
+                                <div class="inline-flex items-center gap-1.5 px-3 py-1.5 bg-neutral-100 rounded-lg text-sm text-neutral-700">
+                                    <span x-text="q.model_id"></span>
+                                    <button @click="removeFromBenchQueue(idx)"
+                                            class="ml-1 text-neutral-500 hover:text-red-500 transition-colors">
+                                        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                                    </button>
+                                </div>
+                            </template>
                         </div>
                     </div>
 
@@ -374,7 +382,7 @@
                                 <button @click="benchCopyText()"
                                         class="px-4 py-1.5 bg-neutral-900 text-white text-xs font-medium rounded-full hover:bg-neutral-800 transition-all flex items-center gap-1.5">
                                     <i data-lucide="copy" class="w-3.5 h-3.5"></i>
-                                    <span x-text="benchCopied ? window.t('bench.results.text_export.copied') : window.t('bench.results.text_export.copy')"></span>
+                                    <span x-text="benchCopied === true ? window.t('bench.results.text_export.copied') : window.t('bench.results.text_export.copy')"></span>
                                 </button>
                             </div>
                             <div class="bg-neutral-900 rounded-b-2xl">
@@ -468,6 +476,28 @@
                             <p class="text-sm text-amber-700"
                                x-text="benchUploadSkipped?.reason === 'splash' ? t('bench.upload_skipped.reason_splash') : t('bench.upload_skipped.reason_external')"></p>
                         </div>
+                    </div>
+
+                    <!-- Completed runs (text exports of earlier runs) -->
+                    <div x-show="benchCompleted.length > 0" x-cloak
+                         class="bg-white rounded-2xl border border-neutral-200 overflow-hidden mb-6">
+                        <div class="px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                            <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('bench.completed.section_label') }}</span>
+                        </div>
+                        <template x-for="(c, idx) in benchCompleted" :key="idx">
+                            <details class="border-b border-neutral-100 last:border-b-0">
+                                <summary class="flex items-center justify-between gap-3 px-6 py-3 cursor-pointer text-sm text-neutral-700">
+                                    <span class="truncate" x-text="c.model_id"></span>
+                                    <button @click.prevent="benchCopyText(c.text, idx)"
+                                            class="px-3 py-1 bg-neutral-900 text-white text-xs font-medium rounded-full hover:bg-neutral-800 transition-all flex items-center gap-1.5 flex-shrink-0">
+                                        <i data-lucide="copy" class="w-3.5 h-3.5"></i>
+                                        <span x-text="benchCopied === idx ? window.t('bench.results.text_export.copied') : window.t('bench.results.text_export.copy')"></span>
+                                    </button>
+                                </summary>
+                                <textarea :value="c.text" readonly
+                                          class="w-full h-[300px] px-4 py-4 bg-neutral-900 text-green-400 font-mono text-xs leading-relaxed resize-none focus:outline-none"></textarea>
+                            </details>
+                        </template>
                     </div>
 
                     <!-- Metrics Reference -->

@@ -503,6 +503,50 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
             del _benchmark_runs[bid]
 
 
+# Requests waiting for the running benchmark, oldest first.
+_queue: list[BenchmarkRequest] = []
+# Task running `run_queue`. It outlives a run's "running" status while that
+# run uploads its results, and it starts the next queued request afterwards.
+_queue_task: Optional[asyncio.Task] = None
+
+
+def queue_busy() -> bool:
+    """True while a `run_queue` task is alive, including during uploads."""
+    return _queue_task is not None and not _queue_task.done()
+
+
+def add_to_queue(request: BenchmarkRequest) -> None:
+    _queue.append(request)
+
+
+def remove_from_queue(idx: int) -> bool:
+    if 0 <= idx < len(_queue):
+        _queue.pop(idx)
+        return True
+    return False
+
+
+def clear_queue() -> None:
+    _queue.clear()
+
+
+def get_queue() -> list[dict]:
+    return [
+        {"model_id": r.model_id, "external": r.external is not None} for r in _queue
+    ]
+
+
+async def run_queue(run: BenchmarkRun, engine_pool: Any) -> None:
+    """Run `run`, then each queued request in turn, stopping on cancel."""
+    while True:
+        await run_benchmark(run, engine_pool)
+        if run.status == "cancelled" or not _queue:
+            return
+        cleanup_old_runs()
+        run = create_run(_queue.pop(0))
+        run.task = asyncio.current_task()
+
+
 # Bundled corpora for benchmark prompts. They contain long-form code or prose,
 # never a short filler sentence. A whole corpus may repeat for a tokenizer that
 # compresses it unusually well, but the repeated unit is hundreds of thousands

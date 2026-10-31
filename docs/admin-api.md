@@ -91,7 +91,8 @@ The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The reque
 
 | Endpoint | Description |
 |---|---|
-| `POST /admin/api/bench/start`, `GET .../{bench_id}/results`, `POST .../{bench_id}/cancel` | Throughput benchmark |
+| `POST /admin/api/bench/start`, `GET .../{bench_id}/results`, `POST .../{bench_id}/cancel` | Throughput benchmark; a start while one runs is queued (`"status": "queued"`) |
+| `GET /admin/api/bench/active`, `DELETE /admin/api/bench/queue/{idx}` | Active run plus waiting queue; remove one queued request |
 | `GET /admin/api/bench/{bench_id}/stream` | Server-sent events for the same run |
 | `/admin/api/bench/context/...` | Long-context benchmark, same pattern |
 | `/admin/api/bench/accuracy/...` | Accuracy benchmark queue |
@@ -101,7 +102,7 @@ Cluster endpoints are described in [distributed-cluster.md](experimental/distrib
 
 ## Long-running tasks
 
-Downloads, oQ, uploads, and benchmarks run in the background. The start call returns a task or benchmark ID right away; poll the matching `tasks` or `results` endpoint (benchmarks also offer an SSE `stream`), and use `cancel` to stop. The web UI polls downloads every 500 ms and stats every 500 ms while the dashboard is open; scripts rarely need anything that fast.
+Downloads, oQ, uploads, and benchmarks run in the background. The start call returns a task or benchmark ID right away — a throughput start that arrives while one is running returns `{"status": "queued"}` and runs after it; poll the matching `tasks` or `results` endpoint (benchmarks also offer an SSE `stream`), and use `cancel` to stop. The web UI polls downloads every 500 ms and stats every 500 ms while the dashboard is open; scripts rarely need anything that fast.
 
 ## Examples
 

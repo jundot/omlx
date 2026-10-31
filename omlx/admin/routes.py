@@ -9250,14 +9250,14 @@ async def get_context_benchmark_results(
 
 @router.get("/api/bench/active")
 async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
-    """Return the currently-running throughput benchmark, if any.
+    """Return the currently-running throughput benchmark and the queue.
 
     Symmetric to `/api/bench/accuracy/queue/status` — lets a fresh page
     load or a second tab discover an in-flight run so it can attach to
     the SSE stream. Combined with the replay-on-subscribe stream this
     is what makes the multi-tab + page-refresh story actually work.
     """
-    from .benchmark import get_active_run
+    from .benchmark import get_active_run, get_queue
 
     run = get_active_run()
     if run is None:
@@ -9266,9 +9266,11 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
             "bench_id": None,
             "model_id": None,
             "context_profile": None,
+            "queue": get_queue(),
         }
     return {
         "running": True,
+        "queue": get_queue(),
         "bench_id": run.bench_id,
         "model_id": run.request.model_id,
         "context_profile": run.request.context_profile.value,
@@ -9285,36 +9287,28 @@ async def start_benchmark(
     request: Request,
     is_admin: bool = Depends(require_admin),
 ):
-    """Start a benchmark run.
+    """Start a benchmark run, or queue it behind the running one.
 
     Validates the model, creates a benchmark run, and starts it
-    as an asyncio background task. Rejects with 409 if another
-    throughput bench is already running — two concurrent runs on
-    the same engine produce mutually-corrupted measurements.
+    as an asyncio background task. Two concurrent runs on the same
+    engine produce mutually-corrupted measurements, so a request that
+    arrives while a throughput bench is running waits in the queue.
     """
+    from . import benchmark as bench_module
     from .benchmark import (
         BenchmarkRequest,
+        add_to_queue,
         cleanup_old_runs,
         create_run,
         get_active_run,
-        run_benchmark,
+        get_queue,
+        queue_busy,
+        run_queue,
     )
 
     engine_pool = _get_engine_pool()
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
-
-    # One throughput bench at a time. The replay-on-subscribe stream lets
-    # clients attach to the already-running one if that's what they want.
-    active = get_active_run()
-    if active is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"A throughput benchmark is already running "
-                f"(bench_id={active.bench_id}, model_id={active.request.model_id})."
-            ),
-        )
 
     from .context_benchmark import get_active_run as get_active_context_run
 
@@ -9361,6 +9355,12 @@ async def start_benchmark(
                 detail=f"Model {bench_request.model_id} is not a supported model (type: {entry.model_type})",
             )
 
+    # The queue task stays alive while a finished run uploads its results,
+    # and it starts the next queued request afterwards.
+    if queue_busy() or get_active_run() is not None:
+        add_to_queue(bench_request)
+        return {"status": "queued", "queue": get_queue()}
+
     # Cleanup old runs
     cleanup_old_runs()
 
@@ -9369,7 +9369,8 @@ async def start_benchmark(
     total_tests = len(bench_request.prompt_lengths) + len(bench_request.batch_sizes) * 2
 
     _drop_idle_gpu_power_cap()
-    run.task = asyncio.create_task(run_benchmark(run, engine_pool))
+    run.task = asyncio.create_task(run_queue(run, engine_pool))
+    bench_module._queue_task = run.task
 
     logger.info(
         f"Benchmark started: {run.bench_id} model={bench_request.model_id} "
@@ -9381,6 +9382,19 @@ async def start_benchmark(
         "status": "started",
         "total_tests": total_tests,
     }
+
+
+@router.delete("/api/bench/queue/{idx}")
+async def remove_from_benchmark_queue(
+    idx: int,
+    is_admin: bool = Depends(require_admin),
+):
+    """Remove a request from the throughput benchmark queue."""
+    from .benchmark import get_queue, remove_from_queue
+
+    if not remove_from_queue(idx):
+        raise HTTPException(status_code=404, detail=f"Queue index {idx} not found")
+    return {"queue": get_queue()}
 
 
 @router.get("/api/bench/{bench_id}/stream")
@@ -9445,12 +9459,18 @@ async def cancel_benchmark(
     bench_id: str,
     is_admin: bool = Depends(require_admin),
 ):
-    """Cancel a running benchmark."""
-    from .benchmark import get_run
+    """Cancel a running benchmark and clear the queue behind it."""
+    from .benchmark import clear_queue, get_run
 
     run = get_run(bench_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Benchmark not found: {bench_id}")
+
+    # A finished run that is still uploading keeps its result; only the
+    # queue behind it is dropped.
+    if run.status == "completed" and run.task is not None and not run.task.done():
+        clear_queue()
+        return {"status": "cancelled", "bench_id": bench_id}
 
     if run.status != "running":
         raise HTTPException(
@@ -9458,6 +9478,7 @@ async def cancel_benchmark(
             detail=f"Benchmark is not running (status: {run.status})",
         )
 
+    clear_queue()
     if run.task and not run.task.done():
         run.task.cancel()
 
