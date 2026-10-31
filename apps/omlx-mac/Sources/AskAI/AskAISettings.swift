@@ -186,9 +186,9 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
     /// False in settings saved before prompts had a default; their empty
     /// prompts get the default once, and a prompt cleared later stays empty.
     var promptDefaultsApplied = true
-    /// Return sends the prompt and Command-Return inserts a newline.
-    /// Off swaps them so Command-Return sends.
-    var sendOnEnter = true
+    /// Return sends and Shift-Return inserts the newline. Command-Return
+    /// sends either way.
+    var sendOnEnter = false
 
     init() {}
 

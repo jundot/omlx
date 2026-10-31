@@ -2,8 +2,8 @@
 // SwiftUI TextEditor, so the field can commit an in-progress IME composition
 // (Korean, Japanese, Chinese) before Return or Command-Return acts, and the
 // panel can take Return, Tab, arrows, and Escape while suggestions are open.
-// Which Return sends is a preference (`sendOnEnter`); the other inserts a
-// newline.
+// Command-Return always sends. With `sendOnEnter`, Return sends too and
+// Shift-Return inserts the newline.
 
 import AppKit
 import SwiftUI
@@ -36,7 +36,6 @@ struct AskAIInputView: NSViewRepresentable {
     @Binding var text: String
     @Binding var height: CGFloat
     let suggestionsVisible: Bool
-    /// Return submits and Command-Return inserts a newline. Off swaps them.
     let sendOnEnter: Bool
     let focus: AskAIInputFocus
     let onCommand: (AskAIInputCommand) -> Void
@@ -132,7 +131,9 @@ struct AskAIInputView: NSViewRepresentable {
                     parent.onCommand(.acceptSuggestion)
                     return true
                 }
-                guard parent.sendOnEnter else { return false }
+                // Shift-Return arrives as insertNewline: too and keeps the newline.
+                let shifted = NSApp.currentEvent?.modifierFlags.contains(.shift) == true
+                guard parent.sendOnEnter, !shifted else { return false }
                 // A live IME composition owns Return; commit it, don't send.
                 if textView.hasMarkedText() {
                     textView.unmarkText()
@@ -162,15 +163,10 @@ struct AskAIInputView: NSViewRepresentable {
             let isReturn = event.keyCode == 36 || event.keyCode == 76
             switch (flags, key) {
             case (.command, _) where isReturn:
-                // Commit the IME composition so the action includes it.
+                // Commit the IME composition so the send includes it.
                 if textView.hasMarkedText() {
                     textView.unmarkText()
                     parent.text = textView.string
-                }
-                if parent.sendOnEnter {
-                    // Enter sends, so Command-Return takes the newline.
-                    textView.insertText("\n", replacementRange: textView.selectedRange())
-                    return true
                 }
                 parent.onCommand(.submit)
                 return true

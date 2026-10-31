@@ -33022,19 +33022,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "↩ Send   ⌘↩ Newline   Esc Close"
+            "value" : "↩ Send   ⇧↩ Newline   Esc Close"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "↩ Отправить   ⌘↩ Перенос   Esc Закрыть"
+            "value" : "↩ Отправить   ⇧↩ Перенос   Esc Закрыть"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "↩ 发送   ⌘↩ 换行   Esc 关闭"
+            "value" : "↩ 发送   ⇧↩ 换行   Esc 关闭"
           }
         }
       }
@@ -33046,19 +33046,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "↩ Follow up   ⌘↩ Newline   ⌘N New   ⇧⌘C Copy"
+            "value" : "↩ Follow up   ⇧↩ Newline   ⌘N New   ⇧⌘C Copy"
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "↩ Уточнить   ⌘↩ Перенос   ⌘N Новый   ⇧⌘C Копировать"
+            "value" : "↩ Уточнить   ⇧↩ Перенос   ⌘N Новый   ⇧⌘C Копировать"
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "↩ 追问   ⌘↩ 换行   ⌘N 新对话   ⇧⌘C 复制"
+            "value" : "↩ 追问   ⇧↩ 换行   ⌘N 新对话   ⇧⌘C 复制"
           }
         }
       }
@@ -33598,19 +33598,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Enter sends the question and ⌘↩ adds a new line. Turn off to swap them."
+            "value" : "Enter sends the question and ⇧↩ adds a new line. ⌘↩ always sends."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Enter отправляет вопрос, ⌘↩ добавляет новую строку. Выключите, чтобы поменять их местами."
+            "value" : "Enter отправляет вопрос, ⇧↩ добавляет новую строку. ⌘↩ всегда отправляет."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "回车发送问题，⌘↩ 换行。关闭后两者互换。"
+            "value" : "回车发送问题，⇧↩ 换行。⌘↩ 始终发送。"
           }
         }
       }

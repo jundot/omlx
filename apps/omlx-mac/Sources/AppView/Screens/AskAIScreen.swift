@@ -285,7 +285,7 @@ private struct TextAdvancedSection: View {
                                   defaultValue: "Send on Enter",
                                   comment: "Row label for the Ask AI Enter-to-send switch"),
                     sublabel: String(localized: "askai.row.send_on_enter.sub",
-                                     defaultValue: "Enter sends the question and ⌘↩ adds a new line. Turn off to swap them.",
+                                     defaultValue: "Enter sends the question and ⇧↩ adds a new line. ⌘↩ always sends.",
                                      comment: "Sublabel for the Ask AI Enter-to-send switch")
                 ) {
                     RowSwitch(isOn: $store.prefs.sendOnEnter)

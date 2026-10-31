@@ -255,11 +255,11 @@ struct AskAIPanelView: View {
         if controller.store.prefs.sendOnEnter {
             if conversation.isEmpty {
                 return String(localized: "askai.hint.idle.enter",
-                              defaultValue: "↩ Send   ⌘↩ Newline   Esc Close",
+                              defaultValue: "↩ Send   ⇧↩ Newline   Esc Close",
                               comment: "Key hints in the Ask AI footer before the first question when Enter sends")
             }
             return String(localized: "askai.hint.conversation.enter",
-                          defaultValue: "↩ Follow up   ⌘↩ Newline   ⌘N New   ⇧⌘C Copy",
+                          defaultValue: "↩ Follow up   ⇧↩ Newline   ⌘N New   ⇧⌘C Copy",
                           comment: "Key hints in the Ask AI footer after an answer when Enter sends")
         }
         if conversation.isEmpty {
