@@ -7,7 +7,7 @@ Batch rows are evaluated independently so late admission cannot share history.
 """
 
 import math
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import cache, lru_cache
 
 import mlx.core as mx
@@ -18,6 +18,7 @@ from mlx_lm.models.switch_layers import SwitchLinear
 
 from omlx.custom_kernels.attention import fast as attention_fast
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
+from omlx.utils.hardware import get_max_working_set_bytes
 
 from ..deepseek_v4.switch_layers import _block_config, _build_mxfp4_blocks
 from . import decode_fused, growth
@@ -815,6 +816,34 @@ def _gather_stage(x):
     return gathered[: x.shape[0]]
 
 
+# Wide prefill bounds the allocator pool rather than emptying it per layer:
+# the server pins the cache limit to total memory, so without a bound freed
+# buffers of widths that never reuse a size class pile up through the chunk,
+# and clearing at every layer hands each buffer back and re-allocates it.
+# 1/16 of the GPU working set reaches the 8 GiB cap from a 128 GiB working
+# set up, and scales down below that (about 6.7 GiB on a 128 GB host,
+# 0.74 GiB on 16 GB) so the retained pool
+# stays a small share of memory the weights and KV cache also need.
+_PREFILL_CACHE_CAP = 8 << 30
+_PREFILL_CACHE_SHARE = 16
+
+
+@cache
+def _prefill_cache_limit():
+    return min(_PREFILL_CACHE_CAP, get_max_working_set_bytes() // _PREFILL_CACHE_SHARE)
+
+
+@contextmanager
+def _prefill_cache_scope():
+    """Bound the allocator pool for one wide-prefill layer loop."""
+    # set_cache_limit returns the limit it replaces; restore it on any exit.
+    previous = mx.set_cache_limit(_prefill_cache_limit())
+    try:
+        yield
+    finally:
+        mx.set_cache_limit(previous)
+
+
 @mx.compile
 def _hc_mix_weights(mixes, scale, base, n, hc_eps, iters):
     pre = mx.sigmoid(mixes[..., :n] * scale[0] + base[:n]) + hc_eps
@@ -1436,12 +1465,15 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             # eval and the Metal pool hoards every freed size class as
             # IOAccelerator footprint (measured +14.5GB per 2048-token chunk).
             # Eval the running stream at each layer boundary during prefill so
-            # intermediates retire as the GPU progresses, and clear the pool at
-            # the same points (per-layer widths vary across the ratio switch,
-            # CED tail and 2047/2048 chunk widths, so size classes never
-            # reuse). Decode/verify widths are only submitted (async_eval).
+            # intermediates retire as the GPU progresses, and bound the pool
+            # for the loop (per-layer widths vary across the ratio switch, CED
+            # tail and 2047/2048 chunk widths, so size classes never reuse).
+            # Decode/verify widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
-            with prefetch.forward() if prefetch is not None else nullcontext():
+            with (
+                _prefill_cache_scope() if prefill_backpressure else nullcontext(),
+                prefetch.forward() if prefetch is not None else nullcontext(),
+            ):
                 first = self._next_engram(stage, -1)
                 if prefetch is not None and first is not None:
                     prefetch.submit(
@@ -1493,7 +1525,6 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                         )
                     if prefill_backpressure:
                         mx.eval(h, pre)
-                        mx.clear_cache()
                     else:
                         # The GPU runs this layer while the next one is built.
                         mx.async_eval(h, pre)

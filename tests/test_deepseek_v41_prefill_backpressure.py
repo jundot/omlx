@@ -24,6 +24,7 @@ import sys
 import types
 
 import mlx.core as mx
+import pytest
 from test_deepseek_v41 import load_reference_weights, tiny
 
 import omlx.patches.deepseek_v41.language as v41_lang
@@ -32,6 +33,42 @@ from omlx.patches.deepseek_v41 import apply_patch
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.scheduler import Scheduler
 
+_TEST_CACHE_LIMIT = 3 << 20
+
+
+def _current_cache_limit():
+    previous = mx.set_cache_limit(0)
+    mx.set_cache_limit(previous)
+    return previous
+
+
+def _spy_allocator(monkeypatch, fail_on_eval=None):
+    """Record per-layer evals, pool clears and cache-limit changes."""
+    events = {"evals": 0, "clears": 0, "limits": []}
+    real_eval = mx.eval
+    real_clear = mx.clear_cache
+    real_limit = mx.set_cache_limit
+
+    def eval_spy(*args, **kw):
+        events["evals"] += 1
+        if fail_on_eval is not None and events["evals"] == fail_on_eval:
+            raise RuntimeError("layer failed")
+        return real_eval(*args, **kw)
+
+    def clear_spy(*args, **kw):
+        events["clears"] += 1
+        return real_clear(*args, **kw)
+
+    def limit_spy(limit):
+        events["limits"].append(limit)
+        return real_limit(limit)
+
+    monkeypatch.setattr(v41_lang.mx, "eval", eval_spy)
+    monkeypatch.setattr(v41_lang.mx, "clear_cache", clear_spy)
+    monkeypatch.setattr(v41_lang.mx, "set_cache_limit", limit_spy)
+    monkeypatch.setattr(v41_lang, "_prefill_cache_limit", lambda: _TEST_CACHE_LIMIT)
+    return events, real_eval
+
 
 def test_v41_prefill_evals_stream_per_layer(monkeypatch):
     """CPU enqueues a 2048-token chunk in ~1s while the GPU needs ~15s; with
@@ -39,50 +76,69 @@ def test_v41_prefill_evals_stream_per_layer(monkeypatch):
     streams over hc_mult=4, gathered sparse-attention loads, MoE routes)
     stays pinned until the final logits eval and the pool hoards every size
     class — the measured +14.5GB/chunk flat sawtooth. The loop must eval the
-    running (h, pre) stream per layer during prefill and clear the allocator
-    pool at the same boundaries; decode widths stay lazy for latency."""
+    running (h, pre) stream per layer during prefill and bound the allocator
+    pool for the loop instead of clearing it at every layer."""
     model = v41_lang.LanguageModel(tiny())
     n_layers = model._config.n_layers
-
-    calls = []
-    clears = []
-    real_eval = mx.eval
-    real_clear = mx.clear_cache
-
-    def spy(*args, **kw):
-        calls.append(sum(len(a) if isinstance(a, (tuple, list)) else 1 for a in args))
-        return real_eval(*args, **kw)
-
-    def clear_spy(**kw):
-        clears.append(1)
-        return real_clear(**kw)
-
-    monkeypatch.setattr(v41_lang.mx, "eval", spy)
-    monkeypatch.setattr(v41_lang.mx, "clear_cache", clear_spy)
+    before = _current_cache_limit()
+    events, real_eval = _spy_allocator(monkeypatch)
 
     ids = mx.zeros((1, 300), dtype=mx.int32)  # >= 256 prefill gate width
     out = model(ids)
     real_eval(out)
-    assert len(calls) >= n_layers, (
-        f"prefill width must eval the stream per layer, got {len(calls)} eval"
-        f" calls for {n_layers} layers"
+    assert events["evals"] >= n_layers, (
+        f"prefill width must eval the stream per layer, got {events['evals']}"
+        f" eval calls for {n_layers} layers"
     )
-    # The allocator caches freed buffers per size class and v41 widths vary
-    # (compress-ratio switches, CED tail, 2047/2048 chunk widths), so the
-    # pool grows monotonically through a chunk unless cleared at the eval
-    # boundaries.
-    assert len(clears) >= n_layers, (
-        f"prefill must clear the allocator pool per layer, got {len(clears)}"
-        f" clears for {n_layers} layers"
-    )
+    assert events["clears"] == 0, "prefill must not clear the pool per layer"
+    # One bound for the whole layer loop, then the previous limit again.
+    assert events["limits"] == [_TEST_CACHE_LIMIT, before]
+    assert _current_cache_limit() == before
 
-    calls.clear()
-    clears.clear()
-    decode = mx.zeros((1, 1), dtype=mx.int32)
-    out = model(decode, cache=model.make_cache())
+
+def test_v41_prefill_restores_cache_limit_when_a_layer_raises(monkeypatch):
+    model = v41_lang.LanguageModel(tiny())
+    before = _current_cache_limit()
+    events, _ = _spy_allocator(monkeypatch, fail_on_eval=2)
+
+    with pytest.raises(RuntimeError, match="layer failed"):
+        model(mx.zeros((1, 300), dtype=mx.int32))
+    assert events["limits"] == [_TEST_CACHE_LIMIT, before]
+    assert _current_cache_limit() == before
+
+
+@pytest.mark.parametrize("width", [1, 4, 255])
+def test_v41_narrow_widths_keep_async_submission(monkeypatch, width):
+    """Decode, verify and short chunks stay lazy and leave the pool alone."""
+    model = v41_lang.LanguageModel(tiny())
+    n_layers = model._config.n_layers
+    events, real_eval = _spy_allocator(monkeypatch)
+
+    out = model(mx.zeros((1, width), dtype=mx.int32), cache=model.make_cache())
     real_eval(out)
-    assert len(calls) < n_layers, "decode width must stay lazy (no per-layer eval)"
-    assert not clears, "decode width must not clear the pool per layer"
+    assert events["evals"] < n_layers, "narrow width must stay lazy"
+    assert events["clears"] == 0
+    assert events["limits"] == []
+
+
+@pytest.mark.parametrize(
+    ("working_set", "expected"),
+    [
+        (12_713_115_648, 12_713_115_648 // 16),  # 16 GB host
+        (115_448_725_504, 115_448_725_504 // 16),  # 128 GB host
+        (128 << 30, 8 << 30),  # the share reaches the cap
+        (240 << 30, 8 << 30),  # larger hosts stay at the cap
+    ],
+)
+def test_v41_prefill_cache_limit_scales_with_working_set(
+    monkeypatch, working_set, expected
+):
+    monkeypatch.setattr(v41_lang, "get_max_working_set_bytes", lambda: working_set)
+    v41_lang._prefill_cache_limit.cache_clear()
+    try:
+        assert v41_lang._prefill_cache_limit() == expected
+    finally:
+        v41_lang._prefill_cache_limit.cache_clear()
 
 
 def test_apply_patch_replaces_foreign_vendor_alias_and_warns(caplog):
