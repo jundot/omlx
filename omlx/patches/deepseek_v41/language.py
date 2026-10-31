@@ -833,6 +833,24 @@ def _hc_mixes(x, fn, scale, base, n, norm_eps, hc_eps, iters):
     return _hc_mix_weights(mixes, scale, base, n, hc_eps, iters)
 
 
+@mx.compile
+def _hc_mixes_transposed(x, fn, scale, base, n, norm_eps, hc_eps, iters):
+    flat = x.flatten(-2).astype(mx.float32)
+    projected = mx.swapaxes(fn @ mx.swapaxes(flat, -1, -2), -1, -2)
+    mixes = projected * mx.rsqrt(mx.mean(flat * flat, -1, keepdims=True) + norm_eps)
+    return _hc_mix_weights(mixes, scale, base, n, hc_eps, iters)
+
+
+@cache
+def _hc_transposed_projection_available():
+    # This FP32 layout is qualified on M5; other Metal generations may select
+    # different reduction kernels. Keep their existing arithmetic and dispatch.
+    try:
+        return mx.device_info().get("architecture") == "applegpu_g17s"
+    except Exception:
+        return False
+
+
 def hc_mixes(x, fn, scale, base, c):
     if (
         x.ndim == 4
@@ -848,6 +866,23 @@ def hc_mixes(x, fn, scale, base, c):
         mixes = fused_hc_projection(x, fn, c.norm_eps)
         return _hc_mix_weights(
             mixes, scale, base, c.hc_mult, c.hc_eps, c.hc_sinkhorn_iters
+        )
+    if (
+        x.ndim == 4
+        and x.shape[0] == 1
+        and 2 <= x.shape[1] <= 8
+        and x.shape[-2] == c.hc_mult == 4
+        and x.shape[-1] == 5120
+        and x.dtype == mx.bfloat16
+        and fn.dtype == mx.float32
+        and fn.shape == (24, 20480)
+        and mx.default_device() == mx.gpu
+        and _hc_transposed_projection_available()
+    ):
+        # Putting the 24 controls on the left avoids the narrow output tile
+        # of flat @ fn.T. One-row GEMV and larger prefill chunks stay on stock.
+        return _hc_mixes_transposed(
+            x, fn, scale, base, c.hc_mult, c.norm_eps, c.hc_eps, c.hc_sinkhorn_iters
         )
     return _hc_mixes(
         x, fn, scale, base, c.hc_mult, c.norm_eps, c.hc_eps, c.hc_sinkhorn_iters
