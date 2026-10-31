@@ -259,3 +259,62 @@ For a real-server comparison, use the same model, prompts and cache state on mai
 # GPU power limit tests
 
 Run `python -m pytest -q tests/test_gpu_power.py` to check the GPU power limiter with a fake registry entry: the lowest active cap applies, the cap is removed after the release delay unless a new request arrives first, a raised or removed cap is rewritten on a 1, 1, 2, 3 check-interval backoff while a stricter thermal limit stays, a marker left by a dead server removes the cap on the next start (a live owner's marker is kept), a benchmark start drops a cap that only waits out the release delay, and a GPU that rejects the cap leaves requests uncapped. No GPU cap is written.
+
+# Decode Fairness Ratio tuning
+
+The macOS Performance screen and WebUI Global Settings > Resource Management
+expose **Decode Fairness Ratio** (`scheduler.decode_fair_share`). Its default is
+`0.5`, with finite values from `0` to `1`. It multiplies measured contended
+prefill time to accrue decode debt; it is not a GPU percentage. Effects depend on
+the workload and whether native MTP is enabled. At `0`, fairness chunk caps still
+apply. Turning **Prioritize Decoding During Prefill** off disables that policy
+while retaining the configured ratio. Apply changes through the normal settings
+flow; existing debt drains normally when only the ratio changes.
+
+Use [the manual tuning harness](../scripts/benchmark_decode_fair_share.py) with
+an existing local checkpoint and the checkout's native MLX environment:
+
+```sh
+python scripts/benchmark_decode_fair_share.py \
+  --model-path /path/to/local-model \
+  --output-dir /path/to/new-results \
+  --ratios 0.1 0.25 0.5 0.75 1.0 --modes ar mtp --repeats 2 \
+  --cases solo burst overlap natural
+```
+
+The default full profile uses 20 fresh-server arms in balanced forward/reverse
+order, five warmup responses per arm, and 220 timed responses: solo `4096/128`,
+a four-request `4096/128` burst, a `2048/768` response joined by `16384/128` one
+second after first content, and four natural `1K/2K/4K/8K` prompts with 128-output
+caps. Prefix caching and DFlash are off. Native MTP retains its stock adaptive
+behavior; the harness checks actual activation rather than labeling fallback as
+MTP. An MTP-capable checkpoint is required when selecting that mode.
+
+For short integration checks, add `--quick --cases solo burst overlap`. This uses
+shorter prompts and outputs, so its timings are **not** comparable with the full
+profile. `--dry-run` prints the selected run order without loading a model or
+starting a server. `--corpus-file` accepts the historical report's frozen input
+fixture and verifies its tokenization against the local model. The harness
+recreates the workloads on the selected checkout; results from different source
+or dependency versions must remain separate.
+
+The server interpreter defaults to the harness's interpreter. `--server-python`
+and `--source-root` can select another checkout/environment; tokenizer dependency
+versions must match. To check a pre-exposure upstream baseline, use
+`--baseline-default --ratios 0.5` only with its untouched stock `0.5` policy.
+No inference observation hooks are installed. Startup's cluster helper is directed
+to isolated state, and only owned server processes are stopped.
+
+Every run requires a new output directory. It retains raw SSE, actual token
+counts, per-request TTFT/completion/visible chunk gaps, whole-case completion,
+aggregate output rate, source/patch/harness and checkpoint hashes, package
+versions, and sampled available memory/swap. Per-trial metrics are also written
+as CSV. Structured responses must match the expected continuation, requested
+work, and the first observed text/count reference. Divergent natural answers are
+performance-only, not evidence of equivalent answer quality. Visible event gaps
+are not native per-token intervals or population request tails. Report repeat
+counts and ranges; two-trial ranges are not confidence intervals.
+
+The harness stops and retains partial results on correctness failures, low
+available memory or swap growth; it never silently retries a failed arm. Run it
+manually on an otherwise quiet machine, separately from the default CI suite.

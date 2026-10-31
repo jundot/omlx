@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from .config import parse_size
+from .config import parse_size, validate_decode_fair_share
 
 if TYPE_CHECKING:
     from .scheduler import SchedulerConfig
@@ -349,6 +349,11 @@ class SchedulerSettings:
     # any engine decodes, and each chunk accrues a decode time debt repaid
     # before the next chunk runs. Off restores the pre-fairness behavior.
     decode_fairness: bool = True
+    # Decode debt per second of contended prefill, when fairness is enabled.
+    decode_fair_share: float = 0.5
+
+    def __post_init__(self) -> None:
+        self.decode_fair_share = validate_decode_fair_share(self.decode_fair_share)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -375,6 +380,7 @@ class SchedulerSettings:
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
             decode_fairness=bool(data.get("decode_fairness", True)),
+            decode_fair_share=data.get("decode_fair_share", 0.5),
         )
 
 
@@ -1794,6 +1800,10 @@ class GlobalSettings:
                 f"Invalid max_concurrent_requests: "
                 f"{self.scheduler.max_concurrent_requests} (must be > 0)"
             )
+        try:
+            validate_decode_fair_share(self.scheduler.decode_fair_share)
+        except ValueError as exc:
+            errors.append(str(exc))
         if self.scheduler.embedding_batch_size <= 0:
             errors.append(
                 f"Invalid embedding_batch_size: "
@@ -1975,6 +1985,7 @@ class GlobalSettings:
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
             decode_fairness=self.scheduler.decode_fairness,
+            decode_fair_share=self.scheduler.decode_fair_share,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,

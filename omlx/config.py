@@ -4,6 +4,18 @@
 import math
 
 
+def validate_decode_fair_share(value: float) -> float:
+    """Validate the global decode-debt multiplier without importing MLX."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value <= 1
+    ):
+        raise ValueError("decode_fair_share must be a finite number between 0 and 1")
+    return float(value)
+
+
 def parse_size(size_str: str) -> int:
     """
     Parse a human-readable size string to bytes.

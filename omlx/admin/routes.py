@@ -725,6 +725,9 @@ class GlobalSettingsRequest(BaseModel):
     chunked_prefill: bool | None = None
     prefill_priority: str | None = None  # "context" | "speed"
     decode_fairness: bool | None = None
+    decode_fair_share: float | None = Field(
+        default=None, ge=0, le=1, allow_inf_nan=False, strict=True
+    )
 
     # Cache settings
     cache_enabled: bool | None = None
@@ -4671,6 +4674,7 @@ def _global_settings_response(global_settings):
             "chunked_prefill": global_settings.scheduler.chunked_prefill,
             "prefill_priority": global_settings.scheduler.prefill_priority,
             "decode_fairness": global_settings.scheduler.decode_fairness,
+            "decode_fair_share": global_settings.scheduler.decode_fair_share,
         },
         "cache": {
             "enabled": global_settings.cache.enabled,
@@ -5191,39 +5195,6 @@ async def update_global_settings(
                         scheduler.config.prefill_speed_priority = value == "speed"
         runtime_applied.append("prefill_priority")
         logger.info(f"Prefill priority set to '{value}'")
-
-    # Apply decode fairness setting (Live)
-    if request.decode_fairness is not None:
-        enabled = bool(request.decode_fairness)
-        global_settings.scheduler.decode_fairness = enabled
-        from ..server import _server_state
-
-        pool = _server_state.engine_pool
-        if pool is not None:
-            pool_config = getattr(pool, "_scheduler_config", None)
-            if pool_config is not None:
-                pool_config.decode_fairness = enabled
-            for mid, entry in pool._entries.items():
-                if entry is None or entry.engine is None:
-                    continue
-                async_core = getattr(entry.engine, "_engine", None)
-                core = (
-                    getattr(async_core, "engine", None)
-                    if async_core is not None
-                    else None
-                )
-                scheduler = (
-                    getattr(core, "scheduler", None) if core is not None else None
-                )
-                if scheduler is not None:
-                    scheduler._decode_fairness = enabled
-                    scheduler._decode_time_owed_s = 0.0
-                    if hasattr(scheduler, "config"):
-                        scheduler.config.decode_fairness = enabled
-        runtime_applied.append("decode_fairness")
-        logger.info(
-            f"Decode fairness {'enabled' if enabled else 'disabled'}"
-        )
 
     if request.hot_cache_max_size is not None:
         try:
@@ -5887,9 +5858,22 @@ async def update_global_settings(
         previous_embedding_batch_size = global_settings.scheduler.embedding_batch_size
         global_settings.scheduler.embedding_batch_size = pending_embedding_batch_size
 
+    previous_decode_fairness = None
+    previous_decode_fair_share = None
+    if request.decode_fairness is not None:
+        previous_decode_fairness = global_settings.scheduler.decode_fairness
+        global_settings.scheduler.decode_fairness = request.decode_fairness
+    if request.decode_fair_share is not None:
+        previous_decode_fair_share = global_settings.scheduler.decode_fair_share
+        global_settings.scheduler.decode_fair_share = request.decode_fair_share
+
     # Validate settings
     errors = global_settings.validate()
     if errors:
+        if previous_decode_fairness is not None:
+            global_settings.scheduler.decode_fairness = previous_decode_fairness
+        if previous_decode_fair_share is not None:
+            global_settings.scheduler.decode_fair_share = previous_decode_fair_share
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
@@ -5904,6 +5888,10 @@ async def update_global_settings(
     try:
         await _save_global_settings_async(global_settings)
     except Exception as e:
+        if previous_decode_fairness is not None:
+            global_settings.scheduler.decode_fairness = previous_decode_fairness
+        if previous_decode_fair_share is not None:
+            global_settings.scheduler.decode_fair_share = previous_decode_fair_share
         if previous_embedding_batch_size is not None:
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
@@ -5913,6 +5901,45 @@ async def update_global_settings(
                 previous_max_concurrent_requests
             )
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    # Apply fairness only after persistence succeeds. Ratio changes affect new
+    # debt; an unchanged toggle echoed by WebUI must not erase existing debt.
+    if request.decode_fairness is not None or request.decode_fair_share is not None:
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            pool_config = getattr(pool, "_scheduler_config", None)
+            if pool_config is not None:
+                if request.decode_fairness is not None:
+                    pool_config.decode_fairness = request.decode_fairness
+                if request.decode_fair_share is not None:
+                    pool_config.decode_fair_share = request.decode_fair_share
+            for entry in pool._entries.values():
+                if entry is None or entry.engine is None:
+                    continue
+                async_core = getattr(entry.engine, "_engine", None)
+                core = getattr(async_core, "engine", None)
+                scheduler = getattr(core, "scheduler", None)
+                if scheduler is None:
+                    continue
+                if request.decode_fairness is not None:
+                    if scheduler._decode_fairness != request.decode_fairness:
+                        scheduler._decode_time_owed_s = 0.0
+                    scheduler._decode_fairness = request.decode_fairness
+                    scheduler.config.decode_fairness = request.decode_fairness
+                if request.decode_fair_share is not None:
+                    scheduler.config.decode_fair_share = request.decode_fair_share
+        if request.decode_fairness is not None:
+            runtime_applied.append("decode_fairness")
+            logger.info(
+                f"Decode fairness {'enabled' if request.decode_fairness else 'disabled'}"
+            )
+        if request.decode_fair_share is not None:
+            runtime_applied.append("decode_fair_share")
+            logger.info(
+                "Decode fairness ratio set to %g (live)", request.decode_fair_share
+            )
 
     if pending_max_concurrent_requests is not None:
         from ..server import _server_state

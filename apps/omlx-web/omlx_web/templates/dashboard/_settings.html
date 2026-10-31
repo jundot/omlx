@@ -675,6 +675,17 @@
                                               class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
                                     </button>
                                 </div>
+                                <!-- Decode Fairness Ratio -->
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
+                                    <div class="flex-1 min-w-0">
+                                        <label for="decode-fair-share" class="text-sm text-neutral-700">{{ t('settings.resource.decode_fair_share') }}</label>
+                                        <p id="decode-fair-share-hint" class="text-xs text-neutral-400 mt-0.5">{{ t('settings.resource.decode_fair_share_description') }}</p>
+                                    </div>
+                                    <input id="decode-fair-share" type="number" x-model.number="globalSettings.scheduler.decode_fair_share"
+                                           min="0" max="1" step="any" aria-describedby="decode-fair-share-hint"
+                                           :disabled="!globalSettings.scheduler.decode_fairness"
+                                           class="w-full sm:w-48 flex-shrink-0 px-3 py-2 text-sm text-right border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all disabled:opacity-50">
+                                </div>
                                 <!-- Prefill Priority -->
                                 <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 px-4 sm:px-6 py-4">
                                     <div>

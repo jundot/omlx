@@ -385,6 +385,7 @@ class TestSchedulerSettings:
             "chunked_prefill": False,
             "prefill_priority": "context",
             "decode_fairness": True,
+            "decode_fair_share": 0.5,
         }
 
     def test_decode_fairness_from_dict(self):
@@ -3346,3 +3347,136 @@ def test_inference_opt_in_keeps_network_management_requirements(
         allow_unauthenticated_inference=True,
     )
     assert any("non-loopback" in error for error in settings.validate())
+
+
+class TestDecodeFairShare:
+    @pytest.mark.parametrize("ratio", [1.1, float("nan")])
+    def test_invalid_persisted_ratio_is_rejected_without_overwriting_file(
+        self, tmp_path, ratio
+    ):
+        path = tmp_path / "settings.json"
+        original = json.dumps({"scheduler": {"decode_fair_share": ratio}})
+        path.write_text(original)
+        with pytest.raises(ValueError, match="decode_fair_share"):
+            GlobalSettings.load(base_path=tmp_path)
+        assert path.read_text() == original
+
+    @pytest.mark.parametrize("ratio", [0, 0.1, 0.5, 0.75, 1])
+    def test_persistence_and_scheduler_conversion(self, tmp_path, ratio):
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.scheduler.decode_fair_share = ratio
+        settings.save()
+        restored = GlobalSettings.load(base_path=tmp_path)
+        assert restored.scheduler.decode_fair_share == ratio
+        assert restored.to_scheduler_config().decode_fair_share == ratio
+        assert SchedulerSettings.from_dict({}).decode_fair_share == 0.5
+
+    @pytest.mark.parametrize(
+        "ratio", [-0.1, 1.1, float("nan"), float("inf"), True, "0.5", None]
+    )
+    def test_rejects_invalid_configs_and_api_input(self, ratio):
+        from pydantic import ValidationError
+
+        from omlx.admin.routes import GlobalSettingsRequest
+        from omlx.scheduler import SchedulerConfig
+
+        for config in (SchedulerSettings, SchedulerConfig):
+            with pytest.raises(ValueError, match="decode_fair_share"):
+                config(decode_fair_share=ratio)
+        if ratio is not None:  # null has the existing API meaning: no update.
+            with pytest.raises(ValidationError):
+                GlobalSettingsRequest(decode_fair_share=ratio, decode_fairness=False)
+
+    @pytest.mark.parametrize("enabled", [None, True, False])
+    def test_live_update_and_toggle_debt_semantics(
+        self, tmp_path, monkeypatch, enabled
+    ):
+        import asyncio
+        import copy
+        from types import SimpleNamespace
+
+        from omlx.admin import routes
+        from omlx.engine.forward_fairness import ForwardFairnessGate
+        from omlx.server import _server_state
+
+        settings = GlobalSettings(base_path=tmp_path)
+        config = settings.to_scheduler_config()
+        schedulers = [
+            SimpleNamespace(
+                config=copy.copy(config), _decode_fairness=True, _decode_time_owed_s=7
+            ),
+            SimpleNamespace(
+                config=copy.copy(config), _decode_fairness=True, _decode_time_owed_s=3
+            ),
+        ]
+        pool = SimpleNamespace(
+            _scheduler_config=config,
+            _entries={
+                str(i): SimpleNamespace(
+                    engine=SimpleNamespace(
+                        _engine=SimpleNamespace(engine=SimpleNamespace(scheduler=s))
+                    )
+                )
+                for i, s in enumerate(schedulers)
+            },
+        )
+        gate = ForwardFairnessGate("decision:test", config)
+        monkeypatch.setattr(routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(_server_state, "engine_pool", pool)
+        request = routes.GlobalSettingsRequest(
+            decode_fair_share=0.25, decode_fairness=enabled
+        )
+        result = asyncio.run(
+            routes.update_global_settings(request=request, is_admin=True)
+        )
+        assert "decode_fair_share" in result["runtime_applied"]
+        assert config.decode_fair_share == 0.25
+        assert gate._config.decode_fair_share == 0.25
+        assert copy.copy(config).decode_fair_share == 0.25
+        assert [s.config.decode_fair_share for s in schedulers] == [0.25, 0.25]
+        assert [s._decode_time_owed_s for s in schedulers] == (
+            [0, 0] if enabled is False else [7, 3]
+        )
+        assert (
+            GlobalSettings.load(base_path=tmp_path).scheduler.decode_fair_share == 0.25
+        )
+        response = routes._global_settings_response(settings)
+        assert response["scheduler"]["decode_fair_share"] == 0.25
+        defaults = asyncio.run(routes.get_global_settings_defaults(is_admin=True))
+        assert defaults["scheduler"]["decode_fair_share"] == 0.5
+
+    def test_save_failure_preserves_settings_and_runtime(self, tmp_path, monkeypatch):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        from fastapi import HTTPException
+
+        from omlx.admin import routes
+        from omlx.server import _server_state
+
+        settings = GlobalSettings(base_path=tmp_path)
+        config = settings.to_scheduler_config()
+        monkeypatch.setattr(routes, "_get_global_settings", lambda: settings)
+        monkeypatch.setattr(
+            _server_state,
+            "engine_pool",
+            SimpleNamespace(_scheduler_config=config, _entries={}),
+        )
+        monkeypatch.setattr(
+            routes,
+            "_save_global_settings_async",
+            AsyncMock(side_effect=OSError("test save failure")),
+        )
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(
+                routes.update_global_settings(
+                    request=routes.GlobalSettingsRequest(
+                        decode_fair_share=0, decode_fairness=False
+                    ),
+                    is_admin=True,
+                )
+            )
+        assert error.value.status_code == 500
+        assert settings.scheduler.decode_fair_share == config.decode_fair_share == 0.5
+        assert settings.scheduler.decode_fairness is config.decode_fairness is True

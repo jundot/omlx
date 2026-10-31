@@ -109,6 +109,31 @@ private struct SchedulerSection: View {
                 RowSwitch(isOn: $vm.chunkedPrefill)
             }
             Row(
+                label: String(localized: "performance.scheduler.decode_fairness",
+                              defaultValue: "Prioritize Decoding During Prefill"),
+                sublabel: String(localized: "performance.scheduler.decode_fairness.sub",
+                                 defaultValue: "Let running responses progress between prefill chunks.")
+            ) {
+                RowSwitch(isOn: $vm.decodeFairness)
+                    .disabled(!vm.supportsDecodeFairness)
+            }
+            Row(
+                label: String(localized: "performance.scheduler.decode_fair_share",
+                              defaultValue: "Decode Fairness Ratio"),
+                sublabel: String(localized: "performance.scheduler.decode_fair_share.sub",
+                                 defaultValue: "Decode-time budget per second of competing prefill. Default 0.5; range 0–1. Effects depend on workload and MTP.")
+            ) {
+                TextInput(text: $vm.decodeFairShareText, mono: true, width: .controlNarrow)
+                    .disabled(!vm.supportsDecodeFairShare || !vm.decodeFairness)
+                    .accessibilityLabel(String(localized: "performance.scheduler.decode_fair_share",
+                                               defaultValue: "Decode Fairness Ratio"))
+                    .help(vm.supportsDecodeFairShare
+                          ? String(localized: "performance.scheduler.decode_fair_share.help",
+                                   defaultValue: "At 0, fairness chunk caps remain active. Turn prioritization off to disable fairness. The saved ratio is retained.")
+                          : String(localized: "performance.scheduler.decode_fair_share.unavailable",
+                                   defaultValue: "This server does not expose Decode Fairness Ratio. Update the server to tune it."))
+            }
+            Row(
                 label: String(localized: "performance.scheduler.prefill_priority",
                               defaultValue: "Prefill Priority",
                               comment: "Row label for the prefill priority segmented control"),
