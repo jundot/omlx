@@ -10,6 +10,9 @@
 //
 // Cancellation: `cancel()` is best-effort; an in-flight download exits at
 // the next stream chunk.
+// A download that stops is resumed from the bytes already on disk, a bounded
+// number of times without progress. There is no whole-transfer deadline: the
+// idle timeout is the stall detector.
 // A staged copy newer than the running app stays on disk across launches.
 // The next check reuses it only after a fresh signature check.
 
@@ -66,7 +69,7 @@ final class AppUpdater {
 
     private var task: Task<Void, Never>?
     private var session: URLSession?
-    private var downloadTask: URLSessionDownloadTask?
+    private var downloadTask: URLSessionTask?
     private var cancelled = false
 
     /// `allowsMeteredNetwork: false` fails the download on Low Data Mode and hotspot connections.
@@ -266,19 +269,121 @@ final class AppUpdater {
 
     // MARK: - Download
 
-    private func downloadDMG(to dest: URL) async throws {
+    /// Consecutive attempts that may end without new bytes before the update
+    /// is reported as failed. An attempt that made progress resets the count.
+    nonisolated static let maxDownloadResumes = 5
+
+    /// The release CDN throttles some routes to a few dozen KB/s per
+    /// connection, so an 830 MB DMG can take hours. The request timeout is an
+    /// idle timeout (its timer resets whenever bytes arrive) and is the stall
+    /// detector. The resource timeout is only a backstop: a one-hour deadline
+    /// here killed transfers that were still receiving bytes (#4199).
+    nonisolated static func downloadSessionConfiguration(
+        allowsMeteredNetwork: Bool
+    ) -> URLSessionConfiguration {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 3600
+        config.timeoutIntervalForResource = 7 * 24 * 60 * 60
+        config.urlCache = nil
         config.allowsConstrainedNetworkAccess = allowsMeteredNetwork
         config.allowsExpensiveNetworkAccess = allowsMeteredNetwork
-        let delegate = DMGDownloadDelegate(destination: dest) { [weak self] pct, received, total in
-            Task { @MainActor [weak self] in
-                guard let self, !self.cancelled else { return }
-                self.onProgress(.downloading(percent: pct, receivedBytes: received, totalBytes: total))
+        return config
+    }
+
+    /// `bytes <first>-<last>/<total>` from a 206; `total` is nil for `*`.
+    nonisolated static func parseContentRange(_ header: String?) -> (first: Int64, total: Int64?)? {
+        guard let header, header.hasPrefix("bytes ") else { return nil }
+        let parts = header.dropFirst(6).split(separator: "/", maxSplits: 1)
+        guard parts.count == 2,
+              let dash = parts[0].firstIndex(of: "-"),
+              let first = Int64(parts[0][..<dash])
+        else { return nil }
+        return (first, Int64(parts[1]))
+    }
+
+    /// A transfer that stopped after `received` bytes were written to disk.
+    /// The next attempt continues from there while the asset still has `etag`.
+    struct DownloadInterrupted: Error {
+        let received: Int64
+        let etag: String?
+        let underlying: Error
+    }
+
+    /// Writes the DMG to `dest`. A transfer that stops is picked up from the
+    /// bytes already on disk with a fresh request to the release URL and a
+    /// `Range` header. The redirect target behind that URL is signed and
+    /// expires, so URLSession's resume data (which replays the signed URL)
+    /// would stop working after the first hour. A 200 or a changed ETag on a
+    /// resumed request starts the file over. The pause before a resume starts
+    /// at `resumeDelay` and doubles while attempts make no progress, so a
+    /// network that is re-associating gets about a minute.
+    func downloadDMG(
+        to dest: URL,
+        configuration: URLSessionConfiguration? = nil,
+        resumeDelay: Duration = .seconds(2)
+    ) async throws {
+        let config = configuration
+            ?? Self.downloadSessionConfiguration(allowsMeteredNetwork: allowsMeteredNetwork)
+        var received: Int64 = 0
+        var etag: String?
+        var attemptsWithoutProgress = 0
+        while true {
+            if cancelled { throw UpdateError.cancelled }
+            do {
+                try await downloadAttempt(to: dest, configuration: config, offset: received, etag: etag)
+                return
+            } catch let interrupted as DownloadInterrupted {
+                if cancelled { throw UpdateError.cancelled }
+                attemptsWithoutProgress =
+                    interrupted.received > received ? 0 : attemptsWithoutProgress + 1
+                guard attemptsWithoutProgress <= Self.maxDownloadResumes else {
+                    throw interrupted.underlying
+                }
+                received = interrupted.received
+                etag = interrupted.etag
+                NSLog(
+                    "oMLX updater: download stopped after %lld bytes (%@), resuming",
+                    received, interrupted.underlying.localizedDescription
+                )
+                do {
+                    try await Task.sleep(for: resumeDelay * (1 << max(attemptsWithoutProgress - 1, 0)))
+                } catch {
+                    throw UpdateError.cancelled
+                }
             }
         }
-        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
+    }
+
+    private func downloadAttempt(
+        to dest: URL,
+        configuration: URLSessionConfiguration,
+        offset: Int64,
+        etag: String?
+    ) async throws {
+        var request = URLRequest(url: dmgURL)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        if offset > 0 {
+            request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
+            if let etag {
+                request.setValue(etag, forHTTPHeaderField: "If-Range")
+            }
+        }
+
+        let delegate: DMGDownloadDelegate
+        do {
+            delegate = try DMGDownloadDelegate(destination: dest, offset: offset, etag: etag) {
+                [weak self] pct, received, total in
+                Task { @MainActor [weak self] in
+                    guard let self, !self.cancelled else { return }
+                    self.onProgress(.downloading(percent: pct, receivedBytes: received, totalBytes: total))
+                }
+            }
+        } catch {
+            throw UpdateError.downloadFailed(
+                "Could not open \(dest.lastPathComponent): \(error.localizedDescription)"
+            )
+        }
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         self.session = session
         defer {
             session.invalidateAndCancel()
@@ -287,82 +392,156 @@ final class AppUpdater {
         }
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            delegate.continuation = continuation
-            let task = session.downloadTask(with: dmgURL)
+            delegate.begin(continuation)
+            let task = session.dataTask(with: request)
             self.downloadTask = task
             task.resume()
         }
-        if cancelled {
-            throw UpdateError.cancelled
-        }
     }
 
-    private final class DMGDownloadDelegate: NSObject, URLSessionDownloadDelegate {
-        let destination: URL
-        let onProgress: @Sendable (Int, Int64, Int64) -> Void
-        var continuation: CheckedContinuation<Void, Error>?
-
+    /// Streams the response body into the destination file. Callbacks arrive
+    /// on the session's serial delegate queue; `lock` guards every stored
+    /// property, and `begin` runs before the task is resumed.
+    private final class DMGDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
         private let lock = NSLock()
-        private var completed = false
+        private let file: FileHandle
+        private let resumingFrom: Int64
+        private let onProgress: @Sendable (Int, Int64, Int64) -> Void
+        private var continuation: CheckedContinuation<Void, Error>?
+        private var received: Int64
+        private var total: Int64?
+        private var etag: String?
         private var lastReportedPct = -1
+        private var completed = false
 
         init(
             destination: URL,
+            offset: Int64,
+            etag: String?,
             onProgress: @escaping @Sendable (Int, Int64, Int64) -> Void
-        ) {
-            self.destination = destination
+        ) throws {
+            if offset == 0 || !FileManager.default.fileExists(atPath: destination.path) {
+                FileManager.default.createFile(atPath: destination.path, contents: nil)
+            }
+            file = try FileHandle(forWritingTo: destination)
+            try file.truncate(atOffset: UInt64(offset))
+            try file.seek(toOffset: UInt64(offset))
+            resumingFrom = offset
+            received = offset
+            self.etag = etag
             self.onProgress = onProgress
         }
 
-        func urlSession(
-            _ session: URLSession,
-            downloadTask: URLSessionDownloadTask,
-            didWriteData bytesWritten: Int64,
-            totalBytesWritten: Int64,
-            totalBytesExpectedToWrite: Int64
-        ) {
-            guard totalBytesExpectedToWrite > 0 else { return }
-            let pct = Int(totalBytesWritten * 100 / totalBytesExpectedToWrite)
+        func begin(_ continuation: CheckedContinuation<Void, Error>) {
             lock.lock()
-            let shouldReport = pct != lastReportedPct
-            if shouldReport { lastReportedPct = pct }
+            self.continuation = continuation
             lock.unlock()
-            if shouldReport {
-                onProgress(pct, totalBytesWritten, totalBytesExpectedToWrite)
-            }
         }
 
         func urlSession(
             _ session: URLSession,
-            downloadTask: URLSessionDownloadTask,
-            didFinishDownloadingTo location: URL
+            dataTask: URLSessionDataTask,
+            didReceive response: URLResponse,
+            completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
         ) {
-            guard let http = downloadTask.response as? HTTPURLResponse,
-                  http.statusCode == 200
-            else {
-                let code = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? -1
-                finish(.failure(UpdateError.downloadFailed("HTTP \(code)")))
+            guard let http = response as? HTTPURLResponse else {
+                finish(.failure(UpdateError.downloadFailed("Not an HTTP response")))
+                completionHandler(.cancel)
                 return
             }
-            do {
-                if FileManager.default.fileExists(atPath: destination.path) {
-                    try FileManager.default.removeItem(at: destination)
+            let responseETag = http.value(forHTTPHeaderField: "ETag")
+            lock.lock()
+            let expectedETag = etag
+            lock.unlock()
+
+            switch http.statusCode {
+            case 206 where resumingFrom > 0:
+                guard let range = AppUpdater.parseContentRange(http.value(forHTTPHeaderField: "Content-Range")),
+                      range.first == resumingFrom,
+                      expectedETag == nil || responseETag == expectedETag
+                else {
+                    // Not the continuation of our file (the asset changed and
+                    // the server ignored If-Range, or it picked another
+                    // range): drop this body and start over on the next attempt.
+                    let changed = UpdateError.downloadFailed("Asset changed while resuming at byte \(resumingFrom)")
+                    finish(.failure(DownloadInterrupted(received: 0, etag: nil, underlying: changed)))
+                    completionHandler(.cancel)
+                    return
                 }
-                try FileManager.default.moveItem(at: location, to: destination)
-                finish(.success(()))
+                lock.lock()
+                total = range.total
+                lock.unlock()
+            case 200:
+                // The whole asset: first attempt, or the server did not honour
+                // the range, or the asset changed. Start the file over.
+                do {
+                    try restartFile()
+                } catch {
+                    finish(.failure(UpdateError.downloadFailed(error.localizedDescription)))
+                    completionHandler(.cancel)
+                    return
+                }
+                lock.lock()
+                total = http.expectedContentLength > 0 ? http.expectedContentLength : nil
+                etag = responseETag
+                lock.unlock()
+            default:
+                finish(.failure(UpdateError.downloadFailed("HTTP \(http.statusCode)")))
+                completionHandler(.cancel)
+                return
+            }
+            completionHandler(.allow)
+        }
+
+        func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+            lock.lock()
+            do {
+                try file.write(contentsOf: data)
             } catch {
+                lock.unlock()
                 finish(.failure(UpdateError.downloadFailed(error.localizedDescription)))
+                dataTask.cancel()
+                return
+            }
+            received += Int64(data.count)
+            var report: (Int, Int64, Int64)?
+            if let total, total > 0 {
+                let pct = Int(received * 100 / total)
+                if pct != lastReportedPct {
+                    lastReportedPct = pct
+                    report = (pct, received, total)
+                }
+            }
+            lock.unlock()
+            if let report {
+                onProgress(report.0, report.1, report.2)
             }
         }
 
-        func urlSession(
-            _ session: URLSession,
-            task: URLSessionTask,
-            didCompleteWithError error: Error?
-        ) {
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            lock.lock()
+            let received = self.received
+            let total = self.total
+            let etag = self.etag
+            lock.unlock()
             if let error {
-                finish(.failure(error))
+                finish(.failure(DownloadInterrupted(received: received, etag: etag, underlying: error)))
+            } else if let total, received != total {
+                // A clean end before the announced length: resume from here.
+                let short = UpdateError.downloadFailed("Received \(received) of \(total) bytes")
+                finish(.failure(DownloadInterrupted(received: received, etag: etag, underlying: short)))
+            } else {
+                finish(.success(()))
             }
+        }
+
+        private func restartFile() throws {
+            lock.lock()
+            defer { lock.unlock() }
+            try file.truncate(atOffset: 0)
+            try file.seek(toOffset: 0)
+            received = 0
+            lastReportedPct = -1
         }
 
         private func finish(_ result: Result<Void, Error>) {
@@ -374,6 +553,7 @@ final class AppUpdater {
             completed = true
             let continuation = self.continuation
             self.continuation = nil
+            try? file.close()
             lock.unlock()
 
             switch result {
