@@ -187,4 +187,43 @@ final class BenchDTODecodeTests: XCTestCase {
 
         XCTAssertThrowsError(try decoder.decode(BenchResultsResponse.self, from: json))
     }
+
+    // MARK: Accuracy queue
+
+    func testDecodeIdleAccuracyQueueStatus() throws {
+        // What `queue/status` returns when idle and right after a cancel.
+        // A decode failure here left the Running row stuck after Cancel (#4250).
+        let json = """
+        {
+            "running": false,
+            "current_model": null,
+            "current_bench_id": null,
+            "last_progress": null,
+            "phase": null,
+            "queue": []
+        }
+        """.data(using: .utf8)!
+
+        let status = try decoder.decode(AccuracyQueueStatus.self, from: json)
+        XCTAssertFalse(status.running)
+        XCTAssertNil(status.currentModel)
+        XCTAssertNil(status.currentBenchId)
+        XCTAssertFalse(status.isActivelyEvaluating)
+    }
+
+    func testDecodeIdleAccuracyResults() throws {
+        let json = """
+        {
+            "results": [],
+            "running": false,
+            "current_model": null,
+            "current_bench_id": null
+        }
+        """.data(using: .utf8)!
+
+        let response = try decoder.decode(AccuracyResultsResponse.self, from: json)
+        XCTAssertFalse(response.running)
+        XCTAssertNil(response.currentModel)
+        XCTAssertNil(response.currentBenchId)
+    }
 }
