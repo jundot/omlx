@@ -1352,6 +1352,7 @@ class TestProcessChatMessages:
             chat_template_kwargs=None,
             tools=None,
             is_partial=None,
+            reply_prefix=None,
         )
 
     @patch("omlx.engine.vlm.extract_images_from_messages")
@@ -2830,6 +2831,42 @@ class TestPartialModeVLM:
         call_kwargs = engine._processor.apply_chat_template.call_args[1]
         assert call_kwargs["add_generation_prompt"] is True
         assert "continue_final_message" not in call_kwargs
+
+    def test_reply_prefix_follows_the_generation_prompt(self):
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.apply_chat_template.return_value = "<formatted>"
+        engine = _make_loaded_engine(tokenizer=mock_tokenizer)
+
+        prompt = engine._apply_chat_template(
+            self._plain_messages()[:1], reply_prefix="<|tool_call>call:"
+        )
+
+        assert prompt == "<formatted><|tool_call>call:"
+        call_kwargs = mock_tokenizer.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is True
+        assert "continue_final_message" not in call_kwargs
+        assert engine.supports_reply_prefix is True
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_generation_path_appends_reply_prefix(self, mock_prepare):
+        engine = self._vision_engine()
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        engine._process_chat_messages(
+            self._plain_messages()[:1],
+            tools=None,
+            kwargs={"is_partial": False, "reply_prefix": "<|tool_call>call:"},
+        )
+
+        call_kwargs = engine._processor.apply_chat_template.call_args[1]
+        assert call_kwargs["add_generation_prompt"] is True
+        assert mock_prepare.call_args[1]["prompts"] == [
+            "<vision prompt><|tool_call>call:"
+        ]
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

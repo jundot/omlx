@@ -68,6 +68,10 @@ class BatchedEngine(BaseEngine):
     concurrent users by batching requests together.
     """
 
+    # Chat requests take a ``reply_prefix``: raw text appended to the rendered
+    # generation prompt, which the reply continues (forced tool calls, #2877).
+    supports_reply_prefix = True
+
     def __init__(
         self,
         model_name: str,
@@ -928,6 +932,7 @@ class BatchedEngine(BaseEngine):
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
         add_generation_prompt: bool | None = None,
+        reply_prefix: str | None = None,
     ) -> str:
         """Apply chat template to messages.
 
@@ -943,7 +948,17 @@ class BatchedEngine(BaseEngine):
                 compatibility with direct engine callers.
             add_generation_prompt: Overrides the partial-derived default, used
                 to render the same messages without the generation prompt.
+            reply_prefix: Raw text appended after the generation prompt, which
+                the reply continues.
         """
+        if reply_prefix:
+            prompt = self._apply_chat_template(
+                messages,
+                tools,
+                chat_template_kwargs=chat_template_kwargs,
+                is_partial=False,
+            )
+            return prompt + reply_prefix
         if hasattr(self._tokenizer, "apply_chat_template"):
             if is_partial is None:
                 is_partial = detect_and_strip_partial(messages)
@@ -1008,6 +1023,7 @@ class BatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
         is_partial: bool | None = None,
+        reply_prefix: str | None = None,
     ) -> int:
         """
         Count prompt tokens for chat messages after applying chat template.
@@ -1017,12 +1033,17 @@ class BatchedEngine(BaseEngine):
             tools: Optional tool definitions
             chat_template_kwargs: Optional kwargs for chat template
             is_partial: Explicit partial-mode signal (see _apply_chat_template).
+            reply_prefix: Raw text after the generation prompt.
 
         Returns:
             Number of prompt tokens
         """
         _, token_ids = self.prepare_chat_prompt(
-            messages, tools, chat_template_kwargs, is_partial
+            messages,
+            tools,
+            chat_template_kwargs,
+            is_partial,
+            reply_prefix=reply_prefix,
         )
         return len(token_ids)
 
@@ -1055,6 +1076,7 @@ class BatchedEngine(BaseEngine):
         is_partial: bool | None = None,
         add_generation_prompt: bool | None = None,
         add_special_tokens: bool | None = None,
+        reply_prefix: str | None = None,
     ) -> tuple[str, list[int]]:
         """Render and tokenize a chat prompt for reuse within one request."""
         messages = self._preprocess_messages(messages)
@@ -1065,6 +1087,7 @@ class BatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
             add_generation_prompt=add_generation_prompt,
+            reply_prefix=reply_prefix,
         )
         if add_special_tokens is None:
             return prompt, list(self._tokenizer.encode(prompt))
@@ -1421,6 +1444,7 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        reply_prefix = kwargs.pop("reply_prefix", None)
         prepared = kwargs.pop("_prepared_prompt", None)
         prompt = (
             prepared[0]
@@ -1430,6 +1454,7 @@ class BatchedEngine(BaseEngine):
                 template_tools,
                 chat_template_kwargs=ct_kwargs,
                 is_partial=partial,
+                reply_prefix=reply_prefix,
             )
         )
 
@@ -1491,6 +1516,7 @@ class BatchedEngine(BaseEngine):
                 template_tools,
                 chat_template_kwargs=kwargs.get("chat_template_kwargs"),
                 is_partial=kwargs.get("is_partial"),
+                reply_prefix=kwargs.get("reply_prefix"),
             )
             # Standalone preflight keeps tokenizer failures for the real chat
             # path to surface through its existing error handler.
@@ -1585,6 +1611,7 @@ class BatchedEngine(BaseEngine):
         # Apply chat template
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        reply_prefix = kwargs.pop("reply_prefix", None)
         prepared = kwargs.pop("_prepared_prompt", None)
         prompt = (
             prepared[0]
@@ -1594,6 +1621,7 @@ class BatchedEngine(BaseEngine):
                 template_tools,
                 chat_template_kwargs=ct_kwargs,
                 is_partial=partial,
+                reply_prefix=reply_prefix,
             )
         )
 

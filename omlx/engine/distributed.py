@@ -205,6 +205,8 @@ class DistributedBatchedEngine(BatchedEngine):
     """Keep oMLX's API/tokenizer layer while proxying model work to MLX ranks."""
 
     supports_request_scoped_abort = True
+    # The ranks render chat prompts themselves.
+    supports_reply_prefix = False
 
     # The coordinator does not own a local Scheduler: each rank process
     # creates and enforces its own prefill guard from the signed deployment.

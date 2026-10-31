@@ -1194,6 +1194,57 @@ class TestBatchedEngineTokenizeChat:
         assert token_ids == [ord(c) for c in "user:hi"]
 
 
+class TestBatchedEngineReplyPrefix:
+    """``reply_prefix`` follows the generation prompt as raw text (#2877)."""
+
+    PREFIX = "<|tool_call>call:"
+
+    @staticmethod
+    def _engine():
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._tokenizer = _TemplateTokenizer()
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(
+                return_value=TestBatchedEngineSpecPrefillForwarding._fake_output()
+            )
+        )
+        return engine
+
+    def test_appended_after_the_generation_prompt(self):
+        engine = self._engine()
+        messages = [{"role": "user", "content": "hi"}]
+
+        prompt = engine._apply_chat_template(messages, reply_prefix=self.PREFIX)
+
+        assert prompt == "user:hi|assistant:" + self.PREFIX
+
+    @pytest.mark.asyncio
+    async def test_chat_submits_the_prompt_prepared_with_it(self):
+        engine = self._engine()
+        messages = [{"role": "user", "content": "hi"}]
+
+        await engine.chat(list(messages), is_partial=False, reply_prefix=self.PREFIX)
+
+        submitted = engine._engine.generate.call_args.kwargs["prompt"]
+        prepared, token_ids = engine.prepare_chat_prompt(
+            list(messages), is_partial=False, reply_prefix=self.PREFIX
+        )
+        assert submitted == prepared == "user:hi|assistant:" + self.PREFIX
+        assert engine.count_chat_tokens(
+            list(messages), is_partial=False, reply_prefix=self.PREFIX
+        ) == len(token_ids)
+
+    def test_distributed_engine_does_not_take_one(self):
+        from omlx.engine.batched import BatchedEngine
+        from omlx.engine.distributed import DistributedBatchedEngine
+
+        assert BatchedEngine.supports_reply_prefix is True
+        assert DistributedBatchedEngine.supports_reply_prefix is False
+
+
 class TestBatchedEnginePreparedPrompt:
     @staticmethod
     def _engine():
