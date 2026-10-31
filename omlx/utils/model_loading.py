@@ -892,6 +892,13 @@ def maybe_apply_pre_load_patches(
             )
             set_mtp_active(False)
             mtp_active = False
+        from ..patches.qwen4_hadamard import (
+            apply_qwen4_hadamard,
+            configure_qwen4_hadamard,
+        )
+
+        configure_qwen4_hadamard(model_name)
+        apply_qwen4_hadamard()
         configure_qwen4_exp_runtime(
             model_name,
             mode=(

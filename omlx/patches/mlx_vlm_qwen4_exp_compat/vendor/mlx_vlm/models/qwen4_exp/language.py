@@ -3029,6 +3029,50 @@ class Qwen4ExpGatedResidual(nn.Module):
             )
 
     def __call__(
+        self, hyper_input: mx.array, target_verify: bool = False, write=None,
+        hyper_plain: bool = False, out_hyper_plain: bool = False,
+    ):
+        # v4 Hadamard fold: when this block is tagged, the stream arrives in the rotated basis.
+        # The conversion lives here rather than in a monkeypatched __call__ so the hot decode path
+        # pays one Python frame instead of a wrapper + getattr + kwargs inspection per block.
+        rots = getattr(self, "_qh_rot", None)
+        if rots is not None:
+            from omlx.patches.qwen4_hadamard import apply_rotation
+            rots_mixed = self._qh_rot_mixed
+            if write is not None:
+                # the pending (branch, gate) residual arrives in the rotated basis
+                branch, gate = write
+                write = (apply_rotation(branch, rots_mixed, inverse=True), gate)
+            if getattr(self, "_qh_busy", False):
+                # the deferred-write path recurses through self(...); the inner call already has a
+                # plain-basis input, so it must not convert again
+                return self._qh_impl(hyper_input, target_verify=target_verify, write=write)
+            self._qh_busy = True
+            try:
+                plain_input = hyper_input if hyper_plain else apply_rotation(
+                    hyper_input, rots, inverse=True)
+                out = self._qh_impl(
+                    plain_input,
+                    target_verify=target_verify,
+                    write=write,
+                )
+            finally:
+                self._qh_busy = False
+            # The passthrough keeps the plain basis across a layer's two blocks: the first block
+            # returns it plain and the second feeds it straight back, so two rotations per layer
+            # (its output rotation and the next block's input unrotation) disappear.
+            if isinstance(out, tuple) and len(out) == 2:
+                mixed, hyper = out
+                hyper_out = hyper if out_hyper_plain else apply_rotation(hyper, rots)
+                return (apply_rotation(mixed, rots_mixed), hyper_out)
+            if isinstance(out, tuple):
+                mixed, hyper, *rest = out
+                hyper_out = hyper if out_hyper_plain else apply_rotation(hyper, rots)
+                return (apply_rotation(mixed, rots_mixed), hyper_out, *rest)
+            return apply_rotation(out, rots_mixed)
+        return self._qh_impl(hyper_input, target_verify=target_verify, write=write)
+
+    def _qh_impl(
         self, hyper_input: mx.array, target_verify: bool = False, write=None
     ):
         # ``write`` is a pending (branch, gate) residual write onto hyper_input.
@@ -3043,7 +3087,7 @@ class Qwen4ExpGatedResidual(nn.Module):
             if fused is not None:
                 return fused
             hyper_input = _hc_write(hyper_input, *write)
-            out = self(hyper_input, target_verify=target_verify)
+            out = self._qh_impl(hyper_input, target_verify=target_verify)
             return out if "block_inject_weight" in self else (out, hyper_input)
         if hc_fused.compatible(self, hyper_input):
             fused = hc_fused.fused_forward(self, hyper_input)
@@ -4555,6 +4599,9 @@ class Qwen4ExpPLELayer(nn.Module):
         self.short_conv_state_len = (
             config.ple_conv_kernel_size - 1
         ) * self.conv_dilation
+        from omlx.patches import qwen4_hadamard as _qh
+
+        self._qh_rot = _qh.rotations_for(hc_hidden_size, period=self.hidden_size)
         self.conv1d = nn.Conv1d(
             hc_hidden_size,
             hc_hidden_size,
@@ -4588,6 +4635,13 @@ class Qwen4ExpPLELayer(nn.Module):
         capture_speculative_state = target_verify and input_ids.shape[1] > 1
         if cache is not None:
             cache._qwen4_exp_ple_speculative_state = None
+        if self._qh_rot is not None:
+            # The PLE path contains a depthwise conv and per-channel gamma norms that a
+            # channel rotation does not commute with, so it runs in the unrotated basis and
+            # only its contribution to the residual is rotated.
+            from omlx.patches import qwen4_hadamard as _qh
+
+            hidden_states = _qh.apply_rotation(hidden_states, self._qh_rot, inverse=True)
         history = None
         if capture_speculative_state and cache is not None:
             history = self.ple_embedding._previous_context(
@@ -4628,7 +4682,12 @@ class Qwen4ExpPLELayer(nn.Module):
                 conv_state=conv_state,
                 conv_inputs=normed,
             )
-        return gated_values + conv_output
+        result = gated_values + conv_output
+        if self._qh_rot is not None:
+            from omlx.patches import qwen4_hadamard as _qh
+
+            result = _qh.apply_rotation(result, self._qh_rot)
+        return result
 
 
 def _hc_write(hyper_input, branch, weights):
@@ -4689,6 +4748,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states,
             target_verify=target_verify,
             write=write,
+            out_hyper_plain=True,
         )
         if self.is_linear:
             linear_attn = self["linear_attn"]
@@ -4709,6 +4769,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hyper_input,
             target_verify=target_verify,
             write=(branch, injection_weights),
+            hyper_plain=True,
         )
         mlp = self["mlp"]
         branch = _VERIFIER._feed_forward(mlp, mixed) if target_verify else mlp(mixed)
@@ -4798,16 +4859,42 @@ class Qwen4ExpModel(nn.Module):
             ):
                 mx.async_eval(hidden_states, *(write or ()))
             if hidden_sink is not None and index in capture:
+                # DFlash2 was trained on completed, zero-based layer outputs
+                # averaged over the hyper-connection streams; Lightning MTP
+                # consumes the mixer's mixed representation instead.
+                mean_capture = bool(
+                    getattr(self, "_omlx_dflash_capture_mean", False)
+                )
                 if write is None:
-                    mixed = self.hyper_connection_mixer(
-                        hidden_states, target_verify=target_verify
-                    )
+                    if mean_capture:
+                        completed = hidden_states
+                    else:
+                        mixed = self.hyper_connection_mixer(
+                            hidden_states, target_verify=target_verify
+                        )
                 else:
-                    mixed, hidden_states = self.hyper_connection_mixer(
-                        hidden_states, target_verify=target_verify, write=write
-                    )
+                    if mean_capture:
+                        completed = _hc_write(hidden_states, *write)
+                    else:
+                        mixed, completed = self.hyper_connection_mixer(
+                            hidden_states, target_verify=target_verify, write=write
+                        )
+                    hidden_states = completed
                     write = None
-                hidden_sink.append(mixed)
+                if mean_capture:
+                    completed = completed.reshape(
+                        *completed.shape[:-1],
+                        self.args.hc_count,
+                        self.args.hidden_size,
+                    ).mean(axis=-2)
+                    rots = getattr(self, "_omlx_hadamard_capture_rots", None)
+                    if rots is not None:
+                        from omlx.patches import qwen4_hadamard as _qh
+
+                        completed = _qh.apply_rotation(completed, rots, inverse=True)
+                    hidden_sink.append(completed)
+                else:
+                    hidden_sink.append(mixed)
 
         mixed = None
         if write is not None:
@@ -4891,12 +4978,39 @@ class Qwen4ExpMTPModule(nn.Module):
             layer_config,
             use_combine=False,
         )
+        # The root model (where this head lives) is not reached by the language model's tagging
+        # pass, so a checkpoint with a declared Hadamard transform would otherwise run this head in
+        # the wrong basis and every draft would be rejected. Self-tag when a spec is active.
+        try:
+            from omlx.patches import qwen4_hadamard as _qh
+
+            spec = _qh.active_spec()
+            if spec is not None:
+                self._omlx_hadamard_capture_rots = _qh.build_rotations(
+                    self.hc_count * self.hidden_size, spec, self.hidden_size)
+                token_rots = _qh.build_rotations(self.hidden_size, spec, self.hidden_size)
+                self._omlx_hadamard_token_rots = token_rots
+                self._omlx_hadamard_out_rots = token_rots
+        except Exception:
+            pass
 
     def fuse_inputs(
         self,
         token_embeddings: mx.array,
         hidden_states: mx.array,
     ) -> mx.array:
+        # v4 Hadamard: the trunk's hyper-connection stream arrives rotated; this head and its
+        # layer run in the plain basis (its hyper-connection is deliberately NOT tagged), so the
+        # basis change is undone once here.
+        # the two basis conversions are independent: the trunk stream uses the hc-wide rotation
+        # and the shared (folded) embedding table uses the hidden-wide one
+        from omlx.patches.qwen4_hadamard import apply_rotation
+        rots = getattr(self, "_omlx_hadamard_capture_rots", None)
+        token_rots = getattr(self, "_omlx_hadamard_token_rots", None)
+        if rots is not None:
+            hidden_states = apply_rotation(hidden_states, rots, inverse=True)
+        if token_rots is not None:
+            token_embeddings = apply_rotation(token_embeddings, token_rots, inverse=True)
         expected_width = self.hc_count * self.hidden_size
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.reshape(
@@ -4964,9 +5078,28 @@ class Qwen4ExpMTPModule(nn.Module):
             if defer_write:
                 hidden_states, write = hidden_states[0], hidden_states[1:]
         if write is not None:
-            # The mixer applies the last write and returns (mixed, residual).
-            return self.hyper_connection_mixer(hidden_states, write=write)
-        return self.hyper_connection_mixer(hidden_states), hidden_states
+            # The mixer applies the last write and returns (mixed, residual). The deferred-write
+            # branch used to return before the basis conversion, so the head produced plain-basis
+            # logits source against a folded lm_head; convert here too.
+            mixed, residual = self.hyper_connection_mixer(hidden_states, write=write)
+            out_rots = getattr(self, "_omlx_hadamard_out_rots", None)
+            if out_rots is not None:
+                from omlx.patches.qwen4_hadamard import apply_rotation
+                mixed = apply_rotation(mixed, out_rots)
+            return mixed, residual
+        mixed = self.hyper_connection_mixer(hidden_states)
+        out_rots = getattr(self, "_omlx_hadamard_out_rots", None)
+        if out_rots is not None:
+            from omlx.patches.qwen4_hadamard import apply_rotation
+            # the shared lm_head is folded to read a rotated stream
+            mixed = apply_rotation(mixed, out_rots)
+            # The chain feeds this residual back into fuse_inputs for the next draft, which
+            # unrotates it on entry. Returning it rotated keeps that invariant for chained drafts;
+            # leaving it plain made depth-2 drafts garbage (d1 accepted, d2 0/3).
+            hc_rots = getattr(self, "_omlx_hadamard_capture_rots", None)
+            if hc_rots is not None:
+                hidden_states = apply_rotation(hidden_states, hc_rots)
+        return mixed, hidden_states
 
 
 class LanguageModel(Qwen3_5LanguageModel):
