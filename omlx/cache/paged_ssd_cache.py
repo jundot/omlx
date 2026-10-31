@@ -168,6 +168,33 @@ _MAX_PENDING_WRITES = _compute_max_pending_writes()
 # cost of taking multiple saves to fully reconverge.
 _MAX_INLINE_UNLINKS_PER_SAVE = 32
 
+# A GDN sidecar carries the model's whole recurrent state, so its size is a
+# property of the architecture and not of the prefix it covers: a Qwen3.5
+# hybrid writes ~49 MiB whether the file holds a 63-token tail or a full
+# 2048-token block.  Writing one per request therefore spends tens of MiB of
+# SSD to save a few milliseconds of prefill, so a partial-block prefix — the
+# trailing tail of every request — is admitted on two conditions instead of on
+# submission:
+#   * it must cover at least ``_GDN_SIDECAR_MIN_TOKENS_DEFAULT`` tokens (a
+#     sub-256-token tail cannot repay the write even when it repeats);
+#   * it must have been requested twice (``_note_gdn_sidecar_request``), so
+#     per-request tails that never repeat are never persisted while a shared
+#     prompt still becomes durable after one miss.
+# A prefix covering at least one full block is admitted on first sighting.
+# Override the floor with OMLX_GDN_SIDECAR_MIN_TOKENS=<tokens>; 0 disables it.
+_GDN_SIDECAR_MIN_TOKENS_ENV = "OMLX_GDN_SIDECAR_MIN_TOKENS"
+_GDN_SIDECAR_MIN_TOKENS_DEFAULT = 256
+
+# How many recently requested sub-block prefixes to remember for the
+# second-sighting rule.  Only 16-byte digests are kept, so the whole table is a
+# few hundred KB.
+_GDN_SIDECAR_SEEN_MAX = 4096
+
+# A policy that drops writes silently is hard to trust, and one that logs every
+# drop floods the log at request rate.  Emit at most one summary line per
+# interval, carrying the number of drops it stands for.
+_GDN_SIDECAR_DROP_LOG_INTERVAL_SECONDS = 60.0
+
 
 # Cache format version. Bump when on-disk layout or RotatingKVCache meta_state
 # semantics change in a way that older blocks become unsafe to load.
@@ -1896,6 +1923,13 @@ class PagedSSDCacheManager(CacheManager):
         self._disk_cache_size_at_check: int = 0
         self._last_disk_pressure_warn: float = 0.0
         self._last_promotion_failure_warn: float = 0.0
+        # Rate limiter for the "GDN sidecar write skipped" diagnostic.
+        self._sidecar_drop_count: int = 0
+        self._sidecar_drop_last_log: float = float("-inf")
+        # Bounded FIFO of sub-block sidecar candidates for the second-sighting
+        # admission rule (see _note_gdn_sidecar_request).
+        self._sidecar_seen: OrderedDict[bytes, None] = OrderedDict()
+        self._sidecar_seen_lock = threading.Lock()
 
         # Statistics
         self._stats = {
@@ -2314,6 +2348,74 @@ class PagedSSDCacheManager(CacheManager):
         """Return the stable directory component for a cache signature."""
         return hashlib.sha256(cache_signature.encode("utf-8")).hexdigest()
 
+    def _gdn_sidecar_min_tokens(self) -> int:
+        """Smallest prefix worth a durable recurrent-state sidecar.
+
+        Defaults to ``_GDN_SIDECAR_MIN_TOKENS_DEFAULT``: below it the
+        fixed-size state write costs more than the prefill it can save, even on
+        a repeat hit.  An explicit ``OMLX_GDN_SIDECAR_MIN_TOKENS`` overrides
+        the floor; 0 disables it.  An unparsable value falls back to the
+        default with a warning.
+        """
+        raw = os.environ.get(_GDN_SIDECAR_MIN_TOKENS_ENV)
+        if not raw:
+            return _GDN_SIDECAR_MIN_TOKENS_DEFAULT
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            logger.warning(
+                "Ignoring %s=%r: expected an integer token count",
+                _GDN_SIDECAR_MIN_TOKENS_ENV,
+                raw,
+            )
+            return _GDN_SIDECAR_MIN_TOKENS_DEFAULT
+
+    def _note_gdn_sidecar_request(
+        self, signature_digest: str, source_block_hash: bytes
+    ) -> bool:
+        """Record a sub-block sidecar candidate; True when it came before.
+
+        Sub-block prefixes are only promoted on the second request for the same
+        prefix.  That keeps per-request tails, which are unique by nature, off
+        the SSD while a shared prompt still becomes durable after one miss.
+        The memory is a bounded FIFO of 16-byte digests, so a workload that
+        never repeats cannot grow it.
+        """
+        key = hashlib.blake2b(
+            signature_digest.encode("utf-8") + b"\x00" + source_block_hash,
+            digest_size=16,
+        ).digest()
+        with self._sidecar_seen_lock:
+            if key in self._sidecar_seen:
+                self._sidecar_seen.move_to_end(key)
+                return True
+            self._sidecar_seen[key] = None
+            while len(self._sidecar_seen) > _GDN_SIDECAR_SEEN_MAX:
+                self._sidecar_seen.popitem(last=False)
+            return False
+
+    def _note_gdn_sidecar_drop(
+        self, token_count: int, min_tokens: int, block_size: int, reason: str
+    ) -> None:
+        """Count a skipped sidecar write and log the running total."""
+        self._stats["ssd_write_drops"] += 1
+        self._sidecar_drop_count += 1
+        now = time.monotonic()
+        if now - self._sidecar_drop_last_log < _GDN_SIDECAR_DROP_LOG_INTERVAL_SECONDS:
+            return
+        skipped = self._sidecar_drop_count
+        self._sidecar_drop_count = 0
+        self._sidecar_drop_last_log = now
+        logger.info(
+            "GDN sidecar write skipped (%s): token_count=%d min_tokens=%d "
+            "block_size=%d; %d skipped in the last interval",
+            reason,
+            token_count,
+            min_tokens,
+            block_size,
+            skipped,
+        )
+
     def _get_gdn_sidecar_path(
         self, source_block_hash: bytes, cache_signature: str
     ) -> Path:
@@ -2613,7 +2715,16 @@ class PagedSSDCacheManager(CacheManager):
         cache_signature: str,
         block_size: int,
     ) -> Path | None:
-        """Atomically promote a request-local recurrent snapshot to SSD."""
+        """Atomically promote a request-local recurrent snapshot to SSD.
+
+        A prefix that is already durable is reused as it stands and the staged
+        copy is removed.  Otherwise a partial-block prefix is admitted only
+        when it covers at least ``OMLX_GDN_SIDECAR_MIN_TOKENS`` tokens (default
+        256) and has been requested more than once; a prefix covering a full
+        block is admitted immediately.  Returns the sidecar path, or ``None``
+        when the write was skipped or failed, in which case the staged file is
+        left in place for the caller to unlink.
+        """
         if self._hot_cache_only or self._cache_dir is None:
             return None
         if not isinstance(source_block_hash, bytes) or not source_block_hash:
@@ -2627,6 +2738,49 @@ class PagedSSDCacheManager(CacheManager):
             return None
 
         signature_digest = self._gdn_signature_digest(cache_signature)
+        min_tokens = self._gdn_sidecar_min_tokens()
+        block_tokens = max(0, int(block_size or 0))
+
+        with self._lock:
+            # The same prefix under the same signature serialises to the same
+            # state, so a staged copy of the size already on disk is a rewrite
+            # of what is durable: touch the entry and drop the staged copy.
+            # This runs before the admission floor so a sidecar written by an
+            # older policy, or before the floor was raised, stays reusable
+            # instead of being orphaned on disk.  A staged file of a different
+            # size is a replacement (a stale index entry), which falls through
+            # to the promotion path below.
+            existing = self._gdn_sidecar_index.get(source_block_hash, signature_digest)
+            if (
+                existing is not None
+                and existing.file_size == staged_stat.st_size
+                and self._is_safe_gdn_sidecar_file(existing.file_path)
+            ):
+                self._gdn_sidecar_index.touch(source_block_hash, signature_digest)
+                self._note_gdn_sidecar_drop(
+                    token_count, min_tokens, block_tokens, "already_durable"
+                )
+                with contextlib.suppress(OSError):
+                    staged_path.unlink()
+                return existing.file_path
+
+        if token_count < block_tokens:
+            if token_count < min_tokens:
+                # A partial tail holds a whole-model recurrent state: the write
+                # is fixed-cost and the prefill it saves is one short prefix.
+                self._note_gdn_sidecar_drop(
+                    token_count, min_tokens, block_tokens, "below_min_tokens"
+                )
+                return None
+            if not self._note_gdn_sidecar_request(signature_digest, source_block_hash):
+                # First sighting of a sub-block prefix: tails are unique by
+                # nature, so wait for a second request before spending a
+                # whole-state write.
+                self._note_gdn_sidecar_drop(
+                    token_count, min_tokens, block_tokens, "first_sighting"
+                )
+                return None
+
         final_path = self._get_gdn_sidecar_path(source_block_hash, cache_signature)
         with self._lock:
             try:

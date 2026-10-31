@@ -4950,3 +4950,258 @@ class TestTurboquantBitsSignature:
             assert payload["turboquant_kv_bits"] == 6.0
         finally:
             mgr.close()
+
+
+class TestGDNSidecarAdmission:
+    """Admission rules for durable GDN sidecars.
+
+    A sidecar holds the model's whole recurrent state, so every write costs the
+    same tens of MiB whatever the prefix length.  Partial-block prefixes are
+    therefore admitted only above a token floor and only on the second request
+    for that prefix; full blocks are admitted on first sighting; a prefix that
+    is already durable is reused instead of rewritten.
+    """
+
+    BLOCK = 2048
+    SIGNATURE = "signature-admission"
+    # The declared bound on the second-sighting memory: a workload that never
+    # repeats must not grow it past this.
+    SIGHTING_MEMORY = 4096
+
+    def _manager(self, tmp_path: Path) -> PagedSSDCacheManager:
+        return PagedSSDCacheManager(
+            cache_dir=tmp_path / "cache",
+            max_size_bytes=64 * 1024,
+        )
+
+    def _stage(self, tmp_path: Path, name: str, size: int = 64) -> Path:
+        staged = tmp_path / name
+        staged.write_bytes(b"s" * size)
+        return staged
+
+    def _commit(
+        self,
+        manager: PagedSSDCacheManager,
+        staged: Path,
+        source_hash: bytes,
+        token_count: int,
+    ) -> Path | None:
+        return manager.commit_gdn_checkpoint_file(
+            source_hash,
+            staged,
+            token_count=token_count,
+            model_name="model",
+            cache_signature=self.SIGNATURE,
+            block_size=self.BLOCK,
+        )
+
+    def test_partial_tail_below_the_floor_is_never_persisted(self, tmp_path: Path):
+        """A 104-token tail cannot repay a whole-state write, even on a repeat."""
+        manager = self._manager(tmp_path)
+        try:
+            source_hash = b"tail-block"
+            staged = self._stage(tmp_path, "tail.safetensors")
+            assert self._commit(manager, staged, source_hash, 104) is None
+            # The caller owns the staged copy when no sidecar is written; the
+            # prefix cache unlinks it on the False return of the commit wrapper.
+            assert staged.exists()
+            assert not manager.has_gdn_checkpoint(source_hash, self.SIGNATURE)
+            # A repeat does not lift the floor.
+            assert self._commit(manager, staged, source_hash, 104) is None
+            assert manager._gdn_sidecar_index.count == 0
+            assert manager._stats["ssd_write_drops"] == 2
+        finally:
+            manager.close()
+
+    def test_sub_block_prefix_is_admitted_on_its_second_request(self, tmp_path: Path):
+        """One miss is enough for a shared prompt, but not for a unique tail."""
+        manager = self._manager(tmp_path)
+        try:
+            source_hash = b"shared-prompt"
+            first = self._stage(tmp_path, "first.safetensors")
+            assert self._commit(manager, first, source_hash, 1000) is None
+            assert first.exists()
+            assert not manager.has_gdn_checkpoint(source_hash, self.SIGNATURE)
+            assert manager._stats["ssd_write_drops"] == 1
+
+            second = self._stage(tmp_path, "second.safetensors", size=96)
+            final_path = self._commit(manager, second, source_hash, 1000)
+            assert final_path is not None
+            assert final_path.read_bytes() == b"s" * 96
+            # The promotion consumes the staged copy.
+            assert not second.exists()
+            assert manager.has_gdn_checkpoint(source_hash, self.SIGNATURE)
+            assert manager._gdn_sidecar_index.count == 1
+        finally:
+            manager.close()
+
+    def test_distinct_sub_block_tails_stay_off_the_disk(self, tmp_path: Path):
+        """Twenty unique tails write nothing; under the old policy, twenty files."""
+        manager = self._manager(tmp_path)
+        try:
+            for index in range(20):
+                staged = self._stage(tmp_path, f"tail-{index}.safetensors")
+                assert (
+                    self._commit(manager, staged, f"tail-{index}".encode(), 467) is None
+                )
+                assert staged.exists()
+            assert manager._gdn_sidecar_index.count == 0
+            assert manager._stats["ssd_write_drops"] == 20
+        finally:
+            manager.close()
+
+    def test_full_block_prefix_is_admitted_on_first_sighting(self, tmp_path: Path):
+        """A selector prefix that already spans a block is worth a write."""
+        manager = self._manager(tmp_path)
+        try:
+            source_hash = b"full-block"
+            staged = self._stage(tmp_path, "block.safetensors")
+            final_path = self._commit(manager, staged, source_hash, self.BLOCK)
+            assert final_path is not None
+            assert final_path.exists()
+            assert not staged.exists()
+            assert manager.has_gdn_checkpoint(source_hash, self.SIGNATURE)
+            assert manager._stats["ssd_write_drops"] == 0
+        finally:
+            manager.close()
+
+    def test_durable_prefix_is_reused_and_the_staged_copy_unlinked(
+        self, tmp_path: Path
+    ):
+        """Rewriting a durable prefix churns the SSD, so reuse it instead."""
+        manager = self._manager(tmp_path)
+        try:
+            source_hash = b"durable"
+            final_path = self._commit(
+                manager,
+                self._stage(tmp_path, "first.safetensors"),
+                source_hash,
+                self.BLOCK,
+            )
+            assert final_path is not None
+            original = final_path.read_bytes()
+
+            rewrite = self._stage(tmp_path, "rewrite.safetensors")
+            rewrite.write_bytes(b"r" * 64)
+            assert self._commit(manager, rewrite, source_hash, self.BLOCK) == final_path
+            # The durable copy is untouched and the staged copy is gone.
+            assert final_path.read_bytes() == original
+            assert not rewrite.exists()
+            assert manager._gdn_sidecar_index.count == 1
+            assert manager._stats["ssd_write_drops"] == 1
+        finally:
+            manager.close()
+
+    def test_durable_sidecar_below_the_floor_is_reused_not_orphaned(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The index lookup runs before the floor so older sidecars stay usable."""
+        manager = self._manager(tmp_path)
+        try:
+            source_hash = b"legacy-tail"
+            monkeypatch.setenv("OMLX_GDN_SIDECAR_MIN_TOKENS", "0")
+            assert (
+                self._commit(manager, self._stage(tmp_path, "a"), source_hash, 128)
+                is None
+            )
+            final_path = self._commit(
+                manager, self._stage(tmp_path, "b"), source_hash, 128
+            )
+            assert final_path is not None
+            original = final_path.read_bytes()
+
+            # The floor is back on, as it would be for a sidecar written by an
+            # older engine or before the floor was raised.
+            monkeypatch.delenv("OMLX_GDN_SIDECAR_MIN_TOKENS")
+            staged = self._stage(tmp_path, "c")
+            assert self._commit(manager, staged, source_hash, 128) == final_path
+            assert final_path.read_bytes() == original
+            assert not staged.exists()
+            assert manager.has_gdn_checkpoint(source_hash, self.SIGNATURE)
+        finally:
+            manager.close()
+
+    def test_min_tokens_env_override_and_invalid_fallback(
+        self, tmp_path: Path, monkeypatch, caplog
+    ):
+        """OMLX_GDN_SIDECAR_MIN_TOKENS overrides the floor; junk values warn."""
+        manager = self._manager(tmp_path)
+        try:
+            source_hash = b"tiny"
+
+            # Default floor: a 8-token tail is dropped before the second
+            # sighting rule even sees it.
+            assert (
+                self._commit(manager, self._stage(tmp_path, "a"), source_hash, 8)
+                is None
+            )
+            assert (
+                self._commit(manager, self._stage(tmp_path, "b"), source_hash, 8)
+                is None
+            )
+            assert manager._gdn_sidecar_index.count == 0
+
+            # 0 disables the floor, so the prefix now follows the second
+            # sighting rule and becomes durable on its repeat.
+            monkeypatch.setenv("OMLX_GDN_SIDECAR_MIN_TOKENS", "0")
+            assert (
+                self._commit(manager, self._stage(tmp_path, "c"), source_hash, 8)
+                is None
+            )
+            final_path = self._commit(
+                manager, self._stage(tmp_path, "d"), source_hash, 8
+            )
+            assert final_path is not None
+            assert manager.has_gdn_checkpoint(source_hash, self.SIGNATURE)
+
+            # An unparsable value falls back to the default with a warning.
+            monkeypatch.setenv("OMLX_GDN_SIDECAR_MIN_TOKENS", "many")
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="omlx.cache.paged_ssd_cache"):
+                assert manager._gdn_sidecar_min_tokens() == 256
+            assert "OMLX_GDN_SIDECAR_MIN_TOKENS" in caplog.text
+        finally:
+            manager.close()
+
+    def test_sighting_memory_is_bounded(self, tmp_path: Path):
+        """A workload that never repeats its tails cannot grow the FIFO."""
+        manager = self._manager(tmp_path)
+        try:
+            for index in range(self.SIGHTING_MEMORY):
+                key = index.to_bytes(8, "big")
+                assert manager._note_gdn_sidecar_request(self.SIGNATURE, key) is False
+            assert len(manager._sidecar_seen) == self.SIGHTING_MEMORY
+
+            assert (
+                manager._note_gdn_sidecar_request(self.SIGNATURE, b"overflow") is False
+            )
+            assert len(manager._sidecar_seen) == self.SIGHTING_MEMORY
+            # The oldest entry was evicted, so it counts as new again.
+            assert (
+                manager._note_gdn_sidecar_request(
+                    self.SIGNATURE, (0).to_bytes(8, "big")
+                )
+                is False
+            )
+        finally:
+            manager.close()
+
+    def test_drop_logging_is_rate_limited(self, tmp_path: Path, caplog):
+        """The skip diagnostic reports a count, not one line per request."""
+        manager = self._manager(tmp_path)
+        try:
+            with caplog.at_level(logging.INFO, logger="omlx.cache.paged_ssd_cache"):
+                assert (
+                    self._commit(manager, self._stage(tmp_path, "a"), b"tail", 104)
+                    is None
+                )
+                assert "GDN sidecar write skipped (below_min_tokens)" in caplog.text
+                caplog.clear()
+                assert (
+                    self._commit(manager, self._stage(tmp_path, "b"), b"tail", 104)
+                    is None
+                )
+                assert "GDN sidecar write skipped" not in caplog.text
+            assert manager._stats["ssd_write_drops"] == 2
+        finally:
+            manager.close()
