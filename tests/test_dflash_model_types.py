@@ -11,6 +11,7 @@ from omlx.utils.model_loading import dflash_batched_supported, dflash_compatibil
     [
         ("qwen3_5_moe", "vlm"),
         ("minicpmv4_7", "vlm"),
+        ("flint", "vlm"),
         ("qwen3_moe", "batched"),
     ],
 )

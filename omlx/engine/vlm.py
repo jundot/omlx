@@ -2865,7 +2865,7 @@ class VLMBatchedEngine(BaseEngine):
     def prepare_dflash_target(self) -> Any:
         """Return the model a DFlash drafter binds to, ready for captures.
 
-        Language models without speculative rollback (Muse Glimmer) gain
+        Language models without speculative rollback (Muse Glimmer, Flint) gain
         layer captures and rollback here, before the drafter binds.
         """
         language_model = self._vlm_model.language_model
