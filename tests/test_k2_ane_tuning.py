@@ -16,7 +16,7 @@ from omlx.model_settings import ModelSettings
 def tuner_pool(monkeypatch, tmp_path):
     from omlx.custom_kernels.quant_matmul import ane as fast
 
-    base = ModelSettings(qwen35_ane_prefill_enabled=True)
+    base = ModelSettings(ane_prefill_enabled=True)
     (tmp_path / "config.json").write_text(json.dumps(dict(num_hidden_layers=3)))
     pool = SimpleNamespace(
         base=base,
@@ -31,7 +31,7 @@ def tuner_pool(monkeypatch, tmp_path):
     monkeypatch.setattr(fast, "ane_available", lambda: True)
     monkeypatch.setattr(fast, "_ext", SimpleNamespace(ane_compile_program=object()))
     yield pool
-    assert base.qwen35_ane_prefill_enabled
+    assert base.ane_prefill_enabled
     assert pool._unload_engine.await_count == 2
     restored.assert_called_once_with(pool, "old")
 
@@ -46,7 +46,7 @@ async def test_k2_recommendation_keeps_settings_unchanged(
 
     async def measure(run, pool, settings, candidate):
         transient = ane_tuning._settings_for_candidate(settings, run.request, candidate)
-        assert transient.qwen35_ane_prefill_enabled == candidate.enabled
+        assert transient.ane_prefill_enabled == candidate.enabled
         return {**ane_tuning._empty_result(candidate), "processing_tps": next(speeds)}
 
     monkeypatch.setattr(ane_tuning, "_measure_candidate", measure)

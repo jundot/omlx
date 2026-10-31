@@ -63,6 +63,7 @@ from ..model_discovery import (
 )
 from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import (
+    normalize_ane_prefill_settings,
     EXCLUDED_FROM_PROFILES,
     filter_profile_fields,
     filter_universal_fields,
@@ -273,11 +274,11 @@ def _ane_prefill_budget_error(settings: dict, model_type: str | None) -> str | N
     if ane_prefill_backend(model_type) != "qwen":
         return None
     fraction = ane_prefill_fraction(
-        settings.get("qwen35_ane_prefill_fraction"), model_type
+        settings.get("ane_prefill_fraction"), model_type
     )
-    fused_down = bool(settings.get("qwen35_ane_prefill_fused_down"))
-    cpu_enabled = bool(settings.get("qwen35_ane_prefill_cpu_enabled"))
-    cpu_fraction = settings.get("qwen35_ane_prefill_cpu_fraction", 0.135) or 0.0
+    fused_down = bool(settings.get("ane_prefill_fused_down"))
+    cpu_enabled = bool(settings.get("ane_prefill_cpu_enabled"))
+    cpu_fraction = settings.get("ane_prefill_cpu_fraction", 0.135) or 0.0
     if fused_down and fraction > 0.50:
         # The fused loader reuses the MLP fraction for the down projection and
         # rejects anything above 0.50.
@@ -288,9 +289,9 @@ def _ane_prefill_budget_error(settings: dict, model_type: str | None) -> str | N
             if fused_down
             else "MLP ANE and CPU fractions must total less than 1.0."
         )
-    gdn = settings.get("qwen35_ane_prefill_gdn", True)
-    gdn_fraction = settings.get("qwen35_ane_prefill_gdn_fraction", 0.5) or 0.0
-    cpu_gdn_fraction = settings.get("qwen35_ane_prefill_cpu_gdn_fraction", 0.0) or 0.0
+    gdn = settings.get("ane_prefill_gdn", True)
+    gdn_fraction = settings.get("ane_prefill_gdn_fraction", 0.5) or 0.0
+    cpu_gdn_fraction = settings.get("ane_prefill_cpu_gdn_fraction", 0.0) or 0.0
     if cpu_enabled and gdn and gdn_fraction + cpu_gdn_fraction >= 1.0:
         return "GDN ANE and CPU fractions must total less than 1.0."
     return None
@@ -354,6 +355,11 @@ def _draft_path_is_unusable(value: str) -> bool:
 
 
 class ModelSettingsRequest(BaseModel):
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_ane_names(cls, data):
+        return normalize_ane_prefill_settings(data) if isinstance(data, dict) else data
+
     """Request model for updating per-model settings."""
 
     model_config = ConfigDict(extra="forbid")
@@ -397,23 +403,23 @@ class ModelSettingsRequest(BaseModel):
     turboquant_kv_bits: float | None = None
     turboquant_skip_last: bool | None = None
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
-    qwen35_ane_prefill_enabled: bool | None = None
-    qwen35_ane_prefill_sequence_length: int | None = None
-    qwen35_ane_prefill_tail_padding_min_tokens: int | None = None
-    qwen35_ane_prefill_fraction: float | None = None
-    qwen35_ane_prefill_shared_fraction: float | None = None
-    qwen35_ane_prefill_fused_down: bool | None = None
-    qwen35_ane_prefill_max_layers: int | None = None
-    qwen35_ane_prefill_dual_ane: bool | None = None
-    qwen35_ane_prefill_gdn: bool | None = None
-    qwen35_ane_prefill_gdn_fraction: float | None = None
-    qwen35_ane_prefill_gdn_max_layers: int | None = None
-    qwen35_ane_prefill_cpu_enabled: bool | None = None
-    qwen35_ane_prefill_cpu_fraction: float | None = None
-    qwen35_ane_prefill_cpu_down_fraction: float | None = None
-    qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
-    qwen35_ane_prefill_cpu_threads: int | None = None
-    qwen35_ane_prefill_cpu_shared_resource: bool | None = None
+    ane_prefill_enabled: bool | None = None
+    ane_prefill_sequence_length: int | None = None
+    ane_prefill_tail_padding_min_tokens: int | None = None
+    ane_prefill_fraction: float | None = None
+    ane_prefill_shared_fraction: float | None = None
+    ane_prefill_fused_down: bool | None = None
+    ane_prefill_max_layers: int | None = None
+    ane_prefill_dual_ane: bool | None = None
+    ane_prefill_gdn: bool | None = None
+    ane_prefill_gdn_fraction: float | None = None
+    ane_prefill_gdn_max_layers: int | None = None
+    ane_prefill_cpu_enabled: bool | None = None
+    ane_prefill_cpu_fraction: float | None = None
+    ane_prefill_cpu_down_fraction: float | None = None
+    ane_prefill_cpu_gdn_fraction: float | None = None
+    ane_prefill_cpu_threads: int | None = None
+    ane_prefill_cpu_shared_resource: bool | None = None
     # INT8-activation (A8) prefill (Qwen3.5/3.6/3.8, Qwen3.8 Flash-Next, DeepSeek V4.1)
     a8_prefill_enabled: bool | None = None
     a8_prefill_min_tokens: int | None = None
@@ -2924,8 +2930,6 @@ async def update_model_settings(
             entry.engine_type = type_to_engine.get(override_value, "batched")
         else:
             # Reset to auto-detected type
-            from pathlib import Path
-
             from ..model_discovery import detect_model_type
 
             detected_type = detect_model_type(Path(entry.model_path))
@@ -3044,27 +3048,27 @@ async def update_model_settings(
             else bool(request.turboquant_skip_last)
         )
     # Shared load-time ANE controls. Model metadata selects limits and backend.
-    if "qwen35_ane_prefill_enabled" in sent:
-        current_settings.qwen35_ane_prefill_enabled = bool(
-            request.qwen35_ane_prefill_enabled
+    if "ane_prefill_enabled" in sent:
+        current_settings.ane_prefill_enabled = bool(
+            request.ane_prefill_enabled
         )
-    if "qwen35_ane_prefill_sequence_length" in sent:
-        value = request.qwen35_ane_prefill_sequence_length
+    if "ane_prefill_sequence_length" in sent:
+        value = request.ane_prefill_sequence_length
         if value is None:
             raise HTTPException(
                 status_code=400, detail="ANE prompt block cannot be null."
             )
-        current_settings.qwen35_ane_prefill_sequence_length = value
+        current_settings.ane_prefill_sequence_length = value
         if (
-            current_settings.qwen35_ane_prefill_tail_padding_min_tokens
+            current_settings.ane_prefill_tail_padding_min_tokens
             >= int(value)
         ):
             # A crossover is calibrated for one fixed program width. Changing
             # that width invalidates it; disable padding until the next tune.
-            current_settings.qwen35_ane_prefill_tail_padding_min_tokens = 0
-    if "qwen35_ane_prefill_tail_padding_min_tokens" in sent:
-        value = request.qwen35_ane_prefill_tail_padding_min_tokens
-        sequence_length = int(current_settings.qwen35_ane_prefill_sequence_length)
+            current_settings.ane_prefill_tail_padding_min_tokens = 0
+    if "ane_prefill_tail_padding_min_tokens" in sent:
+        value = request.ane_prefill_tail_padding_min_tokens
+        sequence_length = int(current_settings.ane_prefill_sequence_length)
         if value is None or not 0 <= value < sequence_length:
             raise HTTPException(
                 status_code=400,
@@ -3073,88 +3077,88 @@ async def update_model_settings(
                     "ANE prompt block."
                 ),
             )
-        current_settings.qwen35_ane_prefill_tail_padding_min_tokens = int(value)
-    if "qwen35_ane_prefill_fraction" in sent:
-        current_settings.qwen35_ane_prefill_fraction = (
-            request.qwen35_ane_prefill_fraction
+        current_settings.ane_prefill_tail_padding_min_tokens = int(value)
+    if "ane_prefill_fraction" in sent:
+        current_settings.ane_prefill_fraction = (
+            request.ane_prefill_fraction
         )
-    if "qwen35_ane_prefill_shared_fraction" in sent:
-        value = request.qwen35_ane_prefill_shared_fraction
-        current_settings.qwen35_ane_prefill_shared_fraction = (
+    if "ane_prefill_shared_fraction" in sent:
+        value = request.ane_prefill_shared_fraction
+        current_settings.ane_prefill_shared_fraction = (
             1.0 if value is None else value
         )
-    if "qwen35_ane_prefill_max_layers" in sent:
-        value = request.qwen35_ane_prefill_max_layers
+    if "ane_prefill_max_layers" in sent:
+        value = request.ane_prefill_max_layers
         if value is None or value < 1:
             raise HTTPException(
                 status_code=400, detail="ANE MLP layer limit must be positive."
             )
-        current_settings.qwen35_ane_prefill_max_layers = int(value)
-    if "qwen35_ane_prefill_dual_ane" in sent:
-        current_settings.qwen35_ane_prefill_dual_ane = bool(
-            request.qwen35_ane_prefill_dual_ane
+        current_settings.ane_prefill_max_layers = int(value)
+    if "ane_prefill_dual_ane" in sent:
+        current_settings.ane_prefill_dual_ane = bool(
+            request.ane_prefill_dual_ane
         )
-    if "qwen35_ane_prefill_gdn" in sent:
-        current_settings.qwen35_ane_prefill_gdn = bool(request.qwen35_ane_prefill_gdn)
-    if "qwen35_ane_prefill_gdn_fraction" in sent:
-        value = request.qwen35_ane_prefill_gdn_fraction
+    if "ane_prefill_gdn" in sent:
+        current_settings.ane_prefill_gdn = bool(request.ane_prefill_gdn)
+    if "ane_prefill_gdn_fraction" in sent:
+        value = request.ane_prefill_gdn_fraction
         if value is None or not 0.05 <= value <= 0.90:
             raise HTTPException(
                 status_code=400,
                 detail="GDN ANE fraction must be between 0.05 and 0.90.",
             )
-        current_settings.qwen35_ane_prefill_gdn_fraction = float(value)
-    if "qwen35_ane_prefill_gdn_max_layers" in sent:
-        value = request.qwen35_ane_prefill_gdn_max_layers
+        current_settings.ane_prefill_gdn_fraction = float(value)
+    if "ane_prefill_gdn_max_layers" in sent:
+        value = request.ane_prefill_gdn_max_layers
         if value is None or value < 0:
             raise HTTPException(
                 status_code=400,
                 detail="ANE GDN layer limit must be zero or greater.",
             )
-        current_settings.qwen35_ane_prefill_gdn_max_layers = int(value)
-    if "qwen35_ane_prefill_cpu_enabled" in sent:
-        current_settings.qwen35_ane_prefill_cpu_enabled = bool(
-            request.qwen35_ane_prefill_cpu_enabled
+        current_settings.ane_prefill_gdn_max_layers = int(value)
+    if "ane_prefill_cpu_enabled" in sent:
+        current_settings.ane_prefill_cpu_enabled = bool(
+            request.ane_prefill_cpu_enabled
         )
-    if "qwen35_ane_prefill_fused_down" in sent:
-        current_settings.qwen35_ane_prefill_fused_down = bool(
-            request.qwen35_ane_prefill_fused_down
+    if "ane_prefill_fused_down" in sent:
+        current_settings.ane_prefill_fused_down = bool(
+            request.ane_prefill_fused_down
         )
-    if "qwen35_ane_prefill_cpu_fraction" in sent:
-        value = request.qwen35_ane_prefill_cpu_fraction
+    if "ane_prefill_cpu_fraction" in sent:
+        value = request.ane_prefill_cpu_fraction
         if value is None or not 0.0 <= value <= 0.25:
             raise HTTPException(
                 status_code=400,
                 detail="CPU MLP fraction must be between 0.0 and 0.25.",
             )
-        current_settings.qwen35_ane_prefill_cpu_fraction = float(value)
-    if "qwen35_ane_prefill_cpu_down_fraction" in sent:
-        value = request.qwen35_ane_prefill_cpu_down_fraction
+        current_settings.ane_prefill_cpu_fraction = float(value)
+    if "ane_prefill_cpu_down_fraction" in sent:
+        value = request.ane_prefill_cpu_down_fraction
         if value is None or not 0.0 <= value <= 0.50:
             raise HTTPException(
                 status_code=400,
                 detail="CPU MLP down fraction must be between 0.0 and 0.50.",
             )
-        current_settings.qwen35_ane_prefill_cpu_down_fraction = float(value)
-    if "qwen35_ane_prefill_cpu_gdn_fraction" in sent:
-        value = request.qwen35_ane_prefill_cpu_gdn_fraction
+        current_settings.ane_prefill_cpu_down_fraction = float(value)
+    if "ane_prefill_cpu_gdn_fraction" in sent:
+        value = request.ane_prefill_cpu_gdn_fraction
         if value is None or not 0.0 <= value <= 0.50:
             raise HTTPException(
                 status_code=400,
                 detail="CPU GDN fraction must be between 0.0 and 0.50",
             )
-        current_settings.qwen35_ane_prefill_cpu_gdn_fraction = float(value)
-    if "qwen35_ane_prefill_cpu_threads" in sent:
-        value = request.qwen35_ane_prefill_cpu_threads
+        current_settings.ane_prefill_cpu_gdn_fraction = float(value)
+    if "ane_prefill_cpu_threads" in sent:
+        value = request.ane_prefill_cpu_threads
         if value is None or not 0 <= value <= 64:
             raise HTTPException(
                 status_code=400,
                 detail="CPU worker count must be between 0 and 64.",
             )
-        current_settings.qwen35_ane_prefill_cpu_threads = int(value)
-    if "qwen35_ane_prefill_cpu_shared_resource" in sent:
-        current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
-            request.qwen35_ane_prefill_cpu_shared_resource
+        current_settings.ane_prefill_cpu_threads = int(value)
+    if "ane_prefill_cpu_shared_resource" in sent:
+        current_settings.ane_prefill_cpu_shared_resource = bool(
+            request.ane_prefill_cpu_shared_resource
         )
     # INT8-activation (A8) prefill. Load-time like the ANE controls above: the
     # runtime signature re-creates a loaded model when this changes.
@@ -3609,6 +3613,7 @@ def _raise_if_alias_conflicts_exposed_profiles(
 def _validate_model_settings(entry, settings):
     from ..model_settings import validate_moe_expert_offload
 
+    settings = normalize_ane_prefill_settings(settings)
     try:
         validate_moe_expert_offload(
             settings, model_type=getattr(entry, "config_model_type", None)
@@ -3646,12 +3651,12 @@ def _validate_model_settings(entry, settings):
                     "newer)."
                 ),
             )
-        if settings.get("qwen35_ane_prefill_enabled"):
+        if settings.get("ane_prefill_enabled"):
             raise HTTPException(
                 status_code=400,
                 detail="ANE prefill and A8 prefill cannot both be enabled.",
             )
-    if any(key.startswith("qwen35_ane_prefill_") for key in settings):
+    if any(key.startswith("ane_prefill_") for key in settings):
         try:
             validate_ane_prefill(settings, entry.config_model_type)
         except ValueError as error:
@@ -3964,10 +3969,11 @@ def _feature_problem(
         return reason if is_paro else None
     if name == "ane_prefill":
         try:
-            validate_ane_prefill(snapshot, entry.config_model_type)
+            effective = normalize_ane_prefill_settings(snapshot)
+            validate_ane_prefill(effective, entry.config_model_type)
         except ValueError as error:
             return str(error)
-        return _ane_prefill_budget_error(snapshot, entry.config_model_type)
+        return _ane_prefill_budget_error(effective, entry.config_model_type)
     if name == "a8_prefill":
         if not _oq_a8_model_supported(entry.config_model_type):
             return (

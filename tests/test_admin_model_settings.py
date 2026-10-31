@@ -90,6 +90,27 @@ async def _update_settings(
 
 
 @pytest.mark.asyncio
+async def test_neutral_names_configure_a_qwen_chat_model():
+    pool, entry = _failed_pool()
+    entry.config_model_type = "qwen3_5"
+    settings = ModelSettings()
+    await _update_settings(pool, settings, admin_routes.ModelSettingsRequest(ane_prefill_enabled=True))
+    assert settings.ane_prefill_enabled is True
+
+
+def test_settings_api_normalizes_legacy_payload_names_and_preserves_explicit_neutral_false():
+    request = admin_routes.ModelSettingsRequest.model_validate({
+        "qwen35_ane_prefill_enabled": True,
+        "clef_flash_ane_enabled": True,
+        "ane_prefill_enabled": False,
+        "clef_flash_cpu_enabled": False,
+    })
+    assert request.ane_prefill_enabled is False
+    assert request.ane_prefill_cpu_enabled is False
+    assert request.model_fields_set == {"ane_prefill_enabled", "ane_prefill_cpu_enabled"}
+
+
+@pytest.mark.asyncio
 async def test_load_time_setting_change_clears_cached_failure():
     pool, entry = _failed_pool()
     settings = ModelSettings(trust_remote_code=False)
@@ -253,27 +274,27 @@ async def test_qwen_ane_prefill_settings_are_persisted():
         pool,
         settings,
         admin_routes.ModelSettingsRequest(
-            qwen35_ane_prefill_enabled=True,
-            qwen35_ane_prefill_sequence_length=2048,
-            qwen35_ane_prefill_tail_padding_min_tokens=1357,
-            qwen35_ane_prefill_fraction=0.53,
-            qwen35_ane_prefill_max_layers=64,
-            qwen35_ane_prefill_dual_ane=True,
-            qwen35_ane_prefill_gdn=True,
-            qwen35_ane_prefill_gdn_fraction=0.50,
-            qwen35_ane_prefill_gdn_max_layers=48,
+            ane_prefill_enabled=True,
+            ane_prefill_sequence_length=2048,
+            ane_prefill_tail_padding_min_tokens=1357,
+            ane_prefill_fraction=0.53,
+            ane_prefill_max_layers=64,
+            ane_prefill_dual_ane=True,
+            ane_prefill_gdn=True,
+            ane_prefill_gdn_fraction=0.50,
+            ane_prefill_gdn_max_layers=48,
         ),
     )
 
-    assert settings.qwen35_ane_prefill_enabled is True
-    assert settings.qwen35_ane_prefill_sequence_length == 2048
-    assert settings.qwen35_ane_prefill_tail_padding_min_tokens == 1357
-    assert settings.qwen35_ane_prefill_fraction == 0.53
-    assert settings.qwen35_ane_prefill_max_layers == 64
-    assert settings.qwen35_ane_prefill_dual_ane is True
-    assert settings.qwen35_ane_prefill_gdn is True
-    assert settings.qwen35_ane_prefill_gdn_fraction == 0.50
-    assert settings.qwen35_ane_prefill_gdn_max_layers == 48
+    assert settings.ane_prefill_enabled is True
+    assert settings.ane_prefill_sequence_length == 2048
+    assert settings.ane_prefill_tail_padding_min_tokens == 1357
+    assert settings.ane_prefill_fraction == 0.53
+    assert settings.ane_prefill_max_layers == 64
+    assert settings.ane_prefill_dual_ane is True
+    assert settings.ane_prefill_gdn is True
+    assert settings.ane_prefill_gdn_fraction == 0.50
+    assert settings.ane_prefill_gdn_max_layers == 48
     assert result["requires_reload"] is False
 
 
@@ -321,7 +342,7 @@ async def test_qwen_ane_prefill_change_unloads_a_loaded_engine():
     result = await _update_settings(
         pool,
         ModelSettings(),
-        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+        admin_routes.ModelSettingsRequest(ane_prefill_enabled=True),
     )
 
     assert result["requires_reload"] is True
@@ -344,7 +365,7 @@ async def test_reload_setting_on_busy_engine_defers_unload():
     result = await _update_settings(
         pool,
         ModelSettings(),
-        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+        admin_routes.ModelSettingsRequest(ane_prefill_enabled=True),
     )
 
     assert result["requires_reload"] is True
@@ -370,19 +391,19 @@ async def test_qwen_ane_prefill_accepts_qwen38_config_type():
     await _update_settings(
         pool,
         settings,
-        admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+        admin_routes.ModelSettingsRequest(ane_prefill_enabled=True),
     )
 
-    assert settings.qwen35_ane_prefill_enabled is True
+    assert settings.ane_prefill_enabled is True
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "initial, update",
     [
-        ({"qwen35_ane_prefill_enabled": True}, {"a8_prefill_enabled": True}),
-        ({"a8_prefill_enabled": True}, {"qwen35_ane_prefill_enabled": True}),
-        ({}, {"a8_prefill_enabled": True, "qwen35_ane_prefill_enabled": True}),
+        ({"ane_prefill_enabled": True}, {"a8_prefill_enabled": True}),
+        ({"a8_prefill_enabled": True}, {"ane_prefill_enabled": True}),
+        ({}, {"a8_prefill_enabled": True, "ane_prefill_enabled": True}),
     ],
 )
 async def test_oq_a8_is_refused_while_ane_prefill_is_on(tmp_path, initial, update):
@@ -490,7 +511,7 @@ async def test_oq_a8_for_qwen4_exp_still_conflicts_with_ane_prefill(tmp_path):
         await admin_routes.update_model_settings(
             "ling",
             admin_routes.ModelSettingsRequest(
-                a8_prefill_enabled=True, qwen35_ane_prefill_enabled=True
+                a8_prefill_enabled=True, ane_prefill_enabled=True
             ),
             is_admin=True,
         )
@@ -709,7 +730,7 @@ async def test_qwen_ane_prefill_rejects_invalid_block_size():
         await _update_settings(
             pool,
             ModelSettings(),
-            admin_routes.ModelSettingsRequest(qwen35_ane_prefill_sequence_length=2000),
+            admin_routes.ModelSettingsRequest(ane_prefill_sequence_length=2000),
         )
 
 
@@ -723,7 +744,7 @@ async def test_qwen_ane_prefill_rejects_tail_threshold_at_block_size():
             pool,
             ModelSettings(),
             admin_routes.ModelSettingsRequest(
-                qwen35_ane_prefill_tail_padding_min_tokens=2048
+                ane_prefill_tail_padding_min_tokens=2048
             ),
         )
 
@@ -735,13 +756,13 @@ async def test_qwen_ane_prefill_rejects_fused_down_above_half_fraction():
     pool, entry = _failed_pool()
     entry.config_model_type = "qwen3_5"
     settings = ModelSettings()
-    settings.qwen35_ane_prefill_fraction = 0.53
+    settings.ane_prefill_fraction = 0.53
 
     with pytest.raises(admin_routes.HTTPException, match="0.50 or"):
         await _update_settings(
             pool,
             settings,
-            admin_routes.ModelSettingsRequest(qwen35_ane_prefill_fused_down=True),
+            admin_routes.ModelSettingsRequest(ane_prefill_fused_down=True),
         )
 
 
@@ -755,13 +776,13 @@ async def test_qwen_ane_prefill_allows_fused_down_at_half_fraction():
         pool,
         settings,
         admin_routes.ModelSettingsRequest(
-            qwen35_ane_prefill_fused_down=True,
-            qwen35_ane_prefill_fraction=0.5,
+            ane_prefill_fused_down=True,
+            ane_prefill_fraction=0.5,
         ),
     )
 
-    assert settings.qwen35_ane_prefill_fused_down is True
-    assert settings.qwen35_ane_prefill_fraction == 0.5
+    assert settings.ane_prefill_fused_down is True
+    assert settings.ane_prefill_fraction == 0.5
 
 
 @pytest.mark.asyncio
@@ -773,7 +794,7 @@ async def test_qwen_ane_prefill_rejects_other_model_families():
         await _update_settings(
             pool,
             ModelSettings(),
-            admin_routes.ModelSettingsRequest(qwen35_ane_prefill_enabled=True),
+            admin_routes.ModelSettingsRequest(ane_prefill_enabled=True),
         )
 
 

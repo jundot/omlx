@@ -228,15 +228,15 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
     html = _model_settings_template()
     script = _dashboard_script()
     fields = {
-        "qwen35_ane_prefill_enabled",
-        "qwen35_ane_prefill_sequence_length",
-        "qwen35_ane_prefill_tail_padding_min_tokens",
-        "qwen35_ane_prefill_fraction",
-        "qwen35_ane_prefill_max_layers",
-        "qwen35_ane_prefill_dual_ane",
-        "qwen35_ane_prefill_gdn",
-        "qwen35_ane_prefill_gdn_fraction",
-        "qwen35_ane_prefill_gdn_max_layers",
+        "ane_prefill_enabled",
+        "ane_prefill_sequence_length",
+        "ane_prefill_tail_padding_min_tokens",
+        "ane_prefill_fraction",
+        "ane_prefill_max_layers",
+        "ane_prefill_dual_ane",
+        "ane_prefill_gdn",
+        "ane_prefill_gdn_fraction",
+        "ane_prefill_gdn_max_layers",
     }
 
     assert "x-if=\"selectedModel?.ane_prefill_backend === 'qwen'\"" in html
@@ -244,8 +244,8 @@ def test_qwen_ane_model_specific_controls_are_fully_wired():
         assert f"modelSettings.{field}" in html
         assert f"{field}:" in script
 
-    assert 'x-model.number="modelSettings.qwen35_ane_prefill_fraction"' in html
-    assert 'x-model.number="modelSettings.qwen35_ane_prefill_gdn_fraction"' in html
+    assert 'x-model.number="modelSettings.ane_prefill_fraction"' in html
+    assert 'x-model.number="modelSettings.ane_prefill_gdn_fraction"' in html
     assert 'min="0.05" max="0.90" step="0.005"' in html
     assert 'placeholder="0.53"' in html
     assert 'placeholder="0.5"' in html
@@ -261,14 +261,14 @@ def test_qwen_ane_numeric_controls_accept_arbitrary_valid_values():
     )
 
     for field in (
-        "qwen35_ane_prefill_sequence_length",
-        "qwen35_ane_prefill_tail_padding_min_tokens",
-        "qwen35_ane_prefill_fraction",
-        "qwen35_ane_prefill_cpu_fraction",
-        "qwen35_ane_prefill_cpu_down_fraction",
-        "qwen35_ane_prefill_cpu_gdn_fraction",
-        "qwen35_ane_prefill_cpu_threads",
-        "qwen35_ane_prefill_gdn_fraction",
+        "ane_prefill_sequence_length",
+        "ane_prefill_tail_padding_min_tokens",
+        "ane_prefill_fraction",
+        "ane_prefill_cpu_fraction",
+        "ane_prefill_cpu_down_fraction",
+        "ane_prefill_cpu_gdn_fraction",
+        "ane_prefill_cpu_threads",
+        "ane_prefill_gdn_fraction",
     ):
         binding = f'x-model.number="modelSettings.{field}"'
         before, after = section.split(binding, 1)
@@ -297,15 +297,15 @@ def test_qwen_ane_web_tuner_is_wired_to_transient_benchmark_and_apply():
     assert "'/admin/api/bench/ane-tune/start'" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results" in script
     assert "/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel" in script
-    assert "qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction)" in script
-    assert "qwen35_ane_prefill_gdn_fraction = Number(" in script
-    assert "qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled" in script
-    assert "qwen35_ane_prefill_cpu_fraction = Number(" in script
+    assert "ane_prefill_fraction = Number(recommendation.mlp_fraction)" in script
+    assert "ane_prefill_gdn_fraction = Number(" in script
+    assert "ane_prefill_cpu_enabled = !!recommendation.cpu_enabled" in script
+    assert "ane_prefill_cpu_fraction = Number(" in script
     assert "allow_cpu: this.aneTuningOverrides.allowCpu" in script
     assert "allow_ane_gdn: this.aneTuningOverrides.allowAneGdn" in script
     assert "allow_cpu_gdn: this.aneTuningOverrides.allowCpu" in script
-    assert "qwen35_ane_prefill_cpu_down_fraction = Number(" in script
-    assert "qwen35_ane_prefill_cpu_gdn_fraction = Number(" in script
+    assert "ane_prefill_cpu_down_fraction = Number(" in script
+    assert "ane_prefill_cpu_gdn_fraction = Number(" in script
     assert "recommendation.cpu_shared_resource" in script
 
 
@@ -320,7 +320,7 @@ def test_qwen_ane_arbitrary_inputs_are_validated_before_save():
     assert "window.t('js.error.gdn_ane_cpu_total')" in script
     assert "window.t('js.error.cpu_workers_range')" in script
     assert "const qwenAneValidationError = this.validateQwenAneSettings()" in script
-    assert "qwen35_ane_prefill_fraction: Number(" in script
+    assert "ane_prefill_fraction: Number(" in script
 
 
 def test_qwen_ane_web_defaults_match_configured_profile():
@@ -330,49 +330,49 @@ def test_qwen_ane_web_defaults_match_configured_profile():
     )[0]
 
     assert (
-        "qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048"
+        "ane_prefill_sequence_length: s.ane_prefill_sequence_length || 2048"
         in state
     )
     assert (
-        "qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53"
+        "ane_prefill_fraction: s.ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53"
         in state
     )
     assert (
-        "qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64" in state
+        "ane_prefill_max_layers: s.ane_prefill_max_layers || 64" in state
     )
     assert (
-        "qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false" in state
+        "ane_prefill_dual_ane: s.ane_prefill_dual_ane !== false" in state
     )
-    assert "qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false" in state
+    assert "ane_prefill_gdn: s.ane_prefill_gdn !== false" in state
     assert (
-        "qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5"
+        "ane_prefill_gdn_fraction: s.ane_prefill_gdn_fraction ?? 0.5"
         in state
     )
     assert (
-        "qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48"
+        "ane_prefill_gdn_max_layers: s.ane_prefill_gdn_max_layers ?? 48"
         in state
     )
     assert (
-        "qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false"
+        "ane_prefill_cpu_enabled: s.ane_prefill_cpu_enabled || false"
         in state
     )
     assert (
-        "qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135"
+        "ane_prefill_cpu_fraction: s.ane_prefill_cpu_fraction ?? 0.135"
         in state
     )
     assert (
-        "qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0"
+        "ane_prefill_cpu_down_fraction: s.ane_prefill_cpu_down_fraction ?? 0"
         in state
     )
     assert (
-        "qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0"
+        "ane_prefill_cpu_gdn_fraction: s.ane_prefill_cpu_gdn_fraction ?? 0"
         in state
     )
     assert (
-        "qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8" in state
+        "ane_prefill_cpu_threads: s.ane_prefill_cpu_threads ?? 8" in state
     )
     assert (
-        "qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false"
+        "ane_prefill_cpu_shared_resource: s.ane_prefill_cpu_shared_resource !== false"
         in state
     )
 
@@ -502,7 +502,7 @@ def test_oq_a8_settings_are_registered_in_the_dashboard_script():
     # The modal has to explain the ANE clash itself rather than let the save
     # come back as a bare 400 with the toggle already flipped.
     validator = js.split("validateA8PrefillSettings()", 1)[1].split("},", 1)[0]
-    assert "qwen35_ane_prefill_enabled" in validator
+    assert "ane_prefill_enabled" in validator
     # The tile must not leak into any of those four places, not even as a
     # hidden default the modal never renders.
     assert "qwen35_oq_a8_variant" not in js

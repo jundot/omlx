@@ -42,29 +42,62 @@ UNIVERSAL_PROFILE_FIELDS = (
     "forced_ct_kwargs",
 )
 
+ANE_PREFILL_FIELDS = (
+    "ane_prefill_enabled",
+    "ane_prefill_sequence_length",
+    "ane_prefill_tail_padding_min_tokens",
+    "ane_prefill_fraction",
+    "ane_prefill_shared_fraction",
+    "ane_prefill_fused_down",
+    "ane_prefill_max_layers",
+    "ane_prefill_dual_ane",
+    "ane_prefill_gdn",
+    "ane_prefill_gdn_fraction",
+    "ane_prefill_gdn_max_layers",
+    "ane_prefill_cpu_enabled",
+    "ane_prefill_cpu_fraction",
+    "ane_prefill_cpu_down_fraction",
+    "ane_prefill_cpu_gdn_fraction",
+    "ane_prefill_cpu_threads",
+    "ane_prefill_cpu_shared_resource",
+)
+
+# Aliases are accepted at input boundaries; runtime and saved output use one schema.
+ANE_PREFILL_ALIASES = {
+    **{f"qwen35_{name}": name for name in ANE_PREFILL_FIELDS},
+    **{
+        name.replace("ane_prefill_", "clef_flash_ane_", 1): name
+        for name in ANE_PREFILL_FIELDS
+        if not name.startswith("ane_prefill_cpu_") and name != "ane_prefill_shared_fraction"
+    },
+    **{
+        name.replace("ane_prefill_", "clef_flash_", 1): name
+        for name in ANE_PREFILL_FIELDS
+        if name.startswith("ane_prefill_cpu_")
+    },
+}
+
+
+def normalize_ane_prefill_settings(data: dict[str, Any]) -> dict[str, Any]:
+    """Read legacy names; explicit neutral keys win, then Clef, then Qwen."""
+    if not ANE_PREFILL_ALIASES.keys() & data.keys():
+        return data
+    result = {key: value for key, value in data.items() if key not in ANE_PREFILL_ALIASES}
+    for alias, name in ANE_PREFILL_ALIASES.items():
+        if alias in data and name not in data:
+            value = data[alias]
+            if value is not None or not alias.startswith("clef_flash_"):
+                result[name] = value
+    return result
+
+
 # Model-specific fields — eligible for per-model profiles only (never templates).
 MODEL_SPECIFIC_PROFILE_FIELDS = (
     "turboquant_kv_enabled",
     "turboquant_kv_scheme",
     "turboquant_kv_bits",
     "turboquant_skip_last",
-    "qwen35_ane_prefill_enabled",
-    "qwen35_ane_prefill_sequence_length",
-    "qwen35_ane_prefill_tail_padding_min_tokens",
-    "qwen35_ane_prefill_fraction",
-    "qwen35_ane_prefill_shared_fraction",
-    "qwen35_ane_prefill_fused_down",
-    "qwen35_ane_prefill_max_layers",
-    "qwen35_ane_prefill_dual_ane",
-    "qwen35_ane_prefill_gdn",
-    "qwen35_ane_prefill_gdn_fraction",
-    "qwen35_ane_prefill_gdn_max_layers",
-    "qwen35_ane_prefill_cpu_enabled",
-    "qwen35_ane_prefill_cpu_fraction",
-    "qwen35_ane_prefill_cpu_down_fraction",
-    "qwen35_ane_prefill_cpu_gdn_fraction",
-    "qwen35_ane_prefill_cpu_threads",
-    "qwen35_ane_prefill_cpu_shared_resource",
+    *ANE_PREFILL_FIELDS,
     "a8_prefill_enabled",
     "a8_prefill_min_tokens",
     "moe_expert_offload_enabled",
@@ -180,7 +213,7 @@ def normalize_turboquant_kv_bits(value: Any) -> Any:
 
 def filter_profile_fields(data: dict[str, Any]) -> dict[str, Any]:
     """Return a new dict of UNIVERSAL + MODEL_SPECIFIC keys with real values."""
-    filtered = _filter_and_sanitize(data, PROFILE_FIELDS_SET)
+    filtered = _filter_and_sanitize(normalize_ane_prefill_settings(data), PROFILE_FIELDS_SET)
     if "turboquant_kv_bits" in filtered:
         filtered["turboquant_kv_bits"] = normalize_turboquant_kv_bits(
             filtered["turboquant_kv_bits"]

@@ -43,7 +43,7 @@ def test_cpu_worker_search_space_is_independent_of_saved_settings():
 
 
 def test_candidate_settings_are_transient_copy():
-    base = ModelSettings(qwen35_ane_prefill_tail_padding_min_tokens=1500)
+    base = ModelSettings(ane_prefill_tail_padding_min_tokens=1500)
     request = ane_tuning.ANETuningRequest(model_id="qwen", sequence_length=2048)
     candidate = ane_tuning._Candidate(
         "test", True, 0.25, True, 0.35, True, 0.125, 0.20, 0.10
@@ -52,21 +52,21 @@ def test_candidate_settings_are_transient_copy():
     tuned = ane_tuning._settings_for_candidate(base, request, candidate)
 
     assert tuned is not base
-    assert tuned.qwen35_ane_prefill_enabled is True
-    assert tuned.qwen35_ane_prefill_fraction == 0.25
-    assert tuned.qwen35_ane_prefill_gdn_fraction == 0.35
-    assert tuned.qwen35_ane_prefill_cpu_enabled is True
-    assert tuned.qwen35_ane_prefill_cpu_fraction == 0.125
-    assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.20
-    assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.10
-    assert tuned.qwen35_ane_prefill_tail_padding_min_tokens == 0
-    assert base.qwen35_ane_prefill_enabled is False
-    assert base.qwen35_ane_prefill_fraction is None
-    assert base.qwen35_ane_prefill_tail_padding_min_tokens == 1500
+    assert tuned.ane_prefill_enabled is True
+    assert tuned.ane_prefill_fraction == 0.25
+    assert tuned.ane_prefill_gdn_fraction == 0.35
+    assert tuned.ane_prefill_cpu_enabled is True
+    assert tuned.ane_prefill_cpu_fraction == 0.125
+    assert tuned.ane_prefill_cpu_down_fraction == 0.20
+    assert tuned.ane_prefill_cpu_gdn_fraction == 0.10
+    assert tuned.ane_prefill_tail_padding_min_tokens == 0
+    assert base.ane_prefill_enabled is False
+    assert base.ane_prefill_fraction is None
+    assert base.ane_prefill_tail_padding_min_tokens == 1500
 
 
 def test_candidate_settings_preserve_single_ane_mode():
-    base = ModelSettings(qwen35_ane_prefill_dual_ane=False)
+    base = ModelSettings(ane_prefill_dual_ane=False)
     request = ane_tuning.ANETuningRequest(model_id="qwen")
     candidate = ane_tuning._Candidate(
         "single", True, 0.45, True, 0.45, True, 0.14, 0.20, 0.13
@@ -74,15 +74,15 @@ def test_candidate_settings_preserve_single_ane_mode():
 
     tuned = ane_tuning._settings_for_candidate(base, request, candidate)
 
-    assert tuned.qwen35_ane_prefill_dual_ane is False
-    assert tuned.qwen35_ane_prefill_cpu_enabled is True
-    assert tuned.qwen35_ane_prefill_cpu_fraction == 0.14
-    assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.20
-    assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.13
+    assert tuned.ane_prefill_dual_ane is False
+    assert tuned.ane_prefill_cpu_enabled is True
+    assert tuned.ane_prefill_cpu_fraction == 0.14
+    assert tuned.ane_prefill_cpu_down_fraction == 0.20
+    assert tuned.ane_prefill_cpu_gdn_fraction == 0.13
 
 
 def test_candidate_settings_apply_tuner_boolean_overrides():
-    base = ModelSettings(qwen35_ane_prefill_cpu_shared_resource=True)
+    base = ModelSettings(ane_prefill_cpu_shared_resource=True)
     request = ane_tuning.ANETuningRequest(
         model_id="qwen",
         allow_cpu=False,
@@ -98,17 +98,17 @@ def test_candidate_settings_apply_tuner_boolean_overrides():
 
     tuned = ane_tuning._settings_for_candidate(base, request, candidate)
 
-    assert tuned.qwen35_ane_prefill_enabled is True
-    assert tuned.qwen35_ane_prefill_gdn is False
-    assert tuned.qwen35_ane_prefill_cpu_enabled is False
-    assert tuned.qwen35_ane_prefill_cpu_fraction == 0.0
-    assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.0
-    assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.0
-    assert tuned.qwen35_ane_prefill_cpu_shared_resource is False
+    assert tuned.ane_prefill_enabled is True
+    assert tuned.ane_prefill_gdn is False
+    assert tuned.ane_prefill_cpu_enabled is False
+    assert tuned.ane_prefill_cpu_fraction == 0.0
+    assert tuned.ane_prefill_cpu_down_fraction == 0.0
+    assert tuned.ane_prefill_cpu_gdn_fraction == 0.0
+    assert tuned.ane_prefill_cpu_shared_resource is False
 
 
 def test_fused_candidate_uses_per_ane_fraction_and_one_cpu_hidden_share():
-    base = ModelSettings(qwen35_ane_prefill_cpu_down_fraction=0.2)
+    base = ModelSettings(ane_prefill_cpu_down_fraction=0.2)
     request = ane_tuning.ANETuningRequest(model_id="qwen")
     candidate = ane_tuning._Candidate(
         label="fused",
@@ -123,11 +123,11 @@ def test_fused_candidate_uses_per_ane_fraction_and_one_cpu_hidden_share():
 
     tuned = ane_tuning._settings_for_candidate(base, request, candidate)
 
-    assert tuned.qwen35_ane_prefill_fused_down is True
-    assert tuned.qwen35_ane_prefill_fraction == 0.19
-    assert tuned.qwen35_ane_prefill_cpu_fraction == 0.14
-    assert tuned.qwen35_ane_prefill_cpu_down_fraction == 0.0
-    assert tuned.qwen35_ane_prefill_cpu_threads == 12
+    assert tuned.ane_prefill_fused_down is True
+    assert tuned.ane_prefill_fraction == 0.19
+    assert tuned.ane_prefill_cpu_fraction == 0.14
+    assert tuned.ane_prefill_cpu_down_fraction == 0.0
+    assert tuned.ane_prefill_cpu_threads == 12
 
 
 def test_fused_profile_refinement_balances_aggregate_dual_ane_width():
@@ -493,8 +493,8 @@ async def test_full_model_gdn_correction_precedes_worker_runner_up(monkeypatch):
     pool = SimpleNamespace(
         _settings_manager=SimpleNamespace(
             get_settings=lambda model_id: ModelSettings(
-                qwen35_ane_prefill_cpu_threads=14,
-                qwen35_ane_prefill_gdn_fraction=0.60,
+                ane_prefill_cpu_threads=14,
+                ane_prefill_gdn_fraction=0.60,
             )
         ),
         get_loaded_model_ids=lambda: [],

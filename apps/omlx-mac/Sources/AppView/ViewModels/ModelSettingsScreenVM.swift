@@ -778,25 +778,25 @@ final class ModelSettingsScreenVM {
                 self.turboquantKvEnabled = s?.turboquantKvEnabled ?? false
                 self.turboquantKvScheme = s?.turboquantKvScheme ?? "turboquant"
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
-                self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
+                self.qwen35AnePrefillSharedFraction = s?.anePrefillSharedFraction.map { String($0) } ?? "1"
                 self.a8PrefillEnabled = s?.a8PrefillEnabled ?? false
                 self.a8PrefillMinTokens = s?.a8PrefillMinTokens.map(String.init) ?? "128"
-                self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
-                self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
-                self.qwen35AnePrefillTailPaddingMinTokens = s?.qwen35AnePrefillTailPaddingMinTokens.map(String.init) ?? "0"
-                self.qwen35AnePrefillFraction = String(s?.qwen35AnePrefillFraction ?? m.anePrefillDefaultFraction ?? 0.53)
-                self.qwen35AnePrefillMaxLayers = s?.qwen35AnePrefillMaxLayers.map(String.init) ?? "64"
-                self.qwen35AnePrefillDualAne = s?.qwen35AnePrefillDualAne ?? true
-                self.qwen35AnePrefillGdn = s?.qwen35AnePrefillGdn ?? true
-                self.qwen35AnePrefillGdnFraction = s?.qwen35AnePrefillGdnFraction.map { Self.formatPct($0) } ?? "0.5"
-                self.qwen35AnePrefillGdnMaxLayers = s?.qwen35AnePrefillGdnMaxLayers.map(String.init) ?? "48"
-                self.qwen35AnePrefillCpuEnabled = s?.qwen35AnePrefillCpuEnabled ?? false
-                self.qwen35AnePrefillCpuFraction = s?.qwen35AnePrefillCpuFraction.map { Self.formatPct($0) } ?? "0.135"
-                self.qwen35AnePrefillCpuDownFraction = s?.qwen35AnePrefillCpuDownFraction.map { Self.formatPct($0) } ?? "0"
-                self.qwen35AnePrefillCpuGdnFraction = s?.qwen35AnePrefillCpuGdnFraction.map { Self.formatPct($0) } ?? "0"
-                self.qwen35AnePrefillCpuThreads = s?.qwen35AnePrefillCpuThreads.map(String.init) ?? "8"
-                self.qwen35AnePrefillCpuSharedResource = s?.qwen35AnePrefillCpuSharedResource ?? true
-                self.qwen35AnePrefillFusedDown = s?.qwen35AnePrefillFusedDown ?? false
+                self.qwen35AnePrefillEnabled = s?.anePrefillEnabled ?? false
+                self.qwen35AnePrefillSequenceLength = s?.anePrefillSequenceLength.map(String.init) ?? "2048"
+                self.qwen35AnePrefillTailPaddingMinTokens = s?.anePrefillTailPaddingMinTokens.map(String.init) ?? "0"
+                self.qwen35AnePrefillFraction = String(s?.anePrefillFraction ?? m.anePrefillDefaultFraction ?? 0.53)
+                self.qwen35AnePrefillMaxLayers = s?.anePrefillMaxLayers.map(String.init) ?? "64"
+                self.qwen35AnePrefillDualAne = s?.anePrefillDualAne ?? true
+                self.qwen35AnePrefillGdn = s?.anePrefillGdn ?? true
+                self.qwen35AnePrefillGdnFraction = s?.anePrefillGdnFraction.map { Self.formatPct($0) } ?? "0.5"
+                self.qwen35AnePrefillGdnMaxLayers = s?.anePrefillGdnMaxLayers.map(String.init) ?? "48"
+                self.qwen35AnePrefillCpuEnabled = s?.anePrefillCpuEnabled ?? false
+                self.qwen35AnePrefillCpuFraction = s?.anePrefillCpuFraction.map { Self.formatPct($0) } ?? "0.135"
+                self.qwen35AnePrefillCpuDownFraction = s?.anePrefillCpuDownFraction.map { Self.formatPct($0) } ?? "0"
+                self.qwen35AnePrefillCpuGdnFraction = s?.anePrefillCpuGdnFraction.map { Self.formatPct($0) } ?? "0"
+                self.qwen35AnePrefillCpuThreads = s?.anePrefillCpuThreads.map(String.init) ?? "8"
+                self.qwen35AnePrefillCpuSharedResource = s?.anePrefillCpuSharedResource ?? true
+                self.qwen35AnePrefillFusedDown = s?.anePrefillFusedDown ?? false
                 self.indexCacheEnabled = s?.indexCacheFreq != nil
                 self.indexCacheFreq = s?.indexCacheFreq.map(String.init) ?? "4"
                 self.specprefillEnabled = s?.specprefillEnabled ?? false
@@ -966,7 +966,7 @@ final class ModelSettingsScreenVM {
         case .turboquantKvBits:        patch.turboquantKvBits = Double(turboquantKvBits)
         case .qwen35AnePrefillSharedFraction:
             guard validateAneWorkingSettings() else { return }
-            patch.qwen35AnePrefillSharedFraction = Double(qwen35AnePrefillSharedFraction)
+            patch.anePrefillSharedFraction = Double(qwen35AnePrefillSharedFraction)
         case .a8PrefillEnabled:  patch.a8PrefillEnabled = a8PrefillEnabled
         case .a8PrefillMinTokens:
             guard let value = Int(a8PrefillMinTokens), value >= 1 else {
@@ -974,54 +974,54 @@ final class ModelSettingsScreenVM {
                 return
             }
             patch.a8PrefillMinTokens = value
-        case .qwen35AnePrefillEnabled: patch.qwen35AnePrefillEnabled = qwen35AnePrefillEnabled
+        case .qwen35AnePrefillEnabled: patch.anePrefillEnabled = qwen35AnePrefillEnabled
         case .qwen35AnePrefillSequenceLength:
             guard validateAneWorkingSettings() else { return }
-            patch.qwen35AnePrefillSequenceLength = Int(qwen35AnePrefillSequenceLength)
+            patch.anePrefillSequenceLength = Int(qwen35AnePrefillSequenceLength)
         case .qwen35AnePrefillTailPaddingMinTokens:
             switch QwenAneSettingsValidator.tailPadding(
                 qwen35AnePrefillTailPaddingMinTokens,
                 sequenceLength: qwen35AnePrefillSequenceLength
             ) {
-            case .success(let value): patch.qwen35AnePrefillTailPaddingMinTokens = value
+            case .success(let value): patch.anePrefillTailPaddingMinTokens = value
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillFraction:
             guard validateAneWorkingSettings() else { return }
-            patch.qwen35AnePrefillFraction = Double(qwen35AnePrefillFraction)
+            patch.anePrefillFraction = Double(qwen35AnePrefillFraction)
         case .qwen35AnePrefillMaxLayers:
             switch QwenAneSettingsValidator.mlpLayers(qwen35AnePrefillMaxLayers) {
-            case .success(let value): patch.qwen35AnePrefillMaxLayers = value
+            case .success(let value): patch.anePrefillMaxLayers = value
             case .failure(let error): lastError = error.message; return
             }
-        case .qwen35AnePrefillDualAne: patch.qwen35AnePrefillDualAne = qwen35AnePrefillDualAne
-        case .qwen35AnePrefillGdn:     patch.qwen35AnePrefillGdn = qwen35AnePrefillGdn
+        case .qwen35AnePrefillDualAne: patch.anePrefillDualAne = qwen35AnePrefillDualAne
+        case .qwen35AnePrefillGdn:     patch.anePrefillGdn = qwen35AnePrefillGdn
         case .qwen35AnePrefillGdnFraction:
             switch QwenAneSettingsValidator.gdnFraction(
                 qwen35AnePrefillGdnFraction,
                 cpuFraction: qwen35AnePrefillCpuEnabled ? qwen35AnePrefillCpuGdnFraction : "0"
             ) {
-            case .success(let value): patch.qwen35AnePrefillGdnFraction = value
+            case .success(let value): patch.anePrefillGdnFraction = value
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillGdnMaxLayers:
             switch QwenAneSettingsValidator.gdnLayers(qwen35AnePrefillGdnMaxLayers) {
-            case .success(let value): patch.qwen35AnePrefillGdnMaxLayers = value
+            case .success(let value): patch.anePrefillGdnMaxLayers = value
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillCpuEnabled:
-            patch.qwen35AnePrefillCpuEnabled = qwen35AnePrefillCpuEnabled
+            patch.anePrefillCpuEnabled = qwen35AnePrefillCpuEnabled
         case .qwen35AnePrefillCpuFraction:
             switch QwenAneSettingsValidator.cpuFraction(
                 qwen35AnePrefillCpuFraction,
                 mlpFraction: qwen35AnePrefillFraction
             ) {
-            case .success(let value): patch.qwen35AnePrefillCpuFraction = value
+            case .success(let value): patch.anePrefillCpuFraction = value
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillCpuDownFraction:
             switch QwenAneSettingsValidator.cpuDownFraction(qwen35AnePrefillCpuDownFraction) {
-            case .success(let value): patch.qwen35AnePrefillCpuDownFraction = value
+            case .success(let value): patch.anePrefillCpuDownFraction = value
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillCpuGdnFraction:
@@ -1029,16 +1029,16 @@ final class ModelSettingsScreenVM {
                 qwen35AnePrefillCpuGdnFraction,
                 gdnFraction: qwen35AnePrefillGdnFraction
             ) {
-            case .success(let value): patch.qwen35AnePrefillCpuGdnFraction = value
+            case .success(let value): patch.anePrefillCpuGdnFraction = value
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillCpuThreads:
             switch QwenAneSettingsValidator.cpuThreads(qwen35AnePrefillCpuThreads) {
-            case .success(let value): patch.qwen35AnePrefillCpuThreads = value
+            case .success(let value): patch.anePrefillCpuThreads = value
             case .failure(let error): lastError = error.message; return
             }
         case .qwen35AnePrefillCpuSharedResource:
-            patch.qwen35AnePrefillCpuSharedResource = qwen35AnePrefillCpuSharedResource
+            patch.anePrefillCpuSharedResource = qwen35AnePrefillCpuSharedResource
         case .indexCacheEnabled:
             patch.indexCacheFreq = indexCacheEnabled ? (Int(indexCacheFreq) ?? 4) : 0
         case .indexCacheFreq:

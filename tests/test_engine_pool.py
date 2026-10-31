@@ -667,14 +667,14 @@ class TestQwenCpuShareMemoryEstimate:
         model = tmp_path / "qwen"
         self._write_config(model)
         settings = ModelSettings(
-            qwen35_ane_prefill_enabled=True,
-            qwen35_ane_prefill_max_layers=3,
-            qwen35_ane_prefill_gdn=True,
-            qwen35_ane_prefill_gdn_max_layers=2,
-            qwen35_ane_prefill_cpu_enabled=True,
-            qwen35_ane_prefill_cpu_fraction=0.25,
-            qwen35_ane_prefill_cpu_down_fraction=0.25,
-            qwen35_ane_prefill_cpu_gdn_fraction=0.25,
+            ane_prefill_enabled=True,
+            ane_prefill_max_layers=3,
+            ane_prefill_gdn=True,
+            ane_prefill_gdn_max_layers=2,
+            ane_prefill_cpu_enabled=True,
+            ane_prefill_cpu_fraction=0.25,
+            ane_prefill_cpu_down_fraction=0.25,
+            ane_prefill_cpu_gdn_fraction=0.25,
         )
 
         estimated = _qwen35_cpu_share_estimated_bytes(str(model), settings)
@@ -690,9 +690,9 @@ class TestQwenCpuShareMemoryEstimate:
         model = tmp_path / "qwen"
         self._write_config(model)
         settings = ModelSettings(
-            qwen35_ane_prefill_enabled=True,
-            qwen35_ane_prefill_cpu_enabled=True,
-            qwen35_ane_prefill_cpu_fraction=0.25,
+            ane_prefill_enabled=True,
+            ane_prefill_cpu_enabled=True,
+            ane_prefill_cpu_fraction=0.25,
         )
         entry = EngineEntry(
             model_id="qwen",
@@ -718,9 +718,9 @@ class TestQwenCpuShareMemoryEstimate:
         model = tmp_path / "qwen"
         self._write_config(model)
         settings = ModelSettings(
-            qwen35_ane_prefill_enabled=True,
-            qwen35_ane_prefill_cpu_enabled=True,
-            qwen35_ane_prefill_cpu_down_fraction=0.25,
+            ane_prefill_enabled=True,
+            ane_prefill_cpu_enabled=True,
+            ane_prefill_cpu_down_fraction=0.25,
         )
         pool = _make_pool(ceiling=100_000)
         pool._entries["qwen"] = EngineEntry(
@@ -747,8 +747,8 @@ class TestQwenCpuShareMemoryEstimate:
         model.mkdir()
         (model / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
         settings = ModelSettings(
-            qwen35_ane_prefill_enabled=True,
-            qwen35_ane_prefill_cpu_enabled=True,
+            ane_prefill_enabled=True,
+            ane_prefill_cpu_enabled=True,
         )
         entry = EngineEntry(
             model_id="qwen",

@@ -205,8 +205,8 @@ def _qwen35_cpu_share_estimated_bytes(
 
     if (
         settings is None
-        or not bool(getattr(settings, "qwen35_ane_prefill_enabled", False))
-        or not bool(getattr(settings, "qwen35_ane_prefill_cpu_enabled", False))
+        or not bool(getattr(settings, "ane_prefill_enabled", False))
+        or not bool(getattr(settings, "ane_prefill_cpu_enabled", False))
     ):
         return 0
 
@@ -231,23 +231,23 @@ def _qwen35_cpu_share_estimated_bytes(
         return None
     layer_count = min(
         layer_count,
-        max(0, int(getattr(settings, "qwen35_ane_prefill_max_layers", 64) or 0)),
+        max(0, int(getattr(settings, "ane_prefill_max_layers", 64) or 0)),
     )
 
     extra = 0.0
     gate_fraction = float(
-        getattr(settings, "qwen35_ane_prefill_cpu_fraction", 0.0) or 0.0
+        getattr(settings, "ane_prefill_cpu_fraction", 0.0) or 0.0
     )
     gate_rows = _aligned_share_rows(intermediate, gate_fraction)
     if gate_rows:
         extra += layer_count * 2 * gate_rows * hidden * _FP16_BYTES
-        if bool(getattr(settings, "qwen35_ane_prefill_fused_down", False)):
+        if bool(getattr(settings, "ane_prefill_fused_down", False)):
             # The fused CPU branch keeps the matching hidden-channel columns
             # of down_proj in FP16 as well as the gate/up rows above.
             extra += layer_count * gate_rows * hidden * _FP16_BYTES
 
     down_fraction = float(
-        getattr(settings, "qwen35_ane_prefill_cpu_down_fraction", 0.0) or 0.0
+        getattr(settings, "ane_prefill_cpu_down_fraction", 0.0) or 0.0
     )
     down_rows = _aligned_share_rows(hidden, down_fraction)
     if down_rows and down_rows < hidden:
@@ -256,9 +256,9 @@ def _qwen35_cpu_share_estimated_bytes(
         extra += layer_count * (cpu_weight + gpu_suffix)
 
     gdn_fraction = float(
-        getattr(settings, "qwen35_ane_prefill_cpu_gdn_fraction", 0.0) or 0.0
+        getattr(settings, "ane_prefill_cpu_gdn_fraction", 0.0) or 0.0
     )
-    if gdn_fraction > 0 and bool(getattr(settings, "qwen35_ane_prefill_gdn", True)):
+    if gdn_fraction > 0 and bool(getattr(settings, "ane_prefill_gdn", True)):
         key_heads = _positive_int(text.get("linear_num_key_heads"))
         key_dim = _positive_int(text.get("linear_key_head_dim"))
         value_heads = _positive_int(text.get("linear_num_value_heads"))
@@ -284,7 +284,7 @@ def _qwen35_cpu_share_estimated_bytes(
             gdn_layers,
             max(
                 0,
-                int(getattr(settings, "qwen35_ane_prefill_gdn_max_layers", 48) or 0),
+                int(getattr(settings, "ane_prefill_gdn_max_layers", 48) or 0),
             ),
         )
         extra += gdn_layers * gdn_rows * hidden * _FP16_BYTES
@@ -656,7 +656,7 @@ class EnginePool:
             )
         if (
             include_ane_reservation
-            and getattr(runtime_settings, "qwen35_ane_prefill_enabled", False)
+            and getattr(runtime_settings, "ane_prefill_enabled", False)
             and ane_prefill_backend(entry.config_model_type) == "k2"
         ):
             from .patches.k2_horizon.ane_prefill import prefill_memory_reservation
@@ -665,11 +665,11 @@ class EnginePool:
             extra += prefill_memory_reservation(
                 config,
                 fraction=ane_prefill_fraction(
-                    runtime_settings.qwen35_ane_prefill_fraction,
+                    runtime_settings.ane_prefill_fraction,
                     entry.config_model_type,
                 ),
-                shared_fraction=runtime_settings.qwen35_ane_prefill_shared_fraction,
-                width=runtime_settings.qwen35_ane_prefill_sequence_length,
+                shared_fraction=runtime_settings.ane_prefill_shared_fraction,
+                width=runtime_settings.ane_prefill_sequence_length,
             )
         if getattr(runtime_settings, "moe_expert_offload_enabled", False):
             from .patches.moe_expert_offload import estimate_offload_admission_bytes
@@ -1254,9 +1254,9 @@ class EnginePool:
         if settings is None:
             return None
 
+        entry = self._entries.get(model_id)
         to_dict = getattr(settings, "to_dict", None)
         data = to_dict() if callable(to_dict) else {}
-        entry = self._entries.get(model_id)
         is_diffusion = bool(entry and self._entry_is_diffusion_model(entry))
 
         def has_value(key: str) -> bool:
@@ -1341,71 +1341,71 @@ class EnginePool:
         if oq_a8_active:
             add("a8_prefill_min_tokens", data.get("a8_prefill_min_tokens", 128))
 
-        ane_active = bool(data.get("qwen35_ane_prefill_enabled", False))
+        ane_active = bool(data.get("ane_prefill_enabled", False))
         model_type = entry.config_model_type if entry else None
         backend = ane_prefill_backend(model_type)
-        add("qwen35_ane_prefill_enabled", ane_active)
+        add("ane_prefill_enabled", ane_active)
         if ane_active:
             add("ane_prefill_backend", backend)
             add(
-                "qwen35_ane_prefill_sequence_length",
-                data.get("qwen35_ane_prefill_sequence_length", 2048),
+                "ane_prefill_sequence_length",
+                data.get("ane_prefill_sequence_length", 2048),
             )
             add(
-                "qwen35_ane_prefill_fraction",
+                "ane_prefill_fraction",
                 ane_prefill_fraction(
-                    data.get("qwen35_ane_prefill_fraction"),
+                    data.get("ane_prefill_fraction"),
                     model_type,
                 ),
             )
             if backend == "k2":
                 add(
-                    "qwen35_ane_prefill_shared_fraction",
-                    data.get("qwen35_ane_prefill_shared_fraction", 1.0),
+                    "ane_prefill_shared_fraction",
+                    data.get("ane_prefill_shared_fraction", 1.0),
                 )
         if ane_active and backend != "k2":
             add(
-                "qwen35_ane_prefill_tail_padding_min_tokens",
-                data.get("qwen35_ane_prefill_tail_padding_min_tokens", 0),
+                "ane_prefill_tail_padding_min_tokens",
+                data.get("ane_prefill_tail_padding_min_tokens", 0),
             )
             add(
-                "qwen35_ane_prefill_fused_down",
-                data.get("qwen35_ane_prefill_fused_down", False),
+                "ane_prefill_fused_down",
+                data.get("ane_prefill_fused_down", False),
             )
-            add("qwen35_ane_prefill_max_layers", data.get("qwen35_ane_prefill_max_layers", 64))
-            add("qwen35_ane_prefill_dual_ane", data.get("qwen35_ane_prefill_dual_ane", True))
-            add("qwen35_ane_prefill_gdn", data.get("qwen35_ane_prefill_gdn", True))
-            if data.get("qwen35_ane_prefill_gdn", True):
+            add("ane_prefill_max_layers", data.get("ane_prefill_max_layers", 64))
+            add("ane_prefill_dual_ane", data.get("ane_prefill_dual_ane", True))
+            add("ane_prefill_gdn", data.get("ane_prefill_gdn", True))
+            if data.get("ane_prefill_gdn", True):
                 add(
-                    "qwen35_ane_prefill_gdn_fraction",
-                    data.get("qwen35_ane_prefill_gdn_fraction", 0.50),
+                    "ane_prefill_gdn_fraction",
+                    data.get("ane_prefill_gdn_fraction", 0.50),
                 )
                 add(
-                    "qwen35_ane_prefill_gdn_max_layers",
-                    data.get("qwen35_ane_prefill_gdn_max_layers", 48),
+                    "ane_prefill_gdn_max_layers",
+                    data.get("ane_prefill_gdn_max_layers", 48),
                 )
-            cpu_active = bool(data.get("qwen35_ane_prefill_cpu_enabled", False))
-            add("qwen35_ane_prefill_cpu_enabled", cpu_active)
+            cpu_active = bool(data.get("ane_prefill_cpu_enabled", False))
+            add("ane_prefill_cpu_enabled", cpu_active)
             if cpu_active:
                 add(
-                    "qwen35_ane_prefill_cpu_fraction",
-                    data.get("qwen35_ane_prefill_cpu_fraction", 0.135),
+                    "ane_prefill_cpu_fraction",
+                    data.get("ane_prefill_cpu_fraction", 0.135),
                 )
                 add(
-                    "qwen35_ane_prefill_cpu_down_fraction",
-                    data.get("qwen35_ane_prefill_cpu_down_fraction", 0.0),
+                    "ane_prefill_cpu_down_fraction",
+                    data.get("ane_prefill_cpu_down_fraction", 0.0),
                 )
                 add(
-                    "qwen35_ane_prefill_cpu_gdn_fraction",
-                    data.get("qwen35_ane_prefill_cpu_gdn_fraction", 0.0),
+                    "ane_prefill_cpu_gdn_fraction",
+                    data.get("ane_prefill_cpu_gdn_fraction", 0.0),
                 )
                 add(
-                    "qwen35_ane_prefill_cpu_threads",
-                    data.get("qwen35_ane_prefill_cpu_threads", 8),
+                    "ane_prefill_cpu_threads",
+                    data.get("ane_prefill_cpu_threads", 8),
                 )
                 add(
-                    "qwen35_ane_prefill_cpu_shared_resource",
-                    data.get("qwen35_ane_prefill_cpu_shared_resource", True),
+                    "ane_prefill_cpu_shared_resource",
+                    data.get("ane_prefill_cpu_shared_resource", True),
                 )
 
         moe_offload_active = bool(data.get("moe_expert_offload_enabled", False))
@@ -4106,7 +4106,7 @@ class EnginePool:
             model_settings = self._effective_deepseek_v41_model_settings(
                 entry, model_settings
             )
-            if getattr(model_settings, "qwen35_ane_prefill_enabled", False):
+            if getattr(model_settings, "ane_prefill_enabled", False):
                 validate_ane_prefill(model_settings.to_dict(), entry.config_model_type)
 
             deployment = self._distributed_deployment_for_entry(entry)

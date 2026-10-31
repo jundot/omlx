@@ -255,7 +255,7 @@ _FEATURE_FLAG_SPECS = (
     _FeatureFlagSpec("mtp_enabled", "mtp", "lightning_mtp", "Lightning MTP"),
     _FeatureFlagSpec("vlm_mtp_enabled", "vlm_mtp", "vlm_mtp", "VLM MTP"),
     _FeatureFlagSpec(
-        "qwen35_ane_prefill_enabled",
+        "ane_prefill_enabled",
         "qwen35_ane_prefill",
         "qwen35_ane_prefill",
         "Qwen ANE Prefill",
@@ -383,23 +383,23 @@ _UPLOADED_SETTING_FIELDS = (
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
-    "qwen35_ane_prefill_enabled",
-    "qwen35_ane_prefill_sequence_length",
-    "qwen35_ane_prefill_tail_padding_min_tokens",
-    "qwen35_ane_prefill_fraction",
-    "qwen35_ane_prefill_shared_fraction",
-    "qwen35_ane_prefill_fused_down",
-    "qwen35_ane_prefill_max_layers",
-    "qwen35_ane_prefill_dual_ane",
-    "qwen35_ane_prefill_gdn",
-    "qwen35_ane_prefill_gdn_fraction",
-    "qwen35_ane_prefill_gdn_max_layers",
-    "qwen35_ane_prefill_cpu_enabled",
-    "qwen35_ane_prefill_cpu_fraction",
-    "qwen35_ane_prefill_cpu_down_fraction",
-    "qwen35_ane_prefill_cpu_gdn_fraction",
-    "qwen35_ane_prefill_cpu_threads",
-    "qwen35_ane_prefill_cpu_shared_resource",
+    "ane_prefill_enabled",
+    "ane_prefill_sequence_length",
+    "ane_prefill_tail_padding_min_tokens",
+    "ane_prefill_fraction",
+    "ane_prefill_shared_fraction",
+    "ane_prefill_fused_down",
+    "ane_prefill_max_layers",
+    "ane_prefill_dual_ane",
+    "ane_prefill_gdn",
+    "ane_prefill_gdn_fraction",
+    "ane_prefill_gdn_max_layers",
+    "ane_prefill_cpu_enabled",
+    "ane_prefill_cpu_fraction",
+    "ane_prefill_cpu_down_fraction",
+    "ane_prefill_cpu_gdn_fraction",
+    "ane_prefill_cpu_threads",
+    "ane_prefill_cpu_shared_resource",
 )
 
 _PATH_VALUED_SETTING_FIELDS = frozenset(
@@ -1982,10 +1982,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # Phase 3: Single request tests
         ane_trace_config: dict[str, Any] | None = None
         if model_settings is not None and getattr(
-            model_settings, "qwen35_ane_prefill_enabled", False
+            model_settings, "ane_prefill_enabled", False
         ):
             gdn_enabled = bool(
-                getattr(model_settings, "qwen35_ane_prefill_gdn", False)
+                getattr(model_settings, "ane_prefill_gdn", False)
             )
             # The settings flag only records intent. The load-time patch stores
             # what it actually compiled on the model, so the trace and the
@@ -2003,18 +2003,18 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "sequence_length": int(
                     getattr(
                         model_settings,
-                        "qwen35_ane_prefill_sequence_length",
+                        "ane_prefill_sequence_length",
                         2048,
                     )
                 ),
                 "mlp_layers": int(
-                    getattr(model_settings, "qwen35_ane_prefill_max_layers", 0)
+                    getattr(model_settings, "ane_prefill_max_layers", 0)
                 ),
                 "gdn_layers": (
                     int(
                         getattr(
                             model_settings,
-                            "qwen35_ane_prefill_gdn_max_layers",
+                            "ane_prefill_gdn_max_layers",
                             0,
                         )
                     )

@@ -62,9 +62,9 @@ def test_shared_ane_web_state_preserves_backend_default_and_saved_fraction(
     ).group()
     metadata = _model_options({"config_model_type": model_type}, None)
     saved = {
-        "qwen35_ane_prefill_enabled": True,
-        "qwen35_ane_prefill_fraction": saved_fraction,
-        "qwen35_ane_prefill_shared_fraction": 0,
+        "ane_prefill_enabled": True,
+        "ane_prefill_fraction": saved_fraction,
+        "ane_prefill_shared_fraction": 0,
     }
     script = (
         "const OCR_CONFIG_MODEL_TYPES = new Set(); const app = {isDiffusionModel: () => false, buildCtKwargEntries: () => [],"
@@ -73,11 +73,11 @@ def test_shared_ane_web_state_preserves_backend_default_and_saved_fraction(
     )
     script += f"console.log(JSON.stringify(app.buildModelSettingsState({json.dumps(metadata)}, {json.dumps(saved)})));"
     state = json.loads(subprocess.check_output([node, "-e", script], text=True))
-    assert state["qwen35_ane_prefill_enabled"] is True
-    assert state["qwen35_ane_prefill_fraction"] == (
+    assert state["ane_prefill_enabled"] is True
+    assert state["ane_prefill_fraction"] == (
         saved_fraction
         if saved_fraction is not None
         else metadata["ane_prefill_default_fraction"]
     )
-    assert state["qwen35_ane_prefill_shared_fraction"] == 0
+    assert state["ane_prefill_shared_fraction"] == 0
     assert not any(key.startswith("k2_ane_") for key in state)
