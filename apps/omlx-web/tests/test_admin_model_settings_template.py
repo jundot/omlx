@@ -1018,7 +1018,6 @@ def test_gpu_power_limit_row_follows_thinking_budget():
     # Out-of-range values get the range message instead of a raw 422 list.
     save = js.split("async saveModelSettings()", 1)[1].split("async ", 1)[0]
     assert "this.validateGpuPowerLimit()" in save
-    assert "Array.isArray(data.detail)" in save
 
 
 def test_speed_benches_say_the_gpu_power_limit_does_not_apply():

@@ -1501,7 +1501,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.saveError = Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_settings_failed'));
+                        this.saveError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                         // Reload settings to revert to server values
                         await this.loadGlobalSettings();
                     }
@@ -1550,7 +1550,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        this.subKeyError = data.detail || window.t('js.error.save_settings_failed');
+                        this.subKeyError = this.formatApiError(data.detail) || window.t('js.error.save_settings_failed');
                     }
                 } catch (err) {
                     this.subKeyError = window.t('js.error.save_settings_failed');
@@ -1645,7 +1645,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.update_model_setting_failed'));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.update_model_setting_failed'));
                         await this.loadModels();
                     }
                 } catch (err) {
@@ -2089,6 +2089,31 @@
                 return v;
             },
 
+            // The admin API answers a pydantic validation error with an array
+            // of {loc, msg} objects. alert() on that array prints
+            // "[object Object]" and hides which field the server refused, so
+            // the settings endpoints that can return one render it here.
+            formatApiError(detail) {
+                if (!detail) return '';
+                if (Array.isArray(detail)) {
+                    return detail.map(item => {
+                        if (!item || typeof item !== 'object') return String(item);
+                        const loc = Array.isArray(item.loc) ? item.loc : [];
+                        const fields = ['body', 'query', 'path', 'header'].includes(loc[0])
+                            ? loc.slice(1) : loc;
+                        const path = fields.join('.');
+                        const message = String(item.msg || item.message || '')
+                            .replace(/^Value error, /, '');
+                        const text = message || JSON.stringify(item);
+                        return path ? `${path}: ${text}` : text;
+                    }).filter(Boolean).join('; ');
+                }
+                if (typeof detail === 'object') {
+                    return String(detail.message || detail.msg || JSON.stringify(detail));
+                }
+                return String(detail);
+            },
+
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
                 const ctk = chatTemplateKwargs || {};
                 const forced = new Set(forcedCtKwargs || []);
@@ -2456,7 +2481,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.save_profile_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.save_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2583,7 +2608,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.update_profile_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.update_profile_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2624,7 +2649,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.save_template_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.save_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2650,7 +2675,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await r.json().catch(() => ({}));
-                        this.profileError = data.detail || window.t('js.error.update_template_failed');
+                        this.profileError = this.formatApiError(data.detail) || window.t('js.error.update_template_failed');
                     }
                 } catch (e) {
                     this.profileError = String(e);
@@ -2949,7 +2974,7 @@
                         return;
                     }
                     if (!response.ok) {
-                        throw new Error(data.detail || window.t('js.error.apply_ane_tuning_result_failed'));
+                        throw new Error(this.formatApiError(data.detail) || window.t('js.error.apply_ane_tuning_result_failed'));
                     }
                     Object.assign(this.modelSettings, patch);
                     const model = this.models.find(item => item.id === this.selectedModel.id);
@@ -3480,8 +3505,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        // Request validation errors (422) carry a list of objects.
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_model_settings_failed')));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_model_settings_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
@@ -3530,7 +3554,7 @@
                     }
                     const data = await response.json().catch(() => ({}));
                     if (!response.ok) {
-                        this.settingsApply.error = data.detail || window.t('js.error.settings_apply_failed');
+                        this.settingsApply.error = this.formatApiError(data.detail) || window.t('js.error.settings_apply_failed');
                         this.settingsApply.phase = 'error';
                         return null;
                     }
@@ -7120,7 +7144,7 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_failed')));
+                        alert(this.formatApiError(data.detail) || window.t('js.error.save_failed'));
                     }
                 } catch (err) {
                     console.error('Failed to save HF mirror endpoint:', err);
