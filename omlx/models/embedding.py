@@ -21,8 +21,13 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_map
 from mlx_vlm.embedding_loader import load_embedding_model
 from mlx_vlm.models.lfm2_colbert import Model as Lfm2Colbert
+from mlx_vlm.models.llama_bidirec import Model as LlamaBidirec
+from mlx_vlm.models.llama_nemotron_vl_embedding import Model as LlamaNemotron
 from mlx_vlm.models.pooling import EmbeddingOutput as VlmEmbeddingOutput
+from mlx_vlm.models.pooling import cls_pooling
 from mlx_vlm.models.pooling import normalize_embeddings as normalize_token_embeddings
+from mlx_vlm.models.pooling import pool_by_config
+from mlx_vlm.models.qwen3_vl_embedding import Model as Qwen3VLEmbedding
 from mlx_vlm.utils import get_model_path, load_audio, load_config, load_processor
 
 from ..patches.modernbert_attention import patch_modernbert_attention
@@ -30,6 +35,11 @@ from ..utils.image import _decode_input_audio_data, load_image, validate_image_d
 from ..utils.model_loading import (
     ensure_model_code_trusted,
     normalize_encoder_quantization_config,
+)
+from ._siglip_embedding import (
+    SiglipImageEncoder,
+    load_siglip_vision,
+    set_siglip_activation,
 )
 from .base_model import (
     ENCODER_BATCH_TOKEN_BUDGET,
@@ -59,7 +69,7 @@ class _ChatEmbeddingFamily:
     context_length: int
     """Context window from the model card. config.json only declares RoPE."""
 
-    system_instruction: Optional[str] = None
+    system_instruction: str | None = None
     add_generation_prompt: bool = False
     media_before_text: bool = False
     template_text: bool = False
@@ -69,7 +79,7 @@ class _ChatEmbeddingFamily:
 _CHAT_EMBEDDING_FAMILIES = {
     "embedding_gemma2": _ChatEmbeddingFamily(context_length=8192),
     "qwen3_vl_embedding": _ChatEmbeddingFamily(
-        context_length=8192,
+        context_length=32768,
         system_instruction="Represent the user's input.",
         add_generation_prompt=True,
         media_before_text=True,
@@ -78,7 +88,24 @@ _CHAT_EMBEDDING_FAMILIES = {
 }
 
 # The stock Qwen3-VL embedding checkpoints keep the qwen3_vl model_type.
-_EMBEDDING_MODEL_TYPE_OVERRIDES = {"qwen3_vl": "qwen3_vl_embedding"}
+_EMBEDDING_MODEL_TYPE_OVERRIDES = {
+    "qwen3_vl": "qwen3_vl_embedding",
+    "llama_nemotron_vl": "llama_nemotron_vl_embedding",
+}
+
+_POOLING_MODE_ALIASES = {
+    "cls": "cls",
+    "mean": "mean",
+    "max": "max",
+    "lasttoken": "lasttoken",
+    "last_token": "lasttoken",
+}
+_POOLING_FLAG_MODES = {
+    "pooling_mode_cls_token": "cls",
+    "pooling_mode_mean_tokens": "mean",
+    "pooling_mode_max_tokens": "max",
+    "pooling_mode_lasttoken": "lasttoken",
+}
 
 # SigLIP's text tower pools the last position, so inputs pad to the full length.
 _PAD_TO_MAX_LENGTH_MODEL_TYPES = frozenset({"siglip"})
@@ -121,23 +148,66 @@ def _colqwen_loader_config(config: dict[str, Any]) -> dict[str, Any]:
     return effective
 
 
-def _is_cls_only_pooling(config: dict[str, Any]) -> bool:
+def _nemotron_loader_config(config: dict[str, Any]) -> dict[str, Any]:
+    effective = deepcopy(config)
+    text_defaults = {
+        "model_type": "llama_bidirec",
+        "hidden_size": 2048,
+        "num_hidden_layers": 16,
+        "intermediate_size": 8192,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 64,
+        "max_position_embeddings": 131072,
+        "vocab_size": 128266,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 500000.0,
+    }
+    vision_defaults = {
+        "hidden_size": 1152,
+        "intermediate_size": 4304,
+        "num_hidden_layers": 27,
+        "num_attention_heads": 16,
+        "num_channels": 3,
+        "image_size": 512,
+        "patch_size": 16,
+        "layer_norm_eps": 1e-6,
+    }
+    text = effective.pop("llm_config", None) or effective.get("text_config") or {}
+    effective["text_config"] = {**text_defaults, **text, "tie_word_embeddings": True}
+    effective["vision_config"] = {
+        **vision_defaults,
+        **(effective.get("vision_config") or {}),
+    }
+    return effective
+
+
+def _supports_prompt_exclusion_without_boundaries(config: dict[str, Any]) -> bool:
     flags = {
         key: value for key, value in config.items() if key.startswith("pooling_mode_")
     }
     if any(not isinstance(value, bool) for value in flags.values()):
         return False
+    active = [key for key, value in flags.items() if value]
+    if any(key not in _POOLING_FLAG_MODES for key in active) or len(active) > 1:
+        return False
     declared = config.get("pooling_mode")
     if "pooling_mode" in config:
-        if not isinstance(declared, str) or declared.strip().lower() != "cls":
+        if not isinstance(declared, str):
             return False
-        if "pooling_mode_cls_token" in config and not config["pooling_mode_cls_token"]:
+        mode = _POOLING_MODE_ALIASES.get(declared.strip().lower())
+        if mode is None:
             return False
-    elif not config.get("pooling_mode_cls_token"):
+        matching = next(
+            key for key, value in _POOLING_FLAG_MODES.items() if value == mode
+        )
+        if matching in flags and not flags[matching]:
+            return False
+        if active and active[0] != matching:
+            return False
+    elif len(active) != 1:
         return False
-    return not any(
-        value for key, value in flags.items() if key != "pooling_mode_cls_token"
-    )
+    return True
 
 
 @dataclass
@@ -161,11 +231,12 @@ class _ChatTemplateEmbeddingInputs:
         self,
         processor,
         family: _ChatEmbeddingFamily,
-        audio_max_seconds: Optional[float] = None,
+        audio_max_seconds: float | None = None,
+        max_input_length: int | None = None,
     ):
         self._processor = processor
         self.family = family
-        self._max_length = family.context_length
+        self._max_length = max_input_length or family.context_length
         feature_extractor = getattr(processor, "feature_extractor", None)
         self._sampling_rate = getattr(feature_extractor, "sampling_rate", 16000)
         # The feature extractor cuts audio at its call-time max_length default
@@ -206,7 +277,11 @@ class _ChatTemplateEmbeddingInputs:
                     {
                         "role": "system",
                         "content": [
-                            {"type": "text", "text": family.system_instruction}
+                            {
+                                "type": "text",
+                                "text": item.get("instruction")
+                                or family.system_instruction,
+                            }
                         ],
                     },
                 )
@@ -272,6 +347,19 @@ class _ChatTemplateEmbeddingInputs:
                         low = size + 1
                     else:
                         high = size - 1
+                boundary = len(original) - best if side == "left" else best
+                if side == "left":
+                    while boundary > 0 and original[boundary - 1].isalnum():
+                        boundary -= 1
+                    candidate = len(original) - boundary
+                else:
+                    while boundary < len(original) and original[boundary].isalnum():
+                        boundary += 1
+                    candidate = boundary
+                if candidate > best:
+                    set_text(candidate)
+                    if lengths(prepare([conversation]), 1)[0] <= limit:
+                        best = candidate
                 set_text(best)
                 changed = True
             if changed:
@@ -346,9 +434,10 @@ class MLXEmbeddingModel:
         self._pooling_source: str = "not resolved"
         self._pooling_config: Optional[Dict[str, Any]] = None
         self._media_processor = None
+        self._siglip_images: SiglipImageEncoder | None = None
         self._supports_audio = False
         self._right_pad_text = False
-        self._cls_prompt_exclusion_compatible = False
+        self._prompt_exclusion_compatible = False
 
     # (hidden_size, num_hidden_layers) of Qwen3-Embedding-0.6B and -8B.
     _FP16_PROMOTE_SHAPES = {(1024, 28), (4096, 36)}
@@ -437,14 +526,7 @@ class MLXEmbeddingModel:
         """
         declared = cfg.get("pooling_mode")
         if isinstance(declared, str):
-            alias = {
-                "cls": "cls",
-                "mean": "mean",
-                "max": "max",
-                "lasttoken": "lasttoken",
-                "last_token": "lasttoken",
-            }
-            mode = alias.get(declared.strip().lower())
+            mode = _POOLING_MODE_ALIASES.get(declared.strip().lower())
             if mode:
                 return mode
         for key, mode in (
@@ -458,8 +540,8 @@ class MLXEmbeddingModel:
         return None
 
     def _resolve_pooling_mode(
-        self, model_path: Optional[Path] = None
-    ) -> Tuple[Optional[str], str]:
+        self, model_path: Path | None = None
+    ) -> tuple[str | None, str]:
         """Resolve the pooling mode and report where it came from.
 
         Returns ``(mode, source)``. ``source`` is logged at load time so an
@@ -620,7 +702,8 @@ class MLXEmbeddingModel:
         original_config = config
         vlm_config = config.get("vlm_config")
         nested_colqwen = model_type == "colqwen2_5" and isinstance(vlm_config, dict)
-        if nested_colqwen:
+        legacy_nemotron = model_type == "llama_nemotron_vl_embedding"
+        if nested_colqwen or legacy_nemotron:
             pending = [config]
             while pending:
                 nested = pending.pop()
@@ -632,7 +715,11 @@ class MLXEmbeddingModel:
                 pending.extend(
                     value for value in nested.values() if isinstance(value, dict)
                 )
+        if nested_colqwen:
             config = _colqwen_loader_config(config)
+        elif legacy_nemotron:
+            config = _nemotron_loader_config(config)
+        if nested_colqwen or legacy_nemotron:
             ensure_model_code_trusted(
                 config,
                 model_path=model_path,
@@ -661,33 +748,43 @@ class MLXEmbeddingModel:
                     "vocab_size", ModelConfig.__dataclass_fields__["vocab_size"].default
                 ),
             )
+        elif legacy_nemotron:
+            set_siglip_activation(model.vision_model, "precise")
         processor = load_processor(
             model_path,
             add_detokenizer=False,
             trust_remote_code=self.trust_remote_code,
         )
-        text_processor = getattr(processor, "tokenizer", processor)
+        if model_type == "siglip":
+            vision = load_siglip_vision(model_path, config)
+            image_processor = getattr(processor, "image_processor", None)
+            if vision is not None and image_processor is not None:
+                self._siglip_images = SiglipImageEncoder(vision, image_processor)
+        text_processor = (
+            processor
+            if self._uses_custom_embedding_inputs(processor)
+            else getattr(processor, "tokenizer", processor)
+        )
         family = _CHAT_EMBEDDING_FAMILIES.get(model_type)
         if self._pooling_config is not None:
             pooling_config = dict(self._pooling_config)
             if (
                 pooling_config.get("include_prompt") is False
-                and _is_cls_only_pooling(pooling_config)
+                and _supports_prompt_exclusion_without_boundaries(pooling_config)
                 and not any(
                     pooling_config.get(key) is not None
                     for key in ("prompt_length", "prompt_mask", "prompt_token_mask")
                 )
                 and family is None
-                and not self._uses_custom_embedding_inputs(text_processor)
             ):
                 pooling_config["include_prompt"] = True
-                self._cls_prompt_exclusion_compatible = True
+                self._prompt_exclusion_compatible = True
             # mlx-vlm matches string modes exactly, while omlx accepts aliases.
-            if (
-                isinstance(pooling_config.get("pooling_mode"), str)
-                and self._pooling_mode
-            ):
-                pooling_config["pooling_mode"] = self._pooling_mode
+            declared = pooling_config.get("pooling_mode")
+            if isinstance(declared, str):
+                mode = _POOLING_MODE_ALIASES.get(declared.strip().lower())
+                if mode:
+                    pooling_config["pooling_mode"] = mode
             model.pooling_config = pooling_config
         elif self._pooling_mode:
             model.pooling_config = {"pooling_mode": self._pooling_mode}
@@ -699,9 +796,14 @@ class MLXEmbeddingModel:
         # images as their first positional argument.
         self.processor = text_processor
         if family is not None:
-            model.max_input_length = family.context_length
+            context_length = family.context_length
+            if model_type == "qwen3_vl_embedding":
+                context_length = (
+                    self._context_length_from_config(model.config) or context_length
+                )
+            model.max_input_length = context_length
             self._media_processor = _ChatTemplateEmbeddingInputs(
-                processor, family, self.audio_max_seconds
+                processor, family, self.audio_max_seconds, context_length
             )
         self._supports_audio = getattr(model, "audio_tower", None) is not None
         self._pad_to_max_length = model_type in _PAD_TO_MAX_LENGTH_MODEL_TYPES
@@ -720,7 +822,7 @@ class MLXEmbeddingModel:
         )
 
     @staticmethod
-    def _embedding_dimension(config: Any) -> Optional[int]:
+    def _embedding_dimension(config: Any) -> int | None:
         text_config = getattr(config, "text_config", None)
         for source, attr in (
             (text_config, "embedding_dim"),
@@ -767,17 +869,33 @@ class MLXEmbeddingModel:
         # ``mean(axis=1)`` averages pad tokens in, both of which corrupt vectors
         # in mixed-length batches while single inputs still look fine. The
         # result is L2-normalized like every other path out of this method.
-        # mlx-vlm models pool inside their forward from model.pooling_config,
-        # and some apply dense projections after pooling, so only native
-        # outputs are pooled here.
         last_hidden = getattr(outputs, "last_hidden_state", None)
         if (
-            self._using_native
+            isinstance(self.model, (LlamaBidirec, LlamaNemotron))
+            and self._pooling_mode
+            and last_hidden is not None
+            and last_hidden.ndim == 3
+        ):
+            mask = attention_mask
+            if mask is None:
+                mask = mx.ones(last_hidden.shape[:2], dtype=mx.int32)
+            return normalize_embeddings(
+                pool_by_config(last_hidden, mask, self.model.pooling_config)
+            )
+        if (
+            (self._using_native or isinstance(self.model, Qwen3VLEmbedding))
             and self._pooling_mode
             and last_hidden is not None
             and last_hidden.ndim == 3
         ):
             if self._pooling_mode == "cls":
+                if (
+                    isinstance(self.model, Qwen3VLEmbedding)
+                    and attention_mask is not None
+                ):
+                    return normalize_embeddings(
+                        cls_pooling(last_hidden, attention_mask)
+                    )
                 return normalize_embeddings(last_hidden[:, 0, :])
             if self._pooling_mode == "lasttoken":
                 return normalize_embeddings(
@@ -942,6 +1060,12 @@ class MLXEmbeddingModel:
                 raise ValueError("max_length must be a positive integer")
             return value
 
+        if (
+            isinstance(self._media_processor, _ChatTemplateEmbeddingInputs)
+            and self._media_processor.family.template_text
+        ):
+            return self._media_processor.family.context_length
+
         for config in (
             getattr(self.model, "config", None),
             getattr(self.processor, "config", None),
@@ -987,12 +1111,21 @@ class MLXEmbeddingModel:
 
         if self._uses_custom_embedding_inputs(processor):
             if hasattr(processor, "prepare_embedding_inputs"):
-                return processor.prepare_embedding_inputs(
+                prepared = processor.prepare_embedding_inputs(
                     normalized_inputs, return_tensors="mlx"
                 )
-            return processor.prepare_model_inputs(
-                normalized_inputs, return_tensors="mlx"
-            )
+            else:
+                prepared = processor.prepare_model_inputs(
+                    normalized_inputs, return_tensors="mlx"
+                )
+            if self._prompt_exclusion_compatible and any(
+                prepared.get(key) is not None
+                for key in ("prompt_length", "prompt_mask", "prompt_token_mask")
+            ):
+                raise NotImplementedError(
+                    "Explicit prompt boundaries are not supported for pooling"
+                )
+            return prepared
 
         if any("image" in item for item in normalized_inputs):
             raise ValueError(
@@ -1027,7 +1160,7 @@ class MLXEmbeddingModel:
 
     def _pad_to_position_table(
         self, encoded, processor, truncation: bool
-    ) -> Dict[str, np.ndarray]:
+    ) -> dict[str, np.ndarray]:
         """Right-pad to the full position table after request truncation.
 
         SigLIP pools the last position and ignores the attention mask, so its
@@ -1058,13 +1191,11 @@ class MLXEmbeddingModel:
             padded[key] = values
         return padded
 
-    def _forward(self, inputs: Dict[str, Any]):
+    def _forward(self, inputs: dict[str, Any]):
         """Run the mlx-vlm model on prepared inputs.
 
-        Qwen3-VL caches rope position ids on the language model and reuses them
-        for any shorter input. Each embedding batch has its own mask, so the
-        cache is cleared on both sides of the call; clearing afterwards also
-        keeps a compile trace from leaving a tracer behind.
+        Qwen3-VL caches rope positions without accounting for a new batch's
+        mask. Clear the cache around each call, including after compile traces.
         """
         language_model = getattr(self.model, "language_model", None)
         resets_rope = hasattr(language_model, "_position_ids")
@@ -1153,13 +1284,14 @@ class MLXEmbeddingModel:
         self.model = None
         self.processor = None
         self._media_processor = None
+        self._siglip_images = None
         self._supports_audio = False
         self._hidden_size = None
         self._loaded = False
         self._using_native = False
         self._pad_to_max_length = False
         self._right_pad_text = False
-        self._cls_prompt_exclusion_compatible = False
+        self._prompt_exclusion_compatible = False
 
         gc.collect()
         mx.synchronize()
@@ -1196,12 +1328,12 @@ class MLXEmbeddingModel:
             max_length = min(max_length, position_limit)
         normalized_inputs = self._normalize_embedding_inputs(inputs)
         for item in normalized_inputs:
-            if self._cls_prompt_exclusion_compatible and any(
+            if self._prompt_exclusion_compatible and any(
                 item.get(key) is not None
                 for key in ("prompt_length", "prompt_mask", "prompt_token_mask")
             ):
                 raise NotImplementedError(
-                    "Explicit prompt boundaries are not supported for CLS pooling"
+                    "Explicit prompt boundaries are not supported for pooling"
                 )
             image_ref = item.get("image")
             if isinstance(image_ref, str):
@@ -1237,13 +1369,30 @@ class MLXEmbeddingModel:
             processor = media_processor
         uses_custom_embedding_inputs = self._uses_custom_embedding_inputs(processor)
 
-        if has_image_inputs and (self._using_native or not uses_custom_embedding_inputs):
+        siglip_images = self._siglip_images if has_image_inputs else None
+        if (
+            has_image_inputs
+            and siglip_images is None
+            and (self._using_native or not uses_custom_embedding_inputs)
+        ):
             raise ValueError(
                 f"Embedding model '{self.model_name}' does not support image inputs"
             )
 
         batches = [list(range(len(normalized_inputs)))]
-        if (
+        if siglip_images is not None:
+            if any(item.get("text") and "image" in item for item in normalized_inputs):
+                raise ValueError(
+                    "SigLIP embeds text and images separately; send each as its own item"
+                )
+            text_rows = [
+                i for i, item in enumerate(normalized_inputs) if "image" not in item
+            ]
+            image_rows = [
+                i for i, item in enumerate(normalized_inputs) if "image" in item
+            ]
+            batches = [rows for rows in (text_rows, image_rows) if rows]
+        elif (
             not uses_custom_embedding_inputs
             and 1 < len(input_texts) == len(normalized_inputs)
             and len(input_texts) * max_length > ENCODER_BATCH_TOKEN_BUDGET
@@ -1257,14 +1406,19 @@ class MLXEmbeddingModel:
         rows: list[list[float]] = []
         total_tokens: int | None = 0
         for batch in batches:
-            embeddings_array, batch_tokens = self._embed_batch(
-                processor,
-                [normalized_inputs[i] for i in batch],
-                max_length,
-                padding,
-                truncation,
-                uses_custom_embedding_inputs,
-            )
+            batch_inputs = [normalized_inputs[i] for i in batch]
+            if siglip_images is not None and "image" in batch_inputs[0]:
+                embeddings_array = siglip_images.embed(batch_inputs)
+                batch_tokens = 0
+            else:
+                embeddings_array, batch_tokens = self._embed_batch(
+                    processor,
+                    batch_inputs,
+                    max_length,
+                    padding,
+                    truncation,
+                    uses_custom_embedding_inputs,
+                )
             # Evaluate per batch so peak memory stays at one batch.
             mx.eval(embeddings_array)
             positions.extend(batch)
@@ -1276,6 +1430,12 @@ class MLXEmbeddingModel:
         embeddings = [
             row for _, row in sorted(zip(positions, rows), key=lambda pair: pair[0])
         ]
+        if siglip_images is not None and any(
+            len(row) != len(embeddings[0]) for row in embeddings
+        ):
+            raise ValueError(
+                "SigLIP text and image embeddings have different dimensions"
+            )
         if total_tokens is None:
             total_tokens = self._count_tokens(normalized_inputs, max_length, truncation)
         dimensions = len(embeddings[0]) if embeddings else 0

@@ -2,9 +2,8 @@
 """
 Embedding engine for oMLX.
 
-This module provides an engine for generating text embeddings using
-mlx-vlm. Unlike LLM engines, embedding engines don't support
-streaming or chat completion.
+This module provides an engine for generating embeddings. Unlike LLM
+engines, embedding engines don't support streaming or chat completion.
 """
 
 import asyncio

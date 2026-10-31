@@ -1439,8 +1439,6 @@ class MLXRerankerModel:
             # Evaluate per batch so peak memory stays at one batch.
             mx.eval(logits)
 
-            # Scores are already activated. Multi-class heads use the
-            # last column (typically the "relevant" class).
             if logits.shape[-1] == 1:
                 batch_scores = logits.squeeze(-1).tolist()
             else:

@@ -2115,8 +2115,6 @@ class TestDeclaredPoolingMode:
         [[1.0, 1.0], [2.0, 0.0], [0.0, 3.0]],
     ]
     _E2E_MASK = [[1, 1, 0], [1, 1, 1]]
-    # Last *real* token of each row, L2-normalized. Without the mask the first
-    # row pools the pad and returns (0.707, 0.707) instead.
     _E2E_EXPECTED = [[0.0, 1.0], [0.0, 1.0]]
 
     @classmethod
@@ -2128,20 +2126,13 @@ class TestDeclaredPoolingMode:
             hidden = mx.array(cls._E2E_HIDDEN)
             return SimpleNamespace(
                 last_hidden_state=hidden,
-                # What a correct checkpoint would have pooled itself; the eager
-                # path must not silently disagree with it.
                 text_embeds=mx.array(cls._E2E_EXPECTED),
                 pooler_output=None,
             )
 
         return _call
 
-    def test_eager_batch_is_masked_standard_processor(self, tmp_path):
-        """compile off + right-padded batch: the tokenizer path must pool real tokens.
-
-        A compile failure sends mixed-length batches here, so this path must
-        pool with the tokenizer mask too.
-        """
+    def test_eager_batch_uses_backend_pooling_with_standard_processor(self, tmp_path):
         import mlx.core as mx
 
         class Tokenizer:
@@ -2161,11 +2152,7 @@ class TestDeclaredPoolingMode:
         out = np.array(m.embed(["ab", "abc"]).embeddings)
         assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
 
-    def test_eager_batch_is_masked_custom_processor(self, tmp_path):
-        """Same batch through the custom-processor branch (Qwen3-VL style).
-
-        The mask was already in scope here and simply was not passed on.
-        """
+    def test_eager_batch_uses_backend_pooling_with_custom_processor(self, tmp_path):
         import mlx.core as mx
 
         class CustomProcessor:
@@ -2184,7 +2171,6 @@ class TestDeclaredPoolingMode:
 
         out = np.array(m.embed(["ab", "abc"]).embeddings)
         assert np.allclose(out, self._E2E_EXPECTED, atol=1e-5)
-
 
 
 class TestEmbeddingDtype:
@@ -2368,6 +2354,85 @@ class TestMlxVlmEmbeddingLoading:
 
 
 class TestMlxVlmQwen3Embedding:
+
+    @pytest.mark.parametrize("mode", ["cls", "mean", "lasttoken"])
+    @pytest.mark.parametrize("padding_side", ["left", "right"])
+    def test_declared_pooling_uses_qwen_hidden_states(
+        self, tmp_path, mode, padding_side
+    ):
+        from mlx_vlm.models.qwen3_vl_embedding import (
+            Model,
+            ModelConfig,
+            TextConfig,
+            VisionConfig,
+        )
+
+        text_config = TextConfig(
+            model_type="qwen3_vl_text",
+            num_hidden_layers=1,
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=2,
+            head_dim=4,
+            rope_theta=10000.0,
+            max_position_embeddings=128,
+            rope_scaling={"type": "default", "mrope_section": [1, 1, 0]},
+        )
+        config = ModelConfig(
+            model_type="qwen3_vl_embedding",
+            text_config=text_config,
+            vision_config=VisionConfig(hidden_size=8, out_hidden_size=8, depth=0),
+            skip_vision=True,
+        )
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
+        pooling = tmp_path / "1_Pooling"
+        pooling.mkdir()
+        (pooling / "config.json").write_text(json.dumps({"pooling_mode": mode}))
+        mx.random.seed(0)
+        actual = Model(config)
+        actual.eval()
+        if padding_side == "left":
+            ids = mx.array([[0, 5, 6], [7, 8, 9]])
+            mask = mx.array([[0, 1, 1], [1, 1, 1]])
+        else:
+            ids = mx.array([[5, 6, 0], [7, 8, 9]])
+            mask = mx.array([[1, 1, 0], [1, 1, 1]])
+        processor = MagicMock()
+        processor.tokenizer = _small_embedding_tokenizer()
+        processor.apply_chat_template.return_value = {
+            "input_ids": ids,
+            "attention_mask": mask,
+        }
+        wrapper = MLXEmbeddingModel(str(tmp_path))
+        with (
+            patch("omlx.models.embedding.load_embedding_model", return_value=actual),
+            patch("omlx.models.embedding.load_processor", return_value=processor),
+            patch.object(wrapper, "_try_compile", return_value=False),
+        ):
+            wrapper.load()
+
+        output = wrapper.embed(["a b", "a b c"])
+        backend = actual(ids, mask)
+        hidden = np.asarray(backend.last_hidden_state)
+        mask_array = np.asarray(mask)
+        if mode == "cls":
+            indices = [np.flatnonzero(row)[0] for row in mask_array]
+            pooled = hidden[np.arange(2), indices]
+        elif mode == "mean":
+            weights = mask_array[:, :, None]
+            pooled = (hidden * weights).sum(axis=1) / weights.sum(axis=1)
+        else:
+            indices = [np.flatnonzero(row)[-1] for row in mask_array]
+            pooled = hidden[np.arange(2), indices]
+        expected = pooled / np.linalg.norm(pooled, axis=-1, keepdims=True)
+
+        np.testing.assert_allclose(output.embeddings, expected, atol=1e-5)
+        if mode != "lasttoken":
+            assert not np.allclose(expected, np.asarray(backend.text_embeds))
+
     @pytest.mark.parametrize("with_image", [False, True])
     def test_chat_format_and_context_limit(self, tmp_path, with_image):
         (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_vl"}))
@@ -2409,11 +2474,13 @@ class TestMlxVlmQwen3Embedding:
             assert content[0]["type"] == "image"
             assert isinstance(content[0]["image"], Image.Image)
         assert processor.apply_chat_template.call_args.kwargs["add_generation_prompt"]
+        too_long = 32769 if with_image else 8193
         processor.apply_chat_template.return_value = {
-            "input_ids": mx.ones((1, 8193), dtype=mx.int32),
-            "attention_mask": mx.ones((1, 8193), dtype=mx.int32),
+            "input_ids": mx.ones((1, too_long), dtype=mx.int32),
+            "attention_mask": mx.ones((1, too_long), dtype=mx.int32),
         }
-        with pytest.raises(ValueError, match="8192-token limit"):
+        limit = 32768 if with_image else 8192
+        with pytest.raises(ValueError, match=f"{limit}-token limit"):
             model.embed([item], max_length=8192)
 
     @pytest.mark.parametrize("fails", [False, True])
@@ -2685,7 +2752,7 @@ class TestMlxVlmEmbeddingGemma2:
 
 
 class TestSiglipEmbedding:
-    """SigLIP embeds text only; its text tower pools the last position."""
+    """SigLIP's text tower pools the last position."""
 
     class MockTokenizer:
         """Pads to max_length and records the call kwargs."""
@@ -2730,6 +2797,153 @@ class TestSiglipEmbedding:
         ):
             model.load()
         return model, siglip, tokenizer
+
+    @staticmethod
+    def _image_uri(color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (4, 4), color).save(buffer, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    @staticmethod
+    def _vision_checkpoint(tmp_path, quantized=False, invalid=None):
+        from dataclasses import asdict
+
+        import mlx.nn as nn
+        from mlx_vlm.models.granite_vision.config import VisionConfig
+        from mlx_vlm.models.granite_vision.vision import VisionModel
+
+        text_config = SiglipTextConfig(
+            vocab_size=32,
+            max_position_embeddings=8,
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+        )
+        vision_config = SiglipVisionConfig(
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=1,
+            image_size=4,
+            patch_size=2,
+        )
+        config = {
+            "model_type": "siglip",
+            "text_config": asdict(text_config),
+            "vision_config": asdict(vision_config),
+        }
+        mx.random.seed(42)
+        text = Siglip(
+            SiglipConfig(text_config=text_config, vision_config=vision_config)
+        )
+        vision = VisionModel(VisionConfig.from_dict(asdict(vision_config)))
+        for layer in vision.vision_model.encoder.layers:
+            layer.mlp.activation_fn = nn.GELU(approx="precise")
+        vision.vision_model.head.mlp.activation_fn = nn.GELU(approx="precise")
+        if quantized:
+            config["quantization"] = {"bits": 4, "group_size": 32}
+            nn.quantize(
+                vision,
+                bits=4,
+                group_size=32,
+                class_predicate=lambda path, _: (
+                    path == "vision_model.head.attention.in_proj"
+                ),
+            )
+        weights = dict(tree_flatten(text.parameters()))
+        weights.update(dict(tree_flatten(vision.parameters())))
+        if invalid == "missing":
+            del weights["vision_model.encoder.layers.0.mlp.fc1.weight"]
+        elif invalid == "dtype":
+            key = "vision_model.head.attention.in_proj.weight"
+            weights[key] = weights[key].astype(mx.float32)
+        for suffix in ("weight", "bias"):
+            key = f"vision_model.head.attention.in_proj.{suffix}"
+            weights[f"vision_model.head.attention.in_proj_{suffix}"] = weights.pop(key)
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+        return text, vision
+
+    @staticmethod
+    def _reference_image_embeddings(vision, images):
+        pixels = np.stack(
+            [
+                np.asarray(image.convert("RGB"), dtype=np.float32) / 255
+                for image in images
+            ]
+        )
+        patches = np.asarray(vision(mx.array(pixels))[0])
+        head = vision.vision_model.head
+        projection = head.attention.in_proj
+        if hasattr(projection, "scales"):
+            weight = np.asarray(
+                mx.dequantize(
+                    projection.weight,
+                    projection.scales,
+                    projection.biases,
+                    group_size=32,
+                    bits=4,
+                )
+            )
+        else:
+            weight = np.asarray(projection.weight)
+        bias = np.asarray(projection.bias)
+        batch, sequence, dimensions = patches.shape
+        heads = head.attention.num_heads
+        probe = np.broadcast_to(np.asarray(head.probe), (batch, 1, dimensions))
+        queries = probe @ weight[:dimensions].T + bias[:dimensions]
+        keys = (
+            patches @ weight[dimensions : 2 * dimensions].T
+            + bias[dimensions : 2 * dimensions]
+        )
+        values = patches @ weight[2 * dimensions :].T + bias[2 * dimensions :]
+        queries = queries.reshape(batch, 1, heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(batch, sequence, heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(batch, sequence, heads, -1).transpose(0, 2, 1, 3)
+        scores = queries @ keys.transpose(0, 1, 3, 2) * head.attention.scale
+        scores = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        attended = scores / scores.sum(axis=-1, keepdims=True) @ values
+        attended = attended.transpose(0, 2, 1, 3).reshape(batch, 1, dimensions)
+        pooled = attended @ np.asarray(head.attention.out_proj.weight).T + np.asarray(
+            head.attention.out_proj.bias
+        )
+        normalized = (pooled - pooled.mean(axis=-1, keepdims=True)) / np.sqrt(
+            pooled.var(axis=-1, keepdims=True) + head.layernorm.eps
+        )
+        normalized = normalized * np.asarray(head.layernorm.weight) + np.asarray(
+            head.layernorm.bias
+        )
+        hidden = normalized @ np.asarray(head.mlp.fc1.weight).T + np.asarray(
+            head.mlp.fc1.bias
+        )
+        hidden = (
+            0.5
+            * hidden
+            * (1 + np.tanh(np.sqrt(2 / np.pi) * (hidden + 0.044715 * hidden**3)))
+        )
+        pooled += hidden @ np.asarray(head.mlp.fc2.weight).T + np.asarray(
+            head.mlp.fc2.bias
+        )
+        pooled = pooled[:, 0]
+        return pooled / np.linalg.norm(pooled, axis=-1, keepdims=True)
+
+    @staticmethod
+    def _vision_processor():
+        class ImageProcessor:
+            def __call__(self, images, return_tensors):
+                pixels = np.stack(
+                    [
+                        np.asarray(image.convert("RGB"), dtype=np.float32) / 255
+                        for image in images
+                    ]
+                )
+                return {"pixel_values": pixels.transpose(0, 3, 1, 2)}
+
+        return SimpleNamespace(
+            tokenizer=TestSiglipEmbedding.MockTokenizer(),
+            image_processor=ImageProcessor(),
+        )
 
     def test_text_pads_to_the_position_table_and_counts_real_tokens(self, tmp_path):
         model, siglip, tokenizer = self._load(tmp_path)
@@ -2778,6 +2992,57 @@ class TestSiglipEmbedding:
         with pytest.raises(ValueError, match="does not support image inputs"):
             model.embed([{"image": IMAGE_DATA_URI}])
 
+    @pytest.mark.parametrize("quantized", [False, True])
+    def test_mixed_text_and_images_use_both_towers(self, tmp_path, quantized):
+        text, vision = self._vision_checkpoint(tmp_path, quantized=quantized)
+        processor = self._vision_processor()
+        wrapper = MLXEmbeddingModel(str(tmp_path))
+        with (
+            patch("omlx.models.embedding.load_processor", return_value=processor),
+            patch.object(wrapper, "_try_compile", return_value=False),
+        ):
+            wrapper.load()
+        red = self._image_uri((255, 0, 0))
+        blue = self._image_uri((0, 0, 255))
+        output = wrapper.embed(
+            [{"text": "a b"}, {"image": red}, {"text": "d"}, {"image": blue}]
+        )
+
+        tokens = processor.tokenizer(["a b", "d"], max_length=8)
+        expected_text = np.asarray(text(mx.array(tokens["input_ids"])).text_embeds)
+        expected_images = self._reference_image_embeddings(
+            vision,
+            [Image.new("RGB", (4, 4), color) for color in ((255, 0, 0), (0, 0, 255))],
+        )
+        np.testing.assert_allclose(
+            np.asarray(output.embeddings)[[0, 2]], expected_text, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            np.asarray(output.embeddings)[[1, 3]], expected_images, atol=1e-5
+        )
+        assert not np.allclose(output.embeddings[1], output.embeddings[3])
+        assert output.total_tokens == int(tokens["attention_mask"].sum())
+        with pytest.raises(ValueError, match="separately"):
+            wrapper.embed([{"text": "a", "image": red}])
+
+    @pytest.mark.parametrize(
+        ("quantized", "invalid", "error"),
+        [(False, "missing", "Missing"), (True, "dtype", "Invalid dtype")],
+    )
+    def test_invalid_vision_weights_fail_loading(
+        self, tmp_path, quantized, invalid, error
+    ):
+        self._vision_checkpoint(tmp_path, quantized=quantized, invalid=invalid)
+        wrapper = MLXEmbeddingModel(str(tmp_path))
+        with (
+            patch(
+                "omlx.models.embedding.load_processor",
+                return_value=self._vision_processor(),
+            ),
+            pytest.raises(ValueError, match=error),
+        ):
+            wrapper.load()
+
 
 def _small_embedding_tokenizer():
     from tokenizers import Tokenizer, models, pre_tokenizers
@@ -2811,7 +3076,7 @@ def _small_embedding_tokenizer():
 
 class TestGraniteClsPromptCompatibility:
     @staticmethod
-    def _load(tmp_path, pooling_config):
+    def _load(tmp_path, pooling_config, processor=None):
         from mlx_vlm.models.modernbert.config import ModelConfig
         from mlx_vlm.models.modernbert.modernbert import Model
 
@@ -2834,7 +3099,10 @@ class TestGraniteClsPromptCompatibility:
         wrapper = MLXEmbeddingModel(str(tmp_path))
         with (
             patch("omlx.models.embedding.load_embedding_model", return_value=actual),
-            patch("omlx.models.embedding.load_processor", return_value=tokenizer),
+            patch(
+                "omlx.models.embedding.load_processor",
+                return_value=processor or tokenizer,
+            ),
             patch.object(wrapper, "_try_compile", return_value=False),
         ):
             wrapper.load()
@@ -2868,10 +3136,81 @@ class TestGraniteClsPromptCompatibility:
         with pytest.raises(NotImplementedError, match="prompt boundaries"):
             wrapper.embed([{"text": "a b", "prompt_length": 1}])
 
+    def test_custom_processor_without_prompt_boundary_uses_mean(self, tmp_path):
+        tokenizer = _small_embedding_tokenizer()
+
+        class CustomProcessor:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.include_boundary = False
+
+            def prepare_embedding_inputs(self, items, return_tensors="mlx"):
+                encoded = tokenizer(
+                    [item["text"] for item in items], padding=True, return_tensors="np"
+                )
+                prepared = {key: mx.array(value) for key, value in encoded.items()}
+                if self.include_boundary:
+                    prepared["prompt_length"] = 1
+                return prepared
+
+        processor = CustomProcessor()
+        wrapper, actual, _ = self._load(
+            tmp_path, {"pooling_mode": "mean", "include_prompt": False}, processor
+        )
+        output = wrapper.embed(["a b c", "d"])
+        encoded = tokenizer(["a b c", "d"], padding=True, return_tensors="np")
+        hidden, _ = actual._encode(
+            mx.array(encoded["input_ids"]), mx.array(encoded["attention_mask"])
+        )
+        values = np.asarray(hidden)
+        mask = encoded["attention_mask"][:, :, None]
+        pooled = (values * mask).sum(axis=1) / mask.sum(axis=1)
+        expected = pooled / np.linalg.norm(pooled, axis=-1, keepdims=True)
+
+        np.testing.assert_allclose(output.embeddings, expected, atol=1e-5)
+        processor.include_boundary = True
+        with pytest.raises(NotImplementedError, match="prompt boundaries"):
+            wrapper.embed(["a b"])
+
+    @pytest.mark.parametrize(
+        ("declaration", "mode"),
+        [
+            ({"pooling_mode_mean_tokens": True}, "mean"),
+            ({"pooling_mode": "mean"}, "mean"),
+            ({"pooling_mode": "max"}, "max"),
+            ({"pooling_mode": "last_token"}, "lasttoken"),
+        ],
+    )
+    def test_absent_prompt_boundary_keeps_declared_pooling(
+        self, tmp_path, declaration, mode
+    ):
+        config = {**declaration, "include_prompt": False}
+        wrapper, actual, tokenizer = self._load(tmp_path, config)
+        texts = ["a b c", "d"]
+        output = wrapper.embed(texts)
+        encoded = tokenizer(texts, padding=True, return_tensors="np")
+        mask = encoded["attention_mask"].astype(bool)
+        hidden, _ = actual._encode(
+            mx.array(encoded["input_ids"]), mx.array(encoded["attention_mask"])
+        )
+        values = np.asarray(hidden)
+        if mode == "mean":
+            pooled = (values * mask[:, :, None]).sum(axis=1) / mask.sum(axis=1)[:, None]
+        elif mode == "max":
+            pooled = np.where(mask[:, :, None], values, -np.inf).max(axis=1)
+        else:
+            pooled = values[np.arange(len(texts)), mask.sum(axis=1) - 1]
+        expected = pooled / np.linalg.norm(pooled, axis=-1, keepdims=True)
+
+        np.testing.assert_allclose(output.embeddings, expected, atol=1e-5)
+        assert wrapper._pooling_config == config
+        assert actual.pooling_config["include_prompt"] is True
+        with pytest.raises(NotImplementedError, match="prompt boundaries"):
+            wrapper.embed([{"text": "a b", "prompt_length": 1}])
+
     @pytest.mark.parametrize(
         "declaration",
         [
-            {"pooling_mode_mean_tokens": True},
             {"pooling_mode_cls_token": True, "pooling_mode_mean_tokens": True},
             {"pooling_mode": "cls", "pooling_mode_mean_tokens": True},
             {"pooling_mode": "cls", "pooling_mode_cls_token": False},
@@ -2890,6 +3229,124 @@ class TestGraniteClsPromptCompatibility:
             wrapper.embed(["a b"])
         assert wrapper._pooling_config == config
         assert actual.pooling_config["include_prompt"] is False
+
+
+class TestLlamaEmbeddingCompatibility:
+    @pytest.mark.parametrize("mode", ["cls", "lasttoken"])
+    def test_bidirectional_llama_honors_declared_pooling(self, tmp_path, mode):
+        from mlx_vlm.models.llama_bidirec import Model, ModelConfig
+
+        config = {
+            "model_type": "llama_bidirec",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "head_dim": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 64,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        pooling = tmp_path / "1_Pooling"
+        pooling.mkdir()
+        (pooling / "config.json").write_text(json.dumps({"pooling_mode": mode}))
+        mx.random.seed(0)
+        actual = Model(ModelConfig.from_dict(config))
+        tokenizer = _small_embedding_tokenizer()
+        wrapper = MLXEmbeddingModel(str(tmp_path))
+        with (
+            patch("omlx.models.embedding.load_embedding_model", return_value=actual),
+            patch("omlx.models.embedding.load_processor", return_value=tokenizer),
+            patch.object(wrapper, "_try_compile", return_value=False),
+        ):
+            wrapper.load()
+
+        texts = ["a b c", "d"]
+        output = wrapper.embed(texts)
+        tokens = tokenizer(texts, padding=True, return_tensors="np")
+        result = actual(
+            mx.array(tokens["input_ids"]), mx.array(tokens["attention_mask"])
+        )
+        hidden = np.asarray(result.last_hidden_state)
+        if mode == "cls":
+            pooled = hidden[:, 0]
+        else:
+            indices = np.asarray(tokens["attention_mask"]).sum(axis=1) - 1
+            pooled = hidden[np.arange(len(texts)), indices]
+        expected = pooled / np.linalg.norm(pooled, axis=-1, keepdims=True)
+
+        np.testing.assert_allclose(output.embeddings, expected, atol=1e-5)
+        assert not np.allclose(output.embeddings, np.asarray(result.text_embeds))
+
+    def test_legacy_nemotron_untied_checkpoint_and_custom_processor(self, tmp_path):
+        from mlx_vlm.models.granite_vision.config import VisionConfig
+        from mlx_vlm.models.llama.config import ModelConfig as TextConfig
+        from mlx_vlm.models.llama_nemotron_vl_embedding import Model, ModelConfig
+
+        text = {
+            "model_type": "llama_bidirec",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "max_position_embeddings": 128,
+            "vocab_size": 64,
+            "tie_word_embeddings": False,
+        }
+        vision = {
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "image_size": 32,
+            "patch_size": 16,
+        }
+        config = {
+            "model_type": "llama_nemotron_vl",
+            "img_context_token_id": 10,
+            "llm_config": text,
+            "vision_config": vision,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        model_config = ModelConfig(
+            text_config=TextConfig.from_dict(
+                {**text, "rms_norm_eps": 1e-5, "tie_word_embeddings": True}
+            ),
+            vision_config=VisionConfig.from_dict(vision),
+            img_context_token_id=10,
+        )
+        mx.random.seed(0)
+        source = Model(model_config)
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"), dict(tree_flatten(source.parameters()))
+        )
+
+        class CustomProcessor:
+            tokenizer = _small_embedding_tokenizer()
+
+            def prepare_embedding_inputs(self, items, return_tensors="mlx"):
+                return {
+                    "input_ids": mx.array([[1, 10, 3]]),
+                    "attention_mask": mx.ones((1, 3), dtype=mx.int32),
+                    "pixel_values": mx.zeros((1, 32, 32, 3)),
+                }
+
+        wrapper = MLXEmbeddingModel(str(tmp_path))
+        with (
+            patch(
+                "omlx.models.embedding.load_processor",
+                return_value=CustomProcessor(),
+            ),
+            patch.object(wrapper, "_try_compile", return_value=False),
+        ):
+            wrapper.load()
+        output = wrapper.embed([{"text": "a", "image": IMAGE_DATA_URI}])
+
+        assert output.dimensions == 8
+        assert output.total_tokens == 3
+        assert np.isfinite(output.embeddings).all()
 
 
 class TestColbertPadding:
@@ -3316,7 +3773,7 @@ class TestQwenChatTextLimits:
             return SimpleNamespace(text_embeds=mx.stack([counts, sums], axis=1))
 
     @classmethod
-    def _model(cls, side="right"):
+    def _model(cls, side="right", max_input_length=8192):
         from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import (
             Qwen3VLImageProcessor,
             Qwen3VLProcessor,
@@ -3338,9 +3795,12 @@ class TestQwenChatTextLimits:
             chat_template=cls._TEMPLATE,
         )
         actual = cls.Model()
+        actual.max_input_length = max_input_length
         wrapper = _eager_model(tokenizer, actual)
         wrapper._media_processor = _ChatTemplateEmbeddingInputs(
-            processor, _CHAT_EMBEDDING_FAMILIES["qwen3_vl_embedding"]
+            processor,
+            _CHAT_EMBEDDING_FAMILIES["qwen3_vl_embedding"],
+            max_input_length=actual.max_input_length,
         )
         return wrapper, actual, tokenizer
 
@@ -3380,6 +3840,24 @@ class TestQwenChatTextLimits:
         assert shorter.total_tokens == len(tokens)
         assert tokenizer.convert_tokens_to_ids("é") in tokens
         assert tokenizer.convert_tokens_to_ids("猫") not in tokens
+
+    def test_qwen_accepts_text_above_the_old_8192_limit(self):
+        wrapper, actual, tokenizer = self._model(max_input_length=16384)
+        output = wrapper.embed(["x " * 9200], max_length=10000)
+        tokens = self._assert_template(actual.calls[-1], tokenizer)
+        assert 8192 < len(tokens) <= 10000
+        assert output.total_tokens == len(tokens)
+
+    def test_each_item_supplies_its_own_instruction(self):
+        wrapper, actual, tokenizer = self._model()
+        output = wrapper.embed(
+            [{"text": "x", "instruction": "a"}, {"text": "x", "instruction": "b"}]
+        )
+        first = self._tokens(actual.calls[-1], 0)
+        second = self._tokens(actual.calls[-1], 1)
+        assert first[2] == tokenizer.convert_tokens_to_ids("a")
+        assert second[2] == tokenizer.convert_tokens_to_ids("b")
+        assert output.embeddings[0] != output.embeddings[1]
 
     def test_left_truncation_preserves_unicode_suffix(self):
         wrapper, actual, tokenizer = self._model(side="left")
@@ -3474,3 +3952,45 @@ class TestQwenChatTextLimits:
         tokens = self._tokens(actual.calls[-1], 0)
         assert result.total_tokens == len(tokens) <= 3
         assert tokens[-1] == 2
+
+    def test_nonmonotonic_word_boundary_keeps_the_complete_word(self):
+        from omlx.models.embedding import (
+            _CHAT_EMBEDDING_FAMILIES,
+            _ChatTemplateEmbeddingInputs,
+        )
+
+        class NonmonotonicProcessor:
+            tokenizer = SimpleNamespace(truncation_side="right")
+
+            def apply_chat_template(self, conversations, **kwargs):
+                rows = []
+                for conversation in conversations:
+                    content = conversation[-1]["content"]
+                    text = content[0]["text"] if content else ""
+                    if not text:
+                        rows.append([1, 2])
+                    elif len(text) <= 3:
+                        rows.append([1, 30, 2])
+                    elif len(text) == 8:
+                        rows.append([1, 80, 2])
+                    else:
+                        rows.append([1, 40, 41, 2])
+                width = max(map(len, rows))
+                return {
+                    "input_ids": mx.array(
+                        [row + [0] * (width - len(row)) for row in rows]
+                    ),
+                    "attention_mask": mx.array(
+                        [[1] * len(row) + [0] * (width - len(row)) for row in rows]
+                    ),
+                }
+
+        actual = self.Model()
+        wrapper = _eager_model(_small_embedding_tokenizer(), actual)
+        wrapper._media_processor = _ChatTemplateEmbeddingInputs(
+            NonmonotonicProcessor(), _CHAT_EMBEDDING_FAMILIES["qwen3_vl_embedding"]
+        )
+        result = wrapper.embed(["document!"], max_length=3)
+
+        assert self._tokens(actual.calls[-1], 0) == [1, 80, 2]
+        assert result.total_tokens == 3
