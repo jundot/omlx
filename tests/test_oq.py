@@ -5330,6 +5330,42 @@ class TestEstimateBpwHeaderOnly:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestQuantizeOqStreamingPassthroughDtypes:
+    def test_baselabs_metadata_survives_quantization(self, tmp_path):
+        from omlx.model_discovery import decision_kind, detect_model_type
+
+        src = tmp_path / "src"
+        src.mkdir()
+        mx.save_safetensors(
+            str(src / "model.safetensors"),
+            {"model.layers.0.self_attn.q_proj.weight": mx.ones((64, 64))},
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "num_hidden_layers": 1,
+                    "modeling_overrides": {
+                        "attention": {
+                            "full_attention": "block_bidirectional",
+                            "linear_attention": "causal",
+                        },
+                        "readout": "slot_lm",
+                        "n_slots": 256,
+                    },
+                }
+            )
+        )
+        (src / "readout.json").write_text('{"readout": "slot_lm", "n_slots": 256}')
+        (src / "calibration.json").write_text('{"temperatures": {"choice:2": 1.5}}')
+        out = tmp_path / "out"
+        quantize_oq_streaming(
+            str(src), str(out), oq_level=4, sensitivity_map_override={0: 0.1}
+        )
+        for name in ("readout.json", "calibration.json"):
+            assert (out / name).read_bytes() == (src / name).read_bytes()
+        assert decision_kind(out) == "baselabs"
+        assert detect_model_type(out) == "decision"
+
     def test_clef_joint_head_is_copied_beside_an_indexed_backbone(self, tmp_path):
         """The Clef decision head is not a backbone weight. It must stay out of
         the quantized shards, and a single-shard output still needs an index
