@@ -84,10 +84,14 @@ def test_wide_causal_matches_per_row(q_len, kv_len):
 @pytest.mark.skipif(
     not mx.metal.is_available() or not _gqa_ready(), reason="requires tensor ops"
 )
-@pytest.mark.parametrize("q_len", [2, 5, 8])
+@pytest.mark.parametrize("q_len", [2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("kv_len", [64, 100, 9000, 33000])
 def test_gqa_causal_matches_per_row(q_len, kv_len):
-    """One pass per KV head over strided cache views and partial key blocks."""
+    """One pass per KV head over strided cache views and partial key blocks.
+
+    Every width from 2 to 8 rows: with G = 6 the fused row count (q_len x G)
+    is padded up to a multiple of 8, so most widths end on a partial row tile.
+    """
     mx.random.seed(10)
     q = mx.random.normal((1, HQ, q_len, HD)).astype(mx.bfloat16)
     capacity = kv_len + 256
