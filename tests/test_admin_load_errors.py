@@ -60,6 +60,7 @@ def _load(pool):
         (ModelBusyError("m", "unload"), 409),
         # Anything else from the pool is still a server-side fault.
         (EnginePoolError("boom"), 500),
+        (RuntimeError("VLM load failed"), 500),
     ],
 )
 def test_load_error_maps_to_status(error, expected):

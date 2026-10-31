@@ -56,7 +56,6 @@ from ..engine.splash import (
     scan_ssd_cache as scan_splash_ssd_cache,
 )
 from ..exceptions import (
-    EnginePoolError,
     InsufficientMemoryError,
     ModelBusyError,
     ModelLoadingError,
@@ -2717,8 +2716,8 @@ async def load_model(
         raise HTTPException(status_code=507, detail=str(e))
     except (ModelUnavailableError, ModelLoadingError, ModelBusyError) as e:
         raise HTTPException(status_code=409, detail=str(e))
-    except EnginePoolError as e:
-        # Any other pool failure is still a server-side fault.
+    except Exception as e:
+        # Some load failures are not EnginePoolError; keep their reason.
         raise HTTPException(status_code=500, detail=str(e))
 
     logger.info(f"Manually loaded model: {model_id}")
