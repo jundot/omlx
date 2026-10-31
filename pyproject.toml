@@ -47,8 +47,6 @@ dependencies = [
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@0d4d3d04f8ab7ce4a51e7209e8615755a48ba94d",
     # regex for mlx-lm's Gemma 4 tool parser (uses recursive patterns)
     "regex",
-    # mlx-embeddings from latest commit (32981fa)
-    "mlx-embeddings @ git+https://github.com/Blaizzy/mlx-embeddings@32981fa4e8064ed664b52071789dd18271fe4206",
     # mlx-vlm custom processors bypass HF AutoProcessor, so torch is not required
     # The mlx-lm pin above includes the NewlineTokenizer registration fix
     # required by transformers 5.13+. mlx-vlm requires the 5.14 processor API.

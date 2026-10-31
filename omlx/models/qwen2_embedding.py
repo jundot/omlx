@@ -4,9 +4,8 @@ Native Qwen2 embedding adapter for omlx.
 
 Serves Qwen2-decoder embedding models (``architectures=["Qwen2ForCausalLM"]``,
 ``model_type="qwen2"``) such as ``jinaai/jina-code-embeddings-1.5b`` (causal)
-and ``Alibaba-NLP/gte-Qwen2-1.5B-instruct`` (bidirectional), without depending
-on mlx-embeddings, which has no ``qwen2`` module and raises
-``ValueError("Model type qwen2 not supported.")`` for these checkpoints.
+and ``Alibaba-NLP/gte-Qwen2-1.5B-instruct`` (bidirectional). mlx-vlm's
+embedding loader has no ``qwen2`` remapping for these checkpoints.
 
 These models pool the *last* (mask-aware) token of the final hidden state and
 L2-normalize, matching their SentenceTransformers configs

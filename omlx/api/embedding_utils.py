@@ -38,7 +38,7 @@ def find_non_finite_embeddings(embeddings: Sequence[Sequence[float]]) -> List[in
     Return the indices of embeddings that contain NaN or infinite values.
 
     A model that overflows in its attention mask (see modernbert in
-    mlx-embeddings) can hand back NaN vectors for some items of a padded
+    mlx-vlm) can hand back NaN vectors for some items of a padded
     batch. Those must not be serialized as a successful response: JSON has
     no NaN, so the client would receive ``null``-filled vectors with a 200.
 
@@ -90,10 +90,10 @@ def count_tokens(processor: Any, texts: List[str]) -> int:
     """
     Count total tokens in input texts.
 
-    Handles different tokenizer/processor types from mlx-embeddings.
+    Handles different tokenizer/processor types from mlx-vlm.
 
     Args:
-        processor: Tokenizer or processor from mlx-embeddings
+        processor: Tokenizer or processor from mlx-vlm
         texts: List of input texts
 
     Returns:

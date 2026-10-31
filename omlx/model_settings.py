@@ -526,7 +526,7 @@ class ModelSettings:
     # (omlx/engine/splash.py). None runs the model in-process.
     external_engine: Optional[str] = None
 
-    # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
+    # Security: opt-in per model. When True, mlx-lm/mlx-vlm/reranker
     # loaders are allowed to execute custom Python from the model repository
     # (modeling_*.py, tokenization_*.py). Off by default — see issue #926.
     trust_remote_code: bool = False
