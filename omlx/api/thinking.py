@@ -700,3 +700,20 @@ class ThinkingBudgetProcessor:
                 # Lazily-created attr absent from the snapshot: drop it so
                 # the next __call__ re-baselines from the history it sees.
                 delattr(self, name)
+
+    def inert_for(self, positions: int) -> bool:
+        """Whether the next ``positions`` calls leave every logit unchanged.
+
+        The budget only touches logits once it forces the close-think
+        sequence. The count rises by at most one per call, and a re-entry
+        into thinking restarts it at zero, so far enough from the budget the
+        next ``positions`` calls can't force anything. MTP draft steps skip
+        the processor then: they rewind its state afterwards anyway, and
+        each call reads the draft tokens back from the GPU, which stalls the
+        draft loop.
+        """
+        if self._forcing or self._waiting_utf8:
+            return False
+        if self._done:
+            return positions < self._budget
+        return self._thinking_tokens + positions < self._budget

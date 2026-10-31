@@ -252,6 +252,55 @@ class TestThinkingBudgetProcessor:
         assert not proc._done
         assert proc._in_thinking
 
+    # --- Speculative draft skipping ---
+
+    @pytest.mark.parametrize("positions", [1, 2, 4])
+    def test_inert_for_holds_until_the_budget_is_in_reach(self, positions):
+        """When inert_for(n) is true, the next n calls return their logits
+        unchanged; the first window that reaches the budget does force."""
+        proc = self._make_processor(budget=6)
+        history = [10]
+        proc(_make_tokens(*history), _make_logits())
+        forced_once = False
+        for step in range(8):
+            inert = proc.inert_for(positions)
+            state = proc.snapshot_state()
+            probe = list(history)
+            changed = False
+            for k in range(positions):
+                probe.append(100 + 10 * step + k)
+                logits = _make_logits()
+                out = proc(_make_tokens(*probe), logits)
+                changed = changed or not mx.array_equal(out, logits).item()
+            proc.restore_state(state)
+            if inert:
+                assert not changed, f"step {step}: inert_for({positions}) but forced"
+            forced_once = forced_once or changed
+            if changed:
+                break
+            history.append(100 + step)
+            proc(_make_tokens(*history), _make_logits())
+        assert forced_once
+
+    def test_inert_after_close_until_a_reentry_could_reach_the_budget(self):
+        proc = self._make_processor(budget=3)
+        proc(_make_tokens(10), _make_logits())
+        proc(_make_tokens(10, self.THINK_END_ID), _make_logits())
+        assert proc._done
+        assert proc.inert_for(2)
+        assert not proc.inert_for(3)
+        history = [10, self.THINK_END_ID]
+        for token in (self.THINK_START_ID, 50):  # re-entry, then one more
+            history.append(token)
+            logits = _make_logits()
+            assert mx.array_equal(proc(_make_tokens(*history), logits), logits).item()
+
+    def test_never_inert_while_forcing(self):
+        proc = self._make_processor(budget=1)
+        proc(_make_tokens(10), _make_logits())
+        assert proc._forcing
+        assert not proc.inert_for(1)
+
 
 # ---------------------------------------------------------------------------
 # ModelSettings serialization
