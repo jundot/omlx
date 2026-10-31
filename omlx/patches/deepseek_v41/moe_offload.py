@@ -774,58 +774,67 @@ class OffloadedExpert(nn.Module):
             outputs.append(out)
         return outputs
 
-    @staticmethod
-    def _chunk_end(ids, start, capacity):
-        """End index of the chunk starting at ``start``.
+    def _groups(self, ids):
+        """Expert groups of one sorted call: the resident experts first, then the misses.
 
-        A chunk holds every route of up to ``capacity`` distinct experts.
+        The resident group reads nothing, so it runs while the first miss group
+        is read ahead. Misses follow in ascending id order, at most ``capacity``
+        distinct experts per group. Running the resident experts before any miss
+        evicts them is what lets a prefill keep them: a sweep over more experts
+        than slots used to evict every resident before reaching it, so each
+        chunk of a prefill read all of its experts.
         """
-        end, distinct = start, 0
-        while end < len(ids) and distinct < capacity:
-            run = end + 1
-            while run < len(ids) and ids[run] == ids[end]:
-                run += 1
-            end, distinct = run, distinct + 1
-        return end
+        resident = self.slots.slot_of
+        experts = [int(e) for e in np.unique(np.asarray(ids, dtype=np.int64))]
+        hits = [e for e in experts if e in resident]
+        misses = [e for e in experts if e not in resident]
+        capacity = self.slots.plan.capacity
+        groups = [hits] if hits else []
+        groups += [misses[i : i + capacity] for i in range(0, len(misses), capacity)]
+        return groups
 
     def _sorted(self, x, indices, weights, input_quantized):
-        """Routes sorted by expert: chunk on expert boundaries.
+        """Routes sorted by expert, run in expert groups, resident experts first.
 
-        A chunk holds every route of up to ``capacity`` distinct experts, so a
-        prefill reads each expert once per layer and runs one kernel per
-        chunk instead of one per ``capacity`` routes. The next chunk's reads
-        are issued before this chunk's eval, so the drive works through the
-        GPU wait instead of queueing behind it.
+        A group holds every route of up to ``capacity`` distinct experts, so a
+        prefill reads each expert at most once per layer and runs one kernel per
+        group. The next group's reads are issued before this group's eval, so
+        the drive works through the GPU wait instead of queueing behind it. A
+        group's routes keep their ascending order; the outputs go back to the
+        routes' sorted order, which the caller's combine expects.
         """
         ids = indices.reshape(-1).tolist()
+        flat = np.asarray(ids, dtype=np.int64)
         rows = x.reshape(-1, 1, x.shape[-1])
         scores = None if weights is None else weights.reshape(-1)
-        capacity = self.slots.plan.capacity
-        outputs = []
-        start = 0
+        groups = self._groups(ids)
+        outputs, positions = [], []
         try:
-            while start < len(ids):
-                end = self._chunk_end(ids, start, capacity)
-                slots = mx.array(self.slots.ensure_ids(ids[start:end]), dtype=mx.int32)
+            for k, group in enumerate(groups):
+                pos_np = np.flatnonzero(np.isin(flat, group))
+                pos = mx.array(pos_np.astype(np.int32))
+                slots = mx.array(self.slots.ensure_ids(flat[pos_np].tolist()), dtype=mx.int32)
                 order = mx.argsort(slots)
                 inverse = mx.argsort(order)
                 out = self.slots.expert(
-                    rows[start:end][order],
+                    rows[pos][order],
                     slots[order],
-                    None if scores is None else scores[start:end][order],
+                    None if scores is None else scores[pos][order],
                     sorted_indices=True,
                     input_quantized=input_quantized,
                 )[inverse]
-                if end < len(ids):
-                    next_end = self._chunk_end(ids, end, capacity)
-                    self.slots.read_ahead(ids[end:next_end])
+                if k + 1 < len(groups):
+                    self.slots.read_ahead(groups[k + 1])
                 mx.eval(out)
                 outputs.append(out)
-                start = end
+                positions.append(pos_np)
         finally:
             # A read-ahead the loop never consumed must not outlive the call.
             self.slots.release_read_ahead()
-        return outputs
+        if len(outputs) == 1:
+            return outputs
+        back = np.argsort(np.concatenate(positions), kind="stable").astype(np.int32)
+        return [mx.concatenate(outputs, axis=0)[mx.array(back)]]
 
 
 def _plan(path, fraction, mtp_resident=False):
