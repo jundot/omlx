@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pytest
+from transformers.processing_utils import ProcessorMixin
 
 from omlx.exceptions import InvalidRequestError
 from omlx.patches.gemma4_audio import apply_gemma4_audio_patch
@@ -150,6 +151,31 @@ class FakeStreamingCore:
 # ---------------------------------------------------------------------------
 # Test stream cleanup
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="mlx is required to import the VLM engine")
+def test_video_processor_patch_keeps_a_real_video_processor(monkeypatch):
+    """mlx-vlm's Qwen3-Omni processor passes its video processor positionally."""
+    vlm_module._patch_video_processor_bug()
+    monkeypatch.setattr(
+        ProcessorMixin, "check_argument_for_proper_class", lambda self, name, arg: None
+    )
+
+    class Qwen3OmniMoeProcessor(ProcessorMixin):
+        def __init__(self, image_processor=None, video_processor=None, tokenizer=None):
+            super().__init__(image_processor, video_processor, tokenizer)
+
+    class OtherProcessor(ProcessorMixin):
+        def __init__(self, image_processor=None, tokenizer=None, **kwargs):
+            super().__init__(image_processor, tokenizer, **kwargs)
+
+    image, video, tokenizer = object(), object(), object()
+    kept = Qwen3OmniMoeProcessor(image, video, tokenizer)
+    assert kept.video_processor is video and kept.tokenizer is tokenizer
+    # Other processors keep dropping theirs, as before Qwen3-Omni needed one.
+    dropped = OtherProcessor(image, tokenizer, video_processor=video)
+    assert dropped.tokenizer is tokenizer
+    assert getattr(dropped, "video_processor", None) is None
 
 
 class TestVLMStreamingCleanup:

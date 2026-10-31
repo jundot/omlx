@@ -108,3 +108,29 @@ class TestVoicesEndpoint:
         response = client.get("/v1/audio/voices", params={"model": "bare"})
         assert response.status_code == 200
         assert response.json()["voices"] == []
+
+    def test_realtime_voices_differ_from_tts_voices(self, voices_client):
+        """LFM3 voice chat has one fixed voice; Qwen3-Omni lists its speakers."""
+        client, _, model_dir = voices_client
+        config = model_dir / "config.json"
+        config.write_text(json.dumps({"model_type": "lfm3_audio"}))
+        tts = client.get("/v1/audio/voices", params={"model": "lfm3"})
+        realtime = client.get(
+            "/v1/audio/voices", params={"model": "lfm3", "realtime": "true"}
+        )
+        assert tts.json()["voices"] == ["female", "male"]
+        assert realtime.json()["voices"] == []
+        # The interleaved-output line stays server-side, so clients see no default.
+        assert realtime.json()["instructions"] == ""
+        assert realtime.json()["capabilities"] == {"input_image": False, "tools": True}
+
+        config.write_text(json.dumps({
+            "model_type": "qwen3_omni_moe",
+            "talker_config": {"speaker_id": {"chelsie": 2301, "ethan": 2302}},
+        }))
+        realtime = client.get(
+            "/v1/audio/voices", params={"model": "omni", "realtime": "true"}
+        )
+        assert realtime.json()["voices"] == ["chelsie", "ethan"]
+        assert realtime.json()["instructions"].startswith("You are Qwen-Omni")
+        assert realtime.json()["capabilities"] == {"input_image": True, "tools": True}

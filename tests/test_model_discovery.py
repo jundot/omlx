@@ -29,6 +29,7 @@ from omlx.model_discovery import (
     format_size,
     is_helper_config_model_type,
     is_helper_model_config,
+    is_realtime_voice_model,
     model_directory_access_error,
     model_display_name,
 )
@@ -900,6 +901,25 @@ class TestDetectModelType:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "vlm"
+
+    def test_detect_qwen3_omni_as_vlm(self, tmp_path):
+        """Qwen3-Omni ships an empty top-level vision_config and loads in mlx-vlm."""
+        config = {
+            "model_type": "qwen3_omni_moe",
+            "architectures": ["Qwen3OmniMoeForConditionalGeneration"],
+            "vision_config": {},
+            "enable_audio_output": True,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "vlm"
+
+    def test_thinker_only_qwen3_omni_is_not_a_voice_model(self):
+        assert is_realtime_voice_model("qwen3_omni_moe", {"enable_audio_output": True})
+        assert not is_realtime_voice_model(
+            "qwen3_omni_moe", {"enable_audio_output": False}
+        )
+        assert is_realtime_voice_model("lfm3_audio", {})
+        assert not is_realtime_voice_model("qwen3_vl_moe", {})
 
     def test_detect_lfm_audio_architecture_as_sts(self, tmp_path):
         """mlx-audio LFM STS remains classified via LFM2AudioModel architecture."""

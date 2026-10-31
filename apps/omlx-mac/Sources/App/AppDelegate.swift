@@ -70,6 +70,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
 
+    /// Quits for real and opens this bundle again after the process exits,
+    /// for permissions that apply only to a new process.
+    func relaunch() {
+        // Gives up after 60 s, so a quit that never happens does not reopen the app later.
+        let script = """
+            i=0; while /bin/kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null && [ $i -lt 300 ]; \
+            do /bin/sleep 0.2; i=$((i+1)); done; \
+            /bin/kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null || /usr/bin/open "$0"
+            """
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = ["-c", script, Bundle.main.bundlePath]
+        do {
+            try helper.run()
+        } catch {
+            NSLog("oMLX: relaunch helper failed to start: \(error)")
+            return
+        }
+        requestQuit()
+    }
+
     /// Cmd-Q / Dock → Quit path: hide every titled window AND set
     /// `.accessory` so the Dock icon vanishes. Server + menubar stay alive.
     func hideWindowsAndDropDockIcon() {
@@ -161,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: UserDefaults.didChangeNotification,
             object: UserDefaults.standard
         )
+        services.relaunchApp = { [weak self] in self?.relaunch() }
         services.updates.setTerminateForUpdate { [weak self] in
             if let self {
                 self.requestQuit()
@@ -562,6 +584,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// True for the quit event that macOS sends on logout, restart, or
     /// shutdown. Dock Quit and AppleScript `quit` send no quit reason.
+    /// System Settings' Quit & Reopen after a privacy change sends
+    /// kAEReallyLogOut too.
     nonisolated static func isSystemQuitEvent(_ event: NSAppleEventDescriptor?) -> Bool {
         guard let event,
               event.eventClass == AEEventClass(kCoreEventClass),

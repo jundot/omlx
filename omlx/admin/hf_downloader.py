@@ -699,8 +699,10 @@ def _repo_layout(names: list[str]) -> str:
 
 def _optional_for_safetensors(name: str) -> bool:
     lower = name.lower()
-    base = lower.rsplit("/", 1)[-1]
-    if base == ".gitattributes" or base.startswith(("readme", "license")):
+    parts = lower.split("/")
+    if any(part.startswith(".") or part == "__pycache__" for part in parts):
+        return True
+    if parts[-1].startswith(("readme", "license")):
         return True
     if "/" in lower and lower.split("/", 1)[0] in _OPTIONAL_DIRS:
         return True
@@ -719,18 +721,152 @@ def _default_mmproj(names: list[str]) -> dict[str, str]:
     }
 
 
-def _is_local_copy(path: Path, size: int) -> bool:
+def _is_repo_id(repo_id: str) -> bool:
+    parts = repo_id.split("/")
+    return len(parts) == 2 and not any(part in ("", ".", "..") for part in parts)
+
+
+def _remote_etags(siblings) -> dict[str, str]:
+    """Map repo paths to the etag hub records for a local copy.
+
+    LFS files use the content sha256, other files the git blob id.
+    """
+    etags: dict[str, str] = {}
+    if not isinstance(siblings, (list, tuple)):
+        return etags
+    for sibling in siblings:
+        name = getattr(sibling, "rfilename", None)
+        lfs = getattr(sibling, "lfs", None)
+        etag = (
+            getattr(lfs, "sha256", None) if lfs else getattr(sibling, "blob_id", None)
+        )
+        if isinstance(name, str) and isinstance(etag, str):
+            etags[name] = etag
+    return etags
+
+
+def _records_dir(local_dir: Path) -> Path:
+    return local_dir / ".cache" / "huggingface" / "download"
+
+
+def _download_record(local_dir: Path, name: str) -> tuple[str, float] | None:
+    """(etag, timestamp) hub recorded when it last fetched or verified ``name``.
+
+    Read directly: hub's reader creates folders and lock files.
+    """
+    record = _records_dir(local_dir) / f"{name}.metadata"
     try:
-        return path.is_file() and (size <= 0 or path.stat().st_size == size)
+        _commit, etag, timestamp = record.read_text(encoding="utf-8").splitlines()[:3]
+        return etag.strip(), float(timestamp)
+    except (OSError, ValueError):
+        return None
+
+
+def _has_download_records(local_dir: Path) -> bool:
+    return any(_records_dir(local_dir).rglob("*.metadata"))
+
+
+def _local_state(local_dir: Path, name: str, size: int, etag: str | None) -> str | None:
+    """'current' or 'outdated' for a repo file in ``local_dir``, None if absent.
+
+    A hub record compares the etag the file was fetched at, so a local edit
+    is not a Hub change.
+    """
+    path = local_dir / name
+    try:
+        if not path.is_file():
+            return None
+        local_size = path.stat().st_size
     except OSError:
-        return False
+        return None
+    record = _download_record(local_dir, name) if etag else None
+    if record is not None:
+        return "current" if record[0] == etag else "outdated"
+    # Without a hub record only a size change is visible.
+    return "current" if size <= 0 or local_size == size else "outdated"
 
 
-def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
+def _update_files(files: list[dict], local_dir: Path | None) -> list[str]:
+    """Files that bring a downloaded copy up to date with the repo.
+
+    Changed files plus required files the copy lacks. Empty unless hub
+    downloaded into the folder and a required file changed or is missing, so
+    a model card edit alone is not an update. Without hub records the files
+    an update replaces could not be told from the user's own.
+    """
+    if local_dir is None or not _has_download_records(local_dir):
+        return []
+    if not any(row["local"] or row["outdated"] for row in files):
+        return []
+    if all(row["local"] for row in files if row["required"]):
+        return []
+    return [
+        row["name"]
+        for row in files
+        if row["outdated"] or (row["required"] and not row["local"])
+    ]
+
+
+def _remove_deleted_files(local_dir: Path, remote_names: list[str]) -> list[str]:
+    """Delete files hub fetched into ``local_dir`` that the repo no longer has.
+
+    Loaders glob every *.safetensors in a folder, so a shard of an older
+    layout would load beside its replacement. Files changed after hub
+    recorded them stay.
+    """
+    records = _records_dir(local_dir)
+    keep = set(remote_names)
+    folded = {name.casefold(): name for name in remote_names}
+    removed = []
+    for record in sorted(records.rglob("*.metadata")):
+        name = record.relative_to(records).as_posix().removesuffix(".metadata")
+        if name in keep:
+            continue
+        path = local_dir / name
+        twin = folded.get(name.casefold())
+        try:
+            # On a case-insensitive volume a renamed file is its replacement.
+            if twin is not None and path.samefile(local_dir / twin):
+                continue
+        except OSError:
+            pass
+        try:
+            if path.is_file():
+                entry = _download_record(local_dir, name)
+                if entry is None or path.stat().st_mtime - 1 > entry[1]:
+                    continue
+                path.unlink()
+                removed.append(name)
+            record.unlink(missing_ok=True)
+            record.with_suffix(".lock").unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"Could not remove {path}: {e}")
+    return removed
+
+
+def _file_rows(siblings) -> list[dict]:
+    """model_info siblings as model-info file rows."""
+    return [
+        {
+            "name": s.rfilename,
+            "size": s.size or 0,
+            "size_formatted": _format_model_size(s.size) if s.size else "",
+        }
+        for s in siblings or []
+    ]
+
+
+def _describe_repo_files(
+    files: list[dict],
+    local_dir: Path | None,
+    etags: dict[str, str] | None = None,
+) -> str:
     """Add download hints to model-info file rows; return the repo layout.
 
-    GGUFs can be at the root or split across a VARIANT/ folder.
+    GGUFs can be at the root or split across a VARIANT/ folder. ``etags``
+    are the repo's, to tell a changed local copy from a current one.
     """
+    etags = etags or {}
     names = [row["name"] for row in files]
     layout = _repo_layout(names)
     split_groups = gguf.split_file_groups(names)
@@ -759,9 +895,13 @@ def _describe_repo_files(files: list[dict], local_dir: Path | None) -> str:
         optional = _optional_for_safetensors(name)
         row["required"] = layout == "safetensors" and not optional
         row["preselected"] = name in preselected
-        row["local"] = local_dir is not None and _is_local_copy(
-            local_dir / name, row["size"]
+        state = (
+            _local_state(local_dir, name, row["size"], etags.get(name))
+            if local_dir is not None
+            else None
         )
+        row["local"] = state == "current"
+        row["outdated"] = state == "outdated"
     return layout
 
 
@@ -1421,21 +1561,11 @@ class HFDownloader(_QueuePersistenceMixin):
             timeout=_HF_API_TIMEOUT,
         )
 
-        # Extract file list with sizes
-        files = []
-        if info.siblings:
-            for s in info.siblings:
-                files.append(
-                    {
-                        "name": s.rfilename,
-                        "size": s.size or 0,
-                        "size_formatted": (
-                            _format_model_size(s.size) if s.size else ""
-                        ),
-                    }
-                )
-
-        layout = await asyncio.to_thread(_describe_repo_files, files, local_dir)
+        files = _file_rows(info.siblings)
+        layout = await asyncio.to_thread(
+            _describe_repo_files, files, local_dir, _remote_etags(info.siblings)
+        )
+        update_files = await asyncio.to_thread(_update_files, files, local_dir)
 
         # Detect LoRA/adapter repos (adapter_config.json is peft standard)
         is_adapter = any(f["name"] == "adapter_config.json" for f in files)
@@ -1488,6 +1618,7 @@ class HFDownloader(_QueuePersistenceMixin):
             "description": "",  # kept for backward compat
             "files": files,
             "layout": layout,
+            "update_files": update_files,
             "download_all_size": download_all_size or 0,
             "unsupported_reason": _unsupported_repo_reason(info),
             "tags": list(info.tags) if info.tags else [],
@@ -1530,6 +1661,69 @@ class HFDownloader(_QueuePersistenceMixin):
         """Update the model directory path."""
         self._model_dir = Path(new_dir)
 
+    def has_unfinished_download(self, repo_id: str) -> bool:
+        """True when the latest download of ``repo_id`` has not completed."""
+        wanted = repo_id.lower()
+        tasks = [t for t in self._tasks.values() if t.repo_id.lower() == wanted]
+        if not tasks:
+            return False
+        latest = max(tasks, key=lambda t: t.created_at)
+        return latest.status != DownloadStatus.COMPLETED
+
+    async def check_updates(self, repo_ids: list[str], token: str = "") -> dict:
+        """Find downloaded repos whose files changed on the Hub.
+
+        Looks up the folders this downloader finished writing, as
+        get_model_info describes them.
+
+        Returns:
+            Dict with 'updates' (repo_id -> file count and bytes to fetch),
+            'checked' (repos looked up) and 'failed' (repo IDs the Hub lookup
+            failed for).
+        """
+        api, _endpoint = _get_hf_api()
+        semaphore = asyncio.Semaphore(_BLOB_FETCH_CONCURRENCY)
+        local_repos = [
+            repo_id
+            for repo_id in dict.fromkeys(repo_ids)
+            if _is_repo_id(repo_id)
+            and not self.has_unfinished_download(repo_id)
+            and _has_download_records(self._model_dir / repo_id)
+        ]
+
+        def _check(repo_id: str) -> dict | None:
+            info = api.model_info(
+                repo_id,
+                files_metadata=True,
+                token=token or None,
+                timeout=_HF_API_TIMEOUT,
+            )
+            local_dir = self._model_dir / repo_id
+            files = _file_rows(info.siblings)
+            _describe_repo_files(files, local_dir, _remote_etags(info.siblings))
+            names = set(_update_files(files, local_dir))
+            if not names:
+                return None
+            size = sum(row["size"] for row in files if row["name"] in names)
+            return {"files": len(names), "size": size}
+
+        async def _one(repo_id: str):
+            async with semaphore:
+                return await asyncio.to_thread(_check, repo_id)
+
+        results = await asyncio.gather(
+            *(_one(repo_id) for repo_id in local_repos), return_exceptions=True
+        )
+        updates: dict[str, dict] = {}
+        failed: list[str] = []
+        for repo_id, result in zip(local_repos, results):
+            if isinstance(result, BaseException):
+                logger.debug("Update check failed for %s: %s", repo_id, result)
+                failed.append(repo_id)
+            elif result is not None:
+                updates[repo_id] = result
+        return {"updates": updates, "checked": len(local_repos), "failed": failed}
+
     async def start_download(
         self,
         repo_id: str,
@@ -1551,8 +1745,7 @@ class HFDownloader(_QueuePersistenceMixin):
                 already has a download queued.
         """
         repo_id = repo_id.strip()
-        parts = repo_id.split("/")
-        if len(parts) != 2 or any(part in ("", ".", "..") for part in parts):
+        if not _is_repo_id(repo_id):
             raise ValueError(
                 f"Invalid repository ID: '{repo_id}'. "
                 "Expected format: 'owner/model' (e.g., 'mlx-community/Llama-3-8B-4bit')"
@@ -1790,6 +1983,9 @@ class HFDownloader(_QueuePersistenceMixin):
                 ignore_patterns = None
                 allow_patterns = _file_patterns(task.files) if task.files else None
                 size_estimate = 0
+                # A checkpoint's repo paths, to drop local files it no longer has.
+                remote_names: list[str] | None = None
+                revision: str | None = None
                 try:
                     model_info = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -1804,6 +2000,14 @@ class HFDownloader(_QueuePersistenceMixin):
                         getattr(model_info, "safetensors", None)
                     )
                     _check_selected_files(task, model_info)
+                    sha = getattr(model_info, "sha", None)
+                    if isinstance(sha, str):
+                        revision = sha
+                    siblings = getattr(model_info, "siblings", None)
+                    if isinstance(siblings, (list, tuple)):
+                        names = [sibling.rfilename for sibling in siblings]
+                        if _repo_layout(names) == "safetensors":
+                            remote_names = names
                     unsupported = _unsupported_repo_reason(model_info)
                     if unsupported:
                         raise _UnsupportedRepoError(unsupported)
@@ -1838,6 +2042,9 @@ class HFDownloader(_QueuePersistenceMixin):
                 }
                 if ignore_patterns:
                     dl_kwargs["ignore_patterns"] = ignore_patterns
+                if revision:
+                    # The payload, the HTTP fallback and remote_names share one commit.
+                    dl_kwargs["revision"] = revision
                 if allow_patterns:
                     dl_kwargs["allow_patterns"] = allow_patterns
 
@@ -1943,6 +2150,21 @@ class HFDownloader(_QueuePersistenceMixin):
                 # Check if cancelled while downloading
                 if task_id in self._cancelled:
                     return
+
+                if remote_names is not None:
+                    try:
+                        removed = await asyncio.to_thread(
+                            _remove_deleted_files, target_dir, remote_names
+                        )
+                        if removed:
+                            logger.info(
+                                f"Removed {len(removed)} file(s) no longer in "
+                                f"{task.repo_id}: {', '.join(removed)}"
+                            )
+                    except Exception as e:  # noqa: BLE001 - the download succeeded
+                        logger.warning(
+                            f"Could not remove old files for {task.repo_id}: {e}"
+                        )
 
                 # Success
                 task.status = DownloadStatus.COMPLETED

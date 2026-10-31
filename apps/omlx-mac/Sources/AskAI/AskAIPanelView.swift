@@ -122,6 +122,18 @@ struct AskAIPanelView: View {
                 )
                 .frame(height: inputHeight)
             }
+            if !conversation.isStreaming, controller.store.prefs.talk.enabled {
+                Button {
+                    controller.switchToVoice()
+                } label: {
+                    Image(systemName: "mic")
+                        .font(.system(size: 16))
+                        .foregroundStyle(theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .help(String(localized: "askai.voice.help", defaultValue: "Talk Instead",
+                             comment: "Tooltip on the Ask AI bar button that switches to the voice card"))
+            }
             if conversation.isStreaming {
                 Button {
                     controller.handle(.stop)
@@ -375,15 +387,24 @@ private struct TurnView: View {
                     .textSelection(.enabled)
             }
 
+            if !turn.activities.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(turn.activities.enumerated()), id: \.offset) { _, activity in
+                        ToolActivityRow(activity: activity)
+                    }
+                }
+            }
+
             if !turn.reasoning.isEmpty {
-                ThinkingView(text: turn.reasoning, isThinking: turn.isStreaming && turn.answer.isEmpty)
+                ThinkingView(text: turn.reasoning,
+                             isThinking: turn.isStreaming && turn.answer.isEmpty && !toolRunning)
             }
 
             if !turn.answer.isEmpty {
                 Markdown(turn.answer)
                     .markdownTheme(.askAI)
                     .textSelection(.enabled)
-            } else if turn.isStreaming && turn.reasoning.isEmpty {
+            } else if turn.isStreaming && turn.reasoning.isEmpty && !toolRunning {
                 ProgressView()
                     .controlSize(.small)
             }
@@ -397,7 +418,7 @@ private struct TurnView: View {
                     .help(error)
             }
 
-            if !turn.isStreaming && !turn.answer.isEmpty {
+            if !turn.isStreaming && !turn.reply.isEmpty {
                 HStack(spacing: 8) {
                     if turn.wasStopped {
                         Text(String(localized: "askai.turn.stopped", defaultValue: "Stopped",
@@ -410,7 +431,7 @@ private struct TurnView: View {
                     }
                     Spacer(minLength: 0)
                     CopyIconButton(
-                        value: turn.answer.trimmingCharacters(in: .whitespacesAndNewlines),
+                        value: turn.reply.trimmingCharacters(in: .whitespacesAndNewlines),
                         helpText: AskAIStrings.copyAnswer
                     )
                 }
@@ -418,6 +439,42 @@ private struct TurnView: View {
             }
         }
     }
+}
+
+private extension TurnView {
+    var toolRunning: Bool { turn.activities.contains(where: \.isRunning) }
+}
+
+private struct ToolActivityRow: View {
+    let activity: AskAIToolActivity
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        HStack(spacing: 6) {
+            if activity.isRunning {
+                ProgressView().controlSize(.mini)
+            } else {
+                Image(systemName: activity.failed ? "exclamationmark.triangle" : icon)
+                    .foregroundStyle(activity.failed ? theme.redDot : theme.textTertiary)
+            }
+            Text(activity.text)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .font(.omlxText(DesignTokens.FontSize.callout))
+        .foregroundStyle(theme.textSecondary)
+        .help(activity.detail)
+    }
+
+    private var icon: String {
+        switch activity.kind {
+        case .search: "magnifyingglass"
+        case .read: "link"
+        case .screen: "camera.viewfinder"
+        }
+    }
+
 }
 
 private struct ThinkingView: View {

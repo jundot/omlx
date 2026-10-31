@@ -22,7 +22,7 @@ omlx/custom_kernels/
   attention/       attention kernels
   sparse_index/    indexer and top-k kernels
   quant_matmul/    quantized matmul kernels, ANE offload
-  lowbit/          1-bit, 2-bit and T5 kernels
+  lowbit/          T5 ternary kernels
   moe_staging/     MoE offload read buffers (native part is in quant_matmul)
   include/omlx/    shared C++ helpers
   _loader.py       loads each extension
@@ -34,7 +34,7 @@ omlx/custom_kernels/
 | `attention` | attention over KV (sparse, block-mask, FA-256, decode SDPA) | GLM, DeepSeek V4/V4.1, Qwen3.5/3.6, Qwen4 |
 | `sparse_index` | choosing which KV blocks to attend to (indexer scores, top-k) | GLM, DeepSeek V4, Qwen4, MiniMax M3 |
 | `quant_matmul` | matmuls on quantized weights, MoE combine, ANE offload | Qwen3.5/3.6, GLM, DeepSeek V4/V4.1, MiMo, K2 |
-| `lowbit` | 1-bit, 2-bit and T5 decode formats | Bonsai |
+| `lowbit` | T5 (base-3 ternary) weights; 1-bit and 2-bit affine run on stock MLX | Bonsai T5 checkpoints |
 
 Each package has:
 

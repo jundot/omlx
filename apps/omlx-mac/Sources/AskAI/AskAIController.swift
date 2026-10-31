@@ -16,6 +16,8 @@ final class AskAIController {
 
     let store: AskAIStore
     let conversation = AskAIConversation()
+    /// Voice mode shares this store and hears about its preference changes.
+    let talk: TalkAIController
 
     var draft = "" {
         didSet {
@@ -45,6 +47,8 @@ final class AskAIController {
     @ObservationIgnored private var modelTypes: [String: String] = [:]
     @ObservationIgnored private var isSubmitting = false
     @ObservationIgnored private var lastClosedAt = Date.distantPast
+    /// The app in front when the panel opened, for the `{app}` placeholder.
+    @ObservationIgnored private var sourceApp: String?
     /// Pastes whose images are still being checked or encoded.
     @ObservationIgnored private var loadingAttachments = 0
     @ObservationIgnored private var submitAfterAttachments = false
@@ -52,6 +56,9 @@ final class AskAIController {
 
     init(store: AskAIStore = AskAIStore()) {
         self.store = store
+        talk = TalkAIController(store: store)
+        talk.willOpen = { [weak self] in self?.panel?.hide(animated: true) }
+        talk.openText = { [weak self] in self?.showPanel(animated: true) }
     }
 
     func start(services: AppServices, openSettings: @escaping () -> Void) {
@@ -65,11 +72,16 @@ final class AskAIController {
             if !new.enabled {
                 self.hidePanel()
             }
+            if old.talk != new.talk {
+                self.talk.prefsChanged(old: old.talk, new: new.talk)
+            }
         }
         applyHotKey()
+        talk.start(services: services, openSettings: openSettings)
     }
 
     func shutdown() {
+        talk.shutdown()
         store.flush()
         hotKey.invalidate()
     }
@@ -79,6 +91,7 @@ final class AskAIController {
     func setHotKeySuspended(_ suspended: Bool) {
         hotKeySuspended = suspended
         applyHotKey()
+        talk.setHotKeySuspended(suspended)
     }
 
     private func applyHotKey() {
@@ -103,6 +116,11 @@ final class AskAIController {
     var isPanelVisible: Bool { panel?.isVisible == true }
 
     func togglePanel() {
+        // The text hotkey over the voice card switches to the bar.
+        if talk.isActive {
+            talk.switchToText()
+            return
+        }
         if isPanelVisible {
             hidePanel()
         } else {
@@ -110,7 +128,11 @@ final class AskAIController {
         }
     }
 
-    func showPanel() {
+    func switchToVoice() {
+        talk.open()
+    }
+
+    func showPanel(animated: Bool = false) {
         guard store.prefs.enabled else { return }
         // Idle time counts from the last send, answer, or close.
         let lastUse = max(conversation.lastActivity, lastClosedAt)
@@ -119,9 +141,11 @@ final class AskAIController {
             conversation.reset()
         }
         notice = nil
+        // The panel never activates oMLX, so the user's app is still in front.
+        sourceApp = NSWorkspace.shared.frontmostApplication?.localizedName
         let panel = self.panel ?? AskAIPanelController(controller: self)
         self.panel = panel
-        panel.show()
+        panel.show(animated: animated)
         inputFocus.focus()
         // Model types only feed the image check and rarely change; a miss
         // refreshes on demand.
@@ -214,18 +238,25 @@ final class AskAIController {
         let images = attachments
         let submittedDraft = draft
         guard let pending = resolveSend(hasImages: !images.isEmpty) else { return }
-        guard !images.isEmpty else {
+        let model = pending.profile.model
+        // Screen capture is offered only to models known to read images.
+        let needsModelType = pending.profile.tools.enabled && pending.profile.tools.screenCapture
+            && modelTypes[model] == nil
+        guard !images.isEmpty || needsModelType else {
             start(pending, images: [], submittedDraft: submittedDraft)
             return
         }
-        // The server drops image parts for text-only models without an
-        // error, so refuse before sending, like the web chat does.
         isSubmitting = true
         Task {
             defer { isSubmitting = false }
-            if let refusal = await imageRefusal(model: pending.profile.model) {
+            // The server drops image parts for text-only models without an
+            // error, so refuse before sending, like the web chat does.
+            if !images.isEmpty, let refusal = await imageRefusal(model: model) {
                 notice = refusal
                 return
+            }
+            if modelTypes[model] == nil {
+                await refreshModelTypes()
             }
             start(pending, images: images, submittedDraft: submittedDraft)
         }
@@ -285,15 +316,22 @@ final class AskAIController {
                                           path: "/v1/chat/completions")
         else { return }
         if pending.startsConversation {
-            conversation.begin(profile: pending.profile, command: pending.command)
+            conversation.begin(profile: pending.profile, command: pending.command,
+                               context: PromptContext(app: sourceApp))
         } else {
-            conversation.updateProfile(pending.profile)
+            conversation.updateProfile(pending.profile, context: PromptContext(app: sourceApp))
         }
+        let tools = AskAITool.tools(for: pending.profile.tools,
+                                    vision: modelTypes[pending.profile.model] == "vlm")
+        let runner = tools.isEmpty ? nil : AskAIToolRunner(host: config.host, port: config.port,
+                                                           apiKey: config.apiKey)
         // A reset during the image check leaves nothing to follow up on.
         // Keep the input so the user can send again.
         guard conversation.send(pending.text, images: images,
                                 gpuPowerLimitW: store.prefs.requestGPUPowerLimit,
-                                using: ChatCompletionClient(url: url, apiKey: config.apiKey))
+                                tools: tools,
+                                using: ChatCompletionClient(url: url, apiKey: config.apiKey),
+                                runner: runner)
         else { return }
         if draft == submittedDraft { draft = "" }
         attachments.removeAll { images.contains($0) }

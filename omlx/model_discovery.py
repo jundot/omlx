@@ -81,6 +81,7 @@ VLM_MODEL_TYPES = {
     "muse_spark",
     "glm5_next",
     "lfm3_audio",
+    "qwen3_omni_moe",
 }
 
 # Text-only model families that are implemented in mlx-vlm rather than
@@ -399,6 +400,18 @@ AUDIO_STS_ARCHITECTURES = {
     "LFM2AudioModel",
 }
 
+# Voice models with a /v1/realtime backend, served by the VLM engine.
+REALTIME_VOICE_MODEL_TYPES = frozenset({"lfm3_audio", "lfm3_omni", "qwen3_omni_moe"})
+
+
+def is_realtime_voice_model(config_model_type: str, config: dict | None = None) -> bool:
+    """True when the model can hold a spoken conversation on /v1/realtime."""
+    if config_model_type not in REALTIME_VOICE_MODEL_TYPES:
+        return False
+    # Thinker-only Qwen3-Omni checkpoints have no talker to speak with.
+    return (config or {}).get("enable_audio_output", True) is not False
+
+
 def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
     """True when an audio_stt model can serve the realtime WebSocket."""
     return model_type == "audio_stt"
@@ -415,6 +428,7 @@ class DiscoveredModel:
     estimated_size: int  # Estimated memory usage in bytes
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    realtime_voice: bool = False  # Its model type and config allow /v1/realtime
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     reasoning_efforts: list[str] | None = None  # Template effort levels (None = no effort)
@@ -834,10 +848,15 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Check for VLM: model_type field (only if vision capabilities are present)
     # Some model families (e.g., qwen3_5_moe) have both VLM and text-only variants.
     # Text-only quants won't carry a vision sub-config. gemma4_unified,
-    # diffusion_gemma and lfm3_audio are exceptions: they are served by mlx-vlm
-    # regardless of vision_config presence in config.json.
+    # diffusion_gemma, lfm3_audio and qwen3_omni_moe are exceptions: they are
+    # served by mlx-vlm regardless of vision_config presence in config.json.
     if normalized_type in VLM_MODEL_TYPES:
-        if normalized_type in {"gemma4_unified", "diffusion_gemma", "lfm3_audio"}:
+        if normalized_type in {
+            "gemma4_unified",
+            "diffusion_gemma",
+            "lfm3_audio",
+            "qwen3_omni_moe",
+        }:
             logger.info(
                 f"{model_type} detected as VLM (mlx-vlm native model)"
             )
@@ -1782,6 +1801,7 @@ def _register_model(
             estimated_size=estimated_size,
             text_only_size=text_only_size,
             config_model_type=config_model_type,
+            realtime_voice=is_realtime_voice_model(config_model_type, _config),
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
             reasoning_efforts=reasoning_efforts,

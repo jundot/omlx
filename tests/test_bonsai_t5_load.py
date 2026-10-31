@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the Bonsai t5 load / quantized_matmul patch.
+"""Tests for Bonsai checkpoint support.
 
 Covers:
+  - t5 repack script round trips
   - _is_t5_weight_replacement shape and dtype gating
   - _patched_load_weights strict behaviour with t5 uint8 replacements
-  - _t5_quantized_matmul routing: t5 uint8 fallback, bits=1 fallback,
+  - _t5_quantized_matmul routing: t5 uint8 fallback,
     uint32 passthrough, native kernel dispatch (with fakes)
   - apply/remove lifecycle (idempotency, restore of originals)
   - free_t5_biases placeholder swap
+  - pre-load wiring by weight format
+  - mlx-vlm 1-bit module rebinding to the stock MLX modules
 """
 
 from __future__ import annotations
@@ -20,10 +23,10 @@ import mlx_lm.utils as mlx_lm_utils
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
+from mlx_vlm.quantization.one_bit import OneBitEmbedding, OneBitLinear
 
 import omlx.patches.bonsai_t5_load as bonsai_t5_load
-from omlx.custom_kernels.lowbit.fast import _dequant_1bit
-from omlx.patches import bonsai_qmv
+from omlx.models.vlm import restore_bonsai_quantized_modules
 from omlx.patches.bonsai_t5_load import (
     _is_t5_weight_replacement,
     _patched_load_weights,
@@ -32,7 +35,8 @@ from omlx.patches.bonsai_t5_load import (
     free_t5_biases,
     remove_bonsai_t5_load_patch,
 )
-from scripts.repack_ternary_t5 import pack_t5
+from omlx.utils.model_loading import maybe_apply_pre_load_patches
+from scripts.repack_ternary_t5 import pack_t5, unpack_mlx_2bit, unpack_t5
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +50,84 @@ def _t5_patch_guard():
     remove_bonsai_t5_load_patch()
     yield
     remove_bonsai_t5_load_patch()
+
+
+# ---------------------------------------------------------------------------
+# t5 repack script
+# ---------------------------------------------------------------------------
+
+
+class TestT5Repack:
+    """Tests for scripts/repack_ternary_t5.py."""
+
+    def test_pack_unpack_roundtrip_gs128(self):
+        rng = np.random.default_rng(0)
+        q = rng.integers(0, 3, size=(8, 128), dtype=np.uint8)
+        t5w = pack_t5(q, group_size=128)
+        assert t5w.shape == (8, 26), f"expected (8,26) got {t5w.shape}"
+        q_rt = unpack_t5(t5w, group_size=128, K=128)
+        np.testing.assert_array_equal(q, q_rt)
+
+    def test_pack_unpack_roundtrip_gs64(self):
+        rng = np.random.default_rng(1)
+        q = rng.integers(0, 3, size=(8, 64), dtype=np.uint8)
+        t5w = pack_t5(q, group_size=64)
+        assert t5w.shape == (8, 13), f"expected (8,13) got {t5w.shape}"
+        q_rt = unpack_t5(t5w, group_size=64, K=64)
+        np.testing.assert_array_equal(q, q_rt)
+
+    def test_pack_unpack_larger_K(self):
+        rng = np.random.default_rng(2)
+        K, gs = 7168, 128
+        q = rng.integers(0, 3, size=(4, K), dtype=np.uint8)
+        t5w = pack_t5(q, group_size=gs)
+        n_groups = K // gs
+        assert t5w.shape == (4, n_groups * 26)
+        q_rt = unpack_t5(t5w, group_size=gs, K=K)
+        np.testing.assert_array_equal(q, q_rt)
+
+    def test_padding_trit_is_neutral(self):
+        """Padding trits (q=1) must contribute zero to the dot product."""
+        # Single group of 128, last 2 positions zero-padded with q=1
+        q = np.ones((1, 128), dtype=np.uint8)  # all t=0 (q=1 → dq=0 for scale*(q-1))
+        t5w = pack_t5(q, group_size=128)
+        # Decode last byte and check it encodes 3 active trits + 2 padding (all q=1)
+        # byte v = 1 + 1*3 + 1*9 + 1*27 + 1*81 = 121
+        assert t5w[0, 25] == 121  # 1+3+9+27+81
+
+    def test_dequant_matches_2bit_reference(self):
+        """t5 and 2-bit dequantize to the same float values."""
+        rng = np.random.default_rng(3)
+        N, K, gs = 16, 256, 128
+        # Generate ternary quants ∈ {0,1,2}
+        q = rng.integers(0, 3, size=(N, K), dtype=np.uint8)
+
+        # 2-bit MLX pack: 16 values per uint32
+        w2bit = np.zeros((N, K // 16), dtype=np.uint32)
+        for i in range(16):
+            w2bit |= (q[:, i::16].astype(np.uint32) << (i * 2))
+
+        # Build matching scales and biases
+        n_groups = K // gs
+        scales = rng.uniform(0.5, 1.5, size=(N, n_groups)).astype(np.float32)
+        biases = -scales  # ternary symmetric
+
+        # Dequantize from 2-bit
+        q2 = unpack_mlx_2bit(w2bit, K)
+        dq2 = sum(
+            (scales[:, g:g+1] * q2[:, g*gs:(g+1)*gs] + biases[:, g:g+1])
+            for g in range(n_groups)
+        )
+
+        # Dequantize from t5
+        t5w = pack_t5(q, group_size=gs)
+        qt5 = unpack_t5(t5w, group_size=gs, K=K)
+        dqt5 = sum(
+            (scales[:, g:g+1] * qt5[:, g*gs:(g+1)*gs] + biases[:, g:g+1])
+            for g in range(n_groups)
+        )
+
+        np.testing.assert_allclose(dq2, dqt5, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -294,43 +376,6 @@ class TestT5QuantizedMatmulFallback:
         expected = (q.astype(np.float32) - 1.0).T[:8]
         np.testing.assert_array_equal(np.array(out.astype(mx.float32)), expected)
 
-    def test_bits1_fallback_hand_computed(self, monkeypatch):
-        """N=2, K=64, gs=32 with explicit bit words and hand-computed output."""
-        monkeypatch.setattr(bonsai_t5_load, "has_native", lambda: False)
-        w = mx.array(
-            np.array(
-                [[0xFFFFFFFF, 0x00000000], [0x00000001, 0x80000000]],
-                dtype=np.uint32,
-            )
-        )
-        scales = mx.array([[2.0, 3.0], [1.0, 0.5]], dtype=mx.float16)
-        biases = mx.array([[-1.0, 0.5], [0.0, -0.25]], dtype=mx.float16)
-        x = mx.ones((1, 64), dtype=mx.float16)
-        out = _t5_quantized_matmul(
-            x, w, scales, biases, transpose=True, bits=1, group_size=32
-        )
-        assert out.shape == (1, 2)
-        # Row 0: 32 cols at 2*1-1=1.0 plus 32 cols at 3*0+0.5=0.5 -> 48.0.
-        assert float(out[0, 0]) == 48.0
-        # Row 1: 1.0 (col 0) + 31*0.0 + 31*(-0.25) + 0.25 (col 63) -> -6.5.
-        assert float(out[0, 1]) == -6.5
-
-    def test_bits1_fallback_matches_dequant_reference(self, monkeypatch):
-        """Random bits: output is exactly x @ _dequant_1bit(w).T."""
-        monkeypatch.setattr(bonsai_t5_load, "has_native", lambda: False)
-        rng = np.random.default_rng(17)
-        N, K, gs = 8, 128, 64
-        w_np = rng.integers(0, 2**32, size=(N, K // 32), dtype=np.uint64)
-        w = mx.array(w_np.astype(np.uint32))
-        scales = mx.array(rng.uniform(0.5, 1.5, (N, K // gs)).astype(np.float16))
-        biases = mx.array(rng.uniform(-0.5, 0.5, (N, K // gs)).astype(np.float16))
-        x = mx.array(rng.standard_normal((2, K)).astype(np.float16))
-        out = _t5_quantized_matmul(
-            x, w, scales, biases, transpose=True, bits=1, group_size=gs
-        )
-        expected = x @ _dequant_1bit(w, scales, biases, mx.float16, gs).T
-        assert mx.array_equal(out, expected).item()
-
     def test_uint32_bits4_passthrough_matches_stock(self, monkeypatch):
         """4-bit uint32 weights go straight to the original C function."""
         monkeypatch.setattr(bonsai_t5_load, "has_native", lambda: False)
@@ -419,39 +464,6 @@ class TestT5QuantizedMatmulNativeRouting:
         assert called["M"] == 32
         assert out.shape == (32, 4)
 
-    def test_bits1_m1_routes_to_q1_qmv(self, monkeypatch):
-        monkeypatch.setattr(bonsai_t5_load, "has_native", lambda: True)
-        called = {}
-
-        def fake_q1(x, w, scales, biases):
-            called["fired"] = True
-            return mx.zeros((1, 4), dtype=mx.float16)
-
-        monkeypatch.setattr(bonsai_t5_load, "q1_affine_qmv", fake_q1)
-        x = mx.zeros((1, 64), dtype=mx.float16)
-        w = mx.zeros((4, 2), dtype=mx.uint32)
-        scales = mx.ones((4, 2), dtype=mx.float16)
-        biases = mx.zeros((4, 2), dtype=mx.float16)
-        _t5_quantized_matmul(x, w, scales, biases, transpose=True, bits=1)
-        assert called.get("fired") is True
-
-    def test_bits1_m3_routes_to_qmv_wide(self, monkeypatch):
-        monkeypatch.setattr(bonsai_t5_load, "has_native", lambda: True)
-        called = {}
-
-        def fake_wide(x, w, scales, biases, bits):
-            called["bits"] = bits
-            return mx.zeros((3, 4), dtype=mx.float16)
-
-        monkeypatch.setattr(bonsai_t5_load, "qmv_wide", fake_wide)
-        x = mx.zeros((3, 64), dtype=mx.float16)
-        w = mx.zeros((4, 2), dtype=mx.uint32)
-        scales = mx.ones((4, 2), dtype=mx.float16)
-        biases = mx.zeros((4, 2), dtype=mx.float16)
-        _t5_quantized_matmul(x, w, scales, biases, transpose=True, bits=1)
-        assert called.get("bits") == 1
-
-
 # ---------------------------------------------------------------------------
 # apply / remove lifecycle
 # ---------------------------------------------------------------------------
@@ -522,12 +534,6 @@ class TestPatchLifecycle:
             remove_bonsai_t5_load_patch()
         assert (
             mlx_lm_utils.infer_quant_config is not bonsai_t5_load._t5_infer_quant_config
-        )
-
-    def test_prefill_threshold_matches_bonsai_qmv(self):
-        # The two module constants are documented as must-match.
-        assert (
-            bonsai_t5_load._T5_PREFILL_THRESHOLD == bonsai_qmv._T5_PREFILL_THRESHOLD
         )
 
 
@@ -601,10 +607,7 @@ def test_installed_matmul_preserves_mlx_call_contract(mode, positional):
 
 @pytest.mark.parametrize("packing", ["affine", "t5", "invalid_u8"])
 @pytest.mark.parametrize("group_size", [64, 128])
-def test_preload_dispatch_uses_weight_format(tmp_path, monkeypatch, packing, group_size):
-    from omlx.utils.model_loading import maybe_apply_pre_load_patches
-
-    monkeypatch.setattr(bonsai_qmv, "apply_bonsai_qmv_patch", lambda: False)
+def test_preload_dispatch_uses_weight_format(tmp_path, packing, group_size):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -646,14 +649,41 @@ def test_preload_dispatch_uses_weight_format(tmp_path, monkeypatch, packing, gro
         mx.eval(model.proj(x))
 
 
-def test_one_bit_preload_still_installs_load_patch(tmp_path, monkeypatch):
-    from omlx.utils.model_loading import maybe_apply_pre_load_patches
-
-    monkeypatch.setattr(bonsai_qmv, "apply_bonsai_qmv_patch", lambda: False)
-    monkeypatch.setattr(bonsai_qmv, "apply_bonsai_construct_patch", lambda: False)
+def test_one_bit_preload_keeps_stock_quantized_matmul(tmp_path):
     (tmp_path / "config.json").write_text(
         '{"model_type": "qwen3", "quantization": {"bits": 1, "group_size": 128}}'
     )
     original = mx.quantized_matmul
     maybe_apply_pre_load_patches(str(tmp_path))
-    assert mx.quantized_matmul is not original
+    assert mx.quantized_matmul is original
+
+
+def test_vlm_one_bit_modules_match_stock_mlx():
+    rng = np.random.default_rng(7)
+    model = nn.Module()
+    model.linear = OneBitLinear(128, 32, bias=False)
+    model.embedding = OneBitEmbedding(32, 128)
+    for module in (model.linear, model.embedding):
+        bits = rng.integers(0, 2**32, size=(32, 4), dtype=np.uint64)
+        module.weight = mx.array(bits.astype(np.uint32))
+        module.scales = mx.array(rng.uniform(0.5, 1.5, (32, 2)).astype(np.float16))
+        module.biases = -0.5 * module.scales
+    xs = [mx.array(rng.standard_normal((m, 128)).astype(np.float16)) for m in (1, 2, 8)]
+    ids = mx.array([0, 7])
+    expected = [model.linear(x) for x in xs]
+    expected_rows = model.embedding(ids)
+    weights = model.linear.weight, model.embedding.weight
+    linear_call = nn.QuantizedLinear.__call__
+
+    assert restore_bonsai_quantized_modules(model) == 2
+    assert type(model.linear) is nn.QuantizedLinear
+    assert type(model.embedding) is nn.QuantizedEmbedding
+    assert model.linear.weight is weights[0]
+    assert model.embedding.weight is weights[1]
+    assert not model.linear.trainable_parameters()
+    assert not model.embedding.trainable_parameters()
+    assert restore_bonsai_quantized_modules(model) == 0
+    assert nn.QuantizedLinear.__call__ is linear_call
+    for x, ref in zip(xs, expected, strict=True):
+        assert mx.allclose(model.linear(x), ref, atol=1e-2, rtol=1e-2).item()
+    assert mx.array_equal(model.embedding(ids), expected_rows).item()

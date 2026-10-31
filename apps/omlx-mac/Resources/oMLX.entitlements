@@ -4,5 +4,7 @@
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
 </dict>
 </plist>

@@ -56,17 +56,19 @@ final class AskAIImage: Identifiable, Equatable, @unchecked Sendable {
 
     /// Decoding, downscaling, and encoding a large image takes hundreds of
     /// milliseconds, so it runs off the main actor.
-    static func make(from source: Source) async -> AskAIImage? {
-        await Task.detached(priority: .userInitiated) { AskAIImage(source: source) }.value
+    static func make(from source: Source, maxPixelSize: Int = maxPixelSize) async -> AskAIImage? {
+        await Task.detached(priority: .userInitiated) {
+            AskAIImage(source: source, maxPixelSize: maxPixelSize)
+        }.value
     }
 
-    private init?(source: Source) {
+    private init?(source: Source, maxPixelSize: Int) {
         let imageSource: CGImageSource? = switch source {
         case .file(let url): CGImageSourceCreateWithURL(url as CFURL, nil)
         case .data(let data): CGImageSourceCreateWithData(data as CFData, nil)
         }
         guard let imageSource,
-              let full = Self.decode(imageSource, maxPixelSize: Self.maxPixelSize).flatMap(Self.onWhite),
+              let full = Self.decode(imageSource, maxPixelSize: maxPixelSize).flatMap(Self.onWhite),
               let small = Self.decode(imageSource, maxPixelSize: Self.thumbnailPixelSize),
               let jpeg = Self.jpeg(full)
         else { return nil }

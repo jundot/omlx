@@ -83,6 +83,23 @@ _BANK_FRACTION = 8
 # Moving the live rows inside the bank copies at most this much per chunk.
 _MOVE_CHUNK_BYTES = 512 * 1024**2
 
+# Banks this large grow early, one layer per synchronized pool clear, so the pool holds one old bank.
+# Smaller banks grow all layers in the step that needs the columns.
+_EARLY_GROWTH_MIN_BYTES = 256 * 1024**2
+_early_growth = {"allowed": False, "grown": False}
+
+
+def allow_early_kv_growth(allowed: bool) -> None:
+    """Let the next decode step grow one large bank before it runs out of columns."""
+    _early_growth["allowed"] = allowed
+
+
+def take_early_kv_growth() -> bool:
+    """True once after a bank grew early; its old buffer then waits in the MLX pool."""
+    grown = _early_growth["grown"]
+    _early_growth["grown"] = False
+    return grown
+
 
 def _logical_kv(cache):
     """``(keys, values)`` cut to the stock (concatenate) width."""
@@ -194,9 +211,41 @@ class _CapacityMethods:
         # triggered growth overwrites [base, old width).
         self._width = width
 
+    def _grow_early(self, count: int) -> None:
+        """Grow a large bank whose spare columns fall under half a grain.
+
+        A lone live row drops the spare rows; otherwise up to as many spare rows as live rows stay.
+        """
+        old_k, old_v = self._keys, self._values
+        if old_k is None or old_k.nbytes + old_v.nbytes < _EARLY_GROWTH_MIN_BYTES:
+            return
+        width = self._logical_width()
+        needed = max(width, self._idx + count)
+        current = int(old_k.shape[2])
+        grain = max(self.step, (1 << (current.bit_length() - 1)) // _BANK_FRACTION)
+        if current - needed >= grain // 2:
+            return
+        capacity = _ladder_capacity(needed, self.step, _BANK_FRACTION)
+        if capacity <= current:
+            return
+        live = int(self.keys.shape[0])
+        rows = 1 if live == 1 else min(int(old_k.shape[0]), 2 * live)
+        _, heads, _, key_dim = old_k.shape
+        keys = mx.zeros((rows, heads, capacity, key_dim), old_k.dtype)
+        values = mx.zeros((rows, heads, capacity, old_v.shape[3]), old_v.dtype)
+        keys[:live, :, :width] = old_k[:live, :, :width]
+        values[:live, :, :width] = old_v[:live, :, :width]
+        self._keys, self._values = keys, values
+        self._width = width
+        self._rows = live if live < rows else None
+        _early_growth["allowed"] = False
+        _early_growth["grown"] = True
+
     def update_and_fetch(self, keys, values):
         if self.__dict__.get("_extracts"):
             self._settle_extracts()
+        if _early_growth["allowed"] and keys.shape[2] < self.step:
+            self._grow_early(keys.shape[2])
         prev = self._idx
         width = self._logical_width()
         if self._keys is None or (prev + keys.shape[2]) > width:
@@ -275,16 +324,12 @@ class _CapacityMethods:
     def _move_rows(self, kept, drop: int) -> bool:
         """Refill freed rows in place from rows past ``len(kept)``.
 
-        False for other orders, for a half-empty bank, or when ``drop`` takes half the width.
-        A compaction then releases the rest.
+        Freed rows stay for later joins until column growth trims them or the batch empties.
+        False for other orders or when ``drop`` takes half the width, which compacts instead.
         """
         count = len(kept)
         moves = [(dst, src) for dst, src in enumerate(kept) if src != dst]
-        if (
-            count * 2 <= int(self._keys.shape[0])
-            or drop * 2 >= self._logical_width()
-            or any(src < count for _, src in moves)
-        ):
+        if drop * 2 >= self._logical_width() or any(src < count for _, src in moves):
             return False
         self._settle_extracts()
         if moves:
@@ -470,10 +515,12 @@ class _CapacityMethods:
         ):
             return False
         rows = [int(k.shape[0]) for k, _ in banks]
+        # Joins keep arriving while the batch runs, so the new bank keeps the spare rows.
+        total = max(sum(rows), int(self._keys.shape[0]))
         width = max_size + self.step
         capacity = _ladder_capacity(width, self.step, _BANK_FRACTION)
-        keys = mx.zeros((sum(rows), k0.shape[1], capacity, k0.shape[3]), k0.dtype)
-        values = mx.zeros((sum(rows), v0.shape[1], capacity, v0.shape[3]), v0.dtype)
+        keys = mx.zeros((total, k0.shape[1], capacity, k0.shape[3]), k0.dtype)
+        values = mx.zeros((total, v0.shape[1], capacity, v0.shape[3]), v0.dtype)
         start = 0
         left_padding = []
         for c, (k, v), n in zip(sides, banks, rows):
@@ -487,7 +534,7 @@ class _CapacityMethods:
         self.left_padding = mx.concatenate(left_padding)
         self._keys, self._values = keys, values
         self._width = max_size
-        self._rows = None
+        self._rows = start if start < total else None
         self._idx = max_idx
         return True
 

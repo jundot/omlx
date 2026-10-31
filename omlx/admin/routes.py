@@ -132,7 +132,7 @@ from .benchmark import (
     _sanitize_upload_error,
     _upload_model_name,
 )
-from .hf_downloader import MODEL_FORMATS
+from .hf_downloader import MODEL_FORMATS, _is_repo_id
 from .recipe import (
     ALL_FIELDS,
     DEFAULTS,
@@ -834,6 +834,13 @@ class HFDownloadRequest(BaseModel):
     repo_id: str
     hf_token: str = ""
     files: list[str] | None = None
+
+
+class HFUpdateCheckRequest(BaseModel):
+    """Request model for checking downloaded models for Hub updates."""
+
+    repo_ids: list[str]
+    hf_token: str = ""
 
 
 class HFRetryRequest(BaseModel):
@@ -2519,6 +2526,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "engine_type": model_info.get("engine_type", "batched"),
             "model_type": model_info.get("model_type", "llm"),
             "config_model_type": model_info.get("config_model_type", ""),
+            "realtime_voice": bool(model_info.get("realtime_voice")),
             # Native context window from the model's config.json — used by
             # the context bench UI to hide targets the model cannot reach.
             "model_context_length": model_info.get("model_context_length"),
@@ -8053,9 +8061,8 @@ async def get_hf_model_info(
     from .hf_downloader import HFDownloader
 
     repo_id = repo_id.strip()
-    parts = repo_id.split("/")
     local_dir = None
-    if _hf_downloader is not None and len(parts) == 2 and not {".", ".."} & set(parts):
+    if _hf_downloader is not None and _is_repo_id(repo_id):
         local_dir = _hf_downloader.model_dir / repo_id
     try:
         result = await HFDownloader.get_model_info(
@@ -8067,6 +8074,9 @@ async def get_hf_model_info(
             result["disk_free"] = await asyncio.to_thread(
                 _free_disk_bytes, _hf_downloader.model_dir
             )
+            # An unfinished download resumes with Retry, not as an update.
+            if _hf_downloader.has_unfinished_download(repo_id):
+                result["update_files"] = []
         return result
     except TimeoutError:
         raise HTTPException(
@@ -8077,6 +8087,18 @@ async def get_hf_model_info(
         raise HTTPException(status_code=404, detail=f"Model '{repo_id}' not found")
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/api/hf/updates")
+async def check_hf_updates(
+    request: HFUpdateCheckRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Report downloaded models whose files changed on HuggingFace."""
+    if _hf_downloader is None:
+        raise HTTPException(status_code=503, detail="Downloader not initialized")
+
+    return await _hf_downloader.check_updates(request.repo_ids, request.hf_token)
 
 
 @router.get("/api/hf/models")

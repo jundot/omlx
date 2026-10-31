@@ -59,7 +59,7 @@ class PrefillReadyRotatingKVCache(RotatingKVCache):
 
 
 def restore_bonsai_quantized_modules(model: nn.Module) -> int:
-    """Keep oMLX's quantized module and kernel paths after VLM loading."""
+    """Rebind mlx-vlm 1-bit modules to the stock MLX quantized modules."""
     from mlx_vlm.quantization.one_bit import OneBitEmbedding, OneBitLinear
 
     restored = 0
@@ -70,16 +70,6 @@ def restore_bonsai_quantized_modules(model: nn.Module) -> int:
     for _, module in model.named_modules():
         replacement = replacements.get(type(module))
         if replacement is not None:
-            if restored == 0:
-                from ..patches.bonsai_qmv import (
-                    apply_bonsai_construct_patch,
-                    apply_bonsai_qmv_patch,
-                )
-                from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
-
-                apply_bonsai_t5_load_patch()
-                apply_bonsai_construct_patch()
-                apply_bonsai_qmv_patch()
             # Both classes store the same packed tensors and quantization fields.
             # Rebinding preserves loaded weights, frozen parameters, and aliases.
             module.__class__ = replacement

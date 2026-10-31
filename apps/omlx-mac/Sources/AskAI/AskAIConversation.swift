@@ -13,12 +13,27 @@ final class AskAIConversation {
         let id = UUID()
         let question: String
         var images: [AskAIImage] = []
+        /// Everything the model wrote, across tool rounds.
         var answer = ""
         var reasoning = ""
         var error: String?
         var isStreaming = true
         var wasStopped = false
+        /// Tools used for this answer, in call order.
+        var activities: [AskAIToolActivity] = []
+        /// Calls and results of finished tool rounds. They are resent with
+        /// the turn, so follow-up questions keep what the tools returned.
+        var exchanges: [ChatMessage] = []
+        /// Where the text after the last tool round starts in `answer`.
+        var replyStart = 0
+
+        /// The final answer, without text written before tool calls.
+        var reply: String { String(answer.dropFirst(replyStart)) }
     }
+
+    /// Tool rounds per question. One more round without tools makes the
+    /// model answer with what it has.
+    static let maxToolRounds = 4
 
     private(set) var turns: [Turn] = []
     private(set) var profile: AskAIProfile?
@@ -30,24 +45,44 @@ final class AskAIConversation {
 
     @ObservationIgnored private var streamTask: Task<Void, Never>?
     @ObservationIgnored private var generation = 0
+    /// The profile's prompt before its placeholders were filled, to tell an
+    /// edited prompt from the same prompt at a later time.
+    @ObservationIgnored private var promptTemplate = ""
 
     var isStreaming: Bool { turns.last?.isStreaming == true }
     var isEmpty: Bool { turns.isEmpty }
 
     var lastAnswer: String? {
-        turns.last(where: { !$0.answer.isEmpty })?.answer
+        turns.last(where: { !$0.reply.isEmpty })?.reply
     }
 
-    func begin(profile: AskAIProfile, command: String?) {
+    func begin(profile: AskAIProfile, command: String?, context: PromptContext = PromptContext()) {
         reset()
-        self.profile = profile
+        promptTemplate = profile.systemPrompt
+        self.profile = Self.filled(profile, context: context)
         self.command = command
     }
 
-    /// Applies settings changed during the conversation to the next turn.
-    func updateProfile(_ profile: AskAIProfile) {
-        guard self.profile != nil else { return }
-        self.profile = profile
+    /// Applies settings changed during the conversation to the next turn. An
+    /// unchanged prompt keeps its filled text, so the prefix cache still matches.
+    func updateProfile(_ profile: AskAIProfile, context: PromptContext = PromptContext()) {
+        guard let current = self.profile else { return }
+        var next = profile
+        if profile.systemPrompt == promptTemplate {
+            next.systemPrompt = current.systemPrompt
+        } else {
+            promptTemplate = profile.systemPrompt
+            next = Self.filled(profile, context: context)
+        }
+        self.profile = next
+    }
+
+    private static func filled(_ profile: AskAIProfile, context: PromptContext) -> AskAIProfile {
+        var context = context
+        context.model = profile.model
+        var out = profile
+        out.systemPrompt = PromptPlaceholders.fill(profile.systemPrompt, context: context)
+        return out
     }
 
     func reset() {
@@ -68,26 +103,24 @@ final class AskAIConversation {
         if !system.isEmpty {
             out.append(ChatMessage(role: .system, content: system))
         }
-        for turn in history where turn.error == nil && !turn.answer.isEmpty {
+        for turn in history where turn.error == nil && !turn.reply.isEmpty {
             out.append(ChatMessage(role: .user, content: turn.question,
                                    imageURLs: turn.images.map(\.dataURL)))
-            out.append(ChatMessage(role: .assistant, content: turn.answer))
+            out += turn.exchanges
+            out.append(ChatMessage(role: .assistant, content: turn.reply))
         }
         out.append(ChatMessage(role: .user, content: question, imageURLs: images.map(\.dataURL)))
         return out
     }
 
     /// Returns false when there is no profile or an answer is still streaming.
+    /// Tools are offered only with a runner to run their calls.
     @discardableResult
     func send(_ question: String, images: [AskAIImage] = [], gpuPowerLimitW: Int? = nil,
-              using client: ChatCompletionClient) -> Bool {
+              tools: [ChatTool] = [], using client: some ChatStreaming,
+              runner: (any AskAIToolRunning)? = nil) -> Bool {
         guard let profile, !isStreaming else { return false }
-        let body = ChatCompletionBody(
-            model: profile.model,
-            messages: Self.messages(profile: profile, history: turns, question: question, images: images),
-            allowThinking: profile.allowThinking,
-            gpuPowerLimitW: gpuPowerLimitW
-        )
+        let base = Self.messages(profile: profile, history: turns, question: question, images: images)
         let turn = Turn(question: question, images: images)
         turns.append(turn)
         autoCopiedTurnID = nil
@@ -95,33 +128,119 @@ final class AskAIConversation {
 
         generation += 1
         let gen = generation
-        let stream = client.stream(body)
+        let tools = runner == nil ? [] : tools
         streamTask = Task { [weak self] in
-            var content = ""
-            var reasoning = ""
-            var lastFlush = ContinuousClock.now
+            var exchanges: [ChatMessage] = []
             do {
-                for try await event in stream {
-                    switch event {
-                    case .content(let text): content += text
-                    case .reasoning(let text): reasoning += text
-                    }
-                    // Batch deltas: Markdown re-parses the whole answer per update.
-                    if ContinuousClock.now - lastFlush >= .milliseconds(50) {
-                        self?.append(content, reasoning, to: turn.id, generation: gen)
-                        content = ""
-                        reasoning = ""
-                        lastFlush = .now
-                    }
+                for round in 0...Self.maxToolRounds {
+                    let body = ChatCompletionBody(
+                        model: profile.model,
+                        messages: base + exchanges,
+                        allowThinking: profile.allowThinking,
+                        gpuPowerLimitW: gpuPowerLimitW,
+                        tools: round < Self.maxToolRounds ? tools : []
+                    )
+                    guard let result = try await self?.streamRound(client.stream(body), turn: turn.id,
+                                                                   generation: gen),
+                          !result.calls.isEmpty, let runner else { break }
+                    guard let messages = await self?.runTools(result.calls, text: result.text,
+                                                              runner: runner, turn: turn.id, generation: gen)
+                    else { return }
+                    exchanges += messages
+                    self?.finishRound(exchanges, turn: turn.id, generation: gen)
                 }
-                self?.append(content, reasoning, to: turn.id, generation: gen)
                 self?.finish(turn.id, generation: gen, error: nil)
             } catch {
-                self?.append(content, reasoning, to: turn.id, generation: gen)
                 self?.finish(turn.id, generation: gen, error: error)
             }
         }
         return true
+    }
+
+    /// Streams one completion into the turn. Returns the text it wrote and
+    /// the tool calls it asked for.
+    private func streamRound(
+        _ stream: AsyncThrowingStream<ChatStreamEvent, Error>, turn id: UUID, generation gen: Int
+    ) async throws -> (text: String, calls: [ChatToolCall]) {
+        var text = ""
+        var content = ""
+        var reasoning = ""
+        var calls: [Int: ChatToolCall] = [:]
+        var lastFlush = ContinuousClock.now
+        do {
+            for try await event in stream {
+                switch event {
+                case .content(let delta):
+                    content += delta
+                    text += delta
+                case .reasoning(let delta):
+                    reasoning += delta
+                case .toolCall(let delta):
+                    var call = calls[delta.index] ?? ChatToolCall(id: "", name: "", arguments: "")
+                    if let callID = delta.id { call.id = callID }
+                    if let name = delta.name { call.name = name }
+                    call.arguments += delta.arguments ?? ""
+                    calls[delta.index] = call
+                }
+                // Batch deltas: Markdown re-parses the whole answer per update.
+                if ContinuousClock.now - lastFlush >= .milliseconds(50) {
+                    append(content, reasoning, to: id, generation: gen)
+                    content = ""
+                    reasoning = ""
+                    lastFlush = .now
+                }
+            }
+        } catch {
+            append(content, reasoning, to: id, generation: gen)
+            throw error
+        }
+        append(content, reasoning, to: id, generation: gen)
+        let ordered = calls.sorted { $0.key < $1.key }.map { _, call in
+            var call = call
+            if call.id.isEmpty { call.id = "call_\(UUID().uuidString.prefix(8).lowercased())" }
+            return call
+        }
+        return (text, ordered.filter { !$0.name.isEmpty })
+    }
+
+    /// Runs one round of calls and returns the messages that record it, or
+    /// nil when the answer was stopped meanwhile.
+    private func runTools(_ calls: [ChatToolCall], text: String, runner: any AskAIToolRunning,
+                          turn id: UUID, generation gen: Int) async -> [ChatMessage]? {
+        var messages = [ChatMessage(role: .assistant, content: text, toolCalls: calls)]
+        var images: [AskAIImage] = []
+        for call in calls {
+            guard gen == generation, let index = turns.firstIndex(where: { $0.id == id }) else { return nil }
+            let slot = AskAITool.activity(for: call).map { activity in
+                turns[index].activities.append(activity)
+                return turns[index].activities.count - 1
+            }
+            let result = await runner.run(call)
+            guard gen == generation, let index = turns.firstIndex(where: { $0.id == id }) else { return nil }
+            if let slot {
+                turns[index].activities[slot].isRunning = false
+                turns[index].activities[slot].failed = result.failed
+            }
+            messages.append(ChatMessage(role: .tool, content: result.text, toolCallID: call.id))
+            if let image = result.image { images.append(image) }
+        }
+        if !images.isEmpty {
+            messages.append(ChatMessage(role: .user, content: "Screenshot from capture_screen.",
+                                        imageURLs: images.map(\.dataURL)))
+        }
+        return messages
+    }
+
+    /// Keeps the finished rounds and starts the reply after the text
+    /// written so far.
+    private func finishRound(_ exchanges: [ChatMessage], turn id: UUID, generation gen: Int) {
+        guard gen == generation, let index = turns.firstIndex(where: { $0.id == id }) else { return }
+        turns[index].exchanges = exchanges
+        if !turns[index].answer.isEmpty, !turns[index].answer.hasSuffix("\n\n") {
+            turns[index].answer += "\n\n"
+        }
+        turns[index].replyStart = turns[index].answer.count
+        lastActivity = Date()
     }
 
     func stop() {
@@ -129,6 +248,7 @@ final class AskAIConversation {
         cancelStream()
         turns[index].isStreaming = false
         turns[index].wasStopped = true
+        Self.endActivities(&turns[index])
         lastActivity = Date()
     }
 
@@ -149,17 +269,24 @@ final class AskAIConversation {
         guard gen == generation, let index = turns.firstIndex(where: { $0.id == id }) else { return }
         streamTask = nil
         turns[index].isStreaming = false
+        Self.endActivities(&turns[index])
         lastActivity = Date()
         if let error {
             turns[index].error = Self.describe(error)
             return
         }
         if profile?.autoCopy == true {
-            let answer = turns[index].answer.trimmingCharacters(in: .whitespacesAndNewlines)
+            let answer = turns[index].reply.trimmingCharacters(in: .whitespacesAndNewlines)
             if !answer.isEmpty {
                 AskAIClipboard.copy(answer)
                 autoCopiedTurnID = id
             }
+        }
+    }
+
+    private static func endActivities(_ turn: inout Turn) {
+        for i in turn.activities.indices {
+            turn.activities[i].isRunning = false
         }
     }
 

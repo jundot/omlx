@@ -105,6 +105,9 @@ final class AskAIPanelController: NSObject, NSWindowDelegate {
     private var isSettingFrame = false
     private var resizeStart: (frame: NSRect, mouseX: CGFloat)?
     private var shadowUpdatePending = false
+    /// Bumped by each show and fade-out, so a stale fade does not hide the panel.
+    private var fadeID = 0
+    private var isFading = false
 
     init(controller: AskAIController) {
         self.controller = controller
@@ -143,7 +146,10 @@ final class AskAIPanelController: NSObject, NSWindowDelegate {
 
     /// Shows the panel at the saved spot, or centered near the top of the
     /// screen under the pointer when none is saved or it is off screen.
-    func show() {
+    func show(animated: Bool = false) {
+        fadeID += 1
+        isFading = false
+        panel.alphaValue = animated ? 0 : 1
         placeForShow()
         if let hosting {
             hosting.layoutSubtreeIfNeeded()
@@ -157,12 +163,36 @@ final class AskAIPanelController: NSObject, NSWindowDelegate {
         panel.orderFrontRegardless()
         panel.makeKey()
         scheduleShadowUpdate()
+        if animated { fade(to: 1) {} }
     }
 
-    func hide() {
-        guard panel.isVisible else { return }
-        panel.orderOut(nil)
-        controller?.panelDidHide()
+    /// Animated when the voice card takes the bar's place.
+    func hide(animated: Bool = false) {
+        guard panel.isVisible, !isFading else { return }
+        guard animated else {
+            panel.orderOut(nil)
+            controller?.panelDidHide()
+            return
+        }
+        isFading = true
+        fadeID += 1
+        let id = fadeID
+        fade(to: 0) { [weak self] in
+            guard let self, self.fadeID == id else { return }
+            self.isFading = false
+            self.panel.orderOut(nil)
+            self.panel.alphaValue = 1
+            self.controller?.panelDidHide()
+        }
+    }
+
+    private func fade(to alpha: CGFloat, completion: @escaping @MainActor () -> Void) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = TalkAIPanelController.fadeDuration
+            panel.animator().alphaValue = alpha
+        } completionHandler: {
+            Task { @MainActor in completion() }
+        }
     }
 
     private func placeForShow() {

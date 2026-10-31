@@ -15,6 +15,9 @@ struct HotKeyCombo: Codable, Equatable, Sendable {
     static let optionSpace = HotKeyCombo(
         keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey), keyLabel: "Space"
     )
+    static let optionShiftSpace = HotKeyCombo(
+        keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey | shiftKey), keyLabel: "Space"
+    )
 
     var displayString: String {
         var out = ""
@@ -76,8 +79,17 @@ final class GlobalHotKey {
     private var action: (() -> Void)?
 
     private static let signature: OSType = 0x6F4D4C58  // "oMLX"
+    private static var nextID: UInt32 = 1
+
+    /// Each instance's own id; handlers pass other instances' presses on.
+    nonisolated let hotKeyID: UInt32
 
     var isRegistered: Bool { hotKeyRef != nil }
+
+    init() {
+        hotKeyID = Self.nextID
+        Self.nextID += 1
+    }
 
     /// Replaces any current registration. Returns a Carbon status; non-zero
     /// usually means another app already owns the combo.
@@ -90,7 +102,7 @@ final class GlobalHotKey {
         let status = RegisterEventHotKey(
             combo.keyCode,
             combo.modifiers,
-            EventHotKeyID(signature: Self.signature, id: 1),
+            EventHotKeyID(signature: Self.signature, id: hotKeyID),
             GetApplicationEventTarget(),
             OptionBits(kEventHotKeyExclusive),
             &ref
@@ -133,6 +145,7 @@ final class GlobalHotKey {
                 return OSStatus(eventNotHandledErr)
             }
             let owner = Unmanaged<GlobalHotKey>.fromOpaque(userData).takeUnretainedValue()
+            guard id.id == owner.hotKeyID else { return OSStatus(eventNotHandledErr) }
             // Carbon dispatches application-target events on the main thread.
             MainActor.assumeIsolated { owner.action?() }
             return noErr

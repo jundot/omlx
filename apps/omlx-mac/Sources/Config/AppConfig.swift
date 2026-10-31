@@ -144,6 +144,17 @@ struct AppConfig: Sendable, Equatable, Codable {
         return comps.url
     }
 
+    /// The `ws://` form of `httpURL`, for WebSocket endpoints.
+    static func webSocketURL(host: String, port: Int, path: String,
+                             query: [URLQueryItem] = []) -> URL? {
+        guard let url = httpURL(host: host, port: port, path: path),
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.scheme = "ws"
+        if !query.isEmpty { components.queryItems = query }
+        return components.url
+    }
+
     var baseURL: URL? {
         Self.httpURL(host: host, port: port)
     }

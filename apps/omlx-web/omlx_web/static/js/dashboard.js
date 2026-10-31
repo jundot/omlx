@@ -489,6 +489,10 @@
             hfTokenInvalid: false,
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
+            // Lowercased repo ID -> {files, size} from the last update check.
+            hfUpdates: {},
+            hfUpdatesChecking: false,
+            hfUpdatesStatus: '',
 
             // Recommended models state
             hfRecommended: { trending: [], popular: [] },
@@ -7188,6 +7192,8 @@
                     });
 
                     if (response.ok) {
+                        const { [repoId.toLowerCase()]: _done, ...updates } = this.hfUpdates;
+                        this.hfUpdates = updates;
                         this.hfSuccess = window.t('js.success.download_started').replace('{repo_id}', repoId);
                         if (this.hfRepoId.trim().toLowerCase() === repoId.toLowerCase()) this.hfRepoId = '';
                         this.closeModelDetail();
@@ -7252,6 +7258,61 @@
                     }
                 } catch (err) {
                     console.error('Failed to load HF models:', err);
+                }
+            },
+
+            // Folders the downloader writes, which an update check can compare.
+            get hfUpdateRepoIds() {
+                return this.hfModels
+                    .filter(m => m.repo_id && m.source_type === 'local')
+                    .map(m => m.repo_id);
+            },
+
+            hfUpdateFor(model) {
+                if (!model.repo_id || !this.isModelDownloaded(model.repo_id)) return null;
+                return this.hfUpdates[model.repo_id.toLowerCase()];
+            },
+
+            async checkHFUpdates() {
+                this.hfUpdatesChecking = true;
+                this.hfUpdatesStatus = '';
+                try {
+                    const response = await fetch('/admin/api/hf/updates', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repo_ids: this.hfUpdateRepoIds, hf_token: this.hfToken }),
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    const data = response.ok ? await response.json() : null;
+                    if (!data || (data.checked && data.failed.length === data.checked)) {
+                        this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                        return;
+                    }
+                    if (!data.checked) {
+                        this.hfUpdatesStatus = window.t('models.manager.nothing_to_check');
+                        return;
+                    }
+                    const updates = {};
+                    for (const [repoId, info] of Object.entries(data.updates)) {
+                        updates[repoId.toLowerCase()] = info;
+                    }
+                    this.hfUpdates = updates;
+                    const count = Object.keys(updates).length;
+                    const status = [count
+                        ? window.t('models.manager.updates_found').replace('{count}', count)
+                        : window.t('models.manager.no_updates')];
+                    if (data.failed.length) {
+                        status.push(window.t('models.manager.update_check_partial').replace('{count}', data.failed.length));
+                    }
+                    this.hfUpdatesStatus = status.join(' · ');
+                } catch (err) {
+                    this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                    console.error('Failed to check for model updates:', err);
+                } finally {
+                    this.hfUpdatesChecking = false;
                 }
             },
 
@@ -8362,11 +8423,11 @@
                 this.msModelDetailLoading = false;
             },
 
-            // A selection starts from what "download all" fetches; GGUF repos start empty.
+            // A selection starts from what "download all" fetches (nothing for GGUF repos) and changed local files.
             resetHfSelection() {
                 const picked = {};
                 for (const file of this.hfModelDetail?.files || []) {
-                    if (file.preselected && !file.local) picked[file.name] = true;
+                    if ((file.preselected || file.outdated) && !file.local) picked[file.name] = true;
                 }
                 this.hfSelectedFiles = picked;
             },
@@ -8398,6 +8459,20 @@
                 return (this.hfModelDetail?.files || [])
                     .filter(file => this.isHfFileSelected(file))
                     .map(file => file.name);
+            },
+
+            // A downloaded checkpoint with Hub changes offers Update instead of the download buttons.
+            hfShowsUpdate() {
+                const detail = this.hfModelDetail;
+                return !!(detail && !detail.is_adapter && !detail.unsupported_reason && detail.layout !== 'gguf'
+                    && detail.update_files?.length && this.isModelDownloaded(detail.repo_id));
+            },
+
+            hfUpdateSize() {
+                const names = new Set(this.hfModelDetail?.update_files || []);
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => names.has(file.name))
+                    .reduce((total, file) => total + (file.size || 0), 0);
             },
 
             hfSelectionSize() {
