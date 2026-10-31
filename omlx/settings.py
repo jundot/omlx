@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from .config import parse_size
+from .config import AUTO_SSD_CACHE_MAX_BYTES, parse_size
 
 if TYPE_CHECKING:
     from .scheduler import SchedulerConfig
@@ -151,7 +151,7 @@ def get_auto_ssd_cache_size(cache_dir: Path) -> int:
                     cache_bytes += path.stat().st_size
                 except FileNotFoundError:
                     pass  # A runtime writer can evict files during the scan.
-    return (free_bytes + cache_bytes) // 2
+    return min((free_bytes + cache_bytes) // 2, AUTO_SSD_CACHE_MAX_BYTES)
 
 
 # Burst Decode UI modes -> (decode_burst_max_steps, decode_burst_budget_single_s).
@@ -385,7 +385,7 @@ class CacheSettings:
     enabled: bool = True
     hot_cache_only: bool = False
     ssd_cache_dir: str | None = None  # None means ~/.omlx/cache
-    ssd_cache_max_size: str = "auto"  # "auto" reserves half of available cache space
+    ssd_cache_max_size: str = "auto"  # "auto": half of free space + cache, max 100GB
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     # When True (and the hot cache is enabled), every saved block is kept in
     # RAM AND persisted to SSD immediately — RAM-speed resume for recent
@@ -472,7 +472,8 @@ class CacheSettings:
             base_path: Base oMLX directory.
 
         Returns:
-            Max SSD cache size in bytes (half of free space plus existing cache for "auto").
+            Max SSD cache size in bytes (half of free space plus existing cache for
+            "auto", capped at 100GB).
         """
         if self.ssd_cache_max_size.lower() == "auto":
             cache_dir = self.get_ssd_cache_dir(base_path)

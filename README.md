@@ -368,7 +368,7 @@ OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
 omlx serve --model-dir ~/models --headless
 ```
 
-The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and existing SSD cache files, including GDN sidecars. The budget is refreshed during use and does not shrink simply because the cache grows or the server restarts. Other disk usage can change the budget. Set `--paged-ssd-cache-max-size 20GB` for a fixed limit.
+The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and existing SSD cache files, including GDN sidecars. It never exceeds 100 GB; a cache already above that is trimmed, least recently used first, the next time a model loads. Each Splash model keeps its own cache directory with its own limit. The budget is refreshed during use and does not shrink simply because the cache grows or the server restarts. Other disk usage can change the budget. Set `--paged-ssd-cache-max-size 20GB` for a fixed limit.
 
 
 Most settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.

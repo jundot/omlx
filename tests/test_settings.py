@@ -475,6 +475,12 @@ class TestCacheSettings:
             assert config.paged_ssd_cache_auto_size is True
             assert config.paged_ssd_cache_max_size == 150
 
+    def test_get_ssd_cache_max_size_bytes_auto_capped(self, tmp_path):
+        settings = CacheSettings(ssd_cache_max_size="auto")
+        with patch("omlx.settings.shutil.disk_usage") as usage:
+            usage.return_value.free = 1024 * 1024**3
+            assert settings.get_ssd_cache_max_size_bytes(tmp_path) == 100 * 1024**3
+
     def test_get_ssd_cache_max_size_bytes_explicit(self):
         """Test explicit SSD cache size."""
         settings = CacheSettings(ssd_cache_max_size="100GB")

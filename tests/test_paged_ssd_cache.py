@@ -2598,6 +2598,50 @@ class TestEffectiveMaxSize:
             manager._pending_write_hashes.clear()
             manager.close()
 
+    def test_auto_budget_capped_at_ceiling(self, tmp_path: Path):
+        """Auto mode never exceeds 100GB, however much disk is free."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache", max_size_bytes=1000, auto_size=True
+        )
+        try:
+            manager._disk_usage_cache = None
+            mock_usage = self._make_disk_usage(
+                total=1000 * 1024**3, used=500 * 1024**3, free=500 * 1024**3
+            )
+            with patch("shutil.disk_usage", return_value=mock_usage):
+                assert manager._get_effective_max_size() == 100 * 1024**3
+        finally:
+            manager.close()
+
+    def test_auto_budget_below_ceiling_unchanged(self, tmp_path: Path):
+        """Below the ceiling, auto mode is still half of free space plus cache."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache", max_size_bytes=1000, auto_size=True
+        )
+        try:
+            manager._disk_usage_cache = None
+            mock_usage = self._make_disk_usage(
+                total=500 * 1024**3, used=400 * 1024**3, free=100 * 1024**3
+            )
+            with patch("shutil.disk_usage", return_value=mock_usage):
+                assert manager._get_effective_max_size() == 50 * 1024**3
+        finally:
+            manager.close()
+
+    def test_explicit_limit_not_capped_by_auto_ceiling(self, tmp_path: Path):
+        """The auto ceiling does not apply to an explicit limit."""
+        manager = PagedSSDCacheManager(
+            cache_dir=tmp_path / "ssd_cache", max_size_bytes=500 * 1024**3
+        )
+        try:
+            mock_usage = self._make_disk_usage(
+                total=2000 * 1024**3, used=1000 * 1024**3, free=1000 * 1024**3
+            )
+            with patch("shutil.disk_usage", return_value=mock_usage):
+                assert manager._get_effective_max_size() == 500 * 1024**3
+        finally:
+            manager.close()
+
     def test_effective_max_size_oserror_fallback(self, tmp_path: Path):
         """When disk_usage fails, fall back to configured max."""
         manager = PagedSSDCacheManager(
@@ -2610,7 +2654,9 @@ class TestEffectiveMaxSize:
 
         assert effective == 50 * 1024**3
 
-    @pytest.mark.parametrize("auto_size,expected_gib", [(True, 250), (False, 495)])
+    # Volume figures stay below the auto ceiling, so the ceiling cannot mask a
+    # budget that re-reads the cache size between disk samples.
+    @pytest.mark.parametrize("auto_size,expected_gib", [(True, 50), (False, 99)])
     def test_effective_max_size_cache_30s(self, tmp_path, auto_size, expected_gib):
         manager = PagedSSDCacheManager(
             cache_dir=tmp_path / "ssd_cache",
@@ -2620,16 +2666,16 @@ class TestEffectiveMaxSize:
         try:
             manager._disk_usage_cache = None
             mock_usage = self._make_disk_usage(
-                1000 * 1024**3, 500 * 1024**3, 500 * 1024**3
+                1000 * 1024**3, 900 * 1024**3, 100 * 1024**3
             )
             with patch("shutil.disk_usage", return_value=mock_usage) as mock_du:
                 assert manager.max_size == expected_gib * 1024**3
-                manager._index._total_size = 100 * 1024**3
+                manager._index._total_size = 40 * 1024**3
                 assert manager.max_size == expected_gib * 1024**3
                 assert mock_du.call_count == 1
                 manager._disk_usage_cache_time -= 31
                 mock_du.return_value = self._make_disk_usage(
-                    1000 * 1024**3, 600 * 1024**3, 400 * 1024**3
+                    1000 * 1024**3, 940 * 1024**3, 60 * 1024**3
                 )
                 assert manager.max_size == expected_gib * 1024**3
                 assert mock_du.call_count == 2
