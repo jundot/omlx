@@ -215,42 +215,6 @@ def test_lightning_mtp_head_is_measured_apart_and_charged_to_rank_zero(
         with_mtp_head(ModelLayout("plain", 0, (1,)))
 
 
-def test_pipeline_plans_carry_the_engram_ssd_offload_flag():
-    """One argv runs on every host, so the flag rides the signed plan."""
-
-    model = synthetic_model_layout(
-        total_weight_bytes=300 * GIB,
-        layer_count=80,
-    )
-    nodes = [
-        NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
-        NodeBudget(node_id="mobile", capacity_bytes=128 * GIB, rank=1),
-    ]
-
-    resident = plan_unequal_pipeline(model, nodes)
-    offloaded = plan_unequal_pipeline(model, nodes, engram_ssd_offload=True)
-    proportional = plan_proportional_pipeline(
-        synthetic_model_layout(total_weight_bytes=300 * GIB, layer_count=80),
-        nodes,
-        engram_ssd_offload=True,
-    )
-    hybrid = plan_hybrid(
-        model,
-        nodes,
-        tensor_parallel_size=1,
-        engram_ssd_offload=True,
-    )
-
-    for plan in (offloaded, proportional, hybrid):
-        assert all(item.engram_ssd_offload for item in plan.assignments)
-    assert not any(item.engram_ssd_offload for item in resident.assignments)
-    # Identity: the same layers on the same Macs with a different table
-    # residency must not share a plan hash, or a staleness check would
-    # accept a resident launch of an offloaded plan.
-    assert offloaded.plan_hash != resident.plan_hash
-    assert "engram_ssd_offload" in offloaded.assignments[0].to_dict()
-
-
 def test_unequal_planner_gives_more_layers_to_larger_mac():
     model = synthetic_model_layout(
         total_weight_bytes=300 * GIB,
@@ -560,10 +524,9 @@ def test_the_planner_puts_each_nodes_memory_tier_on_its_own_assignment():
         plan_unequal_pipeline(model, nodes),
         plan_hybrid(model, nodes, tensor_parallel_size=1),
     ):
-        assert {item.node_id: item.memory_guard_tier for item in plan.assignments} == {
-            "studio": "aggressive",
-            "macbook": "safe",
-        }
+        assert {
+            item.node_id: item.memory_guard_tier for item in plan.assignments
+        } == {"studio": "aggressive", "macbook": "safe"}
 
 
 def test_a_memory_tier_changes_the_plan_hash_and_typos_are_refused():
@@ -613,9 +576,7 @@ def test_a_node_role_changes_the_plan_hash():
             model,
             [
                 NodeBudget(node_id="studio", capacity_bytes=256 * GIB, rank=0),
-                NodeBudget(
-                    node_id="macbook", capacity_bytes=200 * GIB, rank=1, role=role
-                ),
+                NodeBudget(node_id="macbook", capacity_bytes=200 * GIB, rank=1, role=role),
             ],
         )
 
@@ -663,12 +624,9 @@ def test_a_misspelled_role_is_refused_rather_than_quietly_made_headless():
             role="laptop",
         )
     # Case and padding are the UI's business, not a reason to refuse a launch.
-    assert (
-        NodeBudget(
-            node_id="macbook", capacity_bytes=100 * GIB, role=" WorkStation "
-        ).role
-        == "workstation"
-    )
+    assert NodeBudget(
+        node_id="macbook", capacity_bytes=100 * GIB, role=" WorkStation "
+    ).role == "workstation"
 
 
 def test_nemotron_h_quant_group_divisors_cap_tp_degree():
@@ -778,40 +736,7 @@ def test_tensor_plan_leaves_ssd_tables_out_of_rank_memory():
     assert ModelLayout.from_dict(layout.to_dict()) == layout
 
 
-def test_pipeline_plans_hold_offloaded_tables_out_of_rank_memory():
-    """An offloaded Engram stage is admitted by its resident weights."""
-
-    layout = ModelLayout(
-        source="tables",
-        fixed_weight_bytes=10,
-        layer_weight_bytes=(100, 300, 100),
-        tensor_parallel_ssd_layer_bytes=(0, 200, 0),
-        supports_pipeline=True,
-    )
-    nodes = [
-        NodeBudget(node_id=n, capacity_bytes=1000, rank=i) for i, n in enumerate("ab")
-    ]
-
-    plan = plan_unequal_pipeline(layout, nodes, engram_ssd_offload=True)
-
-    assert sum(item.layer_weight_bytes for item in plan.assignments) == 500
-    assert sum(item.ssd_weight_bytes for item in plan.assignments) == 200
-    # planned_weight_bytes is what the guard admits: the mmap'd table is not
-    # part of this rank's wired budget.
-    for item in plan.assignments:
-        assert item.planned_weight_bytes == (
-            item.fixed_weight_bytes
-            + item.layer_weight_bytes
-            - item.ssd_weight_bytes
-            + item.kv_cache_bytes
-        )
-        assert item.headroom_bytes >= 0
-    assert "ssd_weight_bytes" in plan.assignments[0].to_dict()
-
-
-def test_offloaded_tables_make_a_stage_fit_that_resident_tables_cannot():
-    """The Ultra arithmetic: 512 GiB of weights fit 600 GiB only offloaded."""
-
+def test_offloaded_engram_tables_stay_out_of_pipeline_rank_memory():
     layout = ModelLayout(
         source="tables",
         fixed_weight_bytes=0,
@@ -819,66 +744,22 @@ def test_offloaded_tables_make_a_stage_fit_that_resident_tables_cannot():
         tensor_parallel_ssd_layer_bytes=(0, 200, 0),
         supports_pipeline=True,
     )
-    # One 320-byte Mac holds 500 bytes of weights only when layer 1's
-    # 200-byte table is mmap'd instead of resident.
-    node = [
-        NodeBudget(node_id="studio", capacity_bytes=320, rank=0),
-    ]
+    small = [NodeBudget(node_id="mini", capacity_bytes=320, rank=0)]
 
-    with pytest.raises(PlanningError, match="does not fit"):
-        plan_unequal_pipeline(layout, node)
+    for planner in (plan_unequal_pipeline, plan_proportional_pipeline):
+        with pytest.raises(PlanningError):
+            planner(layout, small)
+        (assignment,) = planner(layout, small, engram_ssd_offload=True).assignments
+        assert assignment.layer_weight_bytes == 500
+        assert assignment.ssd_weight_bytes == 200
+        assert assignment.planned_weight_bytes == 300
+        assert _assignment_from_dict(assignment.to_dict()) == assignment
 
-    plan = plan_unequal_pipeline(layout, node, engram_ssd_offload=True)
-    assignment = plan.assignments[0]
-    assert assignment.layer_weight_bytes == 500
-    assert assignment.ssd_weight_bytes == 200
-    assert assignment.planned_weight_bytes == 300
-    assert assignment.headroom_bytes >= 0
-
-
-def test_ssd_weight_bytes_survive_the_worker_plan_and_are_validated():
-    with pytest.raises(ValueError, match="must not exceed"):
-        PipelineAssignment(
-            node_id="studio",
-            rank=0,
-            start_layer=0,
-            end_layer=1,
-            layer_weight_bytes=100,
-            fixed_weight_bytes=0,
-            reserve_bytes=0,
-            capacity_bytes=1000,
-            engram_ssd_offload=True,
-            ssd_weight_bytes=101,
-        )
-    with pytest.raises(ValueError, match="requires engram_ssd_offload"):
-        PipelineAssignment(
-            node_id="studio",
-            rank=0,
-            start_layer=0,
-            end_layer=1,
-            layer_weight_bytes=100,
-            fixed_weight_bytes=0,
-            reserve_bytes=0,
-            capacity_bytes=1000,
-            ssd_weight_bytes=50,
-        )
-
-    assignment = PipelineAssignment(
-        node_id="studio",
-        rank=0,
-        start_layer=0,
-        end_layer=1,
-        layer_weight_bytes=100,
-        fixed_weight_bytes=0,
-        reserve_bytes=0,
-        capacity_bytes=1000,
-        engram_ssd_offload=True,
-        ssd_weight_bytes=50,
+    large = [NodeBudget(node_id="studio", capacity_bytes=1000, rank=0)]
+    assert (
+        plan_unequal_pipeline(layout, large, engram_ssd_offload=True).plan_hash
+        != plan_unequal_pipeline(layout, large).plan_hash
     )
-    decoded = _assignment_from_dict(assignment.to_dict())
-
-    assert decoded == assignment
-    assert decoded.planned_weight_bytes == 50
 
 
 def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
@@ -890,7 +771,9 @@ def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
     from omlx.cluster import planner
 
     (tmp_path / "config.json").write_text(json.dumps({"num_hidden_layers": 1}))
-    _write_safetensors(tmp_path / "model.safetensors", [("model.layers.0.weight", 100)])
+    _write_safetensors(
+        tmp_path / "model.safetensors", [("model.layers.0.weight", 100)]
+    )
 
     calls = []
     real_inspect = planner.inspect_safetensors_layout
@@ -905,7 +788,9 @@ def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
     planner.complete_model_layout(tmp_path)
     assert len(calls) == 1  # second read served from the cache
 
-    _write_safetensors(tmp_path / "model.safetensors", [("model.layers.0.weight", 200)])
+    _write_safetensors(
+        tmp_path / "model.safetensors", [("model.layers.0.weight", 200)]
+    )
     layout = planner.complete_model_layout(tmp_path)
     assert len(calls) == 2  # overwrite invalidated the cached entry
     assert layout.layer_weight_bytes == (200,)

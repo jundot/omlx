@@ -120,7 +120,8 @@ class ModelLayout:
     # state that an earlier layer keeps in its own cache. Empty means any.
     pipeline_stage_starts: tuple[int, ...] = ()
     # Per-layer bytes a tensor-parallel rank reads from SSD instead of holding
-    # (DeepSeek V4.1 Engram tables). Pipeline stages hold them. Empty means 0.
+    # (DeepSeek V4.1 Engram tables). Pipeline stages hold them unless the plan
+    # offloads them too. Empty means 0.
     tensor_parallel_ssd_layer_bytes: tuple[int, ...] = ()
     # The Lightning MTP draft head. Ranks load it only when a plan enables MTP,
     # and then only rank zero, which drafts. Absent from the layer bytes.
@@ -381,22 +382,12 @@ class PipelineAssignment:
     # the guard reads as headless.
     role: str = ""
     memory_guard_tier: str = "balanced"
-    # Whether this rank holds its Engram tables via mmap instead of Metal
-    # buffers. One argv runs unchanged on every host, so a per-model setting
-    # cannot travel as a flag; the plan is already per-rank, signed into the
-    # plan hash, and indexed by rank on arrival — the same channel
-    # ``role`` and ``memory_guard_tier`` use. False (also for plans that
-    # predate the field) keeps the tables resident.
-    engram_ssd_offload: bool = False
-    # Bytes of this stage's layer weights held via mmap instead of Metal
-    # buffers (the Engram tables when ``engram_ssd_offload`` is on). They
-    # count against the SSD, not this rank's wired budget, so
-    # ``planned_weight_bytes`` — what the guard admits and the pool reserves —
-    # subtracts them. 0 keeps every pre-field plan's arithmetic.
-    ssd_weight_bytes: int = 0
     tensor_parallel_rank: int = 0
     tensor_parallel_size: int = 1
     sharded_weight_bytes: int = 0
+    # Part of ``layer_weight_bytes`` this rank reads via mmap (offloaded Engram
+    # tables). Nonzero also tells the rank to load its tables that way.
+    ssd_weight_bytes: int = 0
     # KV cache this node must hold at the planned context length. Counted as
     # resident memory: weights that fit alone still OOM once a long prompt
     # fills the cache, which is how a 22-layer stage took a 128 GiB Mac down.
@@ -423,11 +414,7 @@ class PipelineAssignment:
             normalize_memory_guard_tier(self.memory_guard_tier),
         )
         if not 0 <= self.ssd_weight_bytes <= self.layer_weight_bytes:
-            raise ValueError(
-                "ssd_weight_bytes must not exceed the stage's layer weights"
-            )
-        if self.ssd_weight_bytes and not self.engram_ssd_offload:
-            raise ValueError("ssd_weight_bytes requires engram_ssd_offload")
+            raise ValueError("ssd_weight_bytes must fit the stage's layer weights")
 
     @property
     def layer_count(self) -> int:
@@ -439,9 +426,6 @@ class PipelineAssignment:
         # parallelism the stage's layers are already divided by the TP degree,
         # because shard_linear splits the projections inside each layer. Adding
         # ``sharded_weight_bytes`` on top double-counted the same weights.
-        # Tables held via mmap (``ssd_weight_bytes``) are counted against the
-        # SSD instead of this rank's wired budget, which is what makes an
-        # offloaded Engram stage fit at all.
         return (
             self.fixed_weight_bytes
             + self.layer_weight_bytes
@@ -474,11 +458,10 @@ class PipelineAssignment:
             "utilization": self.utilization,
             "role": self.role,
             "memory_guard_tier": self.memory_guard_tier,
-            "engram_ssd_offload": self.engram_ssd_offload,
-            "ssd_weight_bytes": self.ssd_weight_bytes,
             "tensor_parallel_rank": self.tensor_parallel_rank,
             "tensor_parallel_size": self.tensor_parallel_size,
             "sharded_weight_bytes": self.sharded_weight_bytes,
+            "ssd_weight_bytes": self.ssd_weight_bytes,
             "kv_cache_bytes": self.kv_cache_bytes,
             "kv_bytes_per_token": self.kv_bytes_per_token,
             "max_context_tokens": self.max_context_tokens,
@@ -1054,7 +1037,9 @@ def _kv_bytes_per_token_per_layer(config: dict[str, Any]) -> int:
         text_config = config.get("text_config")
         layer_config = text_config if isinstance(text_config, dict) else config
         layer_types = layer_config.get("layer_types")
-        if config.get("model_type") == "glm5_next" and isinstance(layer_types, list):
+        if config.get("model_type") == "glm5_next" and isinstance(
+            layer_types, list
+        ):
             num_layers = _config_int(config, "num_hidden_layers", 0)
             sparse_layers = sum(
                 layer_type != "linear_attention" for layer_type in layer_types
@@ -1781,26 +1766,14 @@ def plan_unequal_pipeline(
     pipeline_nodes = tuple(sorted(nodes, key=lambda item: item.rank, reverse=True))
     performance_aware = all(node.performance is not None for node in pipeline_nodes)
     kv_bytes_per_layer = _kv_bytes_for_stage(model, 1, context_tokens)
-    ssd_layer_bytes = (
-        model.tensor_parallel_ssd_layer_bytes if engram_ssd_offload else ()
-    )
-    # With offload the partitioner must reason about resident weights: the
-    # mmap'd table is not part of the rank's wired budget, and its per-layer
-    # resident size stays >= its (resident) weight size, which the splitter
-    # requires. The assignment still records the full layer bytes plus the
-    # SSD part, so nothing downstream loses the distinction.
-    resident_layer_weights = tuple(
-        weight_bytes - (ssd_layer_bytes[index] if ssd_layer_bytes else 0)
-        for index, weight_bytes in enumerate(model.layer_weight_bytes)
-    )
+    held_layer_bytes = _held_layer_bytes(model, engram_ssd_offload)
     try:
         ranges = _partition_layers(
-            resident_layer_weights,
+            held_layer_bytes,
             pipeline_nodes,
             fixed_weight_bytes=model.fixed_weight_bytes,
             layer_resident_sizes=tuple(
-                weight_bytes + kv_bytes_per_layer
-                for weight_bytes in resident_layer_weights
+                weight_bytes + kv_bytes_per_layer for weight_bytes in held_layer_bytes
             ),
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
@@ -1825,6 +1798,14 @@ def plan_unequal_pipeline(
         optimization="performance" if performance_aware else "memory",
         engram_ssd_offload=engram_ssd_offload,
     )
+
+
+def _held_layer_bytes(model: ModelLayout, engram_ssd_offload: bool) -> tuple[int, ...]:
+    """Per-layer bytes a pipeline stage holds in memory."""
+
+    if engram_ssd_offload:
+        return model.tensor_parallel_layer_bytes
+    return model.layer_weight_bytes
 
 
 def allocate_layers_proportional(
@@ -1913,14 +1894,9 @@ def plan_proportional_pipeline(
             f"{', '.join(map(str, model.pipeline_stage_starts))}; plan with the "
             "balanced allocator"
         )
-    ssd_layer_bytes = (
-        model.tensor_parallel_ssd_layer_bytes if engram_ssd_offload else ()
-    )
+    held_layer_bytes = _held_layer_bytes(model, engram_ssd_offload)
     for node, (range_start, range_end) in zip(pipeline_nodes, ranges):
-        layer_weight = sum(model.layer_weight_bytes[range_start:range_end])
-        # Tables held via mmap do not occupy this Mac's wired memory.
-        if ssd_layer_bytes:
-            layer_weight -= sum(ssd_layer_bytes[range_start:range_end])
+        layer_weight = sum(held_layer_bytes[range_start:range_end])
         if model.fixed_weight_bytes + layer_weight > node.weight_ceiling_bytes:
             raise PlanningError(
                 f"the RAM-proportional split gives node {node.node_id} "
@@ -1958,28 +1934,22 @@ def _finish_pipeline_plan(
     """Assignments, per-node fit checks, and the signed hash for a partition."""
 
     performance_aware = all(node.performance is not None for node in pipeline_nodes)
-    ssd_layer_bytes = (
-        model.tensor_parallel_ssd_layer_bytes if engram_ssd_offload else ()
-    )
+    held_layer_bytes = _held_layer_bytes(model, engram_ssd_offload)
     assignments: list[PipelineAssignment] = []
     for node, (start, end) in zip(pipeline_nodes, ranges):
         layer_weight_bytes = sum(model.layer_weight_bytes[start:end])
-        ssd_weight_bytes = sum(ssd_layer_bytes[start:end]) if ssd_layer_bytes else 0
-        resident_weight_bytes = layer_weight_bytes - ssd_weight_bytes
+        held_bytes = sum(held_layer_bytes[start:end])
         kv_bytes = _kv_bytes_for_stage(model, end - start, context_tokens)
-        planned = model.fixed_weight_bytes + resident_weight_bytes + kv_bytes
+        planned = model.fixed_weight_bytes + held_bytes + kv_bytes
         if planned > node.usable_bytes:
-            held_back = (
-                " with the Engram tables held on SSD" if ssd_weight_bytes else ""
-            )
             raise PlanningError(
-                f"stage does not fit node {node.node_id}{held_back} once KV "
-                f"cache for {context_tokens} tokens is reserved: {planned} > "
-                f"{node.usable_bytes} (resident weights "
-                f"{resident_weight_bytes}, KV {kv_bytes})"
+                f"stage does not fit node {node.node_id} once KV cache for "
+                f"{context_tokens} tokens is reserved: {planned} > "
+                f"{node.usable_bytes} (weights {held_bytes}, "
+                f"KV {kv_bytes})"
             )
         compute_seconds, send_seconds, stage_seconds = _predict_stage_seconds(
-            layer_weight_bytes,
+            held_bytes,
             node,
             activation_bytes_per_token=model.activation_bytes_per_token,
             workload_profile=workload_profile,
@@ -1998,16 +1968,15 @@ def _finish_pipeline_plan(
                 manual_memory_limit=node.manual_memory_limit,
                 role=node.role,
                 memory_guard_tier=node.memory_guard_tier,
-                engram_ssd_offload=engram_ssd_offload,
+                ssd_weight_bytes=layer_weight_bytes - held_bytes,
                 kv_cache_bytes=kv_bytes,
                 kv_bytes_per_token=_kv_bytes_per_token_for_stage(model, end - start),
                 max_context_tokens=_max_context_for_stage(
                     model,
                     node,
                     layer_count=end - start,
-                    weight_bytes=(model.fixed_weight_bytes + resident_weight_bytes),
+                    weight_bytes=model.fixed_weight_bytes + held_bytes,
                 ),
-                ssd_weight_bytes=ssd_weight_bytes,
                 predicted_compute_seconds=(
                     compute_seconds if performance_aware else None
                 ),
@@ -2048,15 +2017,12 @@ def _finish_pipeline_plan(
                 # workstation plan look identical to every staleness check.
                 "role": item.role,
                 "memory_guard_tier": item.memory_guard_tier,
-                # Identity, like role: two plans that differ only in whether
-                # the tables are mmap'd must not share a hash, or a plan
-                # approved for offloaded tables would satisfy a staleness
-                # check against a resident launch of the same layers.
-                "engram_ssd_offload": item.engram_ssd_offload,
-                # The residency decision fixes how much of the layers this
-                # rank may hold as wired memory, so it is part of the
-                # identity too.
-                "ssd_weight_bytes": item.ssd_weight_bytes,
+                # Omitted when 0 so resident plans keep their hash.
+                **(
+                    {"ssd_weight_bytes": item.ssd_weight_bytes}
+                    if item.ssd_weight_bytes
+                    else {}
+                ),
             }
             for item in assignments
         ],
@@ -2312,7 +2278,8 @@ def plan_hybrid(
     """Plan hybrid pipeline + tensor parallelism across nodes.
 
     ``head_rank_extra_bytes`` are weights only rank zero holds (an unsharded
-    Lightning MTP head).
+    Lightning MTP head). ``engram_ssd_offload`` matters only without tensor
+    parallelism, because tensor-parallel ranks always read Engram from SSD.
 
     Combines contiguous pipeline stages with tensor-parallel weight sharding.
     The world is 2D: pipeline_stages * tensor_parallel_size == len(nodes).
@@ -2492,7 +2459,6 @@ def plan_hybrid(
                     layer_weight_bytes=held_layer_bytes,
                     fixed_weight_bytes=fixed_bytes,
                     reserve_bytes=node.reserve_bytes,
-                    engram_ssd_offload=engram_ssd_offload,
                     capacity_bytes=node.capacity_bytes,
                     manual_memory_limit=node.manual_memory_limit,
                     role=node.role,

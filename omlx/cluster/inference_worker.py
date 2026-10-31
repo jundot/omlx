@@ -1264,27 +1264,6 @@ def _resolve_setting(
     return from_plan or default
 
 
-def _resolve_bool_setting(
-    args: argparse.Namespace,
-    assignment: Any,
-    *,
-    flag: str,
-    field: str,
-) -> bool:
-    """A per-rank boolean setting, from the flag if given and the plan otherwise.
-
-    Same channel as ``_resolve_setting``; a plain flag cannot express a
-    per-model decision on an argv that runs unchanged on every host, so the
-    signed plan is what says it. The flag wins so a rank can be driven by
-    hand; ``getattr`` keeps plans that predate the field on the resident
-    default instead of failing to launch.
-    """
-
-    if getattr(args, flag, False):
-        return True
-    return bool(getattr(assignment, field, False))
-
-
 def _apply_rank_wired_limit(budget_bytes: int) -> int:
     """Wire at most what this rank was admitted for, and only if asked to.
 
@@ -1431,12 +1410,6 @@ def run_worker(args: argparse.Namespace) -> int:
         # actually stops a load. Both come from this rank's own assignment,
         # because one shared argv cannot say different things to different Macs.
         node_role = _resolve_setting(args, assignment, flag="node_role", field="role")
-        engram_ssd_offload = _resolve_bool_setting(
-            args,
-            assignment,
-            flag="engram_ssd_offload",
-            field="engram_ssd_offload",
-        )
         guard_tier = _resolve_setting(
             args,
             assignment,
@@ -1543,9 +1516,7 @@ def run_worker(args: argparse.Namespace) -> int:
                             if key != "phase"
                         },
                     ),
-                    rank_settings=SimpleNamespace(
-                        engram_ssd_offload=engram_ssd_offload
-                    ),
+                    engram_ssd_offload=assignment.ssd_weight_bytes > 0,
                 ),
             ):
                 provider.load_default()
@@ -1825,17 +1796,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mtp", action="store_true")
     parser.add_argument("--mtp-depth", type=int, default=0)
     parser.add_argument("--mtp-fixed-depth", action="store_true")
-    parser.add_argument(
-        "--engram-ssd-offload",
-        action="store_true",
-        help=(
-            "Hold this rank's Engram tables via mmap instead of Metal "
-            "buffers. Normally decided per model by the signed plan, which "
-            "is the only channel that can carry a per-model setting to an "
-            "argv that runs unchanged on every host; the flag exists to "
-            "drive a single rank by hand."
-        ),
-    )
     return parser
 
 

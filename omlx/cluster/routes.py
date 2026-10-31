@@ -62,7 +62,6 @@ from .discovery import (
 )
 from .enrollment import EnrolledNode, EnrollmentError, get_cluster_enrollment
 from .guidance import explain
-from .identity import get_node_identity
 from .incidents import Severity, get_cluster_incidents
 from .launch import (
     CudaFabricProbeHost,
@@ -108,6 +107,7 @@ from .planner import (
 from .probe import collect_cluster_status
 from .rdma.link_routes import cluster_rdma_link_verify, cluster_rdma_links
 from .registry import get_cluster_registry, get_device_registry
+from .identity import get_node_identity
 from .replan import (
     hosts_from_deployment,
     nodes_from_deployment,
@@ -201,7 +201,9 @@ class ClusterWorkerCompleteRequest(ClusterWorkerClaimRequest):
     )
     source_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
     ssh_host_public_key: str = Field(min_length=32, max_length=8192)
-    ssh_host_fingerprint: str = Field(pattern=r"^SHA256:[A-Za-z0-9+/]{40,64}$")
+    ssh_host_fingerprint: str = Field(
+        pattern=r"^SHA256:[A-Za-z0-9+/]{40,64}$"
+    )
     runtime: dict[str, str] = Field(default_factory=dict, max_length=16)
 
 
@@ -225,13 +227,9 @@ def _join_addresses(values: list[str]) -> tuple[str, ...]:
         try:
             address = ipaddress.ip_address(value)
         except ValueError as exc:
-            raise HTTPException(
-                status_code=400, detail="invalid worker IP address"
-            ) from exc
+            raise HTTPException(status_code=400, detail="invalid worker IP address") from exc
         if address.is_unspecified or address.is_multicast or address.is_loopback:
-            raise HTTPException(
-                status_code=400, detail="worker IP must be LAN-reachable"
-            )
+            raise HTTPException(status_code=400, detail="worker IP must be LAN-reachable")
         if address.version != 4 or not (address.is_private or address.is_link_local):
             raise HTTPException(
                 status_code=400,
@@ -247,9 +245,7 @@ def _controller_url(request: ClusterJoinKeyRequest) -> str:
     try:
         address = ipaddress.ip_address(request.controller_ip)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400, detail="controller must be a literal IP"
-        ) from exc
+        raise HTTPException(status_code=400, detail="controller must be a literal IP") from exc
     if (
         address.version != 4
         or address.is_unspecified
@@ -295,8 +291,8 @@ def set_cluster_getters(
     _get_settings_manager = settings_manager_getter
 
 
-def _saved_lightning_mtp(model_path: str) -> bool | None:
-    """The coordinator's saved Lightning MTP setting for this model, if any."""
+def _saved_model_settings(model_path: str) -> Any:
+    """The coordinator's saved settings for this model, if any."""
 
     manager = _get_settings_manager() if _get_settings_manager else None
     if manager is None or _get_engine_pool is None:
@@ -307,8 +303,22 @@ def _saved_lightning_mtp(model_path: str) -> bool | None:
             continue
         if not manager.has_settings(item["id"]):
             return None
-        return bool(manager.get_settings(item["id"]).mtp_enabled)
+        return manager.get_settings(item["id"])
     return None
+
+
+def _saved_lightning_mtp(model_path: str) -> bool | None:
+    """The coordinator's saved Lightning MTP setting for this model, if any."""
+
+    settings = _saved_model_settings(model_path)
+    return None if settings is None else bool(settings.mtp_enabled)
+
+
+def _saved_engram_ssd_offload(model_path: str | None) -> bool:
+    """Whether the saved settings keep DeepSeek V4.1 Engram tables on SSD."""
+
+    settings = _saved_model_settings(model_path) if model_path else None
+    return bool(getattr(settings, "deepseek_v41_engram_ssd_offload", False))
 
 
 def _cluster_mtp(
@@ -462,7 +472,9 @@ class ClusterPlanNodeRequest(BaseModel):
     # "headless" or "workstation" — decides how much is held back for the
     # person using this Mac. See omlx/cluster/node_role.py.
     role: str = Field(default="headless", max_length=32)
-    memory_guard_tier: Literal["safe", "balanced", "aggressive", "custom"] = "balanced"
+    memory_guard_tier: Literal["safe", "balanced", "aggressive", "custom"] = (
+        "balanced"
+    )
     performance: dict[str, Any] | None = None
     accelerator: Literal["metal", "cuda", "cpu"] | None = None
     fabric_kind: str | None = Field(default=None, max_length=64)
@@ -501,10 +513,6 @@ class ClusterPlanRequest(BaseModel):
     path_map: dict[str, str] | None = Field(default=None, max_length=64)
     # Lightning MTP: reserve the draft head on rank zero.
     mtp: bool = False
-    # From the model's saved settings (see ``_saved_engram_ssd_offload``):
-    # one argv runs on every host, so the only channel that can tell a rank
-    # to mmap its Engram tables is the per-rank signed plan.
-    engram_ssd_offload: bool = False
 
 
 class ClusterHostRequest(BaseModel):
@@ -768,9 +776,6 @@ _PLACEMENT_FIELDS = (
     "manual_memory_limit",
     "role",
     "memory_guard_tier",
-    # Where the Engram tables live changes what actually runs (and what the
-    # rank may admit), so the approved placement must pin it.
-    "engram_ssd_offload",
     "tensor_parallel_rank",
     "tensor_parallel_size",
 )
@@ -871,8 +876,9 @@ def _plan_changes(approved: dict[str, Any], launched: dict[str, Any]) -> dict[st
 
 
 def _create_cluster_plan(request: ClusterPlanRequest):
-    if request.tensor_parallel_size > 1 and request.tensor_parallel_size != len(
-        request.nodes
+    if (
+        request.tensor_parallel_size > 1
+        and request.tensor_parallel_size != len(request.nodes)
     ):
         raise PlanningError(
             "Tensor parallelism must use every detected node. Combining tensor "
@@ -901,12 +907,9 @@ def _create_cluster_plan(request: ClusterPlanRequest):
         request.path_map,
         tuple(node.node_id.strip() for node in request.nodes),
     )
-    # One source for every planning path: a preview, an autoconfigure proposal
-    # and the deployment that activates it must produce the same plan hash, or
-    # the approval guard refuses the placement the user approved.
-    engram_ssd_offload = _engram_ssd_offload_for(request)
     pipeline_model = with_mtp_head(model) if request.mtp else model
     head_bytes = model.mtp_weight_bytes if request.mtp else 0
+    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
         if request.allocation != "balanced":
@@ -924,7 +927,6 @@ def _create_cluster_plan(request: ClusterPlanRequest):
             ),
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=head_bytes,
-            engram_ssd_offload=engram_ssd_offload,
         )
     elif request.allocation == "proportional":
         plan = plan_proportional_pipeline(
@@ -951,39 +953,6 @@ def _create_cluster_plan(request: ClusterPlanRequest):
     if path_map:
         plan = replace(plan, path_map=path_map)
     return plan
-
-
-def _saved_engram_ssd_offload(model_path: str) -> bool | None:
-    """The coordinator's saved Engram SSD offload setting, if any.
-
-    The same lookup ``_saved_lightning_mtp`` uses: without a settings
-    manager (CLI planning, tests) the planner keeps its default, which is
-    the resident tables a plan without the field has always budgeted.
-    """
-
-    manager = _get_settings_manager() if _get_settings_manager else None
-    if manager is None or _get_engine_pool is None:
-        return None
-    target = Path(model_path).expanduser().resolve()
-    for item in engine_pool_model_inventory(_engine_pool()):
-        if Path(item["model_path"]).expanduser().resolve() != target:
-            continue
-        if not manager.has_settings(item["id"]):
-            return None
-        return bool(manager.get_settings(item["id"]).deepseek_v41_engram_ssd_offload)
-    return None
-
-
-def _engram_ssd_offload_for(request: ClusterPlanRequest) -> bool:
-    """The Engram residency this plan must carry, from the saved settings.
-
-    An explicit request field wins (tests, CLI); otherwise the model's saved
-    setting decides, the same way MTP does. Unset means resident tables.
-    """
-
-    if request.engram_ssd_offload:
-        return True
-    return bool(_saved_engram_ssd_offload(request.model_path or "") or False)
 
 
 class ClusterAutoconfigureRequest(BaseModel):
@@ -1103,7 +1072,9 @@ def _resolve_fabric(
 
     interfaces = {host: probe_host_interfaces(host) for host in hosts}
     verify = verifier or verify_link_reachability
-    verified_links: dict[tuple[tuple[str, str, str], ...], tuple[bool, str]] = {}
+    verified_links: dict[
+        tuple[tuple[str, str, str], ...], tuple[bool, str]
+    ] = {}
 
     def verify_once(link: Any) -> tuple[bool, str]:
         endpoints = (link.source, link.peer)
@@ -1161,7 +1132,8 @@ def _resolve_fabric(
     if rdma["ok"] and unverified_rdma is not None:
         rdma["ok"] = False
         rdma["reason"] = (
-            "not every cluster pair verified over RDMA: " f"{unverified_rdma.reason}"
+            "not every cluster pair verified over RDMA: "
+            f"{unverified_rdma.reason}"
         )
 
     proposed, reason = choose_backend(pair_links)
@@ -1263,7 +1235,7 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
         mtp = _cluster_mtp(request.mtp, model, request.model_path)
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    engram_ssd_offload = _engram_ssd_offload_for(plan_request)
+    engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
 
     transports: tuple[Any, ...] = ()
     transport_error: str | None = None
@@ -1773,7 +1745,8 @@ def _run_staging_job(
             inventory = model_staging_inventory(model_path)
             shards = index_shards(model_path)
             sidecar_sizes = {
-                str(name): int(size) for name, size in inventory["sidecars"].items()
+                str(name): int(size)
+                for name, size in inventory["sidecars"].items()
             }
         else:
             shards, sidecar_sizes = remote_model_staging_inventory(
@@ -1805,11 +1778,11 @@ def _run_staging_job(
                 destination_dir = explicit_destination or str(model_path)
                 destination_path = Path(destination_dir)
                 present = (
-                    {
-                        path.name: path.stat().st_size
-                        for path in destination_path.iterdir()
-                        if path.is_file()
-                    }
+                {
+                    path.name: path.stat().st_size
+                    for path in destination_path.iterdir()
+                    if path.is_file()
+                }
                     if destination_path.is_dir()
                     else {}
                 )
@@ -1829,7 +1802,8 @@ def _run_staging_job(
             needed = tuple(
                 name
                 for name in (*plan.missing, *sidecars)
-                if present.get(name) != (shard_sizes | sidecar_sizes).get(name)
+                if present.get(name)
+                != (shard_sizes | sidecar_sizes).get(name)
             )
             total_bytes = sum((shard_sizes | sidecar_sizes)[name] for name in needed)
 
@@ -1870,7 +1844,8 @@ def _run_staging_job(
                 _update_staging_job(job_id, apply)
 
             expected_sizes = {
-                name: (shard_sizes | sidecar_sizes)[name] for name in needed
+                name: (shard_sizes | sidecar_sizes)[name]
+                for name in needed
             }
             # When this Mac is one end, the data takes the address the
             # collectives verified (Thunderbolt first) if SSH answers there.
@@ -1914,8 +1889,8 @@ def _run_staging_job(
                 node["status"] = "ready" if staging_result.ok else "failed"
                 node["result"] = staging_result.to_dict()
                 if not staging_result.ok:
-                    node["error"] = "Failed to copy: " + ", ".join(
-                        staging_result.failed
+                    node["error"] = (
+                        "Failed to copy: " + ", ".join(staging_result.failed)
                     )
 
             _update_staging_job(job_id, finish)
@@ -1938,7 +1913,6 @@ def _run_staging_job(
                 deployment_id=deployment.deployment_id,
             )
     except Exception as exc:  # noqa: BLE001 - background job reports the failure
-
         def fail(job: dict[str, Any], *, error=str(exc)) -> None:
             job["status"] = "failed"
             job["ready"] = False
@@ -2178,7 +2152,9 @@ async def cluster_diagnostics():
         )
     incidents: list[dict[str, Any]] = []
     try:
-        incidents = [incident.to_dict() for incident in get_cluster_incidents().list()]
+        incidents = [
+            incident.to_dict() for incident in get_cluster_incidents().list()
+        ]
     except RuntimeError as exc:
         errors.append(f"incidents: {type(exc).__name__}: {exc}")
     payload = {
@@ -2427,11 +2403,11 @@ async def cluster_complete_worker_join(
             status_code=401, detail="invalid enrollment credential"
         ) from None
     try:
-        observed_fingerprint = ssh_public_key_fingerprint(request.ssh_host_public_key)
+        observed_fingerprint = ssh_public_key_fingerprint(
+            request.ssh_host_public_key
+        )
     except (ValueError, TypeError) as exc:
-        raise HTTPException(
-            status_code=400, detail="invalid worker SSH host key"
-        ) from exc
+        raise HTTPException(status_code=400, detail="invalid worker SSH host key") from exc
     if not hmac.compare_digest(observed_fingerprint, request.ssh_host_fingerprint):
         raise HTTPException(status_code=400, detail="worker SSH fingerprint mismatch")
     if request.source_digest != session.source_digest:
@@ -2727,7 +2703,9 @@ async def cluster_cuda_fabric_verify(request: ClusterCudaFabricVerifyRequest):
                 detail=f"Could not inspect {host.node_id}: {exc}",
             ) from exc
 
-    capabilities = await asyncio.gather(*(capability_for(host) for host in members))
+    capabilities = await asyncio.gather(
+        *(capability_for(host) for host in members)
+    )
     probe_hosts: list[CudaFabricProbeHost] = []
     for host, capability in zip(members, capabilities):
         status = capability.get("status") or {}
@@ -2906,12 +2884,8 @@ def _execution_for_request(
         requested,
         async_overlap=request.async_overlap,
         cache_affinity=request.cache_affinity,
-        prompt_cache_ssd=getattr(
-            request, "prompt_cache_ssd", requested.prompt_cache_ssd
-        ),
-        prompt_cache_ssd_max_bytes=getattr(
-            request, "prompt_cache_ssd_max_bytes", requested.prompt_cache_ssd_max_bytes
-        ),
+        prompt_cache_ssd=getattr(request, "prompt_cache_ssd", requested.prompt_cache_ssd),
+        prompt_cache_ssd_max_bytes=getattr(request, "prompt_cache_ssd_max_bytes", requested.prompt_cache_ssd_max_bytes),
         # The context chosen beside the model is both a reservation and a
         # runtime ceiling. Without this fallback the planner could reserve
         # 256k while the server used an unrelated advanced default (or no
@@ -2982,7 +2956,9 @@ def _create_deployment(
         plan.assignments,
         backend=request.backend,
     )
-    if execution.pipeline_microbatch_size != requested_microbatch:
+    if (
+        execution.pipeline_microbatch_size != requested_microbatch
+    ):
         plan_request.pipeline_microbatch_size = execution.pipeline_microbatch_size
         plan = _create_cluster_plan(plan_request)
     if len(request.hosts) != len(request.nodes):
@@ -3043,7 +3019,6 @@ def _build_performance_plan(
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
-            engram_ssd_offload=engram_ssd_offload,
         )
     return plan_unequal_pipeline(
         with_mtp_head(model) if mtp else model,
@@ -3071,9 +3046,12 @@ def _performance_optimized_deployment(
         remote_model_layout(
             validate_ssh_target(source),
             deployment.model,
-            python_executable=(request.model_source_python or DEFAULT_REMOTE_PYTHON),
+            python_executable=(
+                request.model_source_python or DEFAULT_REMOTE_PYTHON
+            ),
         )
-        if source and source not in {LOCAL_NODE, "127.0.0.1", "localhost", "::1"}
+        if source
+        and source not in {LOCAL_NODE, "127.0.0.1", "localhost", "::1"}
         else inspect_safetensors_layout(deployment.model)
     )
     # Same budgets the approved plan was built from — reserve, split cap and
@@ -3081,10 +3059,8 @@ def _performance_optimized_deployment(
     # a capped, Workstation-marked Mac came out of the probe holding almost its
     # whole ceiling.
     nodes = _node_budgets(request.nodes, profiles=profiles)
-    # The deployment that reached this point is the signed plan: its
-    # assignments already carry the offload decision, so re-planning must not
-    # consult the settings file again.
-    engram_ssd_offload = any(item.engram_ssd_offload for item in deployment.assignments)
+    # Keep the approved plan's Engram decision instead of rereading settings.
+    engram_ssd_offload = any(item.ssd_weight_bytes for item in deployment.assignments)
     plan = _build_performance_plan(
         model,
         nodes,
@@ -3110,9 +3086,9 @@ def _performance_optimized_deployment(
             tensor_parallel_size=deployment.tensor_parallel_size,
             workload_profile=execution.profile,
             microbatch_size=execution.pipeline_microbatch_size,
-            engram_ssd_offload=engram_ssd_offload,
             context_tokens=request.target_context_tokens,
             mtp=deployment.execution.mtp,
+            engram_ssd_offload=engram_ssd_offload,
         )
     deployment_id = (
         request.deployment_id.strip()
@@ -3224,7 +3200,9 @@ async def cluster_node_budgets(request: ClusterNodeBudgetRequest) -> dict[str, A
 
     try:
         hosts = [
-            host.model_copy(update={"ssh": validate_ssh_target(host.ssh.strip())})
+            host.model_copy(
+                update={"ssh": validate_ssh_target(host.ssh.strip())}
+            )
             for host in request.hosts
         ]
     except ValueError as exc:
@@ -3304,14 +3282,17 @@ async def cluster_models(request: ClusterModelInventoryRequest) -> dict[str, Any
                 ),
             )
             source_python = host.python_executable or DEFAULT_REMOTE_PYTHON
-            models = [dict(model, python_executable=source_python) for model in models]
+            models = [
+                dict(model, python_executable=source_python) for model in models
+            ]
             return host.node_id, validated, models, ""
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
             return host.node_id, target, [], str(exc)
 
     results = await asyncio.gather(*(read_host(host) for host in request.hosts))
     inventories = [
-        (node_id, ssh_target, models) for node_id, ssh_target, models, _ in results
+        (node_id, ssh_target, models)
+        for node_id, ssh_target, models, _ in results
     ]
     errors = [
         {"node_id": node_id, "ssh": ssh_target, "detail": error}
@@ -3416,7 +3397,9 @@ def _catalogue_for_candidates(
             fit.to_dict()
             | {
                 "model_path": candidate.model_path,
-                "model_source": ("127.0.0.1" if _local_ssh_target(source) else source),
+                "model_source": (
+                    "127.0.0.1" if _local_ssh_target(source) else source
+                ),
                 "source_node_id": candidate.source_node_id,
             }
         )
@@ -3570,7 +3553,8 @@ async def _activate_and_report(
                     "backend": deployment.backend,
                     "world_size": deployment.world_size,
                     "profiles": [
-                        profile.to_dict() for profile in deployment.performance_profiles
+                        profile.to_dict()
+                        for profile in deployment.performance_profiles
                     ],
                     "plan_changed": False,
                 }
@@ -4187,7 +4171,8 @@ async def load_cluster_deployment(deployment_id: str):
             if not callable(register):
                 raise
             estimated_size = sum(
-                assignment.planned_weight_bytes for assignment in deployment.assignments
+                assignment.planned_weight_bytes
+                for assignment in deployment.assignments
             )
             model_id, _ = register(
                 deployment.model,

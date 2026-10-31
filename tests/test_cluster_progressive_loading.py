@@ -548,15 +548,15 @@ def test_progressive_loader_checks_tokenizer_trust_before_model_load(tmp_path):
     assert calls == [("tokenizer", {"trust_remote_code": False})]
 
 
-def test_stage_loader_receives_the_rank_settings_when_it_accepts_them(
+def test_a_model_with_its_own_stage_loader_bypasses_mlx_lm_loading(
     tmp_path, monkeypatch
 ):
-    """The loader kwargs are the last hop of the per-model channel."""
+    """DeepSeek V4.1 checkpoints use oMLX's format, which mlx-lm cannot build."""
 
     calls = []
     module = SimpleNamespace(
-        load_pipeline_stage=lambda path, group, settings=None: (
-            calls.append((path, group, settings)) or "stage"
+        load_pipeline_stage=lambda path, group, engram_ssd_offload: (
+            calls.append((path, group, engram_ssd_offload)) or "stage"
         )
     )
     monkeypatch.setitem(sys.modules, "mlx_lm.models.own_format", module)
@@ -567,87 +567,17 @@ def test_stage_loader_receives_the_rank_settings_when_it_accepts_them(
         load_model=lambda *_args, **_kwargs: pytest.fail("mlx-lm load_model ran"),
     )
     group = SimpleNamespace()
-    settings = SimpleNamespace(engram_ssd_offload=True)
 
     loaded = progressive_sharded_load(
         tmp_path,
         pipeline_group=group,
+        engram_ssd_offload=True,
         utils_module=utils,
         mx_module=_FakeMX(),
-        rank_settings=settings,
     )
 
     assert loaded == ("stage", "tokenizer")
-    assert calls == [(tmp_path, group, settings)]
-
-    # Tensor-parallel loaders get the same treatment, and one that ignores
-    # the settings keeps its old call shape.
-    module.load_tensor_shard = lambda path, group, settings=None: (
-        calls.append((path, group, settings)) or "shard"
-    )
-    loaded = progressive_sharded_load(
-        tmp_path,
-        tensor_group=group,
-        utils_module=utils,
-        mx_module=_FakeMX(),
-        rank_settings=settings,
-    )
-    assert loaded == ("shard", "tokenizer")
-    assert calls[-1][2] is settings
-
-
-def test_stage_loader_without_a_settings_parameter_keeps_working(tmp_path, monkeypatch):
-    """A loader that cannot take settings must not learn the keyword by force."""
-
-    calls = []
-    module = SimpleNamespace(
-        load_pipeline_stage=lambda path, group: calls.append((path, group)) or "stage"
-    )
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.own_format", module)
-    utils = SimpleNamespace(
-        _download=lambda _repo, allow_patterns=None: tmp_path,
-        load_config=lambda _path: {"model_type": "own_format"},
-        load_tokenizer=lambda *_args, **_kwargs: "tokenizer",
-        load_model=lambda *_args, **_kwargs: pytest.fail("mlx-lm load_model ran"),
-    )
-    group = SimpleNamespace()
-
-    loaded = progressive_sharded_load(
-        tmp_path,
-        pipeline_group=group,
-        utils_module=utils,
-        mx_module=_FakeMX(),
-        rank_settings=SimpleNamespace(engram_ssd_offload=True),
-    )
-
-    assert loaded == ("stage", "tokenizer")
-    assert calls == [(tmp_path, group)]
-
-
-def test_a_model_with_its_own_stage_loader_bypasses_mlx_lm_loading(
-    tmp_path, monkeypatch
-):
-    """DeepSeek V4.1 checkpoints use oMLX's format, which mlx-lm cannot build."""
-
-    calls = []
-    module = SimpleNamespace(
-        load_pipeline_stage=lambda path, group: calls.append((path, group)) or "stage"
-    )
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.own_format", module)
-    utils = SimpleNamespace(
-        _download=lambda _repo, allow_patterns=None: tmp_path,
-        load_config=lambda _path: {"model_type": "own_format"},
-        load_tokenizer=lambda *_args, **_kwargs: "tokenizer",
-        load_model=lambda *_args, **_kwargs: pytest.fail("mlx-lm load_model ran"),
-    )
-    group = SimpleNamespace()
-
-    loaded = progressive_sharded_load(
-        tmp_path, pipeline_group=group, utils_module=utils, mx_module=_FakeMX()
-    )
-
-    assert loaded == ("stage", "tokenizer")
-    assert calls == [(tmp_path, group)]
+    assert calls == [(tmp_path, group, True)]
     with pytest.raises(ValueError, match="pipeline parallelism only"):
         progressive_sharded_load(
             tmp_path, tensor_group=group, utils_module=utils, mx_module=_FakeMX()

@@ -149,30 +149,24 @@ def _as_cluster_rank(model: Any, group: Any) -> Model:
     return model
 
 
-def load_pipeline_stage(model_path: Any, group: Any, *, settings: Any = None) -> Model:
-    """This rank's stage of a converted checkpoint, text model only.
-
-    ``settings.engram_ssd_offload`` is the last hop of the per-model channel:
-    the argv is identical on every host, so the rank's signed plan is what
-    carries the setting, resolved by the worker before the loader runs.
-    False (and plans that predate the field) keep the tables in Metal
-    buffers.
-    """
+def load_pipeline_stage(
+    model_path: Any, group: Any, *, engram_ssd_offload: bool = False
+) -> Model:
+    """This rank's stage of a converted checkpoint, text model only."""
 
     model, _ = load(
         model_path,
         stage=lambda language_model: language_model.pipeline(group),
-        engram_ssd_offload=bool(getattr(settings, "engram_ssd_offload", False)),
+        engram_ssd_offload=engram_ssd_offload,
         mtp_head=is_mtp_active() and group.rank() == 0,
     )
     return _as_cluster_rank(model, group)
 
 
-def load_tensor_shard(model_path: Any, group: Any, *, settings: Any = None) -> Model:
-    """This rank's tensor-parallel slice of a converted checkpoint, text only."""
+def load_tensor_shard(model_path: Any, group: Any) -> Model:
+    """This rank's tensor-parallel slice of a converted checkpoint, text model only."""
 
-    # Every rank reads every Engram row, so the tables stay on SSD whatever
-    # the plan says; ``settings`` is accepted for loader-signature parity.
+    # Every rank reads every Engram row, so the tables stay on SSD.
     model, _ = load(
         model_path,
         tensor=group,

@@ -224,7 +224,9 @@ def choose_parallelism(
     measured_choice = False
     if strategy == "auto" and len(candidates) > 1 and measurements:
         available = {
-            size: measurements[size] for size in candidates if size in measurements
+            size: measurements[size]
+            for size in candidates
+            if size in measurements
         }
         # A single measurement is not a comparison. Require every candidate
         # so an old pipeline run cannot beat an unmeasured tensor path (or vice
@@ -254,10 +256,14 @@ def choose_parallelism(
             transports,
             tensor_parallel_size,
         )
-        measured_on_this_path = measured_choice and tensor_parallel_size in (
-            measurements or {}
+        measured_on_this_path = (
+            measured_choice and tensor_parallel_size in (measurements or {})
         )
-        if strategy == "auto" and not fast_enough and not measured_on_this_path:
+        if (
+            strategy == "auto"
+            and not fast_enough
+            and not measured_on_this_path
+        ):
             continue
         try:
             plan = plan_hybrid(
@@ -285,7 +291,8 @@ def choose_parallelism(
                     "tensor-parallel sharding in MLX-LM"
                 )
             elif any(
-                value % max(len(nodes), 1) for value in model.tensor_parallel_divisors
+                value % max(len(nodes), 1)
+                for value in model.tensor_parallel_divisors
             ):
                 reason += (
                     " because an architecture-specific head group does not "
@@ -330,7 +337,9 @@ def choose_parallelism(
         )
 
     if last_error is not None:
-        raise PlanningError(f"no workable split for {len(nodes)} nodes: {last_error}")
+        raise PlanningError(
+            f"no workable split for {len(nodes)} nodes: {last_error}"
+        )
     raise PlanningError(
         f"no tensor-parallel degree divides {len(nodes)} nodes across "
         f"architecture dimensions {model.tensor_parallel_divisors}"
@@ -449,17 +458,17 @@ def describe_transports(transports: Sequence[Any]) -> str:
 
     if not transports:
         return "Link speed unknown"
-    speeds = [getattr(transport, "link_speed_gbps", None) for transport in transports]
+    speeds = [
+        getattr(transport, "link_speed_gbps", None) for transport in transports
+    ]
     known = [speed for speed in speeds if speed]
     versions = {
         getattr(transport, "tb_version", None)
         for transport in transports
         if getattr(transport, "tb_version", None)
     }
-    label = (
-        "/".join(sorted(versions))
-        if versions
-        else next(iter({getattr(t, "kind", "unknown") for t in transports}))
+    label = "/".join(sorted(versions)) if versions else next(
+        iter({getattr(t, "kind", "unknown") for t in transports})
     )
     if known:
         return f"{label} at {min(known)} Gb/s"
@@ -534,7 +543,9 @@ def order_hosts_for_topology(
             candidates = [
                 host
                 for host in remaining
-                if all(bandwidth_between(fast, host, member) > 0 for member in block)
+                if all(
+                    bandwidth_between(fast, host, member) > 0 for member in block
+                )
             ]
             if not candidates:
                 break
@@ -576,11 +587,8 @@ def order_hosts_for_topology(
     basis = (
         "measured bandwidth"
         if evidence == {"measured"}
-        else (
-            "link speed"
-            if "measured" not in evidence
-            else "measured bandwidth where available"
-        )
+        else "link speed" if "measured" not in evidence
+        else "measured bandwidth where available"
     )
     warnings: tuple[str, ...] = ()
     if "measured" not in evidence:
@@ -663,9 +671,7 @@ def preflight_issues(
             )
             continue
 
-        payload = (
-            status.get("status") if isinstance(status.get("status"), dict) else status
-        )
+        payload = status.get("status") if isinstance(status.get("status"), dict) else status
         runtime = payload.get("runtime") or {}
         reported_runtime_mismatch = status.get("runtime_compatible") is False
         if reported_runtime_mismatch:
@@ -700,11 +706,7 @@ def preflight_issues(
             )
 
         models = payload.get("models")
-        if (
-            model_path
-            and isinstance(models, (list, tuple))
-            and model_path not in models
-        ):
+        if model_path and isinstance(models, (list, tuple)) and model_path not in models:
             issues.append(
                 PreflightIssue(
                     node_id,
@@ -803,7 +805,9 @@ class _Guard:
             return False
         return all(
             any(
-                declared == literal if kind == "eq" else declared.startswith(literal)
+                declared == literal
+                if kind == "eq"
+                else declared.startswith(literal)
                 for kind, literal in alternatives
                 for declared in model_types
             )

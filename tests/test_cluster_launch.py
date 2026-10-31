@@ -1612,29 +1612,6 @@ def test_the_node_role_reaches_the_rank_through_the_launched_argv(tmp_path):
     assert assignments[1].role == "headless"
 
 
-def test_the_engram_offload_setting_reaches_the_rank_through_the_plan(tmp_path):
-    """Same channel as the role: one argv, a per-model decision in the plan.
-
-    The flag is only a manual override, so a real launch must carry the
-    setting in ``--plan`` and the rank must resolve it from its own
-    assignment.
-    """
-
-    deployment = replace(
-        _mixed_role_deployment(),
-        assignments=tuple(
-            replace(item, engram_ssd_offload=True)
-            for item in _mixed_role_deployment().assignments
-        ),
-    )
-
-    args, _plan_hash, assignments = _parsed_plan(deployment, tmp_path)
-
-    assert "--engram-ssd-offload" not in _worker_argv(deployment, tmp_path)
-    assert args.engram_ssd_offload is False  # the flag is an override
-    assert all(item.engram_ssd_offload for item in assignments)
-
-
 def test_one_argv_carries_two_different_roles(tmp_path):
     """Why the flag is not the fix.
 

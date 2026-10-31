@@ -301,11 +301,10 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             manual_memory_limit=bool(payload.get("manual_memory_limit", False)),
             role=role,
             memory_guard_tier=memory_guard_tier,
-            engram_ssd_offload=bool(payload.get("engram_ssd_offload", False)),
-            ssd_weight_bytes=int(payload.get("ssd_weight_bytes", 0)),
             tensor_parallel_rank=int(payload.get("tensor_parallel_rank", 0)),
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             sharded_weight_bytes=int(payload.get("sharded_weight_bytes", 0)),
+            ssd_weight_bytes=int(payload.get("ssd_weight_bytes", 0)),
             # ``to_dict`` has always emitted these three; nothing read them
             # back, so every decoded assignment claimed a 0-byte KV cache.
             # ``planned_weight_bytes`` includes the cache, and that is the
@@ -332,13 +331,10 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             assignment.kv_cache_bytes,
             assignment.kv_bytes_per_token,
             assignment.max_context_tokens,
-            assignment.ssd_weight_bytes,
         )
         < 0
     ):
         raise ValueError("pipeline assignment byte counts must be non-negative")
-    if assignment.ssd_weight_bytes > assignment.layer_weight_bytes:
-        raise ValueError("pipeline assignment SSD bytes exceed its layer weights")
     if assignment.capacity_bytes <= assignment.reserve_bytes:
         raise ValueError("pipeline assignment reserve must be below capacity")
     if assignment.headroom_bytes < 0:
@@ -398,15 +394,8 @@ class ClusterDeployment:
             raise ValueError("target_context_tokens must be between 1 and 1,048,576")
         if len(self.assignments) != len(self.hosts):
             raise ValueError("host count must match pipeline assignment count")
-        # Rank 0 is normally spawned as a local child ("127.0.0.1"). On macOS
-        # Tahoe that child cannot join the ring: the identical hostfile joins
-        # in 27 s when rank 0 is spawned over ssh to the machine's own LAN
-        # address, and fails with "[ring] Couldn't connect (error: 60)" on
-        # every run when it is spawned locally. Both targets are accepted here
-        # so the launcher can use the one that works; the address still has to
-        # be non-empty, which is what the check is really about.
-        if not self.hosts[0].ssh:
-            raise ValueError("rank 0 needs an SSH target")
+        if self.hosts[0].ssh != "127.0.0.1":
+            raise ValueError("rank 0 must use SSH target 127.0.0.1")
         if len({host.node_id for host in self.hosts}) != len(self.hosts):
             raise ValueError("cluster node IDs must be unique")
         object.__setattr__(

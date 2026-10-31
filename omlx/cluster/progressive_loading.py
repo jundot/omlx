@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import gc
-import inspect
 import re
 import sys
 from collections.abc import Callable
@@ -72,18 +71,6 @@ def materialize_parameters_progressively(
     return ordered
 
 
-def _loader_takes_settings(loader: Any) -> bool:
-    """Whether ``loader`` accepts the per-rank ``settings`` keyword."""
-
-    if loader is None:
-        return False
-    try:
-        parameters = inspect.signature(loader).parameters
-    except (TypeError, ValueError):
-        return False
-    return "settings" in parameters
-
-
 def progressive_sharded_load(
     repo: Any,
     pipeline_group: Any = None,
@@ -93,7 +80,7 @@ def progressive_sharded_load(
     tokenizer_config: dict[str, Any] | None = None,
     trust_remote_code: bool = False,
     progress: ProgressCallback | None = None,
-    rank_settings: Any = None,
+    engram_ssd_offload: bool = False,
     utils_module: Any = None,
     mx_module: Any = None,
 ) -> Any:
@@ -142,27 +129,18 @@ def progressive_sharded_load(
     # An architecture with its own checkpoint format loads its part itself.
     own_format = sys.modules.get(f"mlx_lm.models.{metadata_config.get('model_type')}")
     stage_loader = getattr(own_format, "load_pipeline_stage", None)
-    # A loader that takes ``settings`` receives this rank's resolved settings
-    # (an argv is identical on every host, so the loader kwargs are the last
-    # hop of the per-model channel). Loaders without the parameter keep
-    # working unchanged.
-    takes_settings = _loader_takes_settings(stage_loader)
-
     if stage_loader is not None:
         if tensor_group is not None:
             tensor_loader = getattr(own_format, "load_tensor_shard", None)
             if tensor_loader is None:
                 raise ValueError("this model supports pipeline parallelism only")
-            if _loader_takes_settings(tensor_loader) and rank_settings is not None:
-                model = tensor_loader(model_path, tensor_group, settings=rank_settings)
-            else:
-                model = tensor_loader(model_path, tensor_group)
+            model = tensor_loader(model_path, tensor_group)
         else:
-            group = pipeline_group or mx_module.distributed.init()
-            if takes_settings and rank_settings is not None:
-                model = stage_loader(model_path, group, settings=rank_settings)
-            else:
-                model = stage_loader(model_path, group)
+            model = stage_loader(
+                model_path,
+                pipeline_group or mx_module.distributed.init(),
+                engram_ssd_offload=engram_ssd_offload,
+            )
         if return_config:
             return model, tokenizer, metadata_config
         return model, tokenizer
@@ -309,7 +287,7 @@ def install_progressive_loader(
     server_module: Any,
     *,
     progress: ProgressCallback | None = None,
-    rank_settings: Any = None,
+    engram_ssd_offload: bool = False,
 ) -> Any:
     """Install the loader only around ``ModelProvider.load_default()``."""
 
@@ -317,7 +295,10 @@ def install_progressive_loader(
 
     def load(*args: Any, **kwargs: Any) -> Any:
         return progressive_sharded_load(
-            *args, **kwargs, progress=progress, rank_settings=rank_settings
+            *args,
+            **kwargs,
+            progress=progress,
+            engram_ssd_offload=engram_ssd_offload,
         )
 
     server_module.sharded_load = load

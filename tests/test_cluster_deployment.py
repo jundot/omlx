@@ -3,7 +3,6 @@
 import base64
 import json
 import zlib
-from dataclasses import replace
 
 import pytest
 
@@ -73,31 +72,6 @@ def _deployment(backend: str = "jaccl") -> ClusterDeployment:
         assignments=_assignments(),
         plan_hash="a" * 64,
     )
-
-
-def test_worker_plan_carries_the_engram_ssd_offload_decision():
-    """The rank's only channel for a per-model setting is the signed plan."""
-
-    deployment = replace(
-        _deployment(),
-        assignments=tuple(
-            replace(item, engram_ssd_offload=True) for item in _assignments()
-        ),
-    )
-
-    plan_hash, decoded = decode_worker_plan(deployment.encode_worker_plan())
-
-    assert plan_hash == deployment.plan_hash
-    assert all(item.engram_ssd_offload for item in decoded)
-    # A plan from before the field keeps the resident default instead of
-    # failing to launch.
-    old_payload = deployment.to_dict()
-    old_payload["assignments"] = [
-        {key: value for key, value in item.items() if key != "engram_ssd_offload"}
-        for item in old_payload["assignments"]
-    ]
-    restored = ClusterDeployment.from_dict(old_payload)
-    assert not any(item.engram_ssd_offload for item in restored.assignments)
 
 
 def test_deployment_round_trip_and_worker_plan_are_json_only():
@@ -315,29 +289,20 @@ def test_jaccl_requires_complete_matrix_with_null_diagonal():
         )
 
 
-def test_rank_zero_may_be_spawned_over_ssh():
-    """MLX's local-child launch cannot join the ring on macOS Tahoe.
-
-    The identical hostfile joins when rank 0 is spawned over ssh to the
-    machine's own address, so a remote rank-0 target must be accepted; only
-    an empty one is rejected (``ClusterHost`` refuses that already).
-    """
-
+def test_rank_zero_must_be_local_launcher_process():
     deployment = _deployment("ring")
-
-    remote_rank_zero = ClusterDeployment(
-        deployment_id=deployment.deployment_id,
-        model=deployment.model,
-        backend=deployment.backend,
-        hosts=(
-            ClusterHost("large", "large.local", ("192.168.20.1",)),
-            deployment.hosts[1],
-        ),
-        assignments=deployment.assignments,
-        plan_hash=deployment.plan_hash,
-    )
-
-    assert remote_rank_zero.hosts[0].ssh == "large.local"
+    with pytest.raises(ValueError, match="rank 0"):
+        ClusterDeployment(
+            deployment_id=deployment.deployment_id,
+            model=deployment.model,
+            backend=deployment.backend,
+            hosts=(
+                ClusterHost("large", "large.local", ("192.168.20.1",)),
+                deployment.hosts[1],
+            ),
+            assignments=deployment.assignments,
+            plan_hash=deployment.plan_hash,
+        )
 
 
 def test_decode_worker_plan_rejects_trailing_compressed_payload():

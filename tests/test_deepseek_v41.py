@@ -1359,11 +1359,24 @@ def test_cluster_stage_loads_only_its_text_weights(tmp_path):
         PipelineAssignment("a", 0, 3, 5, 1, 0, 0, 1),
         PipelineAssignment("b", 1, 0, 3, 1, 0, 0, 1),
     )
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 2)
     with install_unequal_pipeline_plan(plan):
-        stage = deepseek_v41.load_pipeline_stage(
-            target, SimpleNamespace(rank=lambda: 0, size=lambda: 2)
+        stage = deepseek_v41.load_pipeline_stage(target, group)
+        offloaded = deepseek_v41.load_pipeline_stage(
+            target, group, engram_ssd_offload=True
         )
     loaded = dict(tree_flatten(stage.parameters()))
+
+    def resident_tables(model):
+        return [
+            layer.engram.embed._resident is not None
+            for layer in model.language_model.pipeline_layers
+            if "engram" in layer
+        ]
+
+    assert resident_tables(stage) == [True]
+    assert resident_tables(offloaded) == [False]
+    offloaded.close()
 
     assert stage.model.start_idx == 3
     assert len(stage.make_cache()) == len(stage.layers) == 2
