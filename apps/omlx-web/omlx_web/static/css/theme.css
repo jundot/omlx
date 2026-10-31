@@ -275,6 +275,33 @@
     --timeline-accent: rgb(var(--palette-blue-500));
     --focus-ring-color: rgb(var(--palette-neutral-900));
     color-scheme: light;
+
+    /* Named steps. Values match what the console draws today; the utility
+       layer starts resolving through them in the next steps. */
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+    --radius-pill: 9999px;
+    --shadow-raised: 0 1px 2px 0 rgb(var(--palette-black) / 0.05);
+    --shadow-overlay: 0 4px 12px 0 rgb(var(--palette-black) / 0.15);
+    --z-sticky: 30;
+    --z-dropdown: 40;
+    --z-overlay: 50;
+    --z-modal: 60;
+    --z-toast: 1000;
+    --layout-rail: 260px;
+    --layout-rail-wide: 320px;
+    --layout-measure: 768px;
+
+    /* Named surfaces. Opaque, so a text tier's contrast does not depend on
+       whatever happens to sit behind the surface. */
+    --surface-card: rgb(var(--palette-white));
+    --surface-strip: rgb(var(--palette-neutral-100));
+    --surface-control: rgb(var(--palette-neutral-200));
+    --surface-raised: rgb(var(--palette-white));
+    --surface-danger-soft: rgb(var(--palette-red-50));
+    --surface-warning-soft: rgb(var(--palette-amber-50));
 }
 
 [data-theme="dark"] {
@@ -297,6 +324,14 @@
     --timeline-accent: rgb(var(--palette-blue-400));
     --focus-ring-color: rgb(var(--palette-night-50));
     color-scheme: dark;
+
+    --surface-card: rgb(var(--palette-night-800));
+    --surface-strip: rgb(var(--palette-night-700));
+    --surface-control: rgb(var(--palette-night-700));
+    --surface-raised: rgb(var(--palette-night-800));
+    /* red-500 / amber-500 at 0.15 over night-800, flattened to opaque */
+    --surface-danger-soft: rgb(67 42 45);
+    --surface-warning-soft: rgb(68 55 37);
 }
 
 /* === Native select controls ===
