@@ -366,6 +366,24 @@ def test_expert_ordered_verify_gather_matches_gather_qmm(bits):
             ).reshape(rows * top_k, n)
             got = moe_verify_gather.gather_qmv(linear, x, indices.reshape(-1), top_k)
             assert mx.array_equal(got, expected).item()
+            # One ordering shared by both projections gives the same result.
+            order = moe_verify_gather.pair_order(indices.reshape(-1))
+            shared = moe_verify_gather.gather_qmv(
+                linear, x, indices.reshape(-1), top_k, order
+            )
+            assert mx.array_equal(shared, expected).item()
+
+
+@pytest.mark.parametrize("pairs", [2, 16, 33, 64])
+def test_pair_order_sorts_by_expert_then_pair(pairs):
+    from omlx.patches import moe_verify_gather
+
+    mx.random.seed(pairs)
+    # Few experts, so most pairs share one, as verify rows do.
+    rhs = mx.random.randint(0, 6, shape=(pairs,)).astype(mx.uint32)
+    got = moe_verify_gather.pair_order(rhs).tolist()
+    experts = rhs.tolist()
+    assert got == sorted(range(pairs), key=lambda p: (experts[p], p))
 
 
 def _vlm_decode_switch(bits, seed):
