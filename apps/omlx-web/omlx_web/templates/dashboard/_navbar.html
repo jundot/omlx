@@ -8,18 +8,28 @@
                 </a>
                 <div class="flex flex-col gap-0">
                     <a href="/admin/dashboard" class="font-bold tracking-tight text-xl leading-none">oMLX</a>
-                    <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
-                       class="relative text-caption text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
-                       @mouseenter="versionHover = true" @mouseleave="versionHover = false">
-                        v{{ version }}
-                        <span x-show="updateAvailable" x-cloak
-                              class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
-                        <span x-show="versionHover" x-cloak
-                              class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-caption text-white bg-neutral-800 rounded whitespace-nowrap z-50"
-                              x-text="updateAvailable && latestVersion
-                                  ? window.t('navbar.update_available').replace('{version}', latestVersion)
-                                  : window.t('navbar.go_to_github')"></span>
-                    </a>
+                    <div class="flex items-baseline gap-1 leading-none">
+                        <a :href="updateAvailable && releaseUrl ? releaseUrl : 'https://github.com/jundot/omlx'" target="_blank"
+                           class="relative text-caption text-neutral-500 dark:text-neutral-400 leading-none hover:text-neutral-700 dark:hover:text-neutral-300"
+                           @mouseenter="versionHover = true" @mouseleave="versionHover = false">
+                            v{{ version }}
+                            <span x-show="updateAvailable" x-cloak
+                                  class="inline-block w-1.5 h-1.5 bg-green-500 rounded-full ml-0.5 align-middle"></span>
+                            <span x-show="versionHover" x-cloak
+                                  class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-caption text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                                  x-text="updateAvailable && latestVersion
+                                      ? window.t('navbar.update_available').replace('{version}', latestVersion)
+                                      : window.t('navbar.go_to_github')"></span>
+                        </a>
+                        <span x-show="serverStartedAt != null" x-cloak
+                              x-data="{ hover: false }" @mouseenter="hover = true" @mouseleave="hover = false"
+                              class="relative text-caption text-neutral-500 dark:text-neutral-400 leading-none whitespace-nowrap">
+                            · {{ t('status.header.uptime') }} <span x-text="formatUptime(serverUptimeSeconds)"></span>
+                            <span x-show="hover" x-cloak
+                                  class="absolute left-1/2 -translate-x-1/2 top-full mt-1 px-2 py-1 text-caption text-white bg-neutral-800 rounded whitespace-nowrap z-50"
+                                  x-text="window.t('status.header.started_at').replace('{time}', formatStartedAt(serverStartedAt))"></span>
+                        </span>
+                    </div>
                 </div>
             </div>
 
@@ -395,6 +405,24 @@
                     </div>
                 </div>
 
+                <!-- Restart Server -->
+                <button type="button"
+                        @click="restartServerStart()"
+                        :disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
+                        class="nav-tooltip nav-tooltip--end p-2 rounded-full transition-all duration-200 cursor-pointer disabled:cursor-not-allowed"
+                        :class="restartServer.status === 'error'
+                            ? 'text-red-600 hover:bg-neutral-100'
+                            : restartServer.status === 'unsupported'
+                                ? 'text-amber-700 hover:bg-neutral-100'
+                                : 'text-neutral-500 hover:text-neutral-900 hover:bg-neutral-100'"
+                        :data-tooltip="restartServer.status === 'idle' ? window.t('settings.server.restart_button') : restartServer.message"
+                        :aria-label="window.t('settings.server.restart_button')">
+                    <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'" x-cloak
+                       data-lucide="loader-2" class="w-4 h-4 animate-spin"></i>
+                    <i x-show="restartServer.status !== 'restarting' && restartServer.status !== 'waiting'"
+                       data-lucide="rotate-cw" class="w-4 h-4"></i>
+                </button>
+
                 <!-- Logout Button -->
                 <button
                     @click="logout"
@@ -471,6 +499,20 @@
                     <i data-lucide="settings-2" class="w-4 h-4"></i>
                     {{ t('status.layout.customize') }}
                 </button>
+                <button type="button"
+                        @click="restartServerStart(); mobileMenuOpen = false"
+                        :disabled="restartServer.status === 'restarting' || restartServer.status === 'waiting'"
+                        class="w-full px-4 py-2.5 rounded-xl text-sm font-medium transition-all flex items-center gap-2 text-neutral-600 hover:text-neutral-900 hover:bg-neutral-50 disabled:opacity-50">
+                    <i x-show="restartServer.status === 'restarting' || restartServer.status === 'waiting'" x-cloak
+                       data-lucide="loader-2" class="w-4 h-4 animate-spin"></i>
+                    <i x-show="restartServer.status !== 'restarting' && restartServer.status !== 'waiting'"
+                       data-lucide="rotate-cw" class="w-4 h-4"></i>
+                    {{ t('settings.server.restart_button') }}
+                </button>
+                <p x-show="restartServer.status === 'error' || restartServer.status === 'unsupported'" x-cloak
+                   class="px-4 pb-2 text-xs"
+                   :class="restartServer.status === 'error' ? 'text-red-600' : 'text-amber-700'"
+                   x-text="restartServer.message"></p>
                 <div class="border-t border-neutral-100 pt-2 mt-2 flex items-center justify-between px-2">
                     <div class="flex items-center gap-1">
                         <button @click="setTheme('auto')"

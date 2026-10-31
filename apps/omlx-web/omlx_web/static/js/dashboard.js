@@ -419,6 +419,10 @@
                 status: 'idle',
                 message: '',
             },
+            // Server start moment (ms), taken from the stats poll; the navbar
+            // uptime ticks from it on every tab.
+            serverStartedAt: null,
+            uptimeNow: Date.now(),
 
             statsScope: 'session',
             statsNumberScale: window.omlxCount?.scale?.() || 'compact',
@@ -799,6 +803,8 @@
                 }
 
                 await this.handleMainTabChange(this.mainTab);
+                if (this.mainTab !== 'status') this.loadStats(false);
+                setInterval(() => { this.uptimeNow = Date.now(); }, 30000);
                 this.settingsScrollToHash();
 
                 // Watch for main tab changes to manage refresh timers
@@ -4602,6 +4608,9 @@
                     if (response.ok) {
                         const data = await response.json();
                         this.stats = { ...this.stats, ...data };
+                        if (Number.isFinite(data.uptime_seconds)) {
+                            this.serverStartedAt = Date.now() - data.uptime_seconds * 1000;
+                        }
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     }
@@ -4850,16 +4859,13 @@
                 return `${minutes}m`;
             },
 
-            async unloadAllModels() {
-                const loaded = (this.stats.active_models?.models || []).filter(m => !m.is_loading);
-                if (!loaded.length) return;
-                if (!window.confirm(window.t('status.header.unload_all_confirm').replace('{count}', String(loaded.length)))) {
-                    return;
-                }
-                for (const model of loaded) {
-                    await this.unloadModel(model.id);
-                }
-                await this.loadStats();
+            get serverUptimeSeconds() {
+                if (this.serverStartedAt == null) return null;
+                return Math.max(0, (this.uptimeNow - this.serverStartedAt) / 1000);
+            },
+
+            formatStartedAt(ms) {
+                return new Date(ms).toLocaleString(document.documentElement.lang, { dateStyle: 'medium', timeStyle: 'short' });
             },
 
             activeModelsPressureLabel() {

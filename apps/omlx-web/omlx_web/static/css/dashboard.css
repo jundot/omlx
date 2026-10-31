@@ -1252,6 +1252,16 @@
     }
     .nav-tooltip:hover::after,
     .nav-tooltip:focus-visible::after { opacity: 1; }
+    /* Right-aligned and wrapping, for a button near the edge whose tooltip
+       can carry a sentence (the restart error). */
+    .nav-tooltip--end::after {
+        left: auto;
+        right: 0;
+        transform: none;
+        width: max-content;
+        max-width: 16rem;
+        white-space: normal;
+    }
 
     /* === Badge === */
     /* One shape for every status label. The tone comes from color utilities
