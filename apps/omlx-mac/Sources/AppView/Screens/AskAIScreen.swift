@@ -588,10 +588,10 @@ private struct VoiceSection: View {
             Row(
                 label: String(localized: "talkai.row.speed",
                               defaultValue: "Speech Speed",
-                              comment: "Row label for the Talk with AI reply playback speed"),
+                              comment: "Row label for the Ask AI voice reply playback speed"),
                 sublabel: String(localized: "talkai.row.speed.sub",
                                  defaultValue: "Plays replies faster or slower without changing the pitch.",
-                                 comment: "Sublabel for the Talk with AI reply playback speed")
+                                 comment: "Sublabel for the Ask AI voice reply playback speed")
             ) {
                 Popup(selection: $store.prefs.talk.speechSpeed, width: .controlCompact,
                       options: speedOptions)
@@ -656,7 +656,7 @@ private struct VoiceAdvancedSection: View {
             if !voices.isEmpty {
                 Row(label: String(localized: "talkai.row.voice",
                                   defaultValue: "Voice",
-                                  comment: "Row label for the Talk with AI voice picker")) {
+                                  comment: "Row label for the Ask AI voice voice picker")) {
                     Popup(selection: $store.prefs.talk.voice, width: .controlCompact,
                           options: voiceOptions)
                 }
@@ -682,7 +682,7 @@ private struct VoiceAdvancedSection: View {
                 PromptField(text: $store.prefs.talk.systemPrompt,
                             placeholder: String(localized: "talkai.prompt.placeholder",
                                                 defaultValue: "Optional. For example: Keep answers short and friendly.",
-                                                comment: "Placeholder for the Talk with AI system prompt"),
+                                                comment: "Placeholder for the Ask AI voice system prompt"),
                             defaultText: TalkPrefs.defaultPrompt,
                             label: String(localized: "talkai.prompt.general",
                                           defaultValue: "General Prompt",
@@ -727,7 +727,7 @@ private struct VoiceAdvancedSection: View {
         var options: [(String, String)] = [
             ("", String(localized: "talkai.voice.default",
                         defaultValue: "Default",
-                        comment: "Talk with AI voice option that uses the model's default voice")),
+                        comment: "Voice picker option that uses the model's default voice")),
         ]
         let current = store.prefs.talk.voice
         if !current.isEmpty, !voices.contains(current) { options.append((current, current)) }
@@ -797,7 +797,7 @@ private struct MicrophoneGuideSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             Text(String(localized: "talkai.guide.title",
                         defaultValue: "Allow Microphone Access",
-                        comment: "Title of the Talk with AI microphone permission guide"))
+                        comment: "Title of the Ask AI voice microphone permission guide"))
                 .font(.omlxText(DesignTokens.FontSize.title3, weight: .semibold))
                 .foregroundStyle(theme.text)
             step(1, String(localized: "talkai.guide.step1",

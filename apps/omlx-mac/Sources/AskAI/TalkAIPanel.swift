@@ -319,47 +319,47 @@ struct TalkAIPanelView: View {
 private enum TalkAIPanelStrings {
     static var connecting: String {
         String(localized: "talkai.status.connecting", defaultValue: "Connecting…",
-               comment: "Talk with AI status while the voice session starts")
+               comment: "Ask AI voice status while the voice session starts")
     }
 
     static var listening: String {
         String(localized: "talkai.status.listening", defaultValue: "Listening",
-               comment: "Talk with AI status while waiting for or hearing the user")
+               comment: "Ask AI voice status while waiting for or hearing the user")
     }
 
     static var muted: String {
         String(localized: "talkai.status.muted", defaultValue: "Muted",
-               comment: "Talk with AI status while the microphone is muted")
+               comment: "Ask AI voice status while the microphone is muted")
     }
 
     static var thinking: String {
         String(localized: "talkai.status.thinking", defaultValue: "Thinking",
-               comment: "Talk with AI status after the user's turn, before the reply plays")
+               comment: "Ask AI voice status after the user's turn, before the reply plays")
     }
 
     static var speaking: String {
         String(localized: "talkai.status.speaking", defaultValue: "Speaking",
-               comment: "Talk with AI status while the reply plays")
+               comment: "Ask AI voice status while the reply plays")
     }
 
     static var failed: String {
         String(localized: "talkai.status.failed", defaultValue: "Can't Talk Right Now",
-               comment: "Talk with AI status when the session cannot continue")
+               comment: "Ask AI voice status when the session cannot continue")
     }
 
     static var mute: String {
         String(localized: "talkai.button.mute", defaultValue: "Mute",
-               comment: "Help text for the Talk with AI mute button")
+               comment: "Help text for the Ask AI voice mute button")
     }
 
     static var unmute: String {
         String(localized: "talkai.button.unmute", defaultValue: "Unmute",
-               comment: "Help text for the Talk with AI unmute button")
+               comment: "Help text for the Ask AI voice unmute button")
     }
 
     static var end: String {
         String(localized: "talkai.button.end", defaultValue: "End",
-               comment: "Help text for the button that ends the Talk with AI conversation")
+               comment: "Help text for the button that ends the Ask AI voice conversation")
     }
 
     static var shareScreen: String {
@@ -384,7 +384,7 @@ private enum TalkAIPanelStrings {
 
     static var spaceKey: String {
         String(localized: "talkai.orb.space", defaultValue: "Space",
-               comment: "Key cap label in the Talk with AI orb while the user speaks")
+               comment: "Key cap label in the Ask AI voice orb while the user speaks")
     }
 
     static var toSend: String {
@@ -394,6 +394,6 @@ private enum TalkAIPanelStrings {
 
     static var openSettings: String {
         String(localized: "talkai.button.open_settings", defaultValue: "Open Settings",
-               comment: "Button in the Talk with AI panel that opens the relevant settings")
+               comment: "Button in the Ask AI voice panel that opens the relevant settings")
     }
 }

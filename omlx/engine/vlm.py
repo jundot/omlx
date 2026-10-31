@@ -88,7 +88,6 @@ from .realtime_voice import RealtimeVoiceError, RealtimeVoiceSession
 
 logger = logging.getLogger(__name__)
 
-# Realtime voice backends by config model_type.
 _VOICE_BACKENDS = {
     "lfm3_audio": LFM3VoiceBackend,
     "lfm3_omni": LFM3VoiceBackend,

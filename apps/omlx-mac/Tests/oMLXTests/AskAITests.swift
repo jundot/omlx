@@ -1,5 +1,5 @@
 // Ask AI pure logic: SSE line parsing, slash-command parsing, request body
-// shape, tolerant preference decoding, and Talk with AI turn detection and
+// shape, tolerant preference decoding, and Ask AI voice turn detection and
 // realtime event decoding.
 
 @preconcurrency import AVFoundation
@@ -191,7 +191,6 @@ final class AskAITests: XCTestCase {
         XCTAssertFalse(prefs.gpuPowerLimitEnabled)
         XCTAssertNil(prefs.requestGPUPowerLimit)
         XCTAssertEqual(prefs.talk, TalkPrefs())
-        XCTAssertEqual(prefs.talk.hotKey, .optionShiftSpace)
     }
 
     func testGPUPowerLimitIsClampedToTheServerRange() throws {

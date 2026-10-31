@@ -50,7 +50,6 @@ final class TalkAIController {
     /// 0...1 for the orb: the microphone while listening, the reply while speaking.
     private(set) var level = 0.0
     private(set) var hotKeyError: String?
-    /// True once a reply of this conversation can be copied.
     private(set) var canCopyReplies = false
     /// What the session's model accepts; known once the session opens.
     private(set) var capabilities = RealtimeVoiceCapabilities()
@@ -157,7 +156,7 @@ final class TalkAIController {
         hotKeyError = status == noErr ? nil : String(
             localized: "talkai.hotkey.error.in_use",
             defaultValue: "\(combo.displayString) is already used by macOS, Ask AI, or another app. Choose a different shortcut.",
-            comment: "Shown when the Talk with AI hotkey cannot be registered; the argument is the shortcut"
+            comment: "Shown when the Ask AI voice hotkey cannot be registered; the argument is the shortcut"
         )
     }
 
@@ -794,30 +793,30 @@ enum TalkAIStrings {
     static var noModel: String {
         String(localized: "talkai.error.no_model",
                defaultValue: "Choose a voice model in Ask AI settings.",
-               comment: "Shown in the Talk with AI panel when no model is selected")
+               comment: "Shown in the Ask AI voice panel when no model is selected")
     }
 
     static var noMicrophone: String {
         String(localized: "talkai.error.no_microphone",
                defaultValue: "No microphone found. Connect a microphone or headset and try again.",
-               comment: "Shown in the Talk with AI panel when the Mac has no audio input device")
+               comment: "Shown in the Ask AI voice panel when the Mac has no audio input device")
     }
 
     static var microphoneDenied: String {
         String(localized: "talkai.error.microphone",
                defaultValue: "oMLX can't use the microphone. Turn it on in System Settings.",
-               comment: "Shown in the Talk with AI panel when microphone access is denied")
+               comment: "Shown in the Ask AI voice panel when microphone access is denied")
     }
 
     static var audioFailed: String {
         String(localized: "talkai.error.audio",
                defaultValue: "Couldn't start the microphone or speakers.",
-               comment: "Shown in the Talk with AI panel when the audio engine fails to start")
+               comment: "Shown in the Ask AI voice panel when the audio engine fails to start")
     }
 
     static var disconnected: String {
         String(localized: "talkai.error.disconnected",
                defaultValue: "Lost the connection to the server. Make sure it is running.",
-               comment: "Shown in the Talk with AI panel when the realtime connection closes")
+               comment: "Shown in the Ask AI voice panel when the realtime connection closes")
     }
 }

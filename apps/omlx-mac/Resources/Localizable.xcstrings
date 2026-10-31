@@ -33304,7 +33304,7 @@
       }
     },
     "askai.section.general" : {
-      "comment" : "Section header for the Ask AI switch and hotkey",
+      "comment" : "Section header for the Ask AI text and voice switches",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -35842,7 +35842,7 @@
       }
     },
     "talkai.button.end" : {
-      "comment" : "Help text for the button that ends the Talk with AI conversation",
+      "comment" : "Help text for the button that ends the Ask AI voice conversation",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -35866,7 +35866,7 @@
       }
     },
     "talkai.button.mute" : {
-      "comment" : "Help text for the Talk with AI mute button",
+      "comment" : "Help text for the Ask AI voice mute button",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -35890,7 +35890,7 @@
       }
     },
     "talkai.button.open_settings" : {
-      "comment" : "Button in the Talk with AI panel that opens the relevant settings",
+      "comment" : "Button in the Ask AI voice panel that opens the relevant settings",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -35986,7 +35986,7 @@
       }
     },
     "talkai.button.unmute" : {
-      "comment" : "Help text for the Talk with AI unmute button",
+      "comment" : "Help text for the Ask AI voice unmute button",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36010,7 +36010,7 @@
       }
     },
     "talkai.error.audio" : {
-      "comment" : "Shown in the Talk with AI panel when the audio engine fails to start",
+      "comment" : "Shown in the Ask AI voice panel when the audio engine fails to start",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36034,7 +36034,7 @@
       }
     },
     "talkai.error.disconnected" : {
-      "comment" : "Shown in the Talk with AI panel when the realtime connection closes",
+      "comment" : "Shown in the Ask AI voice panel when the realtime connection closes",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36058,7 +36058,7 @@
       }
     },
     "talkai.error.microphone" : {
-      "comment" : "Shown in the Talk with AI panel when microphone access is denied",
+      "comment" : "Shown in the Ask AI voice panel when microphone access is denied",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36082,7 +36082,7 @@
       }
     },
     "talkai.error.no_microphone" : {
-      "comment" : "Shown in the Talk with AI panel when the Mac has no audio input device",
+      "comment" : "Shown in the Ask AI voice panel when the Mac has no audio input device",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36106,7 +36106,7 @@
       }
     },
     "talkai.error.no_model" : {
-      "comment" : "Shown in the Talk with AI panel when no model is selected",
+      "comment" : "Shown in the Ask AI voice panel when no model is selected",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36274,7 +36274,7 @@
       }
     },
     "talkai.guide.title" : {
-      "comment" : "Title of the Talk with AI microphone permission guide",
+      "comment" : "Title of the Ask AI voice microphone permission guide",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36298,7 +36298,7 @@
       }
     },
     "talkai.hotkey.error.in_use" : {
-      "comment" : "Shown when the Talk with AI hotkey cannot be registered; the argument is the shortcut",
+      "comment" : "Shown when the Ask AI voice hotkey cannot be registered; the argument is the shortcut",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36418,7 +36418,7 @@
       }
     },
     "talkai.orb.space" : {
-      "comment" : "Key cap label in the Talk with AI orb while the user speaks",
+      "comment" : "Key cap label in the Ask AI voice orb while the user speaks",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36586,7 +36586,7 @@
       }
     },
     "talkai.prompt.placeholder" : {
-      "comment" : "Placeholder for the Talk with AI system prompt",
+      "comment" : "Placeholder for the Ask AI voice system prompt",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36682,7 +36682,7 @@
       }
     },
     "talkai.row.hotkey" : {
-      "comment" : "Row label for the Talk with AI global shortcut",
+      "comment" : "Row label for the Ask AI voice global shortcut",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36706,7 +36706,7 @@
       }
     },
     "talkai.row.hotkey.sub" : {
-      "comment" : "Sublabel for the Talk with AI global shortcut",
+      "comment" : "Sublabel for the Ask AI voice global shortcut",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36730,7 +36730,7 @@
       }
     },
     "talkai.row.model.sub" : {
-      "comment" : "Sublabel for the Talk with AI model picker",
+      "comment" : "Sublabel for the Ask AI voice model picker",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36754,7 +36754,7 @@
       }
     },
     "talkai.row.speed" : {
-      "comment" : "Row label for the Talk with AI reply playback speed",
+      "comment" : "Row label for the Ask AI voice reply playback speed",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36778,7 +36778,7 @@
       }
     },
     "talkai.row.speed.sub" : {
-      "comment" : "Sublabel for the Talk with AI reply playback speed",
+      "comment" : "Sublabel for the Ask AI voice reply playback speed",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36802,7 +36802,7 @@
       }
     },
     "talkai.row.voice" : {
-      "comment" : "Row label for the Talk with AI voice picker",
+      "comment" : "Row label for the Ask AI voice voice picker",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36898,7 +36898,7 @@
       }
     },
     "talkai.status.connecting" : {
-      "comment" : "Talk with AI status while the voice session starts",
+      "comment" : "Ask AI voice status while the voice session starts",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36922,7 +36922,7 @@
       }
     },
     "talkai.status.failed" : {
-      "comment" : "Talk with AI status when the session cannot continue",
+      "comment" : "Ask AI voice status when the session cannot continue",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36946,7 +36946,7 @@
       }
     },
     "talkai.status.listening" : {
-      "comment" : "Talk with AI status while waiting for or hearing the user",
+      "comment" : "Ask AI voice status while waiting for or hearing the user",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36970,7 +36970,7 @@
       }
     },
     "talkai.status.muted" : {
-      "comment" : "Talk with AI status while the microphone is muted",
+      "comment" : "Ask AI voice status while the microphone is muted",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -36994,7 +36994,7 @@
       }
     },
     "talkai.status.speaking" : {
-      "comment" : "Talk with AI status while the reply plays",
+      "comment" : "Ask AI voice status while the reply plays",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -37018,7 +37018,7 @@
       }
     },
     "talkai.status.thinking" : {
-      "comment" : "Talk with AI status after the user's turn, before the reply plays",
+      "comment" : "Ask AI voice status after the user's turn, before the reply plays",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -37066,7 +37066,7 @@
       }
     },
     "talkai.voice.default" : {
-      "comment" : "Talk with AI voice option that uses the model's default voice",
+      "comment" : "Voice picker option that uses the model's default voice",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
