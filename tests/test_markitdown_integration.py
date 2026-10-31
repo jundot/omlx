@@ -137,7 +137,9 @@ def test_openai_models_hides_markitdown_when_not_exposed():
     assert MARKITDOWN_MODEL_ID not in ids
 
 
-@pytest.mark.parametrize("mime_type", ["application/pdf", "application/octet-stream"])
+@pytest.mark.parametrize(
+    "mime_type", ["application/pdf", "application/octet-stream", "application/x-pdf"]
+)
 def test_markitdown_chat_completion_converts_file(monkeypatch, mime_type):
     state = ServerState()
     state.engine_pool = _EmptyPool()
@@ -460,6 +462,15 @@ def test_text_and_markdown_file_parts_are_inlined_without_converter(monkeypatch)
                         data=_data_uri(b"# Guide", mime_type="text/markdown"),
                         mime_type="text/markdown",
                     ),
+                    # What the web UI sends from a browser whose OS maps .md to
+                    # something else: only the FileReader data URI, no mime_type.
+                    _file_part(
+                        "readme.md",
+                        data=_data_uri(
+                            b"# Readme", mime_type="application/x-genesis-rom"
+                        ),
+                        mime_type="",
+                    ),
                 ],
             )
         ],
@@ -473,6 +484,8 @@ def test_text_and_markdown_file_parts_are_inlined_without_converter(monkeypatch)
     assert "Plain notes" in rendered
     assert "## Attached file: guide.md" in rendered
     assert "# Guide" in rendered
+    assert "## Attached file: readme.md" in rendered
+    assert "# Readme" in rendered
     assert called is False
 
 
@@ -725,19 +738,56 @@ def test_generic_attachment_mime_uses_supported_filename(
     assert parsed.data == b"document"
 
 
-@pytest.mark.parametrize("filename", ["sheet.xlsx", "page.html", "sample"])
-def test_generic_attachment_mime_does_not_allow_unsupported_filename(filename):
+@pytest.mark.parametrize(
+    ("filename", "mime_type"),
+    [
+        ("sheet.xlsx", "application/octet-stream"),
+        ("page.html", "application/octet-stream"),
+        ("page.html", "text/html"),
+        ("sample", "application/octet-stream"),
+    ],
+)
+def test_unsupported_filename_is_rejected_whatever_the_mime(filename, mime_type):
     with pytest.raises(MarkItDownRequestError, match="not supported|Unsupported"):
         parse_file_part(
-            _file_part(filename=filename, mime_type="application/octet-stream"),
+            _file_part(filename=filename, mime_type=mime_type),
             max_file_size_mb=25,
         )
 
 
-def test_supported_filename_does_not_override_specific_unsupported_mime():
-    with pytest.raises(MarkItDownRequestError, match="Unsupported attachment MIME"):
+@pytest.mark.parametrize(
+    ("filename", "mime_type", "expected_mime_type"),
+    [
+        # shared-mime-info still lists *.md under application/x-genesis-rom.
+        ("notes.md", "application/x-genesis-rom", "text/markdown"),
+        ("notes.md", "text/plain; charset=utf-8", "text/markdown"),
+        ("notes.txt", "application/x-unknown", "text/plain"),
+        ("sample.pdf", "application/x-pdf", "application/pdf"),
+    ],
+)
+@pytest.mark.parametrize("explicit_mime", [True, False])
+def test_unrecognized_attachment_mime_falls_back_to_supported_filename(
+    filename, mime_type, expected_mime_type, explicit_mime
+):
+    # The web UI only sends the FileReader data URI, so the browser-reported
+    # type reaches the server either as file.mime_type or inside file_data.
+    part = _file_part(
+        filename=filename,
+        data=_data_uri(b"document", mime_type=mime_type),
+        mime_type=mime_type if explicit_mime else "",
+    )
+
+    parsed = parse_file_part(part, max_file_size_mb=25)
+
+    assert parsed.mime_type == expected_mime_type
+    assert parsed.filename == filename
+    assert parsed.data == b"document"
+
+
+def test_spreadsheet_mime_still_rejects_supported_filename():
+    with pytest.raises(MarkItDownRequestError, match="Spreadsheet"):
         parse_file_part(
-            _file_part(filename="notes.md", mime_type="image/png"),
+            _file_part(filename="notes.md", mime_type="application/vnd.ms-excel"),
             max_file_size_mb=25,
         )
 

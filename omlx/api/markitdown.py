@@ -490,8 +490,6 @@ def parse_file_part(part: dict[str, Any], *, max_file_size_mb: int) -> MarkItDow
         filename = f"attachment{extension}"
 
     extension = Path(filename).suffix.lower()
-    if mime_type == "application/octet-stream":
-        mime_type = ""
     _validate_supported_file(filename, mime_type)
 
     data = _decode_data(data_value)
@@ -502,7 +500,12 @@ def parse_file_part(part: dict[str, Any], *, max_file_size_mb: int) -> MarkItDow
             status_code=400,
         )
 
-    if not mime_type:
+    if mime_type not in SUPPORTED_ATTACHMENT_MIME_TYPES:
+        # Browsers take File.type from the uploading machine's file associations,
+        # not from the file, so the same .md can arrive as application/octet-stream,
+        # an alias registered by some unrelated app, or nothing at all. The
+        # supported extension already decided the file is accepted; it also picks
+        # the converter when the reported MIME type is not one we know.
         mime_type = _mime_type_for_extension(extension)
 
     return MarkItDownFile(filename=filename, mime_type=mime_type, data=data)
@@ -815,12 +818,6 @@ def _validate_supported_file(filename: str, mime_type: str) -> None:
     if extension not in SUPPORTED_ATTACHMENT_EXTENSIONS:
         raise MarkItDownRequestError(
             "Unsupported attachment type. "
-            "Supported formats are PDF, DOCX, PPTX, TXT, and MD.",
-            status_code=400,
-        )
-    if mime_type and mime_type not in SUPPORTED_ATTACHMENT_MIME_TYPES:
-        raise MarkItDownRequestError(
-            "Unsupported attachment MIME type. "
             "Supported formats are PDF, DOCX, PPTX, TXT, and MD.",
             status_code=400,
         )
