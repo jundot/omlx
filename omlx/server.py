@@ -51,7 +51,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -205,6 +205,12 @@ from .api.tool_calling import (
     parse_qwen_tool_calls,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
+)
+from .api.tool_choice import (
+    ForcedToolCall,
+    forced_call_messages,
+    forced_tool_call_outputs,
+    resolve_forced_tool_call,
 )
 from .api.utils import (
     clean_special_tokens,
@@ -4963,6 +4969,46 @@ def _resolve_template_tools(
     return tools_for_template
 
 
+async def _resolve_forced_tool_call(
+    request: ChatCompletionRequest,
+    engine: BaseEngine,
+    tools: list[dict] | None,
+    is_partial: bool,
+) -> ForcedToolCall | None:
+    """The call a ``required`` or named ``tool_choice`` forces (#2877).
+
+    Engines that enforce ``tool_choice`` themselves (Splash) get it as is.
+    """
+    choice = request.tool_choice
+    if choice != "required" and not isinstance(choice, dict):
+        return None
+    if getattr(engine, "handles_tool_choice", False):
+        return None
+    if getattr(engine, "tokenizer", None) is None:
+        await engine.start()
+    forced = resolve_forced_tool_call(choice, tools, engine.tokenizer)
+    if forced is not None and is_partial:
+        # The client continues its own partial assistant turn.
+        logger.warning("tool_choice is not enforced on a partial assistant turn")
+        return None
+    return forced
+
+
+def _generation_prompt_opens_thinking(
+    engine: BaseEngine, chat_template_kwargs: dict | None
+) -> bool:
+    """Whether the template's generation prompt opens the reasoning block."""
+    probe = getattr(engine, "_generation_prompt_text", None)
+    if not callable(probe):
+        return False
+    try:
+        suffix, _ = probe(chat_template_kwargs or None, False)
+        return bool(suffix) and prompt_opens_thinking(engine.tokenizer, suffix)[0]
+    except Exception as exc:
+        logger.debug("Could not detect the generation prompt's thinking: %s", exc)
+        return False
+
+
 def _is_chat_template_error(e: Exception) -> bool:
     # Jinja2 TemplateError, AssertionError from strict role validation,
     # ValueError, etc.
@@ -5070,6 +5116,11 @@ async def create_chat_completion(
         is_partial = chat_messages.is_partial
         native_reasoning = chat_messages.native_reasoning
 
+        tools_for_template = _resolve_template_tools(request, engine, resolved_model)
+        forced_call = await _resolve_forced_tool_call(
+            request, engine, tools_for_template, is_partial
+        )
+
         # Compile grammar for structured output (logit-level enforcement).
         # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
         response_format = request.response_format
@@ -5083,6 +5134,9 @@ async def create_chat_completion(
             request.structured_outputs,
             guided_grammar,
         )
+        if forced_call is not None:
+            # The reply is a call; structured output shapes text replies.
+            response_format = structured_outputs = guided_grammar = None
         _reject_diffusion_structured_outputs(
             engine,
             response_format=response_format,
@@ -5128,7 +5182,6 @@ async def create_chat_completion(
             if json_instruction:
                 messages = _inject_json_instruction(messages, json_instruction)
 
-        tools_for_template = _resolve_template_tools(request, engine, resolved_model)
         # Resolve template defaults before preparing the prompt for reuse.
         _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
         await _ensure_tokenizer_for_system_probe(engine, messages)
@@ -5140,6 +5193,15 @@ async def create_chat_completion(
             is_partial=is_partial,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(),
         )
+        if forced_call is not None:
+            forced_call = replace(
+                forced_call,
+                thinks=_generation_prompt_opens_thinking(engine, merged_ct_kwargs),
+            )
+            if not forced_call.thinks:
+                # The reply starts with the call's opening, a partial turn.
+                messages = forced_call_messages(messages, forced_call)
+                is_partial = True
         # Validate context window before sending to model
         try:
             num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
@@ -5237,6 +5299,11 @@ async def create_chat_completion(
         # Add tools if provided (includes MCP tools)
         if tools_for_template:
             chat_kwargs["tools"] = tools_for_template
+        # Splash enforces a required or named tool_choice itself.
+        if getattr(engine, "handles_tool_choice", False) and (
+            request.tool_choice == "required" or isinstance(request.tool_choice, dict)
+        ):
+            chat_kwargs["tool_choice"] = request.tool_choice
 
         # Add chat template kwargs
         if merged_ct_kwargs:
@@ -5304,6 +5371,7 @@ async def create_chat_completion(
                                 model_load_duration=model_load_duration,
                                 resolved_model=resolved_model,
                                 response_id=response_id,
+                                forced_call=forced_call,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -5324,7 +5392,13 @@ async def create_chat_completion(
             await _raise_if_llm_lease_abort_requested(lease)
             start_time = time.perf_counter()
 
-            output = await engine.chat(messages=messages, **chat_kwargs)
+            if forced_call is not None:
+                async for chunk in forced_tool_call_outputs(
+                    engine, messages, forced_call, **chat_kwargs
+                ):
+                    output = chunk
+            else:
+                output = await engine.chat(messages=messages, **chat_kwargs)
 
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -6577,6 +6651,7 @@ async def stream_chat_completion(
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     response_id: Optional[str] = None,
+    forced_call: ForcedToolCall | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -6680,7 +6755,12 @@ async def stream_chat_completion(
     if request.return_progress:
         # The engine keys the prefill tracker by this id.
         progress_request_id = kwargs.setdefault("_request_id", str(uuid.uuid4()))
-    engine_stream = engine.stream_chat(messages=messages, **kwargs)
+    if forced_call is not None:
+        engine_stream = forced_tool_call_outputs(
+            engine, messages, forced_call, **kwargs
+        )
+    else:
+        engine_stream = engine.stream_chat(messages=messages, **kwargs)
     if progress_request_id is not None:
         engine_stream = _with_prompt_progress(engine_stream, progress_request_id)
     try:

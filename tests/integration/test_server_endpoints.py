@@ -1521,6 +1521,181 @@ def test_chat_usage_reports_reasoning_tokens(
     assert usage["completion_tokens_details"]["reasoning_tokens"] == reasoning_tokens
 
 
+class TestForcedToolChoice:
+    """tool_choice "required" and named functions make the reply a call (#2877).
+
+    The engine has no grammar compiler, as without xgrammar.
+    """
+
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+        for name in ("get_weather", "get_time")
+    ]
+    CALL = "\n<parameter=city>\nVienna\n</parameter>\n</function>\n"
+
+    @pytest.fixture
+    def engine(self, mock_llm_engine):
+        from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+        from omlx.engine.base import GenerationOutput
+
+        tokenizer = mock_llm_engine.tokenizer
+        tokenizer.has_tool_calling = True
+        tokenizer.tool_call_start = "<tool_call>"
+        tokenizer.tool_call_end = "</tool_call>"
+        tokenizer.tool_parser = parse_tool_call
+        mock_llm_engine.calls = []
+        mock_llm_engine.scripts = []
+
+        async def stream_chat(messages, **kwargs):
+            mock_llm_engine.calls.append({"messages": messages, **kwargs})
+            text = ""
+            pieces = mock_llm_engine.scripts.pop(0)
+            for i, piece in enumerate(pieces, 1):
+                text += piece
+                yield GenerationOutput(
+                    text=text,
+                    new_text=piece,
+                    completion_tokens=i,
+                    finished=i == len(pieces),
+                    finish_reason="stop" if i == len(pieces) else None,
+                )
+
+        mock_llm_engine.stream_chat = stream_chat
+        assert mock_llm_engine.grammar_compiler is None
+        return mock_llm_engine
+
+    def _payload(self, tool_choice, **extra):
+        return {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Tell me about Vienna."}],
+            "tools": self.TOOLS,
+            "tool_choice": tool_choice,
+            **extra,
+        }
+
+    def test_required_reply_is_a_call(self, client, engine):
+        engine.scripts.append(["=get_weather>", self.CALL, "</tool_call>"])
+
+        response = client.post("/v1/chat/completions", json=self._payload("required"))
+
+        assert response.status_code == 200
+        choice = response.json()["choices"][0]
+        assert choice["finish_reason"] == "tool_calls"
+        assert choice["message"].get("content") is None
+        [call] = choice["message"]["tool_calls"]
+        assert call["function"]["name"] == "get_weather"
+        assert json.loads(call["function"]["arguments"]) == {"city": "Vienna"}
+        # The reply was started with the call's opening, as a partial turn.
+        [sent] = engine.calls
+        assert sent["messages"][-1] == {
+            "role": "assistant",
+            "content": "<tool_call>\n<function",
+        }
+        assert sent["is_partial"] is True
+        assert "compiled_grammar" not in sent
+
+    def test_named_function_streams_reasoning_then_one_call(
+        self, client, engine, monkeypatch
+    ):
+        # The prompt opens the reasoning block (Qwen3.6 with thinking on).
+        monkeypatch.setattr(
+            "omlx.server._generation_prompt_opens_thinking", lambda *a: True
+        )
+        monkeypatch.setattr(
+            "omlx.server.prompt_opens_thinking", lambda *a, **k: (True, "<think>")
+        )
+        engine.scripts += [["Vienna is", " in Austria.\n"], [self.CALL]]
+        named = {"type": "function", "function": {"name": "get_time"}}
+
+        response = client.post(
+            "/v1/chat/completions", json=self._payload(named, stream=True)
+        )
+
+        assert response.status_code == 200
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        deltas = [c["delta"] for e in events for c in e.get("choices", [])]
+        reasoning = "".join(d.get("reasoning_content") or "" for d in deltas)
+        assert reasoning == "Vienna is in Austria.\n"
+        assert not "".join(d.get("content") or "" for d in deltas).strip()
+        calls = [tc for d in deltas for tc in d.get("tool_calls") or []]
+        assert [c["function"]["name"] for c in calls] == ["get_time"]
+        finish = [c.get("finish_reason") for e in events for c in e.get("choices", [])]
+        assert "tool_calls" in finish
+        phase1, phase2 = engine.calls
+        assert phase1["stop"] == ["</think>"]
+        assert phase2["messages"][-1] == {
+            "role": "assistant",
+            "content": "<tool_call>\n<function=get_time>",
+            "reasoning_content": "Vienna is in Austria.",
+        }
+        assert phase2["stop"] == ["</tool_call>"]
+
+    def test_forced_call_takes_precedence_over_structured_output(self, client, engine):
+        engine.scripts.append(["=get_time>", self.CALL, "</tool_call>"])
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {"name": "x", "schema": {"type": "object"}},
+        }
+
+        response = client.post(
+            "/v1/chat/completions",
+            json=self._payload("required", response_format=response_format),
+        )
+
+        assert response.status_code == 200
+        assert "Warning" not in response.headers
+        [sent] = engine.calls
+        assert "compiled_grammar" not in sent
+        assert sent["messages"][0]["content"] == "Tell me about Vienna."
+
+    def test_unknown_named_function_is_rejected(self, client, engine):
+        named = {"type": "function", "function": {"name": "get_tide"}}
+
+        response = client.post("/v1/chat/completions", json=self._payload(named))
+
+        assert response.status_code == 400
+        assert engine.calls == []
+
+    def test_auto_is_unchanged(self, client, engine):
+        engine.chat = AsyncMock(return_value=MockGenerationOutput(text="Hi."))
+
+        response = client.post("/v1/chat/completions", json=self._payload("auto"))
+
+        assert response.status_code == 200
+        messages = engine.chat.call_args.kwargs["messages"]
+        assert messages[-1]["role"] == "user"
+        assert engine.chat.call_args.kwargs["is_partial"] is False
+
+    def test_engine_that_handles_tool_choice_gets_it(self, client, engine):
+        # Splash enforces the choice itself.
+        engine.handles_tool_choice = True
+        engine.chat = AsyncMock(return_value=MockGenerationOutput(text="Hi."))
+        named = {"type": "function", "function": {"name": "get_time"}}
+
+        response = client.post("/v1/chat/completions", json=self._payload(named))
+
+        assert response.status_code == 200
+        kwargs = engine.chat.call_args.kwargs
+        assert kwargs["tool_choice"] == named
+        assert kwargs["messages"][-1]["role"] == "user"
+        assert engine.calls == []
+
+
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""
 
