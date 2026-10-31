@@ -35,6 +35,9 @@ final class TalkAIController {
     static let maxTurnFrames = 3000  // 60 s
     /// Long side of a voice screenshot; larger ones only delay the spoken reply.
     static let screenshotPixels = 1024
+    /// A forgotten conversation holds the model and any GPU power cap, so it
+    /// ends after this long without speech from either side.
+    static let idleSeconds: TimeInterval = 600
     /// Retries while the server still closes the previous conversation's session.
     static let maxConnectAttempts = 10
 
@@ -88,6 +91,10 @@ final class TalkAIController {
     @ObservationIgnored private var noticeToken = 0
     /// The reply being played; events of other items belong to a stopped reply.
     @ObservationIgnored private var replyItemID: String?
+    /// The response of `replyItemID`; its function calls arrive as their own items.
+    @ObservationIgnored private var replyResponseID: String?
+    /// Last speech from the user or the model, for the idle end.
+    @ObservationIgnored private var lastSpeech = Date()
     /// Set when the user talks over a reply that the server has not announced yet.
     @ObservationIgnored private var dropNextReply = false
     /// Full text of the current reply; `transcript` shows the spoken part.
@@ -333,11 +340,14 @@ final class TalkAIController {
             connectAttempts = 0
             self.capabilities = capabilities
             startListening(modelDefault: modelDefault)
-        case .functionCall(let callID, let name, let arguments):
+        case .functionCall(let callID, let name, let arguments, let responseID):
+            // Calls of a reply the user already talked over must not run.
+            guard responseID == replyResponseID else { return }
             pendingCalls.append(ChatToolCall(id: callID, name: name, arguments: arguments))
-        case .responseStarted(let itemID):
+        case .responseStarted(let itemID, let responseID):
             guard dropNextReply else {
                 replyItemID = itemID
+                replyResponseID = responseID
                 return
             }
             // Nothing of it was heard, so keep none of it in the conversation.
@@ -345,6 +355,7 @@ final class TalkAIController {
             truncate(itemID, heardMs: 0)
         case .audio(let itemID, let pcm):
             guard itemID == replyItemID else { return }
+            lastSpeech = Date()
             audio?.enqueue(pcm)
             if phase == .thinking {
                 phase = .speaking
@@ -436,6 +447,9 @@ final class TalkAIController {
             self.finishPlayedReply()
             self.resetCaption()
             self.phase = .thinking
+            // The next reply is a new item; speech before it arrives drops it.
+            self.replyItemID = nil
+            self.replyResponseID = nil
             self.requestReply()
         }
     }
@@ -468,6 +482,8 @@ final class TalkAIController {
         "input_audio_buffer_empty",
         "conversation_already_has_active_response",
         "input_audio_buffer_too_large",
+        // A truncate or tool output that raced the reply it was meant for.
+        "item_not_found",
     ]
 
     private func startListening(modelDefault: String) {
@@ -507,6 +523,7 @@ final class TalkAIController {
         detector = VoiceActivityDetector()
         preRoll = []
         phase = .listening
+        lastSpeech = Date()
         let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -547,6 +564,7 @@ final class TalkAIController {
         turnFrames = 0
         turnToken += 1
         toolRounds = 0
+        lastSpeech = Date()
         // Speaking over a tool run drops it; the server forgets unanswered calls.
         cancelTools()
         if isSharingScreen {
@@ -570,6 +588,7 @@ final class TalkAIController {
             if let replyItemID { truncate(replyItemID, heardMs: heardMs) }
         }
         replyItemID = nil
+        replyResponseID = nil
         for frame in preRoll { append(frame) }
         preRoll = []
         phase = .userSpeaking
@@ -634,6 +653,9 @@ final class TalkAIController {
             }
         case .listening, .userSpeaking:
             level = Self.normalized(micLevel)
+            if phase == .listening, Date().timeIntervalSince(lastSpeech) > Self.idleSeconds {
+                endConversation(animated: true)
+            }
         default:
             level = 0
         }
@@ -748,6 +770,7 @@ final class TalkAIController {
         awaitingReply = false
         replyRequested = false
         replyItemID = nil
+        replyResponseID = nil
         dropNextReply = false
         pendingAudio = Data()
         preRoll = []

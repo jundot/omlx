@@ -13,9 +13,9 @@ struct RealtimeVoiceCapabilities: Equatable, Sendable {
 enum RealtimeVoiceEvent: Equatable {
     /// Carries the model's default instructions, which the session update replaces.
     case sessionCreated(instructions: String, capabilities: RealtimeVoiceCapabilities)
-    case responseStarted(itemID: String)
-    /// A tool call that ends the current reply; `arguments` is JSON text.
-    case functionCall(callID: String, name: String, arguments: String)
+    case responseStarted(itemID: String, responseID: String)
+    /// A tool call that ends a reply; `arguments` is JSON text.
+    case functionCall(callID: String, name: String, arguments: String, responseID: String)
     case audio(itemID: String, pcm: Data)
     case transcript(itemID: String, text: String)
     case responseDone(itemID: String, status: String)
@@ -43,12 +43,14 @@ extension RealtimeVoiceEvent {
         case "response.function_call_arguments.done":
             guard let callID = event["call_id"] as? String, let name = event["name"] as? String
             else { return nil }
-            return .functionCall(callID: callID, name: name, arguments: event["arguments"] as? String ?? "")
+            return .functionCall(callID: callID, name: name, arguments: event["arguments"] as? String ?? "",
+                                 responseID: event["response_id"] as? String ?? "")
         case "response.output_item.added":
             // Function call items arrive as their own events at the end of a reply.
             let item = event["item"] as? [String: Any]
             guard item?["type"] as? String ?? "message" == "message" else { return nil }
-            return (item?["id"] as? String).map { .responseStarted(itemID: $0) }
+            let responseID = event["response_id"] as? String ?? ""
+            return (item?["id"] as? String).map { .responseStarted(itemID: $0, responseID: responseID) }
         case "response.output_audio.delta":
             let itemID = event["item_id"] as? String ?? ""
             return (event["delta"] as? String).flatMap { Data(base64Encoded: $0) }

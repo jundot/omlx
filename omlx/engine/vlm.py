@@ -345,9 +345,10 @@ def _patch_video_processor_bug():
        own ProcessorMixin.__init__ rejects unexpected kwargs, so it is
        patched to silently drop ``video_processor``.
 
-    A processor built with a real video processor (mlx-vlm's Qwen3-Omni)
-    keeps it: the modality entry is restored while that processor initializes,
-    because ProcessorMixin derives its attribute list from the mapping.
+    mlx-vlm's Qwen3-Omni processor needs its video processor: the modality
+    entry is restored while that processor initializes, because
+    ProcessorMixin derives its attribute list from the mapping. Other
+    processors still drop it.
     """
     global _video_processor_patched
     if _video_processor_patched:
@@ -378,7 +379,8 @@ def _patch_video_processor_bug():
             if video is None and "video_processor" in params:
                 index = params.index("video_processor")
                 video = args[index] if index < len(args) else None
-            if video is not None and video_entry is not None:
+            keeps_video = type(self).__name__ == "Qwen3OmniMoeProcessor"
+            if keeps_video and video is not None and video_entry is not None:
                 mapping["video_processor"] = video_entry
                 try:
                     return _orig_pm_init(self, *args, **kwargs)

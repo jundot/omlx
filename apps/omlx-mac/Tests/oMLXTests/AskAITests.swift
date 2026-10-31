@@ -314,13 +314,13 @@ final class AskAITests: XCTestCase {
                             capabilities: RealtimeVoiceCapabilities(inputImage: true, tools: true))
         )
         XCTAssertEqual(
-            decode(#"{"type":"response.function_call_arguments.done","call_id":"call_1","name":"web_search","arguments":"{\"query\":\"mlx\"}"}"#),
-            .functionCall(callID: "call_1", name: "web_search", arguments: #"{"query":"mlx"}"#)
+            decode(#"{"type":"response.function_call_arguments.done","response_id":"resp_1","call_id":"call_1","name":"web_search","arguments":"{\"query\":\"mlx\"}"}"#),
+            .functionCall(callID: "call_1", name: "web_search", arguments: #"{"query":"mlx"}"#, responseID: "resp_1")
         )
         // The function call item itself is not a reply to play.
         XCTAssertNil(decode(#"{"type":"response.output_item.added","item":{"id":"item_2","type":"function_call"}}"#))
-        XCTAssertEqual(decode(#"{"type":"response.output_item.added","item":{"id":"item_1"}}"#),
-                       .responseStarted(itemID: "item_1"))
+        XCTAssertEqual(decode(#"{"type":"response.output_item.added","response_id":"resp_1","item":{"id":"item_1"}}"#),
+                       .responseStarted(itemID: "item_1", responseID: "resp_1"))
         XCTAssertEqual(decode(#"{"type":"response.output_audio.delta","item_id":"item_1","delta":"AAEC"}"#),
                        .audio(itemID: "item_1", pcm: Data([0, 1, 2])))
         XCTAssertEqual(decode(#"{"type":"response.output_audio_transcript.delta","item_id":"item_1","delta":"Hi"}"#),

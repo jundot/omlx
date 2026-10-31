@@ -161,19 +161,21 @@ def test_video_processor_patch_keeps_a_real_video_processor(monkeypatch):
         ProcessorMixin, "check_argument_for_proper_class", lambda self, name, arg: None
     )
 
-    class WithVideo(ProcessorMixin):
+    class Qwen3OmniMoeProcessor(ProcessorMixin):
         def __init__(self, image_processor=None, video_processor=None, tokenizer=None):
             super().__init__(image_processor, video_processor, tokenizer)
 
-    class WithoutVideo(ProcessorMixin):
+    class OtherProcessor(ProcessorMixin):
         def __init__(self, image_processor=None, tokenizer=None, **kwargs):
             super().__init__(image_processor, tokenizer, **kwargs)
 
     image, video, tokenizer = object(), object(), object()
-    kept = WithVideo(image, video, tokenizer)
+    kept = Qwen3OmniMoeProcessor(image, video, tokenizer)
     assert kept.video_processor is video and kept.tokenizer is tokenizer
-    dropped = WithoutVideo(image, tokenizer, video_processor=None)
+    # Other processors keep dropping theirs, as before Qwen3-Omni needed one.
+    dropped = OtherProcessor(image, tokenizer, video_processor=video)
     assert dropped.tokenizer is tokenizer
+    assert getattr(dropped, "video_processor", None) is None
 
 
 class TestVLMStreamingCleanup:

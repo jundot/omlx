@@ -28,12 +28,14 @@ from PIL import Image
 
 from omlx.api.audio_routes import _realtime_api_key, realtime_router
 from omlx.engine import lfm3_realtime
+from omlx.engine.qwen3_omni_realtime import Qwen3OmniVoiceBackend
 from omlx.engine.realtime_voice import (
     FunctionCall,
     RealtimeVoiceError,
     RealtimeVoiceSession,
     VoiceBackend,
     VoiceStep,
+    ToolOutput,
     VoiceTurn,
     turn_messages,
 )
@@ -864,19 +866,42 @@ def _png_url():
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 
-def test_turn_puts_tool_images_in_the_last_tool_response():
-    tool_turn = VoiceTurn(images=["shot"], tool_outputs=['{"ok": true}', "page"])
+def test_turn_puts_each_tool_screenshot_in_its_own_response():
+    shot, page = ToolOutput('{"ok": true}', ["shot"]), ToolOutput("page")
+    tool_turn = VoiceTurn(tool_outputs=[shot, page])
     assert turn_messages(tool_turn) == [
-        {"role": "tool", "content": '{"ok": true}'},
         {
             "role": "tool",
-            "content": [{"type": "text", "text": "page"}, {"type": "image"}],
+            "content": [{"type": "text", "text": '{"ok": true}'}, {"type": "image"}],
         },
+        {"role": "tool", "content": "page"},
     ]
-    spoken = VoiceTurn(audio=np.zeros(1), images=["shot"])
-    assert turn_messages(spoken) == [
-        {"role": "user", "content": [{"type": "image"}, {"type": "audio"}]}
-    ]
+    spoken = VoiceTurn(audio=np.zeros(1), images=["screen"], tool_outputs=[shot])
+    assert turn_messages(spoken)[-1] == {
+        "role": "user",
+        "content": [{"type": "image"}, {"type": "audio"}],
+    }
+    assert spoken.all_images == ["shot", "screen"]
+
+
+class _TrimCache:
+    def __init__(self):
+        self.trimmed = 0
+
+    def trim(self, count):
+        self.trimmed += count
+
+
+def test_qwen_stop_while_writing_a_call_keeps_only_the_speech():
+    backend = object.__new__(Qwen3OmniVoiceBackend)
+    backend.cache = [_TrimCache(), _TrimCache()]
+    backend.offset = backend.position = 100
+    # Two spoken tokens, then <tool_call> (9) and call text; the last token is unfed.
+    backend.reply, backend.speech_end, backend.unfed = [1, 2, 9, 3, 4], 2, 4
+    backend.im_end, backend.thinker_done, backend.done = 0, False, False
+    backend.stop()
+    assert backend.reply == [1, 2] and backend.pending == [0] and backend.done
+    assert backend.cache[0].trimmed == 2 and backend.offset == backend.position == 98
 
 
 def _eventually(check, timeout=2.0):
@@ -1023,6 +1048,18 @@ class TestRealtimeVoiceWebSocket:
                 }
             )
             assert ws.receive_json()["type"] == "conversation.item.added"
+            # An image right after an output is that tool's screenshot.
+            ws.send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_image", "image_url": _png_url()}],
+                    },
+                }
+            )
+            assert ws.receive_json()["type"] == "conversation.item.added"
             # A tool output alone opens the next reply.
             ws.send_json({"type": "response.create"})
             assert _until(ws, "response.done")[-1]["response"]["status"] == "completed"
@@ -1031,7 +1068,53 @@ class TestRealtimeVoiceWebSocket:
         assert tools == [
             {"type": "function", "function": {"name": "web_search", "parameters": {}}}
         ]
-        assert second.audio is None and second.tool_outputs == ['{"ok": true}']
+        assert second.audio is None and not second.images
+        assert [o.text for o in second.tool_outputs] == ['{"ok": true}']
+        assert len(second.tool_outputs[0].images) == 1
+
+    def test_truncate_drops_outputs_sent_for_the_cut_reply(self):
+        call = FunctionCall("web_search", "{}")
+        backend = _StubVoiceBackend(calls=[[call]])
+        engine = _voice_engine(backend, self.executor)
+        (p1, p2, p3), _, client = _voice_client(engine)
+        tool = {"type": "function", "name": "web_search"}
+        with p1, p2, p3, client, client.websocket_connect(VOICE_PATH) as ws:
+            ws.receive_json()
+            ws.send_json({"type": "session.update", "session": {"tools": [tool]}})
+            ws.receive_json()
+            ws.send_json({"type": "input_audio_buffer.append", "audio": _pcm(0.2)})
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            ws.receive_json()
+            ws.send_json({"type": "response.create"})
+            done = _until(ws, "response.done")[-1]["response"]
+            reply_id, call_id = done["output"][0]["id"], done["output"][1]["call_id"]
+            ws.send_json(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "{}",
+                    },
+                }
+            )
+            ws.receive_json()
+            # The user talks over the reply before its next reply starts.
+            ws.send_json(
+                {
+                    "type": "conversation.item.truncate",
+                    "item_id": reply_id,
+                    "audio_end_ms": 0,
+                }
+            )
+            assert ws.receive_json()["type"] == "conversation.item.truncated"
+            ws.send_json({"type": "input_audio_buffer.append", "audio": _pcm(0.2)})
+            ws.send_json({"type": "input_audio_buffer.commit"})
+            ws.receive_json()
+            ws.send_json({"type": "response.create"})
+            _until(ws, "response.done")
+        turn, _ = backend.inputs[-1]
+        assert turn.audio is not None and not turn.tool_outputs
 
     def test_images_and_tools_need_a_capable_model(self):
         backend = _StubVoiceBackend()
@@ -1283,12 +1366,14 @@ def test_lfm3_tools_open_speech_like_the_plain_prompt(tiny_lfm3):
     assert tooled._offset() == plain._offset()
 
 
-def test_lfm3_tool_reply_writes_calls_without_speech(tiny_lfm3, monkeypatch):
+def test_lfm3_call_reply_is_silent_and_leaves_no_partial_call(tiny_lfm3, monkeypatch):
     monkeypatch.setattr(lfm3_realtime, "MAX_REPLY_SLOTS", 30)
     ids = list(range(10, 30))
     first = _first_choice(tiny_lfm3, ids)
-    backend = _tiny_backend(tiny_lfm3, ids)
     monkeypatch.setattr(_Tokenizer, "special", {"<tool_call>": first})
+    # Call text that never closes, until the slot limit stops it.
+    monkeypatch.setattr(lfm3_realtime, "sample", lambda *args: mx.array([40]))
+    backend = _tiny_backend(tiny_lfm3, ids)
     backend.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, TOOLS)
     texts, audio = [], 0
     while True:
@@ -1297,20 +1382,43 @@ def test_lfm3_tool_reply_writes_calls_without_speech(tiny_lfm3, monkeypatch):
         audio += step.audio.size
         if step.done:
             break
-    assert backend.call_ids[0] == first and audio == 0 and not "".join(texts)
-    assert all(codes is None for _, codes in backend.reply)
-    # Nothing of a call reply was heard, so a cut drops all of it.
-    backend.truncate(0.0)
+    assert audio == 0 and not "".join(texts) and not step.function_calls
     assert backend._offset() == len(ids)
     assert _slots(backend.pending) == [(255, None)]
+
+
+def test_lfm3_call_that_ends_early_turns_into_speech(tiny_lfm3, monkeypatch):
+    ids = list(range(10, 30))
+    first = _first_choice(tiny_lfm3, ids)
+    monkeypatch.setattr(_Tokenizer, "special", {"<tool_call>": first})
+    backend = _tiny_backend(tiny_lfm3, ids)
+    backend.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, TOOLS)
+    assert backend.call_ids == [first]
+    monkeypatch.setattr(lfm3_realtime, "sample", lambda *args: mx.array([255]))
+    backend._slot()
+    assert backend.mode == lfm3_realtime.INTERLEAVED and not backend.call_ids
+    # Back at the prompt's end, with the interleaved opener fed.
+    assert backend._offset() == len(ids) + 1 and not backend.finished
+
+
+def test_lfm3_failed_first_turn_keeps_no_cache(tiny_lfm3, monkeypatch):
+    def fail(*args, **kwargs):
+        raise RuntimeError("out of memory")
+
+    backend = _tiny_backend(tiny_lfm3, list(range(10, 30)))
+    monkeypatch.setattr(type(tiny_lfm3), "get_input_embeddings", fail)
+    with pytest.raises(RuntimeError):
+        backend.begin_turn(VoiceTurn(np.zeros(2400, np.float32)), "", None, TOOLS)
+    # The retry renders the system prompt and tools again.
+    assert backend.cache is None and backend.tools == []
 
 
 def test_lfm3_reads_its_xml_tool_call(tiny_lfm3):
     backend = _tiny_backend(tiny_lfm3)
     xml = "<tool_call>\n<function=web_search>\n<parameter=query>\nmlx\n</parameter>\n</function>\n</tool_call>"
     backend.tokenizer = SimpleNamespace(decode=lambda ids, skip_special_tokens: xml)
-    backend.tools, backend.call_ids, backend.call_done = TOOLS, [1], True
-    (call,) = backend._function_calls()
+    backend.tools, backend.call_ids = TOOLS, [1]
+    (call,) = backend._parse_calls()
     assert call.name == "web_search" and json.loads(call.arguments) == {"query": "mlx"}
 
 

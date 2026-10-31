@@ -1153,10 +1153,17 @@ async def _run_realtime_voice(
         part = {"output_index": 0, "content_index": 0}
         transcript: list[str] = []
 
+        async def send_delta(event: dict) -> None:
+            try:
+                await send(event)
+            except Exception:
+                # The client is gone; stop the reply instead of failing it.
+                session.cancel()
+
         async def on_text(delta: str) -> None:
             await announced.wait()
             transcript.append(delta)
-            await send(
+            await send_delta(
                 {
                     "type": "response.output_audio_transcript.delta",
                     **ids,
@@ -1168,7 +1175,7 @@ async def _run_realtime_voice(
         async def on_audio(audio) -> None:
             await announced.wait()
             delta = base64.b64encode(pcm16_bytes(audio)).decode("ascii")
-            await send(
+            await send_delta(
                 {"type": "response.output_audio.delta", **ids, **part, "delta": delta}
             )
 

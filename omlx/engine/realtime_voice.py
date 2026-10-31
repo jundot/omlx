@@ -54,16 +54,27 @@ class FunctionCall:
 
 
 @dataclass
-class VoiceTurn:
-    """What a reply answers: tool outputs, images, and the user's speech.
+class ToolOutput:
+    """A call's output, with the images the client sent right after it."""
 
-    A turn without speech answers the outputs of the previous reply's calls;
-    its images belong to the last output, as a screenshot a tool took.
-    """
+    text: str
+    images: list = field(default_factory=list)
+
+
+@dataclass
+class VoiceTurn:
+    """What a reply answers: tool outputs, then the user's images and speech."""
 
     audio: np.ndarray | None = None
     images: list = field(default_factory=list)
-    tool_outputs: list[str] = field(default_factory=list)
+    tool_outputs: list[ToolOutput] = field(default_factory=list)
+
+    @property
+    def all_images(self) -> list:
+        """Images in the order the turn's messages show them."""
+        return [image for output in self.tool_outputs for image in output.images] + (
+            self.images if self.audio is not None else []
+        )
 
 
 @dataclass
@@ -163,7 +174,7 @@ class RealtimeVoiceSession:
         self._buffer = bytearray()
         self._pending: np.ndarray | None = None
         self._images: list = []
-        self._tool_outputs: list[str] = []
+        self._tool_outputs: list[ToolOutput] = []
         # Calls of the last reply that still wait for their output.
         self._open_calls: list[str] = []
         self._locked = False
@@ -231,14 +242,19 @@ class RealtimeVoiceSession:
         self._buffer.clear()
 
     def add_image(self, image) -> None:
-        """Attach an image to the next turn."""
+        """Attach an image to the next turn. Before any speech of that turn, an
+        image follows the tool output sent just before it, as a tool screenshot."""
         if not self._backend.input_image:
             raise RealtimeVoiceError("unsupported", "this model does not read images")
-        if len(self._images) >= MAX_TURN_IMAGES:
+        held = len(self._images) + sum(len(o.images) for o in self._tool_outputs)
+        if held >= MAX_TURN_IMAGES:
             raise RealtimeVoiceError(
                 "invalid_value", f"a turn holds at most {MAX_TURN_IMAGES} images"
             )
-        self._images.append(image)
+        if self._pending is None and self._tool_outputs:
+            self._tool_outputs[-1].images.append(image)
+        else:
+            self._images.append(image)
 
     def add_tool_output(self, call_id: str, output: str) -> None:
         if call_id not in self._open_calls:
@@ -246,7 +262,7 @@ class RealtimeVoiceSession:
                 "item_not_found", f"no function call {call_id!r} waits for output"
             )
         self._open_calls.remove(call_id)
-        self._tool_outputs.append(output)
+        self._tool_outputs.append(ToolOutput(output))
 
     def commit(self) -> None:
         if len(self._buffer) < MIN_COMMIT_SECONDS * SAMPLE_RATE * 2:
@@ -401,8 +417,9 @@ class RealtimeVoiceSession:
                 "invalid_value", "audio_end_ms must not be negative"
             )
         await self._settle()
-        # The cut drops any call the reply made.
+        # The cut drops any call the reply made, and the outputs already sent for it.
         self._open_calls = []
+        self._tool_outputs = []
         logger.info("Realtime voice reply truncated after %d ms", audio_end_ms)
         loop = asyncio.get_running_loop()
         self._engine._speech_active += 1
@@ -444,16 +461,18 @@ class TranscriptStream:
 def turn_messages(turn: VoiceTurn) -> list[dict]:
     """Chat messages of one turn: tool outputs, then the user's images and speech.
 
-    Without speech the images are what the last tool returned, so they go
-    inside that tool's response.
+    A tool's screenshot goes inside that tool's response.
     """
-    messages = [{"role": "tool", "content": output} for output in turn.tool_outputs]
-    images = [{"type": "image"} for _ in turn.images]
+    messages = []
+    for output in turn.tool_outputs:
+        content = output.text
+        if output.images:
+            content = [{"type": "text", "text": output.text}]
+            content += [{"type": "image"} for _ in output.images]
+        messages.append({"role": "tool", "content": content})
     if turn.audio is not None:
+        images = [{"type": "image"} for _ in turn.images]
         messages.append({"role": "user", "content": [*images, {"type": "audio"}]})
-    elif images:
-        text = messages[-1]["content"]
-        messages[-1]["content"] = [{"type": "text", "text": text}, *images]
     return messages
 
 

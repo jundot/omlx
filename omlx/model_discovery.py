@@ -404,9 +404,12 @@ AUDIO_STS_ARCHITECTURES = {
 REALTIME_VOICE_MODEL_TYPES = frozenset({"lfm3_audio", "lfm3_omni", "qwen3_omni_moe"})
 
 
-def is_realtime_voice_model(config_model_type: str) -> bool:
+def is_realtime_voice_model(config_model_type: str, config: dict | None = None) -> bool:
     """True when the model can hold a spoken conversation on /v1/realtime."""
-    return config_model_type in REALTIME_VOICE_MODEL_TYPES
+    if config_model_type not in REALTIME_VOICE_MODEL_TYPES:
+        return False
+    # Thinker-only Qwen3-Omni checkpoints have no talker to speak with.
+    return (config or {}).get("enable_audio_output", True) is not False
 
 
 def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
@@ -425,6 +428,7 @@ class DiscoveredModel:
     estimated_size: int  # Estimated memory usage in bytes
     text_only_size: int = 0  # Language-only estimate for VLM checkpoints (0 = n/a)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
+    realtime_voice: bool = False  # Its model type and config allow /v1/realtime
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     reasoning_efforts: list[str] | None = None  # Template effort levels (None = no effort)
@@ -1797,6 +1801,7 @@ def _register_model(
             estimated_size=estimated_size,
             text_only_size=text_only_size,
             config_model_type=config_model_type,
+            realtime_voice=is_realtime_voice_model(config_model_type, _config),
             thinking_default=thinking_default,
             preserve_thinking_default=preserve_thinking_default,
             reasoning_efforts=reasoning_efforts,

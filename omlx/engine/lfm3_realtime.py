@@ -164,7 +164,10 @@ class LFM3VoiceBackend(VoiceBackend):
         self.backbone = model.language_model.model
         self.sampling = {**_SAMPLING, **model.audio_sampling}
         eos = config.eos_token_id
-        self.eos_ids = set(eos if isinstance(eos, (list, tuple)) else [eos])
+        eos = list(eos) if isinstance(eos, (list, tuple)) else [eos]
+        self.eos_ids = set(eos)
+        # The checkpoints list <|im_end|> first, then <|text_end|>.
+        self.im_end = eos[0]
         self.suppress = model.placeholder_token_ids()
         self.limit = config.lm_config.max_position_embeddings
         self.eos_frame = mx.full(
@@ -191,7 +194,7 @@ class LFM3VoiceBackend(VoiceBackend):
                 add_generation_prompt=True,
                 tokenize=False,
             )
-        im_end = self.tokenizer.convert_ids_to_tokens(self.config.eos_token_id[0])
+        im_end = self.tokenizer.convert_ids_to_tokens(self.im_end)
         return continuation_turn_text(self.tokenizer, messages, im_end, turn=len(turn))
 
     def _embed(self, slots: list[tuple[int, mx.array | None]]) -> mx.array:
@@ -219,7 +222,7 @@ class LFM3VoiceBackend(VoiceBackend):
             ]
         inputs = self.processor(
             text=self._turn_text(system, turn_messages(turn), tools),
-            images=turn.images or None,
+            images=turn.all_images or None,
             audio=clips,
         )
         ids = np.asarray(inputs["input_ids"]).reshape(-1).tolist()
@@ -236,22 +239,26 @@ class LFM3VoiceBackend(VoiceBackend):
         self, turn: VoiceTurn, instructions: str, voice: str | None, tools: list[dict]
     ) -> int:
         system = f"{REPLY_PROMPT}\n\n{instructions}" if instructions else REPLY_PROMPT
-        if self.cache is None:
-            self.tools = tools
+        first = self.cache is None
         ids, features = self._turn_inputs(turn, system, tools)
-        if self.cache is None:
-            self.cache = self.model.make_cache()
         prompt_tokens = len(self.pending) + len(ids)
-        if self._offset() + prompt_tokens + MAX_REPLY_SLOTS > self.limit:
+        if (
+            0 if first else self._offset()
+        ) + prompt_tokens + MAX_REPLY_SLOTS > self.limit:
             raise RealtimeVoiceError(
                 "conversation_too_long", "the conversation reached the model's context"
             )
+        # A failed first turn leaves no cache, so a retry renders the system prompt again.
+        cache = self.model.make_cache() if first else self.cache
         turn = self.model.get_input_embeddings(
             mx.array([ids]), **features
         ).inputs_embeds[0]
         if self.pending:
             turn = mx.concatenate([self._embed(self.pending), turn])
-        self.hidden = self.backbone(None, self.cache, turn[None])[:, -1]
+        self.hidden = self.backbone(None, cache, turn[None])[:, -1]
+        self.cache = cache
+        if first:
+            self.tools = tools
         self.pending = []
         self.mode = INTERLEAVED
         self.slots_left = self.config.interleaved_n_text
@@ -263,7 +270,7 @@ class LFM3VoiceBackend(VoiceBackend):
         self.text_ids: list[int] = []
         # Tokens of the calls a tool reply writes, from its <tool_call>.
         self.call_ids: list[int] = []
-        self.call_done = False
+        self.calls: list[FunctionCall] = []
         self.transcript = TranscriptStream(self.tokenizer)
         self.finished = False
         self.codec.reset()
@@ -277,19 +284,29 @@ class LFM3VoiceBackend(VoiceBackend):
         """Start a call reply when the model's first choice is <tool_call>, else speech."""
         logits = self.backbone.embed_tokens.as_linear(self.hidden)
         first = int(mx.argmax(logits, axis=-1).item())
-        tool_start = self.tokenizer.convert_tokens_to_ids("<tool_call>")
-        if first == tool_start:
-            self.snapshot = self._snapshot()
-            self.mode = TEXT
-            self.call_ids = [first]
-            slot = (first, None)
-            self.reply.append(slot)
-        else:
-            # The interleaved opener belongs to the prompt, as it does without tools.
-            slot = (self.config.mixed_start_token_id, None)
+        if first != self.tokenizer.convert_tokens_to_ids("<tool_call>"):
+            self._open_speech()
+            return
+        self.snapshot = self._snapshot()
+        self.mode = TEXT
+        self.call_ids = [first]
+        slot = (first, None)
+        self.reply.append(slot)
         self.hidden = self.backbone(None, self.cache, self._embed([slot])[None])[:, -1]
-        if first != tool_start:
-            self.snapshot = self._snapshot()
+
+    def _open_speech(self) -> None:
+        """Open the interleaved reply. The opener belongs to the prompt, as it does
+        without tools; a call reply that did not work out restarts here."""
+        if self.call_ids:
+            self._restore()
+            self.call_ids, self.reply = [], []
+            self.text_history.clear()
+        self.mode = INTERLEAVED
+        self.slots_left = self.config.interleaved_n_text
+        self.speaking = self.text_done = False
+        slot = (self.config.mixed_start_token_id, None)
+        self.hidden = self.backbone(None, self.cache, self._embed([slot])[None])[:, -1]
+        self.snapshot = self._snapshot()
 
     def _slot(self) -> None:
         """Sample one slot and feed it back, as one ``stream_slots`` iteration."""
@@ -331,10 +348,14 @@ class LFM3VoiceBackend(VoiceBackend):
             if self.call_ids:
                 # A tool reply ends with its calls; it never speaks.
                 self.call_ids.append(token)
-                self.call_done = token == self.tokenizer.convert_tokens_to_ids(
-                    "</tool_call>"
-                )
-                finished = self.call_done or token in self.eos_ids
+                ended = token == self.tokenizer.convert_tokens_to_ids("</tool_call>")
+                if ended or token in self.eos_ids:
+                    self.calls = self._parse_calls() if ended else []
+                    if not self.calls:
+                        # An unreadable or unfinished call: answer in speech instead.
+                        self._open_speech()
+                        return
+                    finished = True
             elif token == config.text_end_token_id:
                 if interleaving:
                     self.text_done = self.speaking = True
@@ -366,7 +387,7 @@ class LFM3VoiceBackend(VoiceBackend):
         if finished:
             # The final token is fed with the next turn, as stream_slots never
             # feeds it. A reply that stops on <|text_end|> still needs <|im_end|>.
-            im_end = config.eos_token_id[0]
+            im_end = self.im_end
             self.pending = [slot] if slot[0] == im_end else [slot, (im_end, None)]
             self.finished = True
         else:
@@ -392,13 +413,11 @@ class LFM3VoiceBackend(VoiceBackend):
         if self.finished:
             audio = np.concatenate([audio, self.codec.flush()])
             out.done = True
-            out.function_calls = self._function_calls()
+            out.function_calls = self.calls
         out.audio = audio
         return out
 
-    def _function_calls(self) -> list[FunctionCall]:
-        if not self.call_done:
-            return []
+    def _parse_calls(self) -> list[FunctionCall]:
         text = self.tokenizer.decode(self.call_ids, skip_special_tokens=False)
         _, calls = parse_tool_calls(text, self.tokenizer, self.tools)
         return [
@@ -414,16 +433,30 @@ class LFM3VoiceBackend(VoiceBackend):
             and slots[-1][1][0].item() == self.config.audio_eos_code
         ):
             tail.append((self.config.audio_out_token_id, self.eos_frame))
-        return tail + [(self.config.eos_token_id[0], None)]
+        return tail + [(self.im_end, None)]
+
+    def _drop_call_reply(self) -> None:
+        """Take a call reply out of the context; nothing of it was spoken."""
+        self._restore()
+        self.pending = self._closing([])
+        self.reply, self.call_ids, self.calls = [], [], []
+        self.finished = True
 
     def stop(self) -> None:
         if self.finished:
+            return
+        if self.call_ids:
+            self._drop_call_reply()
             return
         self.pending = self._closing(self.reply)
         self.finished = True
 
     def truncate(self, played_seconds: float) -> None:
         if self.snapshot is None:
+            return
+        # Truncating a call reply abandons its calls.
+        if self.call_ids:
+            self._drop_call_reply()
             return
         played = int(played_seconds / FRAME_SECONDS + 1e-6)
         heard, kept = 0, []

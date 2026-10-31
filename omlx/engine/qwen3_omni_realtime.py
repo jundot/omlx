@@ -69,6 +69,8 @@ FRAME_SECONDS = 0.08
 SAMPLES_PER_FRAME = 1920
 MAX_REPLY_TOKENS = 1024
 MAX_FRAMES = 1500
+# The talker reprefills the users' turns every reply; older turns only add latency.
+MAX_TALKER_TURNS = 8
 # code2wav attends over at most 72 frames in the reference model.
 CODE2WAV_CONTEXT = 25
 MAX_CODE2WAV_CHUNK = 47
@@ -183,9 +185,8 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
         self, turn: VoiceTurn, instructions: str, voice: str | None, tools: list[dict]
     ) -> int:
         first = self.cache is None
-        if first:
-            self.tools = tools
         text = self._turn_text(instructions, turn_messages(turn), tools)
+        images = turn.all_images
         clips = None
         if turn.audio is not None:
             clips = [
@@ -195,12 +196,13 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
             ]
         inputs = self.processor(
             text=[text],
-            images=turn.images or None,
+            images=images or None,
             audio=clips,
             sampling_rate=INPUT_RATE,
         )
+        # A failed first turn leaves no cache, so a retry renders the system prompt again.
+        cache = make_prompt_cache(self.thinker) if first else self.cache
         if first:
-            self.cache = make_prompt_cache(self.thinker)
             self.offset = self.position = 0
         ids = self.pending + np.asarray(inputs["input_ids"]).reshape(-1).tolist()
         if self.offset + len(ids) + MAX_REPLY_TOKENS > self.limit:
@@ -221,7 +223,7 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
         features = self.model.thinker.get_input_embeddings(tokens, **media)
         embeds = features.inputs_embeds
         visual = {}
-        if turn.images:
+        if images:
             # The helper counts positions from 0 for this turn's tokens.
             positions = features.position_ids + self.position
             visual = {
@@ -230,14 +232,19 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
             }
         else:
             positions = self._positions(len(ids))
-        out = self.thinker(
+        # The inner model skips logits for every prompt position but the last.
+        hidden, accepted = self.thinker.model(
             tokens,
             inputs_embeds=embeds,
-            cache=self.cache,
+            cache=cache,
             position_ids=positions,
             output_hidden_state_idx=self.accept_layer,
             **visual,
         )
+        logits = self._logits(hidden[:, -1:])
+        self.cache = cache
+        if first:
+            self.tools = tools
         self.offset += len(ids)
         self.position = int(positions.max().item()) + 1
         self.snapshot, self.position_snapshot = self.offset, self.position
@@ -250,10 +257,11 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
                 user_start,
                 assistant_start,
                 mx.array(media_mask)[None],
-                out.hidden_states,
+                accepted,
                 embeds,
             )
         )
+        self.user_parts = self.user_parts[-MAX_TALKER_TURNS:]
         self.assistant_prefix = embeds[:, assistant_start:]
         self.speaker = self.speakers[voice or self.voices[0]]
         self.pending = []
@@ -262,7 +270,7 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
         self.speech_end: int | None = None
         self.unfed: int | None = None
         self.thinker_done = False
-        self._accept(int(mx.argmax(out.logits[:, -1, :], axis=-1).item()))
+        self._accept(int(mx.argmax(logits[:, -1, :], axis=-1).item()))
         self.talker_cache = None
         self.talker_done = not self._speech()
         self.frames: list[mx.array] = []
@@ -273,6 +281,11 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
         self.transcript = TranscriptStream(self.tokenizer)
         self.done = not self.reply
         return len(ids)
+
+    def _logits(self, hidden: mx.array) -> mx.array:
+        if self.thinker.args.tie_word_embeddings:
+            return self.thinker.model.embed_tokens.as_linear(hidden)
+        return self.thinker.lm_head(hidden)
 
     def _speech(self) -> list[int]:
         return self.reply if self.speech_end is None else self.reply[: self.speech_end]
@@ -393,10 +406,25 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
             return []
         text = self.tokenizer.decode(self.reply[self.speech_end :])
         _, calls = parse_tool_calls(text, self.tokenizer, self.tools)
+        if not calls:
+            self._drop_call()
+            return []
         return [
-            FunctionCall(call.function.name, call.function.arguments)
-            for call in calls or []
+            FunctionCall(call.function.name, call.function.arguments) for call in calls
         ]
+
+    def _drop_call(self) -> None:
+        """Take a call that will not run out of the context; the speech before it stays."""
+        # Every reply token is in the cache except a last one not fed yet.
+        fed = len(self.reply) - self.speech_end - (self.unfed is not None)
+        for cache in self.cache:
+            cache.trim(fed)
+        self.offset -= fed
+        self.position -= fed
+        self.reply = self.reply[: self.speech_end]
+        self.speech_end = self.unfed = None
+        self.pending = [self.im_end]
+        self.thinker_done = True
 
     def _decode(self, final: bool) -> np.ndarray:
         new = len(self.frames) - self.decoded
@@ -416,6 +444,8 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
         return np.concatenate(audio)
 
     def stop(self) -> None:
+        if self.speech_end is not None and not self.thinker_done:
+            self._drop_call()
         if not self.done:
             self._finish()
 
@@ -423,6 +453,9 @@ class Qwen3OmniVoiceBackend(VoiceBackend):
         played = int(played_seconds / FRAME_SECONDS + 1e-6)
         # Nothing heard drops the whole reply, even before its first frame.
         if self.cache is None or (played and played >= len(self.frames)):
+            # Truncating a reply that called tools abandons the calls.
+            if self.speech_end is not None:
+                self._drop_call()
             return
         # Frame n reads reply token n + 1, so the played frames read reply[: played + 1].
         for cache in self.cache:

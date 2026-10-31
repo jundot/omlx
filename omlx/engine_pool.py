@@ -71,7 +71,6 @@ from .model_discovery import (
     detect_model_type,
     format_size,
     is_realtime_stt_model,
-    is_realtime_voice_model,
 )
 from .model_settings import (
     ModelSettings,
@@ -376,6 +375,7 @@ class EngineEntry:
     config_model_type: str = (
         ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     )
+    realtime_voice: bool = False  # Its model type and config allow /v1/realtime
     thinking_default: bool | None = (
         None  # True if model thinks by default, False if not, None if unknown
     )
@@ -1561,6 +1561,7 @@ class EnginePool:
                     estimated_size=info.estimated_size,
                     text_only_size=getattr(info, "text_only_size", 0),
                     config_model_type=getattr(info, "config_model_type", ""),
+                    realtime_voice=getattr(info, "realtime_voice", False),
                     thinking_default=getattr(info, "thinking_default", None),
                     preserve_thinking_default=getattr(
                         info, "preserve_thinking_default", None
@@ -4752,8 +4753,7 @@ class EnginePool:
                         e.model_type, e.config_model_type
                     ),
                     # d1 decision checkpoints share lfm3_omni but run on the decision engine.
-                    "realtime_voice": e.engine_type == "vlm"
-                    and is_realtime_voice_model(e.config_model_type),
+                    "realtime_voice": e.engine_type == "vlm" and e.realtime_voice,
                     "model_context_length": e.model_context_length,
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,
