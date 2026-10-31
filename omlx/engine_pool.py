@@ -18,6 +18,7 @@ import copy
 import gc
 import json
 import logging
+import re
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
@@ -173,6 +174,51 @@ _MOE_OFFLOAD_PERCENTS = range(5, 96)
 # Cluster ranks load the text model through mlx-lm, so a VLM-classified
 # checkpoint is served text-only while its deployment is active.
 _CLUSTER_ENGINE_TYPES = frozenset({"batched", "vlm"})
+
+# Fallback reasons reach API clients, so they are bounded and redacted:
+# loader errors can embed absolute checkpoint paths and, when an inner
+# exception was formatted with its traceback, whole stack frames.
+_MAX_FALLBACK_REASON_CHARS = 200
+_PATHISH_RE = re.compile(r"~?/(?:[^,;:'\"()\[\]{}]+/)+[^,;:'\"()\[\]{}]*")
+# Effective engine identity per engine class, for clients that must assert
+# which backend actually serves a model (issue #2896).
+_ENGINE_KIND_BY_CLASS = {
+    "DistributedBatchedEngine": "distributed",
+    "VLMBatchedEngine": "vlm",
+    "BatchedEngine": "batched",
+    "SplashEngine": "splash",
+    "EmbeddingEngine": "embedding",
+    "RerankerEngine": "reranker",
+    "STTEngine": "audio_stt",
+    "TTSEngine": "audio_tts",
+    "STSEngine": "audio_sts",
+}
+
+
+def _sanitized_fallback_reason(text: str) -> str:
+    """Bound and redact a fallback reason before it reaches API clients.
+
+    Whitespace is collapsed so a multi-line message cannot leak a stack
+    trace line by line, filesystem-path runs become ``<path>``, and the
+    result is truncated to a fixed budget so an unbounded loader message
+    cannot inflate the status response.
+    """
+
+    collapsed = " ".join(str(text).split())
+    redacted = _PATHISH_RE.sub("<path>", collapsed)
+    if len(redacted) > _MAX_FALLBACK_REASON_CHARS:
+        redacted = redacted[: _MAX_FALLBACK_REASON_CHARS - 3].rstrip() + "..."
+    return redacted
+
+
+def _engine_kind(engine: object) -> str | None:
+    """Effective engine identity for a live engine instance.
+
+    ``None`` for a class the pool never constructs, so callers fall back to
+    the engine type they asked for instead of leaking a class name.
+    """
+
+    return _ENGINE_KIND_BY_CLASS.get(type(engine).__name__)
 
 
 def _positive_int(value: object) -> int:
@@ -419,6 +465,15 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+    # Requested-versus-effective state for the engine that currently serves
+    # this model (issue #2896). DFlash fails soft: a declined or failed
+    # drafter leaves the model's natural batched engine serving, so a client
+    # cannot infer the effective backend from settings alone. All four
+    # describe the live engine and reset on unload.
+    effective_engine: str | None = None
+    dflash_requested: bool = False
+    dflash_active: bool = False
+    dflash_fallback_reason: str | None = None
 
 
 class EnginePool:
@@ -3800,6 +3855,10 @@ class EnginePool:
         entry.runtime_settings_signature = None
         entry.runtime_estimated_size = None
         entry.runtime_settle_size = None
+        entry.effective_engine = None
+        entry.dflash_requested = False
+        entry.dflash_active = False
+        entry.dflash_fallback_reason = None
 
         if external:
             # Cluster weights live in supervised rank processes and Splash's
@@ -4152,13 +4211,28 @@ class EnginePool:
             deployment = deployment if effective_type in _CLUSTER_ENGINE_TYPES else None
             # Decision models never decode, so speculative decoding settings
             # saved for the same checkpoint do not apply.
+            dflash_enabled = bool(getattr(model_settings, "dflash_enabled", False))
+            entry.dflash_requested = dflash_enabled
+            entry.dflash_active = False
+            entry.dflash_fallback_reason = None
+            if dflash_enabled and deployment is not None:
+                entry.dflash_fallback_reason = (
+                    "DFlash is not supported with distributed inference"
+                )
+            elif dflash_enabled and engine is not None:
+                entry.dflash_fallback_reason = (
+                    "DFlash is not supported with an external engine"
+                )
+            elif dflash_enabled and effective_type == "decision":
+                entry.dflash_fallback_reason = (
+                    "DFlash is not supported for decision models"
+                )
             if (
                 engine is None
                 and deployment is None
                 and model_settings is not None
                 and effective_type != "decision"
             ):
-                dflash_enabled = getattr(model_settings, "dflash_enabled", False)
                 dflash_draft = dflash_draft_for(model_settings, entry.model_path)
                 if dflash_enabled and self._entry_is_diffusion_model(entry):
                     logger.warning(
@@ -4166,12 +4240,18 @@ class EnginePool:
                         "loading %s with its native VLM engine",
                         model_id,
                     )
+                    entry.dflash_fallback_reason = (
+                        "DFlash is not supported for diffusion models"
+                    )
                 elif dflash_enabled and not dflash_draft:
                     logger.warning(
                         "DFlash enabled for %s but no draft model is set; "
                         "loading without DFlash. Set dflash_draft_model to "
                         "enable it.",
                         model_id,
+                    )
+                    entry.dflash_fallback_reason = (
+                        "DFlash is enabled but no draft model is configured"
                     )
                 elif dflash_enabled and not dflash_batched_supported(
                     entry.config_model_type, effective_type
@@ -4182,6 +4262,9 @@ class EnginePool:
                         model_id,
                         entry.config_model_type,
                         effective_type,
+                    )
+                    entry.dflash_fallback_reason = (
+                        "DFlash is not supported for this model type and engine"
                     )
                 elif dflash_enabled:
                     # The drafter is attached after start below.
@@ -4401,6 +4484,7 @@ class EnginePool:
                 entry.runtime_estimated_size = resident_size
                 entry.runtime_settle_size = resident_size
             entry.engine = engine
+            entry.effective_engine = _engine_kind(engine) or effective_type
             entry.last_access = time.time()
             self._current_model_memory += resident_size
             load_completed = True
@@ -4452,8 +4536,12 @@ class EnginePool:
                         f"(drafter={drafter_id}): {e} -- toggle ignored"
                     )
                     drafter = None
+                    entry.dflash_fallback_reason = _sanitized_fallback_reason(
+                        f"DFlash drafter load failed: {type(e).__name__}: {e}"
+                    )
                 if drafter is not None:
                     engine.set_dflash_drafter(drafter)
+                    entry.dflash_active = True
 
             # MiniMax M3.1 bundles its DSpark draft in dspark/; Lightning MTP
             # runs it through the same block-drafter verify path.
@@ -4716,6 +4804,15 @@ class EnginePool:
         """
         Get pool status for monitoring endpoints.
 
+        ``engine_type`` stays the model's configured engine. ``effective_engine``
+        names the engine that actually serves it right now, and the ``dflash_*``
+        keys separate a real DFlash load from a silent fallback (issue #2896):
+        requested and active both true means the DFlash drafter serves the
+        model; requested true with active false carries
+        ``dflash_fallback_reason``; requested false means DFlash was never
+        asked for. All four describe the live engine and reset when the model
+        unloads.
+
         Returns:
             Dictionary with pool status information
         """
@@ -4747,6 +4844,10 @@ class EnginePool:
                     "external_engine": external_engine,
                     "pinned": e.is_pinned,
                     "engine_type": e.engine_type,
+                    "effective_engine": e.effective_engine,
+                    "dflash_requested": e.dflash_requested,
+                    "dflash_active": e.dflash_active,
+                    "dflash_fallback_reason": e.dflash_fallback_reason,
                     "model_type": e.model_type,
                     "config_model_type": e.config_model_type,
                     "realtime_stt": is_realtime_stt_model(

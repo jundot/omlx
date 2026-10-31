@@ -61,3 +61,53 @@ Draft checkpoints load through mlx-vlm's drafter classes (DFlash v1, DFlash2, La
 ## Tests
 
 See the "Batched DFlash drafter" section of `docs/TESTING.md`.
+
+## Verifying the effective engine
+
+A DFlash request fails soft: a declined or failed drafter leaves the model's natural batched engine serving, and the request still succeeds with `200`. `GET /v1/models/status` reports what actually happened, so a client can assert DFlash is running instead of reading the server log.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `engine_type` | str | Configured engine for the model (unchanged) |
+| `effective_engine` | str \| null | Engine serving the model now: `batched`, `vlm`, `distributed`, `splash`, `decision`, `embedding`, `reranker`, `audio_stt`, `audio_tts`, `audio_sts`. `null` when not loaded |
+| `dflash_requested` | bool | `dflash_enabled` was set for this load |
+| `dflash_active` | bool | The batched DFlash drafter is loaded and serving |
+| `dflash_fallback_reason` | str \| null | Why a requested DFlash load is not active. Bounded and path-redacted, truncated to 200 characters |
+
+DFlash running:
+
+```json
+{
+  "id": "Qwen3.8-27B",
+  "loaded": true,
+  "engine_type": "batched",
+  "effective_engine": "batched",
+  "dflash_requested": true,
+  "dflash_active": true,
+  "dflash_fallback_reason": null
+}
+```
+
+DFlash requested but fell back:
+
+```json
+{
+  "id": "Qwen3.8-27B",
+  "loaded": true,
+  "engine_type": "batched",
+  "effective_engine": "batched",
+  "dflash_requested": true,
+  "dflash_active": false,
+  "dflash_fallback_reason": "DFlash drafter load failed: ValueError: Received parameters not in model: candidate_selector.hidden_projection.weight, ..."
+}
+```
+
+A one-line client assertion:
+
+```bash
+curl -s localhost:10240/v1/models/status \
+  | jq -e '.models[] | select(.id=="Qwen3.8-27B") | .dflash_active'
+```
+
+DFlash was never requested when `dflash_requested` is `false`; `dflash_active`
+is then `false` and `dflash_fallback_reason` is `null`.
