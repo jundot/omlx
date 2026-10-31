@@ -2308,5 +2308,6 @@
   "cluster.v2.join.cleanup_forgotten": "Staré úklidové pokusy na tomto Macu byly zapomenuty. Vzdálený úklid nebyl potvrzen.",
   "cluster.v2.join.forget_cleanup_error": "Tento úklid se nepodařilo zapomenout.",
   "cluster.v2.membership.waiting_request": "Čeká se, až tento Mac zobrazí kód a odešle žádost o spárování.",
-  "cluster.v2.membership.add_device": "Přidat tento Mac"
+  "cluster.v2.membership.add_device": "Přidat tento Mac",
+  "chat.confirm_delete_message": "This will delete this message and every message after it in this chat. Continue?"
 }
