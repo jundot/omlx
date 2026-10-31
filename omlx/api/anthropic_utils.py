@@ -23,7 +23,7 @@ from .anthropic_models import (
     SystemContent,
 )
 from .openai_models import ToolCall
-from .utils import _strip_client_budget_markers
+from .utils import _extract_text_from_content_list, _strip_client_budget_markers
 
 _PRESERVE_ROLE_BOUNDARY = "_preserve_role_boundary"
 logger = logging.getLogger(__name__)
@@ -184,6 +184,13 @@ def _build_message_from_parts(
 # =============================================================================
 # Message Conversion: Anthropic -> Internal
 # =============================================================================
+
+
+def _message_text(content: Any) -> str:
+    """Text a converted message carries; non-text parts are ignored."""
+    if isinstance(content, str):
+        return content
+    return _extract_text_from_content_list(content)
 
 
 def convert_anthropic_to_internal(
@@ -460,7 +467,22 @@ def convert_anthropic_to_internal(
 
     from .utils import _merge_consecutive_roles
 
-    return _merge_consecutive_roles(processed_messages)
+    messages = _merge_consecutive_roles(processed_messages)
+
+    # A trailing assistant message is an Anthropic prefill: the model continues
+    # that text instead of starting a turn.  Only plain text qualifies — tool
+    # markup needs the boundary flag, and an empty message leaves nothing to
+    # continue.
+    last = messages[-1] if messages else None
+    if (
+        last is not None
+        and last.get("role") == "assistant"
+        and not last.get(_PRESERVE_ROLE_BOUNDARY)
+        and _message_text(last.get("content"))
+    ):
+        last["partial"] = True
+
+    return messages
 
 
 def convert_anthropic_to_internal_harmony(

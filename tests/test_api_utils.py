@@ -1260,6 +1260,53 @@ class TestConvertAnthropicToInternal:
         assert "Please read this:" in content
         assert "Doc content here" in content
 
+    @pytest.mark.parametrize(
+        "messages, expected_partial",
+        [
+            (
+                [
+                    AnthropicMessage(role="user", content="Count from 1."),
+                    AnthropicMessage(role="assistant", content="1, 2, 3,"),
+                ],
+                True,
+            ),
+            (
+                [
+                    AnthropicMessage(role="user", content="Count from 1."),
+                    AnthropicMessage(role="assistant", content="1, 2,"),
+                    AnthropicMessage(role="assistant", content=" 3,"),
+                ],
+                True,
+            ),
+            (
+                [
+                    AnthropicMessage(role="user", content="Count from 1."),
+                    AnthropicMessage(role="assistant", content=""),
+                ],
+                False,
+            ),
+            (
+                [
+                    AnthropicMessage(role="user", content="Count from 1."),
+                    AnthropicMessage(
+                        role="assistant",
+                        content=[
+                            ContentBlockToolUse(id="toolu_1", name="count", input={})
+                        ],
+                    ),
+                ],
+                False,
+            ),
+        ],
+    )
+    def test_trailing_assistant_message_marks_partial(self, messages, expected_partial):
+        """Trailing assistant text is an Anthropic prefill, not a new turn."""
+        request = MessagesRequest(model="claude-3", max_tokens=1024, messages=messages)
+
+        result = convert_anthropic_to_internal(request)
+
+        assert result[-1].get("partial", False) is expected_partial
+
 
 class TestConvertAnthropicToInternalNativeReasoning:
     """Tests that convert_anthropic_to_internal forwards Anthropic thinking
