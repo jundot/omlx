@@ -51,7 +51,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -205,6 +205,14 @@ from .api.tool_calling import (
     parse_qwen_tool_calls,
     restore_gemma4_param_names,
     sanitize_tool_call_markup,
+)
+from .api.tool_choice import (
+    ForcedToolCall,
+    anthropic_tool_choice,
+    forced_call_messages,
+    forced_tool_call_outputs,
+    resolve_forced_tool_call,
+    responses_tool_choice,
 )
 from .api.utils import (
     clean_special_tokens,
@@ -4963,6 +4971,90 @@ def _resolve_template_tools(
     return tools_for_template
 
 
+def _is_forced_tool_choice(choice: str | dict | None) -> bool:
+    """``choice``, in OpenAI's form, is ``required`` or a named function."""
+    return choice == "required" or isinstance(choice, dict)
+
+
+async def _resolve_forced_tool_call(
+    choice: str | dict | None,
+    engine: BaseEngine,
+    tools: list[dict] | None,
+    is_partial: bool,
+) -> ForcedToolCall | None:
+    """The call a ``required`` or named ``tool_choice`` forces (#2877).
+
+    ``choice`` is in OpenAI's form. Engines that enforce ``tool_choice``
+    themselves (Splash) get it as is.
+    """
+    if not _is_forced_tool_choice(choice):
+        return None
+    if getattr(engine, "handles_tool_choice", False):
+        return None
+    if getattr(engine, "tokenizer", None) is None:
+        await engine.start()
+    forced = resolve_forced_tool_call(choice, tools, engine.tokenizer)
+    if forced is not None and is_partial:
+        # The client continues its own partial assistant turn.
+        logger.warning("tool_choice is not enforced on a partial assistant turn")
+        return None
+    return forced
+
+
+def _open_forced_tool_call(
+    engine: BaseEngine,
+    messages: list,
+    forced: ForcedToolCall,
+    chat_template_kwargs: dict | None,
+) -> tuple[ForcedToolCall, list, bool]:
+    """Decide whether the model reasons before the forced call.
+
+    Returns the call, the messages and whether they end with a partial turn.
+    Without reasoning, the reply starts with the call's opening as a partial
+    assistant turn, appended here so that context-window validation,
+    preflight and the prepared prompt all see the real prompt.
+    """
+    forced = replace(
+        forced,
+        thinks=_generation_prompt_opens_thinking(engine, chat_template_kwargs),
+    )
+    if forced.thinks:
+        return forced, messages, False
+    return forced, forced_call_messages(messages, forced), True
+
+
+async def _chat_or_forced_call(
+    engine: BaseEngine,
+    messages: list,
+    forced_call: ForcedToolCall | None,
+    **kwargs,
+) -> GenerationOutput:
+    """``engine.chat``, or the whole reply when it is a forced call."""
+    if forced_call is None:
+        return await engine.chat(messages=messages, **kwargs)
+    last = None
+    async for output in forced_tool_call_outputs(
+        engine, messages, forced_call, **kwargs
+    ):
+        last = output
+    return last
+
+
+def _generation_prompt_opens_thinking(
+    engine: BaseEngine, chat_template_kwargs: dict | None
+) -> bool:
+    """Whether the template's generation prompt opens the reasoning block."""
+    probe = getattr(engine, "_generation_prompt_text", None)
+    if not callable(probe):
+        return False
+    try:
+        suffix, _ = probe(chat_template_kwargs or None, False)
+        return bool(suffix) and prompt_opens_thinking(engine.tokenizer, suffix)[0]
+    except Exception as exc:
+        logger.debug("Could not detect the generation prompt's thinking: %s", exc)
+        return False
+
+
 def _is_chat_template_error(e: Exception) -> bool:
     # Jinja2 TemplateError, AssertionError from strict role validation,
     # ValueError, etc.
@@ -5070,6 +5162,11 @@ async def create_chat_completion(
         is_partial = chat_messages.is_partial
         native_reasoning = chat_messages.native_reasoning
 
+        tools_for_template = _resolve_template_tools(request, engine, resolved_model)
+        forced_call = await _resolve_forced_tool_call(
+            request.tool_choice, engine, tools_for_template, is_partial
+        )
+
         # Compile grammar for structured output (logit-level enforcement).
         # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
         response_format = request.response_format
@@ -5083,6 +5180,9 @@ async def create_chat_completion(
             request.structured_outputs,
             guided_grammar,
         )
+        if forced_call is not None:
+            # The reply is a call; structured output shapes text replies.
+            response_format = structured_outputs = guided_grammar = None
         _reject_diffusion_structured_outputs(
             engine,
             response_format=response_format,
@@ -5128,7 +5228,6 @@ async def create_chat_completion(
             if json_instruction:
                 messages = _inject_json_instruction(messages, json_instruction)
 
-        tools_for_template = _resolve_template_tools(request, engine, resolved_model)
         # Resolve template defaults before preparing the prompt for reuse.
         _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
         await _ensure_tokenizer_for_system_probe(engine, messages)
@@ -5140,6 +5239,10 @@ async def create_chat_completion(
             is_partial=is_partial,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(),
         )
+        if forced_call is not None:
+            forced_call, messages, is_partial = _open_forced_tool_call(
+                engine, messages, forced_call, merged_ct_kwargs
+            )
         # Validate context window before sending to model
         try:
             num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
@@ -5237,6 +5340,11 @@ async def create_chat_completion(
         # Add tools if provided (includes MCP tools)
         if tools_for_template:
             chat_kwargs["tools"] = tools_for_template
+        # Splash enforces a required or named tool_choice itself.
+        if getattr(engine, "handles_tool_choice", False) and _is_forced_tool_choice(
+            request.tool_choice
+        ):
+            chat_kwargs["tool_choice"] = request.tool_choice
 
         # Add chat template kwargs
         if merged_ct_kwargs:
@@ -5304,6 +5412,7 @@ async def create_chat_completion(
                                 model_load_duration=model_load_duration,
                                 resolved_model=resolved_model,
                                 response_id=response_id,
+                                forced_call=forced_call,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -5324,7 +5433,9 @@ async def create_chat_completion(
             await _raise_if_llm_lease_abort_requested(lease)
             start_time = time.perf_counter()
 
-            output = await engine.chat(messages=messages, **chat_kwargs)
+            output = await _chat_or_forced_call(
+                engine, messages, forced_call, **chat_kwargs
+            )
 
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -6577,6 +6688,7 @@ async def stream_chat_completion(
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     response_id: Optional[str] = None,
+    forced_call: ForcedToolCall | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -6680,7 +6792,12 @@ async def stream_chat_completion(
     if request.return_progress:
         # The engine keys the prefill tracker by this id.
         progress_request_id = kwargs.setdefault("_request_id", str(uuid.uuid4()))
-    engine_stream = engine.stream_chat(messages=messages, **kwargs)
+    if forced_call is not None:
+        engine_stream = forced_tool_call_outputs(
+            engine, messages, forced_call, **kwargs
+        )
+    else:
+        engine_stream = engine.stream_chat(messages=messages, **kwargs)
     if progress_request_id is not None:
         engine_stream = _with_prompt_progress(engine_stream, progress_request_id)
     try:
@@ -7295,6 +7412,7 @@ async def stream_anthropic_messages(
     messages: list,
     request: AnthropicMessagesRequest,
     resolved_model: Optional[str] = None,
+    forced_call: ForcedToolCall | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """
@@ -7403,7 +7521,12 @@ async def stream_anthropic_messages(
     )
 
     # 3. Stream content with thinking/content separation
-    engine_stream = engine.stream_chat(messages=messages, **kwargs)
+    if forced_call is not None:
+        engine_stream = forced_tool_call_outputs(
+            engine, messages, forced_call, **kwargs
+        )
+    else:
+        engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
         async for output in engine_stream:
             last_output = output  # Keep reference for tool_calls and token counts
@@ -7993,6 +8116,7 @@ async def create_anthropic_message(
         messages = prompt.messages
         internal_tools = prompt.tools
         merged_ct_kwargs = prompt.chat_template_kwargs
+        is_partial = prompt.is_partial
         ms = prompt.model_settings
 
         # Prepare kwargs
@@ -8048,19 +8172,35 @@ async def create_anthropic_message(
 
         if internal_tools:
             chat_kwargs["tools"] = internal_tools
+        # tool_choice any or tool makes the reply a call (#2877).
+        tool_choice = anthropic_tool_choice(request.tool_choice)
+        forced_call = await _resolve_forced_tool_call(
+            tool_choice, engine, internal_tools, is_partial
+        )
+        # Splash enforces it itself.
+        if getattr(engine, "handles_tool_choice", False) and _is_forced_tool_choice(
+            tool_choice
+        ):
+            chat_kwargs["tool_choice"] = tool_choice
 
         # Add chat template kwargs
         if merged_ct_kwargs:
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
-
-        # Forward partial-mode decision to the engine explicitly
-        chat_kwargs["is_partial"] = prompt.is_partial
         chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
             ms,
             native_reasoning=prompt.native_reasoning,
             chat_template_kwargs=merged_ct_kwargs,
         )
         chat_kwargs.update(_cache_store_kwargs(http_request))
+
+        if forced_call is not None:
+            forced_call, messages, is_partial = _open_forced_tool_call(
+                engine, messages, forced_call, merged_ct_kwargs
+            )
+            prompt.messages = messages
+            prompt.is_partial = is_partial
+        # Forward partial-mode decision to the engine explicitly
+        chat_kwargs["is_partial"] = is_partial
 
         # Validate context window before sending to model
         num_prompt_tokens, prepared_prompt = _count_anthropic_prompt(engine, prompt)
@@ -8097,6 +8237,7 @@ async def create_anthropic_message(
                                 messages,
                                 request,
                                 resolved_model=resolved_model,
+                                forced_call=forced_call,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -8121,7 +8262,9 @@ async def create_anthropic_message(
             await _raise_if_llm_lease_abort_requested(lease)
             start_time = time.perf_counter()
 
-            output = await engine.chat(messages=messages, **chat_kwargs)
+            output = await _chat_or_forced_call(
+                engine, messages, forced_call, **chat_kwargs
+            )
 
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -8618,12 +8761,43 @@ async def create_response(
         # returns plain dicts in {"role": str, "content": str} format.
         # Those extract functions expect Pydantic Message objects from OpenAI/Anthropic requests.
 
+        # Merge MCP tools, matching create_chat_completion's tools_disabled
+        # semantics: tool_choice="none" suppresses tool exposure to the chat
+        # template, and the MCP merge itself must run even when the client
+        # sent no tools of its own, since MCP servers can offer tools the
+        # client never listed.
+        tools_disabled = request.tool_choice == "none" or (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
+        )
+        effective_tools = None if tools_disabled else openai_tools
+        if (
+            _server_state.mcp_manager
+            and not tools_disabled
+            and mcp_tools_exposed()
+        ):
+            effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
+
+        # Convert tools for chat template
+        tools_for_template = (
+            convert_tools_for_template(effective_tools) if effective_tools else None
+        )
+        # tool_choice required or a named function makes the reply a call
+        # (#2877). It takes precedence over text.format, which shapes text
+        # replies.
+        tool_choice = responses_tool_choice(request.tool_choice)
+        forced_call = await _resolve_forced_tool_call(
+            tool_choice, engine, tools_for_template, False
+        )
+        # None lets the engine detect a partial turn, as without a forced call.
+        is_partial = None
+
         # Handle text.format (structured output)
         response_format = None
         compiled_grammar = None
         response_format_warning = None
         native_response_format = None
-        if request.text and request.text.format:
+        if request.text and request.text.format and forced_call is None:
             fmt = request.text.format
             if fmt.type == "json_object":
                 response_format = {"type": "json_object"}
@@ -8670,27 +8844,6 @@ async def create_response(
             else:
                 compiled_grammar = None
 
-        # Merge MCP tools, matching create_chat_completion's tools_disabled
-        # semantics: tool_choice="none" suppresses tool exposure to the chat
-        # template, and the MCP merge itself must run even when the client
-        # sent no tools of its own, since MCP servers can offer tools the
-        # client never listed.
-        tools_disabled = request.tool_choice == "none" or (
-            getattr(engine, "is_diffusion_model", False)
-            and not getattr(engine, "supports_tool_calling", False)
-        )
-        effective_tools = None if tools_disabled else openai_tools
-        if (
-            _server_state.mcp_manager
-            and not tools_disabled
-            and mcp_tools_exposed()
-        ):
-            effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
-
-        # Convert tools for chat template
-        tools_for_template = (
-            convert_tools_for_template(effective_tools) if effective_tools else None
-        )
         # Resolve template defaults before preparing the prompt for reuse.
         native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
         if (
@@ -8712,6 +8865,10 @@ async def create_response(
             is_partial=False,
             unsupported_mid_system_policy=_unsupported_mid_system_policy(),
         )
+        if forced_call is not None:
+            forced_call, messages, is_partial = _open_forced_tool_call(
+                engine, messages, forced_call, merged_ct_kwargs
+            )
 
         # Validate context window
         try:
@@ -8720,6 +8877,7 @@ async def create_response(
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
+                is_partial=is_partial,
             )
         except Exception as e:
             err_name = type(e).__name__.lower()
@@ -8798,8 +8956,15 @@ async def create_response(
 
         if tools_for_template:
             chat_kwargs["tools"] = tools_for_template
+        # Splash enforces a required or named tool_choice itself.
+        if getattr(engine, "handles_tool_choice", False) and _is_forced_tool_choice(
+            tool_choice
+        ):
+            chat_kwargs["tool_choice"] = tool_choice
         if merged_ct_kwargs:
             chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+        if is_partial is not None:
+            chat_kwargs["is_partial"] = is_partial
 
         chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
             ms,
@@ -8851,6 +9016,7 @@ async def create_response(
                                 response_format=response_format,
                                 namespace_aliases=namespace_aliases,
                                 stream_state=stream_state,
+                                forced_call=forced_call,
                                 **chat_kwargs,
                             ),
                             http_request=http_request,
@@ -8877,7 +9043,9 @@ async def create_response(
         async def _build_responses_api():
             await _raise_if_llm_lease_abort_requested(lease)
             start_time = time.perf_counter()
-            output = await engine.chat(messages=messages, **chat_kwargs)
+            output = await _chat_or_forced_call(
+                engine, messages, forced_call, **chat_kwargs
+            )
 
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -9060,6 +9228,7 @@ async def stream_responses_api(
     response_format=None,
     namespace_aliases: Optional[dict] = None,
     stream_state: _ResponsesStreamState | None = None,
+    forced_call: ForcedToolCall | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -9336,7 +9505,12 @@ async def stream_responses_api(
     native_response_format = _native_response_format(engine, response_format)
     if native_response_format is not None:
         kwargs = {**kwargs, "response_format": native_response_format}
-    engine_stream = engine.stream_chat(messages=messages, **kwargs)
+    if forced_call is not None:
+        engine_stream = forced_tool_call_outputs(
+            engine, messages, forced_call, **kwargs
+        )
+    else:
+        engine_stream = engine.stream_chat(messages=messages, **kwargs)
     try:
         async for output in engine_stream:
             stream_state.prefilling = False

@@ -1112,6 +1112,14 @@ class TestRequestTranslation:
 
         assert "thinking_token_budget" not in body
 
+    def test_request_body_passes_a_forced_tool_choice(self, tmp_path):
+        # Splash enforces required and named choices with its own grammar.
+        choice = {"type": "function", "function": {"name": "get_time"}}
+        body = self._body_with(tmp_path, "1.3.0", {"tool_choice": choice})
+
+        assert body["tool_choice"] == choice
+        assert SplashEngine.handles_tool_choice is True
+
     def test_splash_before_1_3_2_gets_no_budget_field(self, tmp_path):
         # thinking_token_budget arrived in Splash 1.3.2.
         body = self._body_with(tmp_path, "1.3.1", {"thinking_budget": 4096})

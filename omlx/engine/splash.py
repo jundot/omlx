@@ -1197,6 +1197,8 @@ class SplashEngine(BaseEngine):
     _prefill_memory_guard_managed_externally = True
     # Splash validates and enforces response_format in its own engine.
     supports_native_response_format = True
+    # And a required or named tool_choice, with its own grammar.
+    handles_tool_choice = True
 
     def __init__(
         self,
@@ -1495,7 +1497,13 @@ class SplashEngine(BaseEngine):
             "repetition_penalty": repetition_penalty,
             "presence_penalty": presence_penalty,
         }
-        for key in ("frequency_penalty", "stop", "seed", "response_format"):
+        for key in (
+            "frequency_penalty",
+            "stop",
+            "seed",
+            "response_format",
+            "tool_choice",
+        ):
             if kwargs.get(key) is not None:
                 body[key] = kwargs[key]
         # oMLX's resolved budget (request over model settings); the in-process
