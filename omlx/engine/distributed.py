@@ -881,6 +881,52 @@ raise SystemExit(2)
             )
         return normalized or None
 
+    def _uses_muse_channels(self) -> bool:
+        """Muse Spark/Glimmer emit a channel protocol rank-zero MLX-LM cannot split.
+
+        The local engines parse it with MuseGlimmerOutputParserSession; this
+        engine receives rank zero's raw content, so it applies the same
+        text-level splitter here.
+        """
+
+        if self._model_type is not None:
+            return self._model_type in ("muse_spark", "muse_glimmer")
+        # No config yet: fall back to the local parser factory's name match.
+        from ..adapter.output_parser import _is_muse_glimmer_model
+
+        return _is_muse_glimmer_model(self._model_name or "")
+
+    @staticmethod
+    def _muse_tool_calls(
+        raw_text: str,
+        tools: list[dict[str, Any]] | None,
+        finish_reason: str | None,
+    ) -> list[dict[str, Any]] | None:
+        """ATEM calls from a finished Muse completion.
+
+        A completion cut at max_tokens may end inside an ATEM block, which the
+        extractor would still close at end of text. Return no calls then, so
+        the length finish reason reaches the client instead of partial
+        arguments.
+        """
+
+        if finish_reason == "length":
+            return None
+        from ..adapter.muse_glimmer import _extract_tool_calls
+
+        return _extract_tool_calls(raw_text, tools) or None
+
+    @staticmethod
+    def _muse_split_complete(content: str) -> str:
+        """Split one complete Muse completion into <think>-wrapped text."""
+
+        from ..adapter.muse_glimmer import _MuseChannelSplitter
+
+        splitter = _MuseChannelSplitter()
+        stream, _ = splitter.feed(content)
+        tail, _ = splitter.finish()
+        return stream + tail
+
     @staticmethod
     def _join_reasoning_and_content(reasoning: Any, content: Any) -> str:
         """Carry private structured reasoning through GenerationOutput safely."""
@@ -1284,9 +1330,15 @@ raise SystemExit(2)
             usage = body["usage"]
             details = usage.get("prompt_tokens_details") or {}
             tool_calls = self._normalize_backend_tool_calls(message.get("tool_calls"))
+            content = message.get("content")
+            if self._uses_muse_channels() and isinstance(content, str):
+                tool_calls = tool_calls or self._muse_tool_calls(
+                    content, tools, choice.get("finish_reason")
+                )
+                content = self._muse_split_complete(content)
             text = self._join_reasoning_and_content(
                 message.get("reasoning") or message.get("reasoning_content"),
-                message.get("content"),
+                content,
             )
             return GenerationOutput(
                 text=text,
@@ -1365,6 +1417,12 @@ raise SystemExit(2)
         request_started_at = time.monotonic()
         reasoning_open = False
         backend_tool_calls: dict[int, dict[str, Any]] = {}
+        muse_splitter = None
+        muse_raw = ""
+        if self._uses_muse_channels():
+            from ..adapter.muse_glimmer import _MuseChannelSplitter
+
+            muse_splitter = _MuseChannelSplitter()
 
         request_id = await self._enter_request(requested_id)
         headers = self._backend_request_headers(request_id)
@@ -1493,24 +1551,32 @@ raise SystemExit(2)
                                 reasoning_open = True
                             new_text += reasoning
                         content = delta.get("content")
+                        # A Muse header delta can split to no visible text; it
+                        # is still a generated token for timing and counts.
+                        content_received = isinstance(content, str) and bool(content)
                         if isinstance(content, str) and content:
                             if reasoning_open:
                                 new_text += "</think>"
                                 reasoning_open = False
+                            if muse_splitter is not None:
+                                muse_raw += content
+                                content, _ = muse_splitter.feed(content)
                             new_text += content
                         if raw_tool_calls and reasoning_open:
                             new_text += "</think>"
                             reasoning_open = False
+                        generated = bool(new_text) or content_received
 
                         reason = choice.get("finish_reason")
                         if reason is not None:
                             finish_reason = reason
-                        if new_text:
+                        if generated:
                             now = time.monotonic()
                             if first_token_at is None:
                                 first_token_at = now
-                            full_text += new_text
                             completion_tokens += 1
+                        if new_text:
+                            full_text += new_text
                             yield GenerationOutput(
                                 text=full_text,
                                 new_text=new_text,
@@ -1545,9 +1611,15 @@ raise SystemExit(2)
         if reasoning_open:
             pending_final_text = "</think>"
             full_text += pending_final_text
+        if muse_splitter is not None:
+            tail, _ = muse_splitter.finish()
+            pending_final_text += tail
+            full_text += tail
         tool_calls = self._normalize_backend_tool_calls(
             [backend_tool_calls[index] for index in sorted(backend_tool_calls)]
         )
+        if muse_splitter is not None and not tool_calls:
+            tool_calls = self._muse_tool_calls(muse_raw, tools, finish_reason)
         finished_at = time.monotonic()
         await self._record_strategy_benchmark(
             prompt_tokens=prompt_tokens,

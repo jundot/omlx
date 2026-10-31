@@ -1443,3 +1443,324 @@ async def test_local_stop_passes_scope_to_supervisor(monkeypatch):
     assert calls == [{"local_only": True}]
     assert engine._client is None
     assert not engine._loaded
+
+
+_MUSE_RAW_ANSWER = (
+    " to=self<|message|>Answer in one sentence.<|eom|>"
+    "<|start|>assistant to=user<|message|>Seoul is the capital."
+)
+_MUSE_RAW_TOOL_CALL = (
+    " to=self<|message|>need weather<|eom|>"
+    "<|start|>assistant to=get_weather<|message|>"
+    '<atem:function_calls>\n<atem:invoke name="get_weather">\n'
+    '<atem:parameter name="city">Seoul</atem:parameter>\n'
+    '<atem:parameter name="days">3</atem:parameter>\n'
+    "</atem:invoke>\n</atem:function_calls>"
+)
+_MUSE_WEATHER_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer"},
+                },
+            },
+        },
+    }
+]
+
+
+def _chat_completion(content: str, finish_reason: str = "stop") -> dict:
+    return {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16},
+    }
+
+
+def _sse_content_stream(pieces: list[str], finish_reason: str = "stop") -> str:
+    events = [
+        {"choices": [{"delta": {"content": piece}, "finish_reason": None}]}
+        for piece in pieces
+    ]
+    events.append({"choices": [{"delta": {}, "finish_reason": finish_reason}]})
+    events.append(
+        {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 7,
+                "completion_tokens": len(pieces),
+                "total_tokens": 7 + len(pieces),
+            },
+        }
+    )
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    return content + "data: [DONE]\n\n"
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_splits_muse_channels_into_reasoning():
+    engine = _ready_engine(
+        lambda request: httpx.Response(200, json=_chat_completion(_MUSE_RAW_ANSWER))
+    )
+    engine._model_type = "muse_spark"
+    try:
+        output = await engine.chat([{"role": "user", "content": "Capital?"}])
+    finally:
+        await engine._client.aclose()
+
+    assert output.text == "<think>Answer in one sentence.</think>Seoul is the capital."
+    assert output.finish_reason == "stop"
+    assert output.tool_calls is None
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_extracts_muse_tool_calls():
+    engine = _ready_engine(
+        lambda request: httpx.Response(200, json=_chat_completion(_MUSE_RAW_TOOL_CALL))
+    )
+    engine._model_type = "muse_spark"
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "Weather?"}], tools=_MUSE_WEATHER_TOOLS
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert output.text == "<think>need weather</think>"
+    assert output.finish_reason == "tool_calls"
+    assert len(output.tool_calls) == 1
+    assert output.tool_calls[0]["name"] == "get_weather"
+    assert json.loads(output.tool_calls[0]["arguments"]) == {
+        "city": "Seoul",
+        "days": 3,
+    }
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_splits_muse_markers_across_deltas():
+    # Markers arrive split across deltas, as rank zero's detokenizer emits them.
+    pieces = [" to=", "self<|mes", "sage|>Answer", " briefly.<|e", "om|><|start|>"]
+    pieces += ["assistant to=user<|message|>", "Seoul", " is the capital."]
+    engine = _ready_engine(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse_content_stream(pieces),
+        )
+    )
+    engine._model_type = "muse_spark"
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Capital?"}]
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    streamed = "".join(output.new_text for output in outputs)
+    assert streamed == "<think>Answer briefly.</think>Seoul is the capital."
+    # The two header-only deltas yield nothing but still count as generated.
+    assert outputs[0].new_text == "<think>Answer"
+    assert outputs[0].completion_tokens == 3
+    assert outputs[-1].text == streamed
+    assert outputs[-1].finish_reason == "stop"
+    assert outputs[-1].tool_calls is None
+    assert outputs[-1].completion_tokens == len(pieces)
+    assert all("<|" not in output.new_text for output in outputs)
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_extracts_muse_tool_calls():
+    pieces = [_MUSE_RAW_TOOL_CALL[:40], _MUSE_RAW_TOOL_CALL[40:]]
+    engine = _ready_engine(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse_content_stream(pieces),
+        )
+    )
+    engine._model_type = "muse_spark"
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Weather?"}],
+                tools=_MUSE_WEATHER_TOOLS,
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert outputs[-1].text == "<think>need weather</think>"
+    assert outputs[-1].finish_reason == "tool_calls"
+    assert [call["name"] for call in outputs[-1].tool_calls] == ["get_weather"]
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_leaves_other_models_content_untouched():
+    engine = _ready_engine(
+        lambda request: httpx.Response(200, json=_chat_completion(_MUSE_RAW_ANSWER))
+    )
+    engine._model_type = "llama"
+    try:
+        output = await engine.chat([{"role": "user", "content": "Capital?"}])
+    finally:
+        await engine._client.aclose()
+
+    assert output.text == _MUSE_RAW_ANSWER
+
+
+# Cut at max_tokens inside the ATEM block: no closing tags.
+_MUSE_TRUNCATED_TOOL_CALL = _MUSE_RAW_TOOL_CALL.split('<atem:parameter name="days">')[0]
+
+
+@pytest.mark.asyncio
+async def test_distributed_chat_keeps_length_for_truncated_muse_tool_call():
+    engine = _ready_engine(
+        lambda request: httpx.Response(
+            200, json=_chat_completion(_MUSE_TRUNCATED_TOOL_CALL, "length")
+        )
+    )
+    engine._model_type = "muse_spark"
+    try:
+        output = await engine.chat(
+            [{"role": "user", "content": "Weather?"}], tools=_MUSE_WEATHER_TOOLS
+        )
+    finally:
+        await engine._client.aclose()
+
+    assert output.text == "<think>need weather</think>"
+    assert output.finish_reason == "length"
+    assert output.tool_calls is None
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_keeps_length_for_truncated_muse_tool_call():
+    engine = _ready_engine(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse_content_stream([_MUSE_TRUNCATED_TOOL_CALL], "length"),
+        )
+    )
+    engine._model_type = "muse_spark"
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Weather?"}],
+                tools=_MUSE_WEATHER_TOOLS,
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert outputs[-1].finish_reason == "length"
+    assert outputs[-1].tool_calls is None
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_times_muse_tool_only_reply():
+    # A reply that is only a tool call yields no visible text while streaming.
+    pieces = [
+        " to=get_weather<|message|>",
+        _MUSE_RAW_TOOL_CALL.split("<|message|>")[-1],
+    ]
+    engine = _ready_engine(
+        lambda request: httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse_content_stream(pieces),
+        )
+    )
+    engine._model_type = "muse_spark"
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Weather?"}],
+                tools=_MUSE_WEATHER_TOOLS,
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert outputs[-1].text == ""
+    assert outputs[-1].first_token_at is not None
+    assert outputs[-1].finish_reason == "tool_calls"
+    assert [call["name"] for call in outputs[-1].tool_calls] == ["get_weather"]
+
+
+def test_distributed_engine_detects_muse_by_name_like_local_parser():
+    engine = DistributedBatchedEngine(
+        replace(_deployment(), model="mlx-community/Muse-Spark-Open-oQ4e")
+    )
+    assert engine._uses_muse_channels() is True
+    assert DistributedBatchedEngine(_deployment())._uses_muse_channels() is False
+
+
+def test_distributed_engine_model_type_overrides_muse_like_name():
+    engine = DistributedBatchedEngine(
+        replace(_deployment(), model="/models/muse-spark-experiments/Llama-3.1")
+    )
+    engine._model_type = "llama"
+    assert engine._uses_muse_channels() is False
+
+
+@pytest.mark.asyncio
+async def test_distributed_stream_chat_counts_tool_call_delta_that_closes_reasoning():
+    # A tool-call-only delta that closes structured reasoning is a generated
+    # chunk; its interim count matches main for non-Muse models.
+    events = [
+        {"choices": [{"delta": {"reasoning": "Need lookup."}, "finish_reason": None}]},
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_weather",
+                                "type": "function",
+                                "function": {"name": "get_weather", "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        },
+    ]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+    engine = _ready_engine(
+        lambda request: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=content
+        )
+    )
+    try:
+        outputs = [
+            output
+            async for output in engine.stream_chat(
+                [{"role": "user", "content": "Weather?"}]
+            )
+        ]
+    finally:
+        await engine._client.aclose()
+
+    assert [output.new_text for output in outputs[:2]] == [
+        "<think>Need lookup.",
+        "</think>",
+    ]
+    assert [output.completion_tokens for output in outputs[:2]] == [1, 2]
