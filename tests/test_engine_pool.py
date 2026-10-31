@@ -3336,7 +3336,7 @@ class TestEnginePoolPrefillEviction:
             phys[0] -= pool[0]
             pool[0] = 0
 
-        def release_slots(request_id):
+        def release_slots(request_id, need_bytes):
             threads.append(threading.current_thread())
             phys[0] = 33 * gb
             return 16 * gb
@@ -3390,11 +3390,75 @@ class TestEnginePoolPrefillEviction:
 
         assert admitted is True
         scheduler._reclaim_prefill_headroom.assert_called_once()
-        scheduler.release_moe_offload_slots.assert_called_once_with("req-1")
+        # The shortfall after the reclaim: 46GB footprint + 10GB - 40GB.
+        scheduler.release_moe_offload_slots.assert_called_once_with("req-1", 16 * gb)
         assert threads and threads[0] is not threading.current_thread()
         release_hot_cache.assert_not_awaited()
         pool_obj._unload_engine.assert_not_awaited()
         pool_obj._release_ane_prefill_for_headroom.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("steps_left", [3, 1])
+    async def test_offload_slot_release_repeats_until_the_prefill_step_fits(
+        self, steps_left
+    ):
+        """Each pass releases a step sized from the shortfall left. The rung
+        repeats while a pass frees bytes; once the slots are at their floor,
+        the hot cache is next."""
+        gb = 1024**3
+        phys = [52 * gb]
+        needs = []
+
+        def release_slots(request_id, need_bytes):
+            needs.append(need_bytes)
+            if len(needs) > steps_left:
+                return 0  # at the floor
+            phys[0] -= 4 * gb
+            return 4 * gb
+
+        scheduler = self._reclaim_scheduler(lambda: None)
+        scheduler.release_moe_offload_slots = MagicMock(side_effect=release_slots)
+        scheduler.requests = {"req-1": object()}
+        scheduler._hot_cache_limit_factor = MagicMock(return_value=1.0)
+        scheduler._prefill_speed_priority = False
+        release_hot_cache = AsyncMock(return_value=8 * gb)
+        req = PrefillEvictionRequest(
+            request_id="req-1",
+            model_id="target",
+            current_bytes=52 * gb,
+            target_cap_bytes=50 * gb,
+            predicted_transient_bytes=10 * gb,
+            requested_tokens=8192,
+            reason="prefill_preflight",
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            pool_obj = _make_pool(ceiling=0)
+            pool_obj._entries = {
+                "target": self._entry(
+                    "target", 40 * gb, scheduler=scheduler, executor=executor
+                ),
+            }
+            pool_obj._current_model_memory = 40 * gb
+            pool_obj._process_memory_enforcer = SimpleNamespace(
+                release_hot_cache_for_prefill=release_hot_cache
+            )
+            pool_obj._release_ane_prefill_for_headroom = AsyncMock(return_value=0)
+            with (
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0),
+                patch("omlx.engine_pool.mx.get_cache_memory", return_value=0),
+                patch(
+                    "omlx.engine_pool.get_phys_footprint", side_effect=lambda: phys[0]
+                ),
+            ):
+                admitted = await pool_obj._evict_idle_lru_for_prefill("target", req)
+
+        assert admitted is True
+        if steps_left == 3:  # 12GB short: three 4GB steps, then it fits
+            assert needs == [12 * gb, 8 * gb, 4 * gb]
+            release_hot_cache.assert_not_awaited()
+        else:  # one step, then the floor: the hot cache covers the rest
+            assert needs == [12 * gb, 8 * gb]
+            release_hot_cache.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_recurring_headroom_pressure_escalates_to_bank_release(self):

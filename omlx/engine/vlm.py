@@ -2160,12 +2160,14 @@ class VLMBatchedEngine(BaseEngine):
         # BEFORE materialize so non-resident experts never load.
         moe_offload_wrapped = 0
         offload_stats = offload_release = offload_restore = None
+        offload_releasable = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
                 moe_offload_caches,
                 moe_offload_stats,
+                releasable_moe_offload_bytes,
                 release_moe_offload_slots,
                 restore_moe_offload_slots,
             )
@@ -2209,6 +2211,9 @@ class VLMBatchedEngine(BaseEngine):
                 offload_stats = functools.partial(moe_offload_stats, caches=caches)
                 offload_release = functools.partial(release_moe_offload_slots, caches)
                 offload_restore = functools.partial(restore_moe_offload_slots, caches)
+                offload_releasable = functools.partial(
+                    releasable_moe_offload_bytes, caches
+                )
         self._moe_offload_wrapped = moe_offload_wrapped
 
         # Materialize lazy buffers (RoPE freqs, vision/audio towers) on the
@@ -2508,6 +2513,7 @@ class VLMBatchedEngine(BaseEngine):
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
+        scheduler.moe_offload_releasable = offload_releasable
         if self._model_settings is not None:
             tq_enabled = getattr(self._model_settings, "turboquant_kv_enabled", False)
             if tq_enabled and self.model_type == "glm5_next":

@@ -3217,7 +3217,7 @@ class EnginePool:
         evicted_any = False
         evicted_count = 0
         reclaim_attempted = False
-        slots_release_attempted = False
+        slots_exhausted = False
         slots_freed = 0
         ane_release_attempted = False
         hot_cache_attempted = False
@@ -3292,15 +3292,19 @@ class EnginePool:
                     )
                     continue
 
-                if not slots_release_attempted:
+                if not slots_exhausted:
                     # The requesting model's MoE offload slots return at its next
                     # decode step, so they go before cached prefixes and models.
-                    slots_release_attempted = True
-                    slots_freed = await self._release_offload_slots_for_headroom(
-                        exclude_model_id, request_id
+                    # Each pass releases the shortfall in coarse steps, and the
+                    # rung repeats until the prefill step fits or the slots are
+                    # at their floor.
+                    released = await self._release_offload_slots_for_headroom(
+                        exclude_model_id, request_id, current + predicted - target
                     )
-                    if slots_freed:
+                    if released:
+                        slots_freed += released
                         continue
+                    slots_exhausted = True
 
                 if not hot_cache_attempted:
                     # Cached prefix blocks give way before any model does.
@@ -3522,9 +3526,10 @@ class EnginePool:
         return freed
 
     async def _release_offload_slots_for_headroom(
-        self, model_id: str, request_id: str
+        self, model_id: str, request_id: str, shortfall: int
     ) -> int:
-        """Release the model's MoE offload slots on its MLX thread; return the bytes."""
+        """Release ``shortfall`` bytes of the model's MoE offload slots, rounded up
+        to the next release step, on its MLX thread; return the bytes."""
         entry = self._entries.get(model_id)
         engine = entry.engine if entry is not None else None
         core = (
@@ -3539,7 +3544,9 @@ class EnginePool:
             return 0
         loop = asyncio.get_running_loop()
         try:
-            released = await loop.run_in_executor(executor, release, request_id)
+            released = await loop.run_in_executor(
+                executor, release, request_id, shortfall
+            )
         except Exception as e:
             logger.warning(
                 "MoE offload slot release failed for prefill request %s: %s",

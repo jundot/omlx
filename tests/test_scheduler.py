@@ -2346,19 +2346,29 @@ class TestSchedulerStatistics:
         self, mock_model, mock_tokenizer
     ):
         """Slots are released only while no other request runs on the engine,
-        and the next decode step restores them once, whatever its batch width."""
+        and the next decode step restores them once, whatever its batch width.
+        The release gets the prefill's shortfall, and both get a per-cache
+        reclaim that clears the Metal pool on the scheduler's stream."""
         scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
         release = MagicMock(return_value=3 * 1024**3)
         scheduler.moe_offload_release = release
         scheduler.moe_offload_restore = MagicMock()
         scheduler._reclaim_prefill_headroom = MagicMock()
         scheduler.running["decoding"] = MagicMock()
-        assert scheduler.release_moe_offload_slots("prefilling") == 0
+        assert scheduler.release_moe_offload_slots("prefilling", 2 * 1024**3) == 0
         release.assert_not_called()
         del scheduler.running["decoding"]
-        assert scheduler.release_moe_offload_slots("prefilling") == 3 * 1024**3
+        assert (
+            scheduler.release_moe_offload_slots("prefilling", 2 * 1024**3)
+            == 3 * 1024**3
+        )
         release.assert_called_once()
+        need, reclaim = release.call_args.args
+        assert need == 2 * 1024**3
         scheduler._reclaim_prefill_headroom.assert_called_once()
+        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear:
+            reclaim()
+        clear.assert_called_once_with(scheduler._stream)
 
         scheduler._schedule_waiting = MagicMock(return_value=([], []))
         scheduler._process_batch_responses = MagicMock(return_value=([], set()))
@@ -2368,7 +2378,11 @@ class TestSchedulerStatistics:
         for _ in range(2):
             scheduler.batch_generator.next_generated.return_value = iter([])
             scheduler.step()
-        scheduler.moe_offload_restore.assert_called_once_with()
+        scheduler.moe_offload_restore.assert_called_once()
+        (reclaim,) = scheduler.moe_offload_restore.call_args.args
+        with patch.object(scheduler_module, "_sync_and_clear_cache") as clear:
+            reclaim()
+        clear.assert_called_once_with(scheduler._stream)
 
 
 class TestSchedulerReset:

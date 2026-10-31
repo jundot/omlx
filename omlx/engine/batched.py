@@ -368,12 +368,14 @@ class BatchedEngine(BaseEngine):
         # resident slot tensors (#1304).
         moe_offload_wrapped = 0
         offload_stats = offload_release = offload_restore = None
+        offload_releasable = None
         if getattr(self._model_settings, "moe_expert_offload_enabled", False):
             from ..patches.moe_expert_offload import (
                 apply_moe_expert_offload,
                 materialize_offload_state,
                 moe_offload_caches,
                 moe_offload_stats,
+                releasable_moe_offload_bytes,
                 release_moe_offload_slots,
                 restore_moe_offload_slots,
             )
@@ -413,6 +415,9 @@ class BatchedEngine(BaseEngine):
                 offload_stats = functools.partial(moe_offload_stats, caches=caches)
                 offload_release = functools.partial(release_moe_offload_slots, caches)
                 offload_restore = functools.partial(restore_moe_offload_slots, caches)
+                offload_releasable = functools.partial(
+                    releasable_moe_offload_bytes, caches
+                )
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).
@@ -750,6 +755,7 @@ class BatchedEngine(BaseEngine):
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
+        scheduler.moe_offload_releasable = offload_releasable
         if ane_prefill_sequence_length:
             from ..patches.qwen35_ane_prefill import (
                 configure_qwen35_ane_prefill_scheduler,
