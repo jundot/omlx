@@ -6213,16 +6213,18 @@ def test_packed_linear_replaces_4bit_projections(monkeypatch):
         assert _close(out[0], _reference(original, x[0]))
 
 
-@pytest.mark.parametrize("bits", [4, 5])
-@pytest.mark.parametrize("batch,length", [(1, 8), (2, 6), (4, 6), (1, 24), (3, 5)])
+@pytest.mark.parametrize("dtype,group_size", [(mx.bfloat16, 64), (mx.float16, 128)])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+@pytest.mark.parametrize("batch,length", [(1, 8), (2, 6), (1, 24), (3, 5)])
 def test_verify_qmm_routes_batched_rows_through_mma_kernel(
-    monkeypatch, batch, length, bits
+    monkeypatch, batch, length, bits, dtype, group_size
 ):
     """rows = batch x block share one weight pass and match stock numerics."""
     from omlx.patches import qwen35_verify_qmm
 
     qwen35_verify_qmm.apply_verify_qmm_patch()
     monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: True)
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: False)
     monkeypatch.setattr(qwen35_verify_qmm, "_MIN_MMA_ROUTE_N", 256)
     monkeypatch.setattr(qwen35_verify_qmm, "_MIN_ROUTE_N", 256)
     routed = []
@@ -6234,15 +6236,15 @@ def test_verify_qmm_routes_batched_rows_through_mma_kernel(
 
     monkeypatch.setattr(qwen35_verify_qmm, "vk_qmm_mma", spy)
     mx.random.seed(7)
-    layer = nn.QuantizedLinear(512, 288, bits=bits, group_size=64)
-    x = (mx.random.normal((batch, length, 512)) * 0.5).astype(mx.bfloat16)
+    layer = nn.QuantizedLinear(512, 288, bits=bits, group_size=group_size)
+    x = (mx.random.normal((batch, length, 512)) * 0.5).astype(dtype)
     expected = mx.quantized_matmul(
         x,
         layer.weight,
         layer.scales,
         layer.biases,
         transpose=True,
-        group_size=64,
+        group_size=group_size,
         bits=bits,
     ).astype(mx.float32)
     out = layer(x).astype(mx.float32)
@@ -6278,7 +6280,7 @@ def _batched_decode_spy(monkeypatch, nax=False):
     """
     monkeypatch.setattr(nn.QuantizedLinear, "__call__", _stock_quantized_linear_call)
     monkeypatch.setattr(batched_decode_qmm, "_PATCHED", False)
-    monkeypatch.setattr(batched_decode_qmm, "is_nax_available", lambda: nax)
+    monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: nax)
     monkeypatch.setattr(qwen35_verify_qmm, "_MIN_SG8_ROUTE_N", 256)
     monkeypatch.setattr(qwen35_verify_qmm, "_MIN_MMA_ROUTE_N", 256)
     batched_decode_qmm._route.cache_clear()
@@ -6363,7 +6365,7 @@ def test_batched_decode_leaves_exact_modes_on_stock(monkeypatch, mode):
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
 @pytest.mark.parametrize("rows", [4, 8])
 def test_sg8_kernels_match_quantized_matmul(bits, rows, dtype):
     """Plain, gate/up swiglu and grouped sg8 launches against stock qmm."""
@@ -6391,6 +6393,8 @@ def test_sg8_kernels_match_quantized_matmul(bits, rows, dtype):
         swiglu = vq.vk_swiglu_sg8(x, gate, up, sums)
         assert _close(swiglu, nn.silu(g) * u, tol=2e-2)
 
+        if bits not in (4, 5):
+            continue
         # Mixed 4/5-bit projections of one input share a launch.
         group = [layer, _quantized_linear(512, 1024, 9 - bits, 14, dtype), gate]
         for got, linear in zip(vq.vk_group_sg8(x, group, sums), group):

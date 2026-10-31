@@ -10,8 +10,7 @@ weight tile once for every row, and they serve one-token decode rows too.
 Only (rows, 1, K) inputs with at least ``MIN_ROWS`` rows are routed, and only
 while no speculative verify or one-row exactness mode is armed. Those modes
 own their (rows, 1, K) calls. Prefill chunks and single-request decode keep
-their paths. On GPUs with the NAX tensor unit, stock MLX moves to a
-tensor-unit qmm for larger batches, so routing stops at ``NAX_MAX_ROWS``.
+their paths. On GPUs with the NAX tensor unit, mma stops at 16 rows.
 """
 
 from __future__ import annotations
@@ -22,8 +21,6 @@ import logging
 import mlx.core as mx
 import mlx.nn as nn
 
-from omlx.custom_kernels.nax import is_nax_available
-
 from . import qwen35_verify_qmm
 from .deepseek_v4 import decode_consistency
 
@@ -31,15 +28,10 @@ logger = logging.getLogger(__name__)
 
 # On M3 Ultra sg8 is slower than stock qmv_wide at four decode rows.
 MIN_ROWS = 6
-# mma covers up to 24 rows.
-MAX_ROWS = 24
-# On M5 Max mma beats the stock NAX qmm at 16 rows and loses at 24.
-NAX_MAX_ROWS = 16
 _ROUTES = ("sg8", "mma", "m1_mma")
 
 _PATCHED = False
 _ENABLED = False
-_max_rows = MAX_ROWS
 _ENGAGED_LOGGED = False
 # Kernel keys whose first launch succeeded (True) or failed (False).
 _CHECKED: dict[tuple, bool] = {}
@@ -60,8 +52,7 @@ def _exactness_armed() -> bool:
 
 
 def apply_batched_decode_qmm_patch() -> bool:
-    global _PATCHED, _ENABLED, _max_rows
-    _max_rows = NAX_MAX_ROWS if is_nax_available() else MAX_ROWS
+    global _PATCHED, _ENABLED
     _ENABLED = True
     if _PATCHED:
         return True
@@ -76,7 +67,6 @@ def apply_batched_decode_qmm_patch() -> bool:
             or x.ndim != 3
             or x.shape[1] != 1
             or x.shape[0] < MIN_ROWS
-            or x.shape[0] > _max_rows
             or getattr(self, "mode", "affine") != "affine"
             or self.scales.dtype != x.dtype
             or _exactness_armed()
