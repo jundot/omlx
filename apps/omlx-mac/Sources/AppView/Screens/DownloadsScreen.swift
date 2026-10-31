@@ -590,7 +590,7 @@ private struct SearchDropdown: View {
             // free for the info button (rendered as a sibling outside
             // this row Button so its tap doesn't fall through to onPick).
             if !isHovered, let downloads = m.downloads, downloads > 0 {
-                Text(CountFormat.compact(downloads))
+                Text(CountFormat.count(downloads))
                     .font(.omlxMono(10.5))
                     .foregroundStyle(theme.textTertiary)
                     .padding(.trailing, 12)
@@ -928,7 +928,7 @@ private struct SuggestedSection: View {
         if let p = m.paramsFormatted { bits.append(p) }
         if let s = m.sizeFormatted, !s.isEmpty { bits.append(s) }
         if let arch = m.architecture { bits.append("GGUF · \(arch)") }
-        if let dl = m.downloads { bits.append("\(CountFormat.compact(dl)) ↓") }
+        if let dl = m.downloads { bits.append("\(CountFormat.count(dl)) ↓") }
         return bits.isEmpty ? "—" : bits.joined(separator: " · ")
     }
 }

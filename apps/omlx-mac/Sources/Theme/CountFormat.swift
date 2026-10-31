@@ -1,7 +1,21 @@
 // Compact counts for the window and the menu bar. Chinese uses 万/亿/万亿
 // (萬/億/兆 in Traditional) like the web UI; other languages use K/M/B/T.
+// Window counts can also keep every digit; that choice lives in Appearance.
 
 import Foundation
+
+/// How the window prints counts. The web console stores the same pair under
+/// "omlx-number-scale" and defaults to the compact form, as the app does.
+enum NumberScale: String {
+    case compact
+    case exact
+
+    static let storageKey = "OMLXNumberScale"
+
+    static var stored: NumberScale {
+        NumberScale(rawValue: UserDefaults.standard.string(forKey: storageKey) ?? "") ?? .compact
+    }
+}
 
 enum CountFormat {
 
@@ -23,6 +37,12 @@ enum CountFormat {
         }
         guard Double(abs(value)) >= 10_000 else { return exact(value, locale: locale) }
         return chinese(value, locale: locale)
+    }
+
+    /// A count for the window, honouring the Appearance number scale.
+    static func count(_ value: Int, locale: Locale = .current) -> String {
+        guard NumberScale.stored == .exact else { return compact(value, locale: locale) }
+        return exact(value, locale: locale)
     }
 
     private static func exact(_ value: Int, locale: Locale) -> String {
