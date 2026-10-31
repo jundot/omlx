@@ -45,7 +45,7 @@ def released(monkeypatch, tmp_path):
     monkeypatch.setattr(
         launch,
         "_reap_stale_remote_workers",
-        lambda _deployment, **_kwargs: [],
+        lambda _deployment, **_kwargs: None,
     )
     monkeypatch.setattr(launch, "_set_serve_release", lambda *_a, **_k: None)
     monkeypatch.setattr(launch, "_install_cluster_ssh_wrapper", lambda _path: None)
