@@ -2378,3 +2378,48 @@ def test_ple_depthwise_conv_validation_mismatch_disables_kernel(_depthwise_conv_
     assert mx.array_equal(out, conv(x)).item()
     assert language._DEPTHWISE_CONV_STATE["enabled"] is False
     assert language._DEPTHWISE_CONV_STATE["validated"] is False
+
+
+def test_packed_expert_quantisation_params_follow_the_rename():
+    """A packed expert checkpoint stores scales/biases next to each weight.
+
+    ``sanitize`` renames the weights ``experts.*`` -> ``switch_mlp.*``; the quantisation
+    params have to follow the same rename, otherwise the loader rejects them as
+    "parameters not in model" and the checkpoint cannot load at all.
+    """
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models import qwen4_exp
+
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            tie_word_embeddings=False, num_experts=4, num_experts_per_tok=2,
+            num_hidden_layers=1,
+        )
+    )
+    host = SimpleNamespace(config=config)
+    prefix = "model.language_model.layers.0.mlp"
+    experts, hidden, inter = 4, 16, 8
+    weights = {
+        f"{prefix}.experts.gate_up_proj": mx.zeros((experts, inter, 2 * hidden)),
+        f"{prefix}.experts.gate_up_proj.scales": mx.zeros((experts, inter, 4)),
+        f"{prefix}.experts.gate_up_proj.biases": mx.zeros((experts, inter, 4)),
+        f"{prefix}.experts.down_proj": mx.zeros((experts, hidden, inter)),
+        f"{prefix}.experts.down_proj.scales": mx.zeros((experts, hidden, 4)),
+        f"{prefix}.experts.down_proj.biases": mx.zeros((experts, hidden, 4)),
+    }
+
+    out = qwen4_exp.Model.sanitize(host, weights)
+
+    # sanitize also rewrites the model prefix; both weights and quantisation params moved,
+    # with the fused gate/up projection split the same way for weight and params
+    mlp = "language_model.model.layers.0.mlp.switch_mlp"
+    assert out[f"{mlp}.gate_proj.weight"].shape == (experts, inter // 2, 2 * hidden)
+    assert out[f"{mlp}.up_proj.weight"].shape == (experts, inter // 2, 2 * hidden)
+    assert out[f"{mlp}.down_proj.weight"].shape == (experts, hidden, inter)
+    for suffix, g in (("scales", 4), ("biases", 4)):
+        assert out[f"{mlp}.gate_proj.{suffix}"].shape == (experts, inter // 2, g)
+        assert out[f"{mlp}.up_proj.{suffix}"].shape == (experts, inter // 2, g)
+        assert out[f"{mlp}.down_proj.{suffix}"].shape == (experts, hidden, g)
+
+    # nothing is left behind under the packed names
+    assert not [k for k in out if ".mlp.experts." in k]
