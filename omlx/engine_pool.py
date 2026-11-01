@@ -3029,7 +3029,11 @@ class EnginePool:
             self._validate_llm_engine_ready(model_id, loaded.engine)
             if _lease:
                 loaded.in_use += 1
-            return loaded.engine
+
+        # Warm after releasing the load lock: the warmup decode is a normal
+        # request, and a prefill eviction request takes this same lock.
+        await self._warm_engine(model_id, loaded.engine, loaded)
+        return loaded.engine
 
     async def _release_engine_lease(self, model_id: str) -> None:
         # A normal completed request need not wait behind unrelated teardown.
@@ -4055,6 +4059,46 @@ class EnginePool:
                     )
                 raise asyncio.CancelledError
         task.result()
+
+    async def _warm_engine(self, model_id: str, engine, entry) -> None:
+        """Absorb one-time lazy initialization before the engine is announced.
+
+        The first decode after a load compiles Metal kernels, builds the chat
+        template prompt and runs the speculative drafter's first verify cycle.
+        Paying that inside a user request makes the first message after a
+        preload take hundreds of milliseconds (seconds on large models), so
+        run one throwaway decode here instead. The cache store is skipped so
+        the warmup prompt cannot seed the prefix cache.
+
+        Callers run this after releasing the pool lock: the warmup is a normal
+        request, and a prefill eviction request takes the same lock.
+        """
+        if entry.engine_type not in ("batched", "vlm") or entry.abort_loading:
+            return
+        chat = getattr(engine, "chat", None)
+        if chat is None or getattr(engine, "is_diffusion_model", False):
+            return
+        started = time.perf_counter()
+        try:
+            await chat(
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=4,
+                temperature=0.0,
+                skip_cache_store=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(f"Engine warmup failed for {model_id}: {exc}")
+            return
+        # Keep the compiled kernels, drop the warmup's transient buffers.
+        await asyncio.get_running_loop().run_in_executor(
+            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+        )
+        logger.debug(
+            f"Engine warmup for {model_id} took "
+            f"{time.perf_counter() - started:.2f}s"
+        )
 
     async def _load_engine(
         self,
