@@ -261,6 +261,10 @@ def load(
             )
             model._moe_offload_plan = offload
             for layer_id, layer in enumerate(model.language_model.layers):
+                # Pipeline stages leave non-owned layers as None placeholders;
+                # they have no experts to wrap and are never forwarded here.
+                if layer is None:
+                    continue
                 prefix = f"language_model.layers.{layer_id}.ffn.experts"
                 layer.ffn.experts = OffloadedExpert(layer.ffn.experts, offload, prefix)
             logger.info(

@@ -1424,7 +1424,10 @@ def test_cluster_stage_loads_only_its_text_weights(tmp_path):
     with install_unequal_pipeline_plan(plan):
         stage = deepseek_v41.load_pipeline_stage(target, group)
         offloaded = deepseek_v41.load_pipeline_stage(
-            target, group, engram_ssd_offload=True
+            target,
+            group,
+            engram_ssd_offload=True,
+            moe_expert_offload_resident_fraction=0.125,
         )
     loaded = dict(tree_flatten(stage.parameters()))
 
