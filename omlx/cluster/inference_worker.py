@@ -1107,6 +1107,10 @@ def _runtime_assignment(
         "tensor_parallel_rank": assignment.tensor_parallel_rank,
         "tensor_parallel_size": assignment.tensor_parallel_size,
         "sharded_weight_bytes": assignment.sharded_weight_bytes,
+        "moe_expert_offload_resident_fraction": (
+            assignment.moe_expert_offload_resident_fraction
+        ),
+        "moe_offload_weight_bytes": assignment.moe_offload_weight_bytes,
     }
     if assignment.predicted_stage_seconds is not None:
         result.update(
@@ -1510,6 +1514,14 @@ def run_worker(args: argparse.Namespace) -> int:
         # any weights are read: without it a rank loads until the OS gives up,
         # taking the machine with it.
         assignment = assignments[rank]
+        moe_expert_offload_resident_fraction = (
+            assignment.moe_expert_offload_resident_fraction
+        )
+        if moe_expert_offload_resident_fraction and getattr(args, "mtp", False):
+            raise RuntimeError(
+                "MoE expert offload cannot be combined with Lightning MTP; "
+                "re-plan with MTP disabled"
+            )
         # Role- and tier-aware: a Mac someone is working on admits at a lower
         # fraction than a headless one, and the guard — not the plan — is what
         # actually stops a load. Both come from this rank's own assignment,
@@ -1554,7 +1566,14 @@ def run_worker(args: argparse.Namespace) -> int:
             assignments=[_runtime_assignment(item) for item in assignments],
         )
 
-        maybe_apply_pre_load_patches(args.model, _mtp_load_settings(args))
+        maybe_apply_pre_load_patches(
+            args.model,
+            (
+                None
+                if moe_expert_offload_resident_fraction
+                else _mtp_load_settings(args)
+            ),
+        )
         # MLX-LM's pipeline shard selection rejects any parameter absent
         # from the safetensors index, though it loads with strict=False
         # moments later. Architectures oMLX patches in (glm_moe_dsa's
@@ -1623,6 +1642,10 @@ def run_worker(args: argparse.Namespace) -> int:
                     ),
                     engram_ssd_offload=assignment.ssd_weight_bytes > 0,
                     tensor_shard_options=_tensor_shard_options(execution, assignment),
+                    tensor_shard_options=_tensor_shard_options(execution),
+                    moe_expert_offload_resident_fraction=(
+                        moe_expert_offload_resident_fraction
+                    ),
                 ),
             ):
                 provider.load_default()
@@ -1646,7 +1669,7 @@ def run_worker(args: argparse.Namespace) -> int:
             _validate_measured_weight_bytes(measured_weight_bytes, assignment)
             mtp_sync = (
                 _arm_cluster_mtp(provider.model, group, rank, mx)
-                if execution.mtp
+                if execution.mtp and not moe_expert_offload_resident_fraction
                 else None
             )
             with (
