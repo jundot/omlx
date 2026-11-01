@@ -1171,16 +1171,36 @@ def _model_source(model_type: str) -> str:
     return ""
 
 
-def _cluster_unloaded_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
-    """Weight prefixes an oMLX-registered rank module never loads."""
+def _cluster_rank_module(config: dict[str, Any]) -> Any | None:
+    """The mlx-lm module a cluster rank would load, registering known adapters.
+
+    A cold planner process has not loaded a checkpoint yet, so the adapter is
+    not in ``sys.modules`` when it reads the unloaded and MTP prefixes. Qwen4's
+    adapter is cheap to register and makes those answers match what the rank
+    will actually load.
+    """
 
     model_type = config.get("model_type")
     if not isinstance(model_type, str):
-        return ()
+        return None
+    qualified = f"mlx_lm.models.{model_type}"
+    module = sys.modules.get(qualified)
+    if module is None and model_type == "qwen4_exp":
+        try:
+            from ..patches.qwen4_exp_mlx_lm import apply_qwen4_exp_mlx_lm_patch
+
+            apply_qwen4_exp_mlx_lm_patch()
+            module = sys.modules.get(qualified)
+        except Exception:  # noqa: BLE001 - planning must survive a missing extra
+            return None
+    return module
+
+
+def _cluster_unloaded_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
+    """Weight prefixes an oMLX-registered rank module never loads."""
+
     prefixes = getattr(
-        sys.modules.get(f"mlx_lm.models.{model_type}"),
-        "CLUSTER_UNLOADED_WEIGHT_PREFIXES",
-        (),
+        _cluster_rank_module(config), "CLUSTER_UNLOADED_WEIGHT_PREFIXES", ()
     )
     return tuple(prefixes)
 
@@ -1188,13 +1208,8 @@ def _cluster_unloaded_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
 def _cluster_mtp_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
     """Weight prefixes of the draft head a registered rank module can load."""
 
-    model_type = config.get("model_type")
-    if not isinstance(model_type, str):
-        return ()
     prefixes = getattr(
-        sys.modules.get(f"mlx_lm.models.{model_type}"),
-        "CLUSTER_MTP_WEIGHT_PREFIXES",
-        (),
+        _cluster_rank_module(config), "CLUSTER_MTP_WEIGHT_PREFIXES", ()
     )
     return tuple(prefixes)
 
@@ -1202,12 +1217,7 @@ def _cluster_mtp_prefixes(config: dict[str, Any]) -> tuple[str, ...]:
 def _pipeline_stage_starts(config: dict[str, Any]) -> tuple[int, ...]:
     """Layers a later stage may start at, when the model's module restricts them."""
 
-    model_type = config.get("model_type")
-    if not isinstance(model_type, str):
-        return ()
-    starts = getattr(
-        sys.modules.get(f"mlx_lm.models.{model_type}"), "pipeline_stage_starts", None
-    )
+    starts = getattr(_cluster_rank_module(config), "pipeline_stage_starts", None)
     return tuple(starts(config)) if callable(starts) else ()
 
 

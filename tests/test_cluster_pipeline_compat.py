@@ -49,14 +49,14 @@ def test_a_checkpoint_without_a_readable_config_supports_no_split(tmp_path):
 
 
 def test_an_architecture_the_loader_has_no_module_for_reports_none(tmp_path):
-    """Qwen4-Exp is mlx-vlm-native: mlx-lm has no module to hold a stage.
+    """Qwen3-Omni is mlx-vlm-native: mlx-lm has no module to hold a stage.
 
     Calling that an "even split" would describe a mechanism that does not exist,
     and the refusal an operator gets would tell them to move layers between Macs
     when no arrangement of layers can run.
     """
 
-    model = _model_config(tmp_path, "qwen4_exp")
+    model = _model_config(tmp_path, "qwen3_omni")
 
     assert pipeline_support(model) == "none"
     assert not pipeline_assignment_is_honored(model)
