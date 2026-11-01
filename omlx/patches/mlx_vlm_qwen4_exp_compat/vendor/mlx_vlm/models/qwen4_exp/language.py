@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.pipeline import PipelineMixin
 
 from omlx.memory_monitor import qwen4_gathered_prefill_route
 from omlx.memory_monitor import (
@@ -4733,7 +4734,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         return _hc_write(hyper_input, branch, injection_weights)
 
 
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(PipelineMixin, nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.args = config
@@ -4749,6 +4750,35 @@ class Qwen4ExpModel(nn.Module):
         self.fa_idx = next(
             (i for i, layer in enumerate(self.layers) if not layer.is_linear), 0
         )
+
+    def pipeline(self, group, split=None):
+        """Slice this model to one stage and localise its layer indices.
+
+        ``PipelineMixin`` leaves ``None`` placeholders for the layers held by
+        other ranks; the mask and cache indices must therefore be recomputed
+        against ``pipeline_layers``, never against the full list.
+        """
+
+        super().pipeline(group, split=split)
+        # MLX's loader walks the module tree; a None placeholder makes it fail
+        # before it reaches this rank's own layers. Empty modules carry no
+        # parameters, so the stage loader skips them and ``pipeline_layers``
+        # still starts at ``start_idx``.
+        if self.start_idx:
+            self.layers[: self.start_idx] = [
+                nn.Module() for _ in range(self.start_idx)
+            ]
+        self.ssm_idx = None
+        self.fa_idx = None
+        for index, layer in enumerate(self.pipeline_layers):
+            if layer is None:
+                continue
+            if self.ssm_idx is None and layer.is_linear:
+                self.ssm_idx = index
+            elif self.fa_idx is None and not layer.is_linear:
+                self.fa_idx = index
+            if self.ssm_idx is not None and self.fa_idx is not None:
+                break
 
     def __call__(
         self,
@@ -4771,12 +4801,25 @@ class Qwen4ExpModel(nn.Module):
             self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         )
         hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
+        boundary_dtype = hidden_states.dtype
+        if self.pipeline_size > 1 and self.pipeline_rank < self.pipeline_size - 1:
+            hidden_states = mx.distributed.recv_like(
+                hidden_states, self.pipeline_rank + 1
+            )
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
-        fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = q35_language._create_qwen3_5_ssm_mask(
-            hidden_states, cache[self.ssm_idx]
+        fa_mask = (
+            _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
+            if self.fa_idx is not None
+            else None
+        )
+        ssm_mask = (
+            q35_language._create_qwen3_5_ssm_mask(
+                hidden_states, cache[self.ssm_idx]
+            )
+            if self.ssm_idx is not None
+            else None
         )
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
             ssm_mask = mask
@@ -4794,7 +4837,9 @@ class Qwen4ExpModel(nn.Module):
             <= _EAGER_DISPATCH_MAX_ROWS
         )
         write = None
-        for index, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
+        for index, (layer, layer_cache) in enumerate(
+            zip(self.pipeline_layers, cache)
+        ):
             layer_mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(
                 hidden_states,
@@ -4826,35 +4871,76 @@ class Qwen4ExpModel(nn.Module):
                 hidden_sink.append(mixed)
 
         mixed = None
-        if write is not None:
-            # The final mixer applies the last write and returns the residual.
-            mixed, hidden_states = self.hyper_connection_mixer(
-                hidden_states, target_verify=target_verify, write=write
+        sent = None
+        if self.pipeline_size > 1 and self.pipeline_rank != 0:
+            # The last local layer's tail write is still pending. Apply it to
+            # the residual before the handoff: the next rank starts with
+            # write=None, and sending the unflushed residual loses it.
+            if write is not None:
+                _, hidden_states = self.hyper_connection_mixer(
+                    hidden_states, target_verify=target_verify, write=write
+                )
+                write = None
+            # Hand the pending HC residual streams to the next rank before the
+            # final mixer: only rank zero owns the last layers and the mixdown.
+            sent = mx.distributed.send(
+                hidden_states.astype(boundary_dtype),
+                (self.pipeline_rank - 1) % self.pipeline_size,
             )
+            if cache:
+                from omlx.cluster.pipeline_compat import _cache_dependency
 
-        if inputs_embeds is None and gdn_sink is None and not _MTP_ONE_ROW_STEP.get():
-            host_ref = getattr(self, "_omlx_mtp_prime_host", None)
-            host = host_ref() if host_ref is not None else None
-            if host is not None:
-                from omlx.patches.mlx_lm_mtp import prompt_priming
-
-                if prompt_priming.capture_eligible(host, cache):
-                    prompt_priming.maybe_capture(
-                        host,
-                        inputs,
-                        hidden_states,
-                        cache,
-                    )
-
-        if hidden_sink is not None and capture_layer_ids == []:
-            # Lightning MTP consumes all residual streams before the final
-            # mixer. Ordinary layer captures retain their mixed representation.
-            hidden_sink.append(hidden_states)
-
-        if mixed is None:
-            mixed = self.hyper_connection_mixer(
-                hidden_states, target_verify=target_verify
+                _cache_dependency(cache[-1], sent, mx)
+            mixed = mx.zeros(
+                (hidden_states.shape[0], hidden_states.shape[1], self.args.hidden_size),
+                dtype=boundary_dtype,
             )
+        else:
+            if write is not None:
+                # The final mixer applies the last write and returns the
+                # residual.
+                mixed, hidden_states = self.hyper_connection_mixer(
+                    hidden_states, target_verify=target_verify, write=write
+                )
+
+            if (
+                inputs_embeds is None
+                and gdn_sink is None
+                and not _MTP_ONE_ROW_STEP.get()
+            ):
+                host_ref = getattr(self, "_omlx_mtp_prime_host", None)
+                host = host_ref() if host_ref is not None else None
+                if host is not None:
+                    from omlx.patches.mlx_lm_mtp import prompt_priming
+
+                    if prompt_priming.capture_eligible(host, cache):
+                        prompt_priming.maybe_capture(
+                            host,
+                            inputs,
+                            hidden_states,
+                            cache,
+                        )
+
+            if hidden_sink is not None and capture_layer_ids == []:
+                # Lightning MTP consumes all residual streams before the final
+                # mixer. Ordinary layer captures retain their mixed
+                # representation.
+                hidden_sink.append(hidden_states)
+
+            if mixed is None:
+                mixed = self.hyper_connection_mixer(
+                    hidden_states, target_verify=target_verify
+                )
+        if sent is not None:
+            # Keep the point-to-point send in the graph the gather evaluates.
+            mixed = mx.depends(mixed, sent)
+        if self.pipeline_size > 1:
+            # The standard pipeline output contract: every rank gathers the
+            # final hidden and samples the same token. The runtime's rank-zero
+            # optimization replaces this with a token all-sum.
+            mixed = mx.distributed.all_gather(mixed.astype(boundary_dtype))[
+                : mixed.shape[0]
+            ]
         return mixed
 
 
@@ -5129,7 +5215,7 @@ class LanguageModel(Qwen3_5LanguageModel):
 
     def make_cache(self):
         caches = []
-        for layer in self.layers:
+        for layer in self.model.pipeline_layers:
             if layer.is_linear:
                 caches.append(ArraysCache(size=4 if "ple" in layer else 2))
             else:

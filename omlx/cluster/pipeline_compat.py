@@ -54,6 +54,16 @@ def _pipeline_module(model_path: str | Path) -> Any | None:
     model_type = model_type_of(model_path)
     if not model_type:
         return None
+    if model_type == "qwen4_exp":
+        # The rank adapter is registered by the worker's pre-load patches; a
+        # cold planner has not loaded a checkpoint and must ask the same
+        # question, so register the cheap text-only module first.
+        try:
+            from ..patches.qwen4_exp_mlx_lm import apply_qwen4_exp_mlx_lm_patch
+
+            apply_qwen4_exp_mlx_lm_patch()
+        except Exception:  # noqa: BLE001 - a missing extra stays "none"
+            return None
     try:
         return importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError:
