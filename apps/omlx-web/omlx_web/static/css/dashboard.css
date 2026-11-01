@@ -27,6 +27,11 @@
 
     /* === Page-level backgrounds === */
     [data-theme="dark"] .bg-white { background-color: var(--bg-primary) !important; }
+    /* The dark remap above is !important with the same weight as a hover utility,
+       so a white button would otherwise never change colour on hover. Raise the
+       hover state above it for the buttons that pair bg-white with a neutral hover. */
+    [data-theme="dark"] .bg-white.hover\:bg-neutral-50:hover { background-color: var(--bg-secondary) !important; }
+    [data-theme="dark"] .bg-white.hover\:bg-neutral-100:hover { background-color: var(--bg-tertiary) !important; }
     [data-theme="dark"] .bg-white\/80 { background-color: rgb(var(--palette-night-850) / 0.8) !important; }
 
     /* Cluster status is operational data, not decorative helper copy. Keep
