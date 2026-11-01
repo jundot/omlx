@@ -505,6 +505,21 @@ class TestCompileGrammarForRequest:
         engine = _make_engine()
         assert self._call(engine) is None
 
+    def test_plain_text_does_not_build_the_grammar_compiler(self):
+        """No format requested: the lazy xgrammar build must not run."""
+        from omlx.server import _compile_grammar_for_request
+
+        touched = []
+
+        class Engine:
+            @property
+            def grammar_compiler(self):
+                touched.append(True)
+                return None
+
+        assert _compile_grammar_for_request(Engine()) is None
+        assert touched == []
+
     def test_raises_when_no_compiler_and_structured_outputs(self):
         from fastapi import HTTPException
         engine = _make_engine(grammar_compiler=None)

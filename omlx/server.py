@@ -5935,11 +5935,15 @@ def _compile_grammar_for_request(
     unhonored strict request when ``strict: true`` was set) rather than being
     silent (#1241).
     """
-    compiler = getattr(engine, "grammar_compiler", None)
-
     fmt = _build_format_element(structured_outputs, response_format)
     if fmt is None:
+        # Nothing to constrain: do not touch ``engine.grammar_compiler``.
+        # That property builds an xgrammar TokenizerInfo over the whole
+        # vocabulary on first access (hundreds of milliseconds on a 250K
+        # vocab), and a plain-text request would otherwise pay it once.
         return None
+
+    compiler = getattr(engine, "grammar_compiler", None)
 
     if compiler is None:
         if structured_outputs is not None:
