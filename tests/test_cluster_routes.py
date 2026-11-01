@@ -836,6 +836,39 @@ def test_cluster_plan_follows_the_saved_moe_expert_offload_setting(
     )
 
 
+def test_moe_offload_allows_deepseek_v41_with_mtp(tmp_path, monkeypatch):
+    from omlx.cluster.planner import ModelLayout
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    monkeypatch.setattr(
+        routes, "_saved_moe_offload", lambda _path: (True, 0.5)
+    )
+    monkeypatch.setattr(
+        "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+        lambda _path: (True, ""),
+    )
+    monkeypatch.setattr(
+        "omlx.patches.deepseek_v41.moe_offload.offload_layer_bytes",
+        lambda _path, _fraction, **_kwargs: (0,),
+    )
+    layout = ModelLayout(
+        source=str(tmp_path),
+        fixed_weight_bytes=1,
+        layer_weight_bytes=(1,),
+        mtp_weight_bytes=1,
+    )
+
+    fraction, layer_bytes = routes._moe_offload_for_plan(
+        str(tmp_path),
+        layout,
+        mtp=True,
+        tensor_parallel_size=1,
+    )
+
+    assert fraction == 0.5
+    assert layer_bytes == (0,)
+
+
 def test_cluster_plan_context_changes_kv_memory_and_signed_placement(monkeypatch):
     from omlx.cluster.planner import ModelLayout
 

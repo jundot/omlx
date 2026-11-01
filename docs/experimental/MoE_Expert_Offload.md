@@ -258,15 +258,51 @@ storage is independent: `deepseek_v41_engram_ssd_offload` can be enabled at
 the same time. Memory admission, loaded-model accounting, and unload targets
 include the expert savings and the selected Engram storage mode.
 
-MoE offload cannot be combined with Lightning MTP (including DSpark), VLM
-MTP, or DFlash. Disable these before enabling offload. Settings and runtime
-validation reject conflicting combinations. V4.1 offload skips retained
-DSpark tensors even when the checkpoint includes them; the checkpoint is
-not modified. Disable offload and reload to use MTP again.
+DeepSeek V4.1 can combine Lightning MTP with expert offload. Its DSpark draft
+head stays resident on rank zero while backbone experts stream from SSD; the
+head is priced into that rank's plan and is not part of the offloaded set. VLM
+MTP and DFlash remain incompatible with expert offload.
 
 GLM-5.3-Flash (`glm5_next`) and the custom DeepSeek V4 expert kernels are not
 supported by this adapter. Unmatched modules remain resident, and unsupported
 custom model families receive no offload admission discount.
+
+## Cluster pipeline ranks
+
+A pipeline rank can use the same routed-expert offload as a single Mac. The
+saved model setting is global for the deployment, while the planner turns it
+into a per-rank `PipelineAssignment`:
+
+- `moe_expert_offload_resident_fraction` is the loader setting.
+- `moe_offload_weight_bytes` is the part of that rank's stage that stays on SSD.
+- `planned_weight_bytes` excludes both expert-offload and Engram-SSD bytes, so
+  the rank guard and the engine-pool admission check the same resident set.
+
+The planner derives the bytes from `ExpertOffloadPlan` rather than applying a
+percentage to the whole stage. That matters because the loader rounds the
+fraction to whole experts per layer and because a stage may hold different
+layers than its neighbours. Engram SSD offload remains independent.
+
+Only pipeline parallelism is supported. Tensor-parallel ranks read every
+expert, so a plan that combines TP with expert offload is refused. DeepSeek
+V4.1 is the supported cluster family; its DSpark head can stay resident while
+the backbone streams, so Lightning MTP is allowed with offload. VLM MTP and
+DFlash are still rejected.
+
+A three-node DeepSeek-V4.1-Flash-1017-oQ2e-ngram-mtp deployment has been
+validated with a 128k plan:
+
+| Node | RAM | Layers | Resident weights |
+|---|---:|---:|---:|
+| M5 Max | 128 GiB | 14-40 | 16.4 GiB |
+| M2 Ultra | 64 GiB | 2-14 | 5.2 GiB |
+| M1 Max | 32 GiB | 0-2 | 3.2 GiB |
+
+The run used 50 % expert residency, Engram on SSD, MTP on rank zero, 2,048
+token prefill chunks and the ring backend. All three ranks reached ready and
+the canary passed. Short completions decoded at about 18-20 tok/s once warm,
+and a 60,070-token prompt completed in 213 s. The 32 GiB rank kept about
+22 GiB of headroom at the plan's 128k reservation.
 
 ## GLM-5.x flagship (glm_moe_dsa)
 
