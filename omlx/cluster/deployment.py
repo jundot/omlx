@@ -305,6 +305,12 @@ def _assignment_from_dict(payload: dict[str, Any]) -> PipelineAssignment:
             tensor_parallel_size=int(payload.get("tensor_parallel_size", 1)),
             sharded_weight_bytes=int(payload.get("sharded_weight_bytes", 0)),
             ssd_weight_bytes=int(payload.get("ssd_weight_bytes", 0)),
+            moe_expert_offload_resident_fraction=float(
+                payload.get("moe_expert_offload_resident_fraction", 0.0)
+            ),
+            moe_offload_weight_bytes=int(
+                payload.get("moe_offload_weight_bytes", 0)
+            ),
             # ``to_dict`` has always emitted these three; nothing read them
             # back, so every decoded assignment claimed a 0-byte KV cache.
             # ``planned_weight_bytes`` includes the cache, and that is the

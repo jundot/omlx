@@ -852,6 +852,32 @@ def estimate_expert_savings(path, fraction, *, mtp_resident=False):
     )
 
 
+def offload_layer_bytes(path, fraction, *, mtp_resident=False):
+    """Per-layer expert bytes a plan reads from SSD instead of holding.
+
+    The planner needs the same whole-expert capacity the loader will use, not
+    a floating-point fraction of every tensor. ``ExpertOffloadPlan`` already
+    validates the checkpoint layout and rounds the fraction to whole experts;
+    this exposes its per-layer saving without constructing a model.
+    """
+
+    return _offload_layer_bytes(
+        str(path), float(fraction), checkpoint_signature(path), bool(mtp_resident)
+    )
+
+
+@lru_cache(maxsize=32)
+def _offload_layer_bytes(path, fraction, signature, mtp_resident):
+    plan = _plan(path, fraction, mtp_resident)
+    if not plan.count:
+        return ()
+    by_layer = {}
+    for prefix, size in plan.layer_bytes.items():
+        parts = prefix.split(".")
+        by_layer[int(parts[2])] = size - size * plan.capacity // plan.count
+    return tuple(by_layer[index] for index in sorted(by_layer))
+
+
 @lru_cache(maxsize=32)
 def _estimate_expert_savings(path, fraction, signature, mtp_resident):
     plan = _plan(path, fraction, mtp_resident)

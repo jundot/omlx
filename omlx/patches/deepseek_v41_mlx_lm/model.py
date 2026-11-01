@@ -150,7 +150,11 @@ def _as_cluster_rank(model: Any, group: Any) -> Model:
 
 
 def load_pipeline_stage(
-    model_path: Any, group: Any, *, engram_ssd_offload: bool = False
+    model_path: Any,
+    group: Any,
+    *,
+    engram_ssd_offload: bool = False,
+    moe_expert_offload_resident_fraction: float = 0.0,
 ) -> Model:
     """This rank's stage of a converted checkpoint, text model only."""
 
@@ -158,6 +162,9 @@ def load_pipeline_stage(
         model_path,
         stage=lambda language_model: language_model.pipeline(group),
         engram_ssd_offload=engram_ssd_offload,
+        moe_expert_offload_resident_fraction=(
+            moe_expert_offload_resident_fraction or None
+        ),
         mtp_head=is_mtp_active() and group.rank() == 0,
     )
     return _as_cluster_rank(model, group)
