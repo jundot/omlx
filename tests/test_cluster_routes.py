@@ -2,6 +2,7 @@
 """Tests for authenticated cluster admin route handlers."""
 
 import base64
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -768,6 +769,70 @@ def test_cluster_plan_follows_the_saved_engram_ssd_offload_setting(monkeypatch):
     assert (
         offloaded.json()["placement_signature"]
         != resident.json()["placement_signature"]
+    )
+
+
+def test_cluster_plan_follows_the_saved_moe_expert_offload_setting(
+    tmp_path, monkeypatch
+):
+    from omlx.cluster.planner import ModelLayout
+
+    gib = 1024**3
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    monkeypatch.setattr(
+        routes,
+        "inspect_safetensors_layout",
+        lambda path: ModelLayout(
+            source=str(path),
+            fixed_weight_bytes=gib,
+            layer_weight_bytes=(4 * gib,) * 4,
+            supports_pipeline=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "omlx.patches.moe_offload_compat.moe_offload_compatibility",
+        lambda _path: (True, ""),
+    )
+    monkeypatch.setattr(
+        "omlx.patches.deepseek_v41.moe_offload.offload_layer_bytes",
+        lambda _path, _fraction, **_kwargs: (0, 2 * gib, 0, 0),
+    )
+    saved = {
+        "v41": SimpleNamespace(
+            moe_expert_offload_enabled=True,
+            moe_expert_offload_resident_fraction=0.125,
+            deepseek_v41_engram_ssd_offload=False,
+            mtp_enabled=False,
+        )
+    }
+    pool = SimpleNamespace(
+        get_status=lambda: {
+            "models": [
+                {"id": "v41", "model_path": str(tmp_path), "model_type": "llm"}
+            ]
+        }
+    )
+    manager = SimpleNamespace(
+        has_settings=lambda model_id: model_id in saved,
+        get_settings=lambda model_id: saved[model_id],
+    )
+    monkeypatch.setattr(routes, "_get_engine_pool", lambda: pool)
+    monkeypatch.setattr(routes, "_get_settings_manager", lambda: manager)
+    body = {
+        "model_path": str(tmp_path),
+        "nodes": [
+            {"node_id": "local", "capacity_bytes": 128 * gib, "reserve_bytes": 2 * gib}
+        ],
+    }
+
+    response = _client().post("/admin/api/cluster/plan", json=body)
+
+    assert response.status_code == 200
+    assignment = response.json()["assignments"][0]
+    assert assignment["moe_expert_offload_resident_fraction"] == 0.125
+    assert assignment["moe_offload_weight_bytes"] == 2 * gib
+    assert assignment["planned_weight_bytes"] == (
+        gib + 4 * 4 * gib - 2 * gib
     )
 
 
