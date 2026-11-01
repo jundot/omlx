@@ -138,10 +138,13 @@ def _normalize_ones_centered_rmsnorm_weights(model, weights):
 
 
 class Model(Qwen3_5Model):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, *, text_only: bool = False):
         nn.Module.__init__(self)
         self.config = config
-        self.vision_tower = VisionModel(config.vision_config)
+        # Cluster ranks serve text only. Skipping the vision tower keeps its
+        # uninitialized parameters out of the rank's wired budget.
+        if not text_only:
+            self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
         if get_mtp_runtime().enabled:
             self.mtp = Qwen4ExpMTPModule(config.text_config)

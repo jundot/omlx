@@ -1236,9 +1236,9 @@ def test_an_undividable_architecture_is_refused_before_the_byte_estimate(
     about nothing.
     """
 
-    model = tmp_path / "qwen4_exp"
+    model = tmp_path / "qwen3_omni"
     model.mkdir()
-    (model / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    (model / "config.json").write_text(json.dumps({"model_type": "qwen3_omni"}))
 
     asked: list[int] = []
     monkeypatch.setattr(
