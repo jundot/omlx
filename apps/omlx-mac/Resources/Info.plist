@@ -60,6 +60,7 @@
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>
+		<string>de</string>
 		<string>zh-Hans</string>
 		<string>zh-Hant</string>
 		<string>ja</string>
