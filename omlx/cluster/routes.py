@@ -204,11 +204,6 @@ def _moe_offload_for_plan(
     enabled, fraction = _saved_moe_offload(model_path)
     if not enabled:
         return 0.0, ()
-    if mtp:
-        raise PlanningError(
-            "MoE expert offload cannot be combined with Lightning MTP; "
-            "disable MTP for this deployment"
-        )
     if tensor_parallel_size > 1:
         raise PlanningError(
             "MoE expert offload is supported for pipeline stages only; "
@@ -230,7 +225,8 @@ def _moe_offload_for_plan(
         raise PlanningError(
             f"could not read the model config for expert offload: {exc}"
         ) from exc
-    if str(config.get("model_type", "")).lower() != "deepseek_v41":
+    model_type = str(config.get("model_type", "")).lower()
+    if model_type != "deepseek_v41":
         raise PlanningError(
             "cluster MoE expert offload currently supports DeepSeek V4.1 "
             "checkpoints only"
@@ -241,7 +237,7 @@ def _moe_offload_for_plan(
         layer_bytes = offload_layer_bytes(
             model_path,
             fraction,
-            mtp_resident=False,
+            mtp_resident=mtp,
         )
     except (OSError, TypeError, ValueError, KeyError) as exc:
         raise PlanningError(
