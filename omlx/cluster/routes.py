@@ -321,6 +321,84 @@ def _saved_engram_ssd_offload(model_path: str | None) -> bool:
     return bool(getattr(settings, "deepseek_v41_engram_ssd_offload", False))
 
 
+def _saved_moe_offload(model_path: str | None) -> tuple[bool, float]:
+    """The saved routed-expert offload decision and resident fraction."""
+
+    settings = _saved_model_settings(model_path) if model_path else None
+    if settings is None:
+        return False, 0.0
+    enabled = bool(getattr(settings, "moe_expert_offload_enabled", False))
+    fraction = float(getattr(settings, "moe_expert_offload_resident_fraction", 0.25))
+    if not 0 < fraction <= 1:
+        raise HTTPException(
+            status_code=400,
+            detail="moe_expert_offload_resident_fraction must be in (0, 1]",
+        )
+    return enabled, fraction
+
+
+def _moe_offload_for_plan(
+    model_path: str | None,
+    model: Any,
+    *,
+    mtp: bool,
+    tensor_parallel_size: int,
+) -> tuple[float, tuple[int, ...]]:
+    """Validate the saved expert-offload setting against this plan shape."""
+
+    enabled, fraction = _saved_moe_offload(model_path)
+    if not enabled:
+        return 0.0, ()
+    if mtp:
+        raise PlanningError(
+            "MoE expert offload cannot be combined with Lightning MTP; "
+            "disable MTP for this deployment"
+        )
+    if tensor_parallel_size > 1:
+        raise PlanningError(
+            "MoE expert offload is supported for pipeline stages only; "
+            "tensor-parallel ranks read every expert"
+        )
+    if not model_path:
+        raise PlanningError(
+            "MoE expert offload needs a model path to measure the expert layout"
+        )
+    from ..patches.moe_offload_compat import moe_offload_compatibility
+
+    supported, reason = moe_offload_compatibility(model_path)
+    if not supported:
+        raise PlanningError(reason)
+    config_path = Path(model_path).expanduser() / "config.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise PlanningError(
+            f"could not read the model config for expert offload: {exc}"
+        ) from exc
+    if str(config.get("model_type", "")).lower() != "deepseek_v41":
+        raise PlanningError(
+            "cluster MoE expert offload currently supports DeepSeek V4.1 "
+            "checkpoints only"
+        )
+    from ..patches.deepseek_v41.moe_offload import offload_layer_bytes
+
+    try:
+        layer_bytes = offload_layer_bytes(
+            model_path,
+            fraction,
+            mtp_resident=False,
+        )
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        raise PlanningError(
+            f"could not size the expert-offload layout: {exc}"
+        ) from exc
+    if len(layer_bytes) != model.layer_count:
+        raise PlanningError(
+            "expert-offload layer count does not match the model layout"
+        )
+    return fraction, layer_bytes
+
+
 def _cluster_mtp(
     requested: bool | None, model: ModelLayout, model_path: str | None
 ) -> bool:
@@ -769,6 +847,8 @@ _PLACEMENT_FIELDS = (
     "start_layer",
     "end_layer",
     "planned_weight_bytes",
+    "moe_expert_offload_resident_fraction",
+    "moe_offload_weight_bytes",
     "kv_cache_bytes",
     "max_context_tokens",
     "reserve_bytes",
@@ -910,6 +990,12 @@ def _create_cluster_plan(request: ClusterPlanRequest):
     pipeline_model = with_mtp_head(model) if request.mtp else model
     head_bytes = model.mtp_weight_bytes if request.mtp else 0
     engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
+    moe_fraction, moe_offload_layer_bytes = _moe_offload_for_plan(
+        request.model_path,
+        model,
+        mtp=bool(request.mtp),
+        tensor_parallel_size=request.tensor_parallel_size,
+    )
     defaults = execution_profile(request.execution_profile)
     if request.tensor_parallel_size > 1:
         if request.allocation != "balanced":
@@ -938,6 +1024,8 @@ def _create_cluster_plan(request: ClusterPlanRequest):
             ),
             context_tokens=request.target_context_tokens,
             engram_ssd_offload=engram_ssd_offload,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
     else:
         plan = plan_unequal_pipeline(
@@ -949,6 +1037,8 @@ def _create_cluster_plan(request: ClusterPlanRequest):
             ),
             context_tokens=request.target_context_tokens,
             engram_ssd_offload=engram_ssd_offload,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
     if path_map:
         plan = replace(plan, path_map=path_map)
@@ -1236,6 +1326,12 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     engram_ssd_offload = _saved_engram_ssd_offload(request.model_path)
+    moe_fraction, moe_offload_layer_bytes = _moe_offload_for_plan(
+        request.model_path,
+        model,
+        mtp=mtp,
+        tensor_parallel_size=1,
+    )
 
     transports: tuple[Any, ...] = ()
     transport_error: str | None = None
@@ -1303,6 +1399,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
             context_tokens=request.target_context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
             engram_ssd_offload=engram_ssd_offload,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
     except PlanningError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1549,6 +1647,8 @@ async def cluster_autoconfigure(request: ClusterAutoconfigureRequest):
                 context_tokens=request.target_context_tokens,
                 mtp=mtp,
                 engram_ssd_offload=engram_ssd_offload,
+                moe_offload_layer_bytes=moe_offload_layer_bytes,
+                moe_expert_offload_resident_fraction=moe_fraction,
             )
             performance_changes = _plan_changes(
                 choice.plan.to_dict(),
@@ -3007,6 +3107,8 @@ def _build_performance_plan(
     context_tokens: int,
     mtp: bool = False,
     engram_ssd_offload: bool = False,
+    moe_offload_layer_bytes: tuple[int, ...] = (),
+    moe_expert_offload_resident_fraction: float = 0.0,
 ) -> ShardPlan:
     """Build a shard plan using the hybrid planner when tensor parallelism is active."""
 
@@ -3019,6 +3121,10 @@ def _build_performance_plan(
             microbatch_size=microbatch_size,
             context_tokens=context_tokens,
             head_rank_extra_bytes=model.mtp_weight_bytes if mtp else 0,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=(
+                moe_expert_offload_resident_fraction
+            ),
         )
     return plan_unequal_pipeline(
         with_mtp_head(model) if mtp else model,
@@ -3027,6 +3133,10 @@ def _build_performance_plan(
         microbatch_size=microbatch_size,
         context_tokens=context_tokens,
         engram_ssd_offload=engram_ssd_offload,
+        moe_offload_layer_bytes=moe_offload_layer_bytes,
+        moe_expert_offload_resident_fraction=(
+            moe_expert_offload_resident_fraction
+        ),
     )
 
 
@@ -3061,6 +3171,23 @@ def _performance_optimized_deployment(
     nodes = _node_budgets(request.nodes, profiles=profiles)
     # Keep the approved plan's Engram decision instead of rereading settings.
     engram_ssd_offload = any(item.ssd_weight_bytes for item in deployment.assignments)
+    moe_fraction = next(
+        (
+            item.moe_expert_offload_resident_fraction
+            for item in deployment.assignments
+            if item.moe_expert_offload_resident_fraction
+        ),
+        0.0,
+    )
+    moe_offload_layer_bytes: tuple[int, ...] = ()
+    if moe_fraction:
+        from ..patches.deepseek_v41.moe_offload import offload_layer_bytes
+
+        moe_offload_layer_bytes = offload_layer_bytes(
+            deployment.model,
+            moe_fraction,
+            mtp_resident=False,
+        )
     plan = _build_performance_plan(
         model,
         nodes,
@@ -3070,6 +3197,8 @@ def _performance_optimized_deployment(
         context_tokens=request.target_context_tokens,
         mtp=deployment.execution.mtp,
         engram_ssd_offload=engram_ssd_offload,
+        moe_offload_layer_bytes=moe_offload_layer_bytes,
+        moe_expert_offload_resident_fraction=moe_fraction,
     )
     execution = tune_execution_settings(
         deployment.execution,
@@ -3089,6 +3218,8 @@ def _performance_optimized_deployment(
             context_tokens=request.target_context_tokens,
             mtp=deployment.execution.mtp,
             engram_ssd_offload=engram_ssd_offload,
+            moe_offload_layer_bytes=moe_offload_layer_bytes,
+            moe_expert_offload_resident_fraction=moe_fraction,
         )
     deployment_id = (
         request.deployment_id.strip()
