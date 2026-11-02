@@ -882,7 +882,7 @@ class TestResponsesEndpoint:
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
 
-    def test_harmony_tool_turn_keeps_content_or_reasoning(self, tmp_path):
+    def test_harmony_history_drops_reasoning_content(self, tmp_path):
         from omlx.server import app, _server_state
 
         engine = RecordingResponsesEngine(outputs=[MockGenerationOutput(text="Done.")])
@@ -933,15 +933,11 @@ class TestResponsesEndpoint:
             )
             assert response.status_code == 200
 
-            tool_turns = [
-                msg
-                for msg in engine.recorded_messages[-1]
-                if msg.get("role") == "assistant" and msg.get("tool_calls")
-            ]
+            messages = engine.recorded_messages[-1]
+            tool_turns = [msg for msg in messages if msg.get("tool_calls")]
             assert len(tool_turns) == 2
-            assert tool_turns[0]["reasoning_content"] == "First call."
             assert tool_turns[1]["content"] == "Let me check."
-            assert "reasoning_content" not in tool_turns[1]
+            assert not any("reasoning_content" in msg for msg in messages)
         finally:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default

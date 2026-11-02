@@ -8594,11 +8594,10 @@ async def create_response(
             preserve_images=preserve_tool_images,
         )
         if engine.model_type == "gpt_oss":
-            # The Harmony template rejects a tool-call turn with both content and
-            # thinking, and transformers renders reasoning_content as thinking.
+            # Same history shape as extract_harmony_messages. The Harmony template
+            # can reject reasoning_content, which transformers renders as thinking.
             for msg in messages:
-                if msg.get("tool_calls") and msg.get("content"):
-                    msg.pop("reasoning_content", None)
+                msg.pop("reasoning_content", None)
 
         # Convert tools: flat → nested. namespace_aliases maps each expanded
         # namespace member's wire name back for the return path.
