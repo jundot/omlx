@@ -843,6 +843,7 @@ except ImportError:
 from .admin.auth import _RedirectToLogin, require_admin, set_web_ui_enabled
 from .admin.routes import (
     configured_api_key,
+    configured_custom_theme,
     configured_ui_language,
     is_admin_request,
     reasoning_levels,
@@ -880,6 +881,7 @@ else:
             is_admin=is_admin_request,
             ui_language=configured_ui_language,
             main_api_key=configured_api_key,
+            custom_theme=configured_custom_theme,
         )
     )
     # Before admin_router so the page routes keep their original order.

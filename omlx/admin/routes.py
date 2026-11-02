@@ -87,6 +87,7 @@ from ..model_settings import (
     merge_chat_template_kwargs,
     validate_kv_compression_settings,
 )
+from ..theme_contract import check_theme
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
@@ -612,6 +613,21 @@ class UpdateTemplateRequest(BaseModel):
         return _normalize_profile_settings(value, universal=True)
 
 
+class CustomThemeRequest(BaseModel):
+    """Saved color token overrides for the light and dark web UI themes."""
+
+    light: dict[str, str] = Field(default_factory=dict)
+    dark: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _valid_and_readable(self):
+        clean, errors = check_theme({"light": self.light, "dark": self.dark})
+        if errors:
+            raise ValueError("; ".join(error["message"] for error in errors))
+        self.light, self.dark = clean["light"], clean["dark"]
+        return self
+
+
 # Dashboard layout grid contract. Keep in sync with static/js/dashboard_layout.js.
 DASHBOARD_COLUMNS = 24
 DASHBOARD_BLOCK_MIN_W = 6
@@ -816,6 +832,8 @@ class GlobalSettingsRequest(BaseModel):
     ui_language: str | None = None
     # Explicit null restores the default dashboard layout.
     ui_dashboard_layout: DashboardLayoutRequest | None = None
+    # Explicit null restores the stock colors.
+    ui_custom_theme: CustomThemeRequest | None = None
 
     # Idle timeout settings. null/0/"" disables the global fallback.
     idle_timeout_seconds: int | None = Field(default=None, ge=60)
@@ -1739,6 +1757,17 @@ def configured_ui_language() -> str:
     except Exception:
         pass
     return "en"
+
+
+def configured_custom_theme() -> dict[str, dict[str, str]] | None:
+    """Return the saved web UI color overrides, or None for the stock colors."""
+    try:
+        settings = _get_global_settings() if _get_global_settings else None
+        if settings:
+            return settings.ui.custom_theme
+    except Exception:
+        pass
+    return None
 
 
 def format_size(size_bytes: int) -> str:
@@ -4791,6 +4820,7 @@ def _global_settings_response(global_settings):
         "ui": {
             "language": global_settings.ui.language,
             "dashboard_layout": global_settings.ui.dashboard_layout,
+            "custom_theme": global_settings.ui.custom_theme,
         },
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
@@ -5848,6 +5878,14 @@ async def update_global_settings(
             layout.model_dump() if layout is not None else None
         )
         runtime_applied.append("ui_dashboard_layout")
+
+    if "ui_custom_theme" in request.model_fields_set:
+        theme = request.ui_custom_theme
+        global_settings.ui.custom_theme = (
+            theme.model_dump() if theme is not None and (theme.light or theme.dark)
+            else None
+        )
+        runtime_applied.append("ui_custom_theme")
 
     # Apply idle timeout settings (Live)
     # Use model_fields_set to distinguish "explicitly sent as null" (disable)

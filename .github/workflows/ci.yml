@@ -54,6 +54,7 @@ jobs:
       - name: Run web UI script tests
         run: >-
           node --test
+          apps/omlx-web/tests/custom_theme_ui.test.cjs
           apps/omlx-web/tests/deepseek_v41_offload_ui.test.cjs
           apps/omlx-web/tests/hf_repo_id_ui.test.cjs
           apps/omlx-web/tests/moe_expert_offload_ui.test.cjs
