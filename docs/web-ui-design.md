@@ -21,6 +21,10 @@ Where to use what:
 
 Do not write hex or `rgb()` literals outside `theme.css`. The one exception is the Enhanced Readability block in `base.html`: its `[style*="color: #..."]` selectors match inline style text, so they keep the literal hex.
 
+## Custom theme overrides
+
+`ui.custom_theme` stores color-token overrides per theme (`{"light": {"bg-primary": "#…"}, "dark": {…}}`). `static/js/custom_theme.js` paints them before first paint, and the settings editor writes them through `/admin/api/global-settings`. The server rejects a save when primary/secondary text, links or button text fall below 4.5:1 against the surfaces they are drawn on; the editor disables Apply for the same pairs, which `CONTRAST_RULES` in `omlx/theme_contract.py` and `static/js/custom_theme.js` define.
+
 Families outside Tailwind's palette:
 
 - `night-*`: dark mode surfaces and text.

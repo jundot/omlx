@@ -91,7 +91,11 @@
         'muse_glimmer_assistant',
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
-    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
+    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models', 'theme']);
+    // settings.theme.contrast.<label> for each contrast-rule foreground.
+    const THEME_CONTRAST_LABELS = {
+        'text-primary': 'text', 'text-secondary': 'secondary', 'link-color': 'link', 'btn-primary-text': 'button',
+    };
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
     const DASHBOARD_DOWNLOADER_SOURCES = new Set(['hf', 'ms', 'recommended']);
@@ -137,6 +141,19 @@
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
             enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
+            // Custom theme editor (static/js/custom_theme.js): the saved
+            // overrides, the defaults from theme.css, and the text in each field.
+            // base.html loads custom_theme.js first; the script tests that load
+            // this file alone have no OmlxCustomTheme, hence the fallbacks.
+            customThemeGroups: window.OmlxCustomTheme?.GROUPS ?? [],
+            customThemeStored: window.OmlxCustomTheme?.sanitize(window._customTheme) ?? { light: {}, dark: {} },
+            customThemeDefaults: { light: {}, dark: {} },
+            customThemeDraft: { light: {}, dark: {} },
+            customThemeSaving: false,
+            customThemeSaved: false,
+            customThemeError: '',
+            _customThemeSavedTimer: null,
+            _customThemeReady: false,
 
             // Global settings section rail
             settingsActiveSection: 'settings-language',
@@ -932,6 +949,7 @@
 
                 this.mainTab = DASHBOARD_MAIN_TABS.has(mainTab) ? mainTab : 'status';
                 this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
+                if (this.activeTab === 'theme') this.initCustomThemeEditor();
                 this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
                 this.benchTab = DASHBOARD_BENCH_TABS.has(benchTab) ? benchTab : 'throughput';
                 const source = params.get('source');
@@ -1027,6 +1045,7 @@
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
                 this.mainTab = 'settings';
+                if (tab === 'theme') this.initCustomThemeEditor();
                 this.syncTabStateToUrl();
             },
 
@@ -7070,6 +7089,195 @@
                 } else {
                     document.documentElement.removeAttribute('data-enhanced-readability');
                 }
+            },
+
+            // =================================================================
+            // Custom theme
+            // =================================================================
+            initCustomThemeEditor() {
+                if (this._customThemeReady) return;
+                this._customThemeReady = true;
+                this.customThemeDefaults = window.OmlxCustomTheme.defaults();
+                this.fillCustomThemeDraft();
+            },
+
+            fillCustomThemeDraft() {
+                const draft = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        draft[mode][token] = this.customThemeStored[mode][token]
+                            || this.customThemeDefaults[mode][token] || '';
+                    }
+                }
+                this.customThemeDraft = draft;
+            },
+
+            get customThemeActive() {
+                return ['light', 'dark'].some(mode => Object.keys(this.customThemeStored[mode]).length > 0);
+            },
+
+            themeTokenValid(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token]) !== null;
+            },
+
+            // The color a field stands for: its valid text, else the default.
+            themeTokenColor(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token])
+                    || this.customThemeDefaults[mode][token] || '#000000';
+            },
+
+            themeTokenChanged(mode, token) {
+                return this.themeTokenColor(mode, token) !== this.customThemeDefaults[mode][token];
+            },
+
+            // The draft as overrides: only the colors that differ from theme.css.
+            customThemeOverrides() {
+                const overrides = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        const color = this.themeTokenColor(mode, token);
+                        if (color !== this.customThemeDefaults[mode][token]) overrides[mode][token] = color;
+                    }
+                }
+                return overrides;
+            },
+
+            get customThemeDirty() {
+                return JSON.stringify(this.customThemeOverrides()) !== JSON.stringify(this.customThemeStored);
+            },
+
+            get customThemeInputsValid() {
+                return ['light', 'dark'].every(mode =>
+                    window.OmlxCustomTheme.TOKENS.every(token => this.themeTokenValid(mode, token))
+                    && this.themeContrastChecks(mode).every(check => check.ok));
+            },
+
+            // The stock color of a token, from theme.css. The column chrome uses
+            // these, not the draft, so editing a surface cannot make the light
+            // column dark or the dark one light.
+            themeModeColor(mode, token) {
+                const stock = this.customThemeDefaults[mode] && this.customThemeDefaults[mode][token];
+                return stock || this.themeTokenColor(mode, token);
+            },
+
+            // The two column heads keep their own theme's colors whichever theme the
+            // page is in, so the light and the dark column stay distinguishable.
+            themeModeHeadStyle(mode) {
+                const color = token => this.themeModeColor(mode, token);
+                return `background:${color('bg-primary')}; border-color:${color('border-normal')}; color:${color('text-secondary')};`;
+            },
+
+            // The value fields keep their own theme's surface and text, so the
+            // light and the dark column read as light and dark in either theme.
+            themeModeCellStyle(mode) {
+                const color = token => this.themeModeColor(mode, token);
+                return `--theme-cell-bg:${color('bg-primary')}; --theme-cell-fg:${color('text-primary')};`
+                    + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`;
+            },
+
+            // The preview's own token values: stock ones, then the edited ones with
+            // everything a saved token would also set (status tints included).
+            themePreviewStyle(mode) {
+                const api = window.OmlxCustomTheme;
+                const stock = this.customThemeDefaults[mode];
+                const lines = api.DERIVED.map(token => `--${token}: ${stock[token]};`);
+                for (const token of api.TOKENS) {
+                    const color = this.themeTokenColor(mode, token);
+                    lines.push(...(color === stock[token]
+                        ? [`--${token}: ${color};`]
+                        : api.declarations(mode, token, color)));
+                }
+                return lines.join(' ');
+            },
+
+            // The lowest ratio of each contrast rule (custom_theme.js), the same
+            // pairs and floor the server enforces on save.
+            themeContrastChecks(mode) {
+                const api = window.OmlxCustomTheme;
+                const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
+                const lowest = {};
+                for (const { foreground, ratio } of api.contrastChecks(colors)) {
+                    lowest[foreground] = Math.min(lowest[foreground] ?? Infinity, ratio);
+                }
+                return Object.entries(lowest).map(([foreground, ratio]) => ({
+                    id: THEME_CONTRAST_LABELS[foreground],
+                    ratio,
+                    ok: ratio >= api.CONTRAST_FLOOR,
+                }));
+            },
+
+            normalizeThemeInput(mode, token) {
+                const text = String(this.customThemeDraft[mode][token] ?? '').trim();
+                if (!text) {
+                    this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+                    return;
+                }
+                const hex = window.OmlxCustomTheme.normalizeHex(text);
+                if (hex) this.customThemeDraft[mode][token] = hex;
+            },
+
+            resetThemeToken(mode, token) {
+                this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+            },
+
+            // Clicking an element in a preview jumps to the field it is drawn from.
+            focusThemeToken(mode, event) {
+                const token = event.target.closest('[data-token]')?.dataset.token;
+                const field = token && document.getElementById(`theme-token-${mode}-${token}`);
+                if (!field) return;
+                field.focus();
+                field.select();
+            },
+
+            // Save to the server (ui.custom_theme), then repaint this page.
+            async saveCustomTheme(overrides) {
+                const api = window.OmlxCustomTheme;
+                const theme = api.sanitize(overrides);
+                this.customThemeSaving = true;
+                this.customThemeError = '';
+                this.customThemeSaved = false;
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_custom_theme: api.isEmpty(theme) ? null : theme }),
+                    });
+                    if (!response.ok) throw new Error(await response.text() || response.statusText);
+                    const clean = api.apply(theme);
+                    this.customThemeStored = clean;
+                    window._customTheme = api.isEmpty(clean) ? null : clean;
+                    this.fillCustomThemeDraft();
+                    return true;
+                } catch (error) {
+                    this.customThemeError = window.t('settings.theme.save_failed');
+                    console.error('Failed to save custom theme:', error);
+                    return false;
+                } finally {
+                    this.customThemeSaving = false;
+                }
+            },
+
+            async applyCustomTheme() {
+                if (!this.customThemeInputsValid) return;
+                if (!(await this.saveCustomTheme(this.customThemeOverrides()))) return;
+                this.customThemeSaved = true;
+                clearTimeout(this._customThemeSavedTimer);
+                this._customThemeSavedTimer = setTimeout(() => { this.customThemeSaved = false; }, 2500);
+            },
+
+            discardCustomThemeDraft() {
+                this.customThemeError = '';
+                this.fillCustomThemeDraft();
+            },
+
+            async resetCustomTheme() {
+                if (!window.confirm(window.t('settings.theme.restore_confirm'))) return;
+                await this.saveCustomTheme(null);
+            },
+
+            openCustomThemeSettings() {
+                this.setSettingsTab('theme');
+                window.scrollTo({ top: 0 });
             },
 
             applyTheme() {
