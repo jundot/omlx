@@ -31171,6 +31171,12 @@
       "comment" : "Display name for the Beta update channel",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beta"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31195,6 +31201,12 @@
       "comment" : "Display name for the Dev update channel",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dev"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31219,6 +31231,12 @@
       "comment" : "Display name for the Nightly update channel",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nightly"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31243,6 +31261,12 @@
       "comment" : "Display name for the Release Candidate update channel",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Release Candidate"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31267,6 +31291,12 @@
       "comment" : "Display name for the Stable update channel",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stable"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31291,6 +31321,12 @@
       "comment" : "Empty state when a GitHub release has no release notes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Release enthält keine ausführlichen Versionshinweise."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31315,6 +31351,12 @@
       "comment" : "Primary button to download, install, and relaunch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Herunterladen, installieren und neu starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31339,6 +31381,12 @@
       "comment" : "Primary button when the update is already staged",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installieren und neu starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31363,6 +31411,12 @@
       "comment" : "Dismiss button in the update confirmation sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Später"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31387,6 +31441,12 @@
       "comment" : "Notice explaining what happens after confirming an update",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX beendet sich, installiert das Update und startet neu."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31411,6 +31471,12 @@
       "comment" : "Update confirmation download size line; placeholder is a formatted byte size or Unknown",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloadgröße: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31435,6 +31501,12 @@
       "comment" : "Subtitle for the update confirmation sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prüfen Sie die Versionshinweise, bevor Sie herunterladen und oMLX neu starten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31459,6 +31531,12 @@
       "comment" : "Update confirmation sheet title; placeholder is the version",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX %@ ist verfügbar"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31483,6 +31561,12 @@
       "comment" : "Tooltip for the release link button in the update confirmation sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Release auf GitHub ansehen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31507,6 +31591,12 @@
       "comment" : "Shown when the release has no matching DMG asset",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diesem Release ist kein installierbares DMG beigefügt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31531,6 +31621,12 @@
       "comment" : "Shown when the swap script can't find the staged bundle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das bereitgestellte Update wurde nicht gefunden. Laden Sie es erneut herunter."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -36853,6 +36949,12 @@
       "comment" : "Update confirmation footer line when the update is already downloaded",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Heruntergeladen und bereit zur Installation"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38149,6 +38251,12 @@
       "comment" : "Subtitle for the update confirmation sheet when the update is already downloaded",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Update ist heruntergeladen. Prüfen Sie die Versionshinweise, bevor Sie oMLX neu starten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
