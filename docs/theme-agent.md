@@ -170,6 +170,32 @@ the same way.
 - Overrides are merged over stock. `PUT` replaces both mode maps; send `{}`
   for a mode to keep the stock values there.
 
+## MCP adapter
+
+`scripts/theme_mcp.py` is a dependency-free stdio MCP server that forwards
+`theme_schema`, `theme_get`, `theme_validate`, `theme_recipe`, `theme_draft`
+and `theme_apply` to this API. It does not read images or store state.
+
+```json
+{
+  "servers": {
+    "omlx-theme": {
+      "transport": "stdio",
+      "command": "python3",
+      "args": ["/path/to/omlx/scripts/theme_mcp.py"],
+      "env": {
+        "OMLX_THEME_URL": "http://127.0.0.1:8000",
+        "OMLX_API_KEY": "<main API key>"
+      },
+      "enabled": true,
+      "timeout": 30
+    }
+  }
+}
+```
+
+The adapter is optional; the REST contract above is the source of truth.
+
 ## Agent prompt shape
 
 The user supplies a style image and asks for a theme. A good agent:
