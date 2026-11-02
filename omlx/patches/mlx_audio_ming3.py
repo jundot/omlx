@@ -14,7 +14,9 @@ turns. This patch keeps the same math and changes how it runs:
   stop_{k+1}, then blocks on stop_k, which was queued one iteration earlier.
 
 Noise is drawn outside the compiled function in mlx-audio's order, so the
-output matches the eager loop for the same seed. The decode-step pipeline
+output matches the eager loop for the same seed. The exception is bf16
+checkpoints: their DiT stacks run on the fused kernels in
+``ming3_dit_kernels``, which round differently. The decode-step pipeline
 follows ming-tts-serve (MIT) ``src/ming_model.zig``.
 """
 
@@ -25,6 +27,8 @@ import math
 from typing import Any
 
 import mlx.core as mx
+
+from . import ming3_dit_kernels as fused
 
 try:
     from mlx_audio.tts.models.bailingmm import bailingmm
@@ -65,6 +69,9 @@ class _Ming3State:
         self.agg_rope = _CachedRope(agg.rotary_embed, 2)
         self.agg_cls = agg.word_embedder(mx.zeros((1, 1), dtype=mx.int32))
         mx.eval(self.agg_cls)
+        gpu = mx.default_device() == mx.gpu
+        self.fused_cfm = gpu and fused.cfm_supported(model.flowloss.cfm.model)
+        self.fused_agg = gpu and fused.stack_supported(agg.blocks)
         self._cfm: dict[tuple, Any] = {}
         self._agg = None
 
@@ -73,12 +80,16 @@ class _Ming3State:
             agg = self.model.linear_proj_audio
             rope = self.agg_rope
             cls = self.agg_cls
+            use_fused = self.fused_agg
 
             def agg_fn(x):
                 x = agg.x_embedder(x)
                 x = mx.concatenate([cls, x], axis=1)
                 for block in agg.blocks:
-                    x = block(x, None, rope)
+                    if use_fused and x.dtype == mx.bfloat16:
+                        x = fused.dit_block(block, x, rope.cos, rope.sin)
+                    else:
+                        x = block(x, None, rope)
                 x = agg.final_layer(x)
                 return x[:, :1, :]
 
@@ -114,6 +125,9 @@ class _Ming3State:
             sqs.append(mx.abs(dt) ** 0.5)
         mx.eval(t_emb, dts, sqs)
 
+        if self.fused_cfm and dtype == mx.bfloat16 and steps > 0:
+            return self._build_fused_cfm(dit, t_emb, dts, sqs, cfg, steps)
+
         def cfm_fn(z, hist, noise, sde, shift):
             c_embed = dit.c_embedder(
                 mx.concatenate([z, mx.zeros_like(z)], axis=0), train=False
@@ -131,6 +145,27 @@ class _Ming3State:
                 f0 = (pred + (pred - null_pred) * cfg).astype(dtype)
                 y = y + dts[i] * f0
                 y = y + shift * sqs[i] * sde[i]
+            return y
+
+        return mx.compile(cfm_fn, inputs=dit.state)
+
+    def _build_fused_cfm(self, dit, t_emb, dts, sqs, cfg, steps):
+        rope = self.dit_rope
+        dtt = mx.stack(dts)
+        sq = mx.stack(sqs)
+        mx.eval(dtt, sq)
+
+        def cfm_fn(z, hist, noise, sde, shift):
+            c_embed = dit.c_embedder(
+                mx.concatenate([z, mx.zeros_like(z)], axis=0), train=False
+            )
+            x_history = dit.x_embedder(hist)
+            y = noise
+            for i in range(steps):
+                h = fused.cfm_embed(y, dit.x_embedder, t_emb[i], c_embed, x_history)
+                for block in dit.blocks:
+                    h = fused.dit_block(block, h, rope.cos, rope.sin)
+                y = fused.cfm_final(h, dit.final_layer, y, dtt, sq, sde, shift, i, cfg)
             return y
 
         return mx.compile(cfm_fn, inputs=dit.state)

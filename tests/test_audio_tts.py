@@ -1649,6 +1649,46 @@ class TestMing3Patches:
             assert got_last == want_last
             assert mx.array_equal(got, want).item()
 
+    # The official checkpoint stores rotary inv_freq in f32, mlx-community's in bf16.
+    @pytest.mark.parametrize("table_dtype", [mx.float32, mx.bfloat16])
+    def test_fused_dit_kernels_match_mlx_modules(self, table_dtype):
+        from omlx.patches import ming3_dit_kernels as fused
+        from omlx.patches.mlx_audio_ming3 import _CachedRope
+
+        bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+        mx.random.seed(0)
+        dit = bm.DiT(
+            in_channels=64, hidden_size=1024, depth=1, num_heads=16, llm_cond_dim=32
+        )
+        dit.set_dtype(mx.bfloat16)
+        dit.rotary_embed.inv_freq = dit.rotary_embed.inv_freq.astype(table_dtype)
+        assert fused.cfm_supported(dit)
+
+        def rel(got, want):
+            got, want = got.astype(mx.float32), want.astype(mx.float32)
+            return (mx.abs(got - want).max() / mx.abs(want).max()).item()
+
+        # CFM rows (CFG batch 2 x seq 3) and aggregator rows (1 x 2).
+        for batch, seq_len in ((2, 3), (1, 2)):
+            rope = _CachedRope(dit.rotary_embed, seq_len)
+            x = mx.random.normal((batch, seq_len, 1024)).astype(mx.bfloat16)
+            want = dit.blocks[0](x, None, rope)
+            assert (
+                rel(fused.dit_block(dit.blocks[0], x, rope.cos, rope.sin), want) < 2e-2
+            )
+
+        h = mx.random.normal((2, 3, 1024)).astype(mx.bfloat16)
+        y = mx.random.normal((1, 1, 64)).astype(mx.bfloat16)
+        dts = mx.full((10,), 0.0625, dtype=mx.bfloat16)
+        sqs = mx.abs(dts) ** 0.5
+        sde = mx.random.normal((10, 1, 1, 64)).astype(mx.bfloat16)
+        pred, null_pred = mx.split(dit.final_layer(h)[:, -1:, :], 2, axis=0)
+        want = y + dts[3] * (pred + (pred - null_pred) * 2.0)
+        want = want + (0.25 * sqs[3]) * sde[3]
+        shift = mx.array(0.25, dtype=mx.bfloat16)
+        got = fused.cfm_final(h, dit.final_layer, y, dts, sqs, sde, shift, 3, 2.0)
+        assert rel(got, want) < 2e-2
+
 
 # ---------------------------------------------------------------------------
 # Integration test (slow, requires mlx-audio)
