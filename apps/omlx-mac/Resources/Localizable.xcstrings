@@ -21899,6 +21899,12 @@
       "comment" : "Advanced row label for the server aliases input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server-Aliase"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -21923,6 +21929,12 @@
       "comment" : "Sublabel describing the server aliases input format",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zusätzliche Hostnamen, unter denen sich der Server ausgibt. Durch Kommas getrennt. Wird für den Abgleich von Cookies und Host-Headern verwendet."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -21947,6 +21959,12 @@
       "comment" : "Advanced row label for the audio upload size limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Größe für Audio-Uploads"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -21971,6 +21989,12 @@
       "comment" : "Sublabel describing the audio upload size limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Dateigröße für die Audio-Transkriptions- und Verarbeitungsendpunkte. Höhere Werte können bei gleichzeitigen Anfragen den Arbeitsspeicherverbrauch erhöhen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -21995,6 +22019,12 @@
       "comment" : "Advanced row label for the SSE keep-alive mode picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSE-Keep-Alive-Modus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22019,6 +22049,12 @@
       "comment" : "SSE keep-alive mode option: empty data chunk",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chunk"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22043,6 +22079,12 @@
       "comment" : "SSE keep-alive mode option: comment ping",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kommentar"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22067,6 +22109,12 @@
       "comment" : "SSE keep-alive mode option: disabled",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22091,6 +22139,12 @@
       "comment" : "Sublabel describing the SSE keep-alive mode options",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wie der Server langlebige SSE-Streams offen hält. „Chunk“ sendet eine leere Datenzeile, „Kommentar“ sendet `: ping`, „Aus“ schaltet die Funktion ab."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22115,6 +22169,12 @@
       "comment" : "Button to apply pending storage changes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übernehmen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22139,6 +22199,12 @@
       "comment" : "API endpoint row label for the Anthropic/Claude Code base URL",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anthropic / Claude Code"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22163,6 +22229,12 @@
       "comment" : "API endpoint row label for the health probe URL",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Statusprüfung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22187,6 +22259,12 @@
       "comment" : "API endpoint row label for the Prometheus metrics URL",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Metriken (Prometheus)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22211,6 +22289,12 @@
       "comment" : "API endpoint row label for the OpenAI-compatible base URL",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OpenAI-kompatibel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22235,6 +22319,12 @@
       "comment" : "Server screen error when the audio upload size is invalid",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die maximale Größe für Audio-Uploads muss ein positiver Wert sein, etwa 100MB oder 1GB."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22259,6 +22349,12 @@
       "comment" : "Server screen error when Base Path is empty on Apply",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Basispfad darf nicht leer sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22283,6 +22379,12 @@
       "comment" : "Server screen error when Context Window input is invalid",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Kontextfenster muss eine positive ganze Zahl sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22307,6 +22409,12 @@
       "comment" : "Server screen error when Max Tokens input is invalid",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Wert für Max. Tokens muss eine positive ganze Zahl sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22331,6 +22439,12 @@
       "comment" : "Server screen error when Models Directory is empty on Apply",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mindestens ein Modellverzeichnis ist erforderlich."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22355,6 +22469,12 @@
       "comment" : "Server screen error when Apply is tapped with no pending changes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nichts zu übernehmen, beide Felder entsprechen der aktuellen Konfiguration."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22379,6 +22499,12 @@
       "comment" : "Server screen error when port value is out of valid range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Port muss eine Zahl zwischen 1 und 65535 sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22403,6 +22529,12 @@
       "comment" : "Server screen error when Repetition Penalty is invalid",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Wiederholungsstrafe muss eine nicht negative Zahl sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22427,6 +22559,12 @@
       "comment" : "Server screen error when Temperature input is out of range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Temperatur muss eine Zahl im Bereich [0, 2] sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22451,6 +22589,12 @@
       "comment" : "Server screen error when Top K input is negative or not a number",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top K muss ≥ 0 sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22475,6 +22619,12 @@
       "comment" : "Server screen error when Top P input is out of range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top P muss eine Zahl im Bereich [0, 1] sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22499,6 +22649,12 @@
       "comment" : "Hint footer text under the Server screen explaining endpoint behavior",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Endpunkte aktualisieren sich live, während Sie Adresse und Port ändern. Einige Änderungen (Host, Port) werden erst nach einem Neustart des Servers wirksam."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22820,6 +22976,12 @@
       "comment" : "Listen-address popup option for binding to all interfaces; the IPv6 wildcard also accepts IPv4 (dual-stack)",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "0.0.0.0 & :: (Alle Netzwerke)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22844,6 +23006,12 @@
       "comment" : "Listen-address popup option for binding to IPv4 interfaces only",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "0.0.0.0 (nur IPv4)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22868,6 +23036,12 @@
       "comment" : "Listen-address popup option for loopback only",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "127.0.0.1 (nur lokal)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22892,6 +23066,12 @@
       "comment" : "Listen-address popup option for localhost",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "localhost"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22916,6 +23096,12 @@
       "comment" : "Log level popup option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Debug"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22940,6 +23126,12 @@
       "comment" : "Log level popup option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fehler"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22964,6 +23156,12 @@
       "comment" : "Log level popup option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Info"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -22988,6 +23186,12 @@
       "comment" : "Log level popup option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Trace"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23012,6 +23216,12 @@
       "comment" : "Log level popup option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Warnung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23036,6 +23246,12 @@
       "comment" : "Tooltip for the add model directory button",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellverzeichnis hinzufügen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -23060,6 +23276,12 @@
       "comment" : "Tooltip for choosing a model directory",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ordner auswählen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -23084,6 +23306,12 @@
       "comment" : "NSOpenPanel message for choosing a model directory",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein Verzeichnis mit MLX-Modellordnern auswählen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -23108,6 +23336,12 @@
       "comment" : "NSOpenPanel button label for choosing a model directory",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auswählen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -23132,6 +23366,12 @@
       "comment" : "Badge for the first model directory",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Primär"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -23156,6 +23396,12 @@
       "comment" : "Tooltip for removing a model directory",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellverzeichnis entfernen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -23180,6 +23426,12 @@
       "comment" : "Row label for the context window field in Default Profile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kontextfenster"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23204,6 +23456,12 @@
       "comment" : "Sublabel for the context window field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Token für Prompt und Ausgabe."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23228,6 +23486,12 @@
       "comment" : "Disabled row label for Enable Thinking",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Denken aktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23252,6 +23516,12 @@
       "comment" : "Note marking Enable Thinking as per-model only",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur pro Modell, im Profil festlegen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23276,6 +23546,12 @@
       "comment" : "Disabled row label for Force Sampling",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sampling erzwingen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23300,6 +23576,12 @@
       "comment" : "Note marking Force Sampling as per-model only",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur pro Modell."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23324,6 +23606,12 @@
       "comment" : "Disabled row label for Limit Tool Output",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tool-Ausgabe begrenzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23348,6 +23636,12 @@
       "comment" : "Note marking Limit Tool Output as per-model only",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur pro Modell."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23372,6 +23666,12 @@
       "comment" : "Row label for the max tokens field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max. Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23396,6 +23696,12 @@
       "comment" : "Sublabel for the max tokens field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Serverweite Obergrenze für generierte Token."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23420,6 +23726,12 @@
       "comment" : "Disabled row label for Min P",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Min P"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23444,6 +23756,12 @@
       "comment" : "Note explaining Min P is per-model only",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Server-Standardwerte enthalten min_p nicht, der Wert wird im Modellprofil festgelegt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23468,6 +23786,12 @@
       "comment" : "Pill text marking a sampling field as configurable only on individual model profiles",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur pro Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23492,6 +23816,12 @@
       "comment" : "Disabled row label for Pin in memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Im Arbeitsspeicher halten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23516,6 +23846,12 @@
       "comment" : "Note explaining where to configure Pin in memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur pro Modell, siehe Modelle → [Modell] → Erweitert."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23540,6 +23876,12 @@
       "comment" : "Disabled row label for Presence Penalty",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Präsenzstrafe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23564,6 +23906,12 @@
       "comment" : "Note marking Presence Penalty as per-model only",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur pro Modell."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23588,6 +23936,12 @@
       "comment" : "Row label for the repetition penalty field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wiederholungsstrafe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23612,6 +23966,12 @@
       "comment" : "Sublabel for the repetition penalty field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wiederholte Token werden bestraft."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23636,6 +23996,12 @@
       "comment" : "Toggle label to expand the advanced sampling fields list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alle Felder anzeigen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23660,6 +24026,12 @@
       "comment" : "Toggle label to collapse the advanced sampling fields list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Weniger anzeigen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23684,6 +24056,12 @@
       "comment" : "Disabled row label for Speculative decoding",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speculative Decoding"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23708,6 +24086,12 @@
       "comment" : "Note explaining Speculative decoding is per-model only and where to find it",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur pro Modell, siehe Modelle → [Modell] → Erweitert."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23732,6 +24116,12 @@
       "comment" : "Row label for the temperature field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Temperatur"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23756,6 +24146,12 @@
       "comment" : "Sublabel for the temperature field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zufälligkeit beim Sampling (0–2)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23780,6 +24176,12 @@
       "comment" : "Row label for the Top K field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top K"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23804,6 +24206,12 @@
       "comment" : "Sublabel for the Top K field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kandidaten auf die Top K begrenzen. 0 = deaktiviert."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23828,6 +24236,12 @@
       "comment" : "Row label for the Top P field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top P"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23852,6 +24266,12 @@
       "comment" : "Sublabel for the Top P field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Grenzwert für Nucleus-Sampling (0–1)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23876,6 +24296,12 @@
       "comment" : "Disabled row label for TTL",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TTL"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23900,6 +24326,12 @@
       "comment" : "Note explaining TTL is per-model only and where to find it",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur pro Modell, siehe Modelle → [Modell] → Grundlegend."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23924,6 +24356,12 @@
       "comment" : "Row label for the server auto-start on app launch toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server beim Start automatisch starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23948,6 +24386,12 @@
       "comment" : "Sublabel under the server auto-start on app launch toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ist die Option deaktiviert, öffnet sich die Menüleisten-App, ohne den Server zu starten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23972,6 +24416,12 @@
       "comment" : "Row label for the Base Path text input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Basispfad"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -23996,6 +24446,12 @@
       "comment" : "Sublabel under the Base Path field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OMLX_BASE_PATH. Beim Ändern werden Dateien verschoben und der Server startet neu."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24020,6 +24476,12 @@
       "comment" : "Row label for enabling standard Hugging Face Hub cache model discovery",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lokalen Hugging-Face-Cache verwenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -24044,6 +24506,12 @@
       "comment" : "Sublabel for enabling Hugging Face local cache discovery",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MLX-kompatible Modelle im standardmäßigen Hugging Face Hub-Cache erkennen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -24067,6 +24535,12 @@
     "server.row.listen_address" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adresse"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24090,6 +24564,12 @@
     "server.row.log_level" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Protokollstufe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24114,6 +24594,12 @@
       "comment" : "Row label for the model directories editor",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellverzeichnisse"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -24138,6 +24624,12 @@
       "comment" : "Sublabel under the model directories editor",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der erste Pfad ist das Downloadziel. Alle Pfade werden nach lokalen Modellen durchsucht."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -24162,6 +24654,12 @@
       "comment" : "Row label for the Models Directory text input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellverzeichnis"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24186,6 +24684,12 @@
       "comment" : "Sublabel under the Models Directory field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Server liest und schreibt die Modellgewichte in diesem Verzeichnis. Heruntergeladene Modelle landen hier."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24209,6 +24713,12 @@
     "server.row.port" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Port"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24233,6 +24743,12 @@
       "comment" : "Sublabel under the Port field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard 8000. Der Server startet beim Speichern neu."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24257,6 +24773,12 @@
       "comment" : "Disclosure header for the advanced server settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweitert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24281,6 +24803,12 @@
       "comment" : "Section heading for the default sampling profile editor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardprofil"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24305,6 +24833,12 @@
       "comment" : "Subtitle for the Default Profile section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ersatzwerte, die gelten, wenn ein Modell kein Profil hat oder wenn ein Profil ein Feld leer lässt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24328,6 +24862,12 @@
     "server.section.endpoints" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Endpunkte"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24351,6 +24891,12 @@
     "server.section.logging" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Protokollierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24374,6 +24920,12 @@
     "server.section.network" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Netzwerk"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24398,6 +24950,12 @@
       "comment" : "Section heading for server launch behavior settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Serverstart"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24422,6 +24980,12 @@
       "comment" : "Section heading for the local usage history switch in Server screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nutzungsverlauf"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24446,6 +25010,12 @@
       "comment" : "Row label for the switch that records local hourly usage history",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nutzungsverlauf aufzeichnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24470,6 +25040,12 @@
       "comment" : "Sublabel explaining the usage history switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speichert stündlich die Token-Summen pro Modell in usage.sqlite3. Beim Ausschalten bleibt der vorhandene Verlauf erhalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24494,6 +25070,12 @@
       "comment" : "Section heading for storage rows in Server screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -24518,6 +25100,12 @@
       "comment" : "Subtitle for the Storage section in Server screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wo Modelle, Einstellungen, Protokolle und der SSD-Cache liegen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
