@@ -5718,6 +5718,12 @@
     },
     "Click to copy" : {
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zum Kopieren klicken"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5734,6 +5740,12 @@
     },
     "Close Window" : {
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fenster schließen"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11587,6 +11599,12 @@
     },
     "oMLX" : {
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX"
+          }
+        },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
