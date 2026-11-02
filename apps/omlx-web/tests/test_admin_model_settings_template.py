@@ -558,8 +558,8 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
         missing = set(english) - set(catalog)
         assert not missing, f"{path.name} is missing {sorted(missing)}"
         if path.name == "zh.json":
-            # Simplified Chinese carries its own labels; every other locale
-            # keeps the English fallback until its own translation lands.
+            # Simplified Chinese carries its own labels; untranslated locales
+            # keep the English fallback until their own translation lands.
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "开"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "关"
             continue
@@ -567,6 +567,10 @@ def test_profile_api_toggle_i18n_keys_exist_in_every_locale():
             # Czech carries its own labels (ZAP/VYP), same exemption as zh.
             assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "ZAP"
             assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "VYP"
+            continue
+        if path.name == "de.json":
+            assert catalog["modal.model_settings.profiles.expose_as_model_on"] == "EIN"
+            assert catalog["modal.model_settings.profiles.expose_as_model_off"] == "AUS"
             continue
         for key, value in english.items():
             assert (
