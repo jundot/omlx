@@ -556,6 +556,16 @@ class TestExtractTextContentReasoningReconstruction:
         assert len(result) == 1
         assert result[0]["content"] == "A"
 
+    def test_inline_thinking_matching_reasoning_is_not_duplicated(self):
+        messages = [
+            Message(
+                role="assistant", reasoning_content="R", content="<think>R</think>A"
+            ),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["content"] == "<think>R</think>A"
+
 
 class TestExtractTextContentNativeReasoningContent:
     """Tests that extract_text_content forwards reasoning_content as a field
@@ -663,6 +673,17 @@ class TestExtractTextContentNativeReasoningContent:
         assert result[0]["content"] == "A"
         assert result[0]["reasoning_content"] == "R"
 
+    def test_native_mode_does_not_duplicate_inline_thinking(self):
+        messages = [
+            Message(
+                role="assistant", reasoning_content="R", content="<think>R</think>A"
+            ),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+
 
 class TestUsesNativeReasoningContent:
     def test_detects_minimax_m3_by_config_type(self):
@@ -707,6 +728,10 @@ class TestUsesNativeReasoningContent:
             "any-name",
             config_model_type="deepseek_v3",
         )
+
+    @pytest.mark.parametrize("key", ["config_model_type", "engine_model_type"])
+    def test_detects_glm5_next(self, key):
+        assert uses_native_reasoning_content("any-name", **{key: "glm5_next"})
 
 
 class TestConvertAnthropicToInternal:
