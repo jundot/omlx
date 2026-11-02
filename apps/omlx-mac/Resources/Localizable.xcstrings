@@ -28571,6 +28571,12 @@
       "comment" : "Singular cache file count",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Datei: 1"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28595,6 +28601,12 @@
       "comment" : "Cache file count; placeholder is the number of files",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dateien: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -28799,6 +28811,12 @@
       "comment" : "Singular memory cache entry count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eintrag: 1"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -28823,6 +28841,12 @@
       "comment" : "Memory cache entry count; placeholder is the number of entries",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einträge: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -28877,6 +28901,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Laufzeit-Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28895,6 +28925,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28913,6 +28949,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28931,6 +28973,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher-Cache leeren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28949,6 +28997,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher-Cache leeren?"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28967,6 +29021,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktiver base_path"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28985,6 +29045,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tatsächlich verwendetes ssd_cache_dir"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29003,6 +29069,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "response-state-Verzeichnis"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29021,6 +29093,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefix-Trefferquote"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29039,6 +29117,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher-Trefferquote"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29057,6 +29141,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefix-Verdrängungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29075,6 +29165,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher-Verdrängungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29093,6 +29189,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29111,6 +29213,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Blockgröße"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29129,6 +29237,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Indizierte Blöcke"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29147,6 +29261,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Teilblock-Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29165,6 +29285,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD-Dateien"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29183,6 +29309,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD-Größe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29201,6 +29333,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeichereinträge"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29219,6 +29357,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeichergröße"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29237,6 +29381,12 @@
       "comment" : "",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hinweis: Im Teilblock-Cache werden Anfragen unterhalb einer vollen Blockgröße (bei manchen Modellen beispielsweise < 1024 Token) im Arbeitsspeicher bzw. im seitenbasierten Cache gespeichert. Sie zählen jedoch nicht als indizierte SSD-Blöcke."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29486,6 +29636,12 @@
       "comment" : "Label for average prompt-processing speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt-Verarbeitung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29510,6 +29666,12 @@
       "comment" : "Note after prompt-processing speed label",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "(ohne Cache)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29712,6 +29874,12 @@
     "status.tile.generation" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Generierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29736,6 +29904,12 @@
       "comment" : "Sub-label for the generation rate tile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "über aktive Modelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29759,6 +29933,12 @@
     "status.tile.requests" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anfragen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29812,6 +29992,12 @@
       "comment" : "Sub-label for the total tokens stat tile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt + Ausgabe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
