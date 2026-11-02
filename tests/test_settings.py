@@ -3115,6 +3115,8 @@ class TestUISettings:
             "dashboard_layout": layout,
             "custom_theme": None,
             "custom_theme_revision": 0,
+            "custom_theme_draft": None,
+            "custom_theme_history": None,
         }
 
     def test_from_dict_legacy_without_layout(self):

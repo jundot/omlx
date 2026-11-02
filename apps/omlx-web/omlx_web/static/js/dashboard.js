@@ -152,6 +152,13 @@
             customThemeSaving: false,
             customThemeSaved: false,
             customThemeError: '',
+            customThemeAgentDraft: null,
+            customThemeRevision: 0,
+            customThemeHistory: [],
+            customThemeAgentError: '',
+            customThemeAgentBusy: false,
+            customThemeJson: '',
+            customThemeJsonError: '',
             _customThemeSavedTimer: null,
             _customThemeReady: false,
 
@@ -7099,13 +7106,133 @@
                 this._customThemeReady = true;
                 this.customThemeDefaults = window.OmlxCustomTheme.defaults();
                 this.fillCustomThemeDraft();
+                this.loadAgentThemeState();
             },
 
-            fillCustomThemeDraft() {
+            // A /admin/api/theme state: the live theme is stored and painted;
+            // a pending agent proposal only fills the fields until it is applied
+            // or discarded.
+            applyThemeState(state) {
+                const api = window.OmlxCustomTheme;
+                this.customThemeRevision = state.revision || 0;
+                this.customThemeAgentDraft = state.draft || null;
+                this.customThemeHistory = state.history || [];
+                this.customThemeStored = api.apply(state.overrides);
+                window._customTheme = api.isEmpty(this.customThemeStored) ? null : this.customThemeStored;
+                this.fillCustomThemeDraft(this.customThemeAgentDraft?.theme);
+            },
+
+            async loadAgentThemeState() {
+                try {
+                    const response = await fetch('/admin/api/theme');
+                    if (response.ok) this.applyThemeState(await response.json());
+                } catch (error) {
+                    console.debug('Theme state unavailable:', error);
+                }
+            },
+
+            async applyAgentThemeDraft() {
+                if (!this.customThemeAgentDraft) return;
+                this.customThemeAgentBusy = true;
+                this.customThemeAgentError = '';
+                try {
+                    const response = await fetch('/admin/api/theme/draft/apply', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ revision: this.customThemeAgentDraft.base_revision }),
+                    });
+                    if (response.status === 409) throw new Error('stale');
+                    if (!response.ok) throw new Error(await response.text() || response.statusText);
+                    this.applyThemeState(await response.json());
+                    this.customThemeSaved = true;
+                    clearTimeout(this._customThemeSavedTimer);
+                    this._customThemeSavedTimer = setTimeout(() => { this.customThemeSaved = false; }, 2500);
+                } catch (error) {
+                    this.customThemeAgentError = error.message === 'stale'
+                        ? window.t('settings.theme.agent.stale')
+                        : window.t('settings.theme.agent.failed');
+                    console.error('Failed to apply agent draft:', error);
+                } finally {
+                    this.customThemeAgentBusy = false;
+                }
+            },
+
+            async discardAgentThemeDraft() {
+                this.customThemeAgentBusy = true;
+                this.customThemeAgentError = '';
+                try {
+                    const response = await fetch('/admin/api/theme/draft', { method: 'DELETE' });
+                    if (!response.ok) throw new Error(await response.text() || response.statusText);
+                    await this.loadAgentThemeState();
+                } catch (error) {
+                    this.customThemeAgentError = window.t('settings.theme.agent.failed');
+                    console.error('Failed to discard agent draft:', error);
+                } finally {
+                    this.customThemeAgentBusy = false;
+                }
+            },
+
+            async undoCustomTheme() {
+                if (!this.customThemeHistory.length) return;
+                this.customThemeSaving = true;
+                this.customThemeError = '';
+                try {
+                    const response = await fetch('/admin/api/theme/undo', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ revision: this.customThemeRevision }),
+                    });
+                    if (response.status === 409) throw new Error('stale');
+                    if (!response.ok) throw new Error(await response.text() || response.statusText);
+                    this.applyThemeState(await response.json());
+                } catch (error) {
+                    this.customThemeError = error.message === 'stale'
+                        ? window.t('settings.theme.agent.stale')
+                        : window.t('settings.theme.save_failed');
+                    console.error('Failed to undo theme:', error);
+                } finally {
+                    this.customThemeSaving = false;
+                }
+            },
+
+            async copyCustomThemeJson() {
+                this.customThemeJson = JSON.stringify(this.customThemeStored, null, 2);
+                this.customThemeJsonError = '';
+                try {
+                    await navigator.clipboard.writeText(this.customThemeJson);
+                } catch (error) {
+                    console.debug('Clipboard unavailable:', error);
+                }
+            },
+
+            importCustomThemeJson() {
+                this.customThemeJsonError = '';
+                let parsed;
+                try {
+                    parsed = JSON.parse(this.customThemeJson);
+                } catch (error) {
+                    this.customThemeJsonError = window.t('settings.theme.json.invalid');
+                    return;
+                }
+                if (!parsed || typeof parsed !== 'object') {
+                    this.customThemeJsonError = window.t('settings.theme.json.invalid');
+                    return;
+                }
+                const clean = window.OmlxCustomTheme.sanitize(parsed);
+                if (window.OmlxCustomTheme.isEmpty(clean)) {
+                    this.customThemeJsonError = window.t('settings.theme.json.invalid');
+                    return;
+                }
+                this.fillCustomThemeDraft(clean);
+            },
+
+            // Fill every field from `theme` (the saved overrides by default),
+            // falling back to the stock color.
+            fillCustomThemeDraft(theme = this.customThemeStored) {
                 const draft = { light: {}, dark: {} };
                 for (const mode of ['light', 'dark']) {
                     for (const token of window.OmlxCustomTheme.TOKENS) {
-                        draft[mode][token] = this.customThemeStored[mode][token]
+                        draft[mode][token] = theme[mode]?.[token]
                             || this.customThemeDefaults[mode][token] || '';
                     }
                 }
@@ -7247,6 +7374,7 @@
                     this.customThemeStored = clean;
                     window._customTheme = api.isEmpty(clean) ? null : clean;
                     this.fillCustomThemeDraft();
+                    await this.loadAgentThemeState();
                     return true;
                 } catch (error) {
                     this.customThemeError = window.t('settings.theme.save_failed');

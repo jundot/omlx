@@ -94,6 +94,7 @@ from ..theme_contract import (
     resolved_theme,
 )
 from ..theme_contract import schema as theme_schema
+from ..theme_recipe import build_recipe, check_seeds
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
@@ -725,6 +726,38 @@ class ThemeApplyRequest(ThemePayload):
     """A full theme write guarded by the revision the agent planned against."""
 
     revision: int
+    source: str = "api"
+
+
+class ThemeDraftRequest(ThemePayload):
+    """An agent proposal stored without changing the live theme."""
+
+    note: str = Field(default="", max_length=500)
+    source: str = Field(default="agent", max_length=60)
+
+
+class ThemeRevisionRequest(BaseModel):
+    """Revision guard for draft apply and undo."""
+
+    revision: int
+
+
+class ThemeRecipeRequest(BaseModel):
+    """Seed colors for the optional recipe expansion."""
+
+    light: dict[str, Any]
+    dark: dict[str, Any]
+
+
+def _pushed_history(ui, source: str) -> list[dict[str, Any]]:
+    """The theme history with the live theme appended; newest last, at most 10."""
+    entry = {
+        "revision": ui.custom_theme_revision,
+        "theme": ui.custom_theme,
+        "at": datetime.now(UTC).isoformat(),
+        "source": source,
+    }
+    return [*(ui.custom_theme_history or []), entry][-10:]
 
 
 def _theme_report(overrides: dict | None) -> dict[str, Any]:
@@ -743,6 +776,8 @@ def _theme_state(global_settings) -> dict[str, Any]:
         "source": "custom" if global_settings.ui.custom_theme else "default",
         "overrides": overrides,
         **_theme_report(overrides),
+        "draft": global_settings.ui.custom_theme_draft,
+        "history": list(global_settings.ui.custom_theme_history or []),
     }
 
 
@@ -776,14 +811,15 @@ def _theme_refused(clean: dict, errors: list[dict]) -> JSONResponse:
     )
 
 
-async def _save_theme(global_settings, **changes) -> dict[str, Any]:
-    """Set UI theme fields and bump the revision; undo both if saving fails."""
+async def _save_theme(global_settings, bump: bool = True, **changes) -> dict:
+    """Set UI theme fields and, unless `bump` is off, the next revision; put
+    every one of them back if saving fails."""
     ui = global_settings.ui
+    if bump:
+        changes["custom_theme_revision"] = ui.custom_theme_revision + 1
     previous = {name: getattr(ui, name) for name in changes}
-    previous["custom_theme_revision"] = ui.custom_theme_revision
     for name, value in changes.items():
         setattr(ui, name, value)
-    ui.custom_theme_revision += 1
     try:
         await _save_global_settings_async(global_settings)
     except Exception as exc:
@@ -4735,8 +4771,12 @@ async def apply_theme(
     clean, errors = check_theme(payload.model_dump())
     if errors:
         return _theme_refused(clean, errors)
-    theme = clean if clean["light"] or clean["dark"] else None
-    return await _save_theme(global_settings, custom_theme=theme)
+    return await _save_theme(
+        global_settings,
+        custom_theme=clean if clean["light"] or clean["dark"] else None,
+        custom_theme_draft=None,
+        custom_theme_history=_pushed_history(global_settings.ui, payload.source),
+    )
 
 
 @router.delete("/api/theme")
@@ -4748,7 +4788,115 @@ async def reset_theme(
     global_settings = _theme_settings()
     if revision != global_settings.ui.custom_theme_revision:
         return _revision_conflict(global_settings, revision)
-    return await _save_theme(global_settings, custom_theme=None)
+    return await _save_theme(
+        global_settings,
+        custom_theme=None,
+        custom_theme_draft=None,
+        custom_theme_history=_pushed_history(global_settings.ui, "reset"),
+    )
+
+
+@router.post("/api/theme/recipe")
+async def expand_theme_recipe(
+    payload: ThemeRecipeRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Expand background/text/accent seeds into all 22 tokens; never saves."""
+    seeds, errors = check_seeds(payload.model_dump())
+    if errors:
+        return JSONResponse(status_code=422, content={"ok": False, "errors": errors})
+    tokens = build_recipe(seeds)
+    clean, errors = check_theme(tokens)
+    if errors:
+        return _theme_refused(clean, errors)
+    return {"ok": True, "tokens": clean, **_theme_report(clean)}
+
+
+@router.get("/api/theme/history")
+async def get_theme_history(is_admin: bool = Depends(require_admin)):
+    """Return the bounded audit list, newest last."""
+    history = _theme_settings().ui.custom_theme_history
+    return {"ok": True, "history": list(history or [])}
+
+
+@router.get("/api/theme/draft")
+async def get_theme_draft(is_admin: bool = Depends(require_admin)):
+    """Return the pending agent proposal, if any."""
+    return {"ok": True, "draft": _theme_settings().ui.custom_theme_draft}
+
+
+@router.post("/api/theme/draft")
+async def create_theme_draft(
+    payload: ThemeDraftRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Store an agent proposal without changing the live theme."""
+    global_settings = _theme_settings()
+    clean, errors = check_theme(payload.model_dump())
+    if errors:
+        return _theme_refused(clean, errors)
+    if not clean["light"] and not clean["dark"]:
+        raise HTTPException(status_code=400, detail="Draft must contain a token")
+    draft = {
+        "theme": clean,
+        "note": payload.note,
+        "source": payload.source,
+        "base_revision": global_settings.ui.custom_theme_revision,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    return await _save_theme(global_settings, bump=False, custom_theme_draft=draft)
+
+
+@router.delete("/api/theme/draft")
+async def delete_theme_draft(is_admin: bool = Depends(require_admin)):
+    """Discard the pending proposal."""
+    return await _save_theme(_theme_settings(), bump=False, custom_theme_draft=None)
+
+
+@router.post("/api/theme/draft/apply")
+async def apply_theme_draft(
+    payload: ThemeRevisionRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Apply the pending proposal, guarded by its base revision and the floor."""
+    global_settings = _theme_settings()
+    draft = global_settings.ui.custom_theme_draft
+    if draft is None:
+        raise HTTPException(status_code=404, detail="No theme draft")
+    current = global_settings.ui.custom_theme_revision
+    if payload.revision != current or draft.get("base_revision") != current:
+        return _revision_conflict(global_settings, payload.revision)
+    # Checked again: the stored draft may predate a change to the contract.
+    clean, errors = check_theme(draft.get("theme"))
+    if errors:
+        return _theme_refused(clean, errors)
+    source = str(draft.get("source") or "draft")
+    return await _save_theme(
+        global_settings,
+        custom_theme=clean,
+        custom_theme_draft=None,
+        custom_theme_history=_pushed_history(global_settings.ui, source),
+    )
+
+
+@router.post("/api/theme/undo")
+async def undo_theme(
+    payload: ThemeRevisionRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Restore the theme before the last write."""
+    global_settings = _theme_settings()
+    if payload.revision != global_settings.ui.custom_theme_revision:
+        return _revision_conflict(global_settings, payload.revision)
+    history = list(global_settings.ui.custom_theme_history or [])
+    if not history:
+        raise HTTPException(status_code=409, detail="No previous theme")
+    entry = history.pop()
+    return await _save_theme(
+        global_settings,
+        custom_theme=entry.get("theme"),
+        custom_theme_history=history,
+    )
 
 
 def _splash_status(global_settings) -> dict:
@@ -6042,8 +6190,11 @@ async def update_global_settings(
             else None
         )
         if next_theme != global_settings.ui.custom_theme:
-            global_settings.ui.custom_theme = next_theme
-            global_settings.ui.custom_theme_revision += 1
+            ui = global_settings.ui
+            ui.custom_theme_history = _pushed_history(ui, "editor")
+            ui.custom_theme = next_theme
+            ui.custom_theme_draft = None
+            ui.custom_theme_revision += 1
         runtime_applied.append("ui_custom_theme")
 
     # Apply idle timeout settings (Live)

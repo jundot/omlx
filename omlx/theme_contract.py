@@ -95,6 +95,41 @@ def stock_colors() -> dict[str, dict[str, str]]:
     return resolved
 
 
+def mix(first: str, second: str, amount: float) -> str:
+    """Mix two #rrggbb colors in sRGB: amount 0 is `first`, 1 is `second`."""
+    return "#" + "".join(
+        f"{round(a + (b - a) * amount):02x}"
+        for a, b in zip(_channels(first), _channels(second))
+    )
+
+
+def best_foreground(background: str) -> str:
+    """Black or white, whichever contrasts more with the background."""
+    black = contrast_ratio("#000000", background)
+    return "#000000" if black >= contrast_ratio("#ffffff", background) else "#ffffff"
+
+
+def ensure_foreground(
+    foreground: str, backgrounds: tuple[str, ...], floor: float = CONTRAST_FLOOR
+) -> str | None:
+    """The smallest step toward black or white that reaches `floor` on every
+    background; the color itself if it already does, None if nothing does."""
+
+    def passes(color: str) -> bool:
+        return all(contrast_ratio(color, bg) >= floor for bg in backgrounds)
+
+    if passes(foreground):
+        return foreground
+    darker = sum(contrast_ratio("#000000", bg) for bg in backgrounds)
+    lighter = sum(contrast_ratio("#ffffff", bg) for bg in backgrounds)
+    target = "#000000" if darker >= lighter else "#ffffff"
+    for step in range(1, 101):
+        color = mix(foreground, target, step / 100)
+        if passes(color):
+            return color
+    return None
+
+
 def _error(code: str, mode: str, token: str, message: str, **extra) -> dict:
     return {"code": code, "mode": mode, "token": token, "message": message, **extra}
 
@@ -104,7 +139,8 @@ def check_theme(theme: dict | None) -> tuple[dict[str, dict[str, str]], list[dic
 
     Returns the lowercased overrides and every error: unknown tokens, values
     that are not opaque #rrggbb, and contrast-rule pairs below the floor once
-    the overrides are merged over the stock colors.
+    the overrides are merged over the stock colors. A contrast error carries
+    the nearest passing foreground as its `suggestion`.
     """
     stock = stock_colors()
     clean: dict[str, dict[str, str]] = {mode: {} for mode in MODES}
@@ -130,8 +166,10 @@ def check_theme(theme: dict | None) -> tuple[dict[str, dict[str, str]], list[dic
         values = {**stock[mode], **clean[mode]}
         for foreground, backgrounds in CONTRAST_RULES:
             for background in backgrounds:
-                ratio = contrast_ratio(values[foreground], values[background])
+                surface = values[background]
+                ratio = contrast_ratio(values[foreground], surface)
                 if ratio < CONTRAST_FLOOR:
+                    nearest = ensure_foreground(values[foreground], (surface,))
                     errors.append(
                         _error(
                             "contrast_below_floor",
@@ -142,6 +180,11 @@ def check_theme(theme: dict | None) -> tuple[dict[str, dict[str, str]], list[dic
                             surface=background,
                             ratio=round(ratio, 2),
                             floor=CONTRAST_FLOOR,
+                            suggestion=nearest
+                            and {
+                                "value": nearest,
+                                "ratio": round(contrast_ratio(nearest, surface), 2),
+                            },
                         )
                     )
     return clean, errors

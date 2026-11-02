@@ -884,6 +884,10 @@ class UISettings:
     custom_theme: dict[str, dict[str, str]] | None = None
     # Incremented on every theme write so external agents can use If-Match.
     custom_theme_revision: int = 0
+    # An agent's proposal, applied only when the user (or agent) confirms.
+    custom_theme_draft: dict[str, Any] | None = None
+    # Previous states, newest last; used by the undo endpoint and the audit list.
+    custom_theme_history: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -892,6 +896,8 @@ class UISettings:
             "dashboard_layout": self.dashboard_layout,
             "custom_theme": self.custom_theme,
             "custom_theme_revision": self.custom_theme_revision,
+            "custom_theme_draft": self.custom_theme_draft,
+            "custom_theme_history": self.custom_theme_history,
         }
 
     @classmethod
@@ -903,11 +909,15 @@ class UISettings:
             revision = int(data.get("custom_theme_revision", 0))
         except (TypeError, ValueError):
             revision = 0
+        draft = data.get("custom_theme_draft")
+        history = data.get("custom_theme_history")
         return cls(
             language=data.get("language", "en"),
             dashboard_layout=layout if isinstance(layout, dict) else None,
             custom_theme=theme if isinstance(theme, dict) else None,
             custom_theme_revision=max(revision, 0),
+            custom_theme_draft=draft if isinstance(draft, dict) else None,
+            custom_theme_history=history if isinstance(history, list) else None,
         )
 
 

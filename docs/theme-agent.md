@@ -68,6 +68,7 @@ blocking rule fails, with structured errors:
     "surface": "bg-tertiary",
     "ratio": 3.82,
     "floor": 4.5,
+    "suggestion": {"value": "#475569", "ratio": 4.71},
     "message": "light: text-primary on bg-tertiary is 3.82:1, below 4.5:1"
   }],
   "resolved": {},
@@ -95,7 +96,60 @@ returns `409` with the current state; a blocking contrast error returns `422`
 with the same structured errors as `/validate`. An `If-Match: "3"` header is
 accepted as an alternative to the body revision.
 
-### `DELETE /?revision=3`
+### `POST /recipe` (optional high-level layer)
+
+If the agent would rather pick a small seed palette than all 22 tokens, send
+`background`, `text` and `accent` per mode (all three required). `surface`
+and the status accents (`success`, `warning`, `danger`, `info`) are optional;
+a missing surface is derived from the background and missing status accents
+fall back to the stock ones. Any other key is refused with `unknown_seed`:
+
+```json
+{
+  "light": {"background": "#fdf6e3", "surface": "#f7efd9",
+            "text": "#073642", "accent": "#cb4b16"},
+  "dark": {"background": "#002b36", "surface": "#073642",
+           "text": "#eee8d5", "accent": "#268bd2"}
+}
+```
+
+The response contains the derived 22-token `tokens` map plus the resolved
+palette and contrast report. The server nudges text, secondary text, links
+and the focus ring toward black/white until they pass; if a seed cannot
+reach the 4.5:1 floor the response is `422` with the usual
+`contrast_below_floor` errors. It never saves. Pass the returned tokens to `/validate` or `PUT` (or use a draft).
+This is a convenience layer, not a different contract.
+
+### `POST /draft`
+
+Stores a proposal without changing the live theme:
+
+```json
+{
+  "light": {"bg-primary": "#fdf6e3", "text-primary": "#073642"},
+  "dark": {"bg-primary": "#002b36"},
+  "note": "Warm paper from the reference image",
+  "source": "agent"
+}
+```
+
+The response contains `draft.base_revision` (the live revision at proposal
+time) and the resolved palette. The Custom Theme page shows the proposal with
+Apply / Discard. `GET /draft` returns it, `DELETE /draft` discards it, and
+`POST /draft/apply` with `{"revision": <base_revision>}` applies it. A stale
+base revision returns `409`; re-read and re-propose. A draft is checked
+against the contrast floor both when it is stored and when it is applied.
+
+### `POST /undo`
+
+```json
+{"revision": 4}
+```
+
+Restores the previous applied theme and increments the revision. `409` if no
+history; `GET /history` returns the bounded audit list.
+
+### `DELETE /?revision=4`
 
 Clears all overrides and returns to the stock colors. Guarded by `revision`
 the same way.
@@ -124,7 +178,8 @@ The user supplies a style image and asks for a theme. A good agent:
 2. maps it to the schema roles, not to arbitrary CSS;
 3. validates contrast before applying;
 4. shows the user the proposed palette and **asks before PUT** unless the
-   user explicitly asked it to apply.
+   user explicitly asked it to apply. Prefer `POST /draft` when the user
+   should review it in the Custom Theme page.
 
 The agent may keep its own preview; oMLX renders the result in the Custom
 Theme page after it is applied.
