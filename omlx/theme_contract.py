@@ -145,3 +145,159 @@ def check_theme(theme: dict | None) -> tuple[dict[str, dict[str, str]], list[dic
                         )
                     )
     return clean, errors
+
+
+# --- External theme API (/admin/api/theme): schema and contrast report ---
+
+SCHEMA_VERSION = 1
+
+GROUP_DESCRIPTIONS = {
+    "surfaces": "Page, panel and section backgrounds.",
+    "text": "Text colors, from headings to muted metadata.",
+    "borders": "Card outlines, dividers and input borders.",
+    "controls": "Primary action, switch and keyboard focus colors.",
+    "status": "Success, warning, danger and info accents.",
+    "accents": "Timeline, link, code and destructive-text accents.",
+}
+
+# token: (role, description)
+TOKEN_INFO = {
+    "bg-primary": ("surface", "Page and card background."),
+    "bg-secondary": ("surface", "Secondary panels and alternating rows."),
+    "bg-tertiary": ("surface", "Section headers, tab tracks and segmented controls."),
+    "text-primary": ("text", "Headings and primary body text."),
+    "text-secondary": ("text", "Labels and secondary copy."),
+    "text-tertiary": ("text", "Tertiary copy and hints."),
+    "text-muted": ("text", "Muted metadata and placeholders."),
+    "border-faint": ("border", "Subtle dividers and card outlines."),
+    "border-normal": ("border", "Inputs, switches and stronger borders."),
+    "btn-primary": ("action", "Primary button background."),
+    "btn-primary-hover": ("action", "Primary button hover background."),
+    "btn-primary-text": ("action", "Text drawn on the primary button."),
+    "switch-on": ("control", "Switch and selected-control track."),
+    "focus-ring-color": ("focus", "Keyboard focus ring."),
+    "success": ("status", "Success accent; soft/line/text tints are derived."),
+    "warning": ("status", "Warning accent; soft/line/text tints are derived."),
+    "danger": ("status", "Danger accent; soft/line/text tints are derived."),
+    "info": ("status", "Info accent; soft/line/text tints are derived."),
+    "timeline-accent": ("accent", "Timeline bars and active indicators."),
+    "link-color": ("accent", "Links and text actions."),
+    "code-bg": ("accent", "Inline code and code chip background."),
+    "text-danger": ("text", "Destructive text and unload actions."),
+}
+
+RULE_DESCRIPTIONS = {
+    "text-primary": "Primary body text must stay readable on every surface.",
+    "text-secondary": "Secondary labels must stay readable on every surface.",
+    "link-color": "Links must stay readable on every surface.",
+    "btn-primary-text": "Button text must stay readable on the primary action.",
+}
+
+# Reported but never blocking: (foreground, backgrounds, floor, description).
+# The stock light text-muted and text-danger sit below 4.5:1 on purpose.
+ADVISORY_RULES = (
+    ("text-tertiary", SURFACES, 4.5, "Tertiary text."),
+    ("text-muted", ("bg-primary",), 4.5, "Muted placeholders."),
+    ("text-danger", ("bg-primary",), 4.5, "Destructive text."),
+    ("border-normal", ("bg-primary",), 3.0, "Input and control boundaries."),
+    ("focus-ring-color", ("bg-primary",), 3.0, "Keyboard focus indicator."),
+)
+DERIVED_STATUS_TOKENS = tuple(
+    f"{status}-{part}"
+    for status in TOKEN_GROUPS["status"]
+    for part in ("soft", "line", "text")
+)
+
+
+def _all_rules():
+    """(foreground, backgrounds, floor, blocking, description) for every rule."""
+    for foreground, backgrounds in CONTRAST_RULES:
+        description = RULE_DESCRIPTIONS[foreground]
+        yield foreground, backgrounds, CONTRAST_FLOOR, True, description
+    for foreground, backgrounds, floor, description in ADVISORY_RULES:
+        yield foreground, backgrounds, floor, False, description
+
+
+def resolved_theme(overrides: dict | None) -> dict[str, dict[str, str]]:
+    """The saved overrides merged over the stock colors."""
+    stock = stock_colors()
+    overrides = overrides or {}
+    return {mode: {**stock[mode], **(overrides.get(mode) or {})} for mode in MODES}
+
+
+def contrast_report(resolved: dict[str, dict[str, str]]) -> list[dict]:
+    """Every blocking and advisory pair, with its ratio and pass state."""
+    report = []
+    for mode in MODES:
+        colors = resolved[mode]
+        for foreground, backgrounds, floor, blocking, _ in _all_rules():
+            for background in backgrounds:
+                ratio = contrast_ratio(colors[foreground], colors[background])
+                report.append(
+                    {
+                        "mode": mode,
+                        "foreground": foreground,
+                        "background": background,
+                        "ratio": round(ratio, 2),
+                        "floor": floor,
+                        "blocking": blocking,
+                        "ok": ratio >= floor,
+                    }
+                )
+    return report
+
+
+def schema() -> dict:
+    """The stable contract an external agent reads before planning colors."""
+    stock = stock_colors()
+    contrast_with = {foreground: list(bgs) for foreground, bgs in CONTRAST_RULES}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "modes": list(MODES),
+        "format": {
+            "hex": "opaque #rrggbb",
+            "case": "case-insensitive; stored lowercase",
+        },
+        "merge": {
+            "overrides": "partial maps merged over the stock values",
+            "save": "PUT replaces both mode maps at once; send {} to clear a mode",
+        },
+        "groups": [
+            {
+                "id": group,
+                "description": GROUP_DESCRIPTIONS[group],
+                "tokens": list(tokens),
+            }
+            for group, tokens in TOKEN_GROUPS.items()
+        ],
+        "tokens": [
+            {
+                "id": token,
+                "group": group,
+                "role": TOKEN_INFO[token][0],
+                "description": TOKEN_INFO[token][1],
+                "default": {mode: stock[mode][token] for mode in MODES},
+                "contrast_with": contrast_with.get(token, []),
+            }
+            for group, tokens in TOKEN_GROUPS.items()
+            for token in tokens
+        ],
+        "contrast_floor": CONTRAST_FLOOR,
+        "contrast_rules": [
+            {
+                "foreground": foreground,
+                "backgrounds": list(backgrounds),
+                "floor": floor,
+                "blocking": blocking,
+                "description": description,
+            }
+            for foreground, backgrounds, floor, blocking, description in _all_rules()
+        ],
+        "non_editable_derived": list(DERIVED_STATUS_TOKENS),
+        "notes": [
+            "Status soft/line/text values are derived from the four status accents.",
+            "Neutral utility channels are derived from the matching semantic token.",
+            "Blocking rules are a hard 4.5:1 floor on every write; a request that "
+            "breaks one is refused with contrast_below_floor.",
+        ],
+    }

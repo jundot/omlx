@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 import requests
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import (
     BaseModel,
@@ -87,7 +87,13 @@ from ..model_settings import (
     merge_chat_template_kwargs,
     validate_kv_compression_settings,
 )
-from ..theme_contract import check_theme
+from ..theme_contract import (
+    SCHEMA_VERSION,
+    check_theme,
+    contrast_report,
+    resolved_theme,
+)
+from ..theme_contract import schema as theme_schema
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
@@ -702,6 +708,91 @@ class DashboardLayoutRequest(BaseModel):
                 f"at most {DASHBOARD_SERVING_TILE_MAX} serving stats tiles allowed"
             )
         return kept or _default_serving_tiles()
+
+
+class ThemePayload(BaseModel):
+    """Partial token overrides for the external theme API.
+
+    Values stay untyped so a bad one comes back as a structured invalid_hex
+    error from check_theme rather than a generic validation error.
+    """
+
+    light: dict[str, Any] = Field(default_factory=dict)
+    dark: dict[str, Any] = Field(default_factory=dict)
+
+
+class ThemeApplyRequest(ThemePayload):
+    """A full theme write guarded by the revision the agent planned against."""
+
+    revision: int
+
+
+def _theme_report(overrides: dict | None) -> dict[str, Any]:
+    """Resolved colors, every contrast pair, and the advisory pairs that fail."""
+    resolved = resolved_theme(overrides)
+    report = contrast_report(resolved)
+    warnings = [item for item in report if not item["blocking"] and not item["ok"]]
+    return {"resolved": resolved, "contrast": report, "warnings": warnings}
+
+
+def _theme_state(global_settings) -> dict[str, Any]:
+    overrides = global_settings.ui.custom_theme or {"light": {}, "dark": {}}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "revision": global_settings.ui.custom_theme_revision,
+        "source": "custom" if global_settings.ui.custom_theme else "default",
+        "overrides": overrides,
+        **_theme_report(overrides),
+    }
+
+
+def _theme_settings():
+    global_settings = _get_global_settings()
+    if global_settings is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    return global_settings
+
+
+def _revision_conflict(global_settings, expected: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "ok": False,
+            "error": {
+                "code": "revision_conflict",
+                "expected": expected,
+                "current": global_settings.ui.custom_theme_revision,
+                "message": "theme changed; re-read and plan again",
+            },
+            **_theme_state(global_settings),
+        },
+    )
+
+
+def _theme_refused(clean: dict, errors: list[dict]) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"ok": False, "errors": errors, **_theme_report(clean)},
+    )
+
+
+async def _save_theme(global_settings, **changes) -> dict[str, Any]:
+    """Set UI theme fields and bump the revision; undo both if saving fails."""
+    ui = global_settings.ui
+    previous = {name: getattr(ui, name) for name in changes}
+    previous["custom_theme_revision"] = ui.custom_theme_revision
+    for name, value in changes.items():
+        setattr(ui, name, value)
+    ui.custom_theme_revision += 1
+    try:
+        await _save_global_settings_async(global_settings)
+    except Exception as exc:
+        for name, value in previous.items():
+            setattr(ui, name, value)
+        raise HTTPException(
+            status_code=500, detail=f"Failed to save theme: {exc}"
+        ) from exc
+    return {"ok": True, **_theme_state(global_settings)}
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -4596,6 +4687,70 @@ async def get_global_settings_defaults(is_admin: bool = Depends(require_admin)):
     return response
 
 
+@router.get("/api/theme/schema")
+async def get_theme_schema(is_admin: bool = Depends(require_admin)):
+    """Return the stable token contract an external agent plans against."""
+    return theme_schema()
+
+
+@router.get("/api/theme")
+async def get_theme(is_admin: bool = Depends(require_admin)):
+    """Return the current overrides, resolved colors, revision and contrast."""
+    return {"ok": True, **_theme_state(_theme_settings())}
+
+
+@router.post("/api/theme/validate")
+async def validate_theme(
+    payload: ThemePayload,
+    is_admin: bool = Depends(require_admin),
+):
+    """Dry-run a theme payload without saving it."""
+    clean, errors = check_theme(payload.model_dump())
+    return {"ok": not errors, "errors": errors, **_theme_report(clean)}
+
+
+@router.put("/api/theme")
+async def apply_theme(
+    payload: ThemeApplyRequest,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+    is_admin: bool = Depends(require_admin),
+):
+    """Replace the theme overrides, guarded by a revision and the contrast floor."""
+    global_settings = _theme_settings()
+    expected = payload.revision
+    if if_match is not None:
+        try:
+            header_revision = int(if_match.strip().strip('"'))
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="If-Match must be a revision number"
+            )
+        if header_revision != expected:
+            raise HTTPException(
+                status_code=400, detail="If-Match and body revision disagree"
+            )
+    if expected != global_settings.ui.custom_theme_revision:
+        return _revision_conflict(global_settings, expected)
+
+    clean, errors = check_theme(payload.model_dump())
+    if errors:
+        return _theme_refused(clean, errors)
+    theme = clean if clean["light"] or clean["dark"] else None
+    return await _save_theme(global_settings, custom_theme=theme)
+
+
+@router.delete("/api/theme")
+async def reset_theme(
+    revision: int,
+    is_admin: bool = Depends(require_admin),
+):
+    """Reset to the stock theme, guarded by the latest revision."""
+    global_settings = _theme_settings()
+    if revision != global_settings.ui.custom_theme_revision:
+        return _revision_conflict(global_settings, revision)
+    return await _save_theme(global_settings, custom_theme=None)
+
+
 def _splash_status(global_settings) -> dict:
     """The Splash launcher oMLX would run, and the models it serves now."""
     binary, reason = find_splash_binary(global_settings.integrations.splash_path)
@@ -4821,6 +4976,7 @@ def _global_settings_response(global_settings):
             "language": global_settings.ui.language,
             "dashboard_layout": global_settings.ui.dashboard_layout,
             "custom_theme": global_settings.ui.custom_theme,
+            "custom_theme_revision": global_settings.ui.custom_theme_revision,
         },
         "idle_timeout": {
             "idle_timeout_seconds": global_settings.idle_timeout.idle_timeout_seconds,
@@ -5881,10 +6037,13 @@ async def update_global_settings(
 
     if "ui_custom_theme" in request.model_fields_set:
         theme = request.ui_custom_theme
-        global_settings.ui.custom_theme = (
+        next_theme = (
             theme.model_dump() if theme is not None and (theme.light or theme.dark)
             else None
         )
+        if next_theme != global_settings.ui.custom_theme:
+            global_settings.ui.custom_theme = next_theme
+            global_settings.ui.custom_theme_revision += 1
         runtime_applied.append("ui_custom_theme")
 
     # Apply idle timeout settings (Live)

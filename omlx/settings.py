@@ -882,6 +882,8 @@ class UISettings:
     # Web UI color token overrides, {"light": {token: hex}, "dark": {...}}.
     # None means the stock colors.
     custom_theme: dict[str, dict[str, str]] | None = None
+    # Incremented on every theme write so external agents can use If-Match.
+    custom_theme_revision: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -889,6 +891,7 @@ class UISettings:
             "language": self.language,
             "dashboard_layout": self.dashboard_layout,
             "custom_theme": self.custom_theme,
+            "custom_theme_revision": self.custom_theme_revision,
         }
 
     @classmethod
@@ -896,10 +899,15 @@ class UISettings:
         """Create from dictionary."""
         layout = data.get("dashboard_layout")
         theme = data.get("custom_theme")
+        try:
+            revision = int(data.get("custom_theme_revision", 0))
+        except (TypeError, ValueError):
+            revision = 0
         return cls(
             language=data.get("language", "en"),
             dashboard_layout=layout if isinstance(layout, dict) else None,
             custom_theme=theme if isinstance(theme, dict) else None,
+            custom_theme_revision=max(revision, 0),
         )
 
 

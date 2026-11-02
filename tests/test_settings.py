@@ -3114,6 +3114,7 @@ class TestUISettings:
             "language": "ko",
             "dashboard_layout": layout,
             "custom_theme": None,
+            "custom_theme_revision": 0,
         }
 
     def test_from_dict_legacy_without_layout(self):
