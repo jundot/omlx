@@ -466,6 +466,32 @@ class TestExtractTextContent:
         assert result[0]["role"] == "system"
         assert result[0]["content"] == "You are a coding assistant."
 
+    @pytest.mark.parametrize(
+        "extract", [extract_text_content, extract_multimodal_content]
+    )
+    def test_native_tool_results_follow_tool_call_order(self, extract):
+        """Tool results are rendered in the order of the assistant's tool_calls."""
+
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        calls = [
+            {"id": tid, "function": {"name": "read", "arguments": "{}"}}
+            for tid in ("call_a", "call_b")
+        ]
+        messages = [
+            Message(role="assistant", content="", tool_calls=calls),
+            Message(role="tool", tool_call_id="call_b", content="B"),
+            Message(role="tool", tool_call_id="call_a", content="A"),
+        ]
+
+        result = extract(messages, tokenizer=NativeToolTokenizer())
+
+        assert [(msg["tool_call_id"], msg["content"]) for msg in result[1:]] == [
+            ("call_a", "A"),
+            ("call_b", "B"),
+        ]
+
 
 class TestExtractTextContentReasoningReconstruction:
     """Tests that extract_text_content reassembles <think> from reasoning_content.
@@ -897,111 +923,43 @@ class TestConvertAnthropicToInternal:
         assert result[1]["tool_call_id"] == "toolu_123"
         assert result[1]["content"] == "The weather is sunny"
 
-    @pytest.mark.parametrize(
-        ("incoming", "expected"),
-        [
-            (
-                [("toolu_b", "B"), ("toolu_a", "A")],
-                [("toolu_a", "A"), ("toolu_b", "B")],
-            ),
-            (
-                [("toolu_c", "C"), ("toolu_x", "X"), ("toolu_a", "A")],
-                [("toolu_a", "A"), ("toolu_c", "C"), ("toolu_x", "X")],
-            ),
-            (
-                [("", "first"), ("toolu_a", "A"), ("", "second")],
-                [("toolu_a", "A"), ("", "first"), ("", "second")],
-            ),
-        ],
-    )
-    def test_native_tool_results_follow_tool_call_order(self, incoming, expected):
-        """Parallel tool results reach the template in tool_calls order."""
+    def test_native_tool_results_follow_tool_call_order(self):
+        """Each run of tool results follows its own turn's tool_calls order."""
 
         class NativeToolTokenizer:
             has_tool_calling = True
 
-        request = MessagesRequest(
-            model="claude-3",
-            max_tokens=1024,
-            messages=[
+        def turn(call_ids, result_ids):
+            return [
                 AnthropicMessage(
                     role="assistant",
                     content=[
-                        ContentBlockToolUse(id=tid, name="read_file", input={})
-                        for tid in ("toolu_a", "toolu_b", "toolu_c")
+                        ContentBlockToolUse(id=tid, name="read", input={})
+                        for tid in call_ids
                     ],
                 ),
                 AnthropicMessage(
                     role="user",
                     content=[
-                        ContentBlockToolResult(tool_use_id=tid, content=text)
-                        for tid, text in incoming
+                        ContentBlockToolResult(tool_use_id=tid, content=tid.upper())
+                        for tid in result_ids
                     ],
                 ),
-            ],
-        )
-
-        result = convert_anthropic_to_internal(
-            request,
-            tokenizer=NativeToolTokenizer(),
-        )
-
-        assert [(msg["tool_call_id"], msg["content"]) for msg in result[1:]] == expected
-
-    def test_native_tool_results_follow_nearest_tool_calls(self):
-        """A later assistant turn orders its own results, not the previous turn."""
-
-        class NativeToolTokenizer:
-            has_tool_calling = True
+            ]
 
         request = MessagesRequest(
             model="claude-3",
             max_tokens=1024,
-            messages=[
-                AnthropicMessage(
-                    role="assistant",
-                    content=[
-                        ContentBlockToolUse(id="toolu_a", name="read", input={}),
-                        ContentBlockToolUse(id="toolu_b", name="read", input={}),
-                    ],
-                ),
-                AnthropicMessage(
-                    role="user",
-                    content=[
-                        ContentBlockToolResult(tool_use_id="toolu_b", content="B"),
-                        ContentBlockToolResult(tool_use_id="toolu_a", content="A"),
-                    ],
-                ),
-                AnthropicMessage(
-                    role="assistant",
-                    content=[
-                        ContentBlockToolUse(id="toolu_c", name="read", input={}),
-                        ContentBlockToolUse(id="toolu_d", name="read", input={}),
-                    ],
-                ),
-                AnthropicMessage(
-                    role="user",
-                    content=[
-                        ContentBlockToolResult(tool_use_id="toolu_d", content="D"),
-                        ContentBlockToolResult(tool_use_id="toolu_c", content="C"),
-                    ],
-                ),
-            ],
+            messages=turn(["a", "b"], ["b", "a"]) + turn(["c", "d"], ["d", "x", "c"]),
         )
 
-        result = convert_anthropic_to_internal(
-            request,
-            tokenizer=NativeToolTokenizer(),
-        )
+        result = convert_anthropic_to_internal(request, tokenizer=NativeToolTokenizer())
 
-        assert [(msg.get("tool_call_id"), msg["content"]) for msg in result] == [
-            (None, ""),
-            ("toolu_a", "A"),
-            ("toolu_b", "B"),
-            (None, ""),
-            ("toolu_c", "C"),
-            ("toolu_d", "D"),
-        ]
+        assert [
+            (msg["tool_call_id"], msg["content"])
+            for msg in result
+            if msg["role"] == "tool"
+        ] == [("a", "A"), ("b", "B"), ("c", "C"), ("d", "D"), ("x", "X")]
 
     def test_tool_result_with_image_preserve_images_nonnative(self):
         """Images in tool_result content are preserved when preserve_images=True (non-native path)."""

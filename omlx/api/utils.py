@@ -924,6 +924,36 @@ def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
     return [merged_system] + non_system
 
 
+def _sort_tool_messages_by_call_order(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Sort each run of tool messages into the preceding assistant's tool_calls order."""
+    ordered: list[dict[str, Any]] = []
+    call_order: dict[str, int] = {}
+    run: list[dict[str, Any]] = []
+
+    def flush() -> None:
+        run.sort(key=lambda m: call_order.get(m.get("tool_call_id", ""), float("inf")))
+        ordered.extend(run)
+        run.clear()
+
+    for msg in messages:
+        if msg.get("role") == "tool":
+            run.append(msg)
+            continue
+        flush()
+        if msg.get("role") == "assistant":
+            call_order = {
+                call.get("id"): index
+                for index, call in enumerate(msg.get("tool_calls") or [])
+                if call.get("id")
+            }
+        ordered.append(msg)
+
+    flush()
+    return ordered
+
+
 def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
     """Merge consecutive messages with the same mergeable role.
 
@@ -1197,6 +1227,7 @@ def extract_text_content(
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
         processed_messages = _consolidate_system_messages(processed_messages)
+    processed_messages = _sort_tool_messages_by_call_order(processed_messages)
     return _merge_consecutive_roles(processed_messages)
 
 
@@ -1375,6 +1406,7 @@ def extract_multimodal_content(
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
         processed_messages = _consolidate_system_messages(processed_messages)
+    processed_messages = _sort_tool_messages_by_call_order(processed_messages)
     return _merge_consecutive_roles(processed_messages)
 
 
