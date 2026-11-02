@@ -6395,6 +6395,12 @@
       "comment" : "Subtitle for Active Downloads when there are none",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine aktiven Aufgaben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6419,6 +6425,12 @@
       "comment" : "Subtitle for Active Downloads; placeholder is the count of running tasks",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld aktiv"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -6443,6 +6455,12 @@
       "comment" : "Section heading for the list of in-progress downloads",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktive Downloads"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6467,6 +6485,12 @@
       "comment" : "Primary button that starts downloading the entered repo",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Herunterladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6491,6 +6515,12 @@
       "comment" : "Button label that re-runs a failed or cancelled download",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erneut versuchen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6515,6 +6545,12 @@
       "comment" : "Tooltip on the info button that opens a model's README sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellkarte anzeigen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6539,6 +6575,12 @@
       "comment" : "Tooltip on the X button that cancels or removes a download task",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abbrechen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6563,6 +6605,12 @@
       "comment" : "Button in the model card sheet that closes it without downloading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abbrechen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6587,6 +6635,12 @@
       "comment" : "Tooltip on the model card sheet's close button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schließen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6611,6 +6665,12 @@
       "comment" : "Primary button in the model card sheet that starts downloading the displayed model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Herunterladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6635,6 +6695,12 @@
       "comment" : "Button in the model card sheet that downloads every file of the repo",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alle herunterladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6659,6 +6725,12 @@
       "comment" : "Primary button in the model card sheet that downloads the files checked in the Files tab",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgewählte herunterladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6683,6 +6755,12 @@
       "comment" : "Empty state shown when the upstream repo has no model card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Modell enthält keine README."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6707,6 +6785,12 @@
       "comment" : "Title shown in the model card sheet when the fetch failed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellkarte konnte nicht geladen werden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6731,6 +6815,12 @@
       "comment" : "Marker on a file in the model card's Files tab that is already in the model folder",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Heruntergeladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6755,6 +6845,12 @@
       "comment" : "Empty state in the Files tab when the upstream API doesn't list any files",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Dateien gemeldet."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6779,6 +6875,12 @@
       "comment" : "Hint above the Files tab of a safetensors repo",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vom Modell benötigte Dateien bleiben ausgewählt. Entfernen Sie das Häkchen bei zusätzlichen Dateien, die Sie nicht benötigen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6803,6 +6905,12 @@
       "comment" : "Hint above the Files tab of a GGUF repo",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wählen Sie die GGUF-Dateien zum Herunterladen aus. Zu jeder GGUF-Datei wird der zugehörige Bild-Projektor mitgeladen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6827,6 +6935,12 @@
       "comment" : "Marker on a file in the model card's Files tab whose copy in the model folder differs from the Hub",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geändert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6851,6 +6965,12 @@
       "comment" : "Marker on a file in the model card's Files tab that the model cannot load without",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erforderlich"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6875,6 +6995,12 @@
       "comment" : "Status text shown while the model README is being fetched",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellkarte wird geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6899,6 +7025,12 @@
       "comment" : "Warning banner shown in the model card sheet when the repo is an adapter rather than a full model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dies ist ein LoRA-Adapter. Zum Ausführen benötigt er ein kompatibles Basismodell. Einzeln heruntergeladen lässt er sich nicht in oMLX laden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6923,6 +7055,12 @@
       "comment" : "Warning beside the download buttons when the selection does not fit on disk",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht genügend freier Speicherplatz im Modellordner"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6947,6 +7085,12 @@
       "comment" : "Retry button shown after the model card fetch failed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erneut versuchen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6971,6 +7115,12 @@
       "comment" : "Tab label in the model card sheet for the README content",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellkarte"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6995,6 +7145,12 @@
       "comment" : "Tab label in the model card sheet for the repo file list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dateien"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7019,6 +7175,12 @@
       "comment" : "Tab label in the model card sheet for the repo tag list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schlagwörter"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7043,6 +7205,12 @@
       "comment" : "Empty state in the Tags tab when the upstream API doesn't list any tags",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Schlagwörter."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7067,6 +7235,12 @@
       "comment" : "Primary button in the model card sheet that fetches the files changed on the Hub since the model was downloaded",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktualisieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7091,6 +7265,12 @@
       "comment" : "Link button in the model card sheet that opens the upstream model page; placeholder is 'Hugging Face' or 'ModelScope'",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf %@ anzeigen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7115,6 +7295,12 @@
       "comment" : "Downloader filter option: show repos of every format",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alle Formate"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7139,6 +7325,12 @@
       "comment" : "Downloader filter option: show GGUF repos only",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur GGUF"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7163,6 +7355,12 @@
       "comment" : "Downloader filter option: show MLX repos only",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur MLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7187,6 +7385,12 @@
       "comment" : "Placeholder for the HF mirror endpoint input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "https://hf-mirror.com  (leer = huggingface.co)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7211,6 +7415,12 @@
       "comment" : "Section heading above the Hugging Face download form",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell von Hugging Face hinzufügen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7235,6 +7445,12 @@
       "comment" : "Button that opens the inline mirror editor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mirror einrichten…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7259,6 +7475,12 @@
       "comment" : "Badge shown next to the mirror host when the user has configured a custom endpoint",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benutzerdefiniert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7283,6 +7505,12 @@
       "comment" : "Inline label preceding the mirror host on the Downloads screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mirror:"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7307,6 +7535,12 @@
       "comment" : "Button that clears the mirror endpoint back to the default",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zurücksetzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7331,6 +7565,12 @@
       "comment" : "Placeholder for the ModelScope mirror endpoint input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "https://modelscope.cn  (leer = ModelScope-Standard)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7355,6 +7595,12 @@
       "comment" : "Section heading above the ModelScope download form",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell von ModelScope hinzufügen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7379,6 +7625,12 @@
       "comment" : "Per-row progress line during downloads. Placeholders: percent, bytes downloaded, total bytes",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld%% · %2$@ von %3$@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -7403,6 +7655,12 @@
       "comment" : "Remaining download time after the progress line. Placeholder: duration such as 2h 30m",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Noch %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -7427,6 +7685,12 @@
       "comment" : "Subtitle for Recent Tasks; placeholder is the count of recent terminal tasks",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zuletzt: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -7451,6 +7715,12 @@
       "comment" : "Section heading for recently completed or failed downloads",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Letzte Aufgaben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7475,6 +7745,12 @@
       "comment" : "Placeholder shown inside the autocomplete dropdown while a search is in flight",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suchen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7499,6 +7775,12 @@
       "comment" : "Source selector option label for Hugging Face",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hugging Face"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7523,6 +7805,12 @@
       "comment" : "Source selector option label for ModelScope",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ModelScope"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7547,6 +7835,12 @@
       "comment" : "Inline note shown beside the source switcher when the ModelScope SDK isn't installed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ModelScope-SDK ist in diesem Build nicht verfügbar"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7571,6 +7865,12 @@
       "comment" : "Status chip label for a download cancelled by the user",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abgebrochen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7595,6 +7895,12 @@
       "comment" : "Status chip label for a finished download",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abgeschlossen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7619,6 +7925,12 @@
       "comment" : "Status chip label while a download is actively transferring bytes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird heruntergeladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7643,6 +7955,12 @@
       "comment" : "Status chip label for a download that errored out",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fehlgeschlagen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7667,6 +7985,12 @@
       "comment" : "Status chip label for a paused download",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Angehalten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7691,6 +8015,12 @@
       "comment" : "Status chip label for a download waiting to start",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "In Warteschlange"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7715,6 +8045,12 @@
       "comment" : "Empty-state message for the Suggested Models section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Derzeit keine Vorschläge verfügbar."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7739,6 +8075,12 @@
       "comment" : "Compact button label that starts downloading a suggested model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Herunterladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7763,6 +8105,12 @@
       "comment" : "Subtitle hint on the Suggested Models header explaining the filter",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nach freiem Arbeitsspeicher gefiltert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7787,6 +8135,12 @@
       "comment" : "Placeholder shown while the recommended-models list is fetching",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Empfehlungen werden geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7811,6 +8165,12 @@
       "comment" : "Sort option: rank suggested models by download count",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Meist heruntergeladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7835,6 +8195,12 @@
       "comment" : "Sort option: rank suggested models by parameter count, descending",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Parameter: absteigend"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7859,6 +8225,12 @@
       "comment" : "Sort option: rank suggested models by on-disk size, descending",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Größe: absteigend"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -7883,6 +8255,12 @@
       "comment" : "Section heading for the recommended-models section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vorgeschlagene Modelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
