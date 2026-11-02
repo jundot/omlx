@@ -791,11 +791,17 @@ def _capture_boundary_candidate(
     except Exception as exc:
         logger.debug("MTP prefix boundary capture failed closed: %s", exc)
         return
+    if isinstance(previous, _MtpBoundaryCandidate) and previous.boundary_tokens % block:
+        # An off-grid tail, such as the shared system prefix, is lost on replace.
+        _publish_boundary_candidate(ctx, previous)
     ctx.snapshot_candidate = candidate
 
 
-def _publish_boundary_candidate(ctx: _PrimeCtx) -> None:
-    candidate = ctx.snapshot_candidate
+def _publish_boundary_candidate(
+    ctx: _PrimeCtx, candidate: Optional[_MtpBoundaryCandidate] = None
+) -> None:
+    if candidate is None:
+        candidate = ctx.snapshot_candidate
     store = getattr(ctx.prefix_cache, "store_mtp_prefix_snapshot", None)
     if not isinstance(candidate, _MtpBoundaryCandidate) or not callable(store):
         return

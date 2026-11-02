@@ -564,6 +564,12 @@ class VLMModelAdapter(nn.Module):
         if hook is not None:
             hook(next_ids, current_ids)
 
+    def prefetch_engram(self, next_ids: mx.array, current_ids: mx.array, cache=None) -> None:
+        """Forward the next-chunk Engram notice to DeepSeek V4.1."""
+        hook = getattr(self._language_model, "prefetch_engram", None)
+        if hook is not None:
+            hook(next_ids, current_ids, cache=cache)
+
     def ple_gathers_ahead(self) -> bool:
         """Whether the language model gathers PLE rows one prefill chunk ahead."""
         probe = getattr(self._language_model, "ple_gathers_ahead", None)

@@ -4,11 +4,13 @@ Base engine interface for oMLX inference.
 """
 
 import asyncio
+import hashlib
 import logging
 import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -320,6 +322,68 @@ class BaseEngine(ABC):
             cache.clear()
         cache[key] = (suffix, persists)
         return suffix, persists
+
+    def _system_prefix_ids(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        chat_template_kwargs: Optional[Dict[str, Any]],
+    ) -> Optional[List[int]]:
+        """Return token ids of the leading system block as rendered before any user.
+
+        Requests that differ only after it share these tokens. Returns None the
+        first time a block is seen: a one-off system prompt is not worth a
+        shared snapshot.
+        """
+        render = getattr(self, "_apply_chat_template", None)
+        if not callable(render):
+            return None
+        head = []
+        for message in messages:
+            if message.get("role") not in ("system", "developer"):
+                break
+            head.append(dict(message))
+        if not head and not tools:
+            return None
+        key = hashlib.blake2b(
+            repr(
+                (head, tools, sorted((chat_template_kwargs or {}).items(), key=repr))
+            ).encode(),
+            digest_size=16,
+        ).digest()
+        cache = self.__dict__.setdefault("_system_prefix_cache", OrderedDict())
+        if key not in cache:
+            cache[key] = False  # Seen once, not rendered yet.
+            if len(cache) > 32:
+                cache.popitem(last=False)
+            return None
+        cache.move_to_end(key)
+        if cache[key] is not False:
+            return cache[key]
+        ids: Optional[List[int]] = None
+        try:
+            # Two probe users: the rendered texts agree up to the user content.
+            a, b = (
+                render(
+                    [dict(m) for m in head] + [{"role": "user", "content": probe}],
+                    tools,
+                    chat_template_kwargs=chat_template_kwargs,
+                    is_partial=False,
+                    add_generation_prompt=False,
+                )
+                for probe in ("A", "B")
+            )
+            if isinstance(a, str) and isinstance(b, str):
+                n = next(
+                    (i for i, (x, y) in enumerate(zip(a, b)) if x != y),
+                    min(len(a), len(b)),
+                )
+                if n:
+                    ids = list(self.tokenizer.encode(a[:n]))
+        except Exception as e:
+            logger.debug(f"System prefix calc failed: {e}")
+        cache[key] = ids
+        return ids
 
     @property
     @abstractmethod

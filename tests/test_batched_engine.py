@@ -1130,6 +1130,37 @@ class TestBatchedEngineSpecPrefillForwarding:
         call_kwargs = engine._engine.generate.call_args.kwargs
         assert "generation_prompt_text" not in call_kwargs
 
+    @pytest.mark.asyncio
+    async def test_chat_forwards_system_prefix_ids_once_seen(self):
+        """A repeated system block reaches the engine as its rendered token ids."""
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._model_settings = SimpleNamespace(specprefill_enabled=False)
+        engine._preprocess_messages = lambda m: m
+        engine._tokenizer = MagicMock()
+        engine._tokenizer.encode.side_effect = lambda text, **kw: [ord(c) for c in text]
+        engine._engine = SimpleNamespace(
+            generate=AsyncMock(return_value=self._fake_output())
+        )
+        engine._apply_chat_template = lambda msgs, *args, **kwargs: "".join(
+            f"<{m['role']}>{m['content']}" for m in msgs
+        )
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ]
+
+        await engine.chat(messages)
+        assert "system_prefix_ids" not in engine._engine.generate.call_args.kwargs
+        await engine.chat(messages)
+        assert engine._engine.generate.call_args.kwargs["system_prefix_ids"] == [
+            ord(c) for c in "<system>sys<user>"
+        ]
+        await engine.chat(messages[1:])
+        assert "system_prefix_ids" not in engine._engine.generate.call_args.kwargs
+
 
 class _TemplateTokenizer:
     """Renders a readable prompt and encodes one id per character."""
@@ -1224,6 +1255,7 @@ class TestBatchedEnginePreparedPrompt:
         engine._tokenizer.encode.return_value = [11, 22, 33]
         # Generation-suffix probes render different, short prompts.
         engine._generation_prompt_text = MagicMock(return_value=("suffix", True))
+        engine._system_prefix_ids = MagicMock(return_value=None)
         engine._engine = FakeStreamingCore()
         engine._engine.generate = AsyncMock(
             return_value=TestBatchedEngineSpecPrefillForwarding._fake_output()

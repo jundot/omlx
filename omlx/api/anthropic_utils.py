@@ -465,8 +465,9 @@ def convert_anthropic_to_internal(
         ):
             msg["content"] = _strip_client_budget_markers(msg["content"])
 
-    from .utils import _merge_consecutive_roles
+    from .utils import _merge_consecutive_roles, _sort_tool_messages_by_call_order
 
+    processed_messages = _sort_tool_messages_by_call_order(processed_messages)
     messages = _merge_consecutive_roles(processed_messages)
 
     # A trailing assistant message is an Anthropic prefill: the model continues

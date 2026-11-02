@@ -88,9 +88,10 @@ class Model(nn.Module):
         offload = getattr(self, "_moe_offload_plan", None)
         if offload is not None:
             closers.append(offload.close)
-        prefetch = getattr(self.language_model, "_engram_prefetch", None)
-        if prefetch is not None:
-            closers.append(prefetch.close)
+        for name in ("_engram_prefetch", "_engram_next_prefetch"):
+            prefetch = getattr(self.language_model, name, None)
+            if prefetch is not None:
+                closers.append(prefetch.close)
         for layer in self.language_model.pipeline_layers:
             if "engram" in layer:
                 close = getattr(layer.engram.embed, "close", None)

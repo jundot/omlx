@@ -186,7 +186,8 @@ def test_block_prefix_cache_mtp_sidecar_uses_live_chain_hash_and_evicts(boundary
 
 
 def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
-    """MTP sidecars remain bounded and follow wholesale cache clears."""
+    """MTP sidecars remain bounded, a shared tail's sidecar does not take an
+    ordinary slot, and sidecars follow wholesale cache clears."""
     from omlx.cache.prefix_cache import BlockAwarePrefixCache
 
     class _HashMap:
@@ -197,18 +198,20 @@ def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
             return self.blocks.get(key)
 
     hash_map = _HashMap()
+    shared = set()
     cache = BlockAwarePrefixCache.__new__(BlockAwarePrefixCache)
     cache.block_size = 4
     cache.paged_cache = SimpleNamespace(
         model_name="tiny-mtp-lru-test",
         cached_block_hash_to_block=hash_map,
+        is_shared_tail=shared.__contains__,
     )
     cache._prefix_index = {}
     cache._mtp_prefix_snapshots = OrderedDict()
     cache._mtp_prefix_snapshot_lock = threading.RLock()
 
     entries = []
-    for branch in range(5):
+    for branch in range(6):
         tokens = [branch * 100 + i for i in range(8)]
         snapshot = object()
         assert cache.store_mtp_prefix_snapshot(tokens, 8, snapshot)
@@ -216,9 +219,12 @@ def test_block_prefix_cache_mtp_sidecar_lru_four_and_clear_lifecycle():
         assert tip is not None
         hash_map.blocks[tip] = object()
         entries.append((tokens, tip, snapshot))
+        if branch == 0:
+            shared.add(tip)
 
-    assert len(cache._mtp_prefix_snapshots) == 4
-    assert cache.restore_mtp_prefix_snapshot(entries[0][0], 8) is None
+    assert len(cache._mtp_prefix_snapshots) == 5
+    assert cache.restore_mtp_prefix_snapshot(entries[0][0], 8) is entries[0][2]
+    assert cache.restore_mtp_prefix_snapshot(entries[1][0], 8) is None
     assert cache.restore_mtp_prefix_snapshot(entries[-1][0], 8) is entries[-1][2]
 
     # Individual backbone eviction removes the matching sidecar even if a
@@ -310,6 +316,20 @@ def test_pooled_head_snapshot_publishes_and_restores_at_tail_boundary():
     assert restored and warm[1] == cold[1] == 21
     assert _pooled_state(warm[0]) == _pooled_state(cold[0])
     assert _pooled_state(snapshot.mtp_cache) == expected
+
+
+def test_pooled_head_publishes_off_grid_tail_before_a_later_boundary():
+    # A shared system-prefix tail (12) precedes block 16: both sidecars are
+    # published, and a request resumed at the tail primes like the cold run.
+    sidecar = _MemoryMtpPrefixCache()
+    _, cold = _pooled_run(sidecar, "cold", (12, 4, 4, 1), tail=12)
+    assert set(sidecar.snapshots) == {
+        sidecar._key(POOL_TOKENS, 12),
+        sidecar._key(POOL_TOKENS, 16),
+    }
+    restored, warm = _pooled_run(sidecar, "warm", (4, 4, 1), cached=12)
+    assert restored and warm[1] == cold[1]
+    assert _pooled_state(warm[0]) == _pooled_state(cold[0])
 
 
 def test_pooled_head_keeps_older_snapshot_when_newer_boundary_cannot_rewind():

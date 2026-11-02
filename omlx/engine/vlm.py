@@ -4736,6 +4736,7 @@ class VLMBatchedEngine(BaseEngine):
             "specprefill_system_end",
             "generation_prompt_text",
             "generation_prompt_persists",
+            "system_prefix_ids",
         ):
             if kwargs.get(key) is not None:
                 specprefill_kwargs[key] = kwargs.pop(key)
@@ -5132,6 +5133,11 @@ class VLMBatchedEngine(BaseEngine):
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(
+            messages, convert_tools_for_template(tools) if tools else None, ct_kwargs
+        )
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         return await self.generate(
             prompt=prompt,
@@ -5381,6 +5387,11 @@ class VLMBatchedEngine(BaseEngine):
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        system_prefix = self._system_prefix_ids(
+            messages, convert_tools_for_template(tools) if tools else None, ct_kwargs
+        )
+        if system_prefix:
+            kwargs["system_prefix_ids"] = system_prefix
 
         async for output in self.stream_generate(
             prompt=prompt,

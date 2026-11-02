@@ -589,7 +589,7 @@ private struct VoiceSection: View {
             Row(
                 label: AskAIScreenStrings.model,
                 sublabel: String(localized: "talkai.row.model.sub",
-                                 defaultValue: "Speech-to-speech models such as LFM3-Audio, LFM3-Omni and Qwen3-Omni.",
+                                 defaultValue: "Speech-to-speech models only (LFM3, Qwen3-Omni).",
                                  comment: "Sublabel for the Ask AI voice model picker")
             ) {
                 Popup(selection: $store.prefs.talk.model, width: .controlWide,

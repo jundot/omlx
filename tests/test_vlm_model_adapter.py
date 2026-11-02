@@ -1005,6 +1005,26 @@ def test_adapter_forwards_prefetch_ple_to_the_language_model():
     assert VLMModelAdapter(plain).ple_gathers_ahead() is False
 
 
+def test_adapter_forwards_prefetch_engram_to_the_language_model():
+    from unittest.mock import MagicMock
+
+    from omlx.models.vlm import VLMModelAdapter
+
+    vlm = MagicMock()
+    vlm.config.model_type = "deepseek_v41"
+    adapter = VLMModelAdapter(vlm)
+    next_ids, current_ids, cache = object(), object(), object()
+    adapter.prefetch_engram(next_ids, current_ids, cache=cache)
+    vlm.language_model.prefetch_engram.assert_called_once_with(
+        next_ids, current_ids, cache=cache
+    )
+    plain = MagicMock(spec=[])
+    plain.language_model = MagicMock(spec=[])
+    plain.config = MagicMock()
+    plain.config.model_type = "qwen3_5_moe"
+    VLMModelAdapter(plain).prefetch_engram(next_ids, current_ids, cache=cache)
+
+
 def test_ssd_cache_restore_binds_nested_vlm_caches_and_preserves_quantization():
     from types import SimpleNamespace
 

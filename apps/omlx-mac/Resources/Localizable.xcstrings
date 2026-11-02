@@ -36832,19 +36832,19 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Speech-to-speech models such as LFM3-Audio, LFM3-Omni and Qwen3-Omni."
+            "value" : "Speech-to-speech models only (LFM3, Qwen3-Omni)."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Модели речь-в-речь, например LFM3-Audio, LFM3-Omni и Qwen3-Omni."
+            "value" : "Только модели речь-в-речь (LFM3, Qwen3-Omni)."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "语音到语音模型，例如 LFM3-Audio、LFM3-Omni 和 Qwen3-Omni。"
+            "value" : "仅支持语音到语音模型（LFM3、Qwen3-Omni）。"
           }
         }
       }

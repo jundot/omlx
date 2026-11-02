@@ -825,6 +825,67 @@ def test_engram_gate_matches_official(expected):
     np.testing.assert_array_equal(actual[:, 1], h[:, 1])
 
 
+def test_prefill_engram_dedupe_matches_undeduped(monkeypatch):
+    from mlx.nn import Module
+
+    from omlx.patches.deepseek_v41 import engram as engram_mod
+    from omlx.patches.deepseek_v41.quantization import QuantizedProjection
+    from omlx.patches.deepseek_v41.storage import dedupe_tuple_ids
+
+    class RecordingWkv(Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+            self.seen = []
+
+        def __call__(self, x):
+            self.seen.append(tuple(x.shape))
+            return self.inner(x)
+
+    c = tiny(
+        dim=512,
+        engram_layer_ids=(1,),
+        engram_num_embeddings=(97,),
+        engram_vocab_size=5,
+        engram_max_ngram_size=4,
+        engram_n_heads=8,
+        engram_head_dim=256,
+        engram_compressed_vocab_size=64,
+    )
+    model = engram_mod.Engram(c, 0)
+    rng = np.random.default_rng(19)
+    model.embed.weight = mx.array(
+        rng.normal(0, 1, model.embed.weight.shape).astype(np.float32)
+    ).astype(mx.bfloat16)
+    weight = mx.array(
+        rng.normal(0, 0.02, model.wkv.weight.shape).astype(np.float32)
+    ).astype(mx.bfloat16)
+    packed, scales = mx.quantize(weight, group_size=32, bits=8, mode="mxfp8")[:2]
+    model.wkv = RecordingWkv(QuantizedProjection(packed, scales, 8, "mxfp8"))
+    ids = rng.integers(0, 97, (1, 32, 24), dtype=np.int32)
+    ids[0, 8:16] = ids[0, :8]
+    ids[0, 24:32] = ids[0, 16:24]
+    h = mx.array(rng.normal(0, 1, (1, 32, c.hc_mult, c.dim)).astype(np.float32))
+    mask = np.zeros((1, 32), dtype=bool)
+    mask[0, 1] = True
+
+    with monkeypatch.context() as m:
+        m.setattr(
+            engram_mod,
+            "dedupe_tuple_ids",
+            lambda values: (np.asarray(values, dtype=np.int64), None),
+        )
+        expected = model(h, ids, mx.array(mask))
+    actual = model(h, ids, mx.array(mask))
+    unique_ids, _ = dedupe_tuple_ids(ids)
+    assert unique_ids.shape[0] < 32
+    assert [shape[0] for shape in model.wkv.seen] == [1, unique_ids.shape[0]]
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), atol=2e-6, rtol=1e-5
+    )
+    np.testing.assert_array_equal(actual[:, 1], h[:, 1])
+
+
 async def _run_vlm_engine(tmp_path):
     import asyncio
 

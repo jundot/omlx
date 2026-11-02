@@ -243,6 +243,7 @@ def load(
             # Keep the GPU submission boundaries in both modes. Resident tables
             # are excluded by submit(), so RAM mode schedules no disk reads.
             model.language_model._engram_prefetch = EngramPrefetch()
+            model.language_model._engram_next_prefetch = EngramPrefetch()
         expected_shapes = {
             name: value.shape for name, value in tree_flatten(model.parameters())
         }

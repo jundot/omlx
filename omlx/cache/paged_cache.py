@@ -579,6 +579,8 @@ class PagedCacheManager(CacheManager):
         # Tail blocks by chain parent (None for a root). A tail is shorter
         # than a block, so the grid walk cannot derive its hash.
         self._tail_index: Dict[Optional[BlockHash], "OrderedDict[BlockHash, int]"] = {}
+        # Tails shared across conversations, capped apart from ordinary tails.
+        self._shared_tails: set[BlockHash] = set()
 
         logger.info(
             f"PagedCacheManager initialized: block_size={block_size}, "
@@ -1150,8 +1152,13 @@ class PagedCacheManager(CacheManager):
         parent_hash: Optional[BlockHash],
         tail_hash: BlockHash,
         token_count: int,
+        shared: bool = False,
     ) -> None:
-        """Index a tail block under its chain parent for later lookup."""
+        """Index a tail block under its chain parent for later lookup.
+
+        Shared tails have their own cap of half the slots, so one-off tails
+        neither evict them nor lose room to them.
+        """
         if token_count <= 0:
             return
         with self._lock:
@@ -1160,11 +1167,25 @@ class PagedCacheManager(CacheManager):
                 and len(self._tail_index) >= _TAIL_INDEX_MAX_PARENTS
             ):
                 self._tail_index.clear()
+                self._shared_tails.clear()
             tails = self._tail_index.setdefault(parent_hash, OrderedDict())
             tails.pop(tail_hash, None)
             tails[tail_hash] = token_count
+            if shared:
+                self._shared_tails.add(tail_hash)
             while len(tails) > _TAIL_INDEX_PER_PARENT:
-                tails.popitem(last=False)
+                shared = [h for h in tails if h in self._shared_tails]
+                if len(tails) - len(shared) > _TAIL_INDEX_PER_PARENT:
+                    victim = next(h for h in tails if h not in self._shared_tails)
+                elif len(shared) > _TAIL_INDEX_PER_PARENT // 2:
+                    victim = shared[0]
+                else:
+                    break
+                del tails[victim]
+                self._shared_tails.discard(victim)
+
+    def is_shared_tail(self, block_hash: Any) -> bool:
+        return block_hash in self._shared_tails
 
     def seed_tail_blocks(
         self, entries: Iterable[Tuple[Optional[BlockHash], BlockHash, int]]
@@ -1215,6 +1236,7 @@ class PagedCacheManager(CacheManager):
                 ssd = self._paged_ssd_cache_manager
                 if ssd is None or not ssd.has_block(tail_hash):
                     tails.pop(tail_hash, None)
+                    self._shared_tails.discard(tail_hash)
                     if not tails:
                         self._tail_index.pop(parent_hash, None)
                     continue
@@ -1482,6 +1504,7 @@ class PagedCacheManager(CacheManager):
 
             self.cached_block_hash_to_block.clear()
             self._tail_index.clear()
+            self._shared_tails.clear()
             if self.on_hash_map_cleared is not None:
                 self.on_hash_map_cleared()
             self.request_tables.clear()

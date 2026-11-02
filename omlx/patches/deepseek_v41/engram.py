@@ -9,6 +9,7 @@ import numpy as np
 
 from .gemv import mxfp8_gemv_each
 from .quantization import QuantizedProjection, quantize_activation
+from .storage import dedupe_tuple_ids
 
 
 def build_compressed_token_map(tokenizer) -> tuple[list[int], int]:
@@ -164,8 +165,10 @@ class Engram(nn.Module):
 
     def __call__(self, h, ids, image_mask=None):
         c = self._config
-        rows = self.embed(mx.array(ids)).flatten(-2)
-        count = rows.shape[0] * rows.shape[1] if rows.ndim == 3 else 1
+        ids_np = np.asarray(ids, dtype=np.int64)
+        ids_host, inverse = dedupe_tuple_ids(ids_np)
+        rows = self.embed(mx.array(ids_host)).flatten(-2)
+        count = math.prod(ids_np.shape[:-1]) if ids_np.ndim >= 2 else 1
         if 1 < count <= _ROWWISE_ROWS:
             # Decode-sized inputs (one token for each of B requests, or an MTP verify block
             # of one request): project each row on its own, exactly as a single-token
@@ -179,6 +182,8 @@ class Engram(nn.Module):
             kv = kv.reshape(*rows.shape[:2], -1)
         else:
             kv = self.wkv(rows)
+        if inverse is not None:
+            kv = kv[mx.array(inverse, dtype=mx.int32)]
         key, value = mx.split(kv, [c.dim * c.hc_mult], axis=-1)
         key = key.astype(mx.float32).reshape(*h.shape)
         x = h.astype(mx.float32)

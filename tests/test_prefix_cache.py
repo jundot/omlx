@@ -2129,10 +2129,11 @@ class TestArraysCacheLastBlockOnly:
         """Hybrid tails follow the same tip lineage as rotating models.
 
         The previous turn's tail stays as the edited-turn fallback; the tail
-        two turns back is deleted when the chain is extended again."""
+        two turns back is deleted when the chain is extended again. A shared
+        tail the conversation started from is never part of that lineage."""
         cache, paged_cache, _, config = self._tail_fixture(mx)
 
-        def turn(request_id, tokens):
+        def turn(request_id, tokens, **kwargs):
             n = len(tokens)
             boundary = (n // 4) * 4
             cache.fetch_cache(request_id, tokens)
@@ -2146,10 +2147,12 @@ class TestArraysCacheLastBlockOnly:
                     n: self._hybrid_state(mx, n, float(n)),
                 },
                 _store_tail_terminal=True,
+                **kwargs,
             )
             paged_cache.release_for_eviction(table.block_ids)
             return paged_cache.allocated_blocks[table.block_ids[-1]].block_hash
 
+        shared = turn("system", list(range(6)), _store_shared_tail=True)
         tail1 = turn("turn-1", list(range(7)))
         turn("turn-2", list(range(11)))
         assert paged_cache.cached_block_hash_to_block.get_block(tail1) is not None
@@ -2157,6 +2160,8 @@ class TestArraysCacheLastBlockOnly:
 
         assert paged_cache.cached_block_hash_to_block.get_block(tail1) is None
         assert tail1 not in cache._tail_hashes
+        assert paged_cache.cached_block_hash_to_block.get_block(shared) is not None
+        assert paged_cache.is_shared_tail(shared)
         assert paged_cache.cached_block_hash_to_block.get_block(tail3) is not None
         table, remaining = cache.fetch_cache(
             "turn-3-edited", list(range(11)) + [90, 91]
@@ -2164,7 +2169,8 @@ class TestArraysCacheLastBlockOnly:
         assert table.num_tokens == 11 and remaining == [90, 91]
 
     def test_store_cache_tail_dedup_reuses_existing_block(self, mx):
-        """An identical tail under the same parent is reused, not re-saved."""
+        """An identical tail under the same parent is reused, not re-saved, and
+        indexed again after it aged out of the tail index."""
         cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
         snapshots = {
             4: self._hybrid_state(mx, 4, 4.0),
@@ -2178,6 +2184,7 @@ class TestArraysCacheLastBlockOnly:
             boundary_snapshots=snapshots,
             _store_tail_terminal=True,
         )
+        paged_cache._tail_index.clear()
         second = cache.store_cache(
             "req-c",
             list(range(7)),
@@ -2192,6 +2199,8 @@ class TestArraysCacheLastBlockOnly:
         tail = paged_cache.allocated_blocks[second.block_ids[-1]]
         assert tail.ref_count == 2
         assert cache.get_stats().tail_blocks_stored == 1
+        parent = paged_cache.allocated_blocks[second.block_ids[0]].block_hash
+        assert tail.block_hash in paged_cache._tail_index[parent]
 
     def test_attaching_ssd_manager_seeds_tail_index(self):
         """Tails from earlier runs are indexed when the SSD tier is attached later."""

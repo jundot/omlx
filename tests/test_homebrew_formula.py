@@ -103,8 +103,12 @@ class TestSharedPipFlags:
             ' "--no-binary", no_binary]' in formula
         )
         assert "system(*pip_install, install_spec)" in formula
-        assert 'system(*pip_install, ".[all]")' in formula
-        assert 'system(*pip_install, "python-multipart>=0.0.5")' in formula
+
+    def test_audio_extra_is_the_only_mlx_audio_source(self, formula):
+        """spaCy for the model check comes only from omlx's [audio] extra, and a
+        separate mlx-audio resource pins a second revision that drifts (#4942)."""
+        assert '"#{buildpath}[audio,grammar]" : "#{buildpath}[audio]"' in formula
+        assert 'resource "mlx-audio"' not in formula
 
     def test_no_bare_pip_install_besides_spacy_wheel(self, formula):
         """The only direct pip invocation is the --no-deps local spaCy model

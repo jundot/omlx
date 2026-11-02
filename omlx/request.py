@@ -260,6 +260,10 @@ class Request:
     generation_prompt_start: int = 0  # Token index where the generation prompt starts
     generation_prompt_persists: bool = False  # History keeps the generation prompt
 
+    # Rendered leading system block; a shared tail snapshot ends where it does.
+    system_prefix_ids: Optional[List[int]] = None
+    system_prefix_end: int = 0  # Token index where the shared system prefix ends
+
     # Cache corruption recovery
     cache_corruption_retries: int = 0  # Per-request corruption retry counter
     generation_overflow_retries: int = 0  # Per-request __next_prime retry counter
