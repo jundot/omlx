@@ -6044,7 +6044,7 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Sichern"
+            "value" : "Speichern"
           }
         },
         "en" : {
@@ -28322,7 +28322,7 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Der SSD-Cache ist aus, weil dieses Verzeichnis beim Start des Servers nicht verfügbar war. Starte den Server nach dem erneuten Verbinden des Laufwerks neu."
+            "value" : "Der SSD-Cache ist aus, weil dieses Verzeichnis beim Start des Servers nicht verfügbar war. Starten Sie den Server nach dem erneuten Verbinden des Laufwerks neu."
           }
         },
         "en" : {
@@ -30676,7 +30676,7 @@
         "de" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Der Nutzungsverlauf ist aus. Aktiviere ihn in den Server-Einstellungen."
+            "value" : "Der Nutzungsverlauf ist aus. Aktivieren Sie ihn in den Server-Einstellungen."
           }
         },
         "en" : {
