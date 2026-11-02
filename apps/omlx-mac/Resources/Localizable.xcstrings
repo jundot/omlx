@@ -2066,6 +2066,12 @@
       "comment" : "About screen Credits row: role/description for the mlx-audio project",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Audio-Modelle (STT / TTS / STS) auf MLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2090,6 +2096,12 @@
       "comment" : "About screen Credits row: role/description for the mlx-embeddings project",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Embedding- und Reranker-Modelle auf MLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2114,6 +2126,12 @@
       "comment" : "About screen Credits row: role/description for the mlx-lm project",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausführung und Feinabstimmung von Sprachmodellen auf MLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2138,6 +2156,12 @@
       "comment" : "About screen Credits row: role/description for the mlx-vlm project",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vision-Sprachmodelle auf MLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2162,6 +2186,12 @@
       "comment" : "About screen Credits row: role/description for the MLX project",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apples Framework für Arrays: die Engine hinter jedem Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2186,6 +2216,12 @@
       "comment" : "Tagline shown under the oMLX product name on the About screen hero card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lokale KI, kein Warten mehr auf dem Mac"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2210,6 +2246,12 @@
       "comment" : "Version + build line on the About screen hero card; placeholders are the bundle short version string and bundle version",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Version %1$@ · Build %2$@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -2234,6 +2276,12 @@
       "comment" : "Name of the open-source license shown on the About screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apache License 2.0"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2258,6 +2306,12 @@
       "comment" : "Copyright + license notice paragraph on the About screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copyright © oMLX contributors. Licensed under the Apache License, Version 2.0. See the LICENSE file in the repository for the full text."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2282,6 +2336,12 @@
       "comment" : "About screen link row label pointing to product documentation",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dokumentation"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2306,6 +2366,12 @@
       "comment" : "Sublabel under the Documentation link on the About screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einrichtung, Modellverwaltung, Integrationen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2330,6 +2396,12 @@
       "comment" : "About screen link row label pointing to the oMLX GitHub repo",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GitHub-Repository"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2354,6 +2426,12 @@
       "comment" : "Sublabel under the GitHub Repository link on the About screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quellcode, Fehlerberichte und Roadmap"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2378,6 +2456,12 @@
       "comment" : "About screen link row label pointing to the GitHub new-issue form",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fehler melden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2402,6 +2486,12 @@
       "comment" : "Sublabel under the Report an Issue link on the About screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fehler und Funktionswünsche auf GitHub"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2426,6 +2516,12 @@
       "comment" : "About screen link row label pointing to GitHub releases",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Releases"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2450,6 +2546,12 @@
       "comment" : "Sublabel under the Releases link on the About screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die neueste CLI und macOS-App herunterladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2474,6 +2576,12 @@
       "comment" : "Section header above the credits list on the About screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Basiert auf"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2498,6 +2606,12 @@
       "comment" : "Section header above the license block on the About screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lizenz"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2522,6 +2636,12 @@
       "comment" : "Section header above the project links list on the About screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Projekt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
