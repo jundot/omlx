@@ -41593,6 +41593,12 @@
       "comment" : "Help text for the button that copies the AI replies of the conversation",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Antworten kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41617,6 +41623,12 @@
       "comment" : "Help text for the button that ends the Ask AI voice conversation",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41641,6 +41653,12 @@
       "comment" : "Help text for the Ask AI voice mute button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stummschalten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41665,6 +41683,12 @@
       "comment" : "Button in the Ask AI voice panel that opens the relevant settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41689,6 +41713,12 @@
       "comment" : "Help text for the voice card button that sends a screenshot with each turn",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bildschirm teilen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41713,6 +41743,12 @@
       "comment" : "Help text for the voice card button while the screen is being shared",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Teilen beenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41737,6 +41773,12 @@
       "comment" : "Help text for the button that switches from the voice card to the Ask AI text bar",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stattdessen tippen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41761,6 +41803,12 @@
       "comment" : "Help text for the Ask AI voice unmute button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ton einschalten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41785,6 +41833,12 @@
       "comment" : "Shown in the Ask AI voice panel when the audio engine fails to start",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mikrofon oder Lautsprecher konnten nicht gestartet werden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41809,6 +41863,12 @@
       "comment" : "Shown in the Ask AI voice panel when the realtime connection closes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Verbindung zum Server ist verloren gegangen. Prüfen, ob er läuft."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41833,6 +41893,12 @@
       "comment" : "Shown in the Ask AI voice panel when microphone access is denied",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX kann das Mikrofon nicht verwenden. In den Systemeinstellungen einschalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41857,6 +41923,12 @@
       "comment" : "Shown in the Ask AI voice panel when the Mac has no audio input device",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kein Mikrofon gefunden. Mikrofon oder Headset anschließen und erneut versuchen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41881,6 +41953,12 @@
       "comment" : "Shown in the Ask AI voice panel when no model is selected",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein Sprachmodell in den Einstellungen von Ask AI auswählen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41905,6 +41983,12 @@
       "comment" : "Button that asks macOS for microphone access",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fortfahren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41929,6 +42013,12 @@
       "comment" : "Button that closes the microphone permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Später"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41953,6 +42043,12 @@
       "comment" : "Button that opens the macOS microphone privacy settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Systemeinstellungen öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41977,6 +42073,12 @@
       "comment" : "First step of the microphone permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf „Fortfahren“ klicken und dann „Erlauben“ wählen, wenn macOS nach dem Mikrofonzugriff fragt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42001,6 +42103,12 @@
       "comment" : "Second step of the microphone permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wenn der Zugriff zuvor abgelehnt wurde, Systemeinstellungen > Datenschutz & Sicherheit > Mikrofon öffnen und oMLX einschalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42025,6 +42133,12 @@
       "comment" : "Third step of the microphone permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Unten ein Sprachmodell auswählen, dann das Tastenkürzel drücken und sprechen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42049,6 +42163,12 @@
       "comment" : "Title of the Ask AI voice microphone permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zugriff auf das Mikrofon erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42073,6 +42193,12 @@
       "comment" : "Shown when the Ask AI voice hotkey cannot be registered; the argument is the shortcut",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ wird bereits von macOS, Ask AI oder einer anderen App verwendet. Eine andere Tastenkombination wählen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42097,6 +42223,12 @@
       "comment" : "Button that opens the microphone permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erlauben…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42121,6 +42253,12 @@
       "comment" : "Warning shown while oMLX has no microphone access",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Mikrofonzugriff ist aus, deshalb kann Ask AI nichts hören."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42145,6 +42283,12 @@
       "comment" : "Warning shown when no installed model can hold a voice conversation",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kein Sprachmodell installiert. „Per Stimme fragen“ braucht ein Speech-to-Speech-Modell wie LFM3-Audio, LFM3-Omni oder Qwen3-Omni."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42169,6 +42313,12 @@
       "comment" : "Button that opens the Downloads screen to get a voice model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloads öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42193,6 +42343,12 @@
       "comment" : "Key cap label in the Ask AI voice orb while the user speaks",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leertaste"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42217,6 +42373,12 @@
       "comment" : "Shown under the Space key cap: pressing Space sends the user's turn",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "zum Senden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42241,6 +42403,12 @@
       "comment" : "Label above the prompt used with every voice model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allgemeiner Prompt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42265,6 +42433,12 @@
       "comment" : "Explains the voice general prompt",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird bei jedem Sprachmodell verwendet, nach dem Modell-Prompt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42289,6 +42463,12 @@
       "comment" : "Label above the prompt used only with the selected voice model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell-Prompt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42313,6 +42493,12 @@
       "comment" : "Placeholder for the voice model prompt when the model has no default",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optional. Dieses Modell hat keinen empfohlenen Prompt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42337,6 +42523,12 @@
       "comment" : "Explains the voice model prompt; the argument is the model name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird nur mit %@ verwendet, vor dem allgemeinen Prompt. Auf Standard zurücksetzen stellt den empfohlenen Prompt des Modells wieder her."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42361,6 +42553,12 @@
       "comment" : "Placeholder for the Ask AI voice system prompt",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optional. Zum Beispiel: Antworten kurz und freundlich halten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42385,6 +42583,12 @@
       "comment" : "Row label for the switch that enables asking Ask AI by voice",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sprachmodus aktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42409,6 +42613,12 @@
       "comment" : "Sublabel for the Ask AI voice switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus jeder App heraus per globalem Tastenkürzel mit einem Sprachmodell sprechen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42433,6 +42643,12 @@
       "comment" : "Sublabel for the Ask AI voice GPU power limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Begrenzt die GPU-Leistung für den ganzen Mac während einer Sprachunterhaltung (2 bis 1000 W). Niedrige Limits können dazu führen, dass Antworten verzögert starten oder stocken. Hat das Modell ebenfalls ein Limit, gilt das niedrigere."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42457,6 +42673,12 @@
       "comment" : "Row label for the Ask AI voice global shortcut",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tastenkürzel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42481,6 +42703,12 @@
       "comment" : "Sublabel for the Ask AI voice global shortcut",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erneut drücken oder Esc beendet die Unterhaltung. Leertaste schließt den eigenen Redebeitrag ab."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42505,6 +42733,12 @@
       "comment" : "Sublabel for the Ask AI voice model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur Speech-to-Speech-Modelle (LFM3, Qwen3-Omni)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42529,6 +42763,12 @@
       "comment" : "Row label for the Ask AI voice reply playback speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sprechgeschwindigkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42553,6 +42793,12 @@
       "comment" : "Sublabel for the Ask AI voice reply playback speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Spielt Antworten schneller oder langsamer ab, ohne die Tonhöhe zu verändern."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42577,6 +42823,12 @@
       "comment" : "Row label for the Ask AI voice voice picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stimme"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42601,6 +42853,12 @@
       "comment" : "Section header for the Ask AI voice conversation settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Per Stimme fragen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42625,6 +42883,12 @@
       "comment" : "Subtitle for the Ask AI voice settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jederzeit zu sprechen unterbricht die Antwort."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42649,6 +42913,12 @@
       "comment" : "Shown in the voice card when screen sharing needs the screen recording permission",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX unter Systemeinstellungen > Bildschirm- & Systemaudioaufnahme erlauben und dann oMLX neu starten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42673,6 +42943,12 @@
       "comment" : "Ask AI voice status while the voice session starts",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verbinden…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42697,6 +42973,12 @@
       "comment" : "Ask AI voice status when the session cannot continue",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sprechen derzeit nicht möglich"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42721,6 +43003,12 @@
       "comment" : "Ask AI voice status while waiting for or hearing the user",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hört zu"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42745,6 +43033,12 @@
       "comment" : "Ask AI voice status while the microphone is muted",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stumm"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42769,6 +43063,12 @@
       "comment" : "Ask AI voice status while the reply plays",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Spricht"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42793,6 +43093,12 @@
       "comment" : "Ask AI voice status after the user's turn, before the reply plays",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Denkt nach"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42817,6 +43123,12 @@
       "comment" : "Hint under the voice settings when the selected model has no tool calling",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Sprachmodell kann keine Tools aufrufen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -42841,6 +43153,12 @@
       "comment" : "Voice picker option that uses the model's default voice",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
