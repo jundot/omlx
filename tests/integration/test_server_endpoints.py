@@ -882,6 +882,71 @@ class TestResponsesEndpoint:
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
 
+    def test_harmony_tool_turn_keeps_content_or_reasoning(self, tmp_path):
+        from omlx.server import app, _server_state
+
+        engine = RecordingResponsesEngine(outputs=[MockGenerationOutput(text="Done.")])
+        pool = MockEnginePool(llm_engine=engine)
+
+        def tool_turn(call_id, reasoning, text=None):
+            summary = [{"type": "summary_text", "text": reasoning}]
+            items = [{"type": "reasoning", "summary": summary}]
+            if text:
+                content = [{"type": "output_text", "text": text}]
+                items.append(
+                    {"type": "message", "role": "assistant", "content": content}
+                )
+            items.append(
+                {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "f",
+                    "arguments": "{}",
+                }
+            )
+            items.append(
+                {"type": "function_call_output", "call_id": call_id, "output": "ok"}
+            )
+            return items
+
+        original_pool = _server_state.engine_pool
+        original_default = _server_state.default_model
+        original_store = _server_state.responses_store
+        try:
+            _server_state.engine_pool = pool
+            _server_state.default_model = "test-model"
+            _server_state.responses_store = ResponseStore(
+                state_dir=tmp_path / "response-state"
+            )
+            client = TestClient(app)
+
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "test-model",
+                    "input": [
+                        {"type": "message", "role": "user", "content": "List."},
+                        *tool_turn("call_1", "First call."),
+                        *tool_turn("call_2", "Second call.", text="Let me check."),
+                    ],
+                },
+            )
+            assert response.status_code == 200
+
+            tool_turns = [
+                msg
+                for msg in engine.recorded_messages[-1]
+                if msg.get("role") == "assistant" and msg.get("tool_calls")
+            ]
+            assert len(tool_turns) == 2
+            assert tool_turns[0]["reasoning_content"] == "First call."
+            assert tool_turns[1]["content"] == "Let me check."
+            assert "reasoning_content" not in tool_turns[1]
+        finally:
+            _server_state.engine_pool = original_pool
+            _server_state.default_model = original_default
+            _server_state.responses_store = original_store
+
 
 class TestModelsStatusEndpoint:
     """Tests for the /v1/models/status endpoint."""
