@@ -461,7 +461,16 @@ def convert_anthropic_to_internal(
     from .utils import _merge_consecutive_roles, _sort_tool_messages_by_call_order
 
     processed_messages = _sort_tool_messages_by_call_order(processed_messages)
-    return _merge_consecutive_roles(processed_messages)
+    messages = _merge_consecutive_roles(processed_messages)
+    # A trailing assistant text turn is an Anthropic prefill.
+    last = messages[-1] if messages else {}
+    if (
+        last.get("role") == "assistant"
+        and last.get("content")
+        and not last.get(_PRESERVE_ROLE_BOUNDARY)
+    ):
+        last["partial"] = True
+    return messages
 
 
 def convert_anthropic_to_internal_harmony(
