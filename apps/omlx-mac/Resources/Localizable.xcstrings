@@ -8955,6 +8955,12 @@
       "comment" : "Empty-state text shown inside the log pane when the server has no log entries",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Protokolleinträge."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8979,6 +8985,12 @@
       "comment" : "Popup label for the active server log file in the Logs screen file selector",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "server.log (aktuell)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9003,6 +9015,12 @@
       "comment" : "Popup option to show the most recent 100 log lines",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Letzte 100"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9027,6 +9045,12 @@
       "comment" : "Popup option to show the most recent 500 log lines",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Letzte 500"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9051,6 +9075,12 @@
       "comment" : "Popup option to show the most recent 1,000 log lines",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Letzte 1.000"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9075,6 +9105,12 @@
       "comment" : "Popup option to show the most recent 5,000 log lines",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Letzte 5.000"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9099,6 +9135,12 @@
       "comment" : "Popup option to show the most recent 20,000 log lines",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Letzte 20.000"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9123,6 +9165,12 @@
       "comment" : "Row label for the log file selector popup on the Logs screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Protokolldatei"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9147,6 +9195,12 @@
       "comment" : "Section header above the log tail pane on the Logs screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server-Protokolle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9171,6 +9225,12 @@
       "comment" : "Section header subtitle on the Logs screen; placeholder is the total number of log lines",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zeilen: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -9195,6 +9255,12 @@
       "comment" : "Button on a memory-guard log row that opens the Performance settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "memory_guard_tier erhöhen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9219,6 +9285,12 @@
       "comment" : "Button on a memory-guard log row that opens the Server settings with the default context window",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kontext verkleinern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9243,6 +9315,12 @@
       "comment" : "Logs table column header: log level",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stufe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9267,6 +9345,12 @@
       "comment" : "Logs table column header: the log message",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nachricht"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9291,6 +9375,12 @@
       "comment" : "Logs table column header: the logger name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modul"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9315,6 +9405,12 @@
       "comment" : "Logs table column header: when the line was written",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9339,6 +9435,12 @@
       "comment" : "Button that closes the log record detail card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schließen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9363,6 +9465,12 @@
       "comment" : "Heading above the list of times a repeated log line appeared; the placeholder is how many times",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vorkommen (%lld)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9387,6 +9495,12 @@
       "comment" : "Line under the occurrence list when the list is capped; the placeholder is how many occurrences are not listed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "…und %lld weitere"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9411,6 +9525,12 @@
       "comment" : "Accessibility label of the handle that resizes the log detail card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Höhe der Detailansicht ändern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9429,6 +9549,12 @@
       "comment" : "Title of the card that shows one log record in full",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eintrag"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9453,6 +9579,12 @@
       "comment" : "Empty-state text shown when the level filter hides every log line",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Zeilen auf dieser Stufe. Senken Sie die Filterstufe, um mehr anzuzeigen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9477,6 +9609,12 @@
       "comment" : "Chip label on a memory-guard log row: the memory ceiling",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Obergrenze"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9501,6 +9639,12 @@
       "comment" : "Chip label on a memory-guard log row: the predicted prefill peak",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vorhergesagte Spitze"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9525,6 +9669,12 @@
       "comment" : "Chip label on a memory-guard log row: process memory in use",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nutzung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9549,6 +9699,12 @@
       "comment" : "Chip label on a memory-guard log row: the abort threshold",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Harte Schwelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9573,6 +9729,12 @@
       "comment" : "Row label for the switch that follows the newest log line",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto-Scroll"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9597,6 +9759,12 @@
       "comment" : "Tooltip on a log row whose header line is above the fetched window",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Ausschnitt beginnt innerhalb dieses Eintrags"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9621,6 +9789,12 @@
       "comment" : "Tooltip on the log level filter explaining what it does",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Filtert nur diese Ansicht. Die Stufe, die die Protokolldatei speichert, bleibt unverändert."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9645,6 +9819,12 @@
       "comment" : "Row label for the segmented level filter on the Logs screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mindeststufe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9669,6 +9849,12 @@
       "comment" : "Row label for the control that switches the Logs screen between the table and the raw text",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ansicht"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9693,6 +9879,12 @@
       "comment" : "Logs screen view option: the log text as the server sent it",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rohtext"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9717,6 +9909,12 @@
       "comment" : "Logs screen view option: one row per log record",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tabelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
