@@ -38,11 +38,11 @@ def _cos_sin(c, compressed, start):
 
 
 @lru_cache(maxsize=None)
-def _window_idx(window, start, old_len):
-    """Attention.__call__ window indices for one query at `start` (host-side, cached)."""
-    local = start - window + 1 + np.arange(window)
-    valid = (local >= max(0, start - old_len)) & (local <= start)
-    return mx.array(np.where(valid, local - (start - old_len), -1).astype(np.int32)[None, None])
+def _window_idx(window, old_len):
+    """Attention.__call__ window indices for one query after old_len window rows (host-side,
+    cached). They do not depend on the position, so the cache holds at most window + 1 arrays."""
+    idx = old_len - window + 1 + np.arange(window)
+    return mx.array(np.where(idx >= 0, idx, -1).astype(np.int32)[None, None])
 
 
 @lru_cache(maxsize=None)
@@ -367,7 +367,7 @@ def attention_core(att, x, qr, q, packed, cache, shared, start, cos, sin, c):
     old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
     kv = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
     cache[1] = kv[:, -c.window_size:]
-    idx = _window_idx(c.window_size, start, old_len)
+    idx = _window_idx(c.window_size, old_len)
     pooled, ci = compress_index(att, x, qr, cache, shared, start, c)
     return split_attention(q.reshape(-1), kv, pooled, idx, ci, att.attn_sink, cos, sin, c)
 

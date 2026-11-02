@@ -132,6 +132,7 @@ def shared_build():
 def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles):
     model = verify_exact(build(fmt=fmt)) if tiles else build(fmt=fmt)
     c = model._config
+    decode_fused._window_idx.cache_clear()
     assert all(decode_fused.supported(layer, c) for layer in model.layers)
     calls = {"fused": 0}
     real = decode_fused.decode_block
@@ -172,6 +173,8 @@ def test_fused_decode_matches_unfused_block(monkeypatch, fmt, tiles):
             mx.eval(model(mx.array([[token]]), cache=cache))
         assert not unfused
     assert calls["fused"] == 6 * c.n_layers
+    # Full-window steps at six positions share one cached window index array.
+    assert decode_fused._window_idx.cache_info().currsize == 1
     # Free-order rounding moves a layer's output by up to ~2.5% of its largest value (2-8 bit
     # affine maps); a wrong layout or kernel selection gives O(1) errors.
     assert worst < 0.05, worst
