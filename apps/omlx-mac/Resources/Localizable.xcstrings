@@ -12331,6 +12331,12 @@
       "comment" : "Apply button at the bottom of the Performance screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übernehmen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12355,6 +12361,12 @@
       "comment" : "Row label for the master cache enable toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cache aktiviert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12379,6 +12391,12 @@
       "comment" : "Sublabel for the master cache enable toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hauptschalter für das KV-Cache-Subsystem der Engine."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12403,6 +12421,12 @@
       "comment" : "Row label for the hot cache only toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur Hot-Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12427,6 +12451,12 @@
       "comment" : "Sublabel for hot cache only toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Überspringt die Auslagerung auf die SSD. Nützlich auf schnellen Rechnern mit reichlich Arbeitsspeicher."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12451,6 +12481,12 @@
       "comment" : "Row label for the hot cache size field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hot-Cache-Größe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12475,6 +12511,12 @@
       "comment" : "Sublabel describing accepted hot cache size values",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Obergrenze im Arbeitsspeicher für den Hot-Cache. „0“ deaktiviert, „8GB“ wird akzeptiert."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12499,6 +12541,12 @@
       "comment" : "Row label for the initial cache blocks field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anfängliche Cache-Blöcke"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12523,6 +12571,12 @@
       "comment" : "Sublabel for the initial cache blocks field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beim Serverstart vorab reservierte Cache-Blöcke. Die Änderung wird erst nach einem Neustart des Servers wirksam."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12547,6 +12601,12 @@
       "comment" : "Row label for the SSD cache directory field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD-Cache-Verzeichnis"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12571,6 +12631,12 @@
       "comment" : "Sublabel for the SSD cache directory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ablageort der auf die SSD ausgelagerten Blöcke. Leer = base_path/cache."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12595,6 +12661,12 @@
       "comment" : "Warning under the SSD cache directory when it was unavailable at server start",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beim Serverstart nicht verfügbar. Der SSD-Cache bleibt bis zum nächsten Serverneustart deaktiviert."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12619,6 +12691,12 @@
       "comment" : "Row label for the SSD cache size field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD-Cache-Größe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12643,6 +12721,12 @@
       "comment" : "Sublabel describing accepted SSD cache size values",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Obergrenze für die Auslagerung auf die SSD. „auto“ = 50 % der Summe aus freiem Speicherplatz und vorhandenem SSD-Cache."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12667,6 +12751,12 @@
       "comment" : "Performance screen error when custom memory guard ceiling is invalid",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die benutzerdefinierte Obergrenze muss größer als 0 GB sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -12691,6 +12781,12 @@
       "comment" : "Performance screen error when embedding batch size input is invalid",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Embedding-Batchgröße muss eine positive ganze Zahl sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12715,6 +12811,12 @@
       "comment" : "Performance screen error when idle timeout input is below 60 seconds",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Inaktivitäts-Timeout muss ≥ 60 Sekunden betragen (oder leer/0 zum Deaktivieren)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12739,6 +12841,12 @@
       "comment" : "Performance screen error when initial cache blocks input is invalid",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anzahl der anfänglichen Cache-Blöcke muss eine positive ganze Zahl sein (oder leer)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12763,6 +12871,12 @@
       "comment" : "Performance screen error when max concurrent input is invalid",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die maximale Anzahl gleichzeitiger Anfragen muss eine positive ganze Zahl sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12787,6 +12901,12 @@
       "comment" : "Row label for memory guard custom ceiling",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benutzerdefinierte Obergrenze"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -12811,6 +12931,12 @@
       "comment" : "Placeholder for custom memory guard ceiling",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GB"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -12835,6 +12961,12 @@
       "comment" : "Sublabel for memory guard custom ceiling",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Feste Obergrenze für den Arbeitsspeicher des Prozesses in GB. Gilt nur mit der Stufe „Benutzerdefiniert“."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -12859,6 +12991,12 @@
       "comment" : "Row label for memory guard tier popup",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speicherschutzstufe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -12883,6 +13021,12 @@
       "comment" : "Memory guard tier option: aggressive",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aggressiv"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -12907,6 +13051,12 @@
       "comment" : "Description for aggressive memory guard tier",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lässt nur 2 % des Arbeitsspeichers (1,5–4 GB) für macOS übrig und komprimiert gegebenenfalls den Speicher anderer Apps, damit oMLX nahezu den gesamten Arbeitsspeicher nutzen kann."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -12931,6 +13081,12 @@
       "comment" : "Memory guard tier option: balanced",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgewogen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -12955,6 +13111,12 @@
       "comment" : "Description for balanced memory guard tier",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hält während des Betriebs von oMLX etwa 8 % des Arbeitsspeichers (3–8 GB) für alltägliche Apps frei."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -12979,6 +13141,12 @@
       "comment" : "Memory guard tier option: custom",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benutzerdefiniert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -13003,6 +13171,12 @@
       "comment" : "Description for custom memory guard tier",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verwendet eine feste Obergrenze in GB statt der adaptiven Berechnung der Stufe."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -13027,6 +13201,12 @@
       "comment" : "Memory guard tier option: safe",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -13051,6 +13231,12 @@
       "comment" : "Description for safe memory guard tier",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hält etwa 20 % des Arbeitsspeichers (6–16 GB) frei, damit auch aufwendigere Apps neben oMLX laufen können."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -13075,6 +13261,12 @@
       "comment" : "Row label for idle timeout field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inaktivitäts-Timeout"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13099,6 +13291,12 @@
       "comment" : "Placeholder text for the idle timeout field when disabled",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "aus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13123,6 +13321,12 @@
       "comment" : "Sublabel for idle timeout",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Serverweites automatisches Entladen nach N Sekunden Inaktivität. Leer oder 0 = deaktiviert. Mindestens 60 Sekunden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13147,6 +13351,12 @@
       "comment" : "Row label for the max model memory field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximaler Modellspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13171,6 +13381,12 @@
       "comment" : "Sublabel for max model memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Obergrenze für den Modellpool der Engine. Modelle darüber werden nicht automatisch geladen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13195,6 +13411,12 @@
       "comment" : "Row label for the max process memory field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximaler Prozessspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13219,6 +13441,12 @@
       "comment" : "Sublabel for max process memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Obergrenze für den gesamten Arbeitsspeicher, den der Serverprozess belegt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13243,6 +13471,12 @@
       "comment" : "Row label for model fallback toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ersatzmodell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13267,6 +13501,12 @@
       "comment" : "Sublabel for model fallback toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ist das angefragte Modell nicht geladen, wird die Anfrage an ein beliebiges geladenes Modell geleitet statt mit 404 beantwortet."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13291,6 +13531,12 @@
       "comment" : "Memory field placeholder meaning automatic",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "auto"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13315,6 +13561,12 @@
       "comment" : "Row label for prefill memory guard toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill-Speicherschutz"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13339,6 +13591,12 @@
       "comment" : "Sublabel for prefill memory guard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prüft den Prefill-Arbeitsspeicher vorab, bevor die Engine anläuft. Verwirft Anfragen, die den Arbeitsspeicher überlasten würden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13363,6 +13621,12 @@
       "comment" : "Row label for the prefill priority segmented control",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill-Priorität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13381,6 +13645,12 @@
       "comment" : "Sublabel for the prefill priority segmented control",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "„Maximaler Kontext“ ermöglicht bei Speicherdruck größere Prompts auf Kosten der Prefill-Geschwindigkeit. „Geschwindigkeit“ behält die volle Prefill-Geschwindigkeit bei und lehnt Prompts ab, die nicht in den Speicher passen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13447,6 +13717,12 @@
       "comment" : "Row label for chunked prefill toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abschnittsweiser Prefill"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13471,6 +13747,12 @@
       "comment" : "Sublabel for chunked prefill toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Teilt lange Prompts auf mehrere Scheduler-Schritte auf, damit sich andere Anfragen dazwischenschieben können."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13495,6 +13777,12 @@
       "comment" : "Row label for embedding batch size",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Embedding-Batchgröße"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13519,6 +13807,12 @@
       "comment" : "Sublabel for embedding batch size",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale Anzahl an Eingabetexten pro Embedding-Durchlauf."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13543,6 +13837,12 @@
       "comment" : "Row label for max concurrent requests",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximale gleichzeitige Anfragen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13567,6 +13867,12 @@
       "comment" : "Sublabel for max concurrent requests",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Obergrenze für gleichzeitige /v1-Anfragen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13591,6 +13897,12 @@
       "comment" : "Section header for KV cache settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13615,6 +13927,12 @@
       "comment" : "Subtitle for the Cache section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auslagerung des KV-Cache. Der Hauptschalter steuert alle Einstellungen darunter."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13639,6 +13957,12 @@
       "comment" : "Section header for memory and lifecycle settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher & Lebenszyklus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13663,6 +13987,12 @@
       "comment" : "Subtitle explaining accepted memory limit values",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Obergrenzen und Verhalten beim automatischen Entladen. Speicherlimits akzeptieren „auto“, „disabled“, „24GB“ oder „50%“."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13687,6 +14017,12 @@
       "comment" : "Section header for the scheduler rows",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Scheduler"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -13711,6 +14047,12 @@
       "comment" : "Subtitle for the Scheduler section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wie viele Anfragen gleichzeitig laufen und wie die Engine sie bündelt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
