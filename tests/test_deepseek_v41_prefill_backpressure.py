@@ -32,57 +32,58 @@ from omlx.patches.deepseek_v41 import apply_patch
 from omlx.patches.deepseek_v41.config import ModelConfig
 from omlx.scheduler import Scheduler
 
+_TEST_CACHE_LIMIT = 3 << 20
+
+
+def _current_cache_limit():
+    previous = mx.set_cache_limit(0)
+    mx.set_cache_limit(previous)
+    return previous
+
 
 def test_v41_prefill_evals_stream_per_layer(monkeypatch):
-    """CPU enqueues a 2048-token chunk in ~1s while the GPU needs ~15s; with
-    the 40-layer loop fully lazy every intermediate (fp32 hyper-connection
-    streams over hc_mult=4, gathered sparse-attention loads, MoE routes)
-    stays pinned until the final logits eval and the pool hoards every size
-    class — the measured +14.5GB/chunk flat sawtooth. The loop must eval the
-    running (h, pre) stream per layer during prefill and clear the allocator
-    pool at the same boundaries; decode widths stay lazy for latency."""
+    """A lazy 40-layer prefill loop pins every intermediate until the logits
+    eval (the measured +14.5GB/chunk sawtooth). Prefill must eval the stream
+    per layer under one bounded pool, without a per-layer clear; narrower
+    calls stay lazy and leave the limit alone."""
     model = v41_lang.LanguageModel(tiny())
     n_layers = model._config.n_layers
+    before = _current_cache_limit()
+    events = {"evals": 0, "clears": 0, "limits": []}
+    real_eval, real_clear, real_limit = mx.eval, mx.clear_cache, mx.set_cache_limit
 
-    calls = []
-    clears = []
-    real_eval = mx.eval
-    real_clear = mx.clear_cache
-
-    def spy(*args, **kw):
-        calls.append(sum(len(a) if isinstance(a, (tuple, list)) else 1 for a in args))
+    def eval_spy(*args, **kw):
+        events["evals"] += 1
         return real_eval(*args, **kw)
 
-    def clear_spy(**kw):
-        clears.append(1)
-        return real_clear(**kw)
+    def clear_spy(*args, **kw):
+        events["clears"] += 1
+        return real_clear(*args, **kw)
 
-    monkeypatch.setattr(v41_lang.mx, "eval", spy)
+    def limit_spy(limit):
+        events["limits"].append(limit)
+        return real_limit(limit)
+
+    monkeypatch.setattr(v41_lang.mx, "eval", eval_spy)
     monkeypatch.setattr(v41_lang.mx, "clear_cache", clear_spy)
+    monkeypatch.setattr(v41_lang.mx, "set_cache_limit", limit_spy)
+    monkeypatch.setattr(v41_lang, "_prefill_cache_limit", lambda: _TEST_CACHE_LIMIT)
 
-    ids = mx.zeros((1, 300), dtype=mx.int32)  # >= 256 prefill gate width
-    out = model(ids)
-    real_eval(out)
-    assert len(calls) >= n_layers, (
-        f"prefill width must eval the stream per layer, got {len(calls)} eval"
-        f" calls for {n_layers} layers"
+    real_eval(model(mx.zeros((1, 300), dtype=mx.int32)))  # >= 256 prefill gate
+    assert events["evals"] >= n_layers, (
+        f"prefill width must eval the stream per layer, got {events['evals']}"
+        f" eval calls for {n_layers} layers"
     )
-    # The allocator caches freed buffers per size class and v41 widths vary
-    # (compress-ratio switches, CED tail, 2047/2048 chunk widths), so the
-    # pool grows monotonically through a chunk unless cleared at the eval
-    # boundaries.
-    assert len(clears) >= n_layers, (
-        f"prefill must clear the allocator pool per layer, got {len(clears)}"
-        f" clears for {n_layers} layers"
-    )
+    assert events["clears"] == 0, "prefill must not clear the pool per layer"
+    assert events["limits"] == [_TEST_CACHE_LIMIT, before]
+    assert _current_cache_limit() == before
 
-    calls.clear()
-    clears.clear()
-    decode = mx.zeros((1, 1), dtype=mx.int32)
-    out = model(decode, cache=model.make_cache())
-    real_eval(out)
-    assert len(calls) < n_layers, "decode width must stay lazy (no per-layer eval)"
-    assert not clears, "decode width must not clear the pool per layer"
+    events.update(evals=0, limits=[])
+    narrow = mx.zeros((1, 255), dtype=mx.int32)
+    real_eval(model(narrow, cache=model.make_cache()))
+    assert events["evals"] < n_layers, "narrow width must stay lazy"
+    assert events["clears"] == 0
+    assert events["limits"] == []
 
 
 def test_apply_patch_replaces_foreign_vendor_alias_and_warns(caplog):
