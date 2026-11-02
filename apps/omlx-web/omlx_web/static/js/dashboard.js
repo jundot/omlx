@@ -4824,11 +4824,13 @@
 
             get activeModelsPressureBarColor() {
                 const pct = this.activeModelsPressurePercent;
-                if (pct >= 90) return 'rgb(var(--palette-red-500))';
-                if (pct >= 80) return 'rgb(var(--palette-orange-500))';
-                if (pct >= 70) return 'rgb(var(--palette-amber-500))';
-                if (pct >= 60) return 'rgb(var(--palette-yellow-400))';
-                return 'rgb(var(--palette-green-500))';
+                if (pct >= 90) return 'var(--danger)';
+                // The in-between steps keep their palette hues unless a custom theme
+                // blends its own roles (custom_theme.js sets --meter-high/--meter-mid).
+                if (pct >= 80) return 'var(--meter-high, rgb(var(--palette-orange-500)))';
+                if (pct >= 70) return 'var(--warning)';
+                if (pct >= 60) return 'var(--meter-mid, rgb(var(--palette-yellow-400)))';
+                return 'var(--success)';
             },
 
             get activeModelsPressureBarStyle() {

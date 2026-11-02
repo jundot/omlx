@@ -7,7 +7,7 @@ These rules cover the web UI in `apps/omlx-web/omlx_web`. Colors and type steps 
 The palette and the light semantic colors are defined in `apps/omlx-web/omlx_web/static/css/theme.css`, which `base.html` loads before `tailwind.css`; `dashboard.css` supplies the dark values of the neutral utility channels.
 
 - Palette entries are named `--palette-<family>-<step>` and hold `R G B` channels, so both `rgb(var(--palette-blue-500))` and `rgb(var(--palette-blue-500) / 0.2)` work.
-- Semantic tokens name a role and point at the palette: `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--text-primary` ... `--text-muted`, `--border-faint`, `--border-normal`, `--code-bg`, `--link-color`, `--btn-primary*`, `--text-danger`, `--bg-danger-hover`, `--timeline-accent`, `--focus-ring-color`.
+- Semantic tokens name a role and point at the palette: `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--text-primary` ... `--text-muted`, `--border-faint`, `--border-normal`, `--code-bg`, `--link-color`, `--btn-primary*`, `--switch-on`, `--text-danger`, `--bg-danger-hover`, `--timeline-accent`, `--focus-ring-color`. The status roles are `--success`, `--warning`, `--danger` and `--info`, each with `-soft`, `-line`, `-text` shades; `status.css` maps the badge/notice/dot utilities to them on every page.
 - `[data-theme="dark"]` in the same file gives the dark values of the semantic tokens. The neutral utilities (`bg-white`, `text-neutral-*`, `border-neutral-*`) resolve through the `*-scale-*` channels: light values in `theme.css`, dark values in `dashboard.css`.
 - `tailwind.config.js` resolves Tailwind's color utilities through the palette, so `bg-neutral-100` and `bg-neutral-100/50` read `theme.css` too.
 
@@ -51,7 +51,7 @@ Segmented items, menu rows, option cards and plain text links are not buttons fo
 ## Choice controls
 
 - Pick one of a few values: the `.segmented` control in `dashboard.css`. `ui.segmented` in `templates/components/ui.html` renders it for plain text items. Inside a card or a table row, add `segmented--sm`. Items that need icons, `x-for` or extra attributes use the classes directly: `segmented__item` on each button and `segmented__item--active` on the selected one.
-- On and off: the switch below. The track is 44x24, black when on and `bg-neutral-200` when off. Dark mode colors come from `dashboard.css`.
+- On and off: the switch below. The track is 44x24, black when on and `bg-neutral-200` when off. Dark mode colors come from the `--switch-on` token.
 
 ```html
 <button type="button" role="switch"

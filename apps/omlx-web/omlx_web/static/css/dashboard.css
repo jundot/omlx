@@ -106,8 +106,6 @@
     [data-theme="dark"] textarea.bg-neutral-900 { background-color: rgb(var(--palette-night-950)) !important; color: rgb(var(--palette-green-400)) !important; }
     [data-theme="dark"] .bg-neutral-800 { background-color: rgb(var(--palette-night-900)) !important; }
     [data-theme="dark"] .border-neutral-700 { border-color: rgb(var(--palette-zinc-700)) !important; }
-    [data-theme="dark"] .text-green-400 { color: rgb(var(--palette-green-400)) !important; }
-    [data-theme="dark"] .text-green-500 { color: rgb(var(--palette-green-500)) !important; }
 
     /* === Input fields === */
     [data-theme="dark"] input:not([type="range"]),
@@ -158,32 +156,15 @@
         background-color: var(--switch-on);
     }
 
-    /* === Badge colors (dark mode adjustments) === */
-    [data-theme="dark"] .bg-green-50 { background-color: rgb(var(--palette-green-500) / 0.15) !important; }
-    [data-theme="dark"] .border-green-200 { border-color: rgb(var(--palette-green-500) / 0.3) !important; }
-    [data-theme="dark"] .text-green-600 { color: rgb(var(--palette-green-400)) !important; }
-    [data-theme="dark"] .text-green-700 { color: rgb(var(--palette-green-400)) !important; }
-    [data-theme="dark"] .bg-green-500 { background-color: rgb(var(--palette-green-500)) !important; }
-    [data-theme="dark"] .bg-amber-50 { background-color: rgb(var(--palette-amber-500) / 0.15) !important; }
-    [data-theme="dark"] .border-amber-200 { border-color: rgb(var(--palette-amber-500) / 0.3) !important; }
-    [data-theme="dark"] .text-amber-600 { color: rgb(var(--palette-amber-400)) !important; }
-    [data-theme="dark"] .text-amber-700 { color: rgb(var(--palette-amber-400)) !important; }
-    [data-theme="dark"] .text-amber-800 { color: rgb(var(--palette-amber-300)) !important; }
-    [data-theme="dark"] .text-amber-900 { color: rgb(var(--palette-amber-300)) !important; }
-    [data-theme="dark"] .bg-blue-50 { background-color: rgb(var(--palette-blue-500) / 0.15) !important; }
-    [data-theme="dark"] .border-blue-200 { border-color: rgb(var(--palette-blue-500) / 0.3) !important; }
-    [data-theme="dark"] .text-blue-700 { color: rgb(var(--palette-blue-300)) !important; }
+    /* === Decorative tag hues (dark mode adjustments) ===
+       The four semantic status roles live in status.css now. These remaining
+       badge hues are a fixed taxonomy, not theme colors, and stay here. */
     [data-theme="dark"] .bg-orange-50 { background-color: rgb(var(--palette-orange-500) / 0.15) !important; }
     [data-theme="dark"] .border-orange-200 { border-color: rgb(var(--palette-orange-500) / 0.3) !important; }
     [data-theme="dark"] .text-orange-700 { color: rgb(var(--palette-orange-300)) !important; }
     [data-theme="dark"] .bg-purple-50 { background-color: rgb(var(--palette-purple-500) / 0.15) !important; }
     [data-theme="dark"] .border-purple-200 { border-color: rgb(var(--palette-purple-500) / 0.3) !important; }
     [data-theme="dark"] .text-purple-700 { color: rgb(var(--palette-violet-300)) !important; }
-    [data-theme="dark"] .bg-red-50 { background-color: rgb(var(--palette-red-500) / 0.15) !important; }
-    [data-theme="dark"] .border-red-200 { border-color: rgb(var(--palette-red-500) / 0.3) !important; }
-    [data-theme="dark"] .text-red-500 { color: rgb(var(--palette-red-400)) !important; }
-    [data-theme="dark"] .text-red-600 { color: rgb(var(--palette-red-400)) !important; }
-    [data-theme="dark"] .text-red-700 { color: rgb(var(--palette-red-300)) !important; }
     [data-theme="dark"] .bg-emerald-50 { background-color: rgb(var(--palette-emerald-500) / 0.15) !important; }
     [data-theme="dark"] .hover\:bg-emerald-100:hover { background-color: rgb(var(--palette-emerald-500) / 0.25) !important; }
     [data-theme="dark"] .border-emerald-200 { border-color: rgb(var(--palette-emerald-500) / 0.3) !important; }

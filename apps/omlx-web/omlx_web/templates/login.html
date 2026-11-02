@@ -10,27 +10,27 @@
     :root:not([data-theme="dark"]) .omlx-logo-dark { display: none !important; }
 
     /* Login page dark mode */
-    [data-theme="dark"] body { background-color: rgb(var(--palette-night-850)) !important; color: rgb(var(--palette-night-50)) !important; }
-    [data-theme="dark"] .bg-white { background-color: rgb(var(--palette-night-850)) !important; }
-    [data-theme="dark"] .bg-neutral-100 { background-color: rgb(var(--palette-night-700)) !important; }
-    [data-theme="dark"] .bg-neutral-50 { background-color: rgb(var(--palette-night-800)) !important; }
-    [data-theme="dark"] .from-neutral-100 { --tw-gradient-from: rgb(var(--palette-night-800)) !important; }
-    [data-theme="dark"] .border-neutral-200 { border-color: rgb(var(--palette-zinc-700)) !important; }
+    [data-theme="dark"] body { background-color: var(--bg-primary) !important; color: var(--text-primary) !important; }
+    [data-theme="dark"] .bg-white { background-color: var(--bg-primary) !important; }
+    [data-theme="dark"] .bg-neutral-100 { background-color: var(--bg-tertiary) !important; }
+    [data-theme="dark"] .bg-neutral-50 { background-color: var(--bg-secondary) !important; }
+    [data-theme="dark"] .from-neutral-100 { --tw-gradient-from: var(--bg-secondary) !important; }
+    [data-theme="dark"] .border-neutral-200 { border-color: var(--border-faint) !important; }
     [data-theme="dark"] .text-neutral-500 { color: rgb(var(--palette-zinc-500)) !important; }
     [data-theme="dark"] .text-neutral-400 { color: rgb(var(--palette-zinc-600)) !important; }
-    [data-theme="dark"] .text-neutral-700 { color: rgb(var(--palette-zinc-400)) !important; }
-    [data-theme="dark"] h2.text-neutral-900 { color: rgb(var(--palette-night-50)) !important; }
+    [data-theme="dark"] .text-neutral-700 { color: var(--text-secondary) !important; }
+    [data-theme="dark"] h2.text-neutral-900 { color: var(--text-primary) !important; }
     [data-theme="dark"] .placeholder-neutral-400::placeholder { color: rgb(var(--palette-zinc-600)) !important; }
-    [data-theme="dark"] input { background-color: rgb(var(--palette-night-800)) !important; color: rgb(var(--palette-night-50)) !important; border-color: rgb(var(--palette-zinc-700)) !important; }
+    [data-theme="dark"] input { background-color: var(--bg-secondary) !important; color: var(--text-primary) !important; border-color: var(--border-faint) !important; }
     [data-theme="dark"] input:focus { box-shadow: 0 0 0 2px rgb(var(--palette-white) / 0.1) !important; }
-    [data-theme="dark"] button.bg-neutral-900 { background-color: rgb(var(--palette-neutral-200)) !important; color: rgb(var(--palette-zinc-900)) !important; }
-    [data-theme="dark"] button.hover\:bg-neutral-800:hover { background-color: rgb(var(--palette-zinc-300)) !important; }
-    [data-theme="dark"] button.bg-neutral-900 span { color: rgb(var(--palette-zinc-900)) !important; }
-    [data-theme="dark"] button.bg-neutral-900 svg { color: rgb(var(--palette-zinc-900)) !important; }
+    [data-theme="dark"] button.bg-neutral-900 { background-color: var(--btn-primary) !important; color: var(--btn-primary-text) !important; }
+    [data-theme="dark"] button.hover\:bg-neutral-800:hover { background-color: var(--btn-primary-hover) !important; }
+    [data-theme="dark"] button.bg-neutral-900 span { color: var(--btn-primary-text) !important; }
+    [data-theme="dark"] button.bg-neutral-900 svg { color: var(--btn-primary-text) !important; }
     [data-theme="dark"] .shadow-xl { box-shadow: 0 20px 25px -5px rgb(var(--palette-black) / 0.4) !important; }
     [data-theme="dark"] ::selection { background-color: rgb(var(--palette-zinc-700)); color: rgb(var(--palette-night-50)); }
-    [data-theme="dark"] input[type="checkbox"] { background-color: rgb(var(--palette-night-800)) !important; border-color: rgb(var(--palette-zinc-700)) !important; }
-    [data-theme="dark"] input[type="checkbox"]:checked { background-color: rgb(var(--palette-neutral-200)) !important; border-color: rgb(var(--palette-neutral-200)) !important; }
+    [data-theme="dark"] input[type="checkbox"] { background-color: var(--bg-secondary) !important; border-color: var(--border-faint) !important; }
+    [data-theme="dark"] input[type="checkbox"]:checked { background-color: var(--btn-primary) !important; border-color: var(--btn-primary) !important; }
 </style>
 {% endblock %}
 

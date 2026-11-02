@@ -58,11 +58,19 @@ def test_focus_ring_uses_theme_aware_two_pixel_outline():
 def test_focus_ring_contrasts_with_login_backgrounds():
     light_ring = _css_color(THEME, r":root", "--focus-ring-color")
     dark_ring = _css_color(THEME, r'\[data-theme="dark"\]', "--focus-ring-color")
-    dark_page = _css_color(LOGIN, r'\[data-theme="dark"\] body', "background-color")
-    dark_control = _css_color(
-        LOGIN, r'\[data-theme="dark"\] \.bg-neutral-50', "background-color"
-    )
+    dark_page = _css_color(THEME, r'\[data-theme="dark"\]', "--bg-primary")
+    dark_control = _css_color(THEME, r'\[data-theme="dark"\]', "--bg-secondary")
 
+    # The login page must keep reading those tokens, not a palette copy.
+    assert re.search(
+        r'\[data-theme="dark"\] body\s*\{[^}]*background-color: var\(--bg-primary\)',
+        LOGIN,
+    )
+    assert re.search(
+        r'\[data-theme="dark"\] \.bg-neutral-50\s*\{[^}]*'
+        r"background-color: var\(--bg-secondary\)",
+        LOGIN,
+    )
     assert _contrast_ratio(light_ring, "#ffffff") >= 3
     assert _contrast_ratio(dark_ring, dark_page) >= 3
     assert _contrast_ratio(dark_ring, dark_control) >= 3
