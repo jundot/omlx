@@ -162,6 +162,8 @@ class OutputItem(BaseModel):
     # message fields
     role: Optional[str] = None
     content: Optional[List[OutputContent]] = None
+    # "commentary" for a tool call turn, "final_answer" for a completed reply.
+    phase: Optional[str] = None
     # function_call fields
     call_id: Optional[str] = None
     name: Optional[str] = None
@@ -173,11 +175,13 @@ class OutputItem(BaseModel):
     summary: Optional[List[ReasoningSummaryPart]] = None
 
     @model_serializer(mode="wrap")
-    def _drop_unset_namespace(self, handler):
-        """Keep ``namespace`` off the items that have none; other fields as-is."""
+    def _drop_unset_optionals(self, handler):
+        """Keep ``namespace`` and ``phase`` off the items that have neither."""
         data = handler(self)
         if data.get("namespace") is None:
             data.pop("namespace", None)
+        if data.get("phase") is None:
+            data.pop("phase", None)
         return data
 
 
