@@ -302,7 +302,12 @@ def _version_tuple(version: str) -> tuple[int, int, int] | None:
 
 
 def _executable(path: Path) -> bool:
-    return path.is_file() and os.access(path, os.X_OK)
+    # is_file() suppresses ENOENT but not PermissionError from an unreadable
+    # parent directory; an unreadable candidate means "not found" here.
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
 
 
 def _find_launcher(name: str) -> Path | None:
