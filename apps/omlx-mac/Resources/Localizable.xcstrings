@@ -1364,6 +1364,12 @@
       "comment" : "Accuracy result card status when the leaderboard already has this result",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bereits auf omlx.ai vorhanden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1406,6 +1412,12 @@
       "comment" : "Accuracy result card status when the omlx.ai upload failed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Community-Upload fehlgeschlagen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1448,6 +1460,12 @@
       "comment" : "Accuracy result card status when the run was below the community upload minimum",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht hochgeladen (mindestens 100 Fragen erforderlich)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1490,6 +1508,12 @@
       "comment" : "Accuracy result card status after a successful community upload",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf omlx.ai hochgeladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2990,6 +3014,12 @@
       "comment" : "Subtitle next to the Benchmarks grid showing the selected count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld ausgewählt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -3014,6 +3044,12 @@
       "comment" : "Subtitle next to the Benchmarks grid when nothing is selected",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zum Auswählen klicken. 0 = gesamter Datensatz."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3038,6 +3074,12 @@
       "comment" : "Inline label above the Accuracy Bench benchmark grid",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benchmarks"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3062,6 +3104,12 @@
       "comment" : "Accuracy Bench primary button that adds the configured run to the queue",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zur Warteschlange hinzufügen und starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3086,6 +3134,12 @@
       "comment" : "Accuracy Bench add-to-queue button label while the request is in flight",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird hinzugefügt…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3110,6 +3164,12 @@
       "comment" : "Inline label next to the per-benchmark sample-size dropdown",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stichproben:"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3134,6 +3194,12 @@
       "comment" : "Accuracy bench catalog category: code benchmarks",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Code"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3158,6 +3224,12 @@
       "comment" : "Accuracy bench catalog category: knowledge benchmarks",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wissen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3182,6 +3254,12 @@
       "comment" : "Accuracy bench catalog category: math benchmarks",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mathematik"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3206,6 +3284,12 @@
       "comment" : "Accuracy bench catalog category: reasoning benchmarks",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reasoning"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3230,6 +3314,12 @@
       "comment" : "Accuracy bench catalog category: safety benchmarks",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sicherheit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3254,6 +3344,12 @@
       "comment" : "Accuracy bench display name with language tag",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CMMLU (Chinesisch)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3278,6 +3374,12 @@
       "comment" : "Accuracy bench display name with language tag",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "JMMLU (Japanisch)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3302,6 +3404,12 @@
       "comment" : "Accuracy bench display name with language tag",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "KMMLU (Koreanisch)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3326,6 +3434,12 @@
       "comment" : "Accuracy Bench error when adding to queue fails; placeholder is the underlying error",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hinzufügen zur Warteschlange fehlgeschlagen: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -3350,6 +3464,12 @@
       "comment" : "Accuracy Bench error when cancelling the running bench fails; placeholder is the underlying error",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abbrechen fehlgeschlagen: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -3374,6 +3494,12 @@
       "comment" : "Accuracy Bench error when clearing accumulated results fails; placeholder is the underlying error",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Löschen der Ergebnisse fehlgeschlagen: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -3398,6 +3524,12 @@
       "comment" : "Accuracy Bench error when listing models fails; placeholder is the underlying error description",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Laden der Modelle fehlgeschlagen: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -3422,6 +3554,12 @@
       "comment" : "Accuracy Bench error when removing a queue entry fails; placeholder is the underlying error",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entfernen fehlgeschlagen: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -3446,6 +3584,12 @@
       "comment" : "Eyebrow label above the Accuracy Bench screen header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Genauigkeits-Benchmark"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3470,6 +3614,12 @@
       "comment" : "Accuracy Bench screen subtitle explaining queueing behavior",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benchmarks für mehrere Modelle in die Warteschlange stellen. Ergebnisse sammeln sich an, bis sie zurückgesetzt werden. Dank der serverseitigen Warteschlange laufen die Benchmarks auch nach einem Neustart der App weiter."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3494,6 +3644,12 @@
       "comment" : "Accuracy Bench screen primary header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellgenauigkeit messen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3518,6 +3674,12 @@
       "comment" : "Suffix appended to a loaded model's name in the Accuracy Bench picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " • geladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3542,6 +3704,12 @@
       "comment" : "Placeholder option in the Accuracy Bench model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell auswählen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3566,6 +3734,12 @@
       "comment" : "Tooltip on the X button next to a queued Accuracy Bench entry",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus der Warteschlange entfernen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3590,6 +3764,12 @@
       "comment" : "Accuracy Bench running-row title when the server hasn't reported the model id yet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Läuft…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3614,6 +3794,12 @@
       "comment" : "Accuracy Bench queue subtitle when nothing is running or queued",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine aktiven Läufe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3638,6 +3824,12 @@
       "comment" : "Accuracy Bench queue subtitle fragment showing queued count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld in der Warteschlange"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -3662,6 +3854,12 @@
       "comment" : "Accuracy Bench queue subtitle when one bench is running; placeholder is the queued-count fragment",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ · 1 läuft"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -3686,6 +3884,12 @@
       "comment" : "Disclosure label on an Accuracy Bench result card revealing per-category breakdowns",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kategorien"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3710,6 +3914,12 @@
       "comment" : "Pill on an Accuracy Bench result card when extended thinking was used",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweitertes Denken"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3734,6 +3944,12 @@
       "comment" : "Button in the Accuracy Bench results header that resets the result list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alles löschen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3758,6 +3974,12 @@
       "comment" : "Subtitle showing the number of accumulated Accuracy Bench results",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -3782,6 +4004,12 @@
       "comment" : "Row label for the Accuracy Bench batch-size selector",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Batchgröße"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3806,6 +4034,12 @@
       "comment" : "Sublabel under the Accuracy Bench batch-size selector",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Größere Batches sind schneller fertig, brauchen aber mehr Arbeitsspeicher."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3830,6 +4064,12 @@
       "comment" : "Row label for the Accuracy Bench model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3854,6 +4094,12 @@
       "comment" : "Sublabel under the Accuracy Bench model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geladene Modelle stehen oben."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3878,6 +4124,12 @@
       "comment" : "Row label for the Accuracy Bench extended-thinking toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweitertes Denken"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3902,6 +4154,12 @@
       "comment" : "Sublabel under the Accuracy Bench extended-thinking toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Denkpfade pro Frage aktivieren (langsamer)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3926,6 +4184,12 @@
       "comment" : "Sample-size dropdown option: full dataset",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Voll"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3950,6 +4214,12 @@
       "comment" : "Section header for the Accuracy Bench configuration block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Konfiguration"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3974,6 +4244,12 @@
       "comment" : "Section header for the Accuracy Bench queue/in-progress block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Warteschlange"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3998,6 +4274,12 @@
       "comment" : "Section header for the Accuracy Bench results list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4022,6 +4304,12 @@
       "comment" : "Section header for the Accuracy Bench text-export block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Text-Export"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4046,6 +4334,12 @@
       "comment" : "Status pill label on the Accuracy Bench running row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Läuft"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4070,6 +4364,12 @@
       "comment" : "Accuracy Bench section subtitle while models are loading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelle werden geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4094,6 +4394,12 @@
       "comment" : "Accuracy Bench section subtitle showing how many benchmarks the user has picked; placeholder is the count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgewählte Benchmarks: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -4118,6 +4424,12 @@
       "comment" : "Transient confirmation label after copying the Accuracy Bench text dump",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kopiert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4142,6 +4454,12 @@
       "comment" : "Disclosure label that hides the Accuracy Bench text export",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Textausgabe ausblenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4166,6 +4484,12 @@
       "comment" : "Disclosure label that reveals the Accuracy Bench text export",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Textausgabe einblenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4190,6 +4514,12 @@
       "comment" : "Context Bench primary button that starts the measurement",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benchmark starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4208,6 +4538,12 @@
       "comment" : "Limited-by value when free memory bounded the result",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verfügbarer Arbeitsspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4226,6 +4562,12 @@
       "comment" : "Limited-by value when the model's own context length bounded the result",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Native Kontextlänge des Modells"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4244,6 +4586,12 @@
       "comment" : "Limited-by value when the selected target bounded the result",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gewählter Zielwert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4262,6 +4610,12 @@
       "comment" : "Eyebrow label above the Context Bench screen header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kontext-Benchmark"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4280,6 +4634,12 @@
       "comment" : "Context Bench screen subtitle describing what the benchmark measures",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ermittelt das größte Kontextfenster, das diese Maschine für ein Modell tatsächlich per Prefill verarbeiten kann, und übernimmt den Wert in die Kontextfenster-Einstellung des Modells."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4298,6 +4658,12 @@
       "comment" : "Context Bench screen primary header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nutzbaren Kontext messen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4316,6 +4682,12 @@
       "comment" : "Model picker entry for a loaded model; placeholder is the model id",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ • geladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -4334,6 +4706,12 @@
       "comment" : "Placeholder option in the Context Bench model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell auswählen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4352,6 +4730,12 @@
       "comment" : "Context Bench progress label before the first server update arrives",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird gestartet…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4370,6 +4754,12 @@
       "comment" : "Hint under the Context Bench result confirming the setting was written",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Wert wurde in die Kontextfenster-Einstellung dieses Modells übernommen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4388,6 +4778,12 @@
       "comment" : "Result row label for what bounded the measurement",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Begrenzt durch"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4406,6 +4802,12 @@
       "comment" : "Result row label for how long the benchmark took",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dauer"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4424,6 +4826,12 @@
       "comment" : "Result row label for the raw measured admission boundary",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zulassungsgrenze"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4442,6 +4850,12 @@
       "comment" : "Result row label for the verify prefill's tokens per second",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill-Geschwindigkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4460,6 +4874,12 @@
       "comment" : "Hint under the Context Bench result explaining the measurement is a snapshot",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Ergebnis spiegelt den freien Arbeitsspeicher und die Speicherschutzstufe zum Messzeitpunkt wider. Wiederholen Sie den Benchmark nach größeren Änderungen dieser Werte."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4478,6 +4898,12 @@
       "comment" : "Unit caption next to the applied context window headline number",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token als Kontextfenster übernommen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4496,6 +4922,12 @@
       "comment" : "Result row label for the prompt size the verification prefill completed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geprüfter Prefill"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4514,6 +4946,12 @@
       "comment" : "Row label for the Context Bench model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4532,6 +4970,12 @@
       "comment" : "Sublabel under the Context Bench model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geladen oder entladen. Bei Bedarf lädt der Server das Modell."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4550,6 +4994,12 @@
       "comment" : "Row label for the prefill priority segmented control on the Context Bench screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill-Priorität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4568,6 +5018,12 @@
       "comment" : "Sublabel explaining the Context Bench prefill priority control mirrors the global setting",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Spiegelt die globale Einstellung und wird sofort gespeichert. Die Inferenz nutzt denselben Modus, der Messwert bleibt daher gültig."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4586,6 +5042,12 @@
       "comment" : "Row label for the Context Bench target selector",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximal zu testender Kontext"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4604,6 +5066,12 @@
       "comment" : "Sublabel under the Context Bench target selector",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Suche endet bei dieser Größe, größere Zielwerte brauchen länger für die Prüfung."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4622,6 +5090,12 @@
       "comment" : "Section header for the Context Bench configuration block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Konfiguration"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4640,6 +5114,12 @@
       "comment" : "Section header for the Context Bench result block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnis"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4658,6 +5138,12 @@
       "comment" : "Context Bench section subtitle while models are loading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelle werden geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4676,6 +5162,12 @@
       "comment" : "Context Bench section subtitle showing how many models are available; placeholder is the count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verfügbare Modelle: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -4694,6 +5186,12 @@
       "comment" : "Body of the warning callout above the Context Bench start button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieser Benchmark kann sehr lange dauern: Für die Prüfung wird ein echter Prompt in der gemessenen Größe per Prefill verarbeitet, was bei großen Modellen viele Minuten dauern kann. Beim Start werden alle geladenen Modelle entladen, laufende Anfragen werden dabei unterbrochen. Nach dem Ende wird das Ergebnis automatisch in die Kontextfenster-Einstellung des Modells übernommen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4712,6 +5210,12 @@
       "comment" : "Heading of the warning callout above the Context Bench start button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bevor Sie beginnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4730,6 +5234,12 @@
       "comment" : "Row label for the synthetic 1x baseline in the batch results table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "1× Referenz"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4754,6 +5264,12 @@
       "comment" : "Batch results column header: average time-to-first-token in ms",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ø TTFT (ms)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4778,6 +5294,12 @@
       "comment" : "Batch results column header: batch size",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Batch"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4802,6 +5324,12 @@
       "comment" : "Batch results column header: end-to-end latency in seconds",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "E2E (s)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4826,6 +5354,12 @@
       "comment" : "Batch results column header: prompt-processing tokens-per-second",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PP TPS"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4850,6 +5384,12 @@
       "comment" : "Batch results column header: speedup vs 1x baseline",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beschleunigung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4874,6 +5414,12 @@
       "comment" : "Batch results column header: token-generation tokens-per-second",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TG TPS"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4898,6 +5444,12 @@
       "comment" : "Subtitle under the Batch Results section header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Continuous Batching im Vergleich zu 1× Referenz"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4922,6 +5474,12 @@
       "comment" : "Throughput Bench primary button that starts a sweep",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benchmark ausführen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4946,6 +5504,12 @@
       "comment" : "Mixed-language code context profile for the throughput benchmark",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Code (gemischt)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4964,6 +5528,12 @@
       "comment" : "Python code context profile for the throughput benchmark",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Code (Python)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -4982,6 +5552,12 @@
       "comment" : "English novel context profile for the throughput benchmark",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Roman (Englisch)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5000,6 +5576,12 @@
       "comment" : "Japanese novel context profile for the throughput benchmark",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Roman (Japanisch)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5018,6 +5600,12 @@
       "comment" : "Korean novel context profile for the throughput benchmark",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Roman (Koreanisch)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5036,6 +5624,12 @@
       "comment" : "Device chip GPU-cores fragment; placeholder is the core count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld GPU-Kerne"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -5060,6 +5654,12 @@
       "comment" : "Device chip memory fragment; placeholder is the GB count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld GB"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -5084,6 +5684,12 @@
       "comment" : "Eyebrow label above the Throughput Bench screen header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchsatz-Benchmark"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5108,6 +5714,12 @@
       "comment" : "Throughput Bench screen subtitle describing the measurement sweep",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TTFT/TPOT für Einzelanfragen plus TPS bei Continuous Batching, gemessen über Kontextlängen und Batchgrößen hinweg. Ergebnisse bleiben im Arbeitsspeicher, bis die Ansicht entladen wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5132,6 +5744,12 @@
       "comment" : "Throughput Bench screen primary header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inferenzgeschwindigkeit messen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5156,6 +5774,12 @@
       "comment" : "Placeholder option in the Throughput Bench model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell auswählen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5180,6 +5804,12 @@
       "comment" : "Throughput Bench progress label with how many results have arrived; placeholder is the count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Läuft… bisherige Ergebnisse: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -5204,6 +5834,12 @@
       "comment" : "Throughput Bench progress label before the first result arrives",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aufwärmen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5228,6 +5864,12 @@
       "comment" : "Sublabel under the batch-size chip row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gleichzeitige Anfragen pro Batch in der Continuous-Batching-Phase"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5252,6 +5894,12 @@
       "comment" : "Inline title above the batch-size chip row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Batchgrößen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5276,6 +5924,12 @@
       "comment" : "Row label for the Throughput Bench context picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benchmark-Kontext"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5294,6 +5948,12 @@
       "comment" : "Sublabel under the Throughput Bench context picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wirkt sich nur bei aktivierten Beschleunigungsfunktionen wie MTP oder DFlash auf die Ergebnisse aus."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5312,6 +5972,12 @@
       "comment" : "Sublabel under the prompt-length chip row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt-Token, die je Einzelanfrage-Durchlauf eingespeist werden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5336,6 +6002,12 @@
       "comment" : "Inline title above the prompt-length chip row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kontextlängen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5360,6 +6032,12 @@
       "comment" : "Row label for the Throughput Bench generation-length field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Generierungslänge"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5384,6 +6062,12 @@
       "comment" : "Sublabel under the Throughput Bench generation-length field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgabe-Token pro Einzelanfrage-Durchlauf"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5408,6 +6092,12 @@
       "comment" : "Row label for the Throughput Bench model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5432,6 +6122,12 @@
       "comment" : "Sublabel under the Throughput Bench model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geladen oder entladen. Bei Bedarf lädt der Server das Modell."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5456,6 +6152,12 @@
       "comment" : "Section header for the Throughput Bench continuous-batching results table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Batch-Ergebnisse"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5480,6 +6182,12 @@
       "comment" : "Section header for the Throughput Bench configuration block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Konfiguration"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5504,6 +6212,12 @@
       "comment" : "Section header for the Throughput Bench community-upload block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Community-Bestenliste"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5528,6 +6242,12 @@
       "comment" : "Section header for the Throughput Bench single-request results table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse für Einzelanfragen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5552,6 +6272,12 @@
       "comment" : "Single-request results column header: end-to-end latency in seconds",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "E2E (s)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5576,6 +6302,12 @@
       "comment" : "Single-request results column header: peak memory usage",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max. Arbeitsspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5600,6 +6332,12 @@
       "comment" : "Single-request results column header: prompt-processing tokens-per-second",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PP TPS"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5624,6 +6362,12 @@
       "comment" : "Single-request results column header: test descriptor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Test"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5648,6 +6392,12 @@
       "comment" : "Single-request results column header: token-generation tokens-per-second",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TG TPS"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5672,6 +6422,12 @@
       "comment" : "Single-request results column header: total throughput",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchsatz"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5696,6 +6452,12 @@
       "comment" : "Single-request results column header: time-per-output-token in ms",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TPOT (ms)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5720,6 +6482,12 @@
       "comment" : "Single-request results column header: time-to-first-token in ms",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TTFT (ms)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5744,6 +6512,12 @@
       "comment" : "Subtitle for the single-request results table; placeholder is the count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchläufe: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -5768,6 +6542,12 @@
       "comment" : "Single-request row identifier showing prompt-processing and token-generation counts; placeholders are pp and tg integer counts",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PP %1$lld / TG %2$lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -5792,6 +6572,12 @@
       "comment" : "Throughput Bench section subtitle while models are loading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelle werden geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5816,6 +6602,12 @@
       "comment" : "Throughput Bench section subtitle showing how many models are available; placeholder is the count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verfügbare Modelle: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -5840,6 +6632,12 @@
       "comment" : "Disclosure header for the Throughput Bench text export block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Text-Export"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5864,6 +6662,12 @@
       "comment" : "Inline counter shown during community upload; placeholder is the submitted count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld gesendet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -5888,6 +6692,12 @@
       "comment" : "Label next to the leaderboard owner-hash identifier",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eigentümer-Hash"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5912,6 +6722,12 @@
       "comment" : "Upload row label when the leaderboard already has this result",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bereits gesendet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5936,6 +6752,12 @@
       "comment" : "Per-row label showing prompt-processing context length in the upload list; placeholder is the integer length",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PP %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -5960,6 +6782,12 @@
       "comment" : "Upload row label when the server returned no leaderboard URL",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine URL zurückgegeben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5984,6 +6812,12 @@
       "comment" : "Upload row label after a successful submission",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gesendet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6008,6 +6842,12 @@
       "comment" : "Fallback skipped-upload reason when the server didn't provide one",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Server hat das Hochladen dieser Ergebnisse übersprungen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6032,6 +6872,12 @@
       "comment" : "Banner heading shown when the server skipped uploading bench results",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Community-Upload übersprungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6056,6 +6902,12 @@
       "comment" : "Community-leaderboard subtitle on success; placeholders are success count and total",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld von %2$lld gesendet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -6080,6 +6932,12 @@
       "comment" : "Community-leaderboard subtitle when some uploads failed; placeholders are success and failure counts",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld ok · %2$lld fehlgeschlagen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -6104,6 +6962,12 @@
       "comment" : "Community-leaderboard subtitle when the server skipped uploading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übersprungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6128,6 +6992,12 @@
       "comment" : "Community-leaderboard subtitle while results are uploading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse werden gesendet…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6152,6 +7022,12 @@
       "comment" : "Status label while bench results are being uploaded to the community leaderboard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird zu omlx.ai hochgeladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -6220,6 +7096,12 @@
       "comment" : "Inline note warning that acceleration features are on; placeholder is the comma-joined feature list",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieser Lauf wird in der Bestenliste markiert: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -6244,6 +7126,12 @@
       "comment" : "Heading above the acceleration-feature chips in the community upload block",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beschleunigungs-Flags"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -6268,6 +7156,12 @@
       "comment" : "Skipped-upload reason when the benchmark ran against an external endpoint",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnisse externer Endpunkte werden nicht gesendet, weil sie entfernte Hardware messen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -6292,6 +7186,12 @@
       "comment" : "Community-leaderboard subtitle when the run was tagged with acceleration flags; placeholders are success count, total, and flag count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld von %2$lld gesendet · %3$lld Flags"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -40645,6 +41545,12 @@
       "comment" : "Note under a benchmark model picker when the model has a GPU power limit; placeholder is the watt value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das GPU-Leistungslimit dieses Modells (%lld W) gilt nicht für Benchmarks."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
