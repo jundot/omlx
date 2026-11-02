@@ -20,6 +20,7 @@ import numpy as np
 
 from ..engine_core import get_mlx_executor
 from ..patches.mlx_audio_compat import ensure_ming_post_load_skips_campplus_conversion
+from ..patches.mlx_audio_ming3 import apply_ming3_patches, release_ming3_state
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -145,6 +146,7 @@ class TTSEngine(BaseNonStreamingEngine):
             ) from exc
 
         ensure_ming_post_load_skips_campplus_conversion()
+        apply_ming3_patches()
 
         model_name = self._model_name
 
@@ -177,10 +179,14 @@ class TTSEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping TTS engine: {self._model_name}")
+        model = self._model
         self._model = None
 
-        gc.collect()
         loop = asyncio.get_running_loop()
+        # MLX compile caches are per thread; free them on the thread that ran them.
+        await loop.run_in_executor(get_mlx_executor(), release_ming3_state, model)
+        del model
+        gc.collect()
         await loop.run_in_executor(
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )

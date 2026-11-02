@@ -1572,6 +1572,85 @@ class TestTTSGenParamsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# Ming-3.0 decode loop patch
+# ---------------------------------------------------------------------------
+
+
+def _tiny_ming3_model(stop_bias):
+    """Random-weight Ming-3.0 model with mlx-audio's real decode modules."""
+    bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+    import mlx.nn as nn
+
+    mx.random.seed(7)
+    hidden = 32
+    args = bm.Qwen2ModelArgs.from_dict(
+        {
+            "model_type": "qwen2",
+            "hidden_size": hidden,
+            "num_hidden_layers": 2,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 16,
+        }
+    )
+    model = bm.Model.__new__(bm.Model)
+    nn.Module.__init__(model)
+    model.ming3 = True
+    model.patch_size = model.history_patch_size = 1
+    model.latent_dim = 4
+    model.llm_args = args
+    model.model = bm.MingQwen2ForCausalLM(args, {})
+    dit = {"hidden_size": 64, "depth": 2, "num_heads": 4}
+    model.linear_proj_audio = bm.Aggregator(in_channels=4, llm_input_dim=hidden, **dit)
+    model.flowloss = bm.FlowLoss(
+        z_channels=4, llm_cond_dim=hidden, ming3_sampling=True, **dit
+    )
+    model.stop_head = nn.Linear(hidden, 2)
+    model.stop_head.bias = mx.array(stop_bias)
+    model.set_dtype(mx.bfloat16)
+    prompt = mx.random.normal((1, 6, hidden)).astype(mx.bfloat16)
+    model._prepare_input_embed = lambda **_: (None, prompt)
+    return model
+
+
+class TestMing3Patches:
+    @pytest.mark.parametrize(
+        "stop_bias, max_steps, temperature, expected_len",
+        [
+            ([20.0, -20.0], 9, 0.0, 9),
+            ([-20.0, 20.0], 9, 0.0, 5),
+            ([20.0, -20.0], 1, 0.0, 1),
+            ([20.0, -20.0], 6, 0.5, 6),
+        ],
+    )
+    def test_pipelined_loop_matches_eager_loop(
+        self, stop_bias, max_steps, temperature, expected_len
+    ):
+        from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
+
+        bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+        assert apply_ming3_patches()
+        eager = bm.Model.sample._omlx_original
+        model = _tiny_ming3_model(stop_bias)
+
+        def run(sample):
+            mx.random.seed(0)
+            steps = sample(
+                model, "p", "t", max_decode_steps=max_steps, temperature=temperature
+            )
+            return [(mx.array(latent), last) for latent, last in steps]
+
+        expected = run(eager)
+        actual = run(bm.Model.sample)
+        assert len(actual) == len(expected) == expected_len
+        for (got, got_last), (want, want_last) in zip(actual, expected):
+            assert got_last == want_last
+            assert mx.array_equal(got, want).item()
+
+
+# ---------------------------------------------------------------------------
 # Integration test (slow, requires mlx-audio)
 # ---------------------------------------------------------------------------
 
