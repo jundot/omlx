@@ -556,6 +556,30 @@ class TestExtractTextContentReasoningReconstruction:
         assert len(result) == 1
         assert result[0]["content"] == "A"
 
+    def test_thinking_content_parts_recover_reasoning(self):
+        """Reasoning replayed as content parts is inlined, not dropped."""
+        messages = [
+            Message(
+                role="assistant",
+                content=[
+                    {"type": "thinking", "thinking": "R"},
+                    {"type": "text", "text": "A"},
+                ],
+            ),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
+
+    def test_inline_thinking_matching_reasoning_is_not_duplicated(self):
+        """Content that already carries the same <think> block is kept once."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="<think>R</think>A"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 1
+        assert result[0]["content"] == "<think>R</think>A"
+
 
 class TestExtractTextContentNativeReasoningContent:
     """Tests that extract_text_content forwards reasoning_content as a field
@@ -663,6 +687,34 @@ class TestExtractTextContentNativeReasoningContent:
         assert result[0]["content"] == "A"
         assert result[0]["reasoning_content"] == "R"
 
+    def test_native_mode_recovers_thinking_content_parts(self):
+        """Reasoning replayed as content parts becomes the native field."""
+        messages = [
+            Message(
+                role="assistant",
+                content=[
+                    {"type": "thinking", "thinking": "R"},
+                    {"type": "text", "text": "A"},
+                ],
+            ),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+        assert "<think>" not in result[0]["content"]
+
+    def test_native_mode_does_not_duplicate_inline_thinking(self):
+        """Inline <think> matching reasoning_content is stripped from content."""
+        messages = [
+            Message(role="assistant", reasoning_content="R", content="<think>R</think>A"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 1
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+        assert "<think>" not in result[0]["content"]
+
 
 class TestUsesNativeReasoningContent:
     def test_detects_minimax_m3_by_config_type(self):
@@ -707,6 +759,16 @@ class TestUsesNativeReasoningContent:
             "any-name",
             config_model_type="deepseek_v3",
         )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"config_model_type": "glm5_next"},
+            {"engine_model_type": "glm5_next"},
+        ],
+    )
+    def test_detects_glm5_next(self, kwargs):
+        assert uses_native_reasoning_content("any-name", **kwargs)
 
 
 class TestConvertAnthropicToInternal:

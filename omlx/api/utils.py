@@ -24,6 +24,9 @@ _NATIVE_REASONING_MODEL_TYPES = {
     "muse_spark",
     # K2 requires a reasoning field for every assistant turn.
     "k2_horizon",
+    # GLM-5.3's template renders history reasoning_content into <think>
+    # blocks itself; inlining it into content reproduces the DeepSeek V4 breakage.
+    "glm5_next",
 }
 
 
@@ -1002,6 +1005,33 @@ def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
     return merged
 
 
+def _split_thinking_parts(content: list) -> tuple[list, str | None]:
+    """Split thinking/reasoning parts out of an assistant content array.
+
+    Some OpenAI-compatible clients replay reasoning as content parts
+    (``{"type": "thinking", "thinking": "..."}``).  Those parts are not
+    ``type="text"``, so the text extractors drop them and the reasoning
+    silently disappears on history replay.  Returns ``(remaining_parts,
+    reasoning)``; ``reasoning`` is ``None`` when no thinking part exists.
+    """
+    remaining: list = []
+    thinking_parts: list[str] = []
+    for item in content:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump()
+        elif hasattr(item, "dict"):
+            item = item.dict()
+        if isinstance(item, dict) and item.get("type") in ("thinking", "reasoning"):
+            text = item.get("thinking") or item.get("text") or item.get("content")
+            if isinstance(text, str) and text:
+                thinking_parts.append(text)
+            continue
+        remaining.append(item)
+    if not thinking_parts:
+        return content, None
+    return remaining, "\n\n".join(thinking_parts)
+
+
 def _apply_reasoning_reconstruction(
     role: str,
     content: Any,
@@ -1011,8 +1041,8 @@ def _apply_reasoning_reconstruction(
     """Reconstruct reasoning on a historical assistant message.
 
     External clients echo reasoning back via the OpenAI ``reasoning_content``
-    field (or Anthropic ``thinking`` blocks).  Chat templates fall into two
-    camps:
+    field, Anthropic ``thinking`` blocks, or content parts.  Chat templates
+    fall into two camps:
 
     * ``native=True`` — template understands ``message.reasoning_content``
       as a top-level field (Qwen 3.6+).  Content stays clean and reasoning
@@ -1023,21 +1053,36 @@ def _apply_reasoning_reconstruction(
     Returns ``(new_content, reasoning_out)`` where ``reasoning_out`` is the
     string to attach as a ``reasoning_content`` field, or ``None`` to skip.
     """
-    if role != "assistant" or not reasoning:
-        if role != "assistant" or not native:
-            return content, None
-        text = content if isinstance(content, str) else ""
-        if isinstance(content, list):
-            text = _extract_text_from_content_list(content)
-        from .thinking import extract_thinking
+    if role != "assistant":
+        return content, None
 
+    from .thinking import extract_thinking
+
+    if isinstance(content, list):
+        content, parts_reasoning = _split_thinking_parts(content)
+        if not reasoning and parts_reasoning:
+            reasoning = parts_reasoning
+
+    text = content if isinstance(content, str) else ""
+    if isinstance(content, list):
+        text = _extract_text_from_content_list(content)
+
+    if not reasoning:
+        if not native:
+            return content, None
+        # Native mode still recovers inline <think> history left by models
+        # whose template did not support the reasoning field.
         inline_reasoning, inline_content = extract_thinking(text)
         if inline_reasoning:
             return inline_content, inline_reasoning
         return content, None
-    text = content if isinstance(content, str) else ""
-    if isinstance(content, list):
-        text = _extract_text_from_content_list(content)
+
+    inline_reasoning, inline_content = extract_thinking(text)
+    if inline_reasoning and inline_reasoning.strip() == reasoning.strip():
+        # Clients may echo reasoning both inline and as a field; rendering
+        # both would duplicate the <think> block.  Keep a single copy.
+        return (inline_content, reasoning) if native else (text, None)
+
     if native:
         return text, reasoning
     return f"<think>\n{reasoning}\n</think>\n\n{text}", None

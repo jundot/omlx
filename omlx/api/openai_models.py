@@ -65,15 +65,17 @@ class ContentPart(BaseModel):
     - input_audio: Audio input for multimodal audio models
     - video_url: Video input for supported multimodal models
     - file: Document or text input for attachment preprocessing
+    - thinking: Reasoning replayed by OpenAI-compatible clients as a content part
     """
 
-    type: str  # "text", "image_url", "video_url", "input_audio", or "file"
+    type: str  # "text", "image_url", "video_url", "input_audio", "file", or "thinking"
     text: Optional[str] = None
     image_url: Optional[ImageURL] = None
     video_url: Optional[ImageURL] = None
     input_video: Optional[Union[ImageURL, str]] = None
     input_audio: Optional[InputAudio] = None
     file: Optional[FileContent] = None
+    thinking: str | None = None
 
 
 # =============================================================================
