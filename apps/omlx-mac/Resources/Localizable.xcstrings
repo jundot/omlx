@@ -14077,6 +14077,12 @@
       "comment" : "Profile banner action that discards working edits when there's no base profile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verwerfen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14101,6 +14107,12 @@
       "comment" : "Profile banner action that reverts working edits back to the base profile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zurücksetzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14125,6 +14137,12 @@
       "comment" : "Profile banner action that saves working edits as a new profile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Als neues Profil speichern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14149,6 +14167,12 @@
       "comment" : "Profile banner action to overwrite the base profile with working edits; placeholder is the base profile's name",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ aktualisieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14173,6 +14197,12 @@
       "comment" : "Profile banner subtitle when no profile is assigned",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Änderungen werden automatisch für dieses Modell gespeichert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14197,6 +14227,12 @@
       "comment" : "Profile banner title when the model uses server defaults",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kein Profil"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14221,6 +14257,12 @@
       "comment" : "Profile banner subtitle when a named profile is active; placeholder is scope label",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profil „%@“ · für dieses Modell aktiv"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14245,6 +14287,12 @@
       "comment" : "Profile banner subtitle for working state with a base profile; placeholders are profile name and scope label",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht gespeichert · basiert auf %1$@ (%2$@)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14269,6 +14317,12 @@
       "comment" : "Profile banner subtitle when working profile has no named base",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht gespeichert · basiert auf Server-Standardwerten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14293,6 +14347,12 @@
       "comment" : "Profile banner title when the user has unsaved edits",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsprofil"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14317,6 +14377,12 @@
       "comment" : "Acceleration chip base name for DFlash drafter",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DFlash"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14341,6 +14407,12 @@
       "comment" : "DFlash drafter quantization chip; placeholders are weight bits, group size",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft-Quantisierung · W%1$lld G%2$lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14365,6 +14437,12 @@
       "comment" : "DFlash chip with drafter model id; placeholder is the model identifier",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DFlash · %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14389,6 +14467,12 @@
       "comment" : "Acceleration chip describing IndexCache frequency; placeholder is the integer frequency",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "IndexCache · alle %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14413,6 +14497,12 @@
       "comment" : "Acceleration chip: built-in MTP head multi-token prediction",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lightning MTP"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14437,6 +14527,12 @@
       "comment" : "Acceleration chip base name for SpecPrefill",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SpecPrefill"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14461,6 +14557,12 @@
       "comment" : "SpecPrefill threshold suffix; placeholder is the formatted token count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "≥ %@ tk"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14485,6 +14587,12 @@
       "comment" : "SpecPrefill chip with detail suffix; placeholder is the joined detail parts",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SpecPrefill · %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14509,6 +14617,12 @@
       "comment" : "Acceleration chip base name for TurboQuant KV-cache compression",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TurboQuant KV"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14533,6 +14647,12 @@
       "comment" : "TurboQuant bit-width suffix when fractional; %.1f gets the decimal width",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%.1f Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14557,6 +14677,12 @@
       "comment" : "TurboQuant bit-width suffix when the value is an integer; placeholder is the int",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14581,6 +14707,12 @@
       "comment" : "TurboQuant skip-last-N suffix; placeholder is the layer count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld übersprungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14605,6 +14737,12 @@
       "comment" : "TurboQuant chip with detail suffix; placeholder is the joined detail parts",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TurboQuant KV · %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14629,6 +14767,12 @@
       "comment" : "Acceleration chip: VLM multi-token prediction",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14653,6 +14797,12 @@
       "comment" : "Profile detail card button that activates this profile on the model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übernehmen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14677,6 +14827,12 @@
       "comment" : "Profile detail card button that closes the preview overlay",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fertig"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14701,6 +14857,12 @@
       "comment" : "Profile detail card button that writes the current working edits into this named profile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mit aktuellen Einstellungen aktualisieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14725,6 +14887,12 @@
       "comment" : "Badge shown on the profile detail card when this profile is active on the model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AKTIV"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14749,6 +14917,12 @@
       "comment" : "Badge on the profile detail card marking the profile the working profile forked from",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "BASIS DES ARBEITSPROFILS"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14773,6 +14947,12 @@
       "comment" : "Badge on the profile detail card indicating unsaved working-state edits",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "UNGESPEICHERT"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14797,6 +14977,12 @@
       "comment" : "Behavior chip: force sampling flag",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sampling erzwingen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14821,6 +15007,12 @@
       "comment" : "Behavior chip: cap on tool result tokens",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tool-Ausgabe begrenzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14845,6 +15037,12 @@
       "comment" : "Behavior chip: pin-in-memory flag",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Im Arbeitsspeicher angeheftet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14869,6 +15067,12 @@
       "comment" : "Behavior chip: extended-thinking flag",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nachdenken"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14893,6 +15097,12 @@
       "comment" : "Behavior chip label when thinking budget is disabled",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Denkbudget"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14917,6 +15127,12 @@
       "comment" : "Behavior chip when thinking budget is enabled; placeholder is the formatted token count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Budget · %@ tk"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -14941,6 +15157,12 @@
       "comment" : "Capacity stat label: max context window",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kontext"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14965,6 +15187,12 @@
       "comment" : "Capacity stat label: max output tokens",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max. Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -14989,6 +15217,12 @@
       "comment" : "Token count rendered next to a Capacity stat; placeholder is the formatted count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ tk"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15013,6 +15247,12 @@
       "comment" : "Raw token count for max tokens; placeholder is the integer count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld tk"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15037,6 +15277,12 @@
       "comment" : "Capacity stat label: time-to-live for the model in memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TTL"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15061,6 +15307,12 @@
       "comment" : "TTL value rendered when the model is pinned indefinitely",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dauerhaft"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15085,6 +15337,12 @@
       "comment" : "TTL value in seconds; placeholder is the integer seconds",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld s"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15109,6 +15367,12 @@
       "comment" : "Capacity stat label: model type override",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Typ"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15133,6 +15397,12 @@
       "comment" : "Placeholder text in the profile detail card when no settings are set",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Profil überschreibt keine Einstellungen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15157,6 +15427,12 @@
       "comment" : "Toggle on the profile detail card that publishes the profile as its own model ID",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Als Modell anbieten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15181,6 +15457,12 @@
       "comment" : "Warning under the expose-as-model toggle when the profile carries engine-construction settings",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen auf Engine-Ebene in diesem Profil wirken nur, wenn es auf das Basismodell angewendet wird. Sie verändern das als API-Modell angebotene Profil nicht."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15205,6 +15487,12 @@
       "comment" : "Tooltip on the expose-as-model toggle",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stellt dieses Profil unter /v1/models als eigene Modell-ID bereit und nutzt dabei die Engine des Basismodells."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15229,6 +15517,12 @@
       "comment" : "Penalty meter label: presence",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Präsenzstrafe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15253,6 +15547,12 @@
       "comment" : "Penalty meter label: repetition",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wiederholungsstrafe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15277,6 +15577,12 @@
       "comment" : "Sampling meter label: min-p",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Min P"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15301,6 +15607,12 @@
       "comment" : "Sampling meter label: temperature",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Temperatur"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15325,6 +15637,12 @@
       "comment" : "Sampling meter label: top-k",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top K"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15349,6 +15667,12 @@
       "comment" : "Sampling meter label: top-p",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top P"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15373,6 +15697,12 @@
       "comment" : "Profile detail card section header for experimental acceleration knobs",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beschleunigung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15397,6 +15727,12 @@
       "comment" : "Profile detail card section header for behavior-flag chips",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verhalten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15421,6 +15757,12 @@
       "comment" : "Profile detail card section header for capacity-related fields",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kapazität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15445,6 +15787,12 @@
       "comment" : "Profile detail card section header for repetition/presence penalty fields",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Strafen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15469,6 +15817,12 @@
       "comment" : "Profile detail card section header for sampler-related fields",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sampling"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15493,6 +15847,12 @@
       "comment" : "Profile detail card section header for tokenizer/chat-template fields",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vorlagen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15517,6 +15877,12 @@
       "comment" : "Profile detail card subtitle for the Server Defaults card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Greift hier, wenn kein Profil gesetzt ist oder wenn ein Profil ein Feld leer lässt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15541,6 +15907,12 @@
       "comment" : "Profile detail card subtitle for a named profile; placeholders are scope label and setting count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profil „%1$@“ · Einstellungen: %2$lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15565,6 +15937,12 @@
       "comment" : "Fallback scope label in the profile detail subtitle when scope is unknown",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profil"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15589,6 +15967,12 @@
       "comment" : "Profile detail card subtitle in working state with a base profile; placeholders are name and scope label",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsprofil · basiert auf %1$@ (%2$@)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15613,6 +15997,12 @@
       "comment" : "Profile detail card subtitle in working state without a base profile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsprofil · basiert auf Server-Standardwerten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15637,6 +16027,12 @@
       "comment" : "Templates chip describing chat-template kwarg override count; placeholder is the count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chat-Vorlage · Überschreibungen: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15661,6 +16057,12 @@
       "comment" : "Templates chip describing forced chat-template key count; placeholder is the count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Forced CT · Schlüssel: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15685,6 +16087,12 @@
       "comment" : "Templates chip naming the active reasoning parser; placeholder is the parser identifier",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reasoning · %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15709,6 +16117,12 @@
       "comment" : "Placeholder text in an empty profile chip group; placeholder is the lowercased scope name",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Noch keine Profile."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -15733,6 +16147,12 @@
       "comment" : "Tooltip on the refresh button in the preset chip group header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Voreinstellungen von omlx.ai aktualisieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15757,6 +16177,12 @@
       "comment" : "Button in profile chip-group header that saves the working profile as a new named profile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktuelles als neues Profil speichern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15781,6 +16207,12 @@
       "comment" : "Placeholder text inside the new-profile name field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "profil-name"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15805,6 +16237,12 @@
       "comment" : "Lead label inside the Save-as popover for naming a new profile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktuelles Profil speichern als"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15829,6 +16267,12 @@
       "comment" : "Scope label for user-defined global profiles",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Global"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15853,6 +16297,12 @@
       "comment" : "Scope label for per-model profiles",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -15877,6 +16327,12 @@
       "comment" : "Scope label for shipped preset profiles in Profiles tab",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Voreinstellung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37381,6 +37837,12 @@
       "comment" : "Behavior chip when a GPU power limit is set; placeholder is the watt value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %lld W"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37405,6 +37867,12 @@
       "comment" : "Behavior chip label when the GPU power limit is off",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU-Leistungslimit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
