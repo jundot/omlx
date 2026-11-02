@@ -591,8 +591,7 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
         pooled, ncs, cs_, offs, ci, cmax = _dummy(mx.uint8), [0] * b_n, [0] * b_n, [0] * b_n, _dummy(mx.int32), 1
     nbs = [max(1, (w + cr + 63) // 64) for cr in cs_]
     nbmax = max(nbs)
-    # cmax (<= index_topk) and nbmax grow with the position: they are the per-request slice
-    # strides in meta[6] / meta[7], not template values, so one pipeline serves every step.
+    # Slots 6 and 7 are the kernels' slice strides: ci's column count and the output block count.
     meta = mx.array([[w, cs_[r], w, ncs[r], nbs[r], offs[r], cmax, nbmax] for r in range(b_n)], mx.int32)
     tmpl = [("D", d), ("H", h), ("WSTRIDE", w * (d + d // 32)), ("WIS", 0)]
     grid = (h // 8 * 1024, nbmax, b_n)

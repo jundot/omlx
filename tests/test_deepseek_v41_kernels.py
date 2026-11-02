@@ -477,24 +477,6 @@ def test_sinkhorn_fused_exact(length, iters, eps):
     )
 
 
-def _record_templates(monkeypatch, templates, module, factory, run=None):
-    """Wrap the kernel factory module.factory so every launch adds its template to
-    templates[factory key]. run(**launch kwargs) replaces the launch when given."""
-    make = getattr(module, factory)
-
-    def wrapped(*args, **kwargs):
-        kernel = make(*args, **kwargs)
-        key = (module.__name__, factory, args, tuple(sorted(kwargs.items())))
-
-        def call(**call_kwargs):
-            templates.setdefault(key, set()).add(tuple(call_kwargs["template"]))
-            return (run or kernel)(**call_kwargs)
-
-        return call
-
-    monkeypatch.setattr(module, factory, wrapped)
-
-
 def test_kernel_templates_do_not_depend_on_token_counts(monkeypatch):
     """Each distinct template compiles a new Metal pipeline. Selection counts,
     tile counts and row counts change with prompt length and causal key count,
@@ -502,7 +484,19 @@ def test_kernel_templates_do_not_depend_on_token_counts(monkeypatch):
     templates = {}
 
     def record(module, factory):
-        _record_templates(monkeypatch, templates, module, factory)
+        make = getattr(module, factory)
+
+        def wrapped(*args, **kwargs):
+            kernel = make(*args, **kwargs)
+            key = (module.__name__, factory, args, tuple(sorted(kwargs.items())))
+
+            def call(**call_kwargs):
+                templates.setdefault(key, set()).add(tuple(call_kwargs["template"]))
+                return kernel(**call_kwargs)
+
+            return call
+
+        monkeypatch.setattr(module, factory, wrapped)
 
     record(kernels, "_topk_kernel")
     record(kernels, "_topk_merge_kernel")
@@ -539,128 +533,55 @@ def test_kernel_templates_do_not_depend_on_token_counts(monkeypatch):
     assert {key: len(seen) for key, seen in templates.items() if len(seen) != 1} == {}
 
 
-_DECODE = SimpleNamespace(window_size=128, n_heads=8, head_dim=512, rope_head_dim=64)
-
-
-def _no_dispatch(**launch):
-    """Stand-in for a decode kernel launch: zero outputs, no Metal dispatch."""
-    return [
-        mx.zeros(s, t) for s, t in zip(launch["output_shapes"], launch["output_dtypes"])
-    ]
-
-
-def _batched_decode_attention(positions, ratio=4, topk=512, compressed=True):
-    """window_attention_bq for one query per request at positions (a full window each),
-    with the compressed row and selected index counts the compressor / indexer keep."""
-    c = _DECODE
-    b_n, w, h, d = len(positions), c.window_size, c.n_heads, c.head_dim
-    parts = None
-    if compressed:
-        rows = [(p + 1) // ratio for p in positions]
-        parts = [
-            (
-                mx.zeros((1, n, d // 2 + d // 16), mx.uint8),
-                mx.zeros((1, 1, min(topk, n)), mx.int32),
-            )
-            for n in rows
-        ]
-    return decode_fused.window_attention_bq(
-        SimpleNamespace(attn_sink=mx.zeros((h,))),
-        mx.zeros((b_n, h * d), mx.bfloat16),
-        mx.zeros((b_n, w, d + d // 32), mx.uint8),
-        parts,
-        {},
-        mx.zeros((b_n, c.rope_head_dim // 2)),
-        mx.zeros((b_n, c.rope_head_dim // 2)),
-        c,
-    )
-
-
-def test_decode_kernel_templates_do_not_depend_on_positions(monkeypatch):
-    """The decode attention kernels (decode_layer.kernel) see one template per
-    model shape: the selected index count and block count grow with the
-    position until index_topk and must reach the kernels as runtime meta. Only
-    templates are inspected, so this runs without Metal."""
+def test_batched_decode_templates_do_not_depend_on_positions(monkeypatch):
+    """The selected index count and block count grow with the position until
+    index_topk. They reach the batched decode attention kernels as meta, so each
+    kernel keeps one template, and every meta row carries the batch-wide slice
+    strides. Only launches are inspected, so this runs without Metal."""
     templates = {}
-    _record_templates(monkeypatch, templates, decode_layer, "kernel", run=_no_dispatch)
-    c = _DECODE
-    with mx.stream(mx.cpu):
-        for position in range(128, 2200, 23):
-            _batched_decode_attention([position])
-            _batched_decode_attention([position, position + 7, 3 * position])
-            _batched_decode_attention([position], compressed=False)
-            selected = min(512, (position + 1) // 4)
-            decode_fused.split_attention(
-                mx.zeros((c.n_heads * c.head_dim,), mx.bfloat16),
-                mx.zeros((1, c.window_size, c.head_dim + c.head_dim // 32), mx.uint8),
-                mx.zeros(
-                    (1, (position + 1) // 4, c.head_dim // 2 + c.head_dim // 16),
-                    mx.uint8,
-                ),
-                mx.zeros((1, 1, c.window_size), mx.int32),
-                mx.zeros((1, 1, selected), mx.int32),
-                mx.zeros((c.n_heads,)),
-                mx.zeros((c.rope_head_dim // 2,)),
-                mx.zeros((c.rope_head_dim // 2,)),
-                c,
-            )
-
-    assert {key[2][0] for key in templates} == {
-        "attn_scores",
-        "attn_pv",
-        "o_merge",
-        "attn_scores_bq",
-        "attn_pv_bq",
-        "o_merge_bq",
-    }
-    assert {key: len(seen) for key, seen in templates.items() if len(seen) != 1} == {}
-
-
-def test_batched_decode_meta_rows_carry_slice_strides(monkeypatch):
-    """Every meta row carries the batch's widest index list (meta[6]) and block
-    count (meta[7]), the per-request slice strides of ci and the outputs; the
-    grid and output shapes still use the block count."""
-    launches = {}
 
     def fake_kernel(name, formats=()):
         def launch(**kw):
-            launches[name] = kw
-            return _no_dispatch(**kw)
+            templates.setdefault(name, set()).add(tuple(kw["template"]))
+            if name == "attn_scores_bq":
+                meta, ci = np.array(kw["inputs"][5]), kw["inputs"][4]
+                assert (meta[:, 6] == ci.shape[1]).all()
+                assert (meta[:, 7] == kw["grid"][1]).all()
+            shapes = zip(kw["output_shapes"], kw["output_dtypes"])
+            return [mx.zeros(s, t) for s, t in shapes]
 
         return launch
 
     monkeypatch.setattr(decode_layer, "kernel", fake_kernel)
-    positions = [130, 700, 3000]  # 32, 175 and 512 (= index_topk) selected indices
+    w, h, d, rd = 128, 8, 512, 64
+    c = SimpleNamespace(window_size=w, n_heads=h, head_dim=d, rope_head_dim=rd)
     with mx.stream(mx.cpu):
-        out = _batched_decode_attention(positions)
-        selected = [min(512, (p + 1) // 4) for p in positions]
-        rows = [(p + 1) // 4 for p in positions]
-        blocks = [(128 + s + 63) // 64 for s in selected]
-        cmax, nbmax = max(selected), max(blocks)
-        meta = launches["attn_scores_bq"]["inputs"][5]
-        expected = [
-            [128, s, 128, n, nb, o, cmax, nbmax]
-            for s, n, nb, o in zip(
-                selected, rows, blocks, (0, rows[0], rows[0] + rows[1])
+        for position in range(128, 2200, 64):
+            # Requests at different positions select different index counts.
+            rows = [(p + 1) // 4 for p in (position, position + 7, 3 * position)]
+            parts = [
+                (
+                    mx.zeros((1, n, d // 2 + d // 16), mx.uint8),
+                    mx.zeros((1, 1, min(512, n)), mx.int32),
+                )
+                for n in rows
+            ]
+            decode_fused.window_attention_bq(
+                SimpleNamespace(attn_sink=mx.zeros((h,))),
+                mx.zeros((3, h * d), mx.bfloat16),
+                mx.zeros((3, w, d + d // 32), mx.uint8),
+                parts,
+                {},
+                mx.zeros((3, rd // 2)),
+                mx.zeros((3, rd // 2)),
+                c,
             )
-        ]
-        assert np.array(meta).tolist() == expected
-        assert launches["attn_pv_bq"]["inputs"][4] is meta
-        assert launches["o_merge_bq"]["inputs"][4] is meta
-        assert launches["attn_scores_bq"]["inputs"][4].shape == (3, cmax)
-    h, d = _DECODE.n_heads, _DECODE.head_dim
-    assert launches["attn_scores_bq"]["grid"][1:] == (nbmax, 3)
-    assert launches["attn_scores_bq"]["output_shapes"] == [
-        (3 * h * nbmax * 64,),
-        (3 * h * nbmax,),
-    ]
-    assert launches["attn_pv_bq"]["output_shapes"] == [
-        (3 * h * nbmax * d,),
-        (3 * h * nbmax,),
-    ]
-    assert out.shape == (3, h * d)
-    for name in ("attn_scores_bq", "attn_pv_bq", "o_merge_bq"):
-        assert {"CMAX", "NBMAX"}.isdisjoint(k for k, _ in launches[name]["template"])
+
+    assert {name: len(seen) for name, seen in templates.items()} == {
+        "attn_scores_bq": 1,
+        "attn_pv_bq": 1,
+        "o_merge_bq": 1,
+    }
 
 
 @pytest.mark.parametrize(

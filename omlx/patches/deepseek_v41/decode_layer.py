@@ -589,10 +589,9 @@ _HC_POST = r"""
 # Batched single-query attention over REQ requests: the request index selects that request's
 # window rows (WSTRIDE bytes each), its compressed rows (offset meta[5] into the concatenated
 # pooled buffer), its window / compressed index lists and its slice of every output; blocks
-# beyond the request's own count exit. The body is the single-request source. The per-request
-# slice strides (the batch's widest index list meta[6] and block count meta[7]) are runtime
-# data: they grow with the position, and as template values every new size compiled a new
-# Metal library.
+# beyond the request's own count exit. The body is the single-request source. The slice
+# strides (widest index list meta[6], block count meta[7]) grow with the position, so they
+# are runtime data, not template values.
 _ATTN_PRELUDE_B = r"""
     const uint REQ = threadgroup_position_in_grid.z;
     const device int* meta = meta_all + REQ * 8;
