@@ -21,7 +21,8 @@ module.exports = {
       },
       // Neutral utilities resolve through theme.css, so light and dark share
       // one definition; dashboard.css supplies the dark channels and the one
-      // dark hover override (hover:text-neutral-700).
+      // dark hover override (hover:text-neutral-700). bg-white is a surface
+      // too; text-white and the other white utilities keep the palette.
       // Values match the palette steps the classes used before (text-400 took
       // the 500 step for AA; see #4727).
       textColor: {
@@ -36,6 +37,7 @@ module.exports = {
         },
       },
       backgroundColor: {
+        white: 'rgb(var(--surface-scale-white) / <alpha-value>)',
         neutral: {
           50: 'rgb(var(--surface-scale-50) / <alpha-value>)',
           100: 'rgb(var(--surface-scale-100) / <alpha-value>)',
@@ -47,6 +49,12 @@ module.exports = {
           100: 'rgb(var(--border-scale-100) / <alpha-value>)',
           200: 'rgb(var(--border-scale-200) / <alpha-value>)',
           300: 'rgb(var(--border-scale-300) / <alpha-value>)',
+        },
+      },
+      gradientColorStops: {
+        neutral: {
+          50: 'rgb(var(--surface-scale-50) / <alpha-value>)',
+          100: 'rgb(var(--surface-scale-100) / <alpha-value>)',
         },
       },
       // Tailwind's palette resolves through the tokens in static/css/theme.css.

@@ -12,6 +12,7 @@
         --text-scale-700: var(--palette-zinc-400);
         --text-scale-800: var(--palette-night-50);
         --text-scale-900: var(--palette-night-50);
+        --surface-scale-white: var(--palette-night-850);
         --surface-scale-50: var(--palette-night-800);
         --surface-scale-100: var(--palette-night-700);
         --surface-scale-200: var(--palette-night-700);
@@ -32,7 +33,6 @@
        hover state above it for the buttons that pair bg-white with a neutral hover. */
     [data-theme="dark"] .bg-white.hover\:bg-neutral-50:hover { background-color: var(--bg-secondary) !important; }
     [data-theme="dark"] .bg-white.hover\:bg-neutral-100:hover { background-color: var(--bg-tertiary) !important; }
-    [data-theme="dark"] .bg-white\/80 { background-color: rgb(var(--palette-night-850) / 0.8) !important; }
 
     /* Cluster status is operational data, not decorative helper copy. Keep
        its cache/fabric labels and request metrics readable in dark mode even
@@ -47,8 +47,7 @@
 
     /* === Borders === */
     /* Row dividers that skip x-show rows (inline display: none), unlike divide-y. */
-    .settings-rows > :not(template):not([style*="display: none"]) ~ :not(template):not([style*="display: none"]) { border-top: 1px solid rgb(var(--palette-neutral-200)); }
-    [data-theme="dark"] .settings-rows > :not(template):not([style*="display: none"]) ~ :not(template):not([style*="display: none"]) { border-top-color: var(--border-faint); }
+    .settings-rows > :not(template):not([style*="display: none"]) ~ :not(template):not([style*="display: none"]) { border-top: 1px solid rgb(var(--border-scale-200)); }
 
     /* === Hover states ===
        In dark the 700 step shares the 600 step's colour, so a 700 hover would
@@ -244,7 +243,6 @@
     [data-theme="dark"] .bg-white\/70 { background-color: rgb(var(--palette-white) / 0.12) !important; }
 
     /* === Gradient background effect === */
-    [data-theme="dark"] .from-neutral-50 { --tw-gradient-from: var(--bg-secondary) !important; }
 
     /* === Background grain texture in dark mode === */
     [data-theme="dark"] .bg-grain { opacity: 0.02; }
@@ -258,8 +256,6 @@
     /* === Disabled states === */
     [data-theme="dark"] .disabled\:opacity-50:disabled { opacity: 0.5; }
 
-    /* === Copy button bg-white/80 === */
-    [data-theme="dark"] .bg-white\/80 { background-color: rgb(var(--palette-night-850) / 0.8) !important; }
 
     /* === Model card markdown styles === */
     .model-card-content { font-size: 0.8125rem; line-height: 1.6; color: var(--text-secondary); }

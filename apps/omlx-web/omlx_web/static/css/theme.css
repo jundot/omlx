@@ -29,6 +29,7 @@
     --text-scale-700: var(--palette-neutral-700);
     --text-scale-800: var(--palette-neutral-800);
     --text-scale-900: var(--palette-neutral-900);
+    --surface-scale-white: var(--palette-white);
     --surface-scale-50: var(--palette-neutral-50);
     --surface-scale-100: var(--palette-neutral-100);
     --surface-scale-200: var(--palette-neutral-200);
