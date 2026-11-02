@@ -69,6 +69,12 @@
       "comment" : "App menu command that hides all windows and drops the Dock icon",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fenster schließen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
