@@ -18761,6 +18761,12 @@
       "comment" : "Tooltip on the API key copy button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "In die Zwischenablage kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18785,6 +18791,12 @@
       "comment" : "Tooltip on the API key regenerate button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zufälligen Schlüssel erzeugen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18809,6 +18821,12 @@
       "comment" : "Tooltip on the eye button when the API key is visible",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schlüssel ausblenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18833,6 +18851,12 @@
       "comment" : "Row label for the API key editor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Schlüssel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18857,6 +18881,12 @@
       "comment" : "API key save button label when changes are pending",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speichern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18881,6 +18911,12 @@
       "comment" : "API key save button label while a save is in progress",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird gespeichert…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18905,6 +18941,12 @@
       "comment" : "Tooltip on the eye button when the API key is masked",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schlüssel einblenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18929,6 +18971,12 @@
       "comment" : "Sublabel below the API key field when a key is already configured",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dient zur Authentifizierung von /v1- und Admin-Anfragen. ≥ 4 druckbare Zeichen, keine Leerzeichen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18953,6 +19001,12 @@
       "comment" : "Sublabel below the API key field when no key is configured",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vor dem Bereitstellen des Servers einen Schlüssel festlegen. ≥ 4 druckbare Zeichen, keine Leerzeichen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18977,6 +19031,12 @@
       "comment" : "Row label for the toggle that disables API key verification",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gesamte Authentifizierung deaktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19001,6 +19061,12 @@
       "comment" : "Sublabel for the disable API key verification toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erlaubt nicht authentifizierte /v1- und Admin-Anfragen. Nur für die Entwicklung gedacht."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19025,6 +19091,12 @@
       "comment" : "Row label for the toggle that allows keyless inference",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inferenz ohne API-Schlüssel erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19049,6 +19121,12 @@
       "comment" : "Button that accepts the keyless inference warning",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ich verstehe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19073,6 +19151,12 @@
       "comment" : "Warning shown before enabling keyless inference",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alle, die diesen Server erreichen können, können die Inferenz-APIs, die MCP-Tools und die Websuche ohne API-Schlüssel nutzen. Mit dem Aktivieren bestätigen Sie, dass der Server Angriffen aus dem Netzwerk ausgesetzt sein wird, dass Sie diesen Sicherheitsschutz aufheben und dass Sie geeignete Sicherheitsmaßnahmen getroffen haben."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19097,6 +19181,12 @@
       "comment" : "Title of the warning shown before enabling keyless inference",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inferenz ohne API-Schlüssel erlauben?"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19121,6 +19211,12 @@
       "comment" : "Sublabel for the keyless inference toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zugang zu Inferenz, MCP-Tools und Websuche ohne Schlüssel. Für den Admin-Zugang ist weiterhin eine Authentifizierung erforderlich."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19145,6 +19241,12 @@
       "comment" : "Section header for the API key editor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Schlüssel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19169,6 +19271,12 @@
       "comment" : "Subtitle for the API key section header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erforderlich für die Authentifizierung von /v1-Anfragen und Admin-Sitzungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19193,6 +19301,12 @@
       "comment" : "Section header for the authentication settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Authentifizierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19217,6 +19331,12 @@
       "comment" : "Section header for the sub-keys list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sub-Schlüssel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19241,6 +19361,12 @@
       "comment" : "Subtitle for the Sub Keys section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stellt eingeschränkte Schlüssel für einzelne Apps oder Benutzer aus. Sub-Schlüssel können keinen Admin-Zugang vergeben."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19265,6 +19391,12 @@
       "comment" : "Sub-key created-at text; placeholder is the formatted date and time",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erstellt · %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19289,6 +19421,12 @@
       "comment" : "Sub-key created-at text when the timestamp can't be parsed; placeholder is the raw ISO string",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erstellt · %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19313,6 +19451,12 @@
       "comment" : "Sub-key created-at text when the timestamp is unavailable",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erstellt · unbekannt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19337,6 +19481,12 @@
       "comment" : "Empty-state text shown when there are no sub-keys",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Noch keine Sub-Schlüssel."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19361,6 +19511,12 @@
       "comment" : "Row label for sub-key value input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schlüssel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19385,6 +19541,12 @@
       "comment" : "Placeholder text inside the sub-key value input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "sk-omlx-sub-…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19409,6 +19571,12 @@
       "comment" : "Row label for sub-key name input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Name"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19433,6 +19601,12 @@
       "comment" : "Placeholder text for sub-key name input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code auf dem Laptop"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19457,6 +19631,12 @@
       "comment" : "Sublabel for sub-key name input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optionale lesbare Bezeichnung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19481,6 +19661,12 @@
       "comment" : "Button to open the sub-key create form",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Neu"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19505,6 +19691,12 @@
       "comment" : "Tooltip on the sub-key delete button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Widerrufen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19529,6 +19721,12 @@
       "comment" : "Fallback display name for a sub-key with no name set",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "(ohne Namen)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
