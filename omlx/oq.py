@@ -3945,7 +3945,7 @@ def make_predicate(config: dict, oq_level: float = 4) -> Callable:
 def estimate_bpw_and_size(
     model_path: str,
     oq_level: float,
-    group_size: int = 64,
+    group_size: int = _OQ_DEFAULT_GROUP_SIZE,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
 ) -> dict:
