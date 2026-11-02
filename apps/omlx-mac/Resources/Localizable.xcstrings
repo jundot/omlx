@@ -87,6 +87,12 @@
       "comment" : "Product name used as the app logo accessibility label and the About screen title",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -105,6 +111,12 @@
       "comment" : "Tooltip on the code chip explaining that clicking copies the value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zum Kopieren klicken"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1910,6 +1922,12 @@
       "comment" : "Sidebar row label / navigation title for the Appearance section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Darstellung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5830,6 +5848,12 @@
       "comment" : "Back button label",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zurück"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5853,6 +5877,12 @@
     "common.cancel" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abbrechen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5894,6 +5924,12 @@
     "common.copy" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5918,6 +5954,12 @@
       "comment" : "Tooltip and accessibility label for a button that copies a model identifier",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell-ID kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5941,6 +5983,12 @@
     "common.create" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erstellen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5964,6 +6012,12 @@
     "common.open" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -5987,6 +6041,12 @@
     "common.save" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speichern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -10617,6 +10677,12 @@
       "comment" : "Thermal severity label shown in the Status screen's System block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kritisch"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -10641,6 +10707,12 @@
       "comment" : "Thermal severity label shown in the Status screen's System block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erhöht"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -10665,6 +10737,12 @@
       "comment" : "Thermal severity label shown in the Status screen's System block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Normal"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -10689,6 +10767,12 @@
       "comment" : "Thermal severity label shown in the Status screen's System block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hoch"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19535,6 +19619,12 @@
       "comment" : "Status pill label when the server process is alive but not answering health checks",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Antwortet nicht"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19558,6 +19648,12 @@
     "server.hero.restart" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Neu starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19581,6 +19677,12 @@
     "server.hero.start" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19604,6 +19706,12 @@
     "server.hero.stop" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stoppen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19628,6 +19736,12 @@
       "comment" : "Hero subtitle while server is running; placeholders are host and port (port is plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lauscht auf %1$@:%2$@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19652,6 +19766,12 @@
       "comment" : "Hero subtitle when server is stopped",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Läuft nicht"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19676,6 +19796,12 @@
       "comment" : "Hero subtitle while server is starting up; placeholders are host and port (port is plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Startet auf %1$@:%2$@…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19700,6 +19826,12 @@
       "comment" : "Hero subtitle while server is shutting down",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird gestoppt…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19724,6 +19856,12 @@
       "comment" : "Hero card title on Server and Status screens",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX-Server"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19748,6 +19886,12 @@
       "comment" : "Hero card button label shown while the server is transitioning between states",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitet…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26622,6 +26766,12 @@
     "sidebar.about" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Über"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26645,6 +26795,12 @@
     "sidebar.accuracyBench" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Genauigkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26686,6 +26842,12 @@
     "sidebar.contextBench" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kontext"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26727,6 +26889,12 @@
     "sidebar.downloads" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Downloads"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26769,6 +26937,12 @@
       "comment" : "Sidebar group heading for accuracy + throughput bench screens",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benchmark"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -26793,6 +26967,12 @@
       "comment" : "Sidebar group heading for the about/integrations/logs screens",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allgemein"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -26817,6 +26997,12 @@
       "comment" : "Sidebar group heading for models/downloads/quant screens",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -26841,6 +27027,12 @@
       "comment" : "Sidebar group heading for server-related screens",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -26864,6 +27056,12 @@
     "sidebar.integrations" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Integrationen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26887,6 +27085,12 @@
     "sidebar.logs" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Protokolle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26928,6 +27132,12 @@
     "sidebar.models" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26969,6 +27179,12 @@
     "sidebar.network" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Netzwerk"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27010,6 +27226,12 @@
     "sidebar.performance" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leistung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27051,6 +27273,12 @@
     "sidebar.quantization" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quantisierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27092,6 +27320,12 @@
     "sidebar.security" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sicherheit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27115,6 +27349,12 @@
     "sidebar.server" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27156,6 +27396,12 @@
     "sidebar.status" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Status"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27197,6 +27443,12 @@
     "sidebar.throughputBench" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchsatz"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27239,6 +27491,12 @@
       "comment" : "Active Now badge: model currently generating tokens",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird generiert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27263,6 +27521,12 @@
       "comment" : "Active Now badge: model is loaded but idle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27287,6 +27551,12 @@
       "comment" : "Active Now badge: model has queued requests",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wartet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27311,6 +27581,12 @@
       "comment" : "Empty-state text shown when the Active Now list has no entries",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server im Leerlauf, keine Modelle geladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27335,6 +27611,12 @@
       "comment" : "Architecture label shown in the System section subtitle for Apple Silicon Macs",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apple Silicon"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27359,6 +27641,12 @@
       "comment" : "Architecture label shown in the System section subtitle for Intel Macs",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Intel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27383,6 +27671,12 @@
       "comment" : "Tooltip on the clear button when all-time scope is selected",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gesamtstatistik löschen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27407,6 +27701,12 @@
       "comment" : "Tooltip on the clear button when session scope is selected",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sitzungsstatistik löschen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27431,6 +27731,12 @@
       "comment" : "Confirmation dialog title for clearing all-time stats",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gesamtstatistik löschen? Das kann nicht rückgängig gemacht werden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27455,6 +27761,12 @@
       "comment" : "Destructive clear button inside stats clear confirmation dialogs",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leeren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27479,6 +27791,12 @@
       "comment" : "Confirmation dialog title for clearing the hot (memory) KV cache",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher-KV-Cache für alle geladenen Modelle leeren? Nachfolgende Anfragen greifen wieder auf die SSD zu oder berechnen neu."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -27503,6 +27821,12 @@
       "comment" : "Confirmation dialog title for clearing session stats",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sitzungsstatistik löschen?"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27527,6 +27851,12 @@
       "comment" : "Confirmation dialog title for clearing the SSD KV cache",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alle SSD-Cache-Dateien löschen? Geladene Modelle bauen ihren KV-Cache beim nächsten Prefill neu auf."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27551,6 +27881,12 @@
       "comment" : "Row label for GPU wired memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reservierter GPU-Arbeitsspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27575,6 +27911,12 @@
       "comment" : "Row label for GPU utilization",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU-Auslastung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27599,6 +27941,12 @@
       "comment" : "Sublabel for GPU utilization row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ungefähr · Last aktiver Anfragen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27623,6 +27971,12 @@
       "comment" : "Row label for server uptime",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server-Betriebszeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27647,6 +28001,12 @@
       "comment" : "Row label for system RAM",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Systemarbeitsspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27671,6 +28031,12 @@
       "comment" : "Row label for thermal state",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thermischer Zustand"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27695,6 +28061,12 @@
       "comment" : "Row label for the running oMLX version",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX-Version"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27719,6 +28091,12 @@
       "comment" : "Subtitle showing the effective KV cache block sizes; placeholder is a separator-joined list of numbers",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Blockgröße · %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -27743,6 +28121,12 @@
       "comment" : "Destructive button to clear the in-memory KV cache",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher-Cache leeren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -27767,6 +28151,12 @@
       "comment" : "Destructive button to clear all SSD cache files",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD-Cache leeren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27791,6 +28181,12 @@
       "comment" : "Cache file count; placeholder is the number of files",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dateien: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27863,6 +28259,12 @@
       "comment" : "Row label for cache file count",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cache-Dateien"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27887,6 +28289,12 @@
       "comment" : "Row label for the SSD cache directory path",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speicherort"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27911,6 +28319,12 @@
       "comment" : "Warning under the SSD cache location when it was unavailable at server start",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der SSD-Cache ist aus, weil dieses Verzeichnis beim Start des Servers nicht verfügbar war. Starten Sie den Server nach dem erneuten Verbinden des Laufwerks neu."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27935,6 +28349,12 @@
       "comment" : "Row label for the in-memory (hot) KV cache size gauge",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher-Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -27959,6 +28379,12 @@
       "comment" : "Row label for the number of in-memory KV cache entries",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeichereinträge"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -27983,6 +28409,12 @@
       "comment" : "Memory cache entry count; placeholder is the number of entries",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einträge: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28055,6 +28487,12 @@
       "comment" : "Row label for total cache size on disk",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gesamtgröße"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28456,6 +28894,12 @@
     "status.scope.alltime" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gesamt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28497,6 +28941,12 @@
     "status.scope.session" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sitzung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28539,6 +28989,12 @@
       "comment" : "Section header for the currently active models list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jetzt aktiv"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28563,6 +29019,12 @@
       "comment" : "Section header for the runtime cache observability panel",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Laufzeit-Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28587,6 +29049,12 @@
       "comment" : "Section header for system status rows",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "System"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28610,6 +29078,12 @@
     "status.session_stats" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inferenzstatistik"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28700,6 +29174,12 @@
       "comment" : "Tile label for average prompt-processing speed excluding cached tokens",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt-Verarbeitung (ohne Cache)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28724,6 +29204,12 @@
       "comment" : "Header label above average serving speed metrics",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchschnittliche Geschwindigkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28748,6 +29234,12 @@
       "comment" : "Label for average token-generation speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token-Generierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28772,6 +29264,12 @@
       "comment" : "Subtitle of the System section showing CPU architecture and macOS version; placeholders are the architecture string and macOS major.minor numbers",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ · macOS %2$lld.%3$lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -28796,6 +29294,12 @@
       "comment" : "Stat tile label for cache efficiency percentage",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cache-Effizienz"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28819,6 +29323,12 @@
     "status.tile.cached" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token im Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28912,6 +29422,12 @@
     "status.tile.total" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill-Token insgesamt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28960,6 +29476,12 @@
       "comment" : "Row label for the auto-check updates toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch prüfen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28984,6 +29506,12 @@
       "comment" : "Sublabel for the auto-check toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Täglich im Hintergrund nach Updates suchen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29008,6 +29536,12 @@
       "comment" : "Row label for the automatic update notification toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Über Updates informieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29032,6 +29566,12 @@
       "comment" : "Sublabel for the automatic update notification toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Versionshinweise anzeigen, wenn ein Update gefunden wird"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29056,6 +29596,12 @@
       "comment" : "Primary update status line when a new version is available; placeholder is the version string",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX %@ ist verfügbar"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29080,6 +29626,12 @@
       "comment" : "Secondary update status line when a new version is available; placeholder is the download size or em dash",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bereit zum Download · %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29104,6 +29656,12 @@
       "comment" : "Row label for the toggle that downloads found updates in the background",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch laden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29128,6 +29686,12 @@
       "comment" : "Sublabel for the background update download toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Im Hintergrund laden und vor dem Installieren nachfragen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29152,6 +29716,12 @@
       "comment" : "Row label for the update channel picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update-Kanal"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29176,6 +29746,12 @@
       "comment" : "Sublabel for the update channel picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stable erhält getestete Versionen. Beta bekommt neue Funktionen früher."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29199,6 +29775,12 @@
     "status.updates.check" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jetzt prüfen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29223,6 +29805,12 @@
       "comment" : "Updates action button label while a check is in progress",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird geprüft…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29247,6 +29835,12 @@
       "comment" : "Primary update status line while a check is in progress",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suche nach Updates…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29271,6 +29865,12 @@
       "comment" : "Secondary update status line while a check is in progress",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GitHub-Releases werden geprüft…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29295,6 +29895,12 @@
       "comment" : "Updates action button label while the download is in progress; placeholder is the percent complete",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird geladen… %lld%%"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29319,6 +29925,12 @@
       "comment" : "Primary update status line while the new build is downloading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update wird geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29343,6 +29955,12 @@
       "comment" : "Secondary update status line during download; placeholder is the percent complete",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird geladen · %lld%%"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29367,6 +29985,12 @@
       "comment" : "Primary update status line when checking for updates failed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update-Prüfung fehlgeschlagen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29390,6 +30014,12 @@
     "status.updates.install" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installieren und neu starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29414,6 +30044,12 @@
       "comment" : "Last-checked text when the last check was before today; placeholder is the formatted date and time",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zuletzt geprüft: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29438,6 +30074,12 @@
       "comment" : "Last-checked text when the last check was today; placeholder is the local time",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Heute um %@ geprüft"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29462,6 +30104,12 @@
       "comment" : "Secondary update line when there is no prior check timestamp",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Noch nie geprüft"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29486,6 +30134,12 @@
       "comment" : "Secondary update status line once the staged bundle is ready; placeholder is the version",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ kann installiert werden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29509,6 +30163,12 @@
     "status.updates.title" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Updates"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29533,6 +30193,12 @@
       "comment" : "Primary update status line when no update is available",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX ist aktuell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29557,6 +30223,12 @@
       "comment" : "Version row value combining marketing version and build number; placeholders are the version string and build string",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ · Build %2$@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29581,6 +30253,12 @@
       "comment" : "Section header for the local usage history panel",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nutzungsverlauf"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29605,6 +30283,12 @@
       "comment" : "Subtitle under the usage history header describing data scope",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lokale Aggregate · Serverzeit · 400 Tage Aufbewahrung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29629,6 +30313,12 @@
       "comment" : "Picker label for the usage history time range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zeitraum"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29653,6 +30343,12 @@
       "comment" : "Usage history range option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Heute"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29677,6 +30373,12 @@
       "comment" : "Usage history range option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gestern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29701,6 +30403,12 @@
       "comment" : "Usage history range option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "7 Tage"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29725,6 +30433,12 @@
       "comment" : "Usage history range option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 Tage"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29749,6 +30463,12 @@
       "comment" : "Usage history range option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "90 Tage"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29773,6 +30493,12 @@
       "comment" : "Usage history range option for the current calendar month",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieser Monat"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29797,6 +30523,12 @@
       "comment" : "Picker label for the usage history model filter",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29821,6 +30553,12 @@
       "comment" : "Usage history model filter option that includes every model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alle Modelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29845,6 +30583,12 @@
       "comment" : "Shown when the selected usage history range has no recorded requests",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine aufgezeichnete Nutzung in diesem Zeitraum. Der Verlauf beginnt nach dem Upgrade."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29869,6 +30613,12 @@
       "comment" : "Warning shown when usage history storage is degraded but data is still displayed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Verlauf ist möglicherweise unvollständig: Die Speicherung ist verzögert oder der Wartepuffer ist übergelaufen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29893,6 +30643,12 @@
       "comment" : "Error shown when the usage history endpoint cannot be reached",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Nutzungsverlauf ist nicht verfügbar. Die Inferenz läuft normal weiter."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29917,6 +30673,12 @@
       "comment" : "Shown on the Status screen when usage history recording is switched off",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Nutzungsverlauf ist aus. Aktivieren Sie ihn in den Server-Einstellungen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29941,6 +30703,12 @@
       "comment" : "Button that jumps from the Status screen to the usage history switch on the Server screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server-Einstellungen öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29965,6 +30733,12 @@
       "comment" : "Usage history tile label for request count",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anfragen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29989,6 +30763,12 @@
       "comment" : "Usage history tile label for prompt plus output tokens",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token insgesamt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30013,6 +30793,12 @@
       "comment" : "Usage history tile label for prompt tokens",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt-Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30037,6 +30823,12 @@
       "comment" : "Usage history tile label for generated tokens",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgabe-Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30061,6 +30853,12 @@
       "comment" : "Usage history tile label for prompt tokens served from cache",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token im Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30085,6 +30883,12 @@
       "comment" : "Heading above the usage history day/hour heatmap",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token-Nutzung nach Tag und Stunde"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30109,6 +30913,12 @@
       "comment" : "Legend text under the usage heatmap heading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stunden 00–23 · dunkleres Grün bedeutet mehr Token · doppelte Stunden bei der Zeitumstellung werden zusammengefasst"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30133,6 +30943,12 @@
       "comment" : "Per-model total token count; placeholder is a compact number",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -30157,6 +30973,12 @@
       "comment" : "Per-model request count and output speed; placeholders are a count and a formatted tokens-per-second value",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld Anfragen · %2$@ Token/s"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -30181,6 +31003,12 @@
       "comment" : "Per-model breakdown sublabel; placeholders are compact prompt, output, and cached token counts",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt %1$@ · Ausgabe %2$@ · Cache %3$@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -30205,6 +31033,12 @@
       "comment" : "Tooltip and accessibility label for one heatmap cell; placeholders are the date, the two-digit hour, and a formatted token count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ %2$@:00 · %3$@ Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -32125,6 +32959,12 @@
       "comment" : "Generic close button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schließen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -34147,6 +34987,12 @@
       "comment" : "Sidebar row label / navigation title for the Ask AI section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "KI fragen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -34357,6 +35203,12 @@
       "comment" : "Sidebar group heading for settings stored by the Mac app itself",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "App"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
