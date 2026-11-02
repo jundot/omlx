@@ -17527,6 +17527,12 @@
       "comment" : "Subtitle of the collapsible About oQ Quantization card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vergleich von Standard-oQ und oQe imatrix sowie Erklärung der erweiterten Quantisierung."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17551,6 +17557,12 @@
       "comment" : "Section heading for the static About card on the Quantization screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Über die oQ-Quantisierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17575,6 +17587,12 @@
       "comment" : "Large heading inside the expanded About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ: Universelle dynamische Quantisierung von oMLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17599,6 +17617,12 @@
       "comment" : "Quoted line inside the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quantisierung sollte nicht auf einen bestimmten Inferenzserver beschränkt sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17623,6 +17647,12 @@
       "comment" : "Quoted line inside the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ erzeugt standardmäßige mlx-lm-Modelle, die überall funktionieren: in oMLX, mlx-lm, LM Studio und jeder App, die das MLX-safetensors-Format unterstützt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17647,6 +17677,12 @@
       "comment" : "Quoted line inside the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kein spezieller Loader erforderlich."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17671,6 +17707,12 @@
       "comment" : "Section heading in the expanded About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ und oQe: MLX-native gemischte Präzision"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17695,6 +17737,12 @@
       "comment" : "Section body in the expanded About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Quantisierer liest Tensoren schrittweise aus safetensors, misst die Schichtempfindlichkeit und schreibt einen Checkpoint mit gemischter Präzision innerhalb eines Byte-Budgets. Standard-oQ konzentriert sich auf die Schichtempfindlichkeit und modellspezifische Schutzregeln. oQe behält denselben oQ-Plan bei und ergänzt imatrix-gewichtete affine Quantisierung."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17719,6 +17767,12 @@
       "comment" : "Heading for the standard-oQ feature list in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Was Standard-oQ leistet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17743,6 +17797,12 @@
       "comment" : "Standard-oQ feature title in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schichtempfindlichkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17767,6 +17827,12 @@
       "comment" : "Standard-oQ feature body in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "wird mit Kalibrierungs-Prompts gemessen, indem der Ausgabefehler quantisierter Schichten mit der Gleitkomma-Referenz verglichen wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17791,6 +17857,12 @@
       "comment" : "Standard-oQ feature title in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gemischte Präzision"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17815,6 +17887,12 @@
       "comment" : "Standard-oQ feature body in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "weist empfindlichen Schichten und geschützten Tensoren mehr Bits zu und hält gleichzeitig das angestrebte Budget an Bits pro Gewicht unter einer festen Obergrenze."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17839,6 +17917,12 @@
       "comment" : "Standard-oQ feature title in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Architekturregeln"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17863,6 +17947,12 @@
       "comment" : "Standard-oQ feature body in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE-Router in fp16 belassen, gemeinsame Experten und ausgabekritische Tensoren schützen, Bild-/Audio-Encoder unquantisiert lassen und SSM-Zustandstensoren erhalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17887,6 +17977,12 @@
       "comment" : "Heading for the oQe addition section in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Was oQe ergänzt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17911,6 +18007,12 @@
       "comment" : "oQe section body in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQe verwendet denselben oQ-Empfindlichkeitsplaner und ergänzt einen Kalibrierungsschritt mit einer Wichtigkeitsmatrix. Diese Idee ist ausdrücklich von imatrix aus llama.cpp übernommen: Die Aktivierungsenergie repräsentativer Prompts wird erfasst und genutzt, damit bei den wichtigsten Eingabekanälen weniger Quantisierungsfehler entstehen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17935,6 +18037,12 @@
       "comment" : "Heading for the imatrix steps in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "So funktioniert die imatrix in oQe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17959,6 +18067,12 @@
       "comment" : "oQe imatrix step title in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktivierungsenergie erfassen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17983,6 +18097,12 @@
       "comment" : "oQe imatrix step body in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQe verarbeitet Kalibrierungsbeispiele mit dem Modell und erfasst für jeden quantisierten Linear-Eingabekanal den Mittelwert der quadrierten Eingabeaktivierung E[x^2]."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18007,6 +18127,12 @@
       "comment" : "oQe imatrix step title in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Experten getrennt erfassen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18031,6 +18157,12 @@
       "comment" : "oQe imatrix step body in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Für MoE-SwitchLinear-Schichten erfasst oQe anhand der vom Router ausgewählten Expertenindizes einen Wichtigkeitsvektor pro Experte. Dadurch werden inaktive oder selten aktive Experten im Abdeckungsbericht sichtbar."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18055,6 +18187,12 @@
       "comment" : "oQe imatrix step title in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anzahl der Beispiele anpassen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18079,6 +18217,12 @@
       "comment" : "oQe imatrix step body in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Kalibrierung beginnt mit der angeforderten Anzahl an Beispielen und kann bis zum adaptiven Maximum fortgesetzt werden, wenn die MoE-Experten nicht ausreichend abgedeckt sind."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18103,6 +18247,12 @@
       "comment" : "oQe imatrix step title in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quantisierungsfehler gewichten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18127,6 +18277,12 @@
       "comment" : "oQe imatrix step body in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bei der affinen Quantisierung wählt oQe Kandidaten für Skalierung und Bias aus, indem sum(importance * (weight - dequantized_weight)^2) minimiert wird, statt des einfachen ungewichteten MSE."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18151,6 +18307,12 @@
       "comment" : "Footnote under the imatrix steps in the About oQ card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fehlt für einen Tensor ein passender imatrix-Eintrag, wird standardmäßig für diesen Tensor auf Standard-oQ zurückgegriffen. Strikte Abdeckung aktivieren, damit der Lauf stattdessen abbricht."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18175,6 +18337,12 @@
       "comment" : "Header cell in the oQ/oQe comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pfad"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18199,6 +18367,12 @@
       "comment" : "Header cell in the oQ/oQe comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bit-Zuweisung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18223,6 +18397,12 @@
       "comment" : "Header cell in the oQ/oQe comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Affine Quantisierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18247,6 +18427,12 @@
       "comment" : "Header cell in the oQ/oQe comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einsatzgebiet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18271,6 +18457,12 @@
       "comment" : "oQ row cell in the comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gemischte Präzision nach Schichtempfindlichkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18295,6 +18487,12 @@
       "comment" : "oQ row cell in the comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardmäßige affine Min-/Max-Quantisierung pro Gruppe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18319,6 +18517,12 @@
       "comment" : "oQ row cell in the comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schnelle, deterministische Konvertierung mit hoher Ausgangsqualität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18343,6 +18547,12 @@
       "comment" : "oQe row cell in the comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Derselbe oQ-Plan"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18367,6 +18577,12 @@
       "comment" : "oQe row cell in the comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "imatrix-gewichtete Begrenzung/Suche pro Gruppe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18391,6 +18607,12 @@
       "comment" : "oQe row cell in the comparison table",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bessere Qualität bei wenigen Bits, besonders bei MoE und Schichten mit ungleich verteilten Aktivierungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18415,6 +18637,12 @@
       "comment" : "Segmented row label: precision for tensors not getting quantized",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Datentyp (nicht quantisiert)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18439,6 +18667,12 @@
       "comment" : "Segmented row sublabel explaining what dtype controls",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Präzision für Tensoren, die nicht quantisiert werden (Normierungen, Skalierungsfaktoren)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18463,6 +18697,12 @@
       "comment" : "Toggle row label: keep multi-token prediction heads",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MTP beibehalten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18487,6 +18727,12 @@
       "comment" : "Toggle row sublabel when MTP is available",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Heads für die Multi-Token-Vorhersage im quantisierten Ergebnis behalten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18511,6 +18757,12 @@
       "comment" : "Toggle row sublabel when MTP isn't supported by the chosen source",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht verfügbar: Das Quellmodell hat keine MTP-Heads."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18535,6 +18787,12 @@
       "comment" : "Toggle row label: drop vision encoder weights when quantizing a VLM",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur Text"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18559,6 +18817,12 @@
       "comment" : "Toggle row sublabel: text-only quantization effect",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bild-Encoder-Gewichte ausschließen (etwa 2-3 % kleiner, reine Textausgabe)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18583,6 +18847,12 @@
       "comment" : "Collapsible header for the Quantization advanced-settings block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweiterte Einstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18607,6 +18877,12 @@
       "comment" : "Primary button label that submits a quantization job",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quantisierung starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18631,6 +18907,12 @@
       "comment" : "Button label shown while a quantization start request is in flight",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird gestartet…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18655,6 +18937,12 @@
       "comment" : "Label for the optional oQe imatrix cache path input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pfad zum imatrix-Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18679,6 +18967,12 @@
       "comment" : "Placeholder for an automatically selected oQe imatrix cache path",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18703,6 +18997,12 @@
       "comment" : "Sublabel for the optional oQe imatrix cache path input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leer lassen, um einen automatischen Speicherort für den Cache zu verwenden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18727,6 +19027,12 @@
       "comment" : "Toggle label that enables enhanced oQe quantization",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQe aktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18751,6 +19057,12 @@
       "comment" : "Toggle sublabel explaining what enabling oQe does",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wichtigkeit der Aktivierungen erfassen und damit den Fehler der affinen Quantisierung verringern."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18775,6 +19087,12 @@
       "comment" : "Toggle label for reusing a compatible oQe imatrix cache",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "imatrix-Cache wiederverwenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18799,6 +19117,12 @@
       "comment" : "Toggle sublabel for the oQe imatrix cache reuse option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eine kompatible zwischengespeicherte imatrix verwenden, sofern vorhanden. Andernfalls eine neue erfassen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18823,6 +19147,12 @@
       "comment" : "Toggle label for requiring imatrix entries for every quantized tensor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Strikte imatrix-Abdeckung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18847,6 +19177,12 @@
       "comment" : "Toggle sublabel for strict oQe imatrix coverage",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mit Fehler abbrechen, wenn für einen quantisierten Tensor kein passender imatrix-Eintrag vorhanden ist, statt auf Standard-oQ zurückzugreifen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18871,6 +19207,12 @@
       "comment" : "Section subtitle explaining oQe imatrix calibration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die affine Quantisierung mithilfe einer imatrix-Kalibrierung nach der Wichtigkeit der Aktivierungen gewichten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18895,6 +19237,12 @@
       "comment" : "Section title for the optional oQe imatrix-calibration controls",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweiterte Quantisierung (oQe)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18919,6 +19267,12 @@
       "comment" : "Banner shown when no full-precision models are available to quantize",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Modelle mit voller Präzision auf der Festplatte gefunden. Zuerst im Tab „Downloads“ ein Modell herunterladen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18994,6 +19348,12 @@
       "comment" : "Banner error when the server returned success=false for a quant start",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server hat die Anfrage abgelehnt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19035,6 +19395,12 @@
       "comment" : "Estimate pill: effective bits-per-weight. Placeholder is the formatted bpw value",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Effektive %@ bpw"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19059,6 +19425,12 @@
       "comment" : "Estimate pill placeholder shown while values are being computed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird berechnet…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19083,6 +19455,12 @@
       "comment" : "Estimate pill: peak memory required to quantize. Placeholder is the formatted byte string",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geschätzter Arbeitsspeicher: ~%@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19107,6 +19485,12 @@
       "comment" : "Estimate pill: predicted on-disk size of the quantized output. Placeholder is the formatted byte string",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgabegröße: ~%@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19131,6 +19515,12 @@
       "comment" : "Eyebrow text above the Quantization screen header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ-Quantisierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19155,6 +19545,12 @@
       "comment" : "Subtitle paragraph describing what the Quantization screen does",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein Modell mit voller Präzision und eine oQ-Stufe auswählen, dann erstellt oMLX einen Plan mit gemischter Präzision, abgestimmt auf die Schichtempfindlichkeit des Modells. Die Ausgabe besteht aus standardmäßigen mlx-lm-safetensors und läuft in jeder MLX-Laufzeit."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19179,6 +19575,12 @@
       "comment" : "Main title for the Quantization screen header",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf dem Gerät quantisieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19203,6 +19605,12 @@
       "comment" : "Tooltip on the X button for an active quant task",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abbrechen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19227,6 +19635,12 @@
       "comment" : "Tooltip on the X button for a terminal quant task",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entfernen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19251,6 +19665,12 @@
       "comment" : "Subtitle for the Queue section. Placeholder is the task count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aufgaben: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19275,6 +19695,12 @@
       "comment" : "Section heading for the quantization task queue",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Warteschlange"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19299,6 +19725,12 @@
       "comment" : "Button label on a completed quant task that opens the HF upload sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zu HF hochladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19323,6 +19755,12 @@
       "comment" : "Tooltip on the Upload to HF button",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "In den Hugging Face Hub hochladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19347,6 +19785,12 @@
       "comment" : "Sentinel option meaning no sensitivity-model override",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keines (Quellmodell verwenden)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19371,6 +19815,12 @@
       "comment" : "Placeholder option in the source-model dropdown",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell auswählen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19395,6 +19845,12 @@
       "comment" : "Row label for the oQ level picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oQ-Stufe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19419,6 +19875,12 @@
       "comment" : "Row sublabel explaining the oQ level tradeoff",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Weniger Bits = kleiner, schneller, ungenauer"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19443,6 +19905,12 @@
       "comment" : "Row label for the optional sensitivity-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Empfindlichkeitsmodell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19467,6 +19935,12 @@
       "comment" : "Row sublabel for the sensitivity-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quantisierte Variante verwenden, um die Schichtempfindlichkeit mit ~4× weniger Arbeitsspeicher zu analysieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19491,6 +19965,12 @@
       "comment" : "Row label for the source-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19515,6 +19995,12 @@
       "comment" : "Row sublabel explaining the source-model picker constraint",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur Modelle mit voller Präzision lassen sich quantisieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19539,6 +20025,12 @@
       "comment" : "Subtitle for Source Model section. Placeholder is the full-precision model count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verfügbare Modelle mit voller Präzision: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19563,6 +20055,12 @@
       "comment" : "Subtitle while the source model list is loading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19587,6 +20085,12 @@
       "comment" : "Section heading for the source-model picker on the Quantization screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quellmodell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19611,6 +20115,12 @@
       "comment" : "Status chip label for a quantization cancelled by the user",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abgebrochen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19635,6 +20145,12 @@
       "comment" : "Status chip label for a finished quantization",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abgeschlossen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19659,6 +20175,12 @@
       "comment" : "Status chip label for a failed quantization",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fehlgeschlagen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19683,6 +20205,12 @@
       "comment" : "Status chip label while the source model is being loaded",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird geladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19707,6 +20235,12 @@
       "comment" : "Status chip label for a queued quantization task",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausstehend"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19731,6 +20265,12 @@
       "comment" : "Status chip label while quantization is running",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird quantisiert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19755,6 +20295,12 @@
       "comment" : "Status chip label while the quantized output is being written",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird gespeichert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19779,6 +20325,12 @@
       "comment" : "Success banner after a quant job starts. Placeholders: source model name, target oQ level",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quantisierung gestartet: %1$@ → %2$@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19803,6 +20355,12 @@
       "comment" : "Subtitle when a token has been validated. Placeholder is the HF username",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Angemeldet als @%@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -19827,6 +20385,12 @@
       "comment" : "Subtitle when no token has been validated yet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token validieren, um das Hochladen zu aktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19851,6 +20415,12 @@
       "comment" : "Section heading inside the upload sheet for the HF token row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zugangsdaten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19875,6 +20445,12 @@
       "comment" : "Row label for the HF namespace picker (user or org)",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ziel-Namespace"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19899,6 +20475,12 @@
       "comment" : "Row sublabel before any token has been validated",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nach der Validierung verfügbar"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19923,6 +20505,12 @@
       "comment" : "Row sublabel when the validated user has no orgs",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ihr Konto ist der einzige verfügbare Namespace"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19947,6 +20535,12 @@
       "comment" : "Row sublabel when orgs are available to publish under",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Unter Ihrem Konto oder einer Ihrer Organisationen veröffentlichen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19971,6 +20565,12 @@
       "comment" : "Toggle row label: append a re-download banner to the auto-generated README",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hinweis zum erneuten Herunterladen hinzufügen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19995,6 +20595,12 @@
       "comment" : "Row label when README is copied — notice toggle is disabled",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hinweis zum erneuten Herunterladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20019,6 +20625,12 @@
       "comment" : "Value text displayed when the re-download notice is unavailable",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20043,6 +20655,12 @@
       "comment" : "Toggle row sublabel for the re-download notice",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Banner anhängen, das Nutzer des Modells zum erneuten Herunterladen auffordert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20067,6 +20685,12 @@
       "comment" : "Row sublabel explaining why the notice toggle is off",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deaktiviert, wenn eine vorhandene README kopiert wird"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20091,6 +20715,12 @@
       "comment" : "Toggle row label: publish as private",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Privates Repository"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20115,6 +20745,12 @@
       "comment" : "Toggle row sublabel explaining the private flag",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur Sie und Ihre Organisation sehen dieses Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20139,6 +20775,12 @@
       "comment" : "Default option in the README source picker meaning generate a default card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch erzeugen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20163,6 +20805,12 @@
       "comment" : "README source option that copies an existing model's README. Placeholder is the source model name",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kopieren von %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -20187,6 +20835,12 @@
       "comment" : "Row label for the README source picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20211,6 +20865,12 @@
       "comment" : "Row sublabel explaining the README source options",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard-Modellkarte erzeugen oder von einem anderen lokalen Modell kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20235,6 +20895,12 @@
       "comment" : "Section heading for the README configuration inside the upload sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "README"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20259,6 +20925,12 @@
       "comment" : "Row label for the editable HF repo name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Repository-Name"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20283,6 +20955,12 @@
       "comment" : "Row sublabel previewing the full repo id. Placeholder is namespace or <namespace> sentinel",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die vollständige Repository-ID lautet %@/<repo-name>"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -20307,6 +20985,12 @@
       "comment" : "Section heading for the repo-config rows inside the upload sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Repository"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20331,6 +21015,12 @@
       "comment" : "Title of the upload-to-HF sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zu Hugging Face hochladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20355,6 +21045,12 @@
       "comment" : "Row label for the HF token input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "HF-Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20379,6 +21075,12 @@
       "comment" : "Button label that re-runs HF token validation after a successful one",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erneut validieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20403,6 +21105,12 @@
       "comment" : "Row sublabel explaining where the HF token is stored",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird im macOS-Schlüsselbund gespeichert. Benötigt Schreibzugriff auf Ihr Konto."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20427,6 +21135,12 @@
       "comment" : "Button label that triggers HF token validation",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Validieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20451,6 +21165,12 @@
       "comment" : "Button label while the HF token validation request is in flight",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird validiert…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20475,6 +21195,12 @@
       "comment" : "Primary footer button label that starts the HF upload",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hochladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20499,6 +21225,12 @@
       "comment" : "Footer button label shown while the upload start request is in flight",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird hochgeladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20523,6 +21255,12 @@
       "comment" : "Status chip label for an upload cancelled by the user",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abgebrochen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20547,6 +21285,12 @@
       "comment" : "Status chip label for a finished upload",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abgeschlossen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20571,6 +21315,12 @@
       "comment" : "Status chip label for a failed upload",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fehlgeschlagen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20595,6 +21345,12 @@
       "comment" : "Status chip label for a queued upload",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausstehend"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20619,6 +21375,12 @@
       "comment" : "Status chip label while an upload is in progress",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird hochgeladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20660,6 +21422,12 @@
       "comment" : "Validation error when the HF token field is empty before validation",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token ist leer."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20701,6 +21469,12 @@
       "comment" : "Error when the server returned success=false for an upload start",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server hat die Anfrage abgelehnt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20725,6 +21499,12 @@
       "comment" : "Error when an upload start request throws. Placeholder is the underlying error description",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hochladen fehlgeschlagen: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -20749,6 +21529,12 @@
       "comment" : "Error message when HF token validation throws. Placeholder is the underlying error description",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Validierung fehlgeschlagen: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -20773,6 +21559,12 @@
       "comment" : "Tooltip on the X button for an active upload task",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abbrechen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20797,6 +21589,12 @@
       "comment" : "Button label that opens the published HF repo URL in a browser",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20821,6 +21619,12 @@
       "comment" : "Tooltip on the X button for a terminal upload task",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entfernen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -20845,6 +21649,12 @@
       "comment" : "Subtitle for Uploads section. Placeholders: active count, completed count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktiv: %1$lld / abgeschlossen: %2$lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -20869,6 +21679,12 @@
       "comment" : "Section heading for the HF upload task list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Uploads"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
