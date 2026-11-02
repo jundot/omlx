@@ -11349,6 +11349,12 @@
       "comment" : "Footer button on the Network screen that commits the edited proxy/TLS values to the server",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übernehmen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11373,6 +11379,12 @@
       "comment" : "Row label for the custom CA bundle path field on the Network screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CA-Bundle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11397,6 +11409,12 @@
       "comment" : "Sublabel explaining the CA bundle field on the Network screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Absoluter Pfad zu einem PEM-kodierten CA-Bundle. Leer = Zertifikatsspeicher des Systems."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11421,6 +11439,12 @@
       "comment" : "Row label for the HTTP_PROXY field on the Network screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "HTTP-Proxy"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11445,6 +11469,12 @@
       "comment" : "Row label for the HTTPS_PROXY field on the Network screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "HTTPS-Proxy"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11469,6 +11499,12 @@
       "comment" : "Row label for the NO_PROXY field on the Network screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kein Proxy"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11493,6 +11529,12 @@
       "comment" : "Sublabel explaining the No proxy field format on the Network screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durch Kommas getrennte Liste von Hosts und CIDR-Bereichen, die den Proxy umgehen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11517,6 +11559,12 @@
       "comment" : "Subtitle under the Proxies section header explaining how the values are applied",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgehendes HTTP-Routing. Leer = kein Proxy. Wird über die Umgebungsvariablen HTTP_PROXY / HTTPS_PROXY / NO_PROXY angewendet."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11541,6 +11589,12 @@
       "comment" : "Section header above the outbound proxy fields on the Network screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Proxies"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11565,6 +11619,12 @@
       "comment" : "Subtitle under the TLS section header on the Network screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eigene Root-CA für Umgebungen, in denen Proxies TLS-Verbindungen prüfen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11589,6 +11649,12 @@
       "comment" : "Section header above the TLS / custom CA fields on the Network screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TLS"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
