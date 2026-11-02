@@ -591,8 +591,9 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
         pooled, ncs, cs_, offs, ci, cmax = _dummy(mx.uint8), [0] * b_n, [0] * b_n, [0] * b_n, _dummy(mx.int32), 1
     nbs = [max(1, (w + cr + 63) // 64) for cr in cs_]
     nbmax = max(nbs)
-    meta = mx.array([[w, cs_[r], w, ncs[r], nbs[r], offs[r], 0, 0] for r in range(b_n)], mx.int32)
-    tmpl = [("D", d), ("H", h), ("NBMAX", nbmax), ("WSTRIDE", w * (d + d // 32)), ("WIS", 0), ("CMAX", cmax)]
+    # Slots 6 and 7 are the kernels' slice strides: ci's column count and the output block count.
+    meta = mx.array([[w, cs_[r], w, ncs[r], nbs[r], offs[r], cmax, nbmax] for r in range(b_n)], mx.int32)
+    tmpl = [("D", d), ("H", h), ("WSTRIDE", w * (d + d // 32)), ("WIS", 0)]
     grid = (h // 8 * 1024, nbmax, b_n)
     s, bmax = DL.kernel("attn_scores_bq")(
         inputs=[q, win, pooled, _arange_i32(w), ci, meta, _const((d**-0.5,))],
@@ -604,7 +605,7 @@ def window_attention_bq(att, q, win, parts, memo, cos, sin, c):
         output_shapes=[(b_n * h * nbmax * d,), (b_n * h * nbmax,)], output_dtypes=[mx.float32, mx.float32])
     return DL.kernel("o_merge_bq")(
         inputs=[pv, den, bmax, att.attn_sink, meta, cos, sin],
-        template=[("NH", h), ("HD", d), ("RD", c.rope_head_dim), ("TPG", 1024), ("NBMAX", nbmax)],
+        template=[("NH", h), ("HD", d), ("RD", c.rope_head_dim), ("TPG", 1024)],
         grid=((h * d // 32 + 31) // 32 * 1024, b_n, 1), threadgroup=(1024, 1, 1),
         output_shapes=[(b_n * h * d,)], output_dtypes=[mx.float32])[0].reshape(b_n, h * d)
 

@@ -1,10 +1,19 @@
 """Checkpoint-free Metal numerical and sparse-addressing gates."""
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import numpy as np
 import pytest
 
-from omlx.patches.deepseek_v41 import activation, hyper_connection, kernels, routing
+from omlx.patches.deepseek_v41 import (
+    activation,
+    decode_fused,
+    decode_layer,
+    hyper_connection,
+    kernels,
+    routing,
+)
 from omlx.patches.deepseek_v41.gemv import mxfp8_gemv
 from omlx.patches.deepseek_v41.kernels import (
     packed_index_scores,
@@ -522,6 +531,57 @@ def test_kernel_templates_do_not_depend_on_token_counts(monkeypatch):
 
     assert len(templates) == 8
     assert {key: len(seen) for key, seen in templates.items() if len(seen) != 1} == {}
+
+
+def test_batched_decode_templates_do_not_depend_on_positions(monkeypatch):
+    """The selected index count and block count grow with the position until
+    index_topk. They reach the batched decode attention kernels as meta, so each
+    kernel keeps one template, and every meta row carries the batch-wide slice
+    strides. Only launches are inspected, so this runs without Metal."""
+    templates = {}
+
+    def fake_kernel(name, formats=()):
+        def launch(**kw):
+            templates.setdefault(name, set()).add(tuple(kw["template"]))
+            if name == "attn_scores_bq":
+                meta, ci = np.array(kw["inputs"][5]), kw["inputs"][4]
+                assert (meta[:, 6] == ci.shape[1]).all()
+                assert (meta[:, 7] == kw["grid"][1]).all()
+            shapes = zip(kw["output_shapes"], kw["output_dtypes"])
+            return [mx.zeros(s, t) for s, t in shapes]
+
+        return launch
+
+    monkeypatch.setattr(decode_layer, "kernel", fake_kernel)
+    w, h, d, rd = 128, 8, 512, 64
+    c = SimpleNamespace(window_size=w, n_heads=h, head_dim=d, rope_head_dim=rd)
+    with mx.stream(mx.cpu):
+        for position in range(128, 2200, 64):
+            # Requests at different positions select different index counts.
+            rows = [(p + 1) // 4 for p in (position, position + 7, 3 * position)]
+            parts = [
+                (
+                    mx.zeros((1, n, d // 2 + d // 16), mx.uint8),
+                    mx.zeros((1, 1, min(512, n)), mx.int32),
+                )
+                for n in rows
+            ]
+            decode_fused.window_attention_bq(
+                SimpleNamespace(attn_sink=mx.zeros((h,))),
+                mx.zeros((3, h * d), mx.bfloat16),
+                mx.zeros((3, w, d + d // 32), mx.uint8),
+                parts,
+                {},
+                mx.zeros((3, rd // 2)),
+                mx.zeros((3, rd // 2)),
+                c,
+            )
+
+    assert {name: len(seen) for name, seen in templates.items()} == {
+        "attn_scores_bq": 1,
+        "attn_pv_bq": 1,
+        "o_merge_bq": 1,
+    }
 
 
 @pytest.mark.parametrize(
