@@ -26,6 +26,11 @@ The other changes align Ming-3.0 with the upstream inclusionAI code:
 - The reference latent is sampled with the Oobleck posterior
   ``std = softplus(scale) + 1e-4``.
 - A built-in voice combined with an instruction is a request error.
+
+Ming-3.0 Tiny (mlx-audio ``lingv3_tts``) runs the same DiT, 16 blocks deep,
+under a float32 Euler loop that dominates its decode step. Its
+``FlowLoss.sample`` is compiled the same way, with the fused DiT blocks on
+bf16 checkpoints.
 """
 
 from __future__ import annotations
@@ -49,14 +54,23 @@ from ..exceptions import InvalidRequestError
 from . import ming3_dit_kernels as fused
 
 try:
-    from mlx_audio.codec.models.stepaudio2.convert import (
-        _map_stepaudio2_campplus_key,
-    )
-    from mlx_audio.codec.models.stepaudio2.speaker import StepAudio2CAMPPlus
     from mlx_audio.tts.models.bailingmm import bailingmm
     from mlx_audio.utils import load_audio, resample_audio
 except ImportError:  # mlx-audio is optional.
     bailingmm = None
+
+try:
+    from mlx_audio.codec.models.stepaudio2.convert import (
+        _map_stepaudio2_campplus_key,
+    )
+    from mlx_audio.codec.models.stepaudio2.speaker import StepAudio2CAMPPlus
+except ImportError:  # Only voice clones need CAM++.
+    StepAudio2CAMPPlus = None
+
+try:
+    from mlx_audio.tts.models.lingv3_tts import flow as tiny_flow
+except ImportError:  # Older mlx-audio pins have no Ming-3.0 Tiny.
+    tiny_flow = None
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +125,27 @@ class _CachedRope:
             rotary._apply(q, self.cos, self.sin),
             rotary._apply(k, self.cos, self.sin),
         )
+
+
+def _dit_rows(dit, rope, current, x_history, c_embed, t_emb, *, use_fused, pair):
+    """DiT rows ``[t + c, history, latent]`` after every block, for one Euler step.
+
+    ``pair`` repeats the latent for the two CFG halves on the MLX path. The
+    fused EMBED kernel always writes both halves from one ``x_history`` row.
+    """
+    if use_fused:
+        h = fused.cfm_embed(current, dit.x_embedder, t_emb, c_embed, x_history)
+        for block in dit.blocks:
+            h = fused.dit_block(block, h, rope.cos, rope.sin)
+        return h
+    x_now = dit.x_embedder(
+        mx.concatenate([current, current], axis=0) if pair else current
+    )
+    h = mx.concatenate([x_history, x_now], axis=1)
+    h = mx.concatenate([t_emb + c_embed, h], axis=1)
+    for block in dit.blocks:
+        h = block(h, None, rope)
+    return h
 
 
 class _Ming3State:
@@ -220,12 +255,17 @@ class _Ming3State:
             x_history = dit.x_embedder(mx.concatenate([hist, hist], axis=0))
             y = noise.astype(dtype)
             for i in range(steps):
-                x_now = dit.x_embedder(mx.concatenate([y, y], axis=0))
-                x_full = mx.concatenate([x_history, x_now], axis=1)
-                x_full = mx.concatenate([t_emb[i] + c_embed, x_full], axis=1)
-                for block in dit.blocks:
-                    x_full = block(x_full, None, rope)
-                out = dit.final_layer(x_full)[:, -1:, :]
+                h = _dit_rows(
+                    dit,
+                    rope,
+                    y,
+                    x_history,
+                    c_embed,
+                    t_emb[i],
+                    use_fused=False,
+                    pair=True,
+                )
+                out = dit.final_layer(h)[:, -1:, :]
                 pred, null_pred = mx.split(out, 2, axis=0)
                 f0 = (pred + (pred - null_pred) * cfg).astype(dtype)
                 y = y + dts[i] * f0
@@ -247,13 +287,142 @@ class _Ming3State:
             x_history = dit.x_embedder(hist)
             y = noise
             for i in range(steps):
-                h = fused.cfm_embed(y, dit.x_embedder, t_emb[i], c_embed, x_history)
-                for block in dit.blocks:
-                    h = fused.dit_block(block, h, rope.cos, rope.sin)
+                h = _dit_rows(
+                    dit,
+                    rope,
+                    y,
+                    x_history,
+                    c_embed,
+                    t_emb[i],
+                    use_fused=True,
+                    pair=True,
+                )
                 y = fused.cfm_final(h, dit.final_layer, y, dtt, sq, sde, shift, i, cfg)
             return y
 
         return mx.compile(cfm_fn, inputs=dit.state)
+
+
+class _TinyFlowState:
+    """Compiled float32 Euler samplers for one Ming-3.0 Tiny ``FlowLoss``."""
+
+    def __init__(self, flowloss):
+        dit = flowloss.cfm.model
+        self.dit = dit
+        self.rope = _CachedRope(dit.rotary_embed, 3)
+        gpu = mx.default_device() == mx.gpu
+        self.fused = gpu and fused.cfm_supported(dit)
+        self._fns: dict[tuple, Any] = {}
+
+    def sampler(self, cfg: float, steps: int, dtype):
+        """Compiled ``fn(hidden, history, state, noises, shift)``.
+
+        ``shift`` is sigma * sqrt(temperature) in float32 and ``noises`` are
+        the per-step SDE draws, drawn in the eager loop's order. Seeded calls
+        match the eager loop except on the fused bf16 path.
+        """
+        key = (float(cfg), int(steps), dtype)
+        fn = self._fns.get(key)
+        if fn is None:
+            fn = self._build(*key)
+            self._fns[key] = fn
+        return fn
+
+    def _build(self, cfg, steps, dtype):
+        dit = self.dit
+        rope = self.rope
+        # The lingv3_tts FlowLoss.sample schedule, in float32.
+        times = tiny_flow.get_epss_timesteps(steps, mx.float32)
+        times = times - (mx.cos(math.pi / 2 * times) - 1 + times)
+        t_emb = [
+            dit.t_embedder(mx.full((1,), times[i], dtype=dtype))[:, None, :]
+            for i in range(steps)
+        ]
+        dts = [times[i + 1] - times[i] for i in range(steps)]
+        sqs = [mx.sqrt(mx.abs(dt)) for dt in dts]
+        mx.eval(t_emb, dts, sqs)
+        # A cfg of 1 runs only the conditional branch, and a cfg near 0 only
+        # the null one.
+        two_branches = not (cfg == 1 or cfg < 1e-5)
+        use_fused = self.fused and two_branches and dtype == mx.bfloat16
+        if use_fused:
+            # EMBED reads one timestep row per CFG half.
+            t_emb = [mx.concatenate([te, te], axis=0) for te in t_emb]
+            mx.eval(t_emb)
+
+        def fn(hidden, history, state, noises, shift):
+            cond = hidden.astype(dtype)
+            past = history.astype(dtype)
+            if two_branches:
+                c_embed = dit.c_embedder(
+                    mx.concatenate([cond, mx.zeros_like(cond)], axis=0), train=False
+                )
+                x_history = dit.x_embedder(
+                    past if use_fused else mx.concatenate([past, past], axis=0)
+                )
+            else:
+                c_embed = dit.c_embedder(
+                    cond if cfg == 1 else mx.zeros_like(cond), train=False
+                )
+                x_history = dit.x_embedder(past)
+            for i in range(steps):
+                h = _dit_rows(
+                    dit,
+                    rope,
+                    state.astype(dtype),
+                    x_history,
+                    c_embed,
+                    t_emb[i],
+                    use_fused=use_fused,
+                    pair=two_branches,
+                )
+                # The MLX path keeps every row so its rounding matches upstream.
+                rows = h[:, -1:, :] if use_fused else h
+                out = dit.final_layer(rows)[:, -1:, :]
+                if two_branches:
+                    prediction, unconditional = mx.split(out, 2, axis=0)
+                    prediction = prediction + (prediction - unconditional) * cfg
+                else:
+                    prediction = out
+                state = state + dts[i] * prediction.astype(mx.float32)
+                # The upstream solver skips the noise after the last step.
+                if i < steps - 1:
+                    state = state + shift * sqs[i] * noises[i]
+            return state
+
+        return mx.compile(fn, inputs=dit.state)
+
+
+def _tiny_flow_sample(
+    self,
+    hidden,
+    history,
+    *,
+    cfg=2.0,
+    sigma=0.25,
+    temperature=0.0,
+    steps=10,
+):
+    """lingv3_tts ``FlowLoss.sample`` for one-latent patches and history."""
+    if cfg < 0 or temperature < 0 or steps < 1 or sigma < 0:
+        raise ValueError(
+            "Flow CFG, sigma and temperature must be nonnegative and steps positive"
+        )
+    state = mx.random.normal(
+        (hidden.shape[0], self.latent_dim, 1), dtype=mx.float32
+    ).transpose(0, 2, 1)
+    # Same draws and order as the eager loop, including the unused last one.
+    noises = mx.stack(
+        [mx.random.normal(state.shape, dtype=mx.float32) for _ in range(steps)]
+    )
+    flow_state = getattr(self, _STATE_ATTR, None)
+    if flow_state is None:
+        flow_state = _TinyFlowState(self)
+        setattr(self, _STATE_ATTR, flow_state)
+    dtype = self.cfm.model.x_embedder.weight.dtype
+    fn = flow_state.sampler(cfg, steps, dtype)
+    shift = mx.array(sigma * math.sqrt(temperature), dtype=mx.float32)
+    return fn(hidden, history, state, noises, shift)
 
 
 def _semantic_length(text: str) -> int:
@@ -381,6 +550,9 @@ def _load_speaker_encoder(model):
     unreadable file does not fail the model load.
     """
     model_path = getattr(model.config, "model_path", None)
+    if StepAudio2CAMPPlus is None:
+        logger.warning("mlx-audio has no CAM++ module; voice clones run without it")
+        return None
     try:
         raw = _campplus_tensors(Path(model_path)) if model_path else None
         if raw is not None:
@@ -416,8 +588,10 @@ def prepare_ming3_state(model: Any) -> None:
 
 def release_ming3_state(model: Any) -> None:
     """Drop compiled functions; call on the thread that ran them."""
-    if model is not None and getattr(model, _STATE_ATTR, None) is not None:
-        setattr(model, _STATE_ATTR, None)
+    # Ming-3.0 keeps its state on the model, Ming-3.0 Tiny on its FlowLoss.
+    for owner in (model, getattr(model, "flowloss", None)):
+        if owner is not None and getattr(owner, _STATE_ATTR, None) is not None:
+            setattr(owner, _STATE_ATTR, None)
 
 
 def _pipelined_sample(
@@ -559,8 +733,30 @@ def _wrap_generate(original):
     return generate
 
 
+def _apply_tiny_patch() -> None:
+    flow_cls = tiny_flow.FlowLoss
+    original = flow_cls.sample
+    if getattr(original, "_omlx_ming3", False):
+        return
+
+    def sample(self, hidden, history, *, patch_size=1, **kwargs):
+        # The compiled DiT runs one row each of condition, history and latent.
+        if patch_size != 1 or hidden.shape[:2] != (1, 1) or history.shape[:2] != (1, 1):
+            return original(self, hidden, history, patch_size=patch_size, **kwargs)
+        return _tiny_flow_sample(self, hidden, history, **kwargs)
+
+    sample._omlx_ming3 = True
+    sample._omlx_original = original
+    flow_cls.sample = sample
+
+
 def apply_ming3_patches() -> bool:
-    """Install the Ming-3.0 changes on mlx-audio's bailingmm Model."""
+    """Install the Ming-3.0 and Ming-3.0 Tiny patches.
+
+    Returns whether the Ming-3.0 (bailingmm) patches are installed.
+    """
+    if tiny_flow is not None:
+        _apply_tiny_patch()
     if bailingmm is None:
         return False
 

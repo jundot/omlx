@@ -1666,6 +1666,53 @@ class TestMing3Patches:
             assert mx.array_equal(got, want).item()
 
     @pytest.mark.parametrize(
+        "cfg, temperature", [(2.0, 0.0), (2.0, 0.5), (1.0, 0.5), (0.0, 0.0)]
+    )
+    def test_tiny_compiled_flow_matches_eager_flow(self, cfg, temperature):
+        from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
+
+        tiny_flow = pytest.importorskip("mlx_audio.tts.models.lingv3_tts.flow")
+        assert apply_ming3_patches()
+        mx.random.seed(5)
+        dit = {"hidden_size": 64, "depth": 2, "num_heads": 4, "mlp_ratio": 4}
+        flow = tiny_flow.FlowLoss(latent_dim=4, hidden_size=32, config=dit)
+        flow.set_dtype(mx.bfloat16)
+        hidden = mx.random.normal((1, 1, 32)).astype(mx.bfloat16)
+        history = mx.random.normal((1, 1, 4))
+
+        def run(sample):
+            mx.random.seed(0)
+            kwargs = {"cfg": cfg, "temperature": temperature, "steps": 10}
+            return sample(flow, hidden, history, **kwargs)
+
+        want = run(tiny_flow.FlowLoss.sample._omlx_original)
+        got = run(tiny_flow.FlowLoss.sample)
+        assert got.dtype == want.dtype == mx.float32
+        assert mx.array_equal(got, want).item()
+
+    def test_tiny_fused_flow_tracks_eager_flow(self):
+        from omlx.patches.mlx_audio_ming3 import _STATE_ATTR, apply_ming3_patches
+
+        tiny_flow = pytest.importorskip("mlx_audio.tts.models.lingv3_tts.flow")
+        assert apply_ming3_patches()
+        mx.random.seed(5)
+        dit = {"hidden_size": 1024, "depth": 1, "num_heads": 16, "mlp_ratio": 4}
+        flow = tiny_flow.FlowLoss(latent_dim=64, hidden_size=32, config=dit)
+        flow.set_dtype(mx.bfloat16)
+        hidden = mx.random.normal((1, 1, 32)).astype(mx.bfloat16)
+        history = mx.random.normal((1, 1, 64))
+
+        def run(sample):
+            mx.random.seed(0)
+            return sample(flow, hidden, history, cfg=2.0, temperature=0.5, steps=10)
+
+        want = run(tiny_flow.FlowLoss.sample._omlx_original)
+        got = run(tiny_flow.FlowLoss.sample)
+        assert getattr(flow, _STATE_ATTR).fused
+        err = (mx.abs(got - want).max() / mx.abs(want).max()).item()
+        assert err < 5e-2
+
+    @pytest.mark.parametrize(
         "text",
         [
             "오늘은 날씨가 정말 좋아서 우리는 공원에 가서 산책을 하고 맛있는 "
