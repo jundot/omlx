@@ -3,6 +3,12 @@
   "strings" : {
     "settings.button.reset_defaults" : {
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardwerte wiederherstellen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -19,6 +25,12 @@
     },
     "settings.reset_defaults.help" : {
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stellt die Standardwerte wieder her. Pfade und API-Schlüssel bleiben erhalten. Zum Speichern auf „Übernehmen“ klicken."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35,6 +47,12 @@
     },
     "settings.reset_defaults.title" : {
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen zurückgesetzt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -51,6 +69,12 @@
     },
     "settings.reset_defaults.message" : {
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Einstellungen wurden auf die Standardwerte zurückgesetzt. Zum Speichern der Änderungen auf „Übernehmen“ klicken."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -141,6 +165,12 @@
       "comment" : "Menu label for hardware overrides in the ANE split tuner",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abweichende Optimierungseinstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -159,6 +189,12 @@
       "comment" : "ANE tuner override: allow offloading work to the CPU",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CPU-Auslagerung erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -177,6 +213,12 @@
       "comment" : "ANE tuner override: allow the gate and up projections on the CPU",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gate-/Aufwärtsprojektion auf CPU erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -195,6 +237,12 @@
       "comment" : "ANE tuner override: allow the down projection on the CPU",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abwärtsprojektion auf CPU erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -213,6 +261,12 @@
       "comment" : "ANE tuner override: allow GDN layers on the ANE",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GDN auf ANE erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -231,6 +285,12 @@
       "comment" : "ANE tuner override: allow GDN layers on the CPU",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GDN auf CPU erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -249,6 +309,12 @@
       "comment" : "ANE tuner override: allow performance-aware CPU scheduling",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leistungsabhängige CPU-Planung erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -267,6 +333,12 @@
       "comment" : "Button that applies the ANE tuner recommendation",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ergebnis verwenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -285,6 +357,12 @@
       "comment" : "Button that re-runs the ANE split tuner",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erneut optimieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -303,6 +381,12 @@
       "comment" : "Button that starts ANE split tuning for the current Mac",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Für diesen Mac optimieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -320,6 +404,12 @@
     "settings.experimental.k2_ane.label" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "K2-Prompt-Verarbeitung auf ANE"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -343,6 +433,12 @@
     "settings.experimental.k2_ane.sub" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE für den Prefill von dichtem MLP und Shared-Expert-MLP verwenden. Attention und Decode bleiben auf der GPU. Änderungen wirken nach dem Neuladen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -366,6 +462,12 @@
     "settings.experimental.k2_ane.dense" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dichtes MLP auf ANE"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -389,6 +491,12 @@
     "settings.experimental.k2_ane.shared" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gemeinsames MLP auf ANE"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -412,6 +520,12 @@
     "settings.experimental.k2_ane.tuner.sub": {
       "extractionState": "manual",
       "localizations": {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optionale Optimierung für lange Prompts mit MLP-Gewichten von acht Bits oder weniger. Die Ergebnisse sagen nichts über die Batch-Leistung aus. Ziel sind drei Minuten, Laden und Bereinigung können länger dauern. Sie können ANE auch ohne Test aktivieren."
+          }
+        },
         "en": {
           "stringUnit": {
             "state": "translated",
@@ -26846,6 +26960,12 @@
       "comment" : "Row label for the DeepSeek V4.1 CED prefill toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CED-Prefill-Beschleunigung (DeepSeek V4.1)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26864,6 +26984,12 @@
       "comment" : "Sublabel for the DeepSeek V4.1 CED prefill toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verbessert die Prefill-Geschwindigkeit in getesteten Konfigurationen um etwa 74–79 %. Nutzt die Causal-Encoder-Decoder-Architektur des Modells, um den Rechenaufwand beim Decoder-Prefill zu senken."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26906,6 +27032,12 @@
       "comment" : "Row label for the Lightning MTP toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lightning MTP"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26930,6 +27062,12 @@
       "comment" : "Default sublabel for the Lightning MTP toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entwirft mehrere Token pro Schritt mit dem integrierten MTP-Kopf des Modells. Bis zu etwa 1,5× schnellere Decodierung für unterstützte Modelle."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26954,6 +27092,12 @@
       "comment" : "Row label for the Lightning MTP draft depth picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Adaptive maximale Tiefe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -26978,6 +27122,12 @@
       "comment" : "Sublabel for the Lightning MTP draft depth picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Passt die Vorschlagstiefe automatisch bis zum gewählten Maximum an."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27002,6 +27152,12 @@
       "comment" : "Default Lightning MTP adaptive maximum draft depth",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3 Token (Standard)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27026,6 +27182,12 @@
       "comment" : "Lightning MTP depth option; placeholder is the maximum draft token count",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27050,6 +27212,12 @@
       "comment" : "Button title that imports an MTPLX MTP side-car",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MTPLX-Side-car importieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27074,6 +27242,12 @@
       "comment" : "Row label for the one-time MTPLX side-car import action",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MTPLX-Side-car"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27098,6 +27272,12 @@
       "comment" : "Sublabel for the MTPLX side-car import action",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Importiert den MTP-Kopf des Modells in den Checkpoint-Index, um Lightning MTP freizuschalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27122,6 +27302,12 @@
       "comment" : "Row label for the Qwen4 extended fused decode toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweiterte fusionierte Qwen4-Decodierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27134,6 +27320,12 @@
       "comment" : "Sublabel for the Qwen4 extended fused decode toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beschleunigt das Decode bei Qwen4 oQ8e und anderen GDN-Layouts, etwa einigen älteren oQ-Downloads und Community-Modellen (bis zu 1,5 GiB mehr Arbeitsspeicher). Keine Wirkung bei aktuellen Builds von oQ2.5e bis oQ6e oder fp16, und kaum Wirkung bei aktiviertem Lightning MTP."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27146,6 +27338,12 @@
       "comment" : "Section header above the Acceleration settings group",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beschleunigung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27170,6 +27368,12 @@
       "comment" : "Toolbar menu holding the reset, optimal and recipe actions",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungsaktionen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27182,6 +27386,12 @@
       "comment" : "Sublabel shown when the float16 activation recast can't be enabled because MoE expert offload is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE-Expertenauslagerung deaktivieren, bevor Float16-Aktivierungen aktiviert werden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27194,6 +27404,12 @@
       "comment" : "Row label for the load-time bfloat16 to float16 recast toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Float16-Aktivierungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27206,6 +27422,12 @@
       "comment" : "Sublabel for the load-time bfloat16 to float16 recast toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wandelt die bfloat16-Skalen, Normierungen und Embeddings dieses Modells beim Laden in float16 um. M1- und M2-GPUs emulieren bfloat16, daher laufen Prefill und Decode schneller. Die Ausgabe kann leicht von bfloat16 abweichen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27218,6 +27440,12 @@
       "comment" : "Menu item for adding a custom (free-form key/value) chat-template kwarg",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benutzerdefiniert…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27242,6 +27470,12 @@
       "comment" : "Plus-button label for adding a chat-template kwarg row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Argument hinzufügen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27266,6 +27500,12 @@
       "comment" : "Count summary in the chat-template editor; placeholder is the entry count",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Argumente: %lld"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -27290,6 +27530,12 @@
       "comment" : "Placeholder text shown when no chat-template kwargs are configured",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Argumente für die Chat-Vorlage."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27314,6 +27560,12 @@
       "comment" : "Checkbox label for forcing a chat-template kwarg via forced_ct_kwargs",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erzwingen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27338,6 +27590,12 @@
       "comment" : "Tooltip explaining the Force checkbox",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fügt diesen Schlüssel zu forced_ct_kwargs hinzu, damit der Anfragetext ihn nicht überschreiben kann."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27362,6 +27620,12 @@
       "comment" : "Placeholder for the custom kwarg key field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schlüssel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27386,6 +27650,12 @@
       "comment" : "Checkbox label that enables a custom reasoning_effort value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benutzerdefiniert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27410,6 +27680,12 @@
       "comment" : "Tooltip on the trash/xmark button that deletes a chat-template kwarg row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Argument entfernen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27434,6 +27710,12 @@
       "comment" : "Section header above the chat-template kwargs editor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chat-Vorlagen-Argumente"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27458,6 +27740,12 @@
       "comment" : "Subtitle for the chat-template kwargs section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird an die Chat-Vorlage des Modells weitergegeben. „Erzwingen“ einschalten, um Werte einzelner Anfragen zu überschreiben."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27482,6 +27770,12 @@
       "comment" : "Eyebrow label above a custom (free-form) chat-template kwarg editor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CUSTOM"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27506,6 +27800,12 @@
       "comment" : "Eyebrow label above the enable_thinking kwarg editor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ENABLE_THINKING"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27530,6 +27830,12 @@
       "comment" : "Eyebrow label above the reasoning_effort kwarg editor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "REASONING_EFFORT"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27554,6 +27860,12 @@
       "comment" : "Placeholder for the custom kwarg value field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27578,6 +27890,12 @@
       "comment" : "Row label for the embedding audio-input toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Audioeingabe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27602,6 +27920,12 @@
       "comment" : "Section header above the embedding audio-input settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Audio"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27614,6 +27938,12 @@
       "comment" : "Sublabel for the embedding audio-input toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Audio-Encoder laden, damit /v1/embeddings Audioelemente akzeptiert. Benötigt auch bei reinen Textanfragen mehr Speicher. Wirkt nach dem Neuladen des Modells."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27638,6 +27968,12 @@
       "comment" : "Row label for the embedding audio length limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max. Audiolänge"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27662,6 +27998,12 @@
       "comment" : "Sublabel for the embedding audio length limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Längere Audiodaten werden auf diese Länge gekürzt (leer = 30 s). Das Kontextfenster des Modells begrenzt sie auf etwa 5 Minuten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27686,6 +28028,12 @@
       "comment" : "Row label for the enable-thinking toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Denken aktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27710,6 +28058,12 @@
       "comment" : "Sublabel for the enable-thinking toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reasoning- und Denkmodus für dieses Modell aktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27734,6 +28088,12 @@
       "comment" : "Draft download button label after the download starts",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird heruntergeladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27758,6 +28118,12 @@
       "comment" : "Button that downloads the draft model an external engine needs; placeholder is the Hugging Face repo",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ herunterladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27782,6 +28148,12 @@
       "comment" : "Sublabel for the external engine toggle of a GGUF model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GGUF-Modelle laufen nur über eine externe Engine."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27806,6 +28178,12 @@
       "comment" : "Row label for the default guided grammar toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vorgegebene Grammatik"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27836,6 +28214,12 @@
       "comment" : "Sublabel for the default guided grammar toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardmäßig eine EBNF-Grammatik für dieses Modell anwenden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27878,6 +28262,12 @@
       "comment" : "Sublabel when SSD N-gram offload is forced by memory limits",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erforderlich, da das Laden in den Arbeitsspeicher das konfigurierte Modellspeicherlimit überschreitet."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27896,6 +28286,12 @@
       "comment" : "Section header above the Experimental settings group",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Experimentelle Funktionen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27938,6 +28334,12 @@
       "comment" : "Row label for serving a model with an external engine",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Externe Engine verwenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27950,6 +28352,12 @@
       "comment" : "Note above MLX-only settings while an external engine serves the model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diese Einstellungen gelten nicht, solange eine externe Engine dieses Modell ausführt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27962,6 +28370,12 @@
       "comment" : "Sublabel for the external engine toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Modell mit einer anderen Inferenz-Engine in einem eigenen Prozess statt mit den MLX-Engines von oMLX ausführen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27974,6 +28388,12 @@
       "comment" : "Row label for the force-sampling toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sampling erzwingen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -27998,6 +28418,12 @@
       "comment" : "Sublabel for the force-sampling toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verwendet diese Werte für Temperatur, Top P und Top K auch dann, wenn ein Client oder Agent andere Werte anfordert."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28040,6 +28466,12 @@
       "comment" : "Row label for the pin-in-memory toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Im Arbeitsspeicher halten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28064,6 +28496,12 @@
       "comment" : "Sublabel for the pin-in-memory toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hält dieses Modell zwischen Anfragen im Arbeitsspeicher."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28088,6 +28526,12 @@
       "comment" : "Row label for the reasoning-parser override field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reasoning-Parser"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28112,6 +28556,12 @@
       "comment" : "Sublabel for the reasoning-parser override field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Überschreibt den Chain-of-Thought-Parser. Leer lassen, um den Standard des Modells zu verwenden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28136,6 +28586,12 @@
       "comment" : "Section header above the Advanced tab fields",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweiterte Einstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28160,6 +28616,12 @@
       "comment" : "Row label for the thinking budget field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Denkbudget"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28184,6 +28646,12 @@
       "comment" : "Sublabel for the thinking budget field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Begrenzt die Denk-Tokens für Reasoning-Modelle. Erzwingt das Ende des Denkens, wenn der Wert überschritten wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28208,6 +28676,12 @@
       "comment" : "Row label for the tool-result token limit field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tool-Ergebnis-Tokens begrenzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28232,6 +28706,12 @@
       "comment" : "Sublabel for the tool-result token limit field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kürzt große Tool-Ergebnisse (z. B. Dateilesevorgänge) auf ein Token-Limit."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28256,6 +28736,12 @@
       "comment" : "Row label for the security-sensitive trust-remote-code toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote-Code vertrauen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28280,6 +28766,12 @@
       "comment" : "Sublabel describing the security implications of trust-remote-code",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Führt benutzerdefinierten Modellcode von Hugging Face aus. Nur für Modelle aktivieren, denen Sie vertrauen. Gilt nur pro Modell und wird nie aus Profilen übernommen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28304,6 +28796,12 @@
       "comment" : "Row label for the model alias field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell-Alias"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28328,6 +28826,12 @@
       "comment" : "Sublabel for the model alias field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Anfragen können dieses Modell auch über seinen Alias statt über den Modellnamen aufrufen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28370,6 +28874,12 @@
       "comment" : "Row label for the context window field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kontextfenster"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28394,6 +28904,12 @@
       "comment" : "Sublabel for the context window field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Legt die gesamte Kontextgröße fest, die das Modell verarbeiten kann. Längere Prompts werden abgelehnt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28436,6 +28952,12 @@
       "comment" : "Sublabel for the context window field of an embedding model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Längere Eingaben werden auf diese Länge gekürzt, wenn die Anfrage kein max_length festlegt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28478,6 +29000,12 @@
       "comment" : "Sublabel for the context window field of a reranker model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird verwendet, wenn eine Anfrage kein max_length festlegt. Jina-Reranker lesen Dokumente gemeinsam bis zu dieser Anzahl an Token, andere Reranker kürzen jedes Paar aus Anfrage und Dokument auf diese Länge."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28520,6 +29048,12 @@
       "comment" : "Row label for the max generated tokens field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Max. Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28544,6 +29078,12 @@
       "comment" : "Placeholder shown when Max Tokens is empty (server default applies)",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28568,6 +29108,12 @@
       "comment" : "Sublabel for the max generated tokens field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Begrenzt die Anzahl der pro Gesprächsrunde generierten Token, wenn die Anfrage kein max_tokens festlegt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28610,6 +29156,12 @@
       "comment" : "Row label for the min-p sampling field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Min P"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28634,6 +29186,12 @@
       "comment" : "Sublabel describing the min-p field range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Untere Wahrscheinlichkeitsschwelle (0 ≤ p ≤ 1)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28658,6 +29216,12 @@
       "comment" : "Row label for the model type override popup",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelltyp"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28682,6 +29246,12 @@
       "comment" : "Row label for the presence-penalty field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Präsenzstrafe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28706,6 +29276,12 @@
       "comment" : "Sublabel describing presence-penalty range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bestraft Token, die bereits im Text vorkommen (−2 bis 2)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28730,6 +29306,12 @@
       "comment" : "Row label for the repetition-penalty field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wiederholungsstrafe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28754,6 +29336,12 @@
       "comment" : "Sublabel describing repetition-penalty range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bestraft wiederholte Token (−2 bis 2)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28778,6 +29366,12 @@
       "comment" : "Section header above the Basic tab fields",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Grundlegende Einstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28802,6 +29396,12 @@
       "comment" : "Row label for the sampling temperature field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Temperatur"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28826,6 +29426,12 @@
       "comment" : "Sublabel describing the temperature field range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zufälligkeit beim Sampling (≥ 0). 0 = deterministisch."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28850,6 +29456,12 @@
       "comment" : "Row label for the top-k sampling field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top K"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28874,6 +29486,12 @@
       "comment" : "Sublabel describing the top-k field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Begrenzt die Kandidaten auf die Top K (0 schaltet die Begrenzung ab)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28898,6 +29516,12 @@
       "comment" : "Row label for the top-p nucleus sampling field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top P"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28922,6 +29546,12 @@
       "comment" : "Sublabel describing the top-p valid range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schwelle für Nucleus-Sampling (0 < p ≤ 1)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28946,6 +29576,12 @@
       "comment" : "Row label for the idle-unload TTL field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TTL"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28970,6 +29606,12 @@
       "comment" : "Placeholder shown when no TTL is configured",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine TTL"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -28994,6 +29636,12 @@
       "comment" : "Sublabel for the idle-unload TTL field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entlädt das Modell automatisch, nachdem es so lange inaktiv war."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29036,6 +29684,12 @@
       "comment" : "Tooltip / sublabel shown when DFlash can't be enabled because MoE expert offload is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE-Expertenauslagerung deaktivieren, bevor DFlash aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29048,6 +29702,12 @@
       "comment" : "Tooltip / sublabel shown when DFlash can't be enabled because Lightning MTP is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lightning MTP deaktivieren, bevor DFlash aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29072,6 +29732,12 @@
       "comment" : "DFlash draft quantization group size — use server default",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29096,6 +29762,12 @@
       "comment" : "DFlash draft quantization weight bits option",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29120,6 +29792,12 @@
       "comment" : "DFlash draft quantization weight bits option",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "4-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29144,6 +29822,12 @@
       "comment" : "DFlash draft quantization weight bits option",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "8-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29168,6 +29852,12 @@
       "comment" : "DFlash verify mode: shrinks block size when acceptance drops",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "adaptiv"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29192,6 +29882,12 @@
       "comment" : "DFlash verify mode option meaning the server default is used",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standard (adaptiv)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29216,6 +29912,12 @@
       "comment" : "DFlash verify mode: standard dflash verifier",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "dflash"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29240,6 +29942,12 @@
       "comment" : "DFlash verify mode: always verify the whole block",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "aus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29264,6 +29972,12 @@
       "comment" : "Initial placeholder option in the SpecPrefill/DFlash draft-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft-Modell auswählen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29288,6 +30002,12 @@
       "comment" : "Row label for the DFlash draft quantization group size picker",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gruppengröße"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29312,6 +30032,12 @@
       "comment" : "Row label for the DFlash draft quantization weight bits picker",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bits pro Gewicht"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29336,6 +30062,12 @@
       "comment" : "Row label for the DFlash draft-quantization picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft-Quantisierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29360,6 +30092,12 @@
       "comment" : "Sublabel for the DFlash draft quantization toggle",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quantisierung des Draft-Modells aktivieren (Bits pro Gewicht und Gruppengröße)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29384,6 +30122,12 @@
       "comment" : "Row label for the DFlash draft-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DFlash-Draft-Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29408,6 +30152,12 @@
       "comment" : "Row label for the DFlash toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DFlash"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29432,6 +30182,12 @@
       "comment" : "Default sublabel for the DFlash toggle (used when the model is compatible)",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Spekulative Decodierung mit Block-Diffusion."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29456,6 +30212,12 @@
       "comment" : "Row label for the DFlash verifier algorithm picker",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prüfmodus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29480,6 +30242,12 @@
       "comment" : "Sublabel for the DFlash verify mode picker",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Algorithmus des Verifizierers. „adaptiv“ wählt anhand gemessener Kosten und Annahmequote, wie viele Entwürfe pro Zyklus geprüft werden. „dflash“ und „aus“ prüfen den gesamten Block."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29504,6 +30272,12 @@
       "comment" : "Row label for the DFlash draft sliding-attention window size field",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft-Fenstergröße"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29528,6 +30302,12 @@
       "comment" : "Sublabel for the DFlash draft window size field",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fenster für die Sliding-Attention des Draft-Modells. Leer = dflash-Standard (2048)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -29552,6 +30332,12 @@
       "comment" : "Row label for the DSA IndexCache toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "IndexCache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29576,6 +30362,12 @@
       "comment" : "Sublabel describing the DSA IndexCache feature",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Index-Cache für Sparse-Attention bei DSA-Modellen. THUDM/IndexCache."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29600,6 +30392,12 @@
       "comment" : "Row label for the SpecPrefill draft-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft-Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29624,6 +30422,12 @@
       "comment" : "Sublabel for the SpecPrefill draft-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kleines Modell, das den Tokenizer mit dem Zielmodell teilt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29648,6 +30452,12 @@
       "comment" : "Row label for the SpecPrefill keep-rate dropdown",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beibehaltungsrate"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29672,6 +30482,12 @@
       "comment" : "Row label for the SpecPrefill toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SpecPrefill"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29696,6 +30512,12 @@
       "comment" : "Sublabel describing SpecPrefill",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Attention-basierter dünn besetzter Prefill für MoE-/Hybridmodelle."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29720,6 +30542,12 @@
       "comment" : "Row label for the SpecPrefill threshold field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schwellenwert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29744,6 +30572,12 @@
       "comment" : "Sublabel for the SpecPrefill threshold field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Minimale Prompt-Tokens zum Auslösen (kürzere Prompts nutzen den vollständigen Prefill)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29768,6 +30602,12 @@
       "comment" : "Row label for the TurboQuant KV cache toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TurboQuant-KV-Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29792,6 +30632,12 @@
       "comment" : "Sublabel describing TurboQuant KV cache",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Quantisiert den KV-Cache während des Prefill. Spart Arbeitsspeicher mit kleinen Qualitätseinbußen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29816,6 +30662,12 @@
       "comment" : "Row label for the VLM MTP draft block-size field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Draft-Blockgröße"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29840,6 +30692,12 @@
       "comment" : "Sublabel for the VLM MTP draft block-size field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tokens, die pro Runde entworfen werden. Leer verwendet den Standard von mlx-vlm."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29864,6 +30722,12 @@
       "comment" : "Row label for the VLM MTP draft-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM-Draft-Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29888,6 +30752,12 @@
       "comment" : "Sublabel for the VLM MTP draft-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Assistent-Draft-Modell, das den Tokenizer des Zielmodells teilt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29912,6 +30782,12 @@
       "comment" : "Row label for the VLM MTP toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29936,6 +30812,12 @@
       "comment" : "Default sublabel for the VLM MTP toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Externes Draft-Modell (Gemma 4 Assistant oder Qwen MTP) beschleunigt einzelne Anfragen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -29960,6 +30842,12 @@
       "comment" : "Button that fills Generation Defaults from the model's own config files",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardwerte laden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30002,6 +30890,12 @@
       "comment" : "Error when the model ships no generation defaults to load",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Standardkonfiguration für dieses Modell gefunden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30044,6 +30938,12 @@
       "comment" : "Section header above the per-model sampling and length defaults",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardwerte für Generierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30086,6 +30986,12 @@
       "comment" : "Subtitle explaining that empty generation fields fall back to the server defaults",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leer lassen, um globale Standardwerte zu verwenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30128,6 +31034,12 @@
       "comment" : "Back button label on a per-model settings sub-page",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zurück zu den Modelleinstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30140,6 +31052,12 @@
       "comment" : "Back button label at the top of the per-model settings screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zurück zu den Modellen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30164,6 +31082,12 @@
       "comment" : "Row label for the MoE expert offload toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE-Expertenauslagerung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30182,6 +31106,12 @@
       "comment" : "Row label for the share of MoE experts kept in memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Residente Experten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30200,6 +31130,12 @@
       "comment" : "Error shown when the MoE resident expert percent is outside 5-95",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geben Sie eine Zahl von 5 bis 95 ein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30224,6 +31160,12 @@
       "comment" : "Sublabel for the MoE resident expert share",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anteil der Expertengewichte, der im Arbeitsspeicher bleibt (5–95 %)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30236,6 +31178,12 @@
       "comment" : "Tooltip on MoE expert offload listing the speculative decoders it excludes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht mit Lightning MTP, VLM MTP oder DFlash kombinierbar."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30260,6 +31208,12 @@
       "comment" : "Tooltip on MoE expert offload for families that keep the MTP head resident",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mit Lightning MTP kombinierbar: Der Draft-Kopf bleibt im Arbeitsspeicher, während die Experten des Hauptmodells gestreamt werden. Nicht mit VLM MTP oder DFlash kombinierbar."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30302,6 +31256,12 @@
       "comment" : "Sublabel for the MoE expert offload toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mixture-of-Experts-Gewichte bei Bedarf aus dem Checkpoint streamen und nur einen Teil im Arbeitsspeicher halten. Ermöglicht MoE-Modelle, die größer als der Arbeitsspeicher sind, verlangsamt jedoch die Decodierung. Erfordert Neuladen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30320,6 +31280,12 @@
       "comment" : "Title of the per-model Memory Saving page and its row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Speicher sparen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30362,6 +31328,12 @@
       "comment" : "Row label for the shared Qwen4 PLE / DeepSeek V4.1 Engram SSD offload toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "N-Gramm-Auslagerung auf SSD"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30404,6 +31376,12 @@
       "comment" : "Sublabel for the shared SSD N-gram offload toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hält die große N-Gramm-Tabelle (Qwen4 PLE oder DeepSeek V4.1 Engram) auf SSD und liest nur die benötigten Zeilen. Spart Arbeitsspeicher, die Geschwindigkeit hängt von den SSD-Lesevorgängen ab. Eine Änderung dieser Einstellung lädt das Modell neu."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30446,6 +31424,12 @@
       "comment" : "Model type option label for speech-to-speech models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Audio STS"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30470,6 +31454,12 @@
       "comment" : "Model type option label for speech-to-text models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Audio STT"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30494,6 +31484,12 @@
       "comment" : "Model type option label for text-to-speech models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Audio TTS"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30518,6 +31514,12 @@
       "comment" : "Model type option meaning the server should auto-detect",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch erkennen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30542,6 +31544,12 @@
       "comment" : "Model type option label for decision models served by /v1/systemone",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entscheidung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30566,6 +31574,12 @@
       "comment" : "Model type option label for embedding models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Embedding"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30590,6 +31604,12 @@
       "comment" : "Model type option label for text language models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "LLM"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30614,6 +31634,12 @@
       "comment" : "Model type option label for reranker models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reranker"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30638,6 +31664,12 @@
       "comment" : "Model type option label for vision-language models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30662,6 +31694,12 @@
       "comment" : "Tooltip / sublabel shown when MoE expert offload can't be enabled because the float16 activation recast is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Float16-Aktivierungen deaktivieren, bevor die MoE-Expertenauslagerung aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30674,6 +31712,12 @@
       "comment" : "Tooltip / sublabel shown when MoE expert offload can't be enabled because DFlash is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DFlash deaktivieren, bevor die MoE-Expertenauslagerung aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30686,6 +31730,12 @@
       "comment" : "Tooltip / sublabel shown when MoE expert offload can't be enabled because Lightning MTP is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lightning MTP deaktivieren, bevor die MoE-Expertenauslagerung aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30698,6 +31748,12 @@
       "comment" : "Tooltip / sublabel shown when MoE expert offload can't be enabled because VLM MTP is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP deaktivieren, bevor die MoE-Expertenauslagerung aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30710,6 +31766,12 @@
       "comment" : "Tooltip / sublabel shown when MTP can't be enabled because DFlash is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DFlash deaktivieren, bevor MTP aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30734,6 +31796,12 @@
       "comment" : "Tooltip / sublabel shown when Lightning MTP can't be enabled because MoE expert offload is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE-Expertenauslagerung deaktivieren, bevor Lightning MTP aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30746,6 +31814,12 @@
       "comment" : "Tooltip / sublabel shown when MTP can't be enabled because TurboQuant KV is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TurboQuant-KV-Cache deaktivieren, bevor MTP aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30770,6 +31844,12 @@
       "comment" : "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP deaktivieren, bevor Lightning MTP aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30794,6 +31874,12 @@
       "comment" : "Plain link button that deep-links to the Server screen's Default Profile section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf dem Server bearbeiten →"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30818,6 +31904,12 @@
       "comment" : "Section label above the user-defined global profile templates chip group",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Globale Profile"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30842,6 +31934,12 @@
       "comment" : "Section label for the per-model profile chip group; placeholder is the model id",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellprofile · %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -30866,6 +31964,12 @@
       "comment" : "Display name shown in the profile detail card when no profile is active",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kein Profil"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30890,6 +31994,12 @@
       "comment" : "Section label above the bundled preset profiles chip group",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Voreingestellte Profile"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30914,6 +32024,12 @@
       "comment" : "Display name of the synthesized 'Server Default' profile card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server-Standardprofil"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30938,6 +32054,12 @@
       "comment" : "Subtitle explaining the role of the Server Defaults profile",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird verwendet, wenn kein Profil gesetzt ist oder ein Profil ein Feld leer lässt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30962,6 +32084,12 @@
       "comment" : "Section header above the read-only Server Defaults card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server-Standardwerte"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -30986,6 +32114,12 @@
       "comment" : "Display name for the in-progress (unsaved) working profile detail card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsprofil"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31010,6 +32144,12 @@
       "comment" : "Segmented control label for the Basic tab",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Grundlegend"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31034,6 +32174,12 @@
       "comment" : "Title of the per-model Profiles page and its row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profile"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31058,6 +32204,12 @@
       "comment" : "SpecPrefill keep-rate dropdown option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "10 %: Aggressiv (~5–7×, etwas Qualitätsverlust)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31082,6 +32234,12 @@
       "comment" : "SpecPrefill keep-rate dropdown option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "20 %: Ausgewogen (~3×, empfohlen)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31106,6 +32264,12 @@
       "comment" : "SpecPrefill keep-rate dropdown option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "25 %: Konservativ+ (~2,5×)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31130,6 +32294,12 @@
       "comment" : "SpecPrefill keep-rate dropdown option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "30 %: Konservativ (~2,2×)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31154,6 +32324,12 @@
       "comment" : "SpecPrefill keep-rate dropdown option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "40 %: Mild (~1,8×)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31178,6 +32354,12 @@
       "comment" : "SpecPrefill keep-rate dropdown option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "50 %: Minimal (~1,5×)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31202,6 +32384,12 @@
       "comment" : "Tooltip / sublabel shown when another speculative feature can't be enabled because VLM MTP is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "VLM MTP deaktivieren, bevor diese Funktion aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31226,6 +32414,12 @@
       "comment" : "Short name of ANE prompt processing in the Experimental row value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ANE-Prefill"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31238,6 +32432,12 @@
       "comment" : "Short name of DeepSeek V4.1 CED prefill in the Acceleration row value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CED-Prefill"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31250,6 +32450,12 @@
       "comment" : "Page row value for MLX-only pages while an external engine serves the model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mit externer Engine nicht verwendet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31262,6 +32468,12 @@
       "comment" : "Chat-template kwargs in the Advanced row value; placeholder is the entry count",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld Argumente"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31274,6 +32486,12 @@
       "comment" : "MoE expert offload in the Memory Saving row value; placeholder is the resident percent",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE-Auslagerung %@%%"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31286,6 +32504,12 @@
       "comment" : "Page row value when no feature on that page is enabled",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31298,6 +32522,12 @@
       "comment" : "Short name of Qwen4 extended fused decode in the Acceleration row value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fused Decode (erweitert)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31310,6 +32540,12 @@
       "comment" : "Short name of the tool-result token limit in the Advanced row value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tool-Ergebnislimit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31322,6 +32558,12 @@
       "comment" : "TurboQuant KV bit-width option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31346,6 +32588,12 @@
       "comment" : "TurboQuant KV bit-width option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2,5-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31370,6 +32618,12 @@
       "comment" : "TurboQuant KV bit-width option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31394,6 +32648,12 @@
       "comment" : "TurboQuant KV bit-width option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "3,5-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31418,6 +32678,12 @@
       "comment" : "TurboQuant KV bit-width option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "4-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31442,6 +32708,12 @@
       "comment" : "TurboQuant KV bit-width option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "6-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31466,6 +32738,12 @@
       "comment" : "TurboQuant KV bit-width option",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "8-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31490,6 +32768,12 @@
       "comment" : "Field name embedded in validation errors for min-p",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Min P"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31514,6 +32798,12 @@
       "comment" : "Validation error when min-p falls outside the allowed range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Min P muss in [0, 1] liegen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31538,6 +32828,12 @@
       "comment" : "Validation error when a sampling field isn't a number; placeholder is the field name",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ muss eine Zahl sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -31562,6 +32858,12 @@
       "comment" : "Validation error when a penalty field is outside [-2,2]; placeholder is the field name",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ muss in [-2, 2] liegen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -31586,6 +32888,12 @@
       "comment" : "Field name embedded in validation errors for presence penalty",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Präsenzstrafe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31610,6 +32918,12 @@
       "comment" : "Field name embedded in validation errors for repetition penalty",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wiederholungsstrafe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31634,6 +32948,12 @@
       "comment" : "Field name embedded in validation errors for temperature",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Temperatur"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31658,6 +32978,12 @@
       "comment" : "Validation error when temperature is below the allowed range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Temperatur muss ≥ 0 sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31682,6 +33008,12 @@
       "comment" : "Validation error when top-k isn't an integer",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top K muss eine ganze Zahl sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31706,6 +33038,12 @@
       "comment" : "Validation error when top-k is negative",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top K muss 0 oder eine positive ganze Zahl sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31730,6 +33068,12 @@
       "comment" : "Field name embedded in validation errors for top-p",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top P"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31754,6 +33098,12 @@
       "comment" : "Validation error when top-p falls outside the allowed range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Top P muss in (0, 1] liegen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31777,6 +33127,12 @@
     "settings.k2.thinking_hint" : {
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "K2 verwendet die Reasoning-Intensität. Mit dem Denkbudget lässt sich das Reasoning begrenzen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31819,6 +33175,12 @@
       "comment" : "Short name of Qwen INT8 activation prefill in the Acceleration row value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "INT8-Prefill"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31831,6 +33193,12 @@
       "comment" : "TurboQuant KV in the Memory Saving row value; placeholder is the bit width",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TurboQuant %@-Bit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31843,6 +33211,12 @@
       "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because DFlash is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DFlash deaktivieren, bevor VLM MTP aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31867,6 +33241,12 @@
       "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because MoE expert offload is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MoE-Expertenauslagerung deaktivieren, bevor VLM MTP aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31879,6 +33259,12 @@
       "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because Lightning MTP is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lightning MTP deaktivieren, bevor VLM MTP aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31903,6 +33289,12 @@
       "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because SpecPrefill is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SpecPrefill deaktivieren, bevor VLM MTP aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31927,6 +33319,12 @@
       "comment" : "Tooltip / sublabel shown when VLM MTP can't be enabled because TurboQuant KV is on",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "TurboQuant-KV-Cache deaktivieren, bevor VLM MTP aktiviert wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31951,6 +33349,12 @@
       "comment" : "Initial placeholder option in the VLM MTP draft-model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Assistent-Draft-Modell auswählen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38797,6 +40201,12 @@
       "comment" : "Menu item that returns every setting of the model to its default",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf Standardwerte zurücksetzen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38815,6 +40225,12 @@
       "comment" : "Menu item that lists the best omlx.ai benchmark settings for this device and model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optimale Einstellungen übernehmen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38833,6 +40249,12 @@
       "comment" : "Menu item that opens the paste-a-recipe sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benutzerdefiniertes Rezept übernehmen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38851,6 +40273,12 @@
       "comment" : "Confirmation dialog title before resetting all model settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alle Einstellungen dieses Modells zurücksetzen?"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38869,6 +40297,12 @@
       "comment" : "Body text inside the reset-settings confirmation dialog",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sampling, Beschleunigung, die Schalter zum Anheften und für den Standard, Aliase und der Anzeigename werden auf ihre Standardwerte zurückgesetzt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38887,6 +40321,12 @@
       "comment" : "Destructive button inside the reset-settings confirmation dialog",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zurücksetzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38905,6 +40345,12 @@
       "comment" : "Title of the paste-a-recipe sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benutzerdefiniertes Rezept übernehmen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38923,6 +40369,12 @@
       "comment" : "Hint explaining where a settings recipe can be copied from",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fügen Sie ein Rezept ein, das Sie aus der Zeile „Recipe“ einer Benchmark-Detailseite auf omlx.ai kopiert haben."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38941,6 +40393,12 @@
       "comment" : "Progress text while a pasted recipe is being applied",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Rezept wird übernommen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38959,6 +40417,12 @@
       "comment" : "Primary button of the paste-a-recipe sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übernehmen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38977,6 +40441,12 @@
       "comment" : "Progress text while omlx.ai candidates are fetched",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beste Benchmark-Ergebnisse werden von omlx.ai abgerufen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38995,6 +40465,12 @@
       "comment" : "Progress text while a chosen benchmark snapshot is applied",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benchmark-Einstellungen werden übernommen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39013,6 +40489,12 @@
       "comment" : "Hint above the benchmark candidate list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wählen Sie ein Benchmark-Ergebnis aus, um dessen Einstellungen zu übernehmen. Die Zeilen zeigen die besten Ergebnisse für diesen Chip und dieses Modell mit gleich viel oder weniger Speicher bei einem 4k-Prompt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39031,6 +40513,12 @@
       "comment" : "Label above the candidates ranked by prompt processing speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beste Prompt-Verarbeitung (PP)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39049,6 +40537,12 @@
       "comment" : "Label above the candidates ranked by token generation speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beste Token-Generierung (TG)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39067,6 +40561,12 @@
       "comment" : "Title of the result sheet after applying a pasted recipe",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Benutzerdefiniertes Rezept übernommen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39085,6 +40585,12 @@
       "comment" : "Title of the optimal-settings sheet",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optimale Einstellungen von omlx.ai"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39103,6 +40609,12 @@
       "comment" : "Headline when omlx.ai has no benchmark for the current device and model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kein Benchmark-Ergebnis passt zu diesem Gerät und Modell."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39121,6 +40633,12 @@
       "comment" : "Guidance shown when no matching benchmark exists",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suchen Sie in den Community-Benchmarks nach einem ähnlichen Modell und übernehmen Sie dessen Rezept über „Benutzerdefiniertes Rezept übernehmen“."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39139,6 +40657,12 @@
       "comment" : "Link button that opens the omlx.ai performance leaderboard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Community-Benchmarks öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39157,6 +40681,12 @@
       "comment" : "Result line when the snapshot equals the current settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Einstellungen stimmten bereits überein, es wurde nichts geändert."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39175,6 +40705,12 @@
       "comment" : "Result line after a pasted recipe was applied",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die folgenden Einstellungen wurden aus dem Rezept übernommen!"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39193,6 +40729,12 @@
       "comment" : "Result line after a chosen benchmark snapshot was applied",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die folgenden Einstellungen wurden aus dem ausgewählten Benchmark übernommen!"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39211,6 +40753,12 @@
       "comment" : "Label above the list of features the server dropped while applying a snapshot",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf diesem Rechner übersprungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39229,6 +40777,12 @@
       "comment" : "Label above the JSON of the applied settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übernommene Einstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39247,6 +40801,12 @@
       "comment" : "Note shown when applied settings only take effect at model load",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Modell verwendet die neuen Einstellungen nach dem nächsten Laden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41473,6 +43033,12 @@
       "comment" : "Row label for the per-model GPU power limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU-Leistungslimit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41497,6 +43063,12 @@
       "comment" : "Sublabel for the per-model GPU power limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Begrenzt die GPU-Leistung des gesamten Macs auf 2 bis 1000 W, während dieses Modell generiert. Das wirkt nur unterhalb der üblichen Leistungsaufnahme. Ein M5 Max braucht zum Beispiel etwa 25 W für eine Antwort: 10 W sparen etwa 40 % Energie pro Token, 5 W etwa die Hälfte."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41521,6 +43093,12 @@
       "comment" : "Error when the GPU power limit is outside the accepted range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das GPU-Leistungslimit muss zwischen 2 und 1000 W liegen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41575,6 +43153,12 @@
       "comment" : "GPU power limit in the Advanced row value; placeholder is the watt value",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU %@ W"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41599,6 +43183,12 @@
       "comment" : "Shown instead of the GPU power limit description when the GPU rejects a power cap",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die GPU dieses Macs unterstützt kein Leistungslimit."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41623,6 +43213,12 @@
       "comment" : "Title of the GPU power limit guide popover",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gemessen auf M5 Max (andere Chips weichen ab)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41647,6 +43243,12 @@
       "comment" : "GPU power guide column: the power limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Limit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41671,6 +43273,12 @@
       "comment" : "GPU power guide column: change in token generation speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Antwortgeschwindigkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41695,6 +43303,12 @@
       "comment" : "GPU power guide column: change in energy used per generated token",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Energie pro Token"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41719,6 +43333,12 @@
       "comment" : "GPU power guide column: change in prompt processing speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prompt-Geschwindigkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41743,6 +43363,12 @@
       "comment" : "GPU power guide row for running without a power limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kein Limit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41767,6 +43393,12 @@
       "comment" : "Footnote of the GPU power limit guide popover",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ab 30 W ändert sich die Antwortgeschwindigkeit kaum. Unter 5 W sinkt die Energie pro Token nicht weiter, und Antworten werden nur langsamer. Das Minimum ist 2 W. Solange das Limit aktiv ist, werden auch andere Anfragen und Apps langsamer. Benchmarks laufen ohne Limit."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -41791,6 +43423,12 @@
       "comment" : "Tooltip on the info button that opens the GPU power limit guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wie viel spart ein Limit?"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
