@@ -31903,6 +31903,12 @@
       "comment" : "Tooltip on the eye-slash button that masks the API key field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schlüssel ausblenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31927,6 +31933,12 @@
       "comment" : "Row label for the primary API key field in Welcome wizard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Schlüssel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31951,6 +31963,12 @@
       "comment" : "Placeholder text inside the API key text field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Schlüssel erstellen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31975,6 +31993,12 @@
       "comment" : "Tooltip on the eye button that unmasks the API key field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schlüssel einblenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -31999,6 +32023,12 @@
       "comment" : "Sublabel explaining API key usage",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieser Schlüssel ist zugleich das Anmeldepasswort für das Web-Dashboard."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32023,6 +32053,12 @@
       "comment" : "NSOpenPanel message when picking the Base Directory in Welcome wizard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wählen Sie einen übergeordneten Ordner. Darin wird ein Verzeichnis .omlx angelegt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32047,6 +32083,12 @@
       "comment" : "NSOpenPanel message when picking the Model Directory in Welcome wizard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wählen Sie das Verzeichnis mit den Modelldateien."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32071,6 +32113,12 @@
       "comment" : "NSOpenPanel button label for the Welcome wizard's folder pickers",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auswählen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32095,6 +32143,12 @@
       "comment" : "Folder picker trigger button in Welcome wizard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchsuchen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32119,6 +32173,12 @@
       "comment" : "Primary footer button that advances from the intro to setup",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Los geht’s"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32143,6 +32203,12 @@
       "comment" : "Footer button that opens the local web dashboard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Web-Dashboard öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32167,6 +32233,12 @@
       "comment" : "Primary footer button that spawns the server",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32191,6 +32263,12 @@
       "comment" : "Footer button label shown while the server is being spawned",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server wird gestartet…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32215,6 +32293,12 @@
       "comment" : "Description on the Welcome completion page",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX läuft lokal unter http://127.0.0.1:%@. Öffnen Sie das Web-Dashboard, um das erste Modell herunterzuladen, Einstellungen zu verwalten und Coding-Tools zu verbinden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32239,6 +32323,12 @@
       "comment" : "Short success status on the Welcome completion page",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server gestartet. Das Dashboard ist bereit."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32263,6 +32353,12 @@
       "comment" : "Heading on the Welcome completion page",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alles bereit!"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32287,6 +32383,12 @@
       "comment" : "Welcome wizard validation: empty base path",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Basisverzeichnis ist erforderlich."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32311,6 +32413,12 @@
       "comment" : "Welcome wizard: port field couldn't be parsed as an integer",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ungültiger Port."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32335,6 +32443,12 @@
       "comment" : "Welcome wizard validation: api key has non-printable or non-ASCII chars",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der API-Schlüssel darf nur druckbare ASCII-Zeichen enthalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32359,6 +32473,12 @@
       "comment" : "Welcome wizard validation: api key below min length",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der API-Schlüssel muss mindestens 4 Zeichen lang sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32383,6 +32503,12 @@
       "comment" : "Welcome wizard validation: api key contains spaces",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der API-Schlüssel darf keine Leerzeichen enthalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32407,6 +32533,12 @@
       "comment" : "Welcome wizard: mkdir on the base path failed; placeholder is the system error message",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Basisverzeichnis konnte nicht angelegt werden: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -32431,6 +32563,12 @@
       "comment" : "Welcome wizard: bind() failed because some other process owns the port",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Port %@ ist bereits belegt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -32455,6 +32593,12 @@
       "comment" : "Welcome wizard: bind() failed because another oMLX instance owns the port",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Port %@ ist bereits belegt (oMLX-Server läuft bereits)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -32479,6 +32623,12 @@
       "comment" : "Welcome wizard validation: port not in valid range",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Port muss eine Zahl zwischen 1 und 65535 sein."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32503,6 +32653,12 @@
       "comment" : "Welcome wizard: PythonRuntime.resolve() threw; placeholder is the system error message",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Python-Laufzeit konnte nicht gefunden werden: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -32527,6 +32683,12 @@
       "comment" : "Welcome wizard: writing settings.json failed; placeholder is the system error message",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Konfiguration konnte nicht gespeichert werden: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -32551,6 +32713,12 @@
       "comment" : "Welcome wizard: ServerProcess.start() threw; placeholder is the system error message",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server konnte nicht gestartet werden: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -32575,6 +32743,12 @@
       "comment" : "Short metadata line on the Welcome intro page",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apple Silicon · macOS-nativ · Apache 2.0"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32599,6 +32773,12 @@
       "comment" : "Short tagline under the Welcome wizard's main heading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lokale KI, kein Warten mehr."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32623,6 +32803,12 @@
       "comment" : "Sub-tagline under the Welcome wizard's main heading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS-nativer MLX-Server mit intelligentem Caching. Claude Code, OpenClaw und Cursor antworten in 5 Sekunden statt in 90."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32647,6 +32833,12 @@
       "comment" : "Main heading shown on the Welcome wizard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32671,6 +32863,12 @@
       "comment" : "Hint line under the API key section pointing to settings.json",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Einstellungen liegen in ~/.omlx/settings.json."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32695,6 +32893,12 @@
       "comment" : "Intro paragraph at the top of the Welcome wizard's setup body",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wählen Sie, wo die Modelle liegen, legen Sie den Port fest und erzeugen Sie den API-Schlüssel für Apps und das Web-Dashboard."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32719,6 +32923,12 @@
       "comment" : "Body for the local server setup card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX bindet beim ersten Start an 127.0.0.1, damit Clients auf diesem Mac den Server nutzen können, ohne ihn im Netzwerk freizugeben."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32743,6 +32953,12 @@
       "comment" : "Title for the local server setup card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lokaler Server"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32767,6 +32983,12 @@
       "comment" : "Heading on the Welcome setup page",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lokalen Server einrichten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32791,6 +33013,12 @@
       "comment" : "Row label for the Model Directory picker in Welcome wizard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellverzeichnis"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32815,6 +33043,12 @@
       "comment" : "Sublabel explaining the model directory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ablageort der heruntergeladenen Modelle."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32839,6 +33073,12 @@
       "comment" : "Row label for the server port field in Welcome wizard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Port"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32863,6 +33103,12 @@
       "comment" : "Sublabel for the port field with the recommended default",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardmäßig 8000. Nur ändern, wenn der Port bereits belegt ist."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -32887,6 +33133,12 @@
       "comment" : "Window title bar text for the Welcome wizard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Willkommen bei oMLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
