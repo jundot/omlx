@@ -527,6 +527,10 @@ def launch_command(args, extra_args: list[str] | None = None):
         print(f"oMLX server is not running at {base_url}")
         print("Start the server first: omlx start")
         sys.exit(1)
+    try:
+        default_model = _optional_str(resp.json().get("default_model")) or ""
+    except (ValueError, AttributeError):
+        default_model = ""
 
     # Get API key: CLI args > settings.json > empty
     api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
@@ -571,8 +575,9 @@ def launch_command(args, extra_args: list[str] | None = None):
         # The integration registers the server's whole model catalog, so
         # there is nothing to pick here; the optional per-tool default (or
         # --model) only seeds the tool's own default model.
+        setting_tool = "codex" if tool_name == "codex_app" else tool_name
         model = (
-            _optional_str(getattr(settings.integrations, f"{tool_name}_model", None))
+            _optional_str(getattr(settings.integrations, f"{setting_tool}_model", None))
             or ""
         )
     if not model and (cli_opus_model or cli_sonnet_model or cli_haiku_model):
@@ -669,6 +674,7 @@ def launch_command(args, extra_args: list[str] | None = None):
         port=port,
         api_key=api_key,
         model=model,
+        default_model=default_model,
         opus_model=opus_model if tool_name == "claude" else None,
         sonnet_model=sonnet_model if tool_name == "claude" else None,
         haiku_model=haiku_model if tool_name == "claude" else None,

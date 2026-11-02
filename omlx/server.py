@@ -845,6 +845,7 @@ from .admin.routes import (
     configured_api_key,
     configured_ui_language,
     is_admin_request,
+    reasoning_levels,
     set_admin_getters,
 )
 from .admin.routes import router as admin_router
@@ -3961,6 +3962,8 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
             continue
 
         m["max_context_window"] = get_max_context_window(model_id)
+        # The chat UI's stops, for clients that offer effort per model.
+        m["reasoning_levels"] = reasoning_levels(m)
         source_model_id = m.get("source_model_id") or model_id
 
         # Resolve effective max_tokens: model setting > global default
