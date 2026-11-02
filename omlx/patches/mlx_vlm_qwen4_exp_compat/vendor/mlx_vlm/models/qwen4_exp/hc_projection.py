@@ -296,8 +296,9 @@ def compatible_projections(down, injection) -> bool:
         and injection.scales.shape == (_HC_COUNT, groups)
         and down.biases.shape == down.scales.shape
         and injection.biases.shape == injection.scales.shape
-        and down.scales.dtype == down.biases.dtype == mx.bfloat16
-        and injection.scales.dtype == injection.biases.dtype == mx.bfloat16
+        and down.scales.dtype in (mx.bfloat16, mx.float16)
+        and down.scales.dtype == down.biases.dtype
+        and injection.scales.dtype == injection.biases.dtype == down.scales.dtype
     )
 
 
@@ -313,8 +314,8 @@ def hybrid_projection(
         not _RUNTIME_FAILED
         and isinstance(x, mx.array)
         and x.shape == (1, 1, _STREAM_WIDTH)
-        and x.dtype == mx.bfloat16
         and compatible_projections(down, injection)
+        and x.dtype == down.scales.dtype
         and mx.default_device() == mx.gpu
         and mx.metal.is_available()
     ):
