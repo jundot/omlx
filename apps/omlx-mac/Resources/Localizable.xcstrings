@@ -37549,6 +37549,12 @@
       "comment" : "Validation error when a preset has no command name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einen Befehlsnamen eingeben."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37573,6 +37579,12 @@
       "comment" : "Validation error for a preset command with invalid characters",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur Buchstaben, Ziffern, - und _, klein geschrieben und ohne Leerzeichen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37597,6 +37609,12 @@
       "comment" : "Validation error when two presets share a command",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eine andere Voreinstellung verwendet diesen Befehl bereits."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37621,6 +37639,12 @@
       "comment" : "Validation error when a preset has no model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein Modell auswählen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37645,6 +37669,12 @@
       "comment" : "Shown when the Ask AI hotkey cannot be registered; the argument is the shortcut",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ wird bereits von macOS oder einer anderen App verwendet. Eine andere Tastenkombination wählen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37669,6 +37699,12 @@
       "comment" : "Shown when the typed slash command matches no preset",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Voreinstellung namens /%@. In den Einstellungen von Ask AI hinzufügen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37693,6 +37729,12 @@
       "comment" : "Shown when a slash command has no text after it",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Den Text eingeben, der nach /%@ gesendet wird."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37717,6 +37759,12 @@
       "comment" : "Shown when a plain question is sent with no default model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein Standardmodell in den Einstellungen von Ask AI auswählen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37741,6 +37789,12 @@
       "comment" : "Tooltip on the copy button of a code block or quote in an Ask AI answer",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37765,6 +37819,12 @@
       "comment" : "Tooltip on the button that copies a whole Ask AI answer",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Antwort kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37789,6 +37849,12 @@
       "comment" : "Notice after an Ask AI answer was copied",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "In die Zwischenablage kopiert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37813,6 +37879,12 @@
       "comment" : "Button in the Ask AI panel that opens the Ask AI settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37837,6 +37909,12 @@
       "comment" : "Placeholder in the Ask AI prompt field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fragen oder / für eine Voreinstellung eingeben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37861,6 +37939,12 @@
       "comment" : "Tooltip on the stop button while an Ask AI answer streams",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stoppen (⌘.)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37885,6 +37969,12 @@
       "comment" : "Key hint in the Ask AI footer while an answer streams",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esc Stoppen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37909,6 +37999,12 @@
       "comment" : "Key hints in the Ask AI footer before the first question",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘↩ Senden   Esc Schließen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37933,6 +38029,12 @@
       "comment" : "Key hints in the Ask AI footer after an answer",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⌘↩ Nachfragen   ⌘N Neu   ⇧⌘C Kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37957,6 +38059,12 @@
       "comment" : "Key hints in the Ask AI footer before the first question when Enter sends",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↩ Senden   ⇧↩ Neue Zeile   Esc Schließen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -37981,6 +38089,12 @@
       "comment" : "Key hints in the Ask AI footer after an answer when Enter sends",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↩ Nachfragen   ⇧↩ Neue Zeile   ⌘N Neu   ⇧⌘C Kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38005,6 +38119,12 @@
       "comment" : "Marker under an Ask AI answer that was stopped early",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gestoppt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38029,6 +38149,12 @@
       "comment" : "Label while the model is still reasoning",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Denkt nach…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38053,6 +38179,12 @@
       "comment" : "Label of the collapsed reasoning section after the answer",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gedankengang"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38077,6 +38209,12 @@
       "comment" : "Hotkey recorder label while waiting for a key press",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tastenkombination drücken…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38101,6 +38239,12 @@
       "comment" : "Tooltip on the Ask AI hotkey recorder",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Klicken, dann die neue Tastenkombination drücken. Esc bricht ab."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38125,6 +38269,12 @@
       "comment" : "Error when the chat stream response is not HTTP",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Server hat eine Antwort gesendet, die Ask AI nicht lesen konnte."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38149,6 +38299,12 @@
       "comment" : "Error when the chat request cannot connect to the local server",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der oMLX-Server ist nicht erreichbar. Prüfen, ob er läuft."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38173,6 +38329,12 @@
       "comment" : "Error when the chat request times out",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Server hat zu lange für die Antwort gebraucht."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38197,6 +38359,12 @@
       "comment" : "Error when the chat request is rejected with HTTP 401",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Server hat den API-Schlüssel abgelehnt. Die Sicherheitseinstellungen prüfen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38221,6 +38389,12 @@
       "comment" : "Hint when the model list could not be loaded",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server starten, um aus installierten Modellen zu wählen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38245,6 +38419,12 @@
       "comment" : "Placeholder option at the top of the Ask AI model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell auswählen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38269,6 +38449,12 @@
       "comment" : "Model picker option for a saved model that is no longer found",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ (nicht installiert)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38293,6 +38479,12 @@
       "comment" : "Section header for the Ask AI text and voice switches",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask AI"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38317,6 +38509,12 @@
       "comment" : "Row label for the switch that enables asking Ask AI by text",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Textmodus aktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38341,6 +38539,12 @@
       "comment" : "Sublabel for the Ask AI text switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aus jeder App mit einer globalen Tastenkombination eine Frage eingeben."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38365,6 +38569,12 @@
       "comment" : "Row label for the Ask AI global shortcut",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tastenkürzel"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38389,6 +38599,12 @@
       "comment" : "Sublabel for the Ask AI global shortcut",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erneut drücken oder Esc schließt die Leiste."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38413,6 +38629,12 @@
       "comment" : "Row label for the idle time that resets the Ask AI conversation",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Neue Unterhaltung starten nach"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38437,6 +38659,12 @@
       "comment" : "Sublabel for the Ask AI conversation reset time",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird die Leiste früher erneut geöffnet, bleibt die letzte Unterhaltung für Nachfragen erhalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38461,6 +38689,12 @@
       "comment" : "Ask AI option: always start a new conversation",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jedes Mal"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38485,6 +38719,12 @@
       "comment" : "Ask AI option: new conversation after 2 idle minutes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "2 Minuten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38509,6 +38749,12 @@
       "comment" : "Row label for the Ask AI Enter-to-send switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Senden mit Eingabetaste"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38533,6 +38779,12 @@
       "comment" : "Sublabel for the Ask AI Enter-to-send switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Eingabetaste sendet die Frage, ⇧↩ fügt eine neue Zeile ein. ⌘↩ sendet immer."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38557,6 +38809,12 @@
       "comment" : "Ask AI option: new conversation after 5 idle minutes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "5 Minuten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38581,6 +38839,12 @@
       "comment" : "Ask AI option: new conversation after 15 idle minutes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "15 Minuten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38605,6 +38869,12 @@
       "comment" : "Placeholder for the Ask AI default system prompt",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optional. Zum Beispiel: Kurz antworten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38629,6 +38899,12 @@
       "comment" : "Section header for the Ask AI slash-command presets",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Voreinstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38653,6 +38929,12 @@
       "comment" : "Subtitle for the Ask AI presets section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein /Befehl in der Leiste von Ask AI nutzt Modell und System-Prompt einer Voreinstellung."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38677,6 +38959,12 @@
       "comment" : "Button that adds an Ask AI preset",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Neu"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38701,6 +38989,12 @@
       "comment" : "Empty state of the Ask AI presets list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Noch keine Voreinstellungen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38725,6 +39019,12 @@
       "comment" : "Confirm button for deleting an Ask AI preset",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Löschen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38749,6 +39049,12 @@
       "comment" : "Confirmation title before deleting an Ask AI preset; the argument is the command",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "/%@ löschen?"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38773,6 +39079,12 @@
       "comment" : "Tooltip on the edit button of an Ask AI preset",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bearbeiten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38797,6 +39109,12 @@
       "comment" : "Tooltip on the delete button of an Ask AI preset",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Löschen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38821,6 +39139,12 @@
       "comment" : "Row label for an Ask AI preset command name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Befehl"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38845,6 +39169,12 @@
       "comment" : "Sublabel for an Ask AI preset command name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Buchstaben beliebiger Sprachen, Ziffern, - und _. Keine Leerzeichen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38869,6 +39199,12 @@
       "comment" : "Placeholder for an Ask AI preset command name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "übersetzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38893,6 +39229,12 @@
       "comment" : "Placeholder for an Ask AI preset system prompt",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zum Beispiel: Den Text in knappem, professionellem Slack-Ton ins Englische übersetzen. Nur die Übersetzung ausgeben."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38917,6 +39259,12 @@
       "comment" : "Label above the Ask AI system prompt editor",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "System-Prompt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38941,6 +39289,12 @@
       "comment" : "Row label for the Ask AI model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38965,6 +39319,12 @@
       "comment" : "Shown in a preset row when no model is chosen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kein Modell"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -38989,6 +39349,12 @@
       "comment" : "Row label for the Ask AI thinking switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nachdenken"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39013,6 +39379,12 @@
       "comment" : "Sublabel for the Ask AI thinking switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wenn aus, antworten Reasoning-Modelle ohne Denkschritt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39037,6 +39409,12 @@
       "comment" : "Row label for the Ask AI auto copy switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39061,6 +39439,12 @@
       "comment" : "Sublabel for the Ask AI auto copy switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Antwort in die Zwischenablage kopieren, sobald sie fertig ist."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39133,6 +39517,12 @@
       "comment" : "Shown when an image is pasted or sent but the target model is not a vision model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ kann keine Bilder lesen. Für Fragen mit Bildern ein Vision-Modell (VLM) verwenden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39157,6 +39547,12 @@
       "comment" : "Shown when more images are pasted than the Ask AI limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bis zu %lld Bilder lassen sich anhängen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39181,6 +39577,12 @@
       "comment" : "Tooltip on the button that removes a pasted image",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bild entfernen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39205,6 +39607,12 @@
       "comment" : "Tooltip on the Ask AI panel icon that moves the panel",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zum Verschieben ziehen. Rechtsklick zum Zurücksetzen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39229,6 +39637,12 @@
       "comment" : "Context menu item that moves the Ask AI panel back to its default spot",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Position zurücksetzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39253,6 +39667,12 @@
       "comment" : "Context menu item that restores the default Ask AI panel width",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Breite zurücksetzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39277,6 +39697,12 @@
       "comment" : "Shown when the model list cannot be loaded to check image support",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ob %@ Bilder lesen kann, ließ sich nicht prüfen. Sicherstellen, dass der Server läuft."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39727,6 +40153,12 @@
       "comment" : "Row label for the GPU power limit while Ask AI answers",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU-Leistungslimit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39751,6 +40183,12 @@
       "comment" : "Sublabel for the Ask AI GPU power limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Begrenzt die GPU-Leistung für den ganzen Mac, während Ask AI antwortet, um Akku zu sparen (2 bis 1000 W). Hat das Modell ebenfalls ein Limit, gilt das niedrigere."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39775,6 +40213,12 @@
       "comment" : "Button that closes the clipboard permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fertig"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39799,6 +40243,12 @@
       "comment" : "Button that opens the macOS Privacy & Security settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Systemeinstellungen öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39823,6 +40273,12 @@
       "comment" : "First step of the clipboard permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf „Test“ klicken, dann „Erlauben“ wählen, wenn macOS nach dem Einsetzen aus einer anderen App fragt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39847,6 +40303,12 @@
       "comment" : "Second step of the clipboard permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Damit nicht bei jeder Unterhaltung gefragt wird, Systemeinstellungen > Datenschutz & Sicherheit öffnen und dort für oMLX „Immer erlauben“ wählen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39871,6 +40333,12 @@
       "comment" : "Button that reads the clipboard once so macOS asks for permission",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Test"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39895,6 +40363,12 @@
       "comment" : "Title of the clipboard permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zugriff auf die Zwischenablage erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39919,6 +40393,12 @@
       "comment" : "Button that opens the clipboard permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "So erlauben Sie den Zugriff…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39943,6 +40423,12 @@
       "comment" : "Warning shown while the clipboard placeholder needs a paste permission",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS fragt nach, bevor oMLX die Zwischenablage für {clipboard} liest."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39967,6 +40453,12 @@
       "comment" : "Back button label on an Ask AI settings sub-page",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zurück zu Ask AI"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -39991,6 +40483,12 @@
       "comment" : "Description of the {app} prompt placeholder",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die App im Vordergrund, wenn Ask AI geöffnet wird"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40015,6 +40513,12 @@
       "comment" : "Description of the {clipboard} prompt placeholder",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Text in der Zwischenablage, bis zu 4.000 Zeichen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40039,6 +40543,12 @@
       "comment" : "Help text above the list of Ask AI prompt placeholders",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Platzhalter werden beim Start einer Unterhaltung gefüllt. Anklicken, um einen hinzuzufügen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40063,6 +40573,12 @@
       "comment" : "Description of the {model} prompt placeholder",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Modell, das antwortet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40087,6 +40603,12 @@
       "comment" : "Explains that a preset prompt replaces the default system prompt",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird statt des Standard-System-Prompts verwendet, solange diese Voreinstellung läuft. Das Datum oder andere Platzhalter hier ergänzen, wenn die Voreinstellung sie braucht."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40111,6 +40633,12 @@
       "comment" : "Button that puts the default Ask AI system prompt back",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf Standard zurücksetzen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40135,6 +40663,12 @@
       "comment" : "Button that quits and reopens oMLX so a new permission applies",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX neu starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40159,6 +40693,12 @@
       "comment" : "Sublabel for the Ask AI default model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird verwendet, wenn eine Frage nicht mit dem Befehl einer Voreinstellung beginnt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40183,6 +40723,12 @@
       "comment" : "Button that closes the screen recording permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Später"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40207,6 +40753,12 @@
       "comment" : "Button that opens the macOS screen recording privacy settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Systemeinstellungen öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40231,6 +40783,12 @@
       "comment" : "First step of the screen recording permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf „Systemeinstellungen öffnen“ klicken und dann oMLX unter Bildschirm- & Systemaudioaufnahme einschalten."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40255,6 +40813,12 @@
       "comment" : "Second step of the screen recording permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Berechtigung gilt erst nach einem Neustart von oMLX. Wenn macOS fragt, „Beenden & neu öffnen“ wählen oder neben der Warnung auf „oMLX neu starten“ klicken."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40279,6 +40843,12 @@
       "comment" : "Title of the screen recording permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bildschirmaufnahme erlauben"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40303,6 +40873,12 @@
       "comment" : "Row and page title for the less used Ask AI text or voice settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweiterte Einstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40327,6 +40903,12 @@
       "comment" : "Section header for the Ask AI text bar settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Per Text fragen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40351,6 +40933,12 @@
       "comment" : "Ask AI tool line after a web page was fetched; the argument is the site",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ gelesen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40375,6 +40963,12 @@
       "comment" : "Ask AI tool line after a page fetch failed; the argument is the site",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ konnte nicht gelesen werden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40399,6 +40993,12 @@
       "comment" : "Ask AI tool line while a web page is fetched; the argument is the site",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ wird gelesen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40423,6 +41023,12 @@
       "comment" : "Ask AI tool line after a screenshot was sent to the model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bildschirm angesehen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40447,6 +41053,12 @@
       "comment" : "Ask AI tool line after a screenshot failed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bildschirm konnte nicht aufgenommen werden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40471,6 +41083,12 @@
       "comment" : "Ask AI tool line while a screenshot is taken",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bildschirm wird angesehen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40495,6 +41113,12 @@
       "comment" : "Ask AI tool line after a web search; the argument is the query",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Web durchsucht: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40519,6 +41143,12 @@
       "comment" : "Ask AI tool line after a failed web search; the argument is the query",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Websuche fehlgeschlagen: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40543,6 +41173,12 @@
       "comment" : "Ask AI tool line while a web search runs; the argument is the query",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Web wird durchsucht: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40567,6 +41203,12 @@
       "comment" : "Checkbox for the Ask AI tool that reads web pages",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Links lesen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40591,6 +41233,12 @@
       "comment" : "Description of the Ask AI read links tool",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Liest Webseiten, auch Links aus einer Frage."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40615,6 +41263,12 @@
       "comment" : "Row label for the Ask AI tool calling switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tool-Aufruf"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40639,6 +41293,12 @@
       "comment" : "Sublabel for the Ask AI tool calling switch",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erlaubt dem Modell, im Web zu suchen, Links zu lesen und bei Bedarf den Bildschirm anzusehen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40663,6 +41323,12 @@
       "comment" : "Checkbox for the Ask AI screen capture tool",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bildschirmaufnahme"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40687,6 +41353,12 @@
       "comment" : "Button that opens the screen recording permission guide",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erlauben…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40711,6 +41383,12 @@
       "comment" : "Shown under the screen capture tool when the model cannot read images",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Braucht ein Vision-Modell (VLM)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40735,6 +41413,12 @@
       "comment" : "Description of the Ask AI screen capture tool",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nimmt einen Screenshot auf, wenn nach etwas auf dem Bildschirm gefragt wird. oMLX-Fenster werden ausgelassen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40759,6 +41443,12 @@
       "comment" : "Warning shown while oMLX has no screen recording permission",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Berechtigung für die Bildschirmaufnahme ist aus, deshalb kann Ask AI den Bildschirm nicht sehen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40783,6 +41473,12 @@
       "comment" : "Checkbox for the Ask AI web search tool",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Websuche"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40807,6 +41503,12 @@
       "comment" : "Description of the Ask AI web search tool",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nutzt den Suchanbieter, der unter Dashboard-Einstellungen > Integrationen festgelegt ist."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -40831,6 +41533,12 @@
       "comment" : "Tooltip on the Ask AI bar button that switches to the voice card",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stattdessen sprechen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
