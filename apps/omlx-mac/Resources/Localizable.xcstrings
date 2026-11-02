@@ -8301,6 +8301,12 @@
       "comment" : "Row label for the Haiku model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Haiku-Stufe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8325,6 +8331,12 @@
       "comment" : "Sublabel for the Haiku tier picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird für Hintergrundaufgaben und Tool-Aufrufe verwendet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8349,6 +8361,12 @@
       "comment" : "Row label for the Claude Code mode segmented control",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8373,6 +8391,12 @@
       "comment" : "Claude Code mode option: route to cloud",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cloud"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8397,6 +8421,12 @@
       "comment" : "Claude Code mode option: route to local server",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lokal"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8421,6 +8451,12 @@
       "comment" : "Row label for the Opus model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Opus-Stufe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8445,6 +8481,12 @@
       "comment" : "Row label for the Sonnet model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sonnet-Stufe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8469,6 +8511,12 @@
       "comment" : "Label for the Codex desktop app launcher command",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desktop-App"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -8493,6 +8541,12 @@
       "comment" : "Label for the Codex CLI launcher command",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CLI"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -8517,6 +8571,12 @@
       "comment" : "Caption above each shell command block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "$ Terminal"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8541,6 +8601,12 @@
       "comment" : "Apply button for the MCP config path",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übernehmen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8565,6 +8631,12 @@
       "comment" : "Row label for the MCP config path input",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Konfigurationspfad"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8589,6 +8661,12 @@
       "comment" : "Sublabel describing the MCP config path field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Absoluter Pfad zu einer MCP-Konfigurationsdatei im JSON-Format. Leer lassen, um sie zu deaktivieren."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8613,6 +8691,12 @@
       "comment" : "Placeholder option shown at the top of every per-integration model picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell auswählen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8637,6 +8721,12 @@
       "comment" : "Row label for the OpenClaw tools-profile picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tool-Profil"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8661,6 +8751,12 @@
       "comment" : "Sublabel for the OpenClaw tools-profile picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Integrierte MCP-Tools, die der OpenClaw-Launcher bereitstellt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8685,6 +8781,12 @@
       "comment" : "OpenClaw tools profile option: coding",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Programmierung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8709,6 +8811,12 @@
       "comment" : "OpenClaw tools profile option: full",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vollständig"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8733,6 +8841,12 @@
       "comment" : "OpenClaw tools profile option: messaging",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nachrichten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8757,6 +8871,12 @@
       "comment" : "OpenClaw tools profile option: minimal",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Minimal"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8781,6 +8901,12 @@
       "comment" : "Section header for the Claude Code integration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Claude Code"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8805,6 +8931,12 @@
       "comment" : "Subtitle for the Claude Code section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leitet Anfragen von Claude Code an lokale Modelle oder die Cloud weiter"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8829,6 +8961,12 @@
       "comment" : "Section header for engines that serve models from their own process",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Externe Engines"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8841,6 +8979,12 @@
       "comment" : "Subtitle for the External Engines section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein Modell mit einer anderen Inferenz-Engine in einem eigenen Prozess bereitstellen. Die Engine wird pro Modell unter Modelleinstellungen → Erweiterte Einstellungen ausgewählt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8853,6 +8997,12 @@
       "comment" : "Section header for the MCP config path row",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MCP"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8877,6 +9027,12 @@
       "comment" : "Subtitle for the MCP section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pfad zu einer Konfigurationsdatei für den MCP-Server. Wird von allen Integrationen gemeinsam genutzt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8901,6 +9057,12 @@
       "comment" : "Section header for the additional integrations list",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Weitere Integrationen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8925,6 +9087,12 @@
       "comment" : "Subtitle for the Other Integrations section",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Standardmodell und Startbefehl für jede benannte Integration"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8949,6 +9117,12 @@
       "comment" : "Section header for the Claude Code setup command block",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einrichtungsbefehl"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8973,6 +9147,12 @@
       "comment" : "Explanation of the advanced env recipe in cloud mode",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Setzt die Anthropic-Umgebungsvariablen zurück, damit die echte claude-Binary mit der Cloud spricht."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8997,6 +9177,12 @@
       "comment" : "Disclosure label revealing the advanced env-var recipe for running claude directly",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Erweitert: claude direkt ausführen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9021,6 +9207,12 @@
       "comment" : "Explanation of the advanced env recipe in local mode",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Richtet die echte claude-Binary auf den lokalen oMLX-Server."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9045,6 +9237,12 @@
       "comment" : "Row label for Splash Neural Engine prefill",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Neural-Engine-Prefill"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9057,6 +9255,12 @@
       "comment" : "Sublabel for Splash Neural Engine prefill",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash darf Teile langer Prompts auf der Neural Engine verarbeiten, wenn dies schneller ist."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9069,6 +9273,12 @@
       "comment" : "Apply button for the Splash launcher path",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übernehmen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9081,6 +9291,12 @@
       "comment" : "Placeholder for an automatic Splash size",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9093,6 +9309,12 @@
       "comment" : "Row label for the Splash launcher",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Splash"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9105,6 +9327,12 @@
       "comment" : "Sublabel for the Splash launcher path field",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pfad zum Launcher splash oder splash-m1"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9117,6 +9345,12 @@
       "comment" : "Tooltip for choosing the Splash launcher",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Launcher auswählen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9129,6 +9363,12 @@
       "comment" : "NSOpenPanel message for choosing the Splash launcher",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wählen Sie den Launcher splash oder splash-m1 aus."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9141,6 +9381,12 @@
       "comment" : "NSOpenPanel button label for choosing the Splash launcher",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auswählen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9153,6 +9399,12 @@
       "comment" : "Cancel editing the Splash launcher path",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abbrechen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9165,6 +9417,12 @@
       "comment" : "Button to edit the detected Splash launcher path",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ändern"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9177,6 +9435,12 @@
       "comment" : "Tooltip when the Splash launcher path was set by the user",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Über einen Pfad festgelegt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9189,6 +9453,12 @@
       "comment" : "Tooltip when the Splash launcher was detected",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch gefunden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9201,6 +9471,12 @@
       "comment" : "Row label for the Splash KV cache format",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "KV-Cache-Präzision"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9213,6 +9489,12 @@
       "comment" : "Sublabel for the Splash KV cache format",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "int8 ermöglicht bei gleichem Speicher etwa doppelt so viel Kontext wie bf16."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9225,6 +9507,12 @@
       "comment" : "Apply button for the Splash memory and SSD cache sizes",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übernehmen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9237,6 +9525,12 @@
       "comment" : "Error when a Splash memory or SSD cache size is not a whole number",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geben Sie ganze Gigabyte an. Bleibt das Feld leer, wird der Wert automatisch gewählt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9249,6 +9543,12 @@
       "comment" : "Row label for the Splash memory limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher-Limit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9261,6 +9561,12 @@
       "comment" : "Sublabel for the Splash memory limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bleibt das Feld leer, hat Splash genug für das volle Kontextfenster. Ein höheres Limit gibt seinem Prefix-Cache mehr Platz."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9273,6 +9579,12 @@
       "comment" : "Row label for the Splash SSD cache size",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "SSD-Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9285,6 +9597,12 @@
       "comment" : "Sublabel for the Splash SSD cache size",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Prefix-Cache von Splash im SSD-Cache-Ordner von oMLX. Bleibt das Feld leer, gilt die Größe des oMLX-SSD-Cache. 0 schaltet ihn ab."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9297,6 +9615,12 @@
       "comment" : "Warning under the Splash SSD cache size about its per-model limit",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gilt für jedes Splash-Modell, und der Cache eines Modells bleibt nach dem Entladen erhalten. Insgesamt kann er also auf diese Größe mal der Anzahl verwendeter Splash-Modelle anwachsen. Legen Sie eine Größe fest, wenn Sie mehr als eines verwenden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9309,6 +9633,12 @@
       "comment" : "Button that clears the Splash path so the server detects the launcher",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Automatisch erkennen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9321,6 +9651,12 @@
       "comment" : "Display name for the Codex integration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Codex"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9345,6 +9681,12 @@
       "comment" : "Display name for the Copilot CLI integration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copilot CLI"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9369,6 +9711,12 @@
       "comment" : "Display name for the DeepSeek Harness (dsh) integration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "DeepSeek Harness"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9393,6 +9741,12 @@
       "comment" : "Display name for the Hermes Agent integration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hermes Agent"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9417,6 +9771,12 @@
       "comment" : "Display name for the OpenClaw integration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OpenClaw"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9441,6 +9801,12 @@
       "comment" : "Display name for the OpenCode integration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OpenCode"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9465,6 +9831,12 @@
       "comment" : "Display name for the Pi integration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pi"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9489,6 +9861,12 @@
       "comment" : "Display name for the Mistral Vibe integration",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mistral Vibe"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
