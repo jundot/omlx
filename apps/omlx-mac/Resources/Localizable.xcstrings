@@ -464,6 +464,12 @@
       "comment" : "Models submenu scope option that lists the whole library",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Alle Modelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -488,6 +494,12 @@
       "comment" : "Models submenu scope option that lists only favorite models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nur Favoriten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -512,6 +524,12 @@
       "comment" : "Appearance row label for the ALL menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gesamtaktivität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -536,6 +554,12 @@
       "comment" : "Appearance row sublabel for the ALL menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchschnittliche Geschwindigkeiten über alle Sitzungen (ALL)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -560,6 +584,12 @@
       "comment" : "Appearance row label for the AVG menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchschnittliche Sitzungsaktivität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -584,6 +614,12 @@
       "comment" : "Appearance row sublabel for the AVG menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchschnittliche Geschwindigkeiten seit dem Serverstart (AVG)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -608,6 +644,12 @@
       "comment" : "Appearance row label for the CPU usage bar menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CPU"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -632,6 +674,12 @@
       "comment" : "Appearance row sublabel for the CPU usage bar menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "CPU-Nutzung als vertikaler Balken."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -656,6 +704,12 @@
       "comment" : "Appearance row label for the GPU usage bar menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -680,6 +734,12 @@
       "comment" : "Appearance row sublabel for the GPU usage bar menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU-Nutzung als vertikaler Balken."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -704,6 +764,12 @@
       "comment" : "Appearance row label for the LIV menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Live-Aktivität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -728,6 +794,12 @@
       "comment" : "Appearance row sublabel for the LIV menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktuelle Geschwindigkeiten über laufende Anfragen (LIV)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -752,6 +824,12 @@
       "comment" : "Appearance row label for the memory usage bar menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -776,6 +854,12 @@
       "comment" : "Appearance row sublabel for the memory usage bar menubar item toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher-Nutzung als vertikaler Balken (MEM)."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -800,6 +884,12 @@
       "comment" : "Appearance row label for the menu bar icon restore action",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Menüleisten-Symbol"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -824,6 +914,12 @@
       "comment" : "Appearance button title that restores the menu bar icon",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wiederherstellen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -848,6 +944,12 @@
       "comment" : "Appearance row sublabel for the menu bar icon restore action",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Holt das oMLX-Symbol in die Menüleiste zurück, wenn es dort entfernt wurde. Unabhängig vom Dock-Symbol."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -872,6 +974,12 @@
       "comment" : "Appearance row label for the menubar refresh cadence picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktualisierungsintervall"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -896,6 +1004,12 @@
       "comment" : "Appearance row sublabel for the menubar refresh cadence picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wie oft die Einträge in der Menüleiste und ihre Diagramme aktualisiert werden."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -920,6 +1034,12 @@
       "comment" : "Appearance row label for the permanent Dock icon toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dock-Symbol anzeigen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -944,6 +1064,12 @@
       "comment" : "Appearance row sublabel for the permanent Dock icon toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lässt das Dock-Symbol auch dann sichtbar, wenn kein Fenster geöffnet ist."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -968,6 +1094,12 @@
       "comment" : "Appearance row label for the Models submenu scope picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sichtbare Modelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -992,6 +1124,12 @@
       "comment" : "Appearance row sublabel for the Models submenu scope picker",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Welche Modelle das Menü „Modelle“ in der Menüleiste auflistet. Geladene Modelle erscheinen immer."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1016,6 +1154,12 @@
       "comment" : "Appearance screen section header for the basic options",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Allgemein"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1040,6 +1184,12 @@
       "comment" : "Appearance screen section header for the metric item toggles",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einträge in der Menüleiste"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1064,6 +1214,12 @@
       "comment" : "Appearance screen section subtitle explaining the metric items",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jeder Eintrag zeigt in der Menüleiste die Geschwindigkeit der Prompt-Verarbeitung und der Token-Generierung. Ein Klick auf einen Eintrag zeigt Details und ein Live-Diagramm."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1088,6 +1244,12 @@
       "comment" : "Appearance screen section header for the Models submenu scope",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellbibliothek der Menüleiste"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1112,6 +1274,12 @@
       "comment" : "Appearance row label for the enhanced readability toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verbesserte Lesbarkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1136,6 +1304,12 @@
       "comment" : "Appearance row sublabel for the enhanced readability toggle",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hebt Text mit schwachem Kontrast auf die Primärfarbe an, damit er besser lesbar ist."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1160,6 +1334,12 @@
       "comment" : "Appearance screen section header for readability settings",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lesbarkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
