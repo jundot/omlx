@@ -4,11 +4,11 @@ These rules cover the web UI in `apps/omlx-web/omlx_web`. Colors and type steps 
 
 ## Colors
 
-Every color is defined in `apps/omlx-web/omlx_web/static/css/theme.css`, which `base.html` loads before `tailwind.css` and the page stylesheets.
+The palette and the light semantic colors are defined in `apps/omlx-web/omlx_web/static/css/theme.css`, which `base.html` loads before `tailwind.css`; `dashboard.css` supplies the dark values of the neutral utility channels.
 
 - Palette entries are named `--palette-<family>-<step>` and hold `R G B` channels, so both `rgb(var(--palette-blue-500))` and `rgb(var(--palette-blue-500) / 0.2)` work.
 - Semantic tokens name a role and point at the palette: `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--text-primary` ... `--text-muted`, `--border-faint`, `--border-normal`, `--code-bg`, `--link-color`, `--btn-primary*`, `--text-danger`, `--bg-danger-hover`, `--timeline-accent`, `--focus-ring-color`.
-- `[data-theme="dark"]` in the same file gives the dark values of the semantic tokens. `dashboard.css` maps light utilities such as `.bg-white` or `.text-neutral-900` to dark values under the same selector.
+- `[data-theme="dark"]` in the same file gives the dark values of the semantic tokens. The neutral utilities (`bg-white`, `text-neutral-*`, `border-neutral-*`) resolve through the `*-scale-*` channels: light values in `theme.css`, dark values in `dashboard.css`.
 - `tailwind.config.js` resolves Tailwind's color utilities through the palette, so `bg-neutral-100` and `bg-neutral-100/50` read `theme.css` too.
 
 Where to use what:

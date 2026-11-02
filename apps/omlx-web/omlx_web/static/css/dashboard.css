@@ -27,12 +27,14 @@
     }
 
     /* === Page-level backgrounds === */
-    [data-theme="dark"] .bg-white { background-color: var(--bg-primary) !important; }
-    /* The dark remap above is !important with the same weight as a hover utility,
-       so a white button would otherwise never change colour on hover. Raise the
-       hover state above it for the buttons that pair bg-white with a neutral hover. */
-    [data-theme="dark"] .bg-white.hover\:bg-neutral-50:hover { background-color: var(--bg-secondary) !important; }
-    [data-theme="dark"] .bg-white.hover\:bg-neutral-100:hover { background-color: var(--bg-tertiary) !important; }
+    /* `.bg-white` resolves through --surface-scale-white, so no dark remap is
+       needed; keeping one would block the hover utilities. A 20% white overlay
+       is an intentional highlight on a dark card, not a surface, so it keeps
+       the palette white instead of the dark surface channel. */
+    [data-theme="dark"] .bg-white\/20 { background-color: rgb(var(--palette-white) / 0.2) !important; }
+    /* --surface-scale-100 and -200 share night-700, so the common
+       bg-neutral-100 + hover:bg-neutral-200 chip would not change on hover. */
+    [data-theme="dark"] .hover\:bg-neutral-200:hover { background-color: rgb(var(--palette-zinc-700)) !important; }
 
     /* Cluster status is operational data, not decorative helper copy. Keep
        its cache/fabric labels and request metrics readable in dark mode even
@@ -242,8 +244,6 @@
     /* Small "API" tag inside the emerald profile pill. */
     [data-theme="dark"] .bg-white\/70 { background-color: rgb(var(--palette-white) / 0.12) !important; }
 
-    /* === Gradient background effect === */
-
     /* === Background grain texture in dark mode === */
     [data-theme="dark"] .bg-grain { opacity: 0.02; }
 
@@ -255,7 +255,6 @@
 
     /* === Disabled states === */
     [data-theme="dark"] .disabled\:opacity-50:disabled { opacity: 0.5; }
-
 
     /* === Model card markdown styles === */
     .model-card-content { font-size: 0.8125rem; line-height: 1.6; color: var(--text-secondary); }

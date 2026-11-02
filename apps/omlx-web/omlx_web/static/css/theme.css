@@ -1,5 +1,6 @@
 /*
- * Web UI color tokens. Every color the web UI draws is defined in this file.
+ * Web UI color tokens. The palette and the light semantic values live here;
+ * dashboard.css supplies the dark values of the neutral utility channels.
  * Palette entries are "R G B" channels so `rgb(var(--palette-x) / <alpha>)`
  * and Tailwind's opacity modifiers keep working. The semantic tokens below
  * name roles and refer to the palette; stylesheets and templates refer to
