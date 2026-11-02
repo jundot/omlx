@@ -259,12 +259,12 @@
     --bg-primary: rgb(var(--palette-white));
     --bg-secondary: rgb(var(--palette-neutral-50));
     --bg-tertiary: rgb(var(--palette-neutral-100));
-    --text-primary: rgb(var(--palette-slate-900));
-    --text-secondary: rgb(var(--palette-slate-600));
-    --text-tertiary: rgb(var(--palette-slate-500));
-    --text-muted: rgb(var(--palette-slate-400));
-    --border-faint: rgb(var(--palette-slate-200));
-    --border-normal: rgb(var(--palette-slate-300));
+    --text-primary: rgb(var(--palette-neutral-900));
+    --text-secondary: rgb(var(--palette-neutral-600));
+    --text-tertiary: rgb(var(--palette-neutral-500));
+    --text-muted: rgb(var(--palette-neutral-500));
+    --border-faint: rgb(var(--palette-neutral-200));
+    --border-normal: rgb(var(--palette-neutral-300));
     --code-bg: rgb(var(--palette-neutral-100));
     --link-color: rgb(var(--palette-blue-600));
     --btn-primary: rgb(var(--palette-neutral-900));
