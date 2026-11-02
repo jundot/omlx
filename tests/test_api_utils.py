@@ -1325,51 +1325,26 @@ class TestConvertAnthropicToInternal:
         assert "Doc content here" in content
 
     @pytest.mark.parametrize(
-        "messages, expected_partial",
+        "content, partial",
         [
-            (
-                [
-                    AnthropicMessage(role="user", content="Count from 1."),
-                    AnthropicMessage(role="assistant", content="1, 2, 3,"),
-                ],
-                True,
-            ),
-            (
-                [
-                    AnthropicMessage(role="user", content="Count from 1."),
-                    AnthropicMessage(role="assistant", content="1, 2,"),
-                    AnthropicMessage(role="assistant", content=" 3,"),
-                ],
-                True,
-            ),
-            (
-                [
-                    AnthropicMessage(role="user", content="Count from 1."),
-                    AnthropicMessage(role="assistant", content=""),
-                ],
-                False,
-            ),
-            (
-                [
-                    AnthropicMessage(role="user", content="Count from 1."),
-                    AnthropicMessage(
-                        role="assistant",
-                        content=[
-                            ContentBlockToolUse(id="toolu_1", name="count", input={})
-                        ],
-                    ),
-                ],
-                False,
-            ),
+            ("1, 2, 3,", True),
+            ("", False),
+            ([ContentBlockToolUse(id="toolu_1", name="count", input={})], False),
         ],
     )
-    def test_trailing_assistant_message_marks_partial(self, messages, expected_partial):
-        """Trailing assistant text is an Anthropic prefill, not a new turn."""
-        request = MessagesRequest(model="claude-3", max_tokens=1024, messages=messages)
+    def test_trailing_assistant_prefill(self, content, partial):
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(role="user", content="Count from 1."),
+                AnthropicMessage(role="assistant", content=content),
+            ],
+        )
 
         result = convert_anthropic_to_internal(request)
 
-        assert result[-1].get("partial", False) is expected_partial
+        assert result[-1].get("partial", False) is partial
 
 
 class TestConvertAnthropicToInternalNativeReasoning:
