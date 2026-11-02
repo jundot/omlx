@@ -1532,6 +1532,12 @@
       "comment" : "Menubar parent item opening the CPU/GPU/Memory submenu",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Systemstatistik"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1556,6 +1562,12 @@
       "comment" : "Header above the throughput graphs in a menubar metric popover",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktivität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1580,6 +1592,12 @@
       "comment" : "Button in a menubar metric popover that opens the web dashboard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dashboard"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1604,6 +1622,12 @@
       "comment" : "Note in the LIV popover when live stats need admin authentication",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Schlüssel eintragen, um die Live-Aktivität zu aktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1628,6 +1652,12 @@
       "comment" : "Note in a menubar metric popover while the server is not running",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server ist aus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1652,6 +1682,12 @@
       "comment" : "Button in a menubar metric popover that opens the Appearance settings pane",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1676,6 +1712,12 @@
       "comment" : "Popover title for the all-time-average menubar item",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gesamt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1700,6 +1742,12 @@
       "comment" : "Popover title for the session-average menubar item",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchschnittliche Sitzung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1724,6 +1772,12 @@
       "comment" : "Popover title for the live-throughput menubar item",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Live-Aktivität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1748,6 +1802,12 @@
       "comment" : "Disabled placeholder in the Models submenu when the favorites-only scope hides every model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Noch keine Favoriten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1772,6 +1832,12 @@
       "comment" : "Memory panel legend row for active memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktiv"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1796,6 +1862,12 @@
       "comment" : "Memory panel legend row for compressed memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Komprimiert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1820,6 +1892,12 @@
       "comment" : "CPU panel caption under the usage bars",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nutzung: E (orange) / P (blau)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1844,6 +1922,12 @@
       "comment" : "CPU panel row label for efficiency-core usage",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "E-Kerne"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1868,6 +1952,12 @@
       "comment" : "Memory panel legend row for free memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Frei"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1892,6 +1982,12 @@
       "comment" : "GPU panel caption under the usage bars",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU (grün) / GPU-Arbeitsspeicher (türkis)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1916,6 +2012,12 @@
       "comment" : "GPU panel row label for accelerator in-use memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU-Arbeitsspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1940,6 +2042,12 @@
       "comment" : "GPU memory value; placeholder is a byte size like 2.60 GB",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ belegt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1964,6 +2072,12 @@
       "comment" : "CPU panel row label for the 1/5/15-minute load averages",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Durchschnittslast"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1988,6 +2102,12 @@
       "comment" : "Title of the Memory panel in the System Stats submenu",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arbeitsspeicher"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2012,6 +2132,12 @@
       "comment" : "CPU panel row label for performance-core usage",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "P-Kerne"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2036,6 +2162,12 @@
       "comment" : "CPU panel row label for the system thermal state",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Thermalzustand"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2060,6 +2192,12 @@
       "comment" : "CPU panel row label for system uptime",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Betriebszeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -2084,6 +2222,12 @@
       "comment" : "Memory panel legend row for wired memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reserviert"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -10875,6 +11019,12 @@
       "comment" : "Button that dismisses an alert",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schließen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -10899,6 +11049,12 @@
       "comment" : "Default dismiss button on the port-conflict alert",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "OK"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -10923,6 +11079,12 @@
       "comment" : "Button that opens the server log file",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Protokoll öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -10947,6 +11109,12 @@
       "comment" : "Button that opens the oMLX settings window",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -10971,6 +11139,12 @@
       "comment" : "Substring describing a known PID; placeholder is the PID number (plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PID %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -10995,6 +11169,12 @@
       "comment" : "Substring used when the conflicting process PID couldn't be determined",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PID unbekannt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11019,6 +11199,12 @@
       "comment" : "Port-conflict alert body when the conflicting process is another oMLX instance",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auf diesem Port läuft bereits ein anderer oMLX-Server (%@). Stoppen Sie ihn, bevor Sie eine neue Instanz starten, oder ändern Sie den Port in den Einstellungen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11043,6 +11229,12 @@
       "comment" : "Port-conflict alert body when an unrelated process owns the port",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ein anderer Prozess (%1$@) belegt Port %2$@. Wählen Sie in den Einstellungen einen anderen Port oder beenden Sie den Prozess."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11067,6 +11259,12 @@
       "comment" : "Title of the port-conflict alert; placeholder is the port number (plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Port %@ ist belegt."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11091,6 +11289,12 @@
       "comment" : "Hint shown when the server failure log suggests a model directory permission problem",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prüfen Sie, ob das eingestellte Modellverzeichnis eingebunden und lesbar ist. Liegt es an einem externen oder geschützten Ort, erteilen Sie oMLX in den Systemeinstellungen unter Datenschutz & Sicherheit Zugriff."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11115,6 +11319,12 @@
       "comment" : "Introductory body text for the server startup failure alert",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Serverprozess hat sich beendet, bevor er bereit war."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11139,6 +11349,12 @@
       "comment" : "Server startup failure alert line that shows the server log path",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Protokoll: %@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11163,6 +11379,12 @@
       "comment" : "Title for the server startup failure alert",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX-Server konnte nicht starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11187,6 +11409,12 @@
       "comment" : "Menubar status header when the server bootstrap threw an error; placeholder is the error description",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server: Initialisierung fehlgeschlagen (%@)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11211,6 +11439,12 @@
       "comment" : "Menubar status header when the server failed; placeholder is the failure message",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server: Fehler (%@)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11235,6 +11469,12 @@
       "comment" : "Initial menubar header text before the server state is known",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server: …"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11259,6 +11499,12 @@
       "comment" : "Menubar status header when the server is running; placeholder is the port (rendered as a plain integer, no grouping)",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server: läuft (Port %@)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11283,6 +11529,12 @@
       "comment" : "Menubar status header while the server is starting",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server: startet…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11307,6 +11559,12 @@
       "comment" : "Menubar status header when the server is stopped",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX gestoppt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11331,6 +11589,12 @@
       "comment" : "Menubar status header while the server is stopping",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server: wird gestoppt…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11355,6 +11619,12 @@
       "comment" : "Menubar status header when the server is unresponsive",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server: reagiert nicht (automatische Wiederherstellung oder Neustart erzwingen)"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11379,6 +11649,12 @@
       "comment" : "Menubar item that opens the standard About window",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Über oMLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11403,6 +11679,12 @@
       "comment" : "Menubar item that opens the browser-based chat dashboard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chatten mit oMLX"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11427,6 +11709,12 @@
       "comment" : "Menubar update item while an app update is downloading; placeholder is the percent",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update wird geladen… %lld%%"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11451,6 +11739,12 @@
       "comment" : "Menubar item that force-restarts a stuck or failed server",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Neustart erzwingen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11475,6 +11769,12 @@
       "comment" : "Menubar update item when an app update is available; placeholder is the version",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX %@ installieren…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11499,6 +11799,12 @@
       "comment" : "Menubar item that terminates the app (Cmd-Q)",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "oMLX beenden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11523,6 +11829,12 @@
       "comment" : "Menubar parent item opening the Serving Stats submenu",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inferenzstatistik"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11547,6 +11859,12 @@
       "comment" : "Menubar item that opens the native settings/preferences window",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11571,6 +11889,12 @@
       "comment" : "Menubar item that starts the server",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server starten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11595,6 +11919,12 @@
       "comment" : "Menubar item that stops the running server",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server stoppen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11619,6 +11949,12 @@
       "comment" : "Menubar item shown when an app update is available",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update installieren…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11643,6 +11979,12 @@
       "comment" : "Menubar item that opens the browser-based web admin dashboard with auto-login",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Web-Dashboard öffnen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11667,6 +12009,12 @@
       "comment" : "Section header inside the Serving Stats submenu for all-time metrics",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gesamt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11691,6 +12039,12 @@
       "comment" : "Stats row label for the average prompt-processing (prefill) speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ø PP-Geschwindigkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11715,6 +12069,12 @@
       "comment" : "Stats row label for the average token-generation speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ø TG-Geschwindigkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11739,6 +12099,12 @@
       "comment" : "Stats row label for the cache efficiency percentage",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cache-Effizienz"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11763,6 +12129,12 @@
       "comment" : "Stats row label for cached tokens count",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token im Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11787,6 +12159,12 @@
       "comment" : "Disabled placeholder shown while stats are loading",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Statistiken werden geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11811,6 +12189,12 @@
       "comment" : "Section header inside the Serving Stats submenu for the current active request",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Live-Aktivität"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11835,6 +12219,12 @@
       "comment" : "Disabled placeholder in the All-Time section of the Serving Stats submenu when no API key is configured",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Schlüssel im Bereich Sicherheit eintragen, um die Statistiken zu aktivieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11859,6 +12249,12 @@
       "comment" : "Disabled placeholder in the Serving Stats submenu when the server isn't running",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server ist aus"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11883,6 +12279,12 @@
       "comment" : "Section header inside the Serving Stats submenu for current-session metrics",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sitzung"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11907,6 +12309,12 @@
       "comment" : "Stats row label for total request count",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Anfragen insgesamt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11931,6 +12339,12 @@
       "comment" : "Stats row label for total tokens processed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verarbeitete Token insgesamt"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35479,6 +35893,12 @@
       "comment" : "Menubar parent item opening the per-model control submenu",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35521,6 +35941,12 @@
       "comment" : "Disabled placeholder in the Models submenu when no models are discovered",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Modelle verfügbar"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35563,6 +35989,12 @@
       "comment" : "Disabled menu item while a model unload is in progress",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell wird entladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35605,6 +36037,12 @@
       "comment" : "Disabled menu item while a model load is in progress",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell wird geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35647,6 +36085,12 @@
       "comment" : "Menu item to unload a currently loaded model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell entladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35689,6 +36133,12 @@
       "comment" : "Menu item to load a model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell laden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35731,6 +36181,12 @@
       "comment" : "Menu item that opens the in-app per-model settings pane",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelleinstellungen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35773,6 +36229,12 @@
       "comment" : "Menu item that copies the model id to the clipboard",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Namen kopieren"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35815,6 +36277,12 @@
       "comment" : "Disabled placeholder in the Models submenu while the model list is being fetched",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird geladen…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35857,6 +36325,12 @@
       "comment" : "Models submenu section header for loaded or loading models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35899,6 +36373,12 @@
       "comment" : "Models submenu section header for favorite models that are not loaded",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Favoriten"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -35941,6 +36421,12 @@
       "comment" : "Models submenu section header for the remaining model library",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bibliothek"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
