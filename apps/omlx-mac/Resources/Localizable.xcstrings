@@ -10941,6 +10941,12 @@
       "comment" : "Status pill label for a model that is not currently loaded",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inaktiv"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -10965,6 +10971,12 @@
       "comment" : "Status pill label for a model that is currently loaded in memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -10989,6 +11001,12 @@
       "comment" : "Empty-state message shown when no models are currently loaded",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Modelle geladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11013,6 +11031,12 @@
       "comment" : "Subtitle for the Active Models section. Placeholders: count of loaded models, total memory footprint",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld geladen · %2$@"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11037,6 +11061,12 @@
       "comment" : "Section heading for the list of currently-loaded models",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktive Modelle"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11061,6 +11091,12 @@
       "comment" : "Tooltip on the eject button that unloads an active model",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modell entladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11085,6 +11121,12 @@
       "comment" : "Destructive button label inside the delete-model confirmation dialog; placeholder is the model id",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ löschen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11109,6 +11151,12 @@
       "comment" : "Body text inside the delete-model confirmation dialog explaining the impact",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Modelldateien werden endgültig von der Festplatte entfernt. Läuft das Modell gerade, wird es entladen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11133,6 +11181,12 @@
       "comment" : "Body text inside the delete-model confirmation dialog when the model lives in the shared Hugging Face cache",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Modell liegt im gemeinsamen Hugging-Face-Cache. Andere Apps, die diesen Cache verwenden, müssen das Modell danach erneut herunterladen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11157,6 +11211,12 @@
       "comment" : "Confirmation dialog title shown before deleting a model from disk",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Modell von der Festplatte löschen?"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11181,6 +11241,12 @@
       "comment" : "Empty-state subtitle directing the user to the Downloads screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Im Bereich Downloads ein Modell von Hugging Face herunterladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11205,6 +11271,12 @@
       "comment" : "Empty-state title shown when no models have been discovered on disk",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine Modelle gefunden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11229,6 +11301,12 @@
       "comment" : "Tooltip on the external engine badge in the model library; placeholder is the engine name",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ kann dieses Modell ausführen. Dafür in den erweiterten Einstellungen des Modells die externe Engine aktivieren."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11253,6 +11331,12 @@
       "comment" : "Tooltip on the GGUF badge in the model library",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eine GGUF-Datei, ausgeführt über eine externe Engine"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11277,6 +11361,12 @@
       "comment" : "Badge on a library model found in the shared Hugging Face cache",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "HF-Cache"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11301,6 +11391,12 @@
       "comment" : "Tooltip on the HF cache badge in the model library",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Im Hugging-Face-Cache gefunden. Andere Apps, die diesen Cache verwenden, müssen das Modell nach dem Löschen erneut herunterladen."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11325,6 +11421,12 @@
       "comment" : "Button label that loads a library model into memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Laden"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11349,6 +11451,12 @@
       "comment" : "Tooltip on the trash button that deletes a model from local storage",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Von der Festplatte entfernen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11373,6 +11481,12 @@
       "comment" : "Tooltip on the chevron that opens a model's settings screen",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einstellungen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11397,6 +11511,12 @@
       "comment" : "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk",
       "extractionState" : "extracted_with_value",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modelle: %1$lld · %2$@ auf der Festplatte"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
@@ -11421,6 +11541,12 @@
       "comment" : "Section heading for the on-disk model library",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellbibliothek"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -11445,6 +11571,12 @@
       "comment" : "Button label that unloads a library model from memory",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Entladen"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
