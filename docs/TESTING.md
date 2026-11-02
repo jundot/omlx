@@ -35,8 +35,8 @@ CI runs all default tests on Python 3.11 for PRs and pushes to `main`. A daily s
 
 The automatic Qwen FP16/BF16 decode route has numerical, cache-state and
 fallback tests in `tests/test_qwen35_fp16_decode.py`. Run it with
-`tests/test_qwen35_gdn_prework.py` to check that the existing BF16 Qwen4 and
-speculative routes remain intact.
+`tests/test_qwen35_gdn_prework.py` to check that the BF16 and FP16 Qwen4 fused
+GDN routes match the stock arithmetic and the speculative routes remain intact.
 
 # First-token burst release
 

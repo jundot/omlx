@@ -12,7 +12,7 @@ import pytest
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 
-def _production_module(bits: int, group_size: int = 64):
+def _production_module(bits: int, group_size: int = 64, dtype=mx.bfloat16):
     from mlx_vlm.models.qwen4_exp.language import (
         Qwen4ExpGatedResidual,
         Qwen4ExpRMSNorm,
@@ -28,7 +28,7 @@ def _production_module(bits: int, group_size: int = 64):
         group_size=2560,
         eps=1e-6,
     )
-    module.hc_norm.weight = (mx.random.normal((10240,)) * 0.02).astype(mx.bfloat16)
+    module.hc_norm.weight = (mx.random.normal((10240,)) * 0.02).astype(dtype)
     module.input_mix_weight_down = nn.QuantizedLinear(
         10240,
         320,
@@ -58,16 +58,18 @@ def _production_module(bits: int, group_size: int = 64):
         module.block_inject_weight,
         module.input_mix_weight_up,
     ):
-        projection.scales = projection.scales.astype(mx.bfloat16)
-        projection.biases = projection.biases.astype(mx.bfloat16)
+        projection.scales = projection.scales.astype(dtype)
+        projection.biases = projection.biases.astype(dtype)
     return module
 
 
-@pytest.mark.parametrize("group_size", [32, 64])
+@pytest.mark.parametrize(
+    "group_size,dtype", [(32, mx.bfloat16), (64, mx.bfloat16), (64, mx.float16)]
+)
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(
-    bits, group_size, monkeypatch
+    bits, group_size, dtype, monkeypatch
 ):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp import hc_fused
@@ -80,7 +82,7 @@ def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(
     # Keep this bit-exact test on the hybrid path, below fused dispatch.
     monkeypatch.setattr(hc_fused, "_DISABLED", True)
     mx.random.seed(20260900 + bits + group_size)
-    module = _production_module(bits, group_size)
+    module = _production_module(bits, group_size, dtype)
     down = module.input_mix_weight_down
     injection = module.block_inject_weight
     down_id = id(down)
@@ -88,7 +90,7 @@ def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(
 
     for seed in range(4):
         mx.random.seed(20261000 + 100 * bits + 10 * group_size + seed)
-        stream = mx.random.normal((1, 1, 10240)).astype(mx.bfloat16)
+        stream = mx.random.normal((1, 1, 10240)).astype(dtype)
         normed = module.hc_norm(stream)
         expected_down = down(normed)
         expected_injection = injection(normed)
@@ -101,7 +103,7 @@ def test_qwen4_exact_hybrid_raw_and_full_outputs_are_bit_exact(
             combined[..., 320:324],
         ).item()
 
-    stream = mx.random.normal((1, 1, 10240)).astype(mx.bfloat16)
+    stream = mx.random.normal((1, 1, 10240)).astype(dtype)
     canonical = module._forward(stream)
     mx.eval(*canonical)
     assert fuse_hyper_connection_projections(module) == 1

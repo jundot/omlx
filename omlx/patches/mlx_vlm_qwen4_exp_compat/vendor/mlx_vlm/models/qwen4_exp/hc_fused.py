@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Metal kernels for Qwen4 hyper-connection inputs.
 
-Decode (at most 16 BF16 rows) fuses per-stream RMS norm, down/inject
+Decode (at most 16 BF16 or FP16 rows) fuses per-stream RMS norm, down/inject
 projections with activation, and the up projection with stream mixing.
 Prefill fuses the stream norm, silu(down / HC), and the mixing/inject
 epilogue around the down/up projections; on GPUs with tensor units (M5) those
 projections run in hc_prefill_nax's kernels with the epilogues folded in
 (bit-identical to the MLX matmul path), elsewhere on MLX's quantized matmul.
 Both need four streams and affine group-size-32 or -64 projections with 4/5/6/8-bit
-weights. FP32 epilogues can round differently from the canonical BF16
-operations.
+weights. FP32 epilogues can round differently from the canonical 16-bit
+operations. The rows, norm weight and projection scales share one dtype.
 
 A pending residual write (previous block's branch times its injection gate)
 can be applied inside the stream norm, which also stores the written
@@ -43,6 +43,7 @@ MAX_ROWS = 16
 # traversal is the same for every group size, only the scale/bias index moves.
 _GROUP_SIZES = (32, 64)
 _SUPPORTED_BITS = (4, 5, 6, 8)
+_DTYPES = (mx.bfloat16, mx.float16)
 # Tests flip the flags below to reach the reference paths.
 _DISABLED = False
 _WRITE_DISABLED = False
@@ -656,7 +657,7 @@ def write_enabled() -> bool:
     return not (_DISABLED or _WRITE_DISABLED)
 
 
-def _quantized_ok(projection) -> bool:
+def _quantized_ok(projection, dtype) -> bool:
     return (
         type(projection) is nn.QuantizedLinear
         and getattr(projection, "group_size", None) in _GROUP_SIZES
@@ -667,8 +668,8 @@ def _quantized_ok(projection) -> bool:
         and projection.weight.dtype == mx.uint32
         and isinstance(getattr(projection, "scales", None), mx.array)
         and isinstance(getattr(projection, "biases", None), mx.array)
-        and projection.scales.dtype == mx.bfloat16
-        and projection.biases.dtype == mx.bfloat16
+        and projection.scales.dtype == dtype
+        and projection.biases.dtype == dtype
     )
 
 
@@ -689,7 +690,7 @@ def _rows_of(hyper_input) -> int | None:
     if not (
         isinstance(hyper_input, mx.array)
         and hyper_input.ndim == 3
-        and hyper_input.dtype == mx.bfloat16
+        and hyper_input.dtype in _DTYPES
     ):
         return None
     return hyper_input.shape[0] * hyper_input.shape[1]
@@ -705,7 +706,6 @@ def compatible(module, hyper_input) -> bool:
     shape = hyper_input.shape
     return (
         len(shape) == 3
-        and hyper_input.dtype == mx.bfloat16
         and 1 <= shape[0] * shape[1] <= MAX_ROWS
         and _layout_compatible(module, hyper_input)
     )
@@ -723,15 +723,17 @@ def prefill_compatible(module, hyper_input) -> bool:
 
 
 def _layout_compatible(module, hyper_input) -> bool:
-    if not _static_layout_compatible(module):
+    if _static_layout_dtype(module) != hyper_input.dtype:
         return False
     if hyper_input.shape[2] != module.hc_count * module.hidden_size:
         return _ineligible(f"input width {hyper_input.shape[2]}")
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
 
-def _static_layout_compatible(module) -> bool:
-    """Cached per module; any reassigned child, weight, scale or bias re-checks.
+def _static_layout_dtype(module):
+    """The module's compute dtype, or False for an unsupported layout.
+
+    Cached per module; any reassigned child, weight, scale or bias re-checks.
 
     The key is the identity of every value of the module and of its child
     modules, compared with ``is`` (``id()`` raises an audit event per call).
@@ -740,18 +742,19 @@ def _static_layout_compatible(module) -> bool:
     """
     cached = module.__dict__.get("_omlx_hc_layout")
     if cached is not None:
-        children, refs, ok = cached
+        children, refs, dtype = cached
         current = tuple(chain(dict.values(module), *map(dict.values, children)))
         if len(current) == len(refs) and all(map(is_, current, refs)):
-            return ok
-    ok = _check_static_layout(module)
+            return dtype
+    dtype = _check_static_layout(module)
     children = [value for value in dict.values(module) if isinstance(value, nn.Module)]
     refs = tuple(chain(dict.values(module), *map(dict.values, children)))
-    module.__dict__["_omlx_hc_layout"] = (children, refs, ok)
-    return ok
+    module.__dict__["_omlx_hc_layout"] = (children, refs, dtype)
+    return dtype
 
 
-def _check_static_layout(module) -> bool:
+def _check_static_layout(module):
+    """The hc_norm weight dtype when the whole layout is supported, else False."""
     if hasattr(module, "input_inject_weight"):
         return _ineligible("combined input projection layout")
     hc_count = getattr(module, "hc_count", None)
@@ -774,22 +777,24 @@ def _check_static_layout(module) -> bool:
         norm is not None
         and getattr(norm, "group_size", None) == hidden
         and isinstance(getattr(norm, "weight", None), mx.array)
-        and norm.weight.dtype == mx.bfloat16
+        and norm.weight.dtype in _DTYPES
         and norm.weight.shape == (hc_count * hidden,)
     ):
         return _ineligible("hc_norm layout")
+    dtype = norm.weight.dtype
     if not (
-        _quantized_ok(getattr(module, "input_mix_weight_down", None))
-        and _quantized_ok(getattr(module, "input_mix_weight_up", None))
+        _quantized_ok(getattr(module, "input_mix_weight_down", None), dtype)
+        and _quantized_ok(getattr(module, "input_mix_weight_up", None), dtype)
     ):
         return _ineligible(
-            "projection quantisation (need affine group-size-32/64 4/5/6/8-bit with bf16 scales)"
+            "projection quantisation (need affine group-size-32/64 4/5/6/8-bit "
+            "with scales in the hc_norm dtype)"
         )
     if "block_inject_weight" in module and not _quantized_ok(
-        module.block_inject_weight
+        module.block_inject_weight, dtype
     ):
         return _ineligible("block_inject_weight quantisation")
-    return True
+    return dtype
 
 
 def _eps_array(module) -> mx.array:

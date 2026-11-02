@@ -298,24 +298,23 @@ def test_verify_gate_resolves_compat_vendor_verifier(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_qwen4_decode_prework_is_bit_exact_including_fp32_gate():
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen4_decode_prework_is_bit_exact_including_fp32_gate(dtype):
     from mlx_vlm.models.qwen3_5.gated_delta import _compute_g_beta
 
     mx.random.seed(29)
-    conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(mx.bfloat16)
+    conv_w = (mx.random.normal((C, 4, 1)) * 0.2).astype(dtype)
     conv1d = nn.Conv1d(C, C, kernel_size=4, groups=C, bias=False)
     conv1d.weight = conv_w
-    qkv = (mx.random.normal((1, 1, C)) * 0.5).astype(mx.bfloat16)
-    state = (mx.random.normal((1, 3, C)) * 0.5).astype(mx.bfloat16)
-    a = (mx.random.normal((1, 1, HV)) * 0.2).astype(mx.bfloat16)
-    b = (mx.random.normal((1, 1, HV)) * 0.2).astype(mx.bfloat16)
+    qkv = (mx.random.normal((1, 1, C)) * 0.5).astype(dtype)
+    state = (mx.random.normal((1, 3, C)) * 0.5).astype(dtype)
+    a = (mx.random.normal((1, 1, HV)) * 0.2).astype(dtype)
+    b = (mx.random.normal((1, 1, HV)) * 0.2).astype(dtype)
     # A fast bf16 exp in the sigmoid gives this beta one ulp off MLX's on M3.
-    b = mx.concatenate(
-        [mx.full((1, 1, 1), -6.84375, dtype=mx.bfloat16), b[..., 1:]], axis=-1
-    )
-    A_log = (mx.random.normal((HV,)) * 0.2).astype(mx.bfloat16)
-    dt_bias = (mx.random.normal((HV,)) * 0.2).astype(mx.bfloat16)
-    q_scale = mx.array(DK**-0.5, dtype=mx.bfloat16)
+    b = mx.concatenate([mx.full((1, 1, 1), -6.84375, dtype=dtype), b[..., 1:]], axis=-1)
+    A_log = (mx.random.normal((HV,)) * 0.2).astype(dtype)
+    dt_bias = (mx.random.normal((HV,)) * 0.2).astype(dtype)
+    q_scale = mx.array(DK**-0.5, dtype=dtype)
 
     q, k, v, next_state = _composed_l2(qkv, state, conv1d)
     g, beta = _compute_g_beta(A_log, a, b, dt_bias)
@@ -373,7 +372,8 @@ def test_qwen4_verify_prework_rows_equal_serial_decode_steps(seq):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_qwen4_decode_norm_gate_is_bit_exact():
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen4_decode_norm_gate_is_bit_exact(dtype):
     from omlx.patches.mlx_vlm_qwen4_exp_compat import (
         apply_mlx_vlm_qwen4_exp_compat_patch,
     )
@@ -382,10 +382,10 @@ def test_qwen4_decode_norm_gate_is_bit_exact():
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpRMSNormGated
 
     mx.random.seed(31)
-    y = (mx.random.normal((1, 1, HV, DV)) * 0.25).astype(mx.bfloat16)
-    z = (mx.random.normal((1, 1, HV, DV)) * 0.25).astype(mx.bfloat16)
+    y = (mx.random.normal((1, 1, HV, DV)) * 0.25).astype(dtype)
+    z = (mx.random.normal((1, 1, HV, DV)) * 0.25).astype(dtype)
     norm = Qwen4ExpRMSNormGated(DV, eps=1e-6, activation="sigmoid")
-    norm.weight = (1 + mx.random.normal((DV,)) * 0.1).astype(mx.bfloat16)
+    norm.weight = (1 + mx.random.normal((DV,)) * 0.1).astype(dtype)
 
     expected = norm(y, z).reshape(1, 1, HV * DV)
     observed = qwen4_decode_norm_gate_fused(
@@ -401,7 +401,7 @@ def test_qwen4_decode_norm_gate_is_bit_exact():
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
 @pytest.mark.parametrize("seed", [3, 17, 41])
 def test_qwen4_decode_step_kernel_equals_its_three_launches(dtype, seed):
     """Prework + recurrence + norm-gate in one launch, over two chained steps.
@@ -442,7 +442,8 @@ def test_qwen4_decode_step_kernel_equals_its_three_launches(dtype, seed):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_qwen4_prefill_route_is_bit_exact_across_chunks(monkeypatch):
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen4_prefill_route_is_bit_exact_across_chunks(monkeypatch, dtype):
     from mlx.utils import tree_map
     from mlx_vlm.models.cache import ArraysCache
 
@@ -472,11 +473,11 @@ def test_qwen4_prefill_route_is_bit_exact_across_chunks(monkeypatch):
     )
     module = Qwen4ExpGatedDeltaNet(config)
     module.update(
-        tree_map(lambda p: (p * 0.2).astype(mx.bfloat16), module.parameters())
+        tree_map(lambda p: (p * 0.2).astype(dtype), module.parameters())
     )
     module.eval()
     chunks = [
-        (mx.random.normal((1, rows, 2560)) * 0.5).astype(mx.bfloat16)
+        (mx.random.normal((1, rows, 2560)) * 0.5).astype(dtype)
         for rows in (80, 67)
     ]
 
@@ -520,7 +521,7 @@ class _FakeCache:
 
 def test_qwen4_decode_dynamic_gate_is_strictly_b1_t1_nonverify(monkeypatch):
     monkeypatch.setattr(prework_mod, "_qwen4_decode_static_eligible", lambda _: True)
-    module = object()
+    module = SimpleNamespace(conv1d=SimpleNamespace(weight=mx.zeros((1,), mx.bfloat16)))
     inputs = mx.zeros((1, 1, 2560), dtype=mx.bfloat16)
     cache = _FakeCache(
         mx.zeros((1, 3, C), dtype=mx.bfloat16),
@@ -558,7 +559,9 @@ def test_qwen4_decode_dynamic_gate_is_strictly_b1_t1_nonverify(monkeypatch):
     assert not eligible()
 
 
-def _fake_quantized_linear(input_dims, output_dims, bits, group_size):
+def _fake_quantized_linear(
+    input_dims, output_dims, bits, group_size, dtype=mx.bfloat16
+):
     linear = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
     nn.Module.__init__(linear)
     linear.bits = bits
@@ -570,13 +573,13 @@ def _fake_quantized_linear(input_dims, output_dims, bits, group_size):
     )
     linear.scales = mx.zeros(
         (output_dims, input_dims // group_size),
-        dtype=mx.bfloat16,
+        dtype=dtype,
     )
     linear.biases = mx.zeros_like(linear.scales)
     return linear
 
 
-def _canonical_qwen4_decode_module(signatures):
+def _canonical_qwen4_decode_module(signatures, dtype=mx.bfloat16):
     module_type = type("Qwen4ExpGatedDeltaNet", (), {})
     module_type.__module__ = "mlx_vlm.models.qwen4_exp.language"
     module = module_type()
@@ -587,18 +590,18 @@ def _canonical_qwen4_decode_module(signatures):
     module.head_v_dim = DV
     module.conv_kernel_size = 4
     module.conv1d = SimpleNamespace(
-        weight=mx.zeros((C, 4, 1), dtype=mx.bfloat16),
+        weight=mx.zeros((C, 4, 1), dtype=dtype),
         bias=None,
     )
     module.norm = SimpleNamespace(
         activation="sigmoid",
-        weight=mx.ones((DV,), dtype=mx.bfloat16),
+        weight=mx.ones((DV,), dtype=dtype),
     )
-    module.A_log = mx.zeros((HV,), dtype=mx.bfloat16)
-    module.dt_bias = mx.zeros((HV,), dtype=mx.bfloat16)
+    module.A_log = mx.zeros((HV,), dtype=dtype)
+    module.dt_bias = mx.zeros((HV,), dtype=dtype)
     rows = (C, HV * DV, HV, HV)
     projections = [
-        _fake_quantized_linear(2560, output, bits, group)
+        _fake_quantized_linear(2560, output, bits, group, dtype)
         for output, (bits, group) in zip(rows, signatures)
     ]
     (
@@ -607,8 +610,20 @@ def _canonical_qwen4_decode_module(signatures):
         module.in_proj_b,
         module.in_proj_a,
     ) = projections
-    module.out_proj = _fake_quantized_linear(6144, 2560, 5, 128)
+    module.out_proj = _fake_quantized_linear(6144, 2560, 5, 128, dtype)
     return module
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen4_decode_static_gate_needs_one_compute_dtype(dtype):
+    other = mx.float16 if dtype == mx.bfloat16 else mx.bfloat16
+    module = _canonical_qwen4_decode_module(((6, 64),) * 4, dtype)
+    assert prework_mod._qwen4_decode_static_eligible(module)
+    module.in_proj_qkv.scales = module.in_proj_qkv.scales.astype(other)
+    assert not prework_mod._qwen4_decode_static_eligible(module)
+    module = _canonical_qwen4_decode_module(((6, 64),) * 4, dtype)
+    module.A_log = module.A_log.astype(other)
+    assert not prework_mod._qwen4_decode_static_eligible(module)
 
 
 @pytest.mark.parametrize(
@@ -1156,8 +1171,8 @@ def _bits(array):
     return array.view(mx.uint32 if array.dtype == mx.float32 else mx.uint16)
 
 
-def _random_projection(input_dims, output_dims, bits, group_size):
-    weight = (mx.random.normal((output_dims, input_dims)) * 0.05).astype(mx.bfloat16)
+def _random_projection(input_dims, output_dims, bits, group_size, dtype=mx.bfloat16):
+    weight = (mx.random.normal((output_dims, input_dims)) * 0.05).astype(dtype)
     linear = nn.QuantizedLinear(
         input_dims, output_dims, bias=False, group_size=group_size, bits=bits
     )
@@ -1167,7 +1182,7 @@ def _random_projection(input_dims, output_dims, bits, group_size):
     return linear
 
 
-def _real_qwen4_decode_module(signatures, seed):
+def _real_qwen4_decode_module(signatures, seed, dtype=mx.bfloat16):
     from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
@@ -1183,18 +1198,18 @@ def _real_qwen4_decode_module(signatures, seed):
     module.head_k_dim, module.head_v_dim = DK, DV
     module.conv_kernel_size = 4
     module.conv1d = nn.Conv1d(C, C, 4, groups=C, bias=False)
-    module.conv1d.weight = (mx.random.normal((C, 4, 1)) * 0.3).astype(mx.bfloat16)
+    module.conv1d.weight = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
     module.norm = Qwen4ExpRMSNormGated(DV, eps=1e-6, activation="sigmoid")
-    module.norm.weight = (1 + mx.random.normal((DV,)) * 0.1).astype(mx.bfloat16)
-    module.A_log = (mx.random.normal((HV,)) * 0.5).astype(mx.bfloat16)
-    module.dt_bias = (mx.random.normal((HV,)) * 0.5).astype(mx.bfloat16)
+    module.norm.weight = (1 + mx.random.normal((DV,)) * 0.1).astype(dtype)
+    module.A_log = (mx.random.normal((HV,)) * 0.5).astype(dtype)
+    module.dt_bias = (mx.random.normal((HV,)) * 0.5).astype(dtype)
     for name, rows, (bits, group) in zip(
         ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"),
         (C, HV * DV, HV, HV),
         signatures,
     ):
-        setattr(module, name, _random_projection(2560, rows, bits, group))
-    module.out_proj = _random_projection(HV * DV, 2560, 5, 128)
+        setattr(module, name, _random_projection(2560, rows, bits, group, dtype))
+    module.out_proj = _random_projection(HV * DV, 2560, 5, 128, dtype)
     module.eval()
     mx.eval(module.parameters())
     return module
@@ -1401,11 +1416,11 @@ def _same(want, got):
     )
 
 
-def _verify_inputs(rows, seed):
+def _verify_inputs(rows, seed, dtype=mx.bfloat16):
     mx.random.seed(seed)
     return (
-        (mx.random.normal((1, rows, 2560)) * 0.5).astype(mx.bfloat16),
-        (mx.random.normal((1, 3, C)) * 0.5).astype(mx.bfloat16),
+        (mx.random.normal((1, rows, 2560)) * 0.5).astype(dtype),
+        (mx.random.normal((1, 3, C)) * 0.5).astype(dtype),
         mx.random.normal((1, HV, DV, DK)) * 0.05,
     )
 
@@ -1484,10 +1499,11 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7, 8, 12, 16])
 @pytest.mark.parametrize("seed", [5, 23])
 def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
-    monkeypatch, qwen4_verify, rows, seed
+    monkeypatch, qwen4_verify, dtype, rows, seed
 ):
     """Row t, the state after it and the conv window equal the t-th planned
     one-token decode step; a partial accept restores that step's states."""
@@ -1503,8 +1519,8 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
         return decode_step(*args)
 
     monkeypatch.setattr(prework_mod, "qwen4_decode_step_fused", counted)
-    module = _real_qwen4_decode_module(((6, 64),) * 4, seed)
-    inputs, conv_state, recurrent_state = _verify_inputs(rows, seed)
+    module = _real_qwen4_decode_module(((6, 64),) * 4, seed, dtype)
+    inputs, conv_state, recurrent_state = _verify_inputs(rows, seed, dtype)
     serial = ArraysCache(size=2)
     serial[0], serial[1] = conv_state, recurrent_state
     outputs, convs, states = [], [conv_state], [recurrent_state]
@@ -1536,10 +1552,11 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("signatures", [((6, 64),) * 4, ((8, 64),) * 4])
 @pytest.mark.parametrize("rows", [2, 3])
 def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
-    monkeypatch, qwen4_verify, signatures, rows
+    monkeypatch, qwen4_verify, dtype, signatures, rows
 ):
     """Up to the per-row projection limit, every row of a batched one-token
     decode, and its next conv and recurrent states, equal that row decoded
@@ -1547,10 +1564,10 @@ def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
     from mlx_vlm.models.cache import ArraysCache
 
     assert rows <= prework_mod._QWEN4_BATCH_ROW_EXACT_ROWS
-    module = _real_qwen4_decode_module(signatures, 17)
+    module = _real_qwen4_decode_module(signatures, 17, dtype)
     mx.random.seed(rows)
-    inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(mx.bfloat16)
-    conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)
+    inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(dtype)
+    conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(dtype)
     recurrent_state = mx.random.normal((rows, HV, DV, DK)) * 0.05
     batch = ArraysCache(size=2)
     batch[0], batch[1] = conv_state, recurrent_state
@@ -1608,7 +1625,7 @@ def test_qwen4_batched_decode_step_equals_one_row_steps(rows):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
 @pytest.mark.parametrize("rows", [1, 2, 4, 9, 16])
 @pytest.mark.parametrize("seed", [7, 29])
 def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows, seed):
@@ -1616,7 +1633,7 @@ def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows
     output and gate products that BF16 rounds away."""
     if dtype == mx.float32 and rows > 9:
         pytest.skip("FP32 staging exceeds 32 KB of threadgroup memory past 15 rows; "
-                    "served verify windows are BF16")
+                    "served verify windows are 16-bit")
     mx.random.seed(seed)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
     q_scale = mx.array(DK**-0.5, dtype=dtype)

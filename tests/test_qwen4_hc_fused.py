@@ -25,7 +25,13 @@ HC, HIDDEN, LOWRANK = 4, 2560, 320
 WIDTH = HC * HIDDEN
 
 
-def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN, group_size: int = 64):
+def _module(
+    bits: int,
+    use_combine: bool = True,
+    hidden: int = HIDDEN,
+    group_size: int = 64,
+    dtype=mx.bfloat16,
+):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
 
@@ -34,7 +40,7 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN, group_siz
     nn.Module.__init__(module)
     module.hc_count, module.hidden_size, module.hc_lowrank = HC, hidden, LOWRANK
     module.hc_norm = Qwen4ExpRMSNorm(width, group_size=hidden, eps=1e-6)
-    module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(mx.bfloat16)
+    module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(dtype)
     module.input_mix_weight_down = nn.QuantizedLinear(
         width, LOWRANK, bias=False, group_size=group_size, bits=bits
     )
@@ -52,10 +58,10 @@ def _module(bits: int, use_combine: bool = True, hidden: int = HIDDEN, group_siz
             # up-projection gate into saturation where any rounding difference flips whole elements.
             projection.scales = (
                 mx.abs(mx.random.normal(projection.scales.shape)) * 0.01 + 0.002
-            ).astype(mx.bfloat16)
+            ).astype(dtype)
             projection.biases = (
                 mx.random.normal(projection.biases.shape) * 0.005
-            ).astype(mx.bfloat16)
+            ).astype(dtype)
     mx.eval(module.parameters())
     return module
 
@@ -89,14 +95,18 @@ def _ulps(a, b):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("group_size", [32, 64])
+@pytest.mark.parametrize(
+    "group_size,dtype", [(32, mx.bfloat16), (64, mx.bfloat16), (64, mx.float16)]
+)
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("rows", [1, 4, 16])
 @pytest.mark.parametrize("use_combine", [True, False])
-def test_fused_matches_canonical_path(bits, rows, use_combine, group_size):
+def test_fused_matches_canonical_path(bits, rows, use_combine, group_size, dtype):
     mx.random.seed(20260905 + bits * 100 + rows)
     _assert_fused_matches_canonical(
-        _module(bits, use_combine, group_size=group_size), rows, use_combine
+        _module(bits, use_combine, group_size=group_size, dtype=dtype),
+        rows,
+        use_combine,
     )
 
 
@@ -118,7 +128,8 @@ def _assert_fused_matches_canonical(module, rows, use_combine):
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     hidden = module.hidden_size
-    x = mx.random.normal((1, rows, HC * hidden)).astype(mx.bfloat16)
+    dtype = module.hc_norm.weight.dtype
+    x = mx.random.normal((1, rows, HC * hidden)).astype(dtype)
     mx.eval(x)
     assert hc_fused.compatible(module, x)
     fused = hc_fused.fused_forward(module, x)
@@ -136,7 +147,7 @@ def _assert_fused_matches_canonical(module, rows, use_combine):
     else:
         fused_mixed, canon_mixed = fused, canonical
     assert fused_mixed.shape == canon_mixed.shape == (1, rows, hidden)
-    assert fused_mixed.dtype == mx.bfloat16
+    assert fused_mixed.dtype == dtype
     max_vs_canon, mean_vs_canon = _ulps(fused_mixed, canon_mixed)
     assert max_vs_canon <= 16 and mean_vs_canon <= 0.5
     # Both paths round differently; judge each against fp32. The fused path keeps fp32 through
@@ -277,6 +288,11 @@ def test_compatible_fails_closed():
         mx.float16
     )
     assert not hc_fused.compatible(module, ok)
+    # An FP16 layout takes FP16 rows only.
+    fp16 = _module(4, dtype=mx.float16)
+    if mx.metal.is_available():
+        assert hc_fused.compatible(fp16, ok.astype(mx.float16))
+    assert not hc_fused.compatible(fp16, ok)
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -361,16 +377,20 @@ def test_specializations_validate_once_and_keep_warm_calls_lazy(monkeypatch):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-@pytest.mark.parametrize("group_size", [32, 64])
+@pytest.mark.parametrize(
+    "group_size,dtype", [(32, mx.bfloat16), (64, mx.bfloat16), (64, mx.float16)]
+)
 @pytest.mark.parametrize("bits", [4, 5])
 @pytest.mark.parametrize("rows", [17, 2048])
 @pytest.mark.parametrize("use_combine", [True, False])
-def test_prefill_path_matches_canonical(bits, rows, use_combine, group_size, monkeypatch):
+def test_prefill_path_matches_canonical(
+    bits, rows, use_combine, group_size, dtype, monkeypatch
+):
     """Prefill fuses the stream norm and, with inject weights, the mix/inject tail."""
     from mlx_vlm.models.qwen4_exp import hc_fused
 
-    module = _module(bits, use_combine, group_size=group_size)
-    x = (mx.random.normal((1, rows, WIDTH)) * 2).astype(mx.bfloat16)
+    module = _module(bits, use_combine, group_size=group_size, dtype=dtype)
+    x = (mx.random.normal((1, rows, WIDTH)) * 2).astype(dtype)
     mx.eval(x)
     assert not hc_fused.compatible(module, x)
     assert hc_fused.prefill_compatible(module, x)
@@ -389,7 +409,7 @@ def test_prefill_path_matches_canonical(bits, rows, use_combine, group_size, mon
     else:
         mixed, canon_mixed = out, canon
     assert mixed.shape == canon_mixed.shape == (1, rows, HIDDEN)
-    assert mixed.dtype == mx.bfloat16
+    assert mixed.dtype == dtype
     max_ulps, mean_ulps = _ulps(mixed, canon_mixed)
     assert max_ulps <= 16 and mean_ulps <= 0.5
 
