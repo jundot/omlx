@@ -700,6 +700,9 @@ def _repo_layout(names: list[str]) -> str:
 
 def _optional_for_safetensors(name: str) -> bool:
     lower = name.lower()
+    # Ming-3.0-tts reads its CAM++ speaker encoder for voice clones from here.
+    if lower == "campplus.onnx":
+        return False
     parts = lower.split("/")
     if any(part.startswith(".") or part == "__pycache__" for part in parts):
         return True

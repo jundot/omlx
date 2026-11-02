@@ -487,6 +487,21 @@ class TestTTSEndpointErrors:
         )
         assert response.status_code >= 500
 
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_invalid_request_from_model_returns_400(self, server_tts_client, stream):
+        from omlx.exceptions import InvalidRequestError
+
+        client, mock_pool = server_tts_client
+        mock_pool.get_engine.return_value.synthesize = AsyncMock(
+            side_effect=InvalidRequestError("voice cannot be combined")
+        )
+        response = client.post(
+            "/v1/audio/speech",
+            json={"model": "ming", "input": "Hi", "stream": stream},
+        )
+        assert response.status_code == 400
+        assert "voice cannot be combined" in response.json()["error"]["message"]
+
     def test_missing_model_field_returns_error(self, server_tts_client):
         """Request without 'model' field returns 4xx."""
         client, _ = server_tts_client
@@ -1597,6 +1612,7 @@ def _tiny_ming3_model(stop_bias):
     )
     model = bm.Model.__new__(bm.Model)
     nn.Module.__init__(model)
+    model.config = SimpleNamespace(model_path=None)
     model.ming3 = True
     model.patch_size = model.history_patch_size = 1
     model.latent_dim = 4
@@ -1649,6 +1665,22 @@ class TestMing3Patches:
             assert got_last == want_last
             assert mx.array_equal(got, want).item()
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "오늘은 날씨가 정말 좋아서 우리는 공원에 가서 산책을 하고 맛있는 "
+            "점심을 먹었습니다. 저녁에는 친구들과 함께 영화를 보기로 했습니다.",
+            "今日はとても天気が良かったので、私たちは公園まで歩いて行きました。"
+            "夕方には友達と一緒に映画を見る予定です。",
+        ],
+    )
+    def test_korean_and_japanese_text_is_split(self, text):
+        from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
+
+        bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+        assert apply_ming3_patches()
+        assert len(bm._split_fragments(text, 24)) > 1
+
     # The official checkpoint stores rotary inv_freq in f32, mlx-community's in bf16.
     @pytest.mark.parametrize("table_dtype", [mx.float32, mx.bfloat16])
     def test_fused_dit_kernels_match_mlx_modules(self, table_dtype):
@@ -1688,6 +1720,20 @@ class TestMing3Patches:
         shift = mx.array(0.25, dtype=mx.bfloat16)
         got = fused.cfm_final(h, dit.final_layer, y, dts, sqs, sde, shift, 3, 2.0)
         assert rel(got, want) < 2e-2
+
+    def test_builtin_voice_with_instructions_is_request_error(self):
+        from omlx.exceptions import InvalidRequestError
+        from omlx.patches.mlx_audio_ming3 import apply_ming3_patches
+
+        bm = pytest.importorskip("mlx_audio.tts.models.bailingmm.bailingmm")
+        assert apply_ming3_patches()
+        with pytest.raises(InvalidRequestError):
+            bm.Model.generate(
+                SimpleNamespace(ming3=True),
+                text="Hi.",
+                voice="UK_George",
+                instruct="Calm.",
+            )
 
 
 # ---------------------------------------------------------------------------

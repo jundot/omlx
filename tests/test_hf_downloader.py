@@ -5357,6 +5357,19 @@ class TestFileSelection:
         assert part["mmproj"] == "mmproj-BF16.gguf"
         assert not any(row["required"] for row in gguf)
 
+    def test_ming_campplus_weights_are_required(self):
+        names = [
+            "config.json",
+            "model.safetensors",
+            "campplus.onnx",
+            "campplus.safetensors",
+            "onnx/model.onnx",
+        ]
+        files = [{"name": name, "size": 1} for name in names]
+        hf_downloader_mod._describe_repo_files(files, None)
+        required = {row["name"] for row in files if row["required"]}
+        assert required == set(names) - {"onnx/model.onnx"}
+
     def test_multi_precision_repo_locks_only_the_default_checkpoint(self):
         names = [
             "config.json",
