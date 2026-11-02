@@ -153,6 +153,17 @@ final class ModelCardDTODecodeTests: XCTestCase {
         XCTAssertEqual(dto.files?[2].sizeFormatted, "")
     }
 
+    func testDecodesUpdateOverviewWithLargeFiles() throws {
+        let json = #"{"model_card":"","repo_id":"Owner/Model","disk_free":120000000000,"update_files":["config.json","model.safetensors"],"files":[{"name":"config.json","size":100,"outdated":true,"required":true,"local":false},{"name":"model.safetensors","size":77000000000,"outdated":true,"local":false},{"name":"tokenizer.json","size":200,"local":true}]}"#
+        let dto = try decoder.decode(ModelCardDTO.self, from: Data(json.utf8))
+        XCTAssertEqual(dto.updateFiles, ["config.json", "model.safetensors"])
+        XCTAssertEqual(dto.files?[0].outdated, true)
+        XCTAssertEqual(dto.files?[0].required, true)
+        XCTAssertEqual(dto.files?[1].size, 77_000_000_000)
+        XCTAssertEqual(dto.files?[2].local, true)
+        XCTAssertEqual(dto.diskFree, 120_000_000_000)
+    }
+
     func testDecodesTagsList() throws {
         // Tags tab payload — flat array of strings. MS encodes them as
         // comma-separated server-side but converts before serializing,

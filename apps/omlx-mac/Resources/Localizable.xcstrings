@@ -1,6 +1,176 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "models.updates.check" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Check for updates"
+          }
+        }
+      }
+    },
+    "models.updates.nothing" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No eligible models to check."
+          }
+        }
+      }
+    },
+    "models.updates.result" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Updates available: %lld · Checked: %lld · Failed: %lld"
+          }
+        }
+      }
+    },
+    "models.updates.available" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update available"
+          }
+        }
+      }
+    },
+    "models.updates.last_known" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update available · last known"
+          }
+        }
+      }
+    },
+    "models.updates.details" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld files · %@"
+          }
+        }
+      }
+    },
+    "models.updates.updating" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Updating"
+          }
+        }
+      }
+    },
+    "models.updates.manage" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Review download"
+          }
+        }
+      }
+    },
+    "models.updates.preview_label" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Review update for %@"
+          }
+        }
+      }
+    },
+    "models.updates.progress_label" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open download progress for %@"
+          }
+        }
+      }
+    },
+    "models.updates.unavailable" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This model changed or is no longer available. Check for updates again."
+          }
+        }
+      }
+    },
+    "models.updates.unload" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Unload this model before updating."
+          }
+        }
+      }
+    },
+    "models.updates.existing_task" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Manage this model's unfinished download in Downloads."
+          }
+        }
+      }
+    },
+    "models.updates.busy" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wait for the current update operation to finish."
+          }
+        }
+      }
+    },
+    "models.updates.check_failed" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not check for model updates. Previous results are last known results."
+          }
+        }
+      }
+    },
+    "models.updates.check_error" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not check for model updates: %@"
+          }
+        }
+      }
+    },
+    "models.updates.start_error" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Could not start the model update: %@"
+          }
+        }
+      }
+    },
     "settings.button.reset_defaults" : {
       "localizations" : {
         "en" : {
