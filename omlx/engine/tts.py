@@ -19,6 +19,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..patches.mlx_audio_compat import ensure_ming_post_load_skips_campplus_conversion
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -142,6 +143,8 @@ class TTSEngine(BaseNonStreamingEngine):
                 "mlx-audio is required for TTS inference. "
                 'Install it with: pip install "omlx[audio]"'
             ) from exc
+
+        ensure_ming_post_load_skips_campplus_conversion()
 
         model_name = self._model_name
 
