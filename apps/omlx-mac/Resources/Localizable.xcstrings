@@ -12703,6 +12703,12 @@
       "comment" : "Prefill priority option that favors the largest context",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maximaler Kontext"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -12721,6 +12727,12 @@
       "comment" : "Prefill priority option that favors prefill speed",
       "extractionState" : "manual",
       "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geschwindigkeit"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
