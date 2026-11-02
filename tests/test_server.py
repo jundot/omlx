@@ -1234,6 +1234,30 @@ class TestExposedProfileModels:
         assert profile_model["max_tokens"] == 1024
 
     @pytest.mark.asyncio
+    async def test_v1_models_status_lists_chat_ui_reasoning_levels(self, manager):
+        import omlx.server as server_module
+
+        class Pool(self._FakePool):
+            def get_status(self):
+                return {
+                    "models": [
+                        {"id": "dsv41", "config_model_type": "deepseek_v41"},
+                        {"id": "oss", "config_model_type": "gpt_oss"},
+                        {"id": "k2", "config_model_type": "k2_horizon"},
+                    ]
+                }
+
+        server_module._server_state.engine_pool = Pool()
+
+        status = await server_module.list_models_status(True)
+
+        assert {m["id"]: m["reasoning_levels"] for m in status["models"]} == {
+            "dsv41": ["off", "low", "high", "max"],
+            "oss": ["low", "medium", "high"],
+            "k2": ["low", "medium", "high"],
+        }
+
+    @pytest.mark.asyncio
     async def test_v1_models_advertises_alias_form_for_exposed_profiles(self, manager):
         """With a base-model alias set, the catalog lists <alias>:<profile> —
         consistent with the base model being listed under its alias."""

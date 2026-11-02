@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import requests
+
 
 def bracket_host(host: str) -> str:
     """Return ``host`` in URL-authority form, bracketing bare IPv6 literals.
@@ -31,6 +33,8 @@ class IntegrationContext:
     port: int
     api_key: str = ""
     model: str = ""
+    # Server default model from /health, for tools that need a starting model.
+    default_model: str = ""
     opus_model: str | None = None
     sonnet_model: str | None = None
     haiku_model: str | None = None
@@ -64,6 +68,45 @@ class IntegrationContext:
         return self.model_type == "vlm"
 
 
+def chat_model_ids(ctx: IntegrationContext) -> list[str]:
+    """Return the served chat model ids, in server order."""
+    status_map = ctx.models_status_map
+    # An aliased model sits under both keys; list its display id once.
+    ids = list(
+        dict.fromkeys(
+            info.get("model_alias") or m_id for m_id, info in status_map.items()
+        )
+    )
+    if not ids:
+        # Status needs a key that /v1/models may not (e.g. under
+        # allow_unauthenticated_inference), so ask for the inventory once.
+        headers = {"Authorization": f"Bearer {ctx.auth_token}"} if ctx.api_key else {}
+        try:
+            resp = requests.get(f"{ctx.base_url}/v1/models", headers=headers, timeout=5)
+            resp.raise_for_status()
+            ids = [
+                m["id"]
+                for m in resp.json().get("data", [])
+                if m.get("id") and m.get("model_type") in ("llm", "vlm", None)
+            ]
+        except Exception:
+            ids = []
+    if not ids and ctx.model:
+        ids = [ctx.model]
+
+    chat_ids: list[str] = []
+    for m_id in ids:
+        info = status_map.get(m_id, {})
+        # Records without a type (no status metadata) stay in.
+        if info.get("is_hidden"):
+            continue
+        model_type = info.get("model_type") or None
+        if model_type and model_type not in ("llm", "vlm"):
+            continue
+        chat_ids.append(m_id)
+    return chat_ids
+
+
 @dataclass
 class Integration:
     """Base integration definition."""
@@ -76,7 +119,7 @@ class Integration:
 
     # Whether `omlx launch <tool>` must interactively pick a model. Tools
     # that configure one model into their config need a pick; tools that
-    # register the server's whole model catalog (dsh) do not, and resolve
+    # register the server's whole model catalog (dsh, Codex) do not, and resolve
     # their optional default from `--model` / the saved per-tool setting.
     requires_model_selection: bool = True
 

@@ -2277,8 +2277,11 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 _OMLX_THINKING_TOGGLE_TYPES = ("deepseek_v4", "minimax_m3")
 
 
-def _reasoning_levels(model_info: dict, model_type: str, forced: bool) -> list[str]:
+def reasoning_levels(model_info: dict) -> list[str]:
     """Return the chat reasoning slider stops, or [] when the model has none."""
+    model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
+    # K2 Horizon always thinks, so it has no "off" stop.
+    forced = model_type == "k2_horizon"
     toggle = model_info.get("thinking_default") is not None or model_type.startswith(
         _OMLX_THINKING_TOGGLE_TYPES
     )
@@ -2321,7 +2324,7 @@ def _model_options(model_info: dict, settings) -> dict:
         ),
         "reasoning_effort_default": "high" if is_k2 else "low",
         "reasoning_effort_custom": not is_k2,
-        "reasoning_levels": _reasoning_levels(model_info, model_type, is_k2),
+        "reasoning_levels": reasoning_levels(model_info),
         "ane_prefill_backend": ane_backend,
         "ane_prefill_default_fraction": ane_prefill_fraction(None, model_type),
         "ane_prefill_mlp_fractions": [1 / 3, 0.5] if ane_backend == "k2" else [],

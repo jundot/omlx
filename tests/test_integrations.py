@@ -3,6 +3,8 @@
 import json
 import os
 import plistlib
+import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -25,8 +27,14 @@ from omlx.integrations.claude_desktop import (
 )
 from omlx.integrations.claude_desktop_app import ClaudeDesktopAppIntegration
 from omlx.integrations.codex import (
+    FALLBACK_INSTRUCTIONS,
     CodexIntegration,
+    capture_codex_instructions,
+    check_codex_version,
     codex_config_args,
+    codex_instructions,
+    codex_model_catalog,
+    resolve_codex_models,
     write_codex_config,
 )
 from omlx.integrations.codex_app import CodexAppIntegration, find_codex_app_bundle
@@ -110,6 +118,31 @@ class TestIntegrationCommands:
         )
 
 
+CODEX_STATUS = {
+    "qwen3.5": {"id": "qwen3.5", "model_type": "llm", "max_context_window": 32768}
+}
+
+
+@pytest.fixture
+def codex_probe():
+    """Stand in for the Codex probes so no real codex runs."""
+    with (
+        patch(
+            "omlx.integrations.codex.capture_codex_instructions",
+            return_value="codex built-in instructions",
+        ) as probe,
+        patch("omlx.integrations.codex.check_codex_version"),
+        patch("omlx.integrations.codex_app.check_codex_version"),
+    ):
+        yield probe
+
+
+def write_fake_codex(path: Path, body: str) -> str:
+    path.write_text(f"#!{sys.executable}\n{body}")
+    path.chmod(0o755)
+    return str(path)
+
+
 class TestCodexIntegration:
     def test_get_command(self):
         codex = CodexIntegration()
@@ -120,34 +153,136 @@ class TestCodexIntegration:
     def test_get_command_no_model(self):
         codex = CodexIntegration()
         cmd = codex.get_command(ctx(port=8000, api_key="", model=""))
-        assert "select-a-model" in cmd
+        assert cmd.endswith("launch codex")
 
-    def test_config_args_use_process_scoped_provider(self):
+    def test_config_args_use_process_scoped_provider(self, tmp_path):
+        catalog = tmp_path / "omlx-models.json"
         args = codex_config_args(
             ctx(
                 host="192.168.1.100",
                 port=9000,
                 model="deepseek-v3.1",
                 context_window=240_000,
-            )
+            ),
+            catalog,
         )
 
         assert 'model_provider="omlx"' in args
         assert 'model_providers.omlx.base_url="http://192.168.1.100:9000/v1"' in args
         assert 'model_providers.omlx.env_key="OMLX_API_KEY"' in args
-        assert "model_context_window=240000" in args
-        assert not any("model_auto_compact_token_limit" in arg for arg in args)
+        assert f'model_catalog_json="{catalog}"' in args
+        assert not any("model_context_window" in arg for arg in args)
 
-    def test_config_args_reasoning_uses_resolved_metadata(self):
-        reasoning_args = codex_config_args(
-            ctx(port=8000, model="custom-model", reasoning=True)
-        )
-        non_reasoning_args = codex_config_args(
-            ctx(port=8000, model="deepseek-r1", reasoning=False)
+    def test_catalog_uses_served_ids_limits_and_effort_levels(self):
+        status = {
+            "qwen-vl-raw": {
+                "model_alias": "qwen-vl",
+                "model_type": "vlm",
+                "max_context_window": 65536,
+                "reasoning_levels": ["off", "on"],
+            },
+            "dsv41": {
+                "model_type": "llm",
+                "reasoning_levels": ["off", "low", "high", "max"],
+            },
+        }
+        status["qwen-vl"] = status["qwen-vl-raw"]
+        c = ctx(models_status_map=status, default_model="qwen-vl-raw")
+
+        model_ids, start = resolve_codex_models(c)
+        entries = codex_model_catalog(c, model_ids, "instructions")["models"]
+
+        assert start == "qwen-vl"
+        assert entries[0]["context_window"] == 65536
+        assert entries[0]["input_modalities"] == ["text", "image"]
+        assert {
+            e["slug"]: [lvl["effort"] for lvl in e["supported_reasoning_levels"]]
+            for e in entries
+        } == {"qwen-vl": [], "dsv41": ["low", "high", "max"]}
+
+    @pytest.mark.parametrize(
+        ("model", "default", "expected"),
+        [
+            ("qwen-vl-raw", "", "qwen-vl"),  # saved raw id of an aliased model
+            ("bge-m3", "gpt-oss", "gpt-oss"),  # not a chat model
+            ("", "bge-m3", "qwen-vl"),  # server default is not a chat model
+        ],
+    )
+    def test_start_model_is_a_served_chat_model(self, model, default, expected):
+        status = {
+            "qwen-vl-raw": {"model_alias": "qwen-vl", "model_type": "vlm"},
+            "gpt-oss": {"model_type": "llm"},
+            "bge-m3": {"model_type": "embedding"},
+        }
+        status["qwen-vl"] = status["qwen-vl-raw"]
+        c = ctx(model=model, default_model=default, models_status_map=status)
+
+        assert resolve_codex_models(c)[1] == expected
+
+    @pytest.mark.parametrize(
+        ("version", "exits"),
+        [("codex-cli 0.147.0", True), ("codex-cli 0.154.0-alpha.6.2", False)],
+    )
+    def test_old_codex_stops_before_the_catalog(self, tmp_path, version, exits):
+        codex_bin = write_fake_codex(tmp_path / "codex", f"print({version!r})\n")
+
+        if exits:
+            with pytest.raises(SystemExit):
+                check_codex_version(codex_bin)
+        else:
+            check_codex_version(codex_bin)
+
+    def test_capture_kills_the_whole_codex_process_group(self, tmp_path):
+        pid_file = tmp_path / "child.pid"
+        # Like the npm shim: a parent that never posts, with a native child.
+        codex_bin = write_fake_codex(
+            tmp_path / "codex",
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c',"
+            " 'import time; time.sleep(60)'])\n"
+            f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+            "time.sleep(60)\n",
         )
 
-        assert 'model_reasoning_effort="high"' in reasoning_args
-        assert not any("model_reasoning_effort" in arg for arg in non_reasoning_args)
+        with patch("omlx.integrations.codex._PROBE_TIMEOUT_SECONDS", 1.0):
+            assert capture_codex_instructions(codex_bin, dict(os.environ)) is None
+
+        child_pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the native codex child outlived the probe")
+
+    def test_capture_reads_instructions_from_isolated_codex_run(self, tmp_path):
+        codex_bin = write_fake_codex(
+            tmp_path / "codex",
+            "import json, os, sys, urllib.request\n"
+            "assert sys.stdin.read() == ''\n"
+            "assert os.listdir(os.environ['CODEX_HOME']) == []\n"
+            "url = next(a.split('=', 1)[1] for a in sys.argv"
+            " if a.startswith('model_providers.omlx.base_url='))\n"
+            "body = json.dumps({'instructions': 'built-in'}).encode()\n"
+            "req = urllib.request.Request(json.loads(url) + '/responses', body)\n"
+            "try:\n"
+            "    urllib.request.urlopen(req)\n"
+            "except urllib.error.HTTPError:\n"
+            "    sys.exit(1)\n",
+        )
+
+        assert capture_codex_instructions(codex_bin, dict(os.environ)) == "built-in"
+
+    def test_instructions_fall_back_when_codex_sends_nothing(self, tmp_path, capsys):
+        codex_bin = write_fake_codex(tmp_path / "codex", "raise SystemExit(2)\n")
+
+        assert codex_instructions(codex_bin, dict(os.environ)) == FALLBACK_INSTRUCTIONS
+        assert "Warning: could not read the built-in instructions" in (
+            capsys.readouterr().out
+        )
 
     def test_configure_does_not_write_codex_config(self):
         with patch("omlx.integrations.codex.write_codex_config") as writer:
@@ -160,7 +295,8 @@ class TestCodexIntegration:
         assert codex.type == "env_var"
         assert codex.display_name == "Codex"
 
-    def test_launch_forwards_extra_args(self):
+    @pytest.mark.usefixtures("codex_probe")
+    def test_launch_forwards_extra_args(self, tmp_path):
         codex = CodexIntegration()
         captured = {}
 
@@ -178,6 +314,10 @@ class TestCodexIntegration:
             patch("omlx.integrations.codex.write_codex_config") as writer,
             patch("omlx.integrations.codex.os.environ", base_env),
             patch("omlx.integrations.codex.os.execvpe", side_effect=fake_execvpe),
+            patch("omlx.integrations.codex.shutil.which", return_value="/bin/codex"),
+            patch(
+                "omlx.integrations.codex.CODEX_CONFIG_PATH", tmp_path / "config.toml"
+            ),
         ):
             codex.launch(
                 ctx(
@@ -185,12 +325,18 @@ class TestCodexIntegration:
                     api_key="key",
                     model="qwen3.5",
                     extra_args=("--yolo",),
+                    models_status_map=CODEX_STATUS,
                 )
             )
 
         assert captured["argv"][-3:] == ["-m", "qwen3.5", "--yolo"]
         assert 'model_provider="omlx"' in captured["argv"]
-        assert "model_context_window=240000" not in captured["argv"]
+        (catalog_path,) = tmp_path.glob("omlx-codex-models-*.json")
+        assert f'model_catalog_json="{catalog_path}"' in captured["argv"]
+        catalog = json.loads(catalog_path.read_text())
+        assert catalog["models"][0]["base_instructions"] == (
+            "codex built-in instructions"
+        )
         assert captured["env"]["OMLX_API_KEY"] == "key"
         assert "PYTHONHOME" not in captured["env"]
         assert "PYTHONPATH" not in captured["env"]
@@ -212,11 +358,13 @@ class TestCodexConfigWriter:
                 api_key="test-key",
                 model="qwen3.5",
             ),
+            tmp_path / "omlx-models.json",
         )
 
         content = config_path.read_text()
         assert 'model = "qwen3.5"' in content
         assert 'model_provider = "omlx"' in content
+        assert f'model_catalog_json = "{tmp_path / "omlx-models.json"}"' in content
         assert 'base_url = "http://192.168.1.100:9000/v1"' in content
         assert 'env_key = "OMLX_API_KEY"' in content
 
@@ -224,7 +372,9 @@ class TestCodexConfigWriter:
         config_path = tmp_path / "config.toml"
         config_path.write_text('model = "old"')
 
-        write_codex_config(config_path, ctx(port=8000, model="new"))
+        write_codex_config(
+            config_path, ctx(port=8000, model="new"), tmp_path / "c.json"
+        )
 
         backups = list(tmp_path.glob("config.*.bak"))
         assert len(backups) == 1
@@ -243,7 +393,9 @@ class TestCodexConfigWriter:
             'name = "old-omlx"\n'
         )
 
-        write_codex_config(config_path, ctx(port=8000, model="new-model"))
+        write_codex_config(
+            config_path, ctx(port=8000, model="new-model"), tmp_path / "c.json"
+        )
 
         content = config_path.read_text()
         assert 'model = "new-model"' in content
@@ -264,6 +416,7 @@ class TestCodexConfigWriter:
         write_codex_config(
             config_path,
             ctx(port=8000, model="llama-3.1-8b", reasoning=False),
+            tmp_path / "c.json",
         )
 
         content = config_path.read_text()
@@ -295,19 +448,37 @@ class TestCodexAppIntegration:
         assert "omlx launch codex_app" in cmd
         assert "--model qwen3.5" in cmd
 
-    def test_configure(self, tmp_path):
+    def test_configure(self, tmp_path, codex_probe):
         codex_app = CodexAppIntegration()
         config_path = tmp_path / "codex" / "config.toml"
-        with patch.object(CodexAppIntegration, "CONFIG_PATH", config_path):
-            codex_app.configure(ctx(port=8000, api_key="test-key", model="qwen3.5"))
+        bundled = "/Applications/ChatGPT.app/Contents/Resources/codex"
+        with (
+            patch.object(CodexAppIntegration, "CONFIG_PATH", config_path),
+            patch(
+                "omlx.integrations.codex_app.bundled_codex_binary",
+                return_value=bundled,
+            ),
+        ):
+            codex_app.configure(
+                ctx(
+                    port=8000,
+                    api_key="test-key",
+                    default_model="qwen3.5",
+                    models_status_map=CODEX_STATUS,
+                )
+            )
 
+        assert codex_probe.call_args.args[0] == bundled
+        (catalog_path,) = config_path.parent.glob("omlx-codex-app-models-*.json")
         assert config_path.exists()
         content = config_path.read_text()
         assert 'model = "qwen3.5"' in content
+        assert f'model_catalog_json = "{catalog_path}"' in content
         assert 'model_provider = "omlx"' in content
         assert 'base_url = "http://127.0.0.1:8000/v1"' in content
         assert 'env_key = "OMLX_API_KEY"' in content
 
+    @pytest.mark.usefixtures("codex_probe")
     def test_launch_app(self, tmp_path):
         codex_app = CodexAppIntegration()
         config_path = tmp_path / "codex" / "config.toml"
@@ -338,6 +509,7 @@ class TestCodexAppIntegration:
                     api_key="key",
                     model="qwen3.5",
                     extra_args=(),
+                    models_status_map=CODEX_STATUS,
                 )
             )
 
@@ -384,6 +556,7 @@ class TestCodexAppIntegration:
         ):
             assert not CodexAppIntegration().is_installed()
 
+    @pytest.mark.usefixtures("codex_probe")
     def test_launch_falls_back_to_bundled_cli(self, tmp_path):
         bundle = make_app_bundle(tmp_path, "Codex.app", "com.openai.codex")
         config_path = tmp_path / "codex" / "config.toml"
@@ -399,7 +572,9 @@ class TestCodexAppIntegration:
             patch("omlx.integrations.codex_app._APP_BUNDLE_ROOTS", (tmp_path,)),
             patch("omlx.integrations.codex_app.os.execvpe", side_effect=fake_execvpe),
         ):
-            CodexAppIntegration().launch(ctx(port=8000, api_key="key", model="q"))
+            CodexAppIntegration().launch(
+                ctx(port=8000, api_key="key", model="q", models_status_map=CODEX_STATUS)
+            )
 
         bundled = str(bundle / "Contents" / "Resources" / "codex")
         assert captured["binary"] == bundled
