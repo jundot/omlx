@@ -816,14 +816,8 @@ def _gather_stage(x):
     return gathered[: x.shape[0]]
 
 
-# Wide prefill bounds the allocator pool rather than emptying it per layer:
-# the server pins the cache limit to total memory, so without a bound freed
-# buffers of widths that never reuse a size class pile up through the chunk,
-# and clearing at every layer hands each buffer back and re-allocates it.
-# 1/16 of the GPU working set reaches the 8 GiB cap from a 128 GiB working
-# set up, and scales down below that (about 6.7 GiB on a 128 GB host,
-# 0.74 GiB on 16 GB) so the retained pool
-# stays a small share of memory the weights and KV cache also need.
+# The server pins the cache limit to total memory (#300). Wide prefill bounds
+# the pool instead, so odd-size buffers do not pile up through a chunk.
 _PREFILL_CACHE_CAP = 8 << 30
 _PREFILL_CACHE_SHARE = 16
 
@@ -836,7 +830,6 @@ def _prefill_cache_limit():
 @contextmanager
 def _prefill_cache_scope():
     """Bound the allocator pool for one wide-prefill layer loop."""
-    # set_cache_limit returns the limit it replaces; restore it on any exit.
     previous = mx.set_cache_limit(_prefill_cache_limit())
     try:
         yield
@@ -1458,16 +1451,9 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                 and int(kwargs.get("next_prefill_tokens") or 0) > c.window_size
             )
             prefetch = getattr(self, "_engram_prefetch", None)
-            # The CPU enqueues a whole prefill chunk in ~1s while the GPU runs
-            # ~15x longer; with the layer loop fully lazy every intermediate
-            # (fp32 hyper-connection streams across hc_mult, gathered sparse
-            # attention loads, MoE routes) stays pinned until the final logits
-            # eval and the Metal pool hoards every freed size class as
-            # IOAccelerator footprint (measured +14.5GB per 2048-token chunk).
-            # Eval the running stream at each layer boundary during prefill so
-            # intermediates retire as the GPU progresses, and bound the pool
-            # for the loop (per-layer widths vary across the ratio switch, CED
-            # tail and 2047/2048 chunk widths, so size classes never reuse).
+            # A fully lazy prefill loop pins every intermediate until the logits
+            # eval (+14.5GB per 2048-token chunk). Prefill evals each layer so
+            # intermediates retire as the GPU runs, under a bounded pool.
             # Decode/verify widths are only submitted (async_eval).
             prefill_backpressure = end - begin >= 256
             with (
