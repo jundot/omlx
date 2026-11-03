@@ -171,6 +171,12 @@ and a capability-gated experimental token-only output path. See
 security boundaries, current limitations, and the physical-hardware validation
 checklist.
 
+A paired Mac can also speed up prefill without splitting the model: the
+[Prefill Accelerator](docs/experimental/prefill-accelerator.md) runs the first
+layers of long prompts on the other Mac while the model, its cache and
+decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next and
+MiniMax M3).
+
 ### Vision-Language Models
 
 Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. MiMo V2.6 checkpoints with bundled sidecars also accept sampled-frame video and 24 kHz audio. Qwen3.5, Qwen3.6 and Qwen3.8 checkpoints (dense and MoE) accept native video input as base64 `video_url` / `input_video` data URIs; video needs OpenCV (`opencv-python-headless`). oQ conversion of official MiMo V2.6 checkpoints preserves image and audio support. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
