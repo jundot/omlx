@@ -42,9 +42,9 @@ assert.equal(state.showsA8Prefill({
 assert.equal(state.showsA8Prefill({config_model_type: 'llama', a8_prefill_supported: true}), false);
 
 state.modelSettings.a8_prefill_enabled = true;
-state.modelSettings.qwen35_ane_prefill_enabled = true;
+state.modelSettings.ane_prefill_enabled = true;
 assert.equal(state.validateA8PrefillSettings(), 'js.error.ane_oq_a8_conflict');
-state.modelSettings.qwen35_ane_prefill_enabled = false;
+state.modelSettings.ane_prefill_enabled = false;
 assert.equal(state.validateA8PrefillSettings(), null);
 console.log('oQ A8 visibility and ANE conflict checks passed');
 

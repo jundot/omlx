@@ -541,7 +541,7 @@ raise SystemExit(2)
                 "specprefill_enabled",
                 "vlm_mtp_enabled",
                 "turboquant_kv_enabled",
-                "qwen35_ane_prefill_enabled",
+                "ane_prefill_enabled",
             )
             if bool(getattr(settings, name, False))
         ]

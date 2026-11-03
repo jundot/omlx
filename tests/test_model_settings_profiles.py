@@ -473,15 +473,15 @@ class TestProfileFieldFiltering:
 
     def test_qwen_ane_prefill_fields_round_trip_as_model_specific(self, mgr):
         settings = {
-            "qwen35_ane_prefill_enabled": True,
-            "qwen35_ane_prefill_sequence_length": 2048,
-            "qwen35_ane_prefill_tail_padding_min_tokens": 1357,
-            "qwen35_ane_prefill_fraction": 0.53,
-            "qwen35_ane_prefill_max_layers": 64,
-            "qwen35_ane_prefill_dual_ane": True,
-            "qwen35_ane_prefill_gdn": True,
-            "qwen35_ane_prefill_gdn_fraction": 0.50,
-            "qwen35_ane_prefill_gdn_max_layers": 48,
+            "ane_prefill_enabled": True,
+            "ane_prefill_sequence_length": 2048,
+            "ane_prefill_tail_padding_min_tokens": 1357,
+            "ane_prefill_fraction": 0.53,
+            "ane_prefill_max_layers": 64,
+            "ane_prefill_dual_ane": True,
+            "ane_prefill_gdn": True,
+            "ane_prefill_gdn_fraction": 0.50,
+            "ane_prefill_gdn_max_layers": 48,
         }
 
         mgr.save_profile("m", "ane", "ANE", None, settings)
@@ -489,15 +489,15 @@ class TestProfileFieldFiltering:
 
         mgr.apply_profile("m", "ane")
         applied = mgr.get_settings("m")
-        assert applied.qwen35_ane_prefill_enabled is True
-        assert applied.qwen35_ane_prefill_sequence_length == 2048
-        assert applied.qwen35_ane_prefill_tail_padding_min_tokens == 1357
-        assert applied.qwen35_ane_prefill_fraction == 0.53
-        assert applied.qwen35_ane_prefill_max_layers == 64
-        assert applied.qwen35_ane_prefill_dual_ane is True
-        assert applied.qwen35_ane_prefill_gdn is True
-        assert applied.qwen35_ane_prefill_gdn_fraction == 0.50
-        assert applied.qwen35_ane_prefill_gdn_max_layers == 48
+        assert applied.ane_prefill_enabled is True
+        assert applied.ane_prefill_sequence_length == 2048
+        assert applied.ane_prefill_tail_padding_min_tokens == 1357
+        assert applied.ane_prefill_fraction == 0.53
+        assert applied.ane_prefill_max_layers == 64
+        assert applied.ane_prefill_dual_ane is True
+        assert applied.ane_prefill_gdn is True
+        assert applied.ane_prefill_gdn_fraction == 0.50
+        assert applied.ane_prefill_gdn_max_layers == 48
 
     def test_save_template_drops_none_and_empty_string_values(self, mgr):
         mgr.save_template(

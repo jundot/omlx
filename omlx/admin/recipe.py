@@ -136,7 +136,8 @@ FEATURE_GROUPS: tuple[FeatureGroup, ...] = (
     ),
     FeatureGroup("turboquant", "turboquant_kv_enabled", prefixes=("turboquant_",)),
     FeatureGroup(
-        "ane_prefill", "qwen35_ane_prefill_enabled", prefixes=("qwen35_ane_prefill_",)
+        "ane_prefill", "ane_prefill_enabled",
+        prefixes=("ane_prefill_",),
     ),
     FeatureGroup("a8_prefill", "a8_prefill_enabled", prefixes=("a8_prefill_",)),
     FeatureGroup(

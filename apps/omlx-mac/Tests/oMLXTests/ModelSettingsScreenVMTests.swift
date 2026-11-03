@@ -8,12 +8,12 @@ final class ModelSettingsScreenVMTests: XCTestCase {
     func testSnapshotResultHelpersFormatSkippedStatsAndAppliedJSON() {
         let skipped = [
             SkippedFeatureDTO(feature: "dflash", reason: "draft model 'x' is not installed"),
-            SkippedFeatureDTO(feature: "a8_prefill", reason: "cannot be combined with qwen35_ane_prefill_enabled"),
+            SkippedFeatureDTO(feature: "a8_prefill", reason: "cannot be combined with ane_prefill_enabled"),
         ]
         XCTAssertEqual(
             ModelSettingsScreenVM.summarizeSkipped(skipped),
             ["dflash: draft model 'x' is not installed",
-             "a8_prefill: cannot be combined with qwen35_ane_prefill_enabled"]
+             "a8_prefill: cannot be combined with ane_prefill_enabled"]
         )
         XCTAssertEqual(ModelSettingsScreenVM.summarizeSkipped(nil), [])
 
@@ -234,27 +234,27 @@ final class ModelSettingsScreenVMTests: XCTestCase {
 
         let settings = vm.currentSettingsDict()
 
-        XCTAssertEqual(settings["qwen35_ane_prefill_enabled"]?.value as? Bool, true)
-        XCTAssertEqual(settings["qwen35_ane_prefill_sequence_length"]?.value as? Int, 2048)
-        XCTAssertEqual(settings["qwen35_ane_prefill_fraction"]?.value as? Double, 0.53)
-        XCTAssertEqual(settings["qwen35_ane_prefill_max_layers"]?.value as? Int, 64)
-        XCTAssertEqual(settings["qwen35_ane_prefill_dual_ane"]?.value as? Bool, true)
-        XCTAssertEqual(settings["qwen35_ane_prefill_gdn"]?.value as? Bool, true)
-        XCTAssertEqual(settings["qwen35_ane_prefill_gdn_fraction"]?.value as? Double, 0.5)
-        XCTAssertEqual(settings["qwen35_ane_prefill_gdn_max_layers"]?.value as? Int, 48)
-        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_enabled"]?.value as? Bool, true)
-        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_fraction"]?.value as? Double, 0.135)
-        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_down_fraction"]?.value as? Double, 0.0)
-        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_gdn_fraction"]?.value as? Double, 0.0)
-        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_threads"]?.value as? Int, 8)
-        XCTAssertEqual(settings["qwen35_ane_prefill_cpu_shared_resource"]?.value as? Bool, true)
+        XCTAssertEqual(settings["ane_prefill_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["ane_prefill_sequence_length"]?.value as? Int, 2048)
+        XCTAssertEqual(settings["ane_prefill_fraction"]?.value as? Double, 0.53)
+        XCTAssertEqual(settings["ane_prefill_max_layers"]?.value as? Int, 64)
+        XCTAssertEqual(settings["ane_prefill_dual_ane"]?.value as? Bool, true)
+        XCTAssertEqual(settings["ane_prefill_gdn"]?.value as? Bool, true)
+        XCTAssertEqual(settings["ane_prefill_gdn_fraction"]?.value as? Double, 0.5)
+        XCTAssertEqual(settings["ane_prefill_gdn_max_layers"]?.value as? Int, 48)
+        XCTAssertEqual(settings["ane_prefill_cpu_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(settings["ane_prefill_cpu_fraction"]?.value as? Double, 0.135)
+        XCTAssertEqual(settings["ane_prefill_cpu_down_fraction"]?.value as? Double, 0.0)
+        XCTAssertEqual(settings["ane_prefill_cpu_gdn_fraction"]?.value as? Double, 0.0)
+        XCTAssertEqual(settings["ane_prefill_cpu_threads"]?.value as? Int, 8)
+        XCTAssertEqual(settings["ane_prefill_cpu_shared_resource"]?.value as? Bool, true)
     }
 
     func testDisabledQwenAneSettingIsIncludedInWorkingProfile() {
         let settings = ModelSettingsScreenVM().currentSettingsDict()
 
-        XCTAssertEqual(settings["qwen35_ane_prefill_enabled"]?.value as? Bool, false)
-        XCTAssertNil(settings["qwen35_ane_prefill_sequence_length"])
+        XCTAssertEqual(settings["ane_prefill_enabled"]?.value as? Bool, false)
+        XCTAssertNil(settings["ane_prefill_sequence_length"])
     }
 
     func testQwenAneProfileBindingCreatesWorkingState() {
@@ -447,52 +447,56 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let json = #"""
         {
-            "qwen35_ane_prefill_enabled": true,
-            "qwen35_ane_prefill_sequence_length": 2048,
-            "qwen35_ane_prefill_fraction": 0.53,
-            "qwen35_ane_prefill_max_layers": 64,
-            "qwen35_ane_prefill_dual_ane": true,
-            "qwen35_ane_prefill_gdn": true,
-            "qwen35_ane_prefill_gdn_fraction": 0.5,
-            "qwen35_ane_prefill_gdn_max_layers": 48,
-            "qwen35_ane_prefill_cpu_enabled": true,
-            "qwen35_ane_prefill_cpu_fraction": 0.135,
-            "qwen35_ane_prefill_cpu_down_fraction": 0.2,
-            "qwen35_ane_prefill_cpu_gdn_fraction": 0.05,
-            "qwen35_ane_prefill_cpu_threads": 8,
-            "qwen35_ane_prefill_cpu_shared_resource": true
+            "ane_prefill_enabled": true,
+            "ane_prefill_sequence_length": 2048,
+            "ane_prefill_shared_fraction": 0,
+            "ane_prefill_fraction": 0.53,
+            "ane_prefill_max_layers": 64,
+            "ane_prefill_dual_ane": true,
+            "ane_prefill_gdn": true,
+            "ane_prefill_gdn_fraction": 0.5,
+            "ane_prefill_gdn_max_layers": 48,
+            "ane_prefill_cpu_enabled": true,
+            "ane_prefill_cpu_fraction": 0.135,
+            "ane_prefill_cpu_down_fraction": 0.2,
+            "ane_prefill_cpu_gdn_fraction": 0.05,
+            "ane_prefill_cpu_threads": 8,
+            "ane_prefill_cpu_shared_resource": true
         }
         """#
         let dto = try decoder.decode(ModelSettingsDTO.self, from: Data(json.utf8))
-        XCTAssertEqual(dto.qwen35AnePrefillFraction, 0.53)
-        XCTAssertEqual(dto.qwen35AnePrefillGdnFraction, 0.5)
-        XCTAssertEqual(dto.qwen35AnePrefillCpuEnabled, true)
-        XCTAssertEqual(dto.qwen35AnePrefillCpuFraction, 0.135)
-        XCTAssertEqual(dto.qwen35AnePrefillCpuDownFraction, 0.2)
-        XCTAssertEqual(dto.qwen35AnePrefillCpuGdnFraction, 0.05)
-        XCTAssertEqual(dto.qwen35AnePrefillCpuThreads, 8)
-        XCTAssertEqual(dto.qwen35AnePrefillCpuSharedResource, true)
+        XCTAssertEqual(dto.anePrefillSharedFraction, 0)
+        XCTAssertEqual(dto.anePrefillFraction, 0.53)
+        XCTAssertEqual(dto.anePrefillGdnFraction, 0.5)
+        XCTAssertEqual(dto.anePrefillCpuEnabled, true)
+        XCTAssertEqual(dto.anePrefillCpuFraction, 0.135)
+        XCTAssertEqual(dto.anePrefillCpuDownFraction, 0.2)
+        XCTAssertEqual(dto.anePrefillCpuGdnFraction, 0.05)
+        XCTAssertEqual(dto.anePrefillCpuThreads, 8)
+        XCTAssertEqual(dto.anePrefillCpuSharedResource, true)
 
         var patch = ModelSettingsPatch()
-        patch.qwen35AnePrefillEnabled = true
-        patch.qwen35AnePrefillFraction = 0.53
-        patch.qwen35AnePrefillCpuEnabled = true
-        patch.qwen35AnePrefillCpuFraction = 0.135
-        patch.qwen35AnePrefillCpuDownFraction = 0.2
-        patch.qwen35AnePrefillCpuGdnFraction = 0.05
-        patch.qwen35AnePrefillCpuThreads = 8
-        patch.qwen35AnePrefillCpuSharedResource = true
+        patch.anePrefillEnabled = true
+        patch.anePrefillSharedFraction = dto.anePrefillSharedFraction
+        patch.anePrefillFraction = 0.53
+        patch.anePrefillCpuEnabled = true
+        patch.anePrefillCpuFraction = 0.135
+        patch.anePrefillCpuDownFraction = 0.2
+        patch.anePrefillCpuGdnFraction = 0.05
+        patch.anePrefillCpuThreads = 8
+        patch.anePrefillCpuSharedResource = true
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let object = try JSONSerialization.jsonObject(with: encoder.encode(patch)) as? [String: Any]
-        XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, true)
-        XCTAssertEqual(object?["qwen35_ane_prefill_fraction"] as? Double, 0.53)
-        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_enabled"] as? Bool, true)
-        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_fraction"] as? Double, 0.135)
-        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_down_fraction"] as? Double, 0.2)
-        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_gdn_fraction"] as? Double, 0.05)
-        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_threads"] as? Int, 8)
-        XCTAssertEqual(object?["qwen35_ane_prefill_cpu_shared_resource"] as? Bool, true)
+        XCTAssertEqual(object?["ane_prefill_enabled"] as? Bool, true)
+        XCTAssertEqual(object?["ane_prefill_shared_fraction"] as? Double, 0)
+        XCTAssertEqual(object?["ane_prefill_fraction"] as? Double, 0.53)
+        XCTAssertEqual(object?["ane_prefill_cpu_enabled"] as? Bool, true)
+        XCTAssertEqual(object?["ane_prefill_cpu_fraction"] as? Double, 0.135)
+        XCTAssertEqual(object?["ane_prefill_cpu_down_fraction"] as? Double, 0.2)
+        XCTAssertEqual(object?["ane_prefill_cpu_gdn_fraction"] as? Double, 0.05)
+        XCTAssertEqual(object?["ane_prefill_cpu_threads"] as? Int, 8)
+        XCTAssertEqual(object?["ane_prefill_cpu_shared_resource"] as? Bool, true)
     }
 
     func testANETunerOverridesEncodeForStartRequest() throws {
@@ -568,16 +572,16 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         vm.qwen35AnePrefillCpuEnabled = true
         vm.model = makeModel(id: "k2", configModelType: "k2_horizon")
         let k2 = vm.currentSettingsDict()
-        XCTAssertEqual(k2["qwen35_ane_prefill_enabled"]?.value as? Bool, true)
-        XCTAssertEqual(k2["qwen35_ane_prefill_fraction"]?.value as? Double, 1.0 / 3.0)
-        XCTAssertEqual(k2["qwen35_ane_prefill_shared_fraction"]?.value as? Double, 0)
-        XCTAssertNil(k2["qwen35_ane_prefill_cpu_enabled"])
+        XCTAssertEqual(k2["ane_prefill_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(k2["ane_prefill_fraction"]?.value as? Double, 1.0 / 3.0)
+        XCTAssertEqual(k2["ane_prefill_shared_fraction"]?.value as? Double, 0)
+        XCTAssertNil(k2["ane_prefill_cpu_enabled"])
         XCTAssertFalse(k2.keys.contains { $0.hasPrefix("k2_ane_") })
         vm.model = makeModel(id: "qwen", configModelType: "qwen3_5")
         let qwen = vm.currentSettingsDict()
-        XCTAssertEqual(qwen["qwen35_ane_prefill_enabled"]?.value as? Bool, true)
-        XCTAssertEqual(qwen["qwen35_ane_prefill_cpu_enabled"]?.value as? Bool, true)
-        XCTAssertNil(qwen["qwen35_ane_prefill_shared_fraction"])
+        XCTAssertEqual(qwen["ane_prefill_enabled"]?.value as? Bool, true)
+        XCTAssertEqual(qwen["ane_prefill_cpu_enabled"]?.value as? Bool, true)
+        XCTAssertNil(qwen["ane_prefill_shared_fraction"])
     }
 
     func testMtplxImportIsOfferedOnlyForTheServerSideSidecarMarker() {
@@ -813,7 +817,7 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(object?["top_p"] is NSNull)
         XCTAssertTrue(object?["reasoning_parser"] is NSNull)
         XCTAssertTrue(object?["mtp_fixed_depth"] is NSNull)
-        XCTAssertEqual(object?["qwen35_ane_prefill_enabled"] as? Bool, false)
+        XCTAssertEqual(object?["ane_prefill_enabled"] as? Bool, false)
     }
 
     func testGPUPowerLimitSendsZeroWhenOff() throws {

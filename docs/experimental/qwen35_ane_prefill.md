@@ -72,23 +72,29 @@ the native q8 tile is not profitable.
 
 ## Per-model settings
 
+These model-neutral `ane_prefill_*` controls live inside the selected
+`models[model_id]` record in `model_settings.json`. The same names apply to
+other supported models, including K2; each model ID has its own values.
+Older Qwen-prefixed settings are accepted on input and saved using neutral
+names. Explicit neutral keys take precedence when both forms are present.
+
 ```json
 {
-  "qwen35_ane_prefill_enabled": true,
-  "qwen35_ane_prefill_sequence_length": 2048,
-  "qwen35_ane_prefill_tail_padding_min_tokens": 0,
-  "qwen35_ane_prefill_fraction": 0.53,
-  "qwen35_ane_prefill_max_layers": 64,
-  "qwen35_ane_prefill_dual_ane": true,
-  "qwen35_ane_prefill_gdn": true,
-  "qwen35_ane_prefill_gdn_fraction": 0.50,
-  "qwen35_ane_prefill_gdn_max_layers": 48,
-  "qwen35_ane_prefill_cpu_enabled": false,
-  "qwen35_ane_prefill_cpu_fraction": 0.135,
-  "qwen35_ane_prefill_cpu_down_fraction": 0.0,
-  "qwen35_ane_prefill_cpu_gdn_fraction": 0.0,
-  "qwen35_ane_prefill_cpu_threads": 8,
-  "qwen35_ane_prefill_cpu_shared_resource": true
+  "ane_prefill_enabled": true,
+  "ane_prefill_sequence_length": 2048,
+  "ane_prefill_tail_padding_min_tokens": 0,
+  "ane_prefill_fraction": 0.53,
+  "ane_prefill_max_layers": 64,
+  "ane_prefill_dual_ane": true,
+  "ane_prefill_gdn": true,
+  "ane_prefill_gdn_fraction": 0.50,
+  "ane_prefill_gdn_max_layers": 48,
+  "ane_prefill_cpu_enabled": false,
+  "ane_prefill_cpu_fraction": 0.135,
+  "ane_prefill_cpu_down_fraction": 0.0,
+  "ane_prefill_cpu_gdn_fraction": 0.0,
+  "ane_prefill_cpu_threads": 8,
+  "ane_prefill_cpu_shared_resource": true
 }
 ```
 

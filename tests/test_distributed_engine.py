@@ -433,10 +433,10 @@ def test_qwen35_ane_prefill_rejected_by_distributed_engine():
     # believe ANE is active on a cluster deployment and get nothing.
     engine = DistributedBatchedEngine(
         _deployment(),
-        model_settings=SimpleNamespace(qwen35_ane_prefill_enabled=True),
+        model_settings=SimpleNamespace(ane_prefill_enabled=True),
     )
 
-    with pytest.raises(ValueError, match="qwen35_ane_prefill_enabled"):
+    with pytest.raises(ValueError, match="ane_prefill_enabled"):
         engine._validate_model_settings()
 
 

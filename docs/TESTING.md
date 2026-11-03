@@ -1,5 +1,9 @@
 # Test layout
 
+Use the prepared project environment: `uv run --no-sync python -m pytest`, or
+`.venv/bin/python -m pytest`. A bare `python` from an unactivated shell may
+select a different interpreter without the project's test dependencies.
+
 Server tests live in `tests/` and must not depend on `apps/`: after the full run, CI deletes `apps/`, collects the server tests again, and starts `omlx serve` to check the API-only fallback. Web UI tests live in `apps/omlx-web/tests/` and the macOS app's Python tests in `apps/omlx-mac/Tests/python/`. A plain `pytest` runs all three through `testpaths`. The standalone dashboard script tests are the `apps/omlx-web/tests/*.test.cjs` files except `network_auth_ui.test.cjs`, which `test_admin_network_auth_ui.py` runs with its input.
 
 # Qwen3.5 text-only checkpoint tests

@@ -903,12 +903,12 @@ def test_oq_a8_and_ane_prefill_cannot_both_be_enabled():
     whichever patches first rather than two accelerators stacking. Constructing
     the combination has to raise so the clash reaches the caller."""
     with pytest.raises(ValueError, match="cannot"):
-        ModelSettings(a8_prefill_enabled=True, qwen35_ane_prefill_enabled=True)
+        ModelSettings(a8_prefill_enabled=True, ane_prefill_enabled=True)
 
     # Either one alone is fine.
     assert ModelSettings(a8_prefill_enabled=True).a8_prefill_enabled is True
     assert (
-        ModelSettings(qwen35_ane_prefill_enabled=True).qwen35_ane_prefill_enabled
+        ModelSettings(ane_prefill_enabled=True).ane_prefill_enabled
         is True
     )
 
@@ -920,14 +920,14 @@ def test_prefill_conflict_resolution_keeps_ane_and_reports_it():
     resolved, conflicts = resolve_qwen35_prefill_conflicts(
         {
             "a8_prefill_enabled": True,
-            "qwen35_ane_prefill_enabled": True,
+            "ane_prefill_enabled": True,
             "max_tokens": 4096,
         }
     )
     assert resolved["a8_prefill_enabled"] is False
-    assert resolved["qwen35_ane_prefill_enabled"] is True
+    assert resolved["ane_prefill_enabled"] is True
     assert resolved["max_tokens"] == 4096
-    assert conflicts == ["qwen35_ane_prefill_enabled"]
+    assert conflicts == ["ane_prefill_enabled"]
     # The resolved dict has to be constructible -- that is the whole point.
     assert ModelSettings.from_dict(resolved).a8_prefill_enabled is False
 
@@ -936,8 +936,8 @@ def test_prefill_conflict_resolution_leaves_clean_dicts_alone():
     for data in (
         {},
         {"a8_prefill_enabled": True},
-        {"qwen35_ane_prefill_enabled": True},
-        {"a8_prefill_enabled": False, "qwen35_ane_prefill_enabled": True},
+        {"ane_prefill_enabled": True},
+        {"a8_prefill_enabled": False, "ane_prefill_enabled": True},
     ):
         resolved, conflicts = resolve_qwen35_prefill_conflicts(data)
         assert conflicts == []
@@ -956,7 +956,7 @@ def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
                 "models": {
                     "clash/model": {
                         "a8_prefill_enabled": True,
-                        "qwen35_ane_prefill_enabled": True,
+                        "ane_prefill_enabled": True,
                         "a8_prefill_min_tokens": 512,
                     }
                 },
@@ -965,7 +965,7 @@ def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
     )
     manager = ModelSettingsManager(tmp_path)
     settings = manager.get_settings("clash/model")
-    assert settings.qwen35_ane_prefill_enabled is True
+    assert settings.ane_prefill_enabled is True
     assert settings.a8_prefill_enabled is False
     # The rest of the blob survives the downgrade.
     assert settings.a8_prefill_min_tokens == 512

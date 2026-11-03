@@ -444,11 +444,11 @@ async def _measure_result_slot(
 
 def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Candidate):
     settings = replace(base)
-    settings.qwen35_ane_prefill_enabled = candidate.enabled
-    settings.qwen35_ane_prefill_sequence_length = request.sequence_length
+    settings.ane_prefill_enabled = candidate.enabled
+    settings.ane_prefill_sequence_length = request.sequence_length
     if candidate.backend == "k2":
-        settings.qwen35_ane_prefill_fraction = candidate.mlp_fraction or 1 / 3
-        settings.qwen35_ane_prefill_shared_fraction = candidate.shared_fraction
+        settings.ane_prefill_fraction = candidate.mlp_fraction or 1 / 3
+        settings.ane_prefill_shared_fraction = candidate.shared_fraction
         for field in (
             "dflash_enabled",
             "specprefill_enabled",
@@ -458,20 +458,20 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
             setattr(settings, field, False)
         settings.__post_init__()
         return settings
-    settings.qwen35_ane_prefill_fused_down = bool(
+    settings.ane_prefill_fused_down = bool(
         candidate.enabled and candidate.fused_down
     )
     # Saved calibration must not alter the search. The winning run computes a
     # fresh crossover from this run's GPU and hybrid throughput measurements.
-    settings.qwen35_ane_prefill_tail_padding_min_tokens = 0
+    settings.ane_prefill_tail_padding_min_tokens = 0
     if candidate.mlp_fraction is not None:
-        settings.qwen35_ane_prefill_fraction = candidate.mlp_fraction
-    settings.qwen35_ane_prefill_gdn = bool(
+        settings.ane_prefill_fraction = candidate.mlp_fraction
+    settings.ane_prefill_gdn = bool(
         candidate.gdn_enabled and request.allow_ane_gdn
     )
     if candidate.gdn_fraction is not None and request.allow_ane_gdn:
-        settings.qwen35_ane_prefill_gdn_fraction = candidate.gdn_fraction
-    settings.qwen35_ane_prefill_cpu_enabled = bool(
+        settings.ane_prefill_gdn_fraction = candidate.gdn_fraction
+    settings.ane_prefill_cpu_enabled = bool(
         candidate.cpu_enabled and request.allow_cpu
     )
     if (
@@ -479,37 +479,37 @@ def _settings_for_candidate(base: Any, request: ANETuningRequest, candidate: _Ca
         and request.allow_cpu
         and request.allow_cpu_gate
     ):
-        settings.qwen35_ane_prefill_cpu_fraction = candidate.cpu_fraction
+        settings.ane_prefill_cpu_fraction = candidate.cpu_fraction
     else:
-        settings.qwen35_ane_prefill_cpu_fraction = 0.0
+        settings.ane_prefill_cpu_fraction = 0.0
     if (
         candidate.cpu_down_fraction is not None
         and request.allow_cpu
         and request.allow_cpu_down
     ):
-        settings.qwen35_ane_prefill_cpu_down_fraction = candidate.cpu_down_fraction
+        settings.ane_prefill_cpu_down_fraction = candidate.cpu_down_fraction
     else:
-        settings.qwen35_ane_prefill_cpu_down_fraction = 0.0
+        settings.ane_prefill_cpu_down_fraction = 0.0
     if candidate.fused_down:
-        settings.qwen35_ane_prefill_cpu_down_fraction = 0.0
+        settings.ane_prefill_cpu_down_fraction = 0.0
     if (
         candidate.cpu_gdn_fraction is not None
         and request.allow_cpu
         and request.allow_ane_gdn
         and request.allow_cpu_gdn
     ):
-        settings.qwen35_ane_prefill_cpu_gdn_fraction = candidate.cpu_gdn_fraction
+        settings.ane_prefill_cpu_gdn_fraction = candidate.cpu_gdn_fraction
     else:
-        settings.qwen35_ane_prefill_cpu_gdn_fraction = 0.0
-    settings.qwen35_ane_prefill_cpu_shared_resource = bool(
+        settings.ane_prefill_cpu_gdn_fraction = 0.0
+    settings.ane_prefill_cpu_shared_resource = bool(
         request.allow_cpu
         and request.allow_cpu_shared_resource
-        and getattr(base, "qwen35_ane_prefill_cpu_shared_resource", True)
+        and getattr(base, "ane_prefill_cpu_shared_resource", True)
     )
     if candidate.cpu_threads is not None:
-        settings.qwen35_ane_prefill_cpu_threads = candidate.cpu_threads
-    settings.qwen35_ane_prefill_dual_ane = bool(
-        getattr(base, "qwen35_ane_prefill_dual_ane", True)
+        settings.ane_prefill_cpu_threads = candidate.cpu_threads
+    settings.ane_prefill_dual_ane = bool(
+        getattr(base, "ane_prefill_dual_ane", True)
     )
     # The tuner reaches into the engine for the raw model and compares prompt
     # throughput across slots, so it must stage the plain LM engine: a DFlash
@@ -672,9 +672,9 @@ async def _measure_candidate(
                 ane_trace_config=(
                     {
                         "sequence_length": run.request.sequence_length,
-                        "mlp_layers": int(settings.qwen35_ane_prefill_max_layers),
+                        "mlp_layers": int(settings.ane_prefill_max_layers),
                         "gdn_layers": (
-                            int(settings.qwen35_ane_prefill_gdn_max_layers)
+                            int(settings.ane_prefill_gdn_max_layers)
                             if candidate.gdn_enabled
                             else 0
                         ),
@@ -1105,7 +1105,7 @@ def _calibrate_fused_components_sync(
     cpu_shared = bool(
         (cpu_supported or gdn_cpu_supported)
         and run.request.allow_cpu_shared_resource
-        and getattr(base_settings, "qwen35_ane_prefill_cpu_shared_resource", True)
+        and getattr(base_settings, "ane_prefill_cpu_shared_resource", True)
         and fast.cpu_shared_resource_available()
     )
     calibration_threads = _CALIBRATION_CPU_THREADS
@@ -1735,7 +1735,7 @@ def _calibrate_components_sync(
     from ..custom_kernels.quant_matmul import ane as fast
     from ..patches import qwen35_ane_prefill as patch
 
-    dual_ane = bool(getattr(base_settings, "qwen35_ane_prefill_dual_ane", True))
+    dual_ane = bool(getattr(base_settings, "ane_prefill_dual_ane", True))
 
     model = _loaded_model(engine)
     modules = list(model.modules()) if hasattr(model, "modules") else []
@@ -1801,7 +1801,7 @@ def _calibrate_components_sync(
     cpu_shared = bool(
         (cpu_gate_supported or cpu_down_supported or gdn_cpu_supported)
         and run.request.allow_cpu_shared_resource
-        and getattr(base_settings, "qwen35_ane_prefill_cpu_shared_resource", True)
+        and getattr(base_settings, "ane_prefill_cpu_shared_resource", True)
         and fast.cpu_shared_resource_available()
     )
     cpu_threads = _CALIBRATION_CPU_THREADS

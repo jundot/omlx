@@ -31,22 +31,22 @@
         'turboquant_kv_scheme',
         'turboquant_kv_bits',
         'turboquant_skip_last',
-        'qwen35_ane_prefill_enabled',
-        'qwen35_ane_prefill_sequence_length',
-        'qwen35_ane_prefill_tail_padding_min_tokens',
-        'qwen35_ane_prefill_fraction',
-        'qwen35_ane_prefill_fused_down',
-        'qwen35_ane_prefill_max_layers',
-        'qwen35_ane_prefill_dual_ane',
-        'qwen35_ane_prefill_gdn',
-        'qwen35_ane_prefill_gdn_fraction',
-        'qwen35_ane_prefill_gdn_max_layers',
-        'qwen35_ane_prefill_cpu_enabled',
-        'qwen35_ane_prefill_cpu_fraction',
-        'qwen35_ane_prefill_cpu_down_fraction',
-        'qwen35_ane_prefill_cpu_gdn_fraction',
-        'qwen35_ane_prefill_cpu_threads',
-        'qwen35_ane_prefill_cpu_shared_resource',
+        'ane_prefill_enabled',
+        'ane_prefill_sequence_length',
+        'ane_prefill_tail_padding_min_tokens',
+        'ane_prefill_fraction',
+        'ane_prefill_fused_down',
+        'ane_prefill_max_layers',
+        'ane_prefill_dual_ane',
+        'ane_prefill_gdn',
+        'ane_prefill_gdn_fraction',
+        'ane_prefill_gdn_max_layers',
+        'ane_prefill_cpu_enabled',
+        'ane_prefill_cpu_fraction',
+        'ane_prefill_cpu_down_fraction',
+        'ane_prefill_cpu_gdn_fraction',
+        'ane_prefill_cpu_threads',
+        'ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
         'moe_expert_offload_resident_fraction',
         'a8_prefill_enabled',
@@ -66,7 +66,7 @@
         'mtp_enabled',
         'mtp_adaptive_max_depth',
         'mtp_fixed_depth',
-        'qwen35_ane_prefill_shared_fraction',
+        'ane_prefill_shared_fraction',
         'vlm_mtp_enabled',
         'vlm_mtp_draft_model',
         'vlm_mtp_draft_block_size',
@@ -281,22 +281,22 @@
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
                 is_diffusion_model: false,
-                qwen35_ane_prefill_enabled: false,
-                qwen35_ane_prefill_sequence_length: 2048,
-                qwen35_ane_prefill_tail_padding_min_tokens: 0,
-                qwen35_ane_prefill_fraction: 0.53,
-                qwen35_ane_prefill_fused_down: false,
-                qwen35_ane_prefill_max_layers: 64,
-                qwen35_ane_prefill_dual_ane: true,
-                qwen35_ane_prefill_gdn: true,
-                qwen35_ane_prefill_gdn_fraction: 0.5,
-                qwen35_ane_prefill_gdn_max_layers: 48,
-                qwen35_ane_prefill_cpu_enabled: false,
-                qwen35_ane_prefill_cpu_fraction: 0.135,
-                qwen35_ane_prefill_cpu_down_fraction: 0,
-                qwen35_ane_prefill_cpu_gdn_fraction: 0,
-                qwen35_ane_prefill_cpu_threads: 8,
-                qwen35_ane_prefill_cpu_shared_resource: true,
+                ane_prefill_enabled: false,
+                ane_prefill_sequence_length: 2048,
+                ane_prefill_tail_padding_min_tokens: 0,
+                ane_prefill_fraction: 0.53,
+                ane_prefill_fused_down: false,
+                ane_prefill_max_layers: 64,
+                ane_prefill_dual_ane: true,
+                ane_prefill_gdn: true,
+                ane_prefill_gdn_fraction: 0.5,
+                ane_prefill_gdn_max_layers: 48,
+                ane_prefill_cpu_enabled: false,
+                ane_prefill_cpu_fraction: 0.135,
+                ane_prefill_cpu_down_fraction: 0,
+                ane_prefill_cpu_gdn_fraction: 0,
+                ane_prefill_cpu_threads: 8,
+                ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
                 moe_expert_offload_resident_fraction: 0.25,
                 a8_prefill_enabled: false,
@@ -2200,22 +2200,22 @@
                     moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
                     a8_prefill_enabled: s.a8_prefill_enabled || false,
                     a8_prefill_min_tokens: s.a8_prefill_min_tokens ?? 128,
-                    qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
-                    qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
-                    qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
-                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53,
-                    qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
-                    qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
-                    qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
-                    qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false,
-                    qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5,
-                    qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48,
-                    qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false,
-                    qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135,
-                    qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0,
-                    qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0,
-                    qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8,
-                    qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
+                    ane_prefill_enabled: s.ane_prefill_enabled || false,
+                    ane_prefill_sequence_length: s.ane_prefill_sequence_length || 2048,
+                    ane_prefill_tail_padding_min_tokens: s.ane_prefill_tail_padding_min_tokens ?? 0,
+                    ane_prefill_fraction: s.ane_prefill_fraction ?? model?.ane_prefill_default_fraction ?? 0.53,
+                    ane_prefill_fused_down: s.ane_prefill_fused_down || false,
+                    ane_prefill_max_layers: s.ane_prefill_max_layers || 64,
+                    ane_prefill_dual_ane: s.ane_prefill_dual_ane !== false,
+                    ane_prefill_gdn: s.ane_prefill_gdn !== false,
+                    ane_prefill_gdn_fraction: s.ane_prefill_gdn_fraction ?? 0.5,
+                    ane_prefill_gdn_max_layers: s.ane_prefill_gdn_max_layers ?? 48,
+                    ane_prefill_cpu_enabled: s.ane_prefill_cpu_enabled || false,
+                    ane_prefill_cpu_fraction: s.ane_prefill_cpu_fraction ?? 0.135,
+                    ane_prefill_cpu_down_fraction: s.ane_prefill_cpu_down_fraction ?? 0,
+                    ane_prefill_cpu_gdn_fraction: s.ane_prefill_cpu_gdn_fraction ?? 0,
+                    ane_prefill_cpu_threads: s.ane_prefill_cpu_threads ?? 8,
+                    ane_prefill_cpu_shared_resource: s.ane_prefill_cpu_shared_resource !== false,
                     specprefill_enabled: s.specprefill_enabled || false,
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
@@ -2237,7 +2237,7 @@
                     mtp_compatibility_reason: model?.mtp_compatibility_reason || '',
                     is_paroquant: model?.is_paroquant === true,
                     paroquant_reason: model?.paroquant_reason || '',
-                    qwen35_ane_prefill_shared_fraction: s.qwen35_ane_prefill_shared_fraction ?? 1,
+                    ane_prefill_shared_fraction: s.ane_prefill_shared_fraction ?? 1,
                     vlm_mtp_enabled: s.vlm_mtp_enabled || false,
                     vlm_mtp_draft_model: s.vlm_mtp_draft_model || '',
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
@@ -2791,7 +2791,7 @@
                         body: JSON.stringify({
                             model_id: modelId,
                             sequence_length: parseInt(
-                                this.modelSettings.qwen35_ane_prefill_sequence_length
+                                this.modelSettings.ane_prefill_sequence_length
                             ) || 2048,
                             repeats: 2,
                             allow_cpu: this.aneTuningOverrides.allowCpu,
@@ -2889,45 +2889,45 @@
                 const recommendation = this.aneTuning.status?.recommendation;
                 if (!recommendation || this.aneTuning.applying) return;
                 const patch = {
-                    qwen35_ane_prefill_enabled: !!recommendation.enabled,
-                    qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
+                    ane_prefill_enabled: !!recommendation.enabled,
+                    ane_prefill_sequence_length: Number(recommendation.sequence_length),
                 };
                 if (recommendation.enabled) {
-                    patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
+                    patch.ane_prefill_fraction = Number(recommendation.mlp_fraction);
                 }
                 if (recommendation.backend === 'k2') {
                     if (recommendation.enabled) {
-                        patch.qwen35_ane_prefill_shared_fraction = Number(recommendation.shared_fraction);
+                        patch.ane_prefill_shared_fraction = Number(recommendation.shared_fraction);
                     }
                 } else {
-                    patch.qwen35_ane_prefill_tail_padding_min_tokens = Number(recommendation.tail_padding_min_tokens || 0);
+                    patch.ane_prefill_tail_padding_min_tokens = Number(recommendation.tail_padding_min_tokens || 0);
                     if (recommendation.enabled) {
-                        patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
-                        patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
+                        patch.ane_prefill_fused_down = !!recommendation.fused_down;
+                        patch.ane_prefill_gdn = !!recommendation.gdn_enabled;
                         if (recommendation.gdn_enabled) {
-                            patch.qwen35_ane_prefill_gdn_fraction = Number(
+                            patch.ane_prefill_gdn_fraction = Number(
                                 recommendation.gdn_fraction
                             );
                         }
-                        patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
-                        patch.qwen35_ane_prefill_cpu_fraction = Number(
+                        patch.ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
+                        patch.ane_prefill_cpu_fraction = Number(
                             recommendation.cpu_fraction || 0
                         );
-                        patch.qwen35_ane_prefill_cpu_down_fraction = Number(
+                        patch.ane_prefill_cpu_down_fraction = Number(
                             recommendation.cpu_down_fraction || 0
                         );
-                        patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
+                        patch.ane_prefill_cpu_gdn_fraction = Number(
                             recommendation.cpu_gdn_fraction || 0
                         );
                         if (recommendation.cpu_threads !== null
                             && recommendation.cpu_threads !== undefined) {
-                            patch.qwen35_ane_prefill_cpu_threads = Number(
+                            patch.ane_prefill_cpu_threads = Number(
                                 recommendation.cpu_threads
                             );
                         }
                         if (recommendation.cpu_shared_resource !== null
                             && recommendation.cpu_shared_resource !== undefined) {
-                            patch.qwen35_ane_prefill_cpu_shared_resource =
+                            patch.ane_prefill_cpu_shared_resource =
                                 !!recommendation.cpu_shared_resource;
                         }
                     }
@@ -3100,7 +3100,7 @@
                 // Both wrap the same MLP call, so the combination silently
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
-                if (this.modelSettings.qwen35_ane_prefill_enabled) {
+                if (this.modelSettings.ane_prefill_enabled) {
                     return window.t('js.error.ane_oq_a8_conflict');
                 }
                 const minTokens = Number(this.modelSettings.a8_prefill_min_tokens);
@@ -3111,7 +3111,7 @@
             },
 
             validateQwenAneSettings() {
-                if (!this.modelSettings.qwen35_ane_prefill_enabled
+                if (!this.modelSettings.ane_prefill_enabled
                     || this.selectedModel?.ane_prefill_backend !== 'qwen') return null;
 
                 const integer = (value, label, minimum) => {
@@ -3135,53 +3135,53 @@
                     return null;
                 };
 
-                const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
+                const sequenceLength = Number(this.modelSettings.ane_prefill_sequence_length);
                 let error = integer(sequenceLength, window.t('js.error.field.ane_prompt_block'), 1024);
                 if (!error && sequenceLength % 64 !== 0) {
                     error = window.t('js.error.ane_prompt_block_multiple');
                 }
                 if (error) return error;
                 error = integer(
-                    this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens,
+                    this.modelSettings.ane_prefill_tail_padding_min_tokens,
                     window.t('js.error.field.ane_tail_padding'),
                     0,
                 );
                 if (error) return error;
-                if (Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
+                if (Number(this.modelSettings.ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
                     return window.t('js.error.ane_tail_padding_lt_prompt_block');
                 }
-                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, window.t('js.error.field.mlp_ane_fraction'), 0.05, 0.90);
+                error = fraction(this.modelSettings.ane_prefill_fraction, window.t('js.error.field.mlp_ane_fraction'), 0.05, 0.90);
                 if (error) return error;
-                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, window.t('js.error.field.ane_mlp_layers'), 1);
+                error = integer(this.modelSettings.ane_prefill_max_layers, window.t('js.error.field.ane_mlp_layers'), 1);
                 if (error) return error;
 
-                if (this.modelSettings.qwen35_ane_prefill_cpu_enabled) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, window.t('js.error.field.cpu_mlp_fraction'), 0, 0.25);
+                if (this.modelSettings.ane_prefill_cpu_enabled) {
+                    error = fraction(this.modelSettings.ane_prefill_cpu_fraction, window.t('js.error.field.cpu_mlp_fraction'), 0, 0.25);
                     if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, window.t('js.error.field.cpu_mlp_down_fraction'), 0, 0.50);
+                    error = fraction(this.modelSettings.ane_prefill_cpu_down_fraction, window.t('js.error.field.cpu_mlp_down_fraction'), 0, 0.50);
                     if (error) return error;
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, window.t('js.error.field.cpu_gdn_fraction'), 0, 0.50);
+                    error = fraction(this.modelSettings.ane_prefill_cpu_gdn_fraction, window.t('js.error.field.cpu_gdn_fraction'), 0, 0.50);
                     if (error) return error;
-                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, window.t('js.error.field.cpu_workers'), 0);
+                    error = integer(this.modelSettings.ane_prefill_cpu_threads, window.t('js.error.field.cpu_workers'), 0);
                     if (error) return error;
-                    if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
+                    if (Number(this.modelSettings.ane_prefill_cpu_threads) > 64) {
                         return window.t('js.error.cpu_workers_range');
                     }
-                    if (Number(this.modelSettings.qwen35_ane_prefill_fraction)
-                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction) >= 1) {
+                    if (Number(this.modelSettings.ane_prefill_fraction)
+                        + Number(this.modelSettings.ane_prefill_cpu_fraction) >= 1) {
                         return window.t('js.error.mlp_ane_cpu_total');
                     }
                 }
 
-                if (this.modelSettings.qwen35_ane_prefill_gdn) {
-                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, window.t('js.error.field.gdn_ane_fraction'), 0.05, 0.90);
+                if (this.modelSettings.ane_prefill_gdn) {
+                    error = fraction(this.modelSettings.ane_prefill_gdn_fraction, window.t('js.error.field.gdn_ane_fraction'), 0.05, 0.90);
                     if (error) return error;
-                    if (this.modelSettings.qwen35_ane_prefill_cpu_enabled
-                        && Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction)
-                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction) >= 1) {
+                    if (this.modelSettings.ane_prefill_cpu_enabled
+                        && Number(this.modelSettings.ane_prefill_gdn_fraction)
+                        + Number(this.modelSettings.ane_prefill_cpu_gdn_fraction) >= 1) {
                         return window.t('js.error.gdn_ane_cpu_total');
                     }
-                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, window.t('js.error.field.ane_gdn_layers'), 0);
+                    error = integer(this.modelSettings.ane_prefill_gdn_max_layers, window.t('js.error.field.ane_gdn_layers'), 0);
                     if (error) return error;
                 }
                 return null;
@@ -3277,34 +3277,34 @@
                     moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
                     a8_prefill_enabled: !!ms.a8_prefill_enabled,
                     a8_prefill_min_tokens: Number(ms.a8_prefill_min_tokens) || 128,
-                    qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
+                    ane_prefill_enabled: !!ms.ane_prefill_enabled,
                     // Validation only runs when the feature is enabled, so a
                     // blank numeric input must fall back to the server default
                     // instead of coercing to 0 and failing an unrelated save.
-                    qwen35_ane_prefill_sequence_length: Number(ms.qwen35_ane_prefill_sequence_length) || 2048,
-                    qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(ms.qwen35_ane_prefill_tail_padding_min_tokens))
-                        ? Number(ms.qwen35_ane_prefill_tail_padding_min_tokens)
+                    ane_prefill_sequence_length: Number(ms.ane_prefill_sequence_length) || 2048,
+                    ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(ms.ane_prefill_tail_padding_min_tokens))
+                        ? Number(ms.ane_prefill_tail_padding_min_tokens)
                         : 0,
-                    qwen35_ane_prefill_fraction: Number(ms.qwen35_ane_prefill_fraction),
-                    qwen35_ane_prefill_max_layers: Number(ms.qwen35_ane_prefill_max_layers) || 64,
-                    qwen35_ane_prefill_dual_ane: !!ms.qwen35_ane_prefill_dual_ane,
-                    qwen35_ane_prefill_gdn: !!ms.qwen35_ane_prefill_gdn,
-                    qwen35_ane_prefill_gdn_fraction: Number(ms.qwen35_ane_prefill_gdn_fraction) || 0.5,
-                    qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(ms.qwen35_ane_prefill_gdn_max_layers))
-                        ? Number(ms.qwen35_ane_prefill_gdn_max_layers)
+                    ane_prefill_fraction: Number(ms.ane_prefill_fraction),
+                    ane_prefill_max_layers: Number(ms.ane_prefill_max_layers) || 64,
+                    ane_prefill_dual_ane: !!ms.ane_prefill_dual_ane,
+                    ane_prefill_gdn: !!ms.ane_prefill_gdn,
+                    ane_prefill_gdn_fraction: Number(ms.ane_prefill_gdn_fraction) || 0.5,
+                    ane_prefill_gdn_max_layers: Number.isFinite(Number(ms.ane_prefill_gdn_max_layers))
+                        ? Number(ms.ane_prefill_gdn_max_layers)
                         : 48,
-                    qwen35_ane_prefill_cpu_enabled: !!ms.qwen35_ane_prefill_cpu_enabled,
-                    qwen35_ane_prefill_cpu_fraction: Number(ms.qwen35_ane_prefill_cpu_fraction),
-                    qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_down_fraction))
-                        ? Number(ms.qwen35_ane_prefill_cpu_down_fraction)
+                    ane_prefill_cpu_enabled: !!ms.ane_prefill_cpu_enabled,
+                    ane_prefill_cpu_fraction: Number(ms.ane_prefill_cpu_fraction),
+                    ane_prefill_cpu_down_fraction: Number.isFinite(Number(ms.ane_prefill_cpu_down_fraction))
+                        ? Number(ms.ane_prefill_cpu_down_fraction)
                         : 0,
-                    qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_gdn_fraction))
-                        ? Number(ms.qwen35_ane_prefill_cpu_gdn_fraction)
+                    ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(ms.ane_prefill_cpu_gdn_fraction))
+                        ? Number(ms.ane_prefill_cpu_gdn_fraction)
                         : 0,
-                    qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_threads))
-                        ? Number(ms.qwen35_ane_prefill_cpu_threads)
+                    ane_prefill_cpu_threads: Number.isFinite(Number(ms.ane_prefill_cpu_threads))
+                        ? Number(ms.ane_prefill_cpu_threads)
                         : 8,
-                    qwen35_ane_prefill_cpu_shared_resource: !!ms.qwen35_ane_prefill_cpu_shared_resource,
+                    ane_prefill_cpu_shared_resource: !!ms.ane_prefill_cpu_shared_resource,
                     specprefill_enabled: ms.specprefill_enabled,
                     specprefill_draft_model: ms.specprefill_draft_model || null,
                     specprefill_keep_pct: ms.specprefill_enabled
@@ -3339,7 +3339,7 @@
                         ? parseInt(ms.mtp_adaptive_max_depth || '3')
                         : null,
                     mtp_fixed_depth: null,
-                    qwen35_ane_prefill_shared_fraction: Number(ms.qwen35_ane_prefill_shared_fraction),
+                    ane_prefill_shared_fraction: Number(ms.ane_prefill_shared_fraction),
                     vlm_mtp_enabled: !!ms.vlm_mtp_enabled,
                     vlm_mtp_draft_model: ms.vlm_mtp_enabled
                         ? (ms.vlm_mtp_draft_model || null)
@@ -3370,21 +3370,21 @@
                         turboquant_kv_enabled: false,
                         turboquant_kv_scheme: 'turboquant',
                         turboquant_kv_bits: 4,
-                        qwen35_ane_prefill_enabled: false,
-                        qwen35_ane_prefill_sequence_length: 2048,
-                        qwen35_ane_prefill_tail_padding_min_tokens: 0,
-                        qwen35_ane_prefill_fraction: 0.53,
-                        qwen35_ane_prefill_max_layers: 64,
-                        qwen35_ane_prefill_dual_ane: true,
-                        qwen35_ane_prefill_gdn: true,
-                        qwen35_ane_prefill_gdn_fraction: 0.5,
-                        qwen35_ane_prefill_gdn_max_layers: 48,
-                        qwen35_ane_prefill_cpu_enabled: false,
-                        qwen35_ane_prefill_cpu_fraction: 0.135,
-                        qwen35_ane_prefill_cpu_down_fraction: 0,
-                        qwen35_ane_prefill_cpu_gdn_fraction: 0,
-                        qwen35_ane_prefill_cpu_threads: 8,
-                        qwen35_ane_prefill_cpu_shared_resource: true,
+                        ane_prefill_enabled: false,
+                        ane_prefill_sequence_length: 2048,
+                        ane_prefill_tail_padding_min_tokens: 0,
+                        ane_prefill_fraction: 0.53,
+                        ane_prefill_max_layers: 64,
+                        ane_prefill_dual_ane: true,
+                        ane_prefill_gdn: true,
+                        ane_prefill_gdn_fraction: 0.5,
+                        ane_prefill_gdn_max_layers: 48,
+                        ane_prefill_cpu_enabled: false,
+                        ane_prefill_cpu_fraction: 0.135,
+                        ane_prefill_cpu_down_fraction: 0,
+                        ane_prefill_cpu_gdn_fraction: 0,
+                        ane_prefill_cpu_threads: 8,
+                        ane_prefill_cpu_shared_resource: true,
                         specprefill_enabled: false,
                         specprefill_draft_model: null,
                         specprefill_keep_pct: null,
@@ -3683,21 +3683,21 @@
                         this.modelSettings.turboquant_kv_enabled = false;
                         this.modelSettings.turboquant_kv_scheme = 'turboquant';
                         this.modelSettings.turboquant_kv_bits = 4;
-                        this.modelSettings.qwen35_ane_prefill_enabled = false;
-                        this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
-                        this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
-                        this.modelSettings.qwen35_ane_prefill_fraction = this.selectedModel?.ane_prefill_default_fraction ?? 0.53;
-                        this.modelSettings.qwen35_ane_prefill_max_layers = 64;
-                        this.modelSettings.qwen35_ane_prefill_dual_ane = true;
-                        this.modelSettings.qwen35_ane_prefill_gdn = true;
-                        this.modelSettings.qwen35_ane_prefill_gdn_fraction = 0.5;
-                        this.modelSettings.qwen35_ane_prefill_gdn_max_layers = 48;
-                        this.modelSettings.qwen35_ane_prefill_cpu_enabled = false;
-                        this.modelSettings.qwen35_ane_prefill_cpu_fraction = 0.135;
-                        this.modelSettings.qwen35_ane_prefill_cpu_down_fraction = 0;
-                        this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction = 0;
-                        this.modelSettings.qwen35_ane_prefill_cpu_threads = 8;
-                        this.modelSettings.qwen35_ane_prefill_cpu_shared_resource = true;
+                        this.modelSettings.ane_prefill_enabled = false;
+                        this.modelSettings.ane_prefill_sequence_length = 2048;
+                        this.modelSettings.ane_prefill_tail_padding_min_tokens = 0;
+                        this.modelSettings.ane_prefill_fraction = this.selectedModel?.ane_prefill_default_fraction ?? 0.53;
+                        this.modelSettings.ane_prefill_max_layers = 64;
+                        this.modelSettings.ane_prefill_dual_ane = true;
+                        this.modelSettings.ane_prefill_gdn = true;
+                        this.modelSettings.ane_prefill_gdn_fraction = 0.5;
+                        this.modelSettings.ane_prefill_gdn_max_layers = 48;
+                        this.modelSettings.ane_prefill_cpu_enabled = false;
+                        this.modelSettings.ane_prefill_cpu_fraction = 0.135;
+                        this.modelSettings.ane_prefill_cpu_down_fraction = 0;
+                        this.modelSettings.ane_prefill_cpu_gdn_fraction = 0;
+                        this.modelSettings.ane_prefill_cpu_threads = 8;
+                        this.modelSettings.ane_prefill_cpu_shared_resource = true;
                         this.modelSettings.specprefill_enabled = false;
                         this.modelSettings.specprefill_draft_model = null;
                         this.modelSettings.specprefill_keep_pct = 0.2;

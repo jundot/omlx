@@ -548,11 +548,11 @@ class BatchedEngine(BaseEngine):
                 logger.debug("oQ A8 prefill patch not applied", exc_info=True)
 
         ane_backend = ane_prefill_backend(self.model_type)
-        ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)
+        ane_enabled = getattr(self._model_settings, "ane_prefill_enabled", False)
         if ane_enabled:
             validate_ane_prefill(self._model_settings.to_dict(), self.model_type)
             ane_fraction = ane_prefill_fraction(
-                self._model_settings.qwen35_ane_prefill_fraction, self.model_type
+                self._model_settings.ane_prefill_fraction, self.model_type
             )
         if ane_enabled and ane_backend == "k2":
             from ..patches.k2_horizon.ane_prefill import enable_ane_prefill
@@ -562,8 +562,8 @@ class BatchedEngine(BaseEngine):
                 lambda: enable_ane_prefill(
                     self._model,
                     fraction=ane_fraction,
-                    shared_fraction=self._model_settings.qwen35_ane_prefill_shared_fraction,
-                    width=self._model_settings.qwen35_ane_prefill_sequence_length,
+                    shared_fraction=self._model_settings.ane_prefill_shared_fraction,
+                    width=self._model_settings.ane_prefill_sequence_length,
                 ),
             )
 
@@ -575,7 +575,7 @@ class BatchedEngine(BaseEngine):
                 requested_ane_sequence_length = int(
                     getattr(
                         self._model_settings,
-                        "qwen35_ane_prefill_sequence_length",
+                        "ane_prefill_sequence_length",
                         2048,
                     )
                 )
@@ -587,7 +587,7 @@ class BatchedEngine(BaseEngine):
                         tail_padding_min_tokens=int(
                             getattr(
                                 self._model_settings,
-                                "qwen35_ane_prefill_tail_padding_min_tokens",
+                                "ane_prefill_tail_padding_min_tokens",
                                 0,
                             )
                             or 0
@@ -595,84 +595,84 @@ class BatchedEngine(BaseEngine):
                         fraction=ane_fraction,
                         max_layers=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_max_layers",
+                            "ane_prefill_max_layers",
                             64,
                         ),
                         gdn=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_gdn",
+                            "ane_prefill_gdn",
                             True,
                         ),
                         gdn_fraction=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_gdn_fraction",
+                            "ane_prefill_gdn_fraction",
                             0.50,
                         ),
                         gdn_max_layers=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_gdn_max_layers",
+                            "ane_prefill_gdn_max_layers",
                             48,
                         ),
                         dual_ane=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_dual_ane",
+                            "ane_prefill_dual_ane",
                             True,
                         ),
                         ane_down_fraction=(
                             ane_fraction
                             if getattr(
                                 self._model_settings,
-                                "qwen35_ane_prefill_fused_down",
+                                "ane_prefill_fused_down",
                                 False,
                             )
                             else 0.0
                         ),
                         fused_down=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_fused_down",
+                            "ane_prefill_fused_down",
                             False,
                         ),
                         cpu_fraction=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_cpu_fraction",
+                            "ane_prefill_cpu_fraction",
                             0.135,
                         )
                         if getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
+                            "ane_prefill_cpu_enabled",
                             False,
                         )
                         else 0.0,
                         cpu_down_fraction=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_cpu_down_fraction",
+                            "ane_prefill_cpu_down_fraction",
                             0.0,
                         )
                         if getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
+                            "ane_prefill_cpu_enabled",
                             False,
                         )
                         else 0.0,
                         cpu_gdn_fraction=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_cpu_gdn_fraction",
+                            "ane_prefill_cpu_gdn_fraction",
                             0.0,
                         )
                         if getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_cpu_enabled",
+                            "ane_prefill_cpu_enabled",
                             False,
                         )
                         else 0.0,
                         cpu_threads=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_cpu_threads",
+                            "ane_prefill_cpu_threads",
                             8,
                         ),
                         cpu_shared_resource=getattr(
                             self._model_settings,
-                            "qwen35_ane_prefill_cpu_shared_resource",
+                            "ane_prefill_cpu_shared_resource",
                             True,
                         ),
                     )

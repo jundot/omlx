@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from .model_profiles import (
+    normalize_ane_prefill_settings,
     MODEL_SPECIFIC_PROFILE_FIELDS,
     RENAMED_FIELDS,
     UNIVERSAL_FIELDS_SET,
@@ -96,26 +97,27 @@ def ane_prefill_fraction(value: float | None, model_type: str | None) -> float:
 
 def validate_ane_prefill(settings: dict, model_type: str | None) -> None:
     """Validate common controls against the selected backend's limits."""
+    settings = normalize_ane_prefill_settings(settings)
     backend = ane_prefill_backend(model_type)
-    if settings.get("qwen35_ane_prefill_enabled") and backend is None:
+    if settings.get("ane_prefill_enabled") and backend is None:
         raise ValueError("ANE prefill is unavailable for this model.")
-    width = settings.get("qwen35_ane_prefill_sequence_length", 2048)
+    width = settings.get("ane_prefill_sequence_length", 2048)
     minimum, alignment = (32, 32) if backend == "k2" else (1024, 64)
     if type(width) is not int or width < minimum or width % alignment:
         raise ValueError(
             f"ANE prompt block must be a multiple of {alignment} and at least {minimum}."
         )
     fraction = ane_prefill_fraction(
-        settings.get("qwen35_ane_prefill_fraction"), model_type
+        settings.get("ane_prefill_fraction"), model_type
     )
     valid_fraction = 0 < fraction <= 1 if backend == "k2" else 0.05 <= fraction <= 0.90
     if not valid_fraction:
         bounds = "in (0, 1]" if backend == "k2" else "between 0.05 and 0.90"
         raise ValueError(f"MLP ANE fraction must be {bounds}.")
-    shared = settings.get("qwen35_ane_prefill_shared_fraction", 1.0)
+    shared = settings.get("ane_prefill_shared_fraction", 1.0)
     if shared is None or not 0 <= shared <= 1:
         raise ValueError("ANE shared fraction must be in [0, 1].")
-    if backend == "k2" and settings.get("qwen35_ane_prefill_enabled"):
+    if backend == "k2" and settings.get("ane_prefill_enabled"):
         for name in (
             "dflash_enabled",
             "specprefill_enabled",
@@ -196,11 +198,12 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
     dicts that predate the exclusivity rule so ``__post_init__`` does not
     reject the whole blob.
     """
-    if not (data.get("a8_prefill_enabled") and data.get("qwen35_ane_prefill_enabled")):
+    data = normalize_ane_prefill_settings(data)
+    if not (data.get("a8_prefill_enabled") and data.get("ane_prefill_enabled")):
         return data, []
     resolved = dict(data)
     resolved["a8_prefill_enabled"] = False
-    return resolved, ["qwen35_ane_prefill_enabled"]
+    return resolved, ["ane_prefill_enabled"]
 
 
 PROFILES_VERSION = 1
@@ -269,33 +272,33 @@ class ModelSettings:
         turboquant_kv_scheme: Cache format: "turboquant", "affine4", or "affine8".
         turboquant_kv_bits: Cache bit depth (2/2.5/3/3.5/4/6/8); affine formats require their named depth.
         turboquant_skip_last: Skip last KVCache layer to prevent corruption.
-        qwen35_ane_prefill_enabled: Enable ANE/GPU prompt processing for a
+        ane_prefill_enabled: Enable ANE/GPU prompt processing for a
             supported model. Model metadata selects the implementation.
-        qwen35_ane_prefill_sequence_length: Compiled ANE prompt block size.
-        qwen35_ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
+        ane_prefill_sequence_length: Compiled ANE prompt block size.
+        ane_prefill_tail_padding_min_tokens: Smallest residual tokenwise
             projection block padded to the compiled ANE shape (zero disables).
-        qwen35_ane_prefill_fraction: Fraction of eligible MLP outputs assigned
+        ane_prefill_fraction: Fraction of eligible MLP outputs assigned
             across the ANE instances (None = backend default).
-        qwen35_ane_prefill_shared_fraction: Shared-expert MLP share where supported.
-        qwen35_ane_prefill_fused_down: Fuse SwiGLU and partial down projection
+        ane_prefill_shared_fraction: Shared-expert MLP share where supported.
+        ane_prefill_fused_down: Fuse SwiGLU and partial down projection
             into each dual-ANE/CPU hidden-channel branch.
-        qwen35_ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
-        qwen35_ane_prefill_dual_ane: Pin a procedure bank to each physical ANE.
-        qwen35_ane_prefill_gdn: Also accelerate eligible GDN input projections.
-        qwen35_ane_prefill_gdn_fraction: Fraction of eligible GDN projection
+        ane_prefill_max_layers: Maximum eligible MLP layers accelerated.
+        ane_prefill_dual_ane: Pin a procedure bank to each physical ANE.
+        ane_prefill_gdn: Also accelerate eligible GDN input projections.
+        ane_prefill_gdn_fraction: Fraction of eligible GDN projection
             outputs assigned across the ANE instances.
-        qwen35_ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
-        qwen35_ane_prefill_cpu_enabled: Share eligible q4 MLP gate/up outputs
+        ane_prefill_gdn_max_layers: Maximum eligible GDN layers accelerated.
+        ane_prefill_cpu_enabled: Share eligible q4 MLP gate/up outputs
             with the CPU. Requires a separately preprocessed FP16 checkpoint.
-        qwen35_ane_prefill_cpu_fraction: Fraction of each eligible gate/up
+        ane_prefill_cpu_fraction: Fraction of each eligible gate/up
             projection assigned to the CPU.
-        qwen35_ane_prefill_cpu_down_fraction: Fraction of each eligible MLP
+        ane_prefill_cpu_down_fraction: Fraction of each eligible MLP
             down projection assigned to the CPU.
-        qwen35_ane_prefill_cpu_gdn_fraction: Fraction of the eligible GDN
+        ane_prefill_cpu_gdn_fraction: Fraction of the eligible GDN
             z+qkv projection outputs assigned to the CPU after the ANE prefix.
-        qwen35_ane_prefill_cpu_threads: Requested Accelerate worker count
+        ane_prefill_cpu_threads: Requested Accelerate worker count
             (zero lets Accelerate choose).
-        qwen35_ane_prefill_cpu_shared_resource: Use dispatch_apply's
+        ane_prefill_cpu_shared_resource: Use dispatch_apply's
             shared-resource scheduling attributes for manually sharded CPU work.
         a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8 and DeepSeek V4.1
             prefill matmuls through the INT8-activation (QxA8) tensor kernels.
@@ -307,7 +310,7 @@ class ModelSettings:
             (affine Q4 / GS64 experts); the MTP draft layer and the down
             projection stay on the A16 path. DeepSeek V4.1 covers its affine
             GS64 routed experts, shared expert and dense projections.
-            Mutually exclusive with qwen35_ane_prefill_enabled.
+            Mutually exclusive with ane_prefill_enabled.
         a8_prefill_min_tokens: Shortest sequence routed to the kernels.
         moe_expert_offload_enabled: Stream MoE expert weights from the
             checkpoint on demand instead of keeping them all resident (fits
@@ -426,27 +429,27 @@ class ModelSettings:
         True  # Skip last KVCache layer (prevents corruption on sensitive models)
     )
 
-    # Shared ANE/GPU prefill controls retain the original Qwen setting names.
+    # Model-neutral ANE/GPU controls are scoped by the model ID.
     # Backend-specific controls apply only to models that support them.
     # Off by default because the fixed-shape ANE models add load-time/runtime
     # cache memory and rely on undocumented AppleNeuralEngine interfaces.
-    qwen35_ane_prefill_enabled: bool = False
-    qwen35_ane_prefill_sequence_length: int = 2048
-    qwen35_ane_prefill_tail_padding_min_tokens: int = 0
-    qwen35_ane_prefill_fraction: Optional[float] = None  # Backend default
-    qwen35_ane_prefill_shared_fraction: float = 1.0
-    qwen35_ane_prefill_fused_down: bool = False
-    qwen35_ane_prefill_max_layers: int = 64
-    qwen35_ane_prefill_dual_ane: bool = True
-    qwen35_ane_prefill_gdn: bool = True
-    qwen35_ane_prefill_gdn_fraction: float = 0.50
-    qwen35_ane_prefill_gdn_max_layers: int = 48
-    qwen35_ane_prefill_cpu_enabled: bool = False
-    qwen35_ane_prefill_cpu_fraction: float = 0.135
-    qwen35_ane_prefill_cpu_down_fraction: float = 0.0
-    qwen35_ane_prefill_cpu_gdn_fraction: float = 0.0
-    qwen35_ane_prefill_cpu_threads: int = 8
-    qwen35_ane_prefill_cpu_shared_resource: bool = True
+    ane_prefill_enabled: bool = False
+    ane_prefill_sequence_length: int = 2048
+    ane_prefill_tail_padding_min_tokens: int = 0
+    ane_prefill_fraction: Optional[float] = None  # Backend default
+    ane_prefill_shared_fraction: float = 1.0
+    ane_prefill_fused_down: bool = False
+    ane_prefill_max_layers: int = 64
+    ane_prefill_dual_ane: bool = True
+    ane_prefill_gdn: bool = True
+    ane_prefill_gdn_fraction: float = 0.50
+    ane_prefill_gdn_max_layers: int = 48
+    ane_prefill_cpu_enabled: bool = False
+    ane_prefill_cpu_fraction: float = 0.135
+    ane_prefill_cpu_down_fraction: float = 0.0
+    ane_prefill_cpu_gdn_fraction: float = 0.0
+    ane_prefill_cpu_threads: int = 8
+    ane_prefill_cpu_shared_resource: bool = True
 
     # oQ mixed-bit QxA8 prefill kernels for Qwen3.5/3.6/3.8 and Qwen3.8 Flash-Next.
     #
@@ -559,9 +562,9 @@ class ModelSettings:
         # in charge and the other silently inert -- with different numerics
         # depending on which won. Rejected at construction time so the clash
         # surfaces in the admin UI / API rather than as a silent no-op.
-        if self.a8_prefill_enabled and self.qwen35_ane_prefill_enabled:
+        if self.a8_prefill_enabled and self.ane_prefill_enabled:
             raise ValueError(
-                "a8_prefill_enabled and qwen35_ane_prefill_enabled cannot "
+                "a8_prefill_enabled and ane_prefill_enabled cannot "
                 "both be True; choose one Qwen3.5 prefill accelerator per model"
             )
         # Legacy TurboQuant bit values stay loadable; see normalize_turboquant_kv_bits.
@@ -637,6 +640,7 @@ class ModelSettings:
         Returns:
             New ModelSettings instance with values from dict.
         """
+        data = normalize_ane_prefill_settings(data)
         # Get valid field names
         valid_fields = {f.name for f in fields(cls)}
 
@@ -1096,6 +1100,12 @@ class ModelSettingsManager:
                 used_api_names: set[str] = set()
                 for name, profile in profiles.items():
                     settings = profile.get("settings")
+                    if settings:
+                        normalized = normalize_ane_prefill_settings(settings)
+                        if normalized is not settings:
+                            profile["settings"] = settings = normalized
+                            changed = True
+                            model_changed = True
                     # Normalize in memory only; the next save writes floats.
                     if settings and "turboquant_kv_bits" in settings:
                         settings["turboquant_kv_bits"] = normalize_turboquant_kv_bits(

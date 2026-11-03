@@ -1087,7 +1087,7 @@ def test_a8_profile_validation_preserves_settings(
     )
     settings = {"a8_prefill_enabled": True}
     if reason == "conflict":
-        settings["qwen35_ane_prefill_enabled"] = True
+        settings["ane_prefill_enabled"] = True
     if reason == "floor":
         settings["a8_prefill_min_tokens"] = 0
     mgr.set_settings("model-a", ModelSettings())
@@ -1115,11 +1115,11 @@ def test_a8_profile_apply_checks_merged_ane_conflict(client, monkeypatch):
     c, mgr = client
     admin_routes._get_engine_pool().get_entry("model-a").config_model_type = "qwen3_5"
     monkeypatch.setattr(admin_routes, "_oq_a8_kernels_available", lambda: True)
-    mgr.set_settings("model-a", ModelSettings(qwen35_ane_prefill_enabled=True))
+    mgr.set_settings("model-a", ModelSettings(ane_prefill_enabled=True))
     mgr.save_profile("model-a", "a8", "A8", "", settings={"a8_prefill_enabled": True})
     response = c.post("/admin/api/models/model-a/profiles/a8/apply")
     assert response.status_code == 400
-    assert mgr.get_settings("model-a").qwen35_ane_prefill_enabled
+    assert mgr.get_settings("model-a").ane_prefill_enabled
     assert not mgr.get_settings("model-a").a8_prefill_enabled
 
 
@@ -1502,10 +1502,10 @@ class TestSettingsRecipeCodec:
         assert resolve("", entries) == (None, None)
 
     def test_settings_diff_sends_dataclass_defaults_not_null(self):
-        current = {"qwen35_ane_prefill_sequence_length": 4096, "temperature": 0.5}
-        scope = {"qwen35_ane_prefill_sequence_length", "temperature", "top_p"}
+        current = {"ane_prefill_sequence_length": 4096, "temperature": 0.5}
+        scope = {"ane_prefill_sequence_length", "temperature", "top_p"}
         diff = settings_recipe.settings_diff({}, current, scope)
-        assert diff == {"qwen35_ane_prefill_sequence_length": 2048, "temperature": None}
+        assert diff == {"ane_prefill_sequence_length": 2048, "temperature": None}
 
     def test_search_url_targets_the_leaderboard_filters(self):
         url = settings_recipe.search_url("M3", "Ultra", "Qwen3.8-27B-4bit", 4096, 512)
@@ -1545,7 +1545,7 @@ class TestSettingsSnapshotRoutes:
                 description="notes",
                 trust_remote_code=True,
                 turboquant_kv_enabled=True,
-                qwen35_ane_prefill_sequence_length=4096,
+                ane_prefill_sequence_length=4096,
                 active_profile_name="p",
             ),
         )
@@ -1636,8 +1636,8 @@ class TestSettingsSnapshotRoutes:
         )
         source = ModelSettings(
             temperature=0.2,
-            qwen35_ane_prefill_enabled=False,
-            qwen35_ane_prefill_sequence_length=128,
+            ane_prefill_enabled=False,
+            ane_prefill_sequence_length=128,
         )
         validate_ane_prefill(source.to_dict(), "k2_horizon")
         recipe = settings_recipe.encode_recipe(_filter_uploaded_settings(source))
@@ -1647,8 +1647,8 @@ class TestSettingsSnapshotRoutes:
         assert response.status_code == 200, response.text
         saved = mgr.get_settings("model-a")
         assert saved.temperature == 0.2
-        assert saved.qwen35_ane_prefill_enabled is False
-        assert saved.qwen35_ane_prefill_sequence_length == (
+        assert saved.ane_prefill_enabled is False
+        assert saved.ane_prefill_sequence_length == (
             2048 if target_type == "qwen3_5" else 128
         )
         assert [item["feature"] for item in response.json()["skipped"]] == (
@@ -1659,7 +1659,7 @@ class TestSettingsSnapshotRoutes:
         "invalid",
         [
             {"temperature": {"bad": 1}},
-            {"qwen35_ane_prefill_fraction": {"bad": 1}},
+            {"ane_prefill_fraction": {"bad": 1}},
         ],
     )
     def test_recipe_invalid_value_types_leave_storage_unchanged(self, client, invalid):
