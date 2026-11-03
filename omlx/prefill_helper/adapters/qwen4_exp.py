@@ -43,7 +43,7 @@ from ...utils.model_loading import (
     maybe_apply_pre_load_patches,
 )
 from .. import wire
-from ..adapter import Arrays, HostArrays, StageAdapter
+from ..adapter import Arrays, Capture, HostArrays, StageAdapter
 
 _WARM = object()
 
@@ -353,6 +353,7 @@ class Qwen4ExpAdapter(StageAdapter):
         tokens: mx.array,
         next_tokens: int,
         inputs: HostArrays | None = None,
+        capture: Capture | None = None,
     ) -> tuple[Arrays, Arrays]:
         layers = _layers(lm)
         for i, layer in enumerate(layers):
@@ -377,6 +378,7 @@ class Qwen4ExpAdapter(StageAdapter):
         k: int,
         boundary: Arrays,
         state: Arrays,
+        capture: Capture | None = None,
         **kwargs: Any,
     ) -> Any:
         h = _run_layers(lm, boundary["h"], tokens, _layers(lm)[k:], cache[k:])

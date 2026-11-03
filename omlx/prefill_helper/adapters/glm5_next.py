@@ -26,16 +26,24 @@ from ...utils.model_loading import (
     expand_per_layer_quant_keys,
     maybe_apply_pre_load_patches,
 )
-from ..adapter import Arrays, HostArrays, StageAdapter
+from ..adapter import Arrays, Capture, HostArrays, StageAdapter
 
 
 def _layers(lm: Any) -> list:
     return lm.model.layers
 
 
-def _run_layers(lm: Any, h: mx.array, layers: list, cache: list) -> mx.array:
-    """``layers`` on the 4-D streams, with the vendored forward's masks and
-    prefill memory policy."""
+def _run_layers(
+    lm: Any,
+    h: mx.array,
+    layers: list,
+    cache: list,
+    first: int = 0,
+    capture: Capture | None = None,
+) -> mx.array:
+    """``layers`` (global ids from ``first``) on the 4-D streams, with the
+    vendored forward's masks and prefill memory policy. A drafter reads a
+    layer with its streams averaged."""
     linear = next((c for layer, c in zip(layers, cache) if layer.is_linear), None)
     sparse = next((c for layer, c in zip(layers, cache) if not layer.is_linear), None)
     x = h[:, :, 0]
@@ -48,10 +56,14 @@ def _run_layers(lm: Any, h: mx.array, layers: list, cache: list) -> mx.array:
         if h.shape[1] >= 256
         else None
     )
-    for layer, c in zip(layers, cache):
+    for i, (layer, c) in enumerate(zip(layers, cache), first):
         h = layer(h, mask=ssm_mask if layer.is_linear else fa_mask, cache=c)
+        extra = []
+        if capture is not None and i in capture.layers:
+            capture.take(i, h.mean(axis=2))
+            extra.append(capture.out[i])
         if pipeline is not None:
-            pipeline.push(h)
+            pipeline.push(h, *extra)
     if pipeline is not None:
         pipeline.drain()
     return h
@@ -97,6 +109,7 @@ def _append_sparse(i: int, item: Any, state: Arrays) -> None:
 
 class Glm5NextAdapter(StageAdapter):
     model_types = ("glm5_next",)
+    captures_layers = True
 
     def layer_count(self, lm: Any) -> int:
         return len(_layers(lm))
@@ -145,6 +158,7 @@ class Glm5NextAdapter(StageAdapter):
         tokens: mx.array,
         next_tokens: int,
         inputs: HostArrays | None = None,
+        capture: Capture | None = None,
     ) -> tuple[Arrays, Arrays]:
         layers = _layers(lm)
         before = {
@@ -158,14 +172,14 @@ class Glm5NextAdapter(StageAdapter):
                 h[:, :, None, :], (*h.shape[:2], lm.model.hc_mult, h.shape[-1])
             )
         )
-        h = _run_layers(lm, h, layers, cache)
+        h = _run_layers(lm, h, layers, cache, capture=capture)
         state: Arrays = {}
         for i, (layer, c) in enumerate(zip(layers, cache)):
             if layer.is_linear:
                 state[f"{i}.conv"], state[f"{i}.rec"] = c[0], c[1]
             else:
                 state.update(_sparse_state(i, c, before[i]))
-        mx.eval(h, list(state.values()))
+        mx.eval(h, list(state.values()), list(capture.out.values()) if capture else [])
         return {"h": h}, state
 
     def run_rest(
@@ -177,9 +191,10 @@ class Glm5NextAdapter(StageAdapter):
         k: int,
         boundary: Arrays,
         state: Arrays,
+        capture: Capture | None = None,
         **kwargs: Any,
     ) -> Any:
-        h = _run_layers(lm, boundary["h"], _layers(lm)[k:], cache[k:])
+        h = _run_layers(lm, boundary["h"], _layers(lm)[k:], cache[k:], k, capture)
         if not prompt_priming.capture_eligible(lm, cache):
             return None
         # Lightning MTP primes its head from the normed hidden of every chunk.

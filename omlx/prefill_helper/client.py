@@ -152,6 +152,7 @@ class HelperClient:
         *,
         layers: int | None = None,
         feed: Callable[[int], dict] | None = None,
+        capture: dict | None = None,
     ) -> HelperJob:
         if not self.alive:
             raise HelperError("prefill helper connection is closed")
@@ -167,6 +168,8 @@ class HelperClient:
             meta["layers"] = int(layers)
         if feed is not None:
             meta["feed"] = True
+        if capture is not None:
+            meta["capture"] = capture
         self._send(meta, arrays)
         if feed is not None:
             threading.Thread(target=job._feed, args=(feed,), daemon=True).start()

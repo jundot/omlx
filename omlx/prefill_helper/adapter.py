@@ -14,6 +14,7 @@ import re
 import struct
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -46,10 +47,29 @@ def _tensors(model_path: Path) -> dict[str, tuple[str, int]]:
     return tensors
 
 
+@dataclass
+class Capture:
+    """Layer outputs a block drafter reads, from chunk row ``start`` on.
+
+    The stage that runs a listed layer stores its output in ``out``, in the
+    form the family's local prefill hands the drafter.
+    """
+
+    layers: list[int]
+    start: int
+    out: Arrays = field(default_factory=dict)
+
+    def take(self, layer: int, value: mx.array) -> None:
+        if layer in self.layers:
+            self.out[layer] = value[:, self.start :]
+
+
 class StageAdapter:
     """Split a model family's prefill forward between two Macs."""
 
     model_types: tuple[str, ...] = ()
+    # Whether run_first/run_rest fill a Capture (block drafters need it).
+    captures_layers = False
 
     def language_model(self, model: Any) -> Any:
         """The module that owns ``layers`` (the scheduler holds an adapter)."""
@@ -144,12 +164,13 @@ class StageAdapter:
         tokens: mx.array,
         next_tokens: int,
         inputs: HostArrays | None = None,
+        capture: Capture | None = None,
     ) -> tuple[Arrays, Arrays]:
         """Helper: run ``[0, k)`` on one chunk with its ``job_feed`` inputs.
 
         Returns the tensors that cross the cut and the chunk's cache state
-        for layers ``[0, k)``, both evaluated. ``inputs`` is None only while
-        warming the kernels.
+        for layers ``[0, k)``, both evaluated, and fills ``capture``.
+        ``inputs`` is None only while warming the kernels.
         """
         raise NotImplementedError
 
@@ -162,6 +183,7 @@ class StageAdapter:
         k: int,
         boundary: Arrays,
         state: Arrays,
+        capture: Capture | None = None,
         **kwargs: Any,
     ) -> Any:
         """This Mac: run ``[k, n)`` on the chunk the helper sent."""

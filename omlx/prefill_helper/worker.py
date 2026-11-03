@@ -30,6 +30,7 @@ import numpy as np
 
 from .. import __version__
 from . import wire
+from .adapter import Capture
 from .adapters import adapter_for
 from .lending import active_marker_path
 
@@ -46,6 +47,8 @@ class _Job:
     layers: int
     prefix: dict[str, mx.array] | None = None
     feed: bool = False
+    # Block drafter layers to return: {"layers": [...], "from": job row}.
+    capture: dict | None = None
     inputs: dict[int, dict] = field(default_factory=dict)
     acked: int = -1
     cancelled: bool = False
@@ -138,6 +141,7 @@ class HelperServer:
                             min(int(meta.get("layers", self.k)), self.k),
                             prefix or None,
                             bool(meta.get("feed")),
+                            meta.get("capture"),
                         )
                         session.jobs.append(job)
                         session.by_id[job.job_id] = job
@@ -220,10 +224,17 @@ class HelperServer:
                 inputs = job.inputs.pop(index, {})
             tokens = mx.array(job.tokens[start : start + size])[None]
             following = job.chunks[index + 1] if index + 1 < len(job.chunks) else 0
+            capture = None
+            if job.capture and start + size > job.capture["from"]:
+                capture = Capture(
+                    job.capture["layers"], max(0, job.capture["from"] - start)
+                )
             began = time.perf_counter()
             boundary, state = self.adapter.run_first(
-                self.lm, cache, tokens, following, inputs
+                self.lm, cache, tokens, following, inputs, capture
             )
+            if capture is not None:
+                boundary.update({f"cap.{i}": v for i, v in capture.out.items()})
             elapsed = time.perf_counter() - began
             arrays = {f"b:{n}": wire.to_host(v) for n, v in boundary.items()}
             arrays.update({f"s:{n}": wire.to_host(v) for n, v in state.items()})

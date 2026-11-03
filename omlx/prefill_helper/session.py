@@ -37,6 +37,8 @@ class HelperPrefill:
     job: HelperJob
     grid: list[int]
     layers: int
+    # Block drafter layers and the first job row its window keeps.
+    capture: tuple[list[int], int] | None = None
     index: int = 0
     chunk: Chunk | None = None
 
@@ -119,19 +121,30 @@ class PrefillHelperSession:
         tokens: np.ndarray,
         grid: list[int],
         cache: list | None,
+        capture: tuple[list[int], int] | None = None,
     ) -> HelperPrefill | None:
-        """Queue a job; ``cache`` holds a restored prefix (None without one)."""
+        """Queue a job; ``cache`` holds a restored prefix (None without one).
+
+        ``capture`` names a block drafter's layers and the first job row of
+        its window; the helper returns the ones it runs.
+        """
         layers = self.pick_layers()
         prefix = self.adapter.prefix_state(cache, layers) if cache else None
         feed = self.adapter.job_feed(self.lm, cache, tokens, grid, layers)
+        wanted = None
+        if capture is not None:
+            below = [i for i in capture[0] if i < layers]
+            wanted = {"layers": below, "from": int(capture[1])} if below else None
         try:
-            job = self.client.submit(tokens, grid, prefix, layers=layers, feed=feed)
+            job = self.client.submit(
+                tokens, grid, prefix, layers=layers, feed=feed, capture=wanted
+            )
         except HelperError as error:
             self.note_failure(str(error))
             return None
         with self._lock:
             self._jobs[request_id] = job
-        return HelperPrefill(self, job, list(grid), layers)
+        return HelperPrefill(self, job, list(grid), layers, capture)
 
     def finish(self, request_id: str, tokens: int, seconds: float) -> None:
         with self._lock:

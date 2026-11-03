@@ -20,7 +20,7 @@ import numpy as np
 from ...patches.deepseek_v41 import growth
 from ...patches.deepseek_v41.loading import load
 from ...patches.deepseek_v41.storage import decode_rows, dedupe_tuple_ids
-from ..adapter import Arrays, HostArrays, StageAdapter
+from ..adapter import Arrays, Capture, HostArrays, StageAdapter
 
 _SLOTS = 7
 # Compressed KV and index keys grow with the prompt on KV-source layers; the
@@ -175,6 +175,7 @@ class DeepseekV41Adapter(StageAdapter):
         tokens: mx.array,
         next_tokens: int,
         inputs: HostArrays | None = None,
+        capture: Capture | None = None,
     ) -> tuple[Arrays, Arrays]:
         for i, layer in enumerate(lm.pipeline_layers):
             if "engram" in layer and isinstance(layer.engram.embed, _HostRows):
@@ -214,6 +215,7 @@ class DeepseekV41Adapter(StageAdapter):
         k: int,
         boundary: Arrays,
         state: Arrays,
+        capture: Capture | None = None,
         **kwargs: Any,
     ) -> Any:
         shared = {

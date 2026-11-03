@@ -84,6 +84,7 @@ from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
 )
+from .prefill_helper.adapter import Capture
 from .prefill_helper.client import HelperError
 from .prefill_helper.session import HelperPrefill
 from .prefill_progress import get_prefill_tracker
@@ -6820,12 +6821,13 @@ class Scheduler:
         """Queue *request* for the prefill helper; False to prefill it here.
 
         Its first chunk runs in _advance_chunked_prefills once the helper sends
-        it. Drafters that capture prompt layers stay on the local path.
+        it. A block drafter's layers come back from whichever Mac runs them.
         """
         session = self._prefill_helper
+        drafter = _block_drafter_for(self.model)
         if (
             session is None
-            or _block_drafter_for(self.model) is not None
+            or (drafter is not None and not session.adapter.captures_layers)
             or not session.accepts(len(tokens) - 1)
         ):
             return False
@@ -6833,11 +6835,20 @@ class Scheduler:
         state.sampler = sampler
         state.sm = self._stop_sequences_for_insert(request)
         state.per_row_lps = list(logits_processors) if logits_processors else []
+        capture = None
+        if drafter is not None:
+            # The drafter keeps the prompt's last window rows (job rows here).
+            window_start = len(request.prompt_token_ids) - drafter.window
+            capture = (
+                list(drafter.target_layer_ids),
+                window_start - Scheduler._prefill_start(state),
+            )
         state.helper = session.start(
             request.request_id,
             tokens[:-1],
             Scheduler._helper_chunk_grid(self, state),
             state.cache if state.base_size > 0 else None,
+            capture,
         )
         # Without a job the request still prefills here in chunks.
         self.prefilling.append(request)
@@ -6941,6 +6952,13 @@ class Scheduler:
         if helper is not None:
             helper.session.drop(state.request.request_id, reason)
 
+    @staticmethod
+    def _prefill_start(state: _PrefillState) -> int:
+        """Prompt position of the first prefill row, as chunks count it."""
+        if state.boundary_enabled:
+            return state.base_size
+        return max(int(getattr(state.request, "cached_tokens", 0) or 0), 0)
+
     def _forward_helper_chunk(
         self,
         state: _PrefillState,
@@ -6953,6 +6971,19 @@ class Scheduler:
         helper = state.helper
         session = helper.session
         part, helper.chunk = helper.chunk, None
+        drafter = _block_drafter_for(self.model) if helper.capture else None
+        capture = None
+        if drafter is not None:
+            layers, window_start = helper.capture
+            if part.index == 0:
+                Scheduler._dflash_prepare_request(
+                    self, state.request, Scheduler._prefill_start(state)
+                )
+            if part.start + part.size > window_start:
+                capture = Capture(
+                    [i for i in layers if i >= helper.layers],
+                    max(0, window_start - part.start),
+                )
         if "next_prefill_tokens" in chunk_kwargs:
             # The grid is exact, unlike the throttled estimate.
             chunk_kwargs["next_prefill_tokens"] = helper.next_size()
@@ -6977,10 +7008,20 @@ class Scheduler:
             helper.layers,
             part.boundary,
             part.state,
+            capture=capture,
             **chunk_kwargs,
         )
         adapter.apply_state(state.cache, helper.layers, part.state)
         adapter.finish_chunk(lm, chunk, output, state.cache)
+        if capture is not None:
+            drafter.seed_request(
+                state.request.request_id,
+                [
+                    capture.out[i] if i >= helper.layers else part.boundary[f"cap.{i}"]
+                    for i in helper.capture[0]
+                ],
+                Scheduler._prefill_start(state) + part.start + capture.start,
+            )
         mx.eval([c.state for c in state.cache])
         session.observe(
             helper.layers, part.size, part.seconds, time.perf_counter() - began

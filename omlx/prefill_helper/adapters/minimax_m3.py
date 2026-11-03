@@ -23,7 +23,7 @@ from ...utils.model_loading import (
     expand_per_layer_quant_keys,
     maybe_apply_pre_load_patches,
 )
-from ..adapter import Arrays, HostArrays, StageAdapter
+from ..adapter import Arrays, Capture, HostArrays, StageAdapter
 
 # Calls this short keep explicit positions, as the language model does.
 _EXPLICIT_POSITIONS_MAX = 16
@@ -33,15 +33,24 @@ def _layers(lm: Any) -> list:
     return lm.model.layers
 
 
-def _run_layers(lm: Any, h: mx.array, layers: list, cache: list) -> mx.array:
+def _run_layers(
+    lm: Any,
+    h: mx.array,
+    layers: list,
+    cache: list,
+    first: int = 0,
+    capture: Capture | None = None,
+) -> mx.array:
     mask = create_attention_mask(h, cache[0])
     length = h.shape[1]
     positions = None
     if length <= _EXPLICIT_POSITIONS_MAX:
         offset = cache[0].offset
         positions = mx.arange(offset, offset + length, dtype=mx.int32)[None]
-    for layer, c in zip(layers, cache):
+    for i, (layer, c) in enumerate(zip(layers, cache), first):
         h = layer(h, mask, c, position_ids=positions)
+        if capture is not None:
+            capture.take(i, h)
     return h
 
 
@@ -59,6 +68,7 @@ def _cache_state(i: int, item: Any, since: int) -> Arrays:
 
 class MiniMaxM3Adapter(StageAdapter):
     model_types = ("minimax_m3_vl",)
+    captures_layers = True
 
     def layer_count(self, lm: Any) -> int:
         return len(_layers(lm))
@@ -107,13 +117,16 @@ class MiniMaxM3Adapter(StageAdapter):
         tokens: mx.array,
         next_tokens: int,
         inputs: HostArrays | None = None,
+        capture: Capture | None = None,
     ) -> tuple[Arrays, Arrays]:
         before = [c.offset for c in cache]
-        h = _run_layers(lm, lm.model.embed_tokens(tokens), _layers(lm), cache)
+        h = _run_layers(
+            lm, lm.model.embed_tokens(tokens), _layers(lm), cache, capture=capture
+        )
         state: Arrays = {}
         for i, c in enumerate(cache):
             state.update(_cache_state(i, c, before[i]))
-        mx.eval(h, list(state.values()))
+        mx.eval(h, list(state.values()), list(capture.out.values()) if capture else [])
         return {"h": h}, state
 
     def run_rest(
@@ -125,9 +138,10 @@ class MiniMaxM3Adapter(StageAdapter):
         k: int,
         boundary: Arrays,
         state: Arrays,
+        capture: Capture | None = None,
         **kwargs: Any,
     ) -> Any:
-        return _run_layers(lm, boundary["h"], _layers(lm)[k:], cache[k:])
+        return _run_layers(lm, boundary["h"], _layers(lm)[k:], cache[k:], k, capture)
 
     def apply_state(self, cache: list, k: int, state: Arrays) -> None:
         for i in range(k):

@@ -1037,3 +1037,55 @@ def test_minimax_split_matches_whole_model(k, prefix):
     last = ids[:, -1:]
     for a, b in zip(_glm_logits(host, reference, last), _glm_logits(host, cache, last)):
         np.testing.assert_array_equal(a, b)
+
+
+class _Drafter:
+    """Records what prefill seeds a block drafter with."""
+
+    def __init__(self, layers, window):
+        self.target_layer_ids, self.window = layers, window
+        self.seeds = []
+
+    def seed_request(self, request_id, layers, position):
+        self.seeds.append((position, [np.asarray(x) for x in layers]))
+
+    def prepare_request(self, *args):
+        pass
+
+    def bind_uid(self, *args):
+        pass
+
+
+def test_scheduler_seeds_a_block_drafter_from_both_macs():
+    k, tokens = 2, [int(t) for t in np.random.default_rng(3).integers(3, 60, 100)]
+
+    def drive(helper_k):
+        host = _tiny_vlm_adapter(
+            lambda: (_minimax(), SimpleNamespace(model_type="minimax_m3_vl"))
+        )
+        drafter = _Drafter([0, 3], window=40)
+        host._language_model._omlx_drafter = drafter
+        sched = _scheduler(host, 32)
+        session = None
+        if helper_k:
+            helper = _minimax()
+            MINIMAX.keep_first(helper, helper_k)
+            session, listener, thread = _session(
+                host._language_model, helper, helper_k, adapter=MINIMAX
+            )
+            sched.attach_prefill_helper(session)
+        state = _drive(sched, _request(tokens), tokens)
+        if session is not None:
+            assert state.helper is not None
+            session.close()
+            thread.join(10)
+            listener.close()
+        return drafter.seeds
+
+    local, split = drive(0), drive(k)
+    # Layer 0 runs on the helper and layer 3 here; the window starts in the
+    # second chunk.
+    assert [p for p, _ in split] == [p for p, _ in local] == [60, 64, 96]
+    for (_, a), (_, b) in zip(local, split):
+        for x, y in zip(a, b):
+            np.testing.assert_array_equal(x, y)
