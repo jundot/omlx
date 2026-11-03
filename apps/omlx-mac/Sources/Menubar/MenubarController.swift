@@ -426,9 +426,12 @@ final class MenubarController: NSObject {
 
         // Icon swap — outline when not actively serving, filled otherwise.
         // Live throughput lives in the dedicated LIV/AVG/ALL metric items,
-        // so the main item stays a fixed square icon.
-        let serving = state.isRunningLike
-        statusItem.button?.image = serving ? iconFilled : iconOutline
+        // so the main item stays a fixed square icon. This runs on every stats
+        // tick, and assigning even the same image redraws the item.
+        let icon = state.isRunningLike ? iconFilled : iconOutline
+        if statusItem.button?.image !== icon {
+            statusItem.button?.image = icon
+        }
     }
 
     private func refreshUpdateMenuItem() {
