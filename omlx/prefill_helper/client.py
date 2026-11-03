@@ -149,6 +149,7 @@ class HelperClient:
         self._open = threading.Event()
         self.alive = True
         self.stopped_by_helper = False
+        self.replaced_on_helper = False
         # Last frame from the helper, or the last job sent to it.
         self.heard = time.monotonic()
         threading.Thread(target=self._receive, daemon=True).start()
@@ -211,6 +212,7 @@ class HelperClient:
                 self.heard = time.monotonic()
                 if meta.get("op") == "stopped":
                     self.stopped_by_helper = True
+                    self.replaced_on_helper = bool(meta.get("replaced"))
                     self._fail("stopped on the helper Mac")
                     return
                 with self._lock:

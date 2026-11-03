@@ -6,6 +6,7 @@ import os
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -36,6 +37,7 @@ from omlx.patches.mlx_vlm_minimax_m3_compat import (
 from omlx.prefill_helper import launcher, lending, wire
 from omlx.prefill_helper import manager as manager_module
 from omlx.prefill_helper import routes as helper_routes
+from omlx.prefill_helper import worker as worker_module
 from omlx.prefill_helper.adapters import adapter_for
 from omlx.prefill_helper.client import HelperClient, HelperError
 from omlx.prefill_helper.launcher import HelperTarget
@@ -752,6 +754,14 @@ def test_manager_retries_a_lost_helper_but_not_a_stopped_one(tmp_path, monkeypat
     manager.configure("node-1", None)
     time.sleep(0.3)
     assert manager.status()["state"] == "stopped" and len(fake.servers) == 2
+    # Replaced by another model's helper: stays off the same way.
+    manager.retry()
+    _wait_state(manager, "ready")
+    attached[-1].client.stopped_by_helper = True
+    attached[-1].client.replaced_on_helper = True
+    attached[-1].client.close()
+    status = _wait_state(manager, "stopped", reason="now helping another model")
+    assert status["reason"] == "M5max is now helping another model"
     manager.close()
 
 
@@ -828,6 +838,40 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     monkeypatch.setattr(helper_routes.os, "kill", lambda pid, sig: killed.append(sig))
     assert client.post(f"{base}/lending/stop").json()["stopped"]
     assert killed[-1] == signal.SIGTERM
+
+
+def test_a_mac_helping_another_model_counts_that_memory_as_free(monkeypatch):
+    info = {
+        "budget": 100 << 30,
+        "available": 20 << 30,
+        "lending": {"host": "Studio", "model": "/m/Other", "active_gib": 60.0},
+    }
+    assert manager_module.helper_budget(info) == 80 << 30
+    target = HelperTarget("n", "M5max", "u@10.0.0.2", "10.0.0.2", "thunderbolt")
+    monkeypatch.setattr(helper_routes.launcher, "resolve_target", lambda node: target)
+    monkeypatch.setattr(helper_routes.launcher, "remote_info", lambda t: info)
+    monkeypatch.setattr(helper_routes, "computer_name", lambda: "Studio")
+    device = {"node_id": "n", "friendly_name": "M5max"}
+    row = helper_routes._candidate(device, "/models/Mine", _PlanAdapter(), None)
+    assert row["lending"] == {"host": "Studio", "model": "Other"}
+    # Helping this same model is not a takeover.
+    row = helper_routes._candidate(device, "/models/Other", _PlanAdapter(), None)
+    assert row["lending"] is None
+
+
+def test_a_new_helper_stops_the_one_running_on_its_mac(tmp_path, monkeypatch):
+    running = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    marker = tmp_path / "active.json"
+    marker.write_text(json.dumps({"pid": running.pid, "host": "Studio"}))
+    monkeypatch.setattr(lending, "active_marker_path", lambda: marker)
+    monkeypatch.setattr(lending, "_is_helper", lambda pid: pid == running.pid)
+    # Reaped like an SSH session reaps the real helper.
+    reaper = threading.Thread(target=running.wait)
+    reaper.start()
+    began = time.monotonic()
+    worker_module._replace_running_helper(timeout=10)
+    reaper.join(5)
+    assert running.returncode == -signal.SIGUSR1 and time.monotonic() - began < 5
 
 
 def test_resolve_target_uses_the_thunderbolt_link_local_without_ipv4(monkeypatch):

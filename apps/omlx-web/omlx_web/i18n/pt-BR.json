@@ -1360,6 +1360,7 @@
   "modal.model_settings.prefill_helper_update": "needs oMLX {version}",
   "modal.model_settings.prefill_helper_fits": "{n} layers fit",
   "modal.model_settings.prefill_helper_no_memory": "not enough memory",
+  "modal.model_settings.prefill_helper_takes_over": "{name} is helping {host} with {model}. Using it here stops that.",
   "modal.model_settings.prefill_helper_battery": "{name} is on battery power. Prefill drains its battery quickly.",
   "modal.model_settings.prefill_helper_layers": "Layers on the helper",
   "modal.model_settings.prefill_helper_layers_auto": "Auto",

@@ -178,7 +178,8 @@ def _link_speed(
 
 _INFO = (
     "import json, os, re, shutil, subprocess, omlx, mlx.core as mx; "
-    "i = mx.device_info(); "
+    "from omlx.prefill_helper.lending import active_lending; "
+    "i = mx.device_info(); m = active_lending() or {}; "
     "run = lambda *a: subprocess.run(a, capture_output=True, text=True).stdout; "
     "p = run('/usr/bin/pmset', '-g', 'ps'); v = run('/usr/bin/vm_stat'); "
     "page = int(re.search(r'page size of (\\d+)', v).group(1)); "
@@ -189,7 +190,9 @@ _INFO = (
     "'on_battery': 'Battery Power' in p, "
     "'available': page * sum(pages.get(k, 0) for k in "
     "('free', 'inactive', 'speculative', 'purgeable')), "
-    "'disk_free': shutil.disk_usage(os.path.expanduser('~')).free}))"
+    "'disk_free': shutil.disk_usage(os.path.expanduser('~')).free, "
+    "'lending': {k: m.get(k) for k in ('host', 'model', 'active_gib')} "
+    "if m else None}))"
 )
 
 

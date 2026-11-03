@@ -59,8 +59,11 @@ def helper_budget(info: dict) -> int:
     if info.get("memory"):
         budget = min(budget, int(info["memory"]) - _OS_BYTES)
     if info.get("available"):
-        # Models the helper Mac's own server holds stay where they are.
-        budget = min(budget, int(info["available"]))
+        # Models the helper Mac's own server holds stay where they are; a
+        # helper running there for another model makes way for this one.
+        lending = info.get("lending") or {}
+        freed = int(float(lending.get("active_gib") or 0) * 2**30)
+        budget = min(budget, int(info["available"]) + freed)
     return budget
 
 
@@ -74,7 +77,7 @@ def fit_layers(shared: int, per_layer: list[int], budget: int, limit: int) -> in
     return held
 
 
-def _computer_name() -> str:
+def computer_name() -> str:
     try:
         name = subprocess.run(
             ["scutil", "--get", "ComputerName"],
@@ -208,13 +211,20 @@ class PrefillHelperManager:
                     continue
                 name = self._session.name
                 stopped = self._session.client.stopped_by_helper
+                replaced = self._session.client.replaced_on_helper
                 reason = self._session.last_error or "the connection was lost"
                 self._teardown()
                 if stopped:
                     # The user stopped it on that Mac; do not start it again.
                     wanted = False
                     self._set(
-                        "stopped", node_id=self.node_id, reason=f"Stopped on {name}"
+                        "stopped",
+                        node_id=self.node_id,
+                        reason=(
+                            f"{name} is now helping another model"
+                            if replaced
+                            else f"Stopped on {name}"
+                        ),
                     )
                 else:
                     attempt = 1
@@ -268,7 +278,7 @@ class PrefillHelperManager:
             model_dir,
             self.model_type,
             held,
-            host_name=_computer_name(),
+            host_name=computer_name(),
             warm_tokens=self.chunk_tokens,
             a8_min_tokens=self.a8_min_tokens,
         )

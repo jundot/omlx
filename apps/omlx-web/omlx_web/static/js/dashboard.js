@@ -3183,6 +3183,14 @@
                 }
             },
 
+            prefillHelperTakeoverText(device) {
+                if (!device?.lending) return '';
+                return window.t('modal.model_settings.prefill_helper_takes_over')
+                    .replaceAll('{name}', device.name || '')
+                    .replaceAll('{host}', device.lending.host || '?')
+                    .replaceAll('{model}', device.lending.model || '?');
+            },
+
             prefillHelperLayerChoices() {
                 const device = this.prefillHelperCandidate(this.modelSettings.prefill_helper_node_id);
                 const most = Math.max(

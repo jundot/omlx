@@ -22006,6 +22006,18 @@
         }
       }
     },
+    "settings.acceleration.prefill_helper.takes_over" : {
+      "comment" : "Warning when the chosen helper Mac already helps another model",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ is helping %@ with %@. Using it here stops that."
+          }
+        }
+      }
+    },
     "settings.acceleration.prefill_helper.needs_cluster" : {
       "comment" : "Hint when no Mac can be paired for the Prefill Accelerator",
       "extractionState" : "manual",

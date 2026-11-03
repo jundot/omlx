@@ -432,6 +432,13 @@ struct PrefillHelperCandidatesDTO: Codable, Equatable, Sendable {
         var versionOk: Bool? = nil
         var layersFit: Int? = nil
         var onBattery: Bool? = nil
+        /// What the Mac helps now, when it is another model.
+        var lending: Lending? = nil
+
+        struct Lending: Codable, Equatable, Sendable {
+            var host: String? = nil
+            var model: String? = nil
+        }
 
         var id: String { nodeId }
         var usable: Bool { online && versionOk == true && (layersFit ?? 0) > 0 }

@@ -13,6 +13,7 @@ import signal
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
@@ -22,7 +23,7 @@ from ..cluster.registry import get_device_registry
 from . import launcher
 from .adapters import adapter_for
 from .lending import active_lending
-from .manager import fit_layers, helper_budget
+from .manager import computer_name, fit_layers, helper_budget
 
 router = APIRouter(prefix="/admin/api/prefill-helper", tags=["prefill-helper"])
 
@@ -76,6 +77,15 @@ def _candidate(
     if limit is None:
         limit = len(per_layer) - 1
     held = fit_layers(shared, per_layer, helper_budget(info), limit)
+    lending = info.get("lending")
+    if lending:
+        lending = {
+            "host": lending.get("host"),
+            "model": Path(str(lending.get("model") or "")).name,
+        }
+        if lending == {"host": computer_name(), "model": Path(model_path).name}:
+            # The helper already runs for this model.
+            lending = None
     return {
         **row,
         "online": True,
@@ -86,6 +96,7 @@ def _candidate(
         "layers_fit": held,
         "budget": info.get("budget"),
         "on_battery": bool(info.get("on_battery")),
+        "lending": lending,
     }
 
 

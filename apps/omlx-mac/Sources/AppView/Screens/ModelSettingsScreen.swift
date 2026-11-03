@@ -1465,7 +1465,7 @@ private struct PrefillAcceleratorGroup: View {
                 sublabel: String(localized: "settings.acceleration.prefill_helper.sub",
                                  defaultValue: "Another Mac runs the first layers of long prompts, so prefill finishes sooner. Decoding stays on this Mac.",
                                  comment: "Sublabel for the Prefill Accelerator picker"),
-                warning: batteryWarning,
+                warning: takeoverWarning ?? batteryWarning,
                 isLast: !vm.prefillHelperAvailable ? false : vm.prefillHelperNodeID.isEmpty && statusText == nil) {
                 if vm.prefillHelperAvailable {
                     Popup(selection: Binding(
@@ -1574,6 +1574,15 @@ private struct PrefillAcceleratorGroup: View {
                       defaultValue: "Auto",
                       comment: "Layer count option that splits by measured speed"))]
             + vm.prefillHelperLayerChoices.map { (Optional($0), "\($0)") }
+    }
+
+    private var takeoverWarning: String? {
+        guard let device = vm.prefillHelperCandidates.first(where: { $0.nodeId == vm.prefillHelperNodeID }),
+              let lending = device.lending else { return nil }
+        let name = device.name
+        return String(localized: "settings.acceleration.prefill_helper.takes_over",
+                      defaultValue: "\(name) is helping \(lending.host ?? "another Mac") with \(lending.model ?? "another model"). Using it here stops that.",
+                      comment: "Warning when the chosen helper Mac already helps another model")
     }
 
     private var batteryWarning: String? {

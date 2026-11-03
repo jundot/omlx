@@ -32,7 +32,7 @@ from .. import __version__
 from . import wire
 from .adapter import Capture
 from .adapters import adapter_for
-from .lending import active_marker_path
+from .lending import active_lending, active_marker_path
 
 WINDOW = wire.WINDOW
 _KEEP_WARM_SECONDS = 0.5
@@ -85,13 +85,14 @@ class HelperServer:
         self.state = "idle"
         self._session: _Session | None = None
 
-    def notify_stopped(self, timeout: float = 2.0) -> None:
-        """Tell the host this Mac's user stopped the helper, so it stays off."""
+    def notify_stopped(self, replaced: bool = False, timeout: float = 2.0) -> None:
+        """Tell the host this helper was stopped here or replaced by another
+        model's, so it stays off."""
         session = self._session
         if session is None or session.closed:
             return
         sent = threading.Event()
-        session.outbox.put(({"op": "stopped"}, None))
+        session.outbox.put(({"op": "stopped", "replaced": replaced}, None))
         session.outbox.put(("flush", sent))
         sent.wait(timeout)
 
@@ -302,6 +303,23 @@ def _clear_marker(path: Path) -> None:
         pass
 
 
+def _replace_running_helper(timeout: float = 30.0) -> None:
+    """One helper per Mac: stop the one running here and wait until its
+    memory is free."""
+    previous = active_lending()
+    if previous is None:
+        return
+    pid = int(previous["pid"])
+    os.kill(pid, signal.SIGUSR1)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.2)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="omlx.prefill_helper.worker")
     parser.add_argument("--model", required=True)
@@ -325,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
             f"prefill helper: unsupported model type {args.model_type}", file=sys.stderr
         )
         return 2
+    _replace_running_helper()
     info = mx.device_info()
     mx.set_cache_limit(int(info["memory_size"]))
     mx.set_wired_limit(int(info["max_recommended_working_set_size"]))
@@ -383,7 +402,13 @@ def main(argv: list[str] | None = None) -> int:
         server.notify_stopped()
         stop()
 
+    def replaced(*_: Any) -> None:
+        # SIGUSR1 comes from a helper starting here for another model.
+        server.notify_stopped(replaced=True)
+        stop()
+
     signal.signal(signal.SIGTERM, stopped_here)
+    signal.signal(signal.SIGUSR1, replaced)
     signal.signal(signal.SIGHUP, stop)
 
     def watch_stdin() -> None:
