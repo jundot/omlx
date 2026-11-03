@@ -112,6 +112,12 @@ def test_reasoning_effort_has_presets_and_custom_input():
 
     assert 'x-for="value in selectedModel?.reasoning_effort_options || []"' in section
     assert ':value="value" x-text="value"' in section
+    # x-model runs before x-for adds the options, so each option binds its own selection.
+    assert ':selected="value === entry.value"' in section
+    assert (
+        ':selected="!selectedModel?.reasoning_effort_options?.includes(entry.value)"'
+        in section
+    )
     assert "!selectedModel?.reasoning_effort_custom && !entry.custom" in section
 
 

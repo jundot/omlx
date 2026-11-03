@@ -1230,9 +1230,9 @@
                                             <div class="flex-1 space-y-2">
                                                 <select x-show="!entry.custom" x-model="entry.value"
                                                        class="w-full px-3 py-1.5 border border-neutral-200 rounded-lg text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all bg-white">
-                                                    <option x-show="!selectedModel?.reasoning_effort_options?.includes(entry.value)" :value="entry.value" x-text="entry.value" disabled></option>
+                                                    <option x-show="!selectedModel?.reasoning_effort_options?.includes(entry.value)" :value="entry.value" x-text="entry.value" :selected="!selectedModel?.reasoning_effort_options?.includes(entry.value)" disabled></option>
                                                     <template x-for="value in selectedModel?.reasoning_effort_options || []" :key="value">
-                                                        <option :value="value" x-text="value"></option>
+                                                        <option :value="value" x-text="value" :selected="value === entry.value"></option>
                                                     </template>
                                                 </select>
                                                 <input x-show="entry.custom" type="text" x-model="entry.customValue"
