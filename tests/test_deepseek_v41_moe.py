@@ -180,6 +180,29 @@ def test_shared_expert_a8_takes_an_mxfp8_down_projection():
     assert float(mx.linalg.norm(actual - expected) / mx.linalg.norm(expected)) < 0.08
 
 
+@pytest.mark.skipif(
+    not quant_fast.oq_a8_available(), reason="needs INT8 tensor-unit kernels"
+)
+def test_dense_a8_pair_runs_two_mxfp8_projections():
+    """The attention wq_a/wkv pair of an oQ4e layer."""
+    projections = []
+    for seed, rows in ((10, 128), (11, 64)):
+        weight = mx.random.normal((rows, 256), key=mx.random.key(seed)) * 0.05
+        packed, scales = mx.quantize(
+            weight.astype(mx.bfloat16), bits=8, group_size=32, mode="mxfp8"
+        )
+        projections.append(QuantizedProjection(packed, scales, 8, "mxfp8"))
+    a8.tag_dense_a8(SimpleNamespace(layers=projections), 128)
+    x = mx.random.normal((1, 256, 256), key=mx.random.key(3)).astype(mx.bfloat16)
+    pair = a8.dense_a8_pair(*projections, x)
+    assert pair is not None
+    for p, actual in zip(projections, pair):
+        object.__setattr__(p, a8._PLAN, None)
+        expected = p(x).astype(mx.float32)
+        error = mx.linalg.norm(actual.astype(mx.float32) - expected)
+        assert float(error / mx.linalg.norm(expected)) < 0.05
+
+
 def test_a8_skips_offloaded_experts_and_mismatched_metadata():
     """Offloaded experts have no resident weights, and fp32 scales are not
     what the A8 kernels read: both stay on the A16 path."""

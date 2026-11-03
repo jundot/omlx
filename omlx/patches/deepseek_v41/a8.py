@@ -167,7 +167,7 @@ def dense_a8_pair(first, second, x):
     A; MXFP8 ones each run their own gather."""
     if _plan(first, x) is _MXFP8 and _plan(second, x) is _MXFP8:
         pair = _mxfp8_gather(x, (first,)), _mxfp8_gather(x, (second,))
-        return None if None in pair else pair
+        return None if any(y is None for y in pair) else pair
     shared = _shared_stage((first, second), x)
     if shared is None:
         return None
