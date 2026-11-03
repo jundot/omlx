@@ -60,6 +60,8 @@ final class MenubarStatsPoller {
             let total: Int?
             let speed: Double?
             let eta: Double?
+            /// For example "via M5max" while a Prefill Accelerator helps.
+            var detail: String? = nil
         }
 
         struct GenerationProgress: Codable, Sendable, Equatable {
@@ -146,6 +148,9 @@ final class MenubarStatsPoller {
                 }
                 if let etaSeconds = progress.eta, etaSeconds >= 0 {
                     detailParts.append("\(formatDuration(etaSeconds)) left")
+                }
+                if let via = progress.detail, !via.isEmpty {
+                    detailParts.append(via)
                 }
 
                 return LiveActivity(

@@ -40,6 +40,7 @@ final class ModelSettingsScreenVM {
         case repetitionPenalty, presencePenalty, ttl
         case enableThinking, ssdNgramOffload
         case deepseekV41CedPrefill, qwen4GdnDecodeWideProj, activationFp16
+        case prefillHelper
         case thinkingBudgetEnabled, thinkingBudgetTokens
         case limitToolResults, toolResultLimitTokens
         case limitGpuPower, gpuPowerLimitWatts
@@ -264,6 +265,18 @@ final class ModelSettingsScreenVM {
     var deepseekV41EngramSsdOffloadSupported: Bool = false
     var deepseekV41EngramSsdOffloadForced: Bool = false
     var deepseekV41CedPrefillEnabled: Bool = false
+    // Prefill Accelerator: per model, outside profiles, saved on change.
+    var prefillHelperSupported: Bool = false
+    /// Node id of the helper Mac; empty is off.
+    var prefillHelperNodeID: String = ""
+    /// Layers on the helper; nil splits by measured speed.
+    var prefillHelperLayers: Int? = nil
+    var prefillHelperCandidates: [PrefillHelperCandidatesDTO.Device] = []
+    var prefillHelperCandidatesLoading: Bool = false
+    /// False while the server's cluster setting is off (no pairing to use).
+    var prefillHelperAvailable: Bool = true
+    var prefillHelperStatus: PrefillHelperStatusDTO? = nil
+    var prefillHelperBusy: Bool = false
     var qwen4GdnDecodeWideProj: Bool = false
     var activationFp16Enabled: Bool = false
     var thinkingBudgetEnabled: Bool = false
@@ -563,6 +576,7 @@ final class ModelSettingsScreenVM {
             return true
         case .enableThinking, .ssdNgramOffload,
              .deepseekV41CedPrefill, .qwen4GdnDecodeWideProj, .activationFp16,
+             .prefillHelper,
              .thinkingBudgetEnabled, .thinkingBudgetTokens:
             return true
         case .limitToolResults, .toolResultLimitTokens:
@@ -738,6 +752,10 @@ final class ModelSettingsScreenVM {
                 self.deepseekV41EngramSsdOffload = self.deepseekV41EngramSsdOffloadForced
                     || (s?.deepseekV41EngramSsdOffload ?? false)
                 self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? false
+                self.prefillHelperSupported = m.prefillHelperSupported ?? false
+                self.prefillHelperNodeID = s?.prefillHelperNodeId ?? ""
+                self.prefillHelperLayers = s?.prefillHelperLayers
+                self.prefillHelperStatus = m.prefillHelper
                 self.qwen4GdnDecodeWideProj = s?.qwen4GdnDecodeWideProj ?? false
                 self.activationFp16Enabled = s?.activationFp16Enabled ?? false
                 self.thinkingBudgetEnabled = s?.thinkingBudgetEnabled ?? false
@@ -906,6 +924,11 @@ final class ModelSettingsScreenVM {
         case .qwen4GdnDecodeWideProj:
             guard isQwen4Exp else { return }
             patch.qwen4GdnDecodeWideProj = qwen4GdnDecodeWideProj
+        case .prefillHelper:
+            guard prefillHelperSupported else { return }
+            let off = prefillHelperNodeID.isEmpty
+            patch.prefillHelperNodeId = .some(off ? nil : prefillHelperNodeID)
+            patch.prefillHelperLayers = .some(off ? nil : prefillHelperLayers)
         case .activationFp16:          patch.activationFp16Enabled = activationFp16Enabled
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
@@ -1081,6 +1104,53 @@ final class ModelSettingsScreenVM {
             await reportFailedSave(error, modelID: targetModelID, client: client,
                                    preservingEdits: true)
         }
+    }
+
+    // MARK: - Prefill Accelerator
+
+    func loadPrefillHelperCandidates(client: OMLXClient) async {
+        guard prefillHelperSupported else { return }
+        let target = modelID
+        prefillHelperCandidatesLoading = true
+        defer { if modelID == target { prefillHelperCandidatesLoading = false } }
+        do {
+            let result = try await client.prefillHelperCandidates(id: target)
+            guard modelID == target else { return }
+            prefillHelperCandidates = result.devices
+            prefillHelperAvailable = true
+        } catch OMLXClientError.http(let status, _) where status == 403 || status == 404 {
+            // The endpoints exist only while the cluster setting is on.
+            if modelID == target { prefillHelperAvailable = false }
+        } catch {
+            if modelID == target { lastError = String(describing: error) }
+        }
+    }
+
+    func refreshPrefillHelperStatus(client: OMLXClient) async {
+        guard prefillHelperSupported, prefillHelperAvailable else { return }
+        let target = modelID
+        if let status = try? await client.prefillHelperStatus(id: target), modelID == target {
+            prefillHelperStatus = status
+        }
+    }
+
+    /// `action` is copy, retry or stop.
+    func prefillHelperAction(_ action: String, client: OMLXClient) async {
+        let target = modelID
+        prefillHelperBusy = true
+        defer { prefillHelperBusy = false }
+        do {
+            let status = try await client.prefillHelperAction(id: target, action: action)
+            if modelID == target { prefillHelperStatus = status }
+        } catch {
+            lastError = String(describing: error)
+        }
+    }
+
+    /// Layer counts the chosen Mac can hold, plus the saved count.
+    var prefillHelperLayerChoices: [Int] {
+        let fit = prefillHelperCandidates.first { $0.nodeId == prefillHelperNodeID }?.layersFit ?? 0
+        return Array(1...max(1, max(fit, prefillHelperLayers ?? 0)))
     }
 
     func startANETuning(client: OMLXClient) async {

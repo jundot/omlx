@@ -403,43 +403,43 @@
         }
       }
     },
-    "settings.experimental.k2_ane.tuner.sub": {
-      "extractionState": "manual",
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Optional tuning for long-prompt processing with MLP weights at eight bits or below. Results do not predict batching performance. Targets three minutes; loading and cleanup can take longer. You can enable ANE without testing."
+    "settings.experimental.k2_ane.tuner.sub" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Optional tuning for long-prompt processing with MLP weights at eight bits or below. Results do not predict batching performance. Targets three minutes; loading and cleanup can take longer. You can enable ANE without testing."
           }
         },
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "MLP 重みが 8 ビット以下のモデルで長いプロンプトの処理を任意で調整します。結果はバッチ処理性能を予測するものではありません。目安は 3 分ですが、読み込みや後処理で長くなる場合があります。テストなしで ANE を有効にできます。"
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MLP 重みが 8 ビット以下のモデルで長いプロンプトの処理を任意で調整します。結果はバッチ処理性能を予測するものではありません。目安は 3 分ですが、読み込みや後処理で長くなる場合があります。テストなしで ANE を有効にできます。"
           }
         },
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "MLP 가중치가 8비트 이하인 모델의 긴 프롬프트 처리를 선택적으로 조정합니다. 결과는 배치 처리 성능을 예측하지 않습니다. 약 3분이 목표이며 로딩과 정리에 더 걸릴 수 있습니다. 테스트 없이 ANE를 켤 수 있습니다."
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "MLP 가중치가 8비트 이하인 모델의 긴 프롬프트 처리를 선택적으로 조정합니다. 결과는 배치 처리 성능을 예측하지 않습니다. 약 3분이 목표이며 로딩과 정리에 더 걸릴 수 있습니다. 테스트 없이 ANE를 켤 수 있습니다."
           }
         },
-        "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Необязательная настройка обработки длинных промптов с весами MLP до восьми бит включительно. Результаты не предсказывают производительность пакетной обработки. Около трёх минут; загрузка и очистка могут занять больше времени. ANE можно включить без теста."
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Необязательная настройка обработки длинных промптов с весами MLP до восьми бит включительно. Результаты не предсказывают производительность пакетной обработки. Около трёх минут; загрузка и очистка могут занять больше времени. ANE можно включить без теста."
           }
         },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "可选调优：针对 MLP 权重为 8 位及以下的模型处理长提示词。结果不代表批处理性能。目标约三分钟，加载和清理可能需要更久。无需测试即可启用 ANE。"
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "可选调优：针对 MLP 权重为 8 位及以下的模型处理长提示词。结果不代表批处理性能。目标约三分钟，加载和清理可能需要更久。无需测试即可启用 ANE。"
           }
         },
-        "zh-Hant": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "選用調校：針對 MLP 權重為 8 位元及以下的模型處理長提示詞。結果不代表批次處理效能。目標約三分鐘，載入和清理可能需要更久。無需測試即可啟用 ANE。"
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "選用調校：針對 MLP 權重為 8 位元及以下的模型處理長提示詞。結果不代表批次處理效能。目標約三分鐘，載入和清理可能需要更久。無需測試即可啟用 ANE。"
           }
         }
       }
@@ -21910,6 +21910,318 @@
         }
       }
     },
+    "settings.acceleration.prefill_helper.auto" : {
+      "comment" : "Layer count option that splits by measured speed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.battery" : {
+      "comment" : "Warning when the helper Mac runs on battery",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ is on battery power. Prefill drains its battery quickly."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.copy" : {
+      "comment" : "Button that copies model files to the helper Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy Files"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.fits" : {
+      "comment" : "Picker suffix with how many layers fit on the helper Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld layers fit"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.label" : {
+      "comment" : "Row label for choosing the Mac that helps prefill",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Prefill Accelerator"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.layers.label" : {
+      "comment" : "Row label for the number of layers the helper Mac runs",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Layers on the helper"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.layers.sub" : {
+      "comment" : "Sublabel for the Prefill Accelerator layer count",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Auto splits the work by the measured speed of both Macs."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.needs_cluster" : {
+      "comment" : "Hint when no Mac can be paired for the Prefill Accelerator",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Turn on Cluster in the web dashboard's Settings, then pair a Mac in its Cluster tab."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.no_memory" : {
+      "comment" : "Picker suffix for a paired Mac without room for one layer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "not enough memory"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.off" : {
+      "comment" : "Picker option that turns the Prefill Accelerator off",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Off"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.offline" : {
+      "comment" : "Picker suffix for a paired Mac that does not answer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "offline"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.open_cluster" : {
+      "comment" : "Button opening the web dashboard's Cluster tab",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open Cluster Tab"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.retry" : {
+      "comment" : "Button that retries starting the helper",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Retry"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.start" : {
+      "comment" : "Button that restarts a stopped helper",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Start Again"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.connecting" : {
+      "comment" : "Prefill Accelerator status while connecting",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connecting to %@..."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.copying" : {
+      "comment" : "Prefill Accelerator status while copying files",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copying model files to %@: %@ of %@"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.last_prompt" : {
+      "comment" : "Prefill Accelerator status suffix with the last prompt timing",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "last prompt %lld tokens in %@s"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.needs_files" : {
+      "comment" : "Prefill Accelerator status asking to copy model files",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ needs %@ of model files in %@ (%@ free)."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.offline" : {
+      "comment" : "Prefill Accelerator status while the helper is unreachable",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ is unreachable (%@). Retrying."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.ready" : {
+      "comment" : "Prefill Accelerator status when the helper is ready",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ready on %@ with %lld layers"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.starting" : {
+      "comment" : "Prefill Accelerator status while the helper loads layers",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loading %lld layers on %@..."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.stopped" : {
+      "comment" : "Prefill Accelerator status after Stop",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stopped."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.unloaded" : {
+      "comment" : "Prefill Accelerator status while the model is not loaded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Starts when this model is loaded."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.stop" : {
+      "comment" : "Button that stops the helper",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stop"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.sub" : {
+      "comment" : "Sublabel for the Prefill Accelerator picker",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Another Mac runs the first layers of long prompts, so prefill finishes sooner. Decoding stays on this Mac."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.update" : {
+      "comment" : "Picker suffix for a paired Mac on another oMLX version",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "needs the same oMLX version"
+          }
+        }
+      }
+    },
     "settings.acceleration.qwen4_wide_decode.label" : {
       "comment" : "Row label for the Qwen4 extended fused decode toggle",
       "extractionState" : "manual",
@@ -27873,6 +28185,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "清除所有 SSD 缓存文件？已加载的模型将在下次预填充时重建 KV 缓存。"
+          }
+        }
+      }
+    },
+    "status.prefill_lending.stop" : {
+      "comment" : "Button that stops lending this Mac to another Mac's prefill",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Stop"
+          }
+        }
+      }
+    },
+    "status.prefill_lending.text" : {
+      "comment" : "Banner shown while this Mac runs another Mac's prefill helper",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This Mac is helping %@ with prompt prefill: %lld layers of %@. It stops when %@ unloads the model."
           }
         }
       }

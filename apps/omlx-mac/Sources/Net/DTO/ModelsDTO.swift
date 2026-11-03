@@ -82,6 +82,10 @@ struct ModelDTO: Codable, Equatable, Sendable, Identifiable {
     var a8PrefillSupported: Bool? = nil
     /// True when this Mac's GPU accepts a power cap.
     var gpuPowerLimitSupported: Bool? = nil
+    /// True for families another Mac can help prefill (Prefill Accelerator).
+    var prefillHelperSupported: Bool? = nil
+    /// The helper's state while the model is loaded; nil otherwise.
+    var prefillHelper: PrefillHelperStatusDTO? = nil
     /// "hf_cache" for models found in the shared Hugging Face Hub cache.
     var sourceType: String? = nil
     /// "gguf" for a GGUF file, which only an external engine serves.
@@ -135,6 +139,8 @@ struct ModelSettingsDTO: Codable, Equatable, Sendable {
     var activationFp16Enabled: Bool? = nil
     var deepseekV41EngramSsdOffload: Bool? = nil
     var deepseekV41CedPrefillEnabled: Bool? = nil
+    var prefillHelperNodeId: String? = nil
+    var prefillHelperLayers: Int? = nil
     let thinkingBudgetEnabled: Bool?
     let thinkingBudgetTokens: Int?
     var gpuPowerLimitW: Int? = nil
@@ -231,6 +237,8 @@ struct ModelSettingsPatch: Encodable, Equatable, Sendable {
     var activationFp16Enabled: Bool? = nil
     var deepseekV41EngramSsdOffload: Bool? = nil
     var deepseekV41CedPrefillEnabled: Bool? = nil
+    var prefillHelperNodeId: String?? = nil // .some(nil) sends JSON null (off).
+    var prefillHelperLayers: Int?? = nil // .some(nil) sends JSON null (auto).
     var thinkingBudgetEnabled: Bool? = nil
     var thinkingBudgetTokens: Int? = nil
     var maxToolResultTokens: Int? = nil
@@ -381,4 +389,64 @@ struct SimpleStatusResponse: Codable, Sendable {
     let status: String?
     let message: String?
     let success: Bool?
+}
+
+// MARK: - Prefill Accelerator
+
+/// GET /admin/api/prefill-helper/models/{id}, also `prefill_helper` in the
+/// model list. `state` is off, connecting, needs_files, copying, starting,
+/// ready, working, offline, stopped, error or unloaded.
+struct PrefillHelperStatusDTO: Codable, Equatable, Sendable {
+    struct LastPrompt: Codable, Equatable, Sendable {
+        let tokens: Int
+        let seconds: Double
+    }
+
+    let state: String
+    var name: String? = nil
+    var nodeId: String? = nil
+    var link: String? = nil
+    var held: Int? = nil
+    var layers: Int? = nil
+    var reason: String? = nil
+    var path: String? = nil
+    var bytes: Int64? = nil
+    var free: Int64? = nil
+    var done: Int64? = nil
+    var onBattery: Bool? = nil
+    var lastPrompt: LastPrompt? = nil
+}
+
+/// GET /admin/api/prefill-helper/candidates?model_id=: paired Macs and
+/// whether each can help the model.
+struct PrefillHelperCandidatesDTO: Codable, Equatable, Sendable {
+    struct Device: Codable, Equatable, Sendable, Identifiable {
+        let nodeId: String
+        let name: String
+        var chip: String? = nil
+        var ramGb: Int? = nil
+        let online: Bool
+        var reason: String? = nil
+        var link: String? = nil
+        var version: String? = nil
+        var versionOk: Bool? = nil
+        var layersFit: Int? = nil
+        var onBattery: Bool? = nil
+
+        var id: String { nodeId }
+        var usable: Bool { online && versionOk == true && (layersFit ?? 0) > 0 }
+    }
+
+    let version: String
+    let devices: [Device]
+}
+
+/// GET /admin/api/prefill-helper/lending: the helper this Mac runs for
+/// another Mac, if any.
+struct PrefillLendingDTO: Codable, Equatable, Sendable {
+    let active: Bool
+    var host: String? = nil
+    var model: String? = nil
+    var layers: Int? = nil
+    var activeGib: Double? = nil
 }
