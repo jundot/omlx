@@ -34,7 +34,6 @@ def _layers(lm: Any) -> list:
 
 
 def _run_layers(
-    lm: Any,
     h: mx.array,
     layers: list,
     cache: list,
@@ -121,7 +120,7 @@ class MiniMaxM3Adapter(StageAdapter):
     ) -> tuple[Arrays, Arrays]:
         before = [c.offset for c in cache]
         h = _run_layers(
-            lm, lm.model.embed_tokens(tokens), _layers(lm), cache, capture=capture
+            lm.model.embed_tokens(tokens), _layers(lm), cache, capture=capture
         )
         state: Arrays = {}
         for i, c in enumerate(cache):
@@ -141,7 +140,7 @@ class MiniMaxM3Adapter(StageAdapter):
         capture: Capture | None = None,
         **kwargs: Any,
     ) -> Any:
-        return _run_layers(lm, boundary["h"], _layers(lm)[k:], cache[k:], k, capture)
+        return _run_layers(boundary["h"], _layers(lm)[k:], cache[k:], k, capture)
 
     def apply_state(self, cache: list, k: int, state: Arrays) -> None:
         for i in range(k):

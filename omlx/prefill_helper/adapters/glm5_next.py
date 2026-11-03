@@ -34,7 +34,6 @@ def _layers(lm: Any) -> list:
 
 
 def _run_layers(
-    lm: Any,
     h: mx.array,
     layers: list,
     cache: list,
@@ -172,7 +171,7 @@ class Glm5NextAdapter(StageAdapter):
                 h[:, :, None, :], (*h.shape[:2], lm.model.hc_mult, h.shape[-1])
             )
         )
-        h = _run_layers(lm, h, layers, cache, capture=capture)
+        h = _run_layers(h, layers, cache, capture=capture)
         state: Arrays = {}
         for i, (layer, c) in enumerate(zip(layers, cache)):
             if layer.is_linear:
@@ -194,7 +193,7 @@ class Glm5NextAdapter(StageAdapter):
         capture: Capture | None = None,
         **kwargs: Any,
     ) -> Any:
-        h = _run_layers(lm, boundary["h"], _layers(lm)[k:], cache[k:], k, capture)
+        h = _run_layers(boundary["h"], _layers(lm)[k:], cache[k:], k, capture)
         if not prompt_priming.capture_eligible(lm, cache):
             return None
         # Lightning MTP primes its head from the normed hidden of every chunk.

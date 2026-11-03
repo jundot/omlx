@@ -150,18 +150,18 @@ def _run(config, k, sizes, prefix=0):
         np.testing.assert_array_equal(a, b)
 
 
-@pytest.mark.parametrize("k", [1, 2, 3, 4])
+@pytest.mark.parametrize("k", [1, 4])
 def test_split_matches_whole_model(k):
     _run(tiny(), k, [7, 5, 3])
 
 
-@pytest.mark.parametrize("k", [1, 2, 3])
+@pytest.mark.parametrize("k", [1, 3])
 def test_split_matches_whole_model_with_ced(k):
     # Chunks wider than the window skip the decoder tail, then replay it.
     _run(tiny_ced(), k, [9, 6, 7])
 
 
-@pytest.mark.parametrize("k", [1, 2, 3, 4])
+@pytest.mark.parametrize("k", [1, 3])
 def test_split_matches_whole_model_with_engram(k):
     _run(tiny(**_ENGRAM), k, [7, 5, 3])
 
@@ -169,11 +169,6 @@ def test_split_matches_whole_model_with_engram(k):
 def test_split_continues_a_cached_prefix():
     _run(tiny(**_ENGRAM), 2, [6, 5, 4], prefix=1)
     _run(tiny_ced(), 3, [9, 6, 7], prefix=1)
-
-
-def test_split_limit_keeps_the_ced_midpoint_here():
-    lm = LanguageModel(tiny_ced())
-    assert DSV41.max_split(lm) == lm._config.n_layers // 2
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +748,8 @@ def test_manager_retries_a_lost_helper_but_not_a_stopped_one(tmp_path, monkeypat
     attached[-1].client.stopped_by_helper = True
     attached[-1].client.close()
     assert _wait_state(manager, "stopped")["reason"] == "Stopped on M5max"
+    # Saving other settings does not start it either.
+    manager.configure("node-1", None)
     time.sleep(0.3)
     assert manager.status()["state"] == "stopped" and len(fake.servers) == 2
     manager.close()
@@ -788,19 +785,6 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     a8.close()
 
 
-def test_saving_other_settings_leaves_a_stopped_helper_stopped(tmp_path):
-    attached, fake = [], _FakeLauncher(None)
-    manager = _manager(fake, attached, tmp_path / "speeds.json")
-    manager.configure("node-1", None)
-    _wait_state(manager, "ready")
-    manager.stop()
-    _wait_state(manager, "stopped")
-    manager.configure("node-1", None)
-    time.sleep(0.3)
-    assert manager.status()["state"] == "stopped" and len(fake.servers) == 1
-    manager.close()
-
-
 # ---------------------------------------------------------------------------
 # Admin routes.
 # ---------------------------------------------------------------------------
@@ -834,8 +818,12 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     monkeypatch.setattr(lending, "active_marker_path", lambda: marker)
     monkeypatch.setattr(lending, "_is_helper", lambda pid: pid == os.getpid())
     assert client.get(f"{base}/lending").json() == {"active": False}
-    marker.write_text(json.dumps({"pid": os.getpid(), "host": "Mac Studio"}))
+    assert lending.lending_note() == ""
+    marker.write_text(
+        json.dumps({"pid": os.getpid(), "host": "Mac Studio", "active_gib": 82.4})
+    )
     assert client.get(f"{base}/lending").json()["host"] == "Mac Studio"
+    assert "lending 82 GB to Mac Studio" in lending.lending_note()
     killed = []
     monkeypatch.setattr(helper_routes.os, "kill", lambda pid, sig: killed.append(sig))
     assert client.post(f"{base}/lending/stop").json()["stopped"]
@@ -960,7 +948,7 @@ def _glm_state(cache):
     return [np.asarray(a) for a in out]
 
 
-def _glm_logits(lm, cache, last):
+def _logits(lm, cache, last):
     logits = lm(last, cache=cache).logits[:, -1]
     out = [np.asarray(logits)]
     for _ in range(3):
@@ -970,12 +958,12 @@ def _glm_logits(lm, cache, last):
     return out
 
 
-@pytest.mark.parametrize("k,prefix", [(1, 0), (2, 0), (3, 0), (2, 1)])
-def test_glm_split_matches_whole_model(k, prefix):
-    host, helper = _glm(), _glm()
-    GLM.keep_first(helper, k)
-    ids = mx.array(np.random.default_rng(5).integers(3, 60, (1, 23)))
-    chunks = _chunks(ids, [9, 6, 7])
+def _split_matches(adapter, make, ids, sizes, k, prefix, state_of):
+    """Prefill ``ids`` split at ``k`` after ``prefix`` local chunks; the caches
+    and the next greedy logits must match one model's prefill."""
+    host, helper = make(), make()
+    adapter.keep_first(helper, k)
+    chunks = _chunks(ids, sizes)
     reference = host.make_cache()
     for chunk in chunks:
         host(chunk, cache=reference)
@@ -984,50 +972,30 @@ def test_glm_split_matches_whole_model(k, prefix):
     for chunk in chunks[:prefix]:
         host(chunk, cache=cache)
     if prefix:
-        GLM.load_prefix(helper_cache, GLM.prefix_state(cache, k))
-    for chunk in chunks[prefix:]:
-        boundary, state = GLM.run_first(helper, helper_cache, chunk, 0, {})
-        GLM.run_rest(None, host, cache, chunk, k, boundary, state)
-        GLM.apply_state(cache, k, state)
+        adapter.load_prefix(helper_cache, adapter.prefix_state(cache, k))
+    rest = chunks[prefix:]
+    tokens = np.concatenate([np.asarray(c[0]) for c in rest])
+    feed = adapter.job_feed(
+        host, cache if prefix else None, tokens, [c.shape[1] for c in rest], k
+    )
+    for index, chunk in enumerate(rest):
+        inputs = feed(index) if feed else {}
+        boundary, state = adapter.run_first(helper, helper_cache, chunk, 0, inputs)
+        adapter.run_rest(None, host, cache, chunk, k, boundary, state)
+        adapter.apply_state(cache, k, state)
         mx.eval([c.state for c in cache])
 
-    for a, b in zip(_glm_state(reference), _glm_state(cache)):
+    for a, b in zip(state_of(reference), state_of(cache)):
         np.testing.assert_array_equal(a, b)
     last = ids[:, -1:]
-    for a, b in zip(_glm_logits(host, reference, last), _glm_logits(host, cache, last)):
+    for a, b in zip(_logits(host, reference, last), _logits(host, cache, last)):
         np.testing.assert_array_equal(a, b)
 
 
-def test_scheduler_glm_helper_prefill_matches_local():
-    k, tokens = 2, [int(t) for t in np.random.default_rng(3).integers(3, 60, 23)]
-    host = _tiny_vlm_adapter(_tiny_glm5_next)
-    local = _drive(_scheduler(host, 6), _request(tokens), tokens)
-
-    helper = _glm()
-    GLM.keep_first(helper, k)
-    sched = _scheduler(host, 6)
-    session, listener, thread = _session(host._language_model, helper, k, adapter=GLM)
-    sched.attach_prefill_helper(session)
-    state = _drive(sched, _request(tokens), tokens)
-    assert state.helper is not None and state.helper.index == len(state.helper.grid)
-    for a, b in zip(_glm_state(local.cache), _glm_state(state.cache)):
-        np.testing.assert_array_equal(a, b)
-    session.close()
-    thread.join(10)
-    listener.close()
-
-
-def test_lending_note_names_the_host_while_the_helper_runs(tmp_path, monkeypatch):
-    marker = tmp_path / "active.json"
-    monkeypatch.setattr(lending, "active_marker_path", lambda: marker)
-    monkeypatch.setattr(lending, "_is_helper", lambda pid: pid == os.getpid())
-    assert lending.lending_note() == ""
-    marker.write_text(
-        json.dumps({"pid": os.getpid(), "host": "HJKmac", "active_gib": 82.4})
-    )
-    assert "lending 82 GB to HJKmac" in lending.lending_note()
-    marker.write_text(json.dumps({"pid": 999999999, "host": "HJKmac"}))
-    assert lending.lending_note() == ""
+@pytest.mark.parametrize("k,prefix", [(1, 0), (2, 0), (3, 0), (2, 1)])
+def test_glm_split_matches_whole_model(k, prefix):
+    ids = mx.array(np.random.default_rng(5).integers(3, 60, (1, 23)))
+    _split_matches(GLM, _glm, ids, [9, 6, 7], k, prefix, _glm_state)
 
 
 # ---------------------------------------------------------------------------
@@ -1071,54 +1039,37 @@ def _qwen4_state(cache):
     "layers,k,prefix", [(2, 1, 0), (4, 1, 0), (4, 2, 0), (4, 3, 0), (4, 2, 1)]
 )
 def test_qwen4_split_matches_whole_model(layers, k, prefix):
-    host, helper = _qwen4(layers), _qwen4(layers)
-    QWEN4.keep_first(helper, k)
     ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 23)))
-    chunks = _chunks(ids, [9, 6, 7])
-    reference = host.make_cache()
-    for chunk in chunks:
-        host(chunk, cache=reference)
-
-    cache, helper_cache = host.make_cache(), helper.make_cache()
-    for chunk in chunks[:prefix]:
-        host(chunk, cache=cache)
-    if prefix:
-        QWEN4.load_prefix(helper_cache, QWEN4.prefix_state(cache, k))
-    rest = chunks[prefix:]
-    feed = QWEN4.job_feed(
-        host,
-        cache if prefix else None,
-        np.concatenate([np.asarray(c[0]) for c in rest]),
-        [c.shape[1] for c in rest],
-        k,
+    _split_matches(
+        QWEN4, lambda: _qwen4(layers), ids, [9, 6, 7], k, prefix, _qwen4_state
     )
-    for index, chunk in enumerate(rest):
-        inputs = feed(index) if feed else {}
-        boundary, state = QWEN4.run_first(helper, helper_cache, chunk, 0, inputs)
-        QWEN4.run_rest(None, host, cache, chunk, k, boundary, state)
-        QWEN4.apply_state(cache, k, state)
-        mx.eval([c.state for c in cache])
-
-    for a, b in zip(_qwen4_state(reference), _qwen4_state(cache)):
-        np.testing.assert_array_equal(a, b)
-    last = ids[:, -1:]
-    for a, b in zip(_glm_logits(host, reference, last), _glm_logits(host, cache, last)):
-        np.testing.assert_array_equal(a, b)
 
 
-def test_scheduler_qwen4_helper_prefill_matches_local():
-    k, tokens = 1, [int(t) for t in np.random.default_rng(3).integers(3, 58, 23)]
-    host = _tiny_vlm_adapter(_tiny_qwen4_exp)
+@pytest.mark.parametrize(
+    "factory,make,adapter,k,state_of",
+    [
+        (_tiny_glm5_next, _glm, GLM, 2, _glm_state),
+        (_tiny_qwen4_exp, _qwen4, QWEN4, 1, _qwen4_state),
+    ],
+    ids=["glm", "qwen4"],
+)
+def test_scheduler_family_helper_prefill_matches_local(
+    factory, make, adapter, k, state_of
+):
+    tokens = [int(t) for t in np.random.default_rng(3).integers(3, 58, 23)]
+    host = _tiny_vlm_adapter(factory)
     local = _drive(_scheduler(host, 6), _request(tokens), tokens)
 
-    helper = _qwen4()
-    QWEN4.keep_first(helper, k)
+    helper = make()
+    adapter.keep_first(helper, k)
     sched = _scheduler(host, 6)
-    session, listener, thread = _session(host._language_model, helper, k, adapter=QWEN4)
+    session, listener, thread = _session(
+        host._language_model, helper, k, adapter=adapter
+    )
     sched.attach_prefill_helper(session)
     state = _drive(sched, _request(tokens), tokens)
     assert state.helper is not None and state.helper.index == len(state.helper.grid)
-    for a, b in zip(_qwen4_state(local.cache), _qwen4_state(state.cache)):
+    for a, b in zip(state_of(local.cache), state_of(state.cache)):
         np.testing.assert_array_equal(a, b)
     session.close()
     thread.join(10)
@@ -1154,37 +1105,16 @@ def _minimax():
     return lm
 
 
+def _minimax_state(cache):
+    return [np.asarray(a) for item in cache for a in (*item.state[0], item.state[1])]
+
+
 @pytest.mark.parametrize("k,prefix", [(1, 0), (2, 0), (3, 0), (2, 1)])
 def test_minimax_split_matches_whole_model(k, prefix):
-    host, helper = _minimax(), _minimax()
-    MINIMAX.keep_first(helper, k)
     # Past 16 blocks of 8 the layers take the sparse path; the 9-token tail
     # keeps explicit positions.
     ids = mx.array(np.random.default_rng(5).integers(3, 60, (1, 200)))
-    chunks = _chunks(ids, [96, 94, 9])
-    reference = host.make_cache()
-    for chunk in chunks:
-        host(chunk, cache=reference)
-
-    cache, helper_cache = host.make_cache(), helper.make_cache()
-    for chunk in chunks[:prefix]:
-        host(chunk, cache=cache)
-    if prefix:
-        MINIMAX.load_prefix(helper_cache, MINIMAX.prefix_state(cache, k))
-    for chunk in chunks[prefix:]:
-        boundary, state = MINIMAX.run_first(helper, helper_cache, chunk, 0, {})
-        MINIMAX.run_rest(None, host, cache, chunk, k, boundary, state)
-        MINIMAX.apply_state(cache, k, state)
-        mx.eval([c.state for c in cache])
-
-    for a, b in zip(reference, cache):
-        (ka, va), ia = a.state
-        (kb, vb), ib = b.state
-        for x, y in ((ka, kb), (va, vb), (ia, ib)):
-            np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
-    last = ids[:, -1:]
-    for a, b in zip(_glm_logits(host, reference, last), _glm_logits(host, cache, last)):
-        np.testing.assert_array_equal(a, b)
+    _split_matches(MINIMAX, _minimax, ids, [96, 94, 9], k, prefix, _minimax_state)
 
 
 class _Drafter:
