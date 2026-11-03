@@ -20,6 +20,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
+from test_mlx_vlm_minimax_m3_compat import _tiny_text_config
 from test_scheduler_chunked_prefill import (
     _tiny_glm5_next,
     _tiny_qwen4_exp,
@@ -28,6 +29,9 @@ from test_scheduler_chunked_prefill import (
 
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
+from omlx.patches.mlx_vlm_minimax_m3_compat import (
+    apply_mlx_vlm_minimax_m3_compat_patch,
+)
 from omlx.prefill_helper import launcher, lending, wire
 from omlx.prefill_helper import manager as manager_module
 from omlx.prefill_helper import routes as helper_routes
@@ -43,6 +47,7 @@ from omlx.scheduler import Scheduler, SchedulerConfig
 DSV41 = adapter_for("deepseek_v41")
 GLM = adapter_for("glm5_next")
 QWEN4 = adapter_for("qwen4_exp")
+MINIMAX = adapter_for("minimax_m3_vl")
 _TABLES = tempfile.TemporaryDirectory(prefix="omlx-prefill-helper-")
 _TABLE_IDS = itertools.count()
 
@@ -970,3 +975,65 @@ def test_scheduler_qwen4_helper_prefill_matches_local():
     session.close()
     thread.join(10)
     listener.close()
+
+
+# ---------------------------------------------------------------------------
+# MiniMax M3: dense and MoE layers with sparse attention on either side.
+# ---------------------------------------------------------------------------
+
+
+def _minimax():
+    apply_mlx_vlm_minimax_m3_compat_patch()
+    from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
+
+    args = _tiny_text_config(
+        pack_shared_expert=False,
+        num_hidden_layers=4,
+        moe_layer_freq=[0, 0, 1, 1],
+        vocab_size=64,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1, 1, 1, 1],
+            "sparse_index_dim": 16,
+            "sparse_num_index_heads": 1,
+            "sparse_block_size": 8,
+            "sparse_topk_blocks": 2,
+        },
+    )
+    mx.random.seed(7)
+    lm = LanguageModel(args)
+    mx.eval(lm.parameters())
+    return lm
+
+
+@pytest.mark.parametrize("k,prefix", [(1, 0), (2, 0), (3, 0), (2, 1)])
+def test_minimax_split_matches_whole_model(k, prefix):
+    host, helper = _minimax(), _minimax()
+    MINIMAX.keep_first(helper, k)
+    # Past 16 blocks of 8 the layers take the sparse path; the 9-token tail
+    # keeps explicit positions.
+    ids = mx.array(np.random.default_rng(5).integers(3, 60, (1, 200)))
+    chunks = _chunks(ids, [96, 94, 9])
+    reference = host.make_cache()
+    for chunk in chunks:
+        host(chunk, cache=reference)
+
+    cache, helper_cache = host.make_cache(), helper.make_cache()
+    for chunk in chunks[:prefix]:
+        host(chunk, cache=cache)
+    if prefix:
+        MINIMAX.load_prefix(helper_cache, MINIMAX.prefix_state(cache, k))
+    for chunk in chunks[prefix:]:
+        boundary, state = MINIMAX.run_first(helper, helper_cache, chunk, 0, {})
+        MINIMAX.run_rest(None, host, cache, chunk, k, boundary, state)
+        MINIMAX.apply_state(cache, k, state)
+        mx.eval([c.state for c in cache])
+
+    for a, b in zip(reference, cache):
+        (ka, va), ia = a.state
+        (kb, vb), ib = b.state
+        for x, y in ((ka, kb), (va, vb), (ia, ib)):
+            np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
+    last = ids[:, -1:]
+    for a, b in zip(_glm_logits(host, reference, last), _glm_logits(host, cache, last)):
+        np.testing.assert_array_equal(a, b)
