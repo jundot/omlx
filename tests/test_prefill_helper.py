@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,7 +20,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
-from test_scheduler_chunked_prefill import _tiny_glm5_next, _tiny_vlm_adapter
+from test_scheduler_chunked_prefill import (
+    _tiny_glm5_next,
+    _tiny_qwen4_exp,
+    _tiny_vlm_adapter,
+)
 
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
@@ -37,6 +42,7 @@ from omlx.scheduler import Scheduler, SchedulerConfig
 
 DSV41 = adapter_for("deepseek_v41")
 GLM = adapter_for("glm5_next")
+QWEN4 = adapter_for("qwen4_exp")
 _TABLES = tempfile.TemporaryDirectory(prefix="omlx-prefill-helper-")
 _TABLE_IDS = itertools.count()
 
@@ -869,3 +875,98 @@ def test_lending_note_names_the_host_while_the_helper_runs(tmp_path, monkeypatch
     assert "lending 82 GB to HJKmac" in lending.lending_note()
     marker.write_text(json.dumps({"pid": 999999999, "host": "HJKmac"}))
     assert lending.lending_note() == ""
+
+
+# ---------------------------------------------------------------------------
+# Qwen3.8 Flash-Next: GDN, PLE and QSA layers on either side of the cut.
+# ---------------------------------------------------------------------------
+
+
+def _qwen4(layers=2):
+    """The tiny Qwen4 stack; four layers put PLE on layer 1 and QSA on 2."""
+    mx.random.seed(7)
+    lm, config = _tiny_qwen4_exp()
+    if layers == 4:
+        text = replace(
+            config.text_config,
+            num_hidden_layers=4,
+            layer_types=[
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+                "linear_attention",
+            ],
+            ple_layer_ids=[2],
+        )
+        mx.random.seed(7)
+        lm = type(lm)(text, replace(config, text_config=text))
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _qwen4_state(cache):
+    out = []
+    for item in cache:
+        if hasattr(item, "update_indexer"):
+            out += [a for a in item.state if a is not None]
+        else:
+            out += [a for a in item.cache if a is not None]
+    return [np.asarray(a.astype(mx.float32)) for a in out]
+
+
+@pytest.mark.parametrize(
+    "layers,k,prefix", [(2, 1, 0), (4, 1, 0), (4, 2, 0), (4, 3, 0), (4, 2, 1)]
+)
+def test_qwen4_split_matches_whole_model(layers, k, prefix):
+    host, helper = _qwen4(layers), _qwen4(layers)
+    QWEN4.keep_first(helper, k)
+    ids = mx.array(np.random.default_rng(5).integers(3, 58, (1, 23)))
+    chunks = _chunks(ids, [9, 6, 7])
+    reference = host.make_cache()
+    for chunk in chunks:
+        host(chunk, cache=reference)
+
+    cache, helper_cache = host.make_cache(), helper.make_cache()
+    for chunk in chunks[:prefix]:
+        host(chunk, cache=cache)
+    if prefix:
+        QWEN4.load_prefix(helper_cache, QWEN4.prefix_state(cache, k))
+    rest = chunks[prefix:]
+    feed = QWEN4.job_feed(
+        host,
+        cache if prefix else None,
+        np.concatenate([np.asarray(c[0]) for c in rest]),
+        [c.shape[1] for c in rest],
+        k,
+    )
+    for index, chunk in enumerate(rest):
+        inputs = feed(index) if feed else {}
+        boundary, state = QWEN4.run_first(helper, helper_cache, chunk, 0, inputs)
+        QWEN4.run_rest(None, host, cache, chunk, k, boundary, state)
+        QWEN4.apply_state(cache, k, state)
+        mx.eval([c.state for c in cache])
+
+    for a, b in zip(_qwen4_state(reference), _qwen4_state(cache)):
+        np.testing.assert_array_equal(a, b)
+    last = ids[:, -1:]
+    for a, b in zip(_glm_logits(host, reference, last), _glm_logits(host, cache, last)):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_scheduler_qwen4_helper_prefill_matches_local():
+    k, tokens = 1, [int(t) for t in np.random.default_rng(3).integers(3, 58, 23)]
+    host = _tiny_vlm_adapter(_tiny_qwen4_exp)
+    local = _drive(_scheduler(host, 6), _request(tokens), tokens)
+
+    helper = _qwen4()
+    QWEN4.keep_first(helper, k)
+    sched = _scheduler(host, 6)
+    session, listener, thread = _session(host._language_model, helper, k, adapter=QWEN4)
+    sched.attach_prefill_helper(session)
+    state = _drive(sched, _request(tokens), tokens)
+    assert state.helper is not None and state.helper.index == len(state.helper.grid)
+    for a, b in zip(_qwen4_state(local.cache), _qwen4_state(state.cache)):
+        np.testing.assert_array_equal(a, b)
+    session.close()
+    thread.join(10)
+    listener.close()

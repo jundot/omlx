@@ -7301,18 +7301,19 @@ class Scheduler:
             engram_prefetch(
                 state.tokens_remaining[:, :next_n], chunk, cache=state.cache
             )
-        if prefetch is not None and remaining > 0:
+        if prefetch is not None and remaining > 0 and not helper_chunk:
             prefetch(state.tokens_remaining[:, :next_n], chunk)
         # A chunked text prefill can yield to active decode between
         # forwards. Completion cleanup or the intervening decode batch may
         # replace the VLM adapter's process-local mRoPE state. Rebind this
         # request at the model-call boundary so the next scalar-cache chunk
         # continues from its absolute cache offset instead of restarting at
-        # local position zero.
-        _bind_text_prefill_rope_delta(
-            self.model,
-            getattr(state.request, "rope_deltas", 0.0),
-        )
+        # local position zero. A helper chunk does not call the adapter.
+        if not helper_chunk:
+            _bind_text_prefill_rope_delta(
+                self.model,
+                getattr(state.request, "rope_deltas", 0.0),
+            )
         state.request.text_positions_proven = True
         prefill_model = getattr(self.model, "_omlx_prefill", self.model)
         chunk_kwargs = {}
