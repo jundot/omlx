@@ -2510,6 +2510,65 @@ class TestCopilotIntegration:
         assert path.stat().st_mtime_ns == mtime
         assert not list(tmp_path.glob("*.bak"))
 
+    def test_configure_protects_registry_and_backup_before_writing(self, tmp_path):
+        import builtins
+        import io
+
+        path = tmp_path / "providers.json"
+        path.write_text('{"providers": [{"name": "omlx", "bearerToken": "old"}]}')
+        path.chmod(0o644)
+        write_modes = []
+
+        def track_open(opener):
+            def tracked(file, mode="r", *args, **kwargs):
+                stream = opener(file, mode, *args, **kwargs)
+                if mode.startswith(("w", "a", "x")) or "+" in mode:
+                    write_modes.append(os.fstat(stream.fileno()).st_mode & 0o777)
+                return stream
+
+            return tracked
+
+        with (
+            patch(
+                "omlx.integrations.copilot.os.environ",
+                {"COPILOT_PROVIDERS_CONFIG": str(path)},
+            ),
+            patch("builtins.open", side_effect=track_open(builtins.open)),
+            patch("io.open", side_effect=track_open(io.open)),
+        ):
+            CopilotIntegration().configure(ctx(api_key="new", model="m"))
+
+        assert write_modes == [0o600, 0o600]
+        assert path.stat().st_mode & 0o777 == 0o600
+        backups = list(tmp_path.glob("*.bak"))
+        assert len(backups) == 1
+        assert backups[0].stat().st_mode & 0o777 == 0o600
+        assert (
+            json.loads(backups[0].read_text())["providers"][0]["bearerToken"] == "old"
+        )
+        assert json.loads(path.read_text())["providers"][0]["bearerToken"] == "new"
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["pathlib.Path.chmod", "tempfile.NamedTemporaryFile", "os.fchmod"],
+    )
+    def test_configure_aborts_when_private_write_cannot_be_protected(
+        self, tmp_path, operation
+    ):
+        path = tmp_path / "providers.json"
+        original = '{"providers": [{"name": "omlx", "bearerToken": "old"}]}'
+        path.write_text(original)
+        with (
+            patch(
+                "omlx.integrations.copilot.os.environ",
+                {"COPILOT_PROVIDERS_CONFIG": str(path)},
+            ),
+            patch(operation, side_effect=PermissionError("cannot protect token file")),
+            pytest.raises(PermissionError, match="cannot protect token file"),
+        ):
+            CopilotIntegration().configure(ctx(api_key="new", model="m"))
+        assert path.read_text() == original
+
     @pytest.mark.parametrize("existing", ["not json {{{", '["legacy"]'])
     def test_configure_invalid_file_is_backed_up(self, tmp_path, existing):
         path = tmp_path / "providers.json"
@@ -2593,16 +2652,27 @@ class TestCopilotIntegration:
         registry = json.loads((tmp_path / "providers.json").read_text())
         assert [entry["id"] for entry in registry["models"]] == ["text", "vision-alias"]
 
-    def test_catalog_uses_public_inventory_without_status(self, model_inventory):
+    @pytest.mark.parametrize(
+        ("context_limit", "expected"), [(8192, 8192), (None, 32768)]
+    )
+    def test_catalog_uses_public_inventory_without_status(
+        self, model_inventory, context_limit, expected
+    ):
         model_inventory.return_value.json.return_value = {
             "data": [
-                {"id": "public-chat", "model_type": "llm"},
+                {
+                    "id": "public-chat",
+                    "model_type": "llm",
+                    "max_model_len": context_limit,
+                },
                 {"id": "public-embedding", "model_type": "embedding"},
             ]
         }
         config = copilot_provider_config(ctx())
         assert [entry["id"] for entry in config["models"]] == ["public-chat"]
-        assert config["models"][0]["maxPromptTokens"] == 32768
+        assert config["models"][0]["maxPromptTokens"] == expected
+        assert config["models"][0]["maxContextWindowTokens"] == expected
+        model_inventory.assert_called_once()
 
     def test_launch_without_chat_models_leaves_registry_untouched(
         self, tmp_path, monkeypatch

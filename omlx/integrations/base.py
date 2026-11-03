@@ -68,43 +68,45 @@ class IntegrationContext:
         return self.model_type == "vlm"
 
 
-def chat_model_ids(ctx: IntegrationContext) -> list[str]:
-    """Return the served chat model ids, in server order."""
-    status_map = ctx.models_status_map
+def chat_models(ctx: IntegrationContext) -> dict[str, dict]:
+    """Return served chat models and their metadata, in server order."""
     # An aliased model sits under both keys; list its display id once.
-    ids = list(
-        dict.fromkeys(
-            info.get("model_alias") or m_id for m_id, info in status_map.items()
-        )
-    )
-    if not ids:
+    models = {
+        info.get("model_alias") or model_id: info
+        for model_id, info in ctx.models_status_map.items()
+    }
+    if not models:
         # Status needs a key that /v1/models may not (e.g. under
         # allow_unauthenticated_inference), so ask for the inventory once.
         headers = {"Authorization": f"Bearer {ctx.auth_token}"} if ctx.api_key else {}
         try:
             resp = requests.get(f"{ctx.base_url}/v1/models", headers=headers, timeout=5)
             resp.raise_for_status()
-            ids = [
-                m["id"]
+            models = {
+                m["id"]: {**m, "max_context_window": m.get("max_model_len")}
                 for m in resp.json().get("data", [])
                 if m.get("id") and m.get("model_type") in ("llm", "vlm", None)
-            ]
+            }
         except Exception:
-            ids = []
-    if not ids and ctx.model:
-        ids = [ctx.model]
+            models = {}
+    if not models and ctx.model:
+        models = {ctx.model: ctx.models_status_map.get(ctx.model, {})}
 
-    chat_ids: list[str] = []
-    for m_id in ids:
-        info = status_map.get(m_id, {})
+    chat: dict[str, dict] = {}
+    for model_id, info in models.items():
         # Records without a type (no status metadata) stay in.
         if info.get("is_hidden"):
             continue
         model_type = info.get("model_type") or None
         if model_type and model_type not in ("llm", "vlm"):
             continue
-        chat_ids.append(m_id)
-    return chat_ids
+        chat[model_id] = info
+    return chat
+
+
+def chat_model_ids(ctx: IntegrationContext) -> list[str]:
+    """Return the served chat model ids, in server order."""
+    return list(chat_models(ctx))
 
 
 @dataclass

@@ -5,16 +5,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
 from omlx.integrations.base import (
     Integration,
     IntegrationContext,
-    backup_then_write,
-    chat_model_ids,
+    chat_models,
 )
 from omlx.utils.install import get_cli_command_prefix
 
@@ -50,22 +51,13 @@ def _clobber_omlx_entries(entries: list, key: str, replacement: list) -> list:
     return result
 
 
-def _restrict_permissions(path: Path) -> None:
-    # The registry stores a bearer token in plaintext.
-    try:
-        os.chmod(path, 0o600)
-    except OSError as e:
-        print(f"Warning: could not restrict permissions on {path}: {e}")
-
-
 def copilot_provider_config(ctx: IntegrationContext) -> dict:
     """Build the omlx provider/model entries for the CLI providers registry."""
     selected_id = (
         ctx.models_status_map.get(ctx.model, {}).get("model_alias") or ctx.model
     )
     entries = []
-    for model_id in chat_model_ids(ctx):
-        status = ctx.models_status_map.get(model_id, {})
+    for model_id, status in chat_models(ctx).items():
         context_window = status.get("max_context_window")
         model_type = status.get("model_type")
         reasoning = status.get("enable_thinking")
@@ -139,6 +131,7 @@ class CopilotIntegration(Integration):
         existing_text: str | None = None
         existing: object = None
         if path.is_file():
+            path.chmod(0o600)
             try:
                 existing_text = path.read_text(encoding="utf-8")
                 existing = json.loads(existing_text)
@@ -161,10 +154,26 @@ class CopilotIntegration(Integration):
         )
         payload = json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
         if existing_text != payload:
-            backup_then_write(
-                path, payload, note="Copilot providers config", mode=0o600
-            )
-        _restrict_permissions(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                with (
+                    path.open("rb") as source,
+                    tempfile.NamedTemporaryFile(
+                        prefix=f"{path.stem}.",
+                        suffix=".bak",
+                        dir=path.parent,
+                        delete=False,
+                    ) as backup,
+                ):
+                    shutil.copyfileobj(source, backup)
+                print(f"Backup: {backup.name}")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                # Protect the opened file before writing or truncating its token.
+                os.fchmod(file.fileno(), 0o600)
+                file.write(payload)
+                file.truncate()
+            print(f"Copilot providers config: {path}")
 
     def launch(self, ctx: IntegrationContext) -> None:
         registry = copilot_provider_config(ctx)
