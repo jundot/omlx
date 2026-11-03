@@ -26,7 +26,6 @@ Families outside Tailwind's palette:
 - `night-*`: dark mode surfaces and text.
 - `signal-red-*`: the readability red.
 - `mid-gray`: empty cells in the usage strip.
-- `fabric-ink-*`, `fabric-lime-*`: the cluster fabric diagram only.
 
 ## Type
 
