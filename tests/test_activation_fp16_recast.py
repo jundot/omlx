@@ -107,6 +107,51 @@ def test_cast_keeps_bf16_when_a_value_exceeds_the_float16_range():
     assert numerics_revision_for_model(model) is None
 
 
+def test_recast_covers_leaves_hidden_from_parameters():
+    """``parameters()`` cannot see RoPE-style frozen buffers held by plain
+    helper objects (mirroring mlx-vlm's PixtralRotaryEmbedding, as in the
+    materialize_lazy_state tests), underscore attributes, or underscore
+    sub-Modules. A bf16 survivor next to fp16 weights promotes hot-path math
+    back to float32, so those leaves must be recast and tagged too."""
+
+    class _PlainRotary:
+        def __init__(self):
+            freqs = 1.0 / (10000.0 ** (mx.arange(0, 8, 2) / 8.0))
+            self.inv_freq = mx.concatenate([freqs, freqs], axis=-1).astype(mx.bfloat16)
+
+    class _Vision(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8, bias=False)
+            self.rotary = _PlainRotary()
+            self._hidden = mx.ones(4, dtype=mx.bfloat16)
+            self._head = nn.Linear(8, 2, bias=False)
+            self._head.set_dtype(mx.bfloat16)
+
+    model = _Vision()
+    model.set_dtype(mx.bfloat16)
+    mx.eval(
+        model.parameters(),
+        model.rotary.inv_freq,
+        model._hidden,
+        model._head.parameters(),
+    )
+
+    recast = cast_bf16_params_to_fp16(model)
+
+    assert model.rotary.inv_freq.dtype == mx.float16, "helper inv_freq must be recast"
+    assert model._hidden.dtype == mx.float16, "underscore attribute must be recast"
+    assert model._head.weight.dtype == mx.float16, (
+        "underscore sub-Module leaf must be recast"
+    )
+    # proj.weight plus the three hidden leaves; everything but proj.weight is
+    # invisible to parameters(), so the count must exceed the parameter tree.
+    params = tree_flatten(model.parameters())
+    assert recast > len(params)
+    assert all(value.dtype == mx.float16 for _, value in params)
+    assert getattr(model, "_omlx_fp16_recast", False) is True
+
+
 def test_checkpoint_has_bf16_leaves_reads_safetensors_headers(tmp_path):
     def _write(path, dtype):
         header = json.dumps(

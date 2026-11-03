@@ -86,6 +86,63 @@ def test_v41_prefill_evals_stream_per_layer(monkeypatch):
     assert events["limits"] == []
 
 
+def test_prefill_cache_scope_restore_survives_non_lifo_interleaving(monkeypatch):
+    """``mx.set_cache_limit`` is process-global with no per-thread scoping,
+    and each engine's forward runs on its own executor thread, so two prefill
+    scopes can exit in either order. Per-scope save/restore pinned the limit
+    at the 512 MiB-class prefill bound whenever the first-entered scope exited
+    first, instead of the server's startup total (the enforcer and engine_pool
+    rely on the limit staying pinned there). Only the outermost scope may
+    restore, and it must restore the pre-entry limit. Two engines' scopes are
+    replayed on this thread as a deterministic non-LIFO enter/exit sequence.
+    """
+    before = _current_cache_limit()
+    calls = []
+    current = [before]
+
+    def fake_set_cache_limit(limit):
+        calls.append(limit)
+        previous = current[0]
+        current[0] = limit
+        return previous
+
+    monkeypatch.setattr(v41_lang.mx, "set_cache_limit", fake_set_cache_limit)
+    monkeypatch.setattr(v41_lang, "_prefill_cache_limit", lambda: _TEST_CACHE_LIMIT)
+
+    scope_a = v41_lang._prefill_cache_scope()
+    scope_b = v41_lang._prefill_cache_scope()
+    opened = []
+    try:
+        scope_a.__enter__()
+        opened.append(scope_a)
+        scope_b.__enter__()
+        opened.append(scope_b)
+        assert current[0] == _TEST_CACHE_LIMIT
+        # Non-LIFO: the first-entered scope exits while B is still running.
+        scope_a.__exit__(None, None, None)
+        opened.remove(scope_a)
+        assert current[0] == _TEST_CACHE_LIMIT, (
+            "the still-open scope must keep the bound"
+        )
+        scope_b.__exit__(None, None, None)
+        opened.remove(scope_b)
+        assert current[0] == before, "the last exit must restore the pre-entry limit"
+        assert calls == [_TEST_CACHE_LIMIT, _TEST_CACHE_LIMIT, before]
+    finally:
+        for scope in opened:
+            scope.__exit__(None, None, None)
+
+    # Nested same-thread scopes still apply the bound and restore exactly once.
+    calls.clear()
+    with v41_lang._prefill_cache_scope():
+        assert current[0] == _TEST_CACHE_LIMIT
+        with v41_lang._prefill_cache_scope():
+            assert current[0] == _TEST_CACHE_LIMIT
+        assert current[0] == _TEST_CACHE_LIMIT, "inner exit must not restore early"
+    assert current[0] == before
+    assert calls == [_TEST_CACHE_LIMIT, _TEST_CACHE_LIMIT, before]
+
+
 def test_apply_patch_replaces_foreign_vendor_alias_and_warns(caplog):
     """apply_patch used ``sys.modules.setdefault``, which silently keeps a
     pre-existing ``mlx_vlm.models.deepseek_v41`` (the exact failure mode that

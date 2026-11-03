@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -1494,6 +1495,47 @@ def load_text_model(
     )
 
 
+def _scan_attr_arrays(model: Any) -> Iterator[tuple[Any, str, mx.array]]:
+    """Yield ``(holder, attribute, array)`` for arrays tree flattening misses.
+
+    ``tree_flatten`` only descends Module/list/dict containers and
+    ``Module.parameters`` additionally drops underscore-prefixed keys. Arrays
+    held by plain helper objects hung off modules (e.g. mlx-vlm's
+    PixtralRotaryEmbedding, a non-Module class whose inv_freq is built at
+    construction time) stay invisible to both. Scan one attribute level below
+    every module for such containers. ``materialize_lazy_state`` (stream
+    safety) and ``cast_bf16_params_to_fp16`` (dtype recast) both depend on
+    this blind-spot scan; keep them in sync.
+    """
+
+    def _scan_plain_object(obj: Any) -> Iterator[tuple[Any, str, mx.array]]:
+        for name, attr in vars(obj).items():
+            if isinstance(attr, mx.array):
+                yield obj, name, attr
+
+    modules = model.modules() if hasattr(model, "modules") else []
+    for module in modules:
+        # nn.Module splits attribute storage: arrays and containers live in
+        # the Module's dict payload (where tree_flatten skips underscore
+        # keys), while plain helper objects land in the instance __dict__.
+        slots = list(vars(module).items())
+        if isinstance(module, dict):
+            slots.extend(dict.items(module))
+        for name, value in slots:
+            if isinstance(value, mx.array):
+                yield module, name, value
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if not isinstance(item, (nn.Module, mx.array)) and hasattr(
+                        item, "__dict__"
+                    ):
+                        yield from _scan_plain_object(item)
+            elif not isinstance(value, (nn.Module, dict)) and hasattr(
+                value, "__dict__"
+            ):
+                yield from _scan_plain_object(value)
+
+
 def materialize_lazy_state(model: Any) -> None:
     """Force-evaluate every mx.array in the model tree on the loader thread.
 
@@ -1507,39 +1549,9 @@ def materialize_lazy_state(model: Any) -> None:
     makes every leaf array safe to read from any thread afterwards.
     """
     arrays = [v for _, v in tree_flatten(model) if isinstance(v, mx.array)]
-
-    # tree_flatten only descends Module/list/dict containers and skips
-    # underscore-prefixed attributes. Lazy arrays held by plain helper
-    # objects hung off modules (e.g. mlx-vlm's PixtralRotaryEmbedding, a
-    # non-Module class whose inv_freq is built at construction time) stay
-    # invisible to it and keep their loader-thread stream binding. Scan one
-    # attribute level below every module for such containers as well.
-    def _scan_plain_object(obj: Any) -> None:
-        for attr in vars(obj).values():
-            if isinstance(attr, mx.array):
-                arrays.append(attr)
-
-    modules = model.modules() if hasattr(model, "modules") else []
-    for module in modules:
-        # nn.Module splits attribute storage: arrays and containers live in
-        # the Module's dict payload (where tree_flatten skips underscore
-        # keys), while plain helper objects land in the instance __dict__.
-        values = list(vars(module).values())
-        if isinstance(module, dict):
-            values.extend(dict.values(module))
-        for value in values:
-            if isinstance(value, mx.array):
-                arrays.append(value)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if not isinstance(item, (nn.Module, mx.array)) and hasattr(
-                        item, "__dict__"
-                    ):
-                        _scan_plain_object(item)
-            elif not isinstance(value, (nn.Module, dict)) and hasattr(
-                value, "__dict__"
-            ):
-                _scan_plain_object(value)
+    # Arrays invisible to tree flattening (see _scan_attr_arrays) keep their
+    # loader-thread stream binding unless scanned explicitly.
+    arrays.extend(array for _, _, array in _scan_attr_arrays(model))
 
     if arrays:
         # Evaluate in bounded chunks rather than one mx.eval(arrays). A single
@@ -1586,12 +1598,20 @@ def checkpoint_has_bf16_leaves(model_path: str) -> bool:
 
 
 def cast_bf16_params_to_fp16(model: Any) -> int:
-    """Recast every bfloat16 parameter of a loaded model to float16.
+    """Recast every bfloat16 leaf of a loaded model to float16.
 
     M1/M2 GPUs emulate bfloat16 but run float16 natively. The activation dtype
     follows the non-quantized leaves (scales, biases, norms, embeddings), so
     recasting them moves the forward onto the native path. Quantized U32
     payloads are untouched.
+
+    Leaves invisible to ``parameters()`` are recast too: frozen buffers such
+    as RoPE inv_freq held by plain helper objects, underscore attributes, or
+    underscore sub-Modules (the blind spots ``_scan_attr_arrays`` covers for
+    ``materialize_lazy_state``). A missed bf16 leaf next to fp16 weights
+    promotes hot-path math back to float32, the opposite of the recast.
+    Arrays nested inside tuples or underscore-keyed list/dict containers stay
+    skipped, as every prior recast skipped them.
 
     A value outside the float16 range raises ValueError before any leaf
     changes. Leaves are then swapped one chunk at a time, so peak memory grows
@@ -1599,11 +1619,21 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
 
     Returns the number of tensors recast.
     """
-    pending = [
+    # A string dest is a tree key (``model.update`` swaps it back in bulk); a
+    # (holder, attribute) dest is a leaf outside the parameter tree, rebound
+    # in place with setattr.
+    pending: list[tuple[Any, mx.array]] = [
         (key, value)
         for key, value in tree_flatten(model.parameters())
         if isinstance(value, mx.array) and value.dtype == mx.bfloat16
     ]
+    seen = {id(value) for _, value in pending}
+    for holder, attribute, value in _scan_attr_arrays(model):
+        # _scan_attr_arrays also re-yields payload arrays parameters() already
+        # returned (as dict-module values); recast each leaf exactly once.
+        if value.dtype == mx.bfloat16 and id(value) not in seen:
+            seen.add(id(value))
+            pending.append(((holder, attribute), value))
     count = len(pending)
     fp16_max = mx.finfo(mx.float16).max
     # Reductions only, so this pass allocates no tensor-sized temporaries.
@@ -1620,13 +1650,19 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
         # Rebinding ``pending`` drops the previous chunk's bfloat16 originals.
         chunk = pending[:_MATERIALIZE_EVAL_CHUNK]
         pending = pending[_MATERIALIZE_EVAL_CHUNK:]
-        converted = [(key, value.astype(mx.float16)) for key, value in chunk]
+        converted = [(dest, value.astype(mx.float16)) for dest, value in chunk]
         mx.eval([value for _, value in converted])
         # mx.eval returns once the float16 copies are ready, but the command
         # buffer's completion handler still holds the bfloat16 inputs; wait
         # for it so they are freed before the next chunk allocates.
         mx.synchronize()
-        model.update(tree_unflatten(converted))
+        tree = [(dest, value) for dest, value in converted if isinstance(dest, str)]
+        if tree:
+            model.update(tree_unflatten(tree))
+        for dest, value in converted:
+            if not isinstance(dest, str):
+                holder, attribute = dest
+                setattr(holder, attribute, value)
         del chunk, converted
     if count:
         # Read by numerics_revision_for_model so bfloat16 KV blocks are not reused.
