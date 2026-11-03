@@ -1375,7 +1375,7 @@
             },
 
             async saveGlobalSettings() {
-                if (this.resettingGlobalSettings) return;
+                if (this.saving || this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -3418,6 +3418,7 @@
             },
 
             async saveModelSettings() {
+                if (this.savingModelSettings) return;
                 if (!this.selectedModel) return;
 
                 const a8PrefillValidationError = this.validateA8PrefillSettings();
@@ -3907,6 +3908,17 @@
             },
 
             get claudeCodeCommand() {
+                return this._claudeCodeCommand(this.stats.api_key);
+            },
+
+            // On-screen variant with the auth token masked (sub-key style), so
+            // the rendered dashboard never exposes the API key; the copy
+            // button still copies the real claudeCodeCommand.
+            get claudeCodeCommandDisplay() {
+                return this._claudeCodeCommand(this.stats.api_key ? '••••••••' : '');
+            },
+
+            _claudeCodeCommand(authToken) {
                 const mode = this.globalSettings.claude_code.mode;
                 if (mode === 'cloud') {
                     return 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u API_TIMEOUT_MS -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC claude';
@@ -3918,8 +3930,8 @@
                 const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
                 parts.push(this.shellEnvAssign('ANTHROPIC_BASE_URL', `http://${this.displayHost}:${port}`));
-                if (this.stats.api_key) {
-                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', this.stats.api_key));
+                if (authToken) {
+                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', authToken));
                 }
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_OPUS_MODEL', opusModel));
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_SONNET_MODEL', sonnetModel));
