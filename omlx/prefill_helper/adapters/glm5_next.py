@@ -130,7 +130,7 @@ class Glm5NextAdapter(StageAdapter):
         finally:
             lm.model.layers = layers
 
-    def load_first(self, path: str, k: int) -> Any:
+    def load_first(self, path: str, k: int, a8_min_tokens: int | None = None) -> Any:
         maybe_apply_pre_load_patches(path, None, for_vlm=True)
         load_config = vlm_utils.load_config
 

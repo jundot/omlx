@@ -2356,9 +2356,15 @@ private struct AccelerationSection: View {
 
     private var a8PrefillSublabel: String {
         if let reason = vm.a8PrefillConflictReason { return reason }
-        return String(localized: "settings.experimental.qwen_oq_a8.sub",
+        let text = String(localized: "settings.experimental.qwen_oq_a8.sub",
                       defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, routed expert gate/up projections on Qwen3.8 Flash-Next, and the expert and attention projections of DeepSeek V4.1. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
+        guard vm.model?.a8PrefillSupported != true, !vm.prefillHelperNodeID.isEmpty else {
+            return text
+        }
+        return text + " " + String(localized: "settings.experimental.qwen_oq_a8.helper_only",
+                                   defaultValue: "This Mac has no INT8 tensor units, so only the layers on the Prefill Accelerator Mac use INT8 activations.",
+                                   comment: "Added to the INT8 prefill sublabel when only the Prefill Accelerator Mac can run it")
     }
 
     private var mtpToggleDisabled: Bool {

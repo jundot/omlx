@@ -549,6 +549,27 @@ async def test_oq_a8_needs_native_int8_kernels():
     assert "M5-series or newer" in excinfo.value.detail
     assert settings.a8_prefill_enabled is False
 
+    # A Prefill Accelerator Mac runs the model's first layers with A8.
+    entry.config_model_type = "qwen4_exp"
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=False):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(
+                a8_prefill_enabled=True, prefill_helper_node_id="m5"
+            ),
+        )
+    assert settings.a8_prefill_enabled is True
+    # Without the Mac, A8 has nothing to run on.
+    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=False):
+        await _update_settings(
+            pool,
+            settings,
+            admin_routes.ModelSettingsRequest(prefill_helper_node_id=None),
+        )
+    assert settings.prefill_helper_node_id is None
+    assert settings.a8_prefill_enabled is False
+
 
 @pytest.mark.asyncio
 async def test_qwen4_ple_ssd_offload_is_persisted_for_qwen4_only():

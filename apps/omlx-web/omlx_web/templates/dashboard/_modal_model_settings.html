@@ -778,6 +778,7 @@
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.qwen_oq_a8') }}</span>
                                         <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_oq_a8_hint') }}</p>
+                                        <p x-show="selectedModel?.a8_prefill_supported !== true && modelSettings.prefill_helper_node_id" class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.qwen_oq_a8_helper_only') }}</p>
                                     </div>
                                     <button type="button"
                                             @click="modelSettings.a8_prefill_enabled = !modelSettings.a8_prefill_enabled"

@@ -101,8 +101,11 @@ class PrefillHelperManager:
         launcher: Any = default_launcher,
         connect: Callable[..., HelperClient] = HelperClient,
         speeds_path: Path | None = None,
+        a8_min_tokens: int | None = None,
     ):
         self.model_path = str(Path(model_path).expanduser())
+        # The model's A8 prefill setting, which the helper's layers follow.
+        self.a8_min_tokens = a8_min_tokens
         self.speeds_path = speeds_path or default_speeds_path()
         self._saved: tuple | None = None
         self.model_type, self.adapter, self.lm = model_type, adapter, language_model
@@ -267,6 +270,7 @@ class PrefillHelperManager:
             held,
             host_name=_computer_name(),
             warm_tokens=self.chunk_tokens,
+            a8_min_tokens=self.a8_min_tokens,
         )
         try:
             client = self.connect(target.address, process.port, process.token)
@@ -340,7 +344,9 @@ class PrefillHelperManager:
         self.launcher.copy_files(target, self.model_path, model_dir, missing, progress)
 
     def _speeds_key(self) -> str:
-        return f"{self.node_id}:{self.model_path}"
+        # A8 changes the helper's speed, so each setting keeps its own.
+        a8 = ":a8" if self.a8_min_tokens is not None else ""
+        return f"{self.node_id}:{self.model_path}{a8}"
 
     def _load_speeds(self) -> dict[str, Any]:
         try:

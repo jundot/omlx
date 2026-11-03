@@ -33,6 +33,7 @@ from ...patches.qwen35_gdn_prework import (
     apply_qwen35_gdn_prework_patch,
     configure_qwen4_decode,
 )
+from ...patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 from ...patches.qwen35_q4_mlp import (
     apply_qwen35_q4_mlp_patch,
     apply_qwen35_q4_prefill_linear_patch,
@@ -275,7 +276,7 @@ class Qwen4ExpAdapter(StageAdapter):
         finally:
             lm.model.layers = layers
 
-    def load_first(self, path: str, k: int) -> Any:
+    def load_first(self, path: str, k: int, a8_min_tokens: int | None = None) -> Any:
         maybe_apply_pre_load_patches(path, None, for_vlm=True)
         # Resident tables open no PLE files; keep_first drops the table.
         configure_qwen4_exp_runtime(path, "resident")
@@ -302,6 +303,8 @@ class Qwen4ExpAdapter(StageAdapter):
         apply_qwen35_gdn_prefill_patch()
         apply_qwen35_q4_mlp_patch()
         apply_qwen35_q4_prefill_linear_patch(model)
+        if a8_min_tokens is not None:
+            apply_qwen35_oq_a8_patch(model, min_tokens=a8_min_tokens)
         mx.eval(lm.parameters())
         return lm
 

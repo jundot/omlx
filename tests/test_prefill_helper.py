@@ -647,9 +647,21 @@ class _FakeLauncher:
             progress(name)
         self.missing = []
 
-    def launch(self, target, model_dir, model_type, layers, *, host_name, warm_tokens):
+    def launch(
+        self,
+        target,
+        model_dir,
+        model_type,
+        layers,
+        *,
+        host_name,
+        warm_tokens,
+        a8_min_tokens=None,
+    ):
         listener, thread = _serve(_helper_model(tiny(), layers), layers)
-        server = SimpleNamespace(listener=listener, thread=thread, layers=layers)
+        server = SimpleNamespace(
+            listener=listener, thread=thread, layers=layers, a8=a8_min_tokens
+        )
         self.servers.append(server)
         return SimpleNamespace(
             port=listener.getsockname()[1], token=TOKEN, hello={}, stop=listener.close
@@ -662,7 +674,7 @@ def launcher_version():
     return __version__
 
 
-def _manager(fake, attached, speeds_path):
+def _manager(fake, attached, speeds_path, a8_min_tokens=None):
     return PrefillHelperManager(
         model_path="/models/x",
         model_type="deepseek_v41",
@@ -672,6 +684,7 @@ def _manager(fake, attached, speeds_path):
         chunk_tokens=8,
         launcher=fake,
         speeds_path=speeds_path,
+        a8_min_tokens=a8_min_tokens,
     )
 
 
@@ -764,6 +777,15 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     saved = json.loads(speeds.read_text())
     assert [key.split(":")[0] for key in saved] == ["node-1"]
     again.close()
+
+    # The helper follows the model's A8 setting, and A8 keeps its own speeds.
+    fake = _FakeLauncher(None)
+    a8 = _manager(fake, attached, speeds, a8_min_tokens=256)
+    a8.configure("node-1", None)
+    _wait_state(a8, "ready")
+    assert fake.servers[-1].a8 == 256
+    assert (attached[-1].unit_helper, attached[-1].unit_host) != measured
+    a8.close()
 
 
 def test_saving_other_settings_leaves_a_stopped_helper_stopped(tmp_path):

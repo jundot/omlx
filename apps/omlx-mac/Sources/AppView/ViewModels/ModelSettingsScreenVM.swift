@@ -1362,11 +1362,12 @@ final class ModelSettingsScreenVM {
     var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
     /// The INT8 kernels run only on GPUs with native INT8 tensor ops
-    /// (M5-series or newer). A saved "on" keeps the row so it can be
-    /// turned off.
+    /// (M5-series or newer), here or on the Prefill Accelerator Mac. A saved
+    /// "on" keeps the row so it can be turned off.
     var showsA8Prefill: Bool {
         isA8PrefillModel
-            && (model?.a8PrefillSupported == true || model?.settings?.a8PrefillEnabled == true)
+            && (model?.a8PrefillSupported == true || model?.settings?.a8PrefillEnabled == true
+                || !prefillHelperNodeID.isEmpty)
     }
 
     /// Native Lightning MTP can't co-exist with the other speculative

@@ -3004,6 +3004,11 @@ async def update_model_settings(
         current_settings.prefill_helper_node_id = (
             (request.prefill_helper_node_id or None) if supported else None
         )
+        if not current_settings.prefill_helper_node_id and not (
+            _oq_a8_kernels_available()
+        ):
+            # Without the helper, A8 has no layers to run on here.
+            current_settings.a8_prefill_enabled = False
     if "prefill_helper_layers" in sent:
         layers = request.prefill_helper_layers
         if layers is not None and layers < 1:
@@ -3690,13 +3695,16 @@ def _validate_model_settings(entry, settings):
                     "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
                 ),
             )
-        if not _oq_a8_kernels_available():
+        # The layers on a Prefill Accelerator Mac follow the setting.
+        if not _oq_a8_kernels_available() and not settings.get(
+            "prefill_helper_node_id"
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "A8 prefill needs the native prefill kernels and a Metal "
                     "device with native INT8 tensor operations (M5-series or "
-                    "newer)."
+                    "newer), or a Prefill Accelerator Mac for this model."
                 ),
             )
         if settings.get("qwen35_ane_prefill_enabled"):
@@ -3746,7 +3754,11 @@ async def create_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
+    # Profiles never carry the helper Mac; A8 checks need the model's own.
+    helper = mgr.get_settings(model_id).prefill_helper_node_id
+    _validate_model_settings(
+        entry, {"prefill_helper_node_id": helper, **(request.settings or {})}
+    )
     engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
@@ -3791,7 +3803,11 @@ async def update_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
+    # Profiles never carry the helper Mac; A8 checks need the model's own.
+    helper = mgr.get_settings(model_id).prefill_helper_node_id
+    _validate_model_settings(
+        entry, {"prefill_helper_node_id": helper, **(request.settings or {})}
+    )
     engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
@@ -4027,7 +4043,9 @@ def _feature_problem(
                 "A8 prefill is available only for Qwen3.5/3.6/3.8, "
                 "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
             )
-        if not _oq_a8_kernels_available():
+        if not _oq_a8_kernels_available() and not snapshot.get(
+            "prefill_helper_node_id"
+        ):
             return (
                 "A8 prefill needs the native prefill kernels and a Metal "
                 "device with native INT8 tensor operations."

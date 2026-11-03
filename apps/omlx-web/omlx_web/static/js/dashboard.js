@@ -3261,12 +3261,14 @@
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
-            // The kernels need native INT8 tensor ops (M5-series or newer).
-            // A saved "on" keeps the toggle so it can be turned off.
+            // The kernels need native INT8 tensor ops (M5-series or newer),
+            // here or on the Prefill Accelerator Mac. A saved "on" keeps the
+            // toggle so it can be turned off.
             showsA8Prefill(model) {
                 return this.isA8PrefillModel(model)
                     && (model?.a8_prefill_supported === true
-                        || model?.settings?.a8_prefill_enabled === true);
+                        || model?.settings?.a8_prefill_enabled === true
+                        || !!this.modelSettings?.prefill_helper_node_id);
             },
 
             validateGpuPowerLimit() {

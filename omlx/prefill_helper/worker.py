@@ -311,6 +311,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--warm-tokens", type=int, default=8192)
     parser.add_argument("--host-name", default="")
+    parser.add_argument("--a8-min-tokens", type=int)
     args = parser.parse_args(argv)
     # The session token arrives on stdin so it never shows up in ps.
     token = sys.stdin.readline().strip().encode()
@@ -327,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     info = mx.device_info()
     mx.set_cache_limit(int(info["memory_size"]))
     mx.set_wired_limit(int(info["max_recommended_working_set_size"]))
-    lm = adapter.load_first(args.model, args.layers)
+    lm = adapter.load_first(args.model, args.layers, args.a8_min_tokens)
 
     began = time.perf_counter()
     warm = np.arange(args.warm_tokens, dtype=np.int32) % 1000 + 3

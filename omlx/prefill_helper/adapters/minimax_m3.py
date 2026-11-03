@@ -89,7 +89,7 @@ class MiniMaxM3Adapter(StageAdapter):
         finally:
             lm.model.layers = layers
 
-    def load_first(self, path: str, k: int) -> Any:
+    def load_first(self, path: str, k: int, a8_min_tokens: int | None = None) -> Any:
         maybe_apply_pre_load_patches(path, None, for_vlm=True)
         # The server's MiniMax MoE sanitize wrapper, so packed and unpacked
         # shared experts load as they do there.
