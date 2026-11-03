@@ -2550,7 +2550,12 @@ class TestCopilotIntegration:
 
     @pytest.mark.parametrize(
         "operation",
-        ["pathlib.Path.chmod", "tempfile.NamedTemporaryFile", "os.fchmod"],
+        [
+            "pathlib.Path.chmod",
+            "tempfile.NamedTemporaryFile",
+            "os.fchmod",
+            "pathlib.Path.replace",
+        ],
     )
     def test_configure_aborts_when_private_write_cannot_be_protected(
         self, tmp_path, operation
@@ -2568,6 +2573,72 @@ class TestCopilotIntegration:
         ):
             CopilotIntegration().configure(ctx(api_key="new", model="m"))
         assert path.read_text() == original
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_overlapping_configure_preserves_complete_registry(self, tmp_path):
+        import io
+
+        path = tmp_path / "providers.json"
+        user_provider = {"name": "user", "baseUrl": "https://example.invalid"}
+        path.write_text(
+            json.dumps({"providers": [user_provider], "customKey": {"keep": True}})
+        )
+        original_open = io.open
+        interleaved = False
+
+        def interleave_open(file, mode="r", *args, **kwargs):
+            stream = original_open(file, mode, *args, **kwargs)
+            if mode != "w":
+                return stream
+            wrapped = MagicMock(wraps=stream)
+            wrapped.__enter__.return_value = wrapped
+            wrapped.__exit__.side_effect = stream.__exit__
+
+            def write(data):
+                nonlocal interleaved
+                if interleaved:
+                    return stream.write(data)
+                interleaved = True
+                midpoint = len(data) // 2
+                stream.write(data[:midpoint])
+                stream.flush()
+                CopilotIntegration().configure(ctx(api_key="second" * 100, model="m"))
+                stream.write(data[midpoint:])
+                return len(data)
+
+            wrapped.write.side_effect = write
+            return wrapped
+
+        with (
+            patch(
+                "omlx.integrations.copilot.os.environ",
+                {"COPILOT_PROVIDERS_CONFIG": str(path)},
+            ),
+            patch("io.open", side_effect=interleave_open),
+        ):
+            CopilotIntegration().configure(ctx(api_key="first", model="m"))
+
+        assert interleaved
+        registry = json.loads(path.read_text())
+        assert registry["customKey"] == {"keep": True}
+        assert registry["providers"] == [
+            user_provider,
+            copilot_provider_config(ctx(api_key="first", model="m"))["providers"][0],
+        ]
+
+    def test_configure_preserves_registry_symlink(self, tmp_path):
+        target = tmp_path / "actual.json"
+        target.write_text('{"customKey": {"keep": true}}')
+        path = tmp_path / "providers.json"
+        path.symlink_to(target)
+        with patch(
+            "omlx.integrations.copilot.os.environ",
+            {"COPILOT_PROVIDERS_CONFIG": str(path)},
+        ):
+            CopilotIntegration().configure(ctx(api_key="new", model="m"))
+        assert path.is_symlink()
+        assert json.loads(target.read_text())["customKey"] == {"keep": True}
+        assert json.loads(target.read_text())["providers"][0]["bearerToken"] == "new"
 
     @pytest.mark.parametrize("existing", ["not json {{{", '["legacy"]'])
     def test_configure_invalid_file_is_backed_up(self, tmp_path, existing):

@@ -127,7 +127,7 @@ class CopilotIntegration(Integration):
 
     def _write_registry(self, registry: dict) -> None:
         """Refresh omlx-owned entries, preserving other providers and settings."""
-        path = copilot_providers_config_path()
+        path = copilot_providers_config_path().resolve()
         existing_text: str | None = None
         existing: object = None
         if path.is_file():
@@ -167,12 +167,23 @@ class CopilotIntegration(Integration):
                 ):
                     shutil.copyfileobj(source, backup)
                 print(f"Backup: {backup.name}")
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                # Protect the opened file before writing or truncating its token.
-                os.fchmod(file.fileno(), 0o600)
-                file.write(payload)
-                file.truncate()
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    prefix=f"{path.stem}.",
+                    suffix=".tmp",
+                    dir=path.parent,
+                    delete=False,
+                ) as file:
+                    temporary_path = Path(file.name)
+                    os.fchmod(file.fileno(), 0o600)
+                    file.write(payload)
+                temporary_path.replace(path)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
             print(f"Copilot providers config: {path}")
 
     def launch(self, ctx: IntegrationContext) -> None:
