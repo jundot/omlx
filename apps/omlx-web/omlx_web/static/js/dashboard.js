@@ -3171,6 +3171,18 @@
                 return parts.join(' · ');
             },
 
+            // Where A8 runs only on the helper's layers, it is on with a
+            // helper Mac and off without one; the toggle can still turn it off.
+            selectPrefillHelper(nodeId) {
+                const wasOff = !this.modelSettings.prefill_helper_node_id;
+                this.modelSettings.prefill_helper_node_id = nodeId;
+                const model = this.selectedModel;
+                if (wasOff !== !nodeId && this.isA8PrefillModel(model)
+                    && model?.a8_prefill_supported !== true) {
+                    this.modelSettings.a8_prefill_enabled = !!nodeId;
+                }
+            },
+
             prefillHelperLayerChoices() {
                 const device = this.prefillHelperCandidate(this.modelSettings.prefill_helper_node_id);
                 const most = Math.max(

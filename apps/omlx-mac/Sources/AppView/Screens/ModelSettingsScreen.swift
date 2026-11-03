@@ -1468,7 +1468,13 @@ private struct PrefillAcceleratorGroup: View {
                 warning: batteryWarning,
                 isLast: !vm.prefillHelperAvailable ? false : vm.prefillHelperNodeID.isEmpty && statusText == nil) {
                 if vm.prefillHelperAvailable {
-                    Popup(selection: vm.bind($vm.prefillHelperNodeID, save: save),
+                    Popup(selection: Binding(
+                              get: { vm.prefillHelperNodeID },
+                              set: { node in
+                                  guard node != vm.prefillHelperNodeID else { return }
+                                  vm.selectPrefillHelper(node)
+                                  save()
+                              }),
                           width: .controlWide, options: macOptions)
                 }
             }

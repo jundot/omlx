@@ -929,6 +929,7 @@ final class ModelSettingsScreenVM {
             let off = prefillHelperNodeID.isEmpty
             patch.prefillHelperNodeId = .some(off ? nil : prefillHelperNodeID)
             patch.prefillHelperLayers = .some(off ? nil : prefillHelperLayers)
+            if a8RunsOnlyOnHelper { patch.a8PrefillEnabled = a8PrefillEnabled }
         case .activationFp16:          patch.activationFp16Enabled = activationFp16Enabled
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
@@ -1360,6 +1361,22 @@ final class ModelSettingsScreenVM {
     }
 
     var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
+
+    /// A8 here reaches only the layers on the Prefill Accelerator Mac.
+    private var a8RunsOnlyOnHelper: Bool {
+        isA8PrefillModel && model?.a8PrefillSupported != true
+    }
+
+    /// Picks the helper Mac. Where A8 runs only on the helper's layers, it
+    /// is on with a helper Mac and off without one; the toggle can still
+    /// turn it off.
+    func selectPrefillHelper(_ nodeID: String) {
+        let wasOff = prefillHelperNodeID.isEmpty
+        prefillHelperNodeID = nodeID
+        if a8RunsOnlyOnHelper && wasOff != nodeID.isEmpty {
+            a8PrefillEnabled = !nodeID.isEmpty
+        }
+    }
 
     /// The INT8 kernels run only on GPUs with native INT8 tensor ops
     /// (M5-series or newer), here or on the Prefill Accelerator Mac. A saved

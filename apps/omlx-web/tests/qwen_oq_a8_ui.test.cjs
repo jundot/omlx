@@ -41,6 +41,25 @@ assert.equal(state.showsA8Prefill({
 }), true);
 assert.equal(state.showsA8Prefill({config_model_type: 'llama', a8_prefill_supported: true}), false);
 
+// Without the kernels here, A8 follows the helper Mac: on with one, off without.
+state.selectedModel = {config_model_type: 'deepseek_v41', a8_prefill_supported: false};
+state.modelSettings.a8_prefill_enabled = false;
+state.selectPrefillHelper('m5');
+assert.equal(state.showsA8Prefill(state.selectedModel), true);
+assert.equal(state.modelSettings.a8_prefill_enabled, true);
+state.modelSettings.a8_prefill_enabled = false;
+state.selectPrefillHelper('m5-2');
+assert.equal(state.modelSettings.a8_prefill_enabled, false);
+state.selectPrefillHelper('');
+state.selectPrefillHelper('m5');
+assert.equal(state.modelSettings.a8_prefill_enabled, true);
+state.selectPrefillHelper('');
+assert.equal(state.modelSettings.a8_prefill_enabled, false);
+state.selectedModel = {config_model_type: 'deepseek_v41', a8_prefill_supported: true};
+state.selectPrefillHelper('m5');
+assert.equal(state.modelSettings.a8_prefill_enabled, false);
+state.selectPrefillHelper('');
+
 state.modelSettings.a8_prefill_enabled = true;
 state.modelSettings.qwen35_ane_prefill_enabled = true;
 assert.equal(state.validateA8PrefillSettings(), 'js.error.ane_oq_a8_conflict');

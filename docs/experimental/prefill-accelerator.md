@@ -61,6 +61,8 @@ The Cluster tab's Prefill Accelerator checks report which of these the Macs use.
 
 **Layers on the helper** is **Auto** by default: each prompt is split by the measured speed of both Macs, and the measurements are kept per model and Mac so a restarted helper splits its first prompt the same way. A fixed number is available for testing.
 
+On a Mac without INT8 tensor units (M4 and earlier), choosing a helper also turns on the model's **INT8 Activation Prefill**, which then applies only to the helper's layers. Turn it off there to keep those layers on 16-bit activations. Changing it reloads the model.
+
 ## How it works
 
 Each prompt is cut into a fixed chunk grid when it is admitted. For every chunk the helper runs layers `[0, K)` and sends what crosses the cut (the hidden state, plus the shared state some families need) and the chunk's cache rows for its layers. This Mac runs layers `[K, n)` and appends the helper's rows to its own cache, so after the last chunk this Mac holds the full cache as if it had prefilled alone. The helper computes a couple of chunks ahead, so both Macs work at the same time.
