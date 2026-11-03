@@ -93,12 +93,17 @@ class DeepseekV41Adapter(StageAdapter):
 
     def layer_work(self, lm: Any) -> list[float]:
         c = lm._config
-        if not c.ced_prefill:
-            return [1.0] * c.n_layers
-        # CED: past the midpoint only the window tail runs, and decoder tails
-        # of chunks that another chunk follows are skipped.
-        mid = c.n_layers // 2
-        return [1.0] * mid + [0.1] + [0.0] * (c.n_layers - mid - 1)
+        work = [1.0] * c.n_layers
+        if c.ced_prefill:
+            # CED: past the midpoint only the window tail runs, and decoder
+            # tails of chunks that another chunk follows are skipped.
+            mid = c.n_layers // 2
+            work = [1.0] * mid + [0.1] + [0.0] * (c.n_layers - mid - 1)
+        # An Engram layer also projects its table rows; measured on M3 Ultra
+        # and M5 Max it costs about two plain layers.
+        for i in c.engram_layer_ids:
+            work[i] *= 2
+        return work
 
     def resident(self, tensor: str) -> bool:
         # Engram rows come from this Mac; draft heads and vision never load.
