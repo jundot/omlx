@@ -1,12 +1,15 @@
 """Prefill Accelerator: a split prefill must match the whole-model prefill."""
 
+import itertools
 import json
 import os
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +21,7 @@ from fastapi.testclient import TestClient
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
 
 from omlx.patches.deepseek_v41.language import LanguageModel
+from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
 from omlx.prefill_helper import launcher, wire
 from omlx.prefill_helper import manager as manager_module
 from omlx.prefill_helper import routes as helper_routes
@@ -31,6 +35,8 @@ from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig
 
 DSV41 = adapter_for("deepseek_v41")
+_TABLES = tempfile.TemporaryDirectory(prefix="omlx-prefill-helper-")
+_TABLE_IDS = itertools.count()
 
 
 def _model(config):
@@ -38,6 +44,13 @@ def _model(config):
     load_reference_weights(model)
     if config.engram_layer_ids:
         model.set_token_map(np.arange(config.vocab_size))
+        # Tables on disk, as a loaded checkpoint has them: this Mac reads the
+        # helper's rows from them.
+        for layer in model.layers:
+            if "engram" in layer:
+                path = Path(_TABLES.name) / f"{next(_TABLE_IDS)}.safetensors"
+                mx.save_safetensors(str(path), {"weight": layer.engram.embed.weight})
+                layer.engram.embed = DiskEngramEmbedding(path, "weight", None)
     return model
 
 
@@ -93,8 +106,17 @@ def _run(config, k, sizes, prefix=0):
         host._omlx_prefill(chunk, cache=cache, next_prefill_tokens=nxt)
     if prefix:
         DSV41.load_prefix(helper_cache, DSV41.prefix_state(cache, k))
-    for chunk, nxt in zip(chunks[prefix:], nexts[prefix:]):
-        boundary, state = DSV41.run_first(helper, helper_cache, chunk, nxt)
+    rest = chunks[prefix:]
+    feed = DSV41.job_feed(
+        host,
+        cache if prefix else None,
+        np.concatenate([np.asarray(c[0]) for c in rest]),
+        [c.shape[1] for c in rest],
+        k,
+    )
+    for index, (chunk, nxt) in enumerate(zip(rest, nexts[prefix:])):
+        inputs = feed(index) if feed else {}
+        boundary, state = DSV41.run_first(helper, helper_cache, chunk, nxt, inputs)
         DSV41.run_rest(
             host._omlx_prefill,
             host,
@@ -178,7 +200,9 @@ def test_helper_over_a_socket_matches_whole_model():
 
     listener, thread = _serve(_helper_model(config, k), k)
     client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
-    job = client.submit(np.asarray(ids[0, :-1]), sizes)
+    tokens = np.asarray(ids[0, :-1])
+    feed = DSV41.job_feed(host, None, tokens, sizes, k)
+    job = client.submit(tokens, sizes, feed=feed)
     cache = host.make_cache()
     for chunk, nxt in zip(chunks, nexts):
         part = job.take(timeout=60)
@@ -268,12 +292,13 @@ def _request(tokens, rid="req-1"):
     return request
 
 
-def _session(lm, k, **kwargs):
+def _session(host, lm, k, **kwargs):
     listener, thread = _serve(lm, k)
     client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
     session = PrefillHelperSession(
         client,
         DSV41,
+        host,
         k,
         "helper-mac",
         DSV41.layer_work(lm),
@@ -311,14 +336,16 @@ def _drive(sched, request, tokens):
     return finished["state"]
 
 
-@pytest.mark.parametrize("config", [tiny(), tiny_ced()], ids=["plain", "ced"])
+@pytest.mark.parametrize(
+    "config", [tiny(), tiny_ced(), tiny(**_ENGRAM)], ids=["plain", "ced", "engram"]
+)
 def test_scheduler_helper_prefill_matches_local(config):
     k, tokens = 2, [int(t) for t in np.random.default_rng(3).integers(3, 60, 23)]
     host = _model(config)
     local = _drive(_scheduler(host, 6), _request(tokens), tokens)
 
     sched = _scheduler(host, 6)
-    session, listener, thread = _session(_helper_model(config, k), k)
+    session, listener, thread = _session(host, _helper_model(config, k), k)
     sched.attach_prefill_helper(session)
     state = _drive(sched, _request(tokens), tokens)
     assert state.helper is not None and state.helper.index == len(state.helper.grid)
@@ -337,7 +364,7 @@ def test_scheduler_finishes_locally_when_the_helper_leaves(how):
     local = _drive(_scheduler(host, 6), _request(tokens), tokens)
 
     sched = _scheduler(host, 6)
-    session, listener, thread = _session(_helper_model(config, k), k)
+    session, listener, thread = _session(host, _helper_model(config, k), k)
     sched.attach_prefill_helper(session)
     original = Scheduler._forward_helper_chunk
 
@@ -359,8 +386,9 @@ def test_scheduler_finishes_locally_when_the_helper_leaves(how):
 
 def test_scheduler_cancels_the_job_of_a_dropped_request():
     k, tokens = 2, list(range(3, 40))
-    sched = _scheduler(_model(tiny()), 4)
-    session, listener, thread = _session(_helper_model(tiny(), k), k)
+    host = _model(tiny())
+    sched = _scheduler(host, 4)
+    session, listener, thread = _session(host, _helper_model(tiny(), k), k)
     sched.attach_prefill_helper(session)
     request = _request(tokens)
     assert Scheduler._start_helper_prefill(
@@ -398,7 +426,7 @@ def test_helper_grid_stops_at_blocks_and_tails():
 def test_auto_split_balances_measured_speed():
     work = [1.0] * 20 + [0.1] + [0.0] * 19  # DeepSeek V4.1 with CED
     client = SimpleNamespace(info={"warm_seconds": 18.0, "warm_tokens": 1}, alive=True)
-    session = PrefillHelperSession(client, DSV41, 18, "helper-mac", work)
+    session = PrefillHelperSession(client, DSV41, None, 18, "helper-mac", work)
     # Before this Mac is timed, both Macs count as equally fast.
     assert session.pick_layers() == 10
     # This Mac takes twice as long per unit of work: the helper gets more.
@@ -419,7 +447,9 @@ def test_job_uses_fewer_layers_than_the_helper_holds():
 
     listener, thread = _serve(_helper_model(config, held), held)
     client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
-    job = client.submit(np.asarray(ids[0, :-1]), sizes, layers=k)
+    tokens = np.asarray(ids[0, :-1])
+    feed = DSV41.job_feed(host, None, tokens, sizes, k)
+    job = client.submit(tokens, sizes, layers=k, feed=feed)
     cache = host.make_cache()
     for chunk in chunks:
         part = job.take(timeout=60)
@@ -481,6 +511,33 @@ def test_helper_target_rejects_a_shell_unsafe_interpreter():
         HelperTarget("n", "x", "u@1.2.3.4", "1.2.3.4", "thunderbolt", "py; rm -rf ~")
 
 
+def test_helper_files_leave_out_engram_tables_and_later_layers(tmp_path):
+    shards = {
+        "a.safetensors": ["language_model.embed.weight", "language_model.layers.0.w"],
+        "b.safetensors": [
+            "language_model.layers.1.engram.embed.weight",
+            "language_model.layers.1.engram.embed.scales",
+        ],
+        "c.safetensors": ["language_model.layers.1.ffn.w"],
+        "d.safetensors": ["language_model.layers.3.w", "language_model.mtp.0.w"],
+    }
+    weight_map = {}
+    for name, tensors in shards.items():
+        mx.save_safetensors(str(tmp_path / name), {t: mx.zeros((2,)) for t in tensors})
+        weight_map.update(dict.fromkeys(tensors, name))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    (tmp_path / "config.json").write_text("{}")
+    files = launcher.required_files(tmp_path, 2, DSV41)
+    assert sorted(files) == [
+        "a.safetensors",
+        "c.safetensors",
+        "config.json",
+        "model.safetensors.index.json",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Manager: the steps from a chosen Mac to an attached session.
 # ---------------------------------------------------------------------------
@@ -516,7 +573,7 @@ class _FakeLauncher:
             "device": "Apple M5 Max",
         }
 
-    def required_files(self, model_path, layers):
+    def required_files(self, model_path, layers, adapter):
         return {"config.json": 10, "model-1.safetensors": 1 << 20}
 
     def locate_files(self, target, name, files):
@@ -548,7 +605,7 @@ def launcher_version():
     return __version__
 
 
-def _manager(fake, attached):
+def _manager(fake, attached, speeds_path):
     return PrefillHelperManager(
         model_path="/models/x",
         model_type="deepseek_v41",
@@ -557,6 +614,7 @@ def _manager(fake, attached):
         attach=attached.append,
         chunk_tokens=8,
         launcher=fake,
+        speeds_path=speeds_path,
     )
 
 
@@ -570,10 +628,10 @@ def _wait_state(manager, *states, reason="", timeout=30):
     raise AssertionError(f"state stayed {manager.status()}")
 
 
-def test_manager_waits_for_consent_before_copying_then_attaches():
+def test_manager_waits_for_consent_before_copying_then_attaches(tmp_path):
     attached = []
     fake = _FakeLauncher(None, missing=["model-1.safetensors"])
-    manager = _manager(fake, attached)
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
     manager.configure("node-1", None)
     status = _wait_state(manager, "needs_files")
     assert status["bytes"] == 1 << 20 and fake.copied == []
@@ -589,10 +647,10 @@ def test_manager_waits_for_consent_before_copying_then_attaches():
     manager.close()
 
 
-def test_manager_blocks_what_a_retry_cannot_fix():
+def test_manager_blocks_what_a_retry_cannot_fix(tmp_path):
     attached = []
     fake = _FakeLauncher(None, version="0.0.1")
-    manager = _manager(fake, attached)
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
     manager.configure("node-1", None)
     _wait_state(manager, "error", reason="update it to")
     fake.version, fake.budget = launcher_version(), 12 << 30
@@ -608,12 +666,12 @@ def test_manager_blocks_what_a_retry_cannot_fix():
     manager.close()
 
 
-def test_manager_retries_a_lost_helper_but_not_a_stopped_one(monkeypatch):
+def test_manager_retries_a_lost_helper_but_not_a_stopped_one(tmp_path, monkeypatch):
     monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
     monkeypatch.setattr(manager_module, "_WATCH_S", 0.05)
     attached = []
     fake = _FakeLauncher(None)
-    manager = _manager(fake, attached)
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
     manager.configure("node-1", None)
     _wait_state(manager, "ready")
     first = attached[-1]
@@ -628,6 +686,22 @@ def test_manager_retries_a_lost_helper_but_not_a_stopped_one(monkeypatch):
     time.sleep(0.3)
     assert manager.status()["state"] == "stopped" and len(fake.servers) == 2
     manager.close()
+
+
+def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
+    attached, speeds = [], tmp_path / "speeds.json"
+    manager = _manager(_FakeLauncher(None), attached, speeds)
+    manager.configure("node-1", None)
+    _wait_state(manager, "ready")
+    attached[-1].observe(2, 2048, helper_s=1.0, host_s=3.0)
+    measured = (attached[-1].unit_helper, attached[-1].unit_host)
+    manager.close()
+
+    again = _manager(_FakeLauncher(None), attached, speeds)
+    again.configure("node-1", None)
+    _wait_state(again, "ready")
+    assert (attached[-1].unit_helper, attached[-1].unit_host) == measured
+    again.close()
 
 
 # ---------------------------------------------------------------------------

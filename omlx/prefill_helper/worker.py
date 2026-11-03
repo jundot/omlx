@@ -6,6 +6,7 @@ loads its layers, warms the kernels at the chunk size, prints a ready line and
 then serves one authenticated connection at a time. Jobs run in arrival order.
 Each job streams one frame per chunk and stays at most ``WINDOW`` frames ahead
 of the host's acknowledgements, so a slow host never piles chunks in memory.
+A job that takes host inputs (``feed``) also waits for each chunk's inputs.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from .. import __version__
 from . import wire
 from .adapters import adapter_for
 
-WINDOW = 2
+WINDOW = wire.WINDOW
 _KEEP_WARM_SECONDS = 0.5
 READY_PREFIX = "OMLX_PREFILL_HELPER_READY "
 
@@ -47,6 +48,8 @@ class _Job:
     chunks: list[int]
     layers: int
     prefix: dict[str, mx.array] | None = None
+    feed: bool = False
+    inputs: dict[int, dict] = field(default_factory=dict)
     acked: int = -1
     cancelled: bool = False
 
@@ -137,9 +140,14 @@ class HelperServer:
                             [int(n) for n in meta["chunks"]],
                             min(int(meta.get("layers", self.k)), self.k),
                             prefix or None,
+                            bool(meta.get("feed")),
                         )
                         session.jobs.append(job)
                         session.by_id[job.job_id] = job
+                    elif op == "inputs":
+                        job = session.by_id.get(meta["job_id"])
+                        if job is not None:
+                            job.inputs[int(meta["index"])] = arrays
                     elif op == "ack":
                         job = session.by_id.get(meta["job_id"])
                         if job is not None:
@@ -206,26 +214,19 @@ class HelperServer:
         for index, size in enumerate(job.chunks):
             with session.changed:
                 while (
-                    index - job.acked > WINDOW
-                    and not job.cancelled
-                    and not session.closed
-                ):
+                    index - job.acked > WINDOW or (job.feed and index not in job.inputs)
+                ) and not (job.cancelled or session.closed):
                     session.changed.wait()
                 if job.cancelled or session.closed:
                     return
-            ids = job.tokens[None, start : start + size]
+                # None is the warm-up call; a real chunk always has a dict.
+                inputs = job.inputs.pop(index, {})
+            tokens = mx.array(job.tokens[start : start + size])[None]
             following = job.chunks[index + 1] if index + 1 < len(job.chunks) else 0
             began = time.perf_counter()
-            if index == 0:
-                self.adapter.prefetch(self.lm, cache, ids[:, :0], ids)
-            self.adapter.prefetch(
-                self.lm,
-                cache,
-                ids,
-                job.tokens[None, start + size : start + size + following],
+            boundary, state = self.adapter.run_first(
+                self.lm, cache, tokens, following, inputs
             )
-            tokens = mx.array(ids)
-            boundary, state = self.adapter.run_first(self.lm, cache, tokens, following)
             elapsed = time.perf_counter() - began
             arrays = {f"b:{n}": wire.to_host(v) for n, v in boundary.items()}
             arrays.update({f"s:{n}": wire.to_host(v) for n, v in state.items()})

@@ -18,20 +18,23 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 
 Arrays = dict[str, mx.array]
+# Host arrays as they cross the link: (data, dtype name).
+HostArrays = dict[str, tuple[np.ndarray, str]]
 _LAYER = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
-def _tensor_bytes(model_path: Path) -> dict[str, int]:
-    """Bytes per tensor from the safetensors headers, without loading data."""
+def _tensors(model_path: Path) -> dict[str, tuple[str, int]]:
+    """File and bytes of each tensor, from the safetensors headers only."""
     index = model_path / "model.safetensors.index.json"
     files = (
         sorted(set(json.loads(index.read_text())["weight_map"].values()))
         if index.exists()
         else ["model.safetensors"]
     )
-    sizes: dict[str, int] = {}
+    tensors: dict[str, tuple[str, int]] = {}
     for name in files:
         with open(model_path / name, "rb") as f:
             (length,) = struct.unpack("<Q", f.read(8))
@@ -39,8 +42,8 @@ def _tensor_bytes(model_path: Path) -> dict[str, int]:
         for key, spec in header.items():
             if key != "__metadata__":
                 start, end = spec["data_offsets"]
-                sizes[key] = end - start
-    return sizes
+                tensors[key] = (name, end - start)
+    return tensors
 
 
 class StageAdapter:
@@ -86,7 +89,7 @@ class StageAdapter:
         return [1.0] * self.layer_count(lm)
 
     def resident(self, tensor: str) -> bool:
-        """Whether the helper keeps this tensor in GPU memory."""
+        """Whether the helper loads this tensor (into GPU memory)."""
         return True
 
     def needed_outside_layers(self, tensor: str) -> bool:
@@ -96,7 +99,7 @@ class StageAdapter:
     def memory_plan(self, model_path: str | Path) -> tuple[int, list[int]]:
         """(bytes outside the layers, bytes per layer) the helper holds."""
         shared, per_layer = 0, {}
-        for tensor, size in _tensor_bytes(Path(model_path).expanduser()).items():
+        for tensor, (_, size) in _tensors(Path(model_path).expanduser()).items():
             if not self.resident(tensor):
                 continue
             match = _LAYER.search(tensor)
@@ -108,18 +111,45 @@ class StageAdapter:
         count = max(per_layer) + 1 if per_layer else 0
         return shared, [per_layer.get(i, 0) for i in range(count)]
 
+    def weight_files(self, model_path: str | Path, k: int) -> set[str]:
+        """Weight files a helper holding layers ``[0, k)`` reads."""
+        files = set()
+        for tensor, (name, _) in _tensors(Path(model_path).expanduser()).items():
+            if not self.resident(tensor):
+                continue
+            match = _LAYER.search(tensor)
+            if int(match.group(1)) < k if match else self.needed_outside_layers(tensor):
+                files.add(name)
+        return files
+
     def load_first(self, path: str, k: int) -> Any:
         """Helper: load layers ``[0, k)`` of a checkpoint; returns the module
         ``run_first`` takes."""
         raise NotImplementedError
 
+    def job_feed(
+        self, lm: Any, cache: list | None, tokens: np.ndarray, grid: list[int], k: int
+    ) -> Callable[[int], HostArrays] | None:
+        """This Mac: per-chunk inputs it reads for the helper's layers.
+
+        The returned callable runs on a background thread, once per chunk in
+        order, and must not use the GPU. None when the helper needs nothing.
+        """
+        return None
+
     def run_first(
-        self, lm: Any, cache: list, tokens: mx.array, next_tokens: int
+        self,
+        lm: Any,
+        cache: list,
+        tokens: mx.array,
+        next_tokens: int,
+        inputs: HostArrays | None = None,
     ) -> tuple[Arrays, Arrays]:
-        """Helper: run ``[0, k)`` on one chunk.
+        """Helper: run ``[0, k)`` on one chunk with its ``job_feed`` inputs.
 
         Returns the tensors that cross the cut and the chunk's cache state
-        for layers ``[0, k)``, both evaluated.
+        for layers ``[0, k)``, both evaluated. ``inputs`` is None only while
+        warming the kernels.
         """
         raise NotImplementedError
 

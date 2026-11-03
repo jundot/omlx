@@ -3,9 +3,11 @@
 
 A receiver thread fills numpy buffers; MLX arrays are made on the caller's
 thread when a chunk is taken. Taking a chunk acknowledges it, which lets the
-helper compute the next one. While any job is open, a tiny GPU kernel ticks
-on a separate stream: the scheduler waits for the helper between chunks, and
-an idle GPU stalls the next command buffer for seconds.
+helper compute the next one. A job with a feed has a thread that sends each
+chunk's host inputs one step ahead of what the helper may compute. While any
+job is open, a tiny GPU kernel ticks on a separate stream: the scheduler waits
+for the helper between chunks, and an idle GPU stalls the next command buffer
+for seconds.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import queue
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -44,6 +47,8 @@ class HelperJob:
     def __init__(self, client: HelperClient, job_id: str, chunks: list[int]):
         self.client, self.job_id, self.chunks = client, job_id, chunks
         self._frames: queue.Queue = queue.Queue()
+        self._taken = threading.Condition()
+        self.acked = -1
         self.finished = False
 
     def ready(self) -> bool:
@@ -65,6 +70,9 @@ class HelperJob:
             self.client._send(
                 {"op": "ack", "job_id": self.job_id, "index": meta["index"]}
             )
+        with self._taken:
+            self.acked = meta["index"]
+            self._taken.notify_all()
         boundary, state = {}, {}
         for name, value in arrays.items():
             target = boundary if name.startswith("b:") else state
@@ -88,6 +96,26 @@ class HelperJob:
         if not self.finished:
             self.finished = True
             self.client._job_closed(self)
+            with self._taken:
+                self._taken.notify_all()
+
+    def _feed(self, feed: Callable[[int], dict]) -> None:
+        for index in range(len(self.chunks)):
+            with self._taken:
+                while not self.finished and index > self.acked + wire.WINDOW + 1:
+                    self._taken.wait()
+            if self.finished:
+                return
+            meta = {"op": "inputs", "job_id": self.job_id, "index": index}
+            try:
+                self.client._send(meta, feed(index))
+            except HelperError:
+                return
+            except Exception as error:  # the job cannot go on without its inputs
+                self._deliver({"op": "error", "error": f"host inputs: {error!r}"}, {})
+                with contextlib.suppress(HelperError):
+                    self.client._send({"op": "cancel", "job_id": self.job_id})
+                return
 
 
 class HelperClient:
@@ -123,6 +151,7 @@ class HelperClient:
         prefix: dict[str, mx.array] | None = None,
         *,
         layers: int | None = None,
+        feed: Callable[[int], dict] | None = None,
     ) -> HelperJob:
         if not self.alive:
             raise HelperError("prefill helper connection is closed")
@@ -136,7 +165,11 @@ class HelperClient:
         meta = {"op": "job", "job_id": job.job_id, "chunks": job.chunks}
         if layers is not None:
             meta["layers"] = int(layers)
+        if feed is not None:
+            meta["feed"] = True
         self._send(meta, arrays)
+        if feed is not None:
+            threading.Thread(target=job._feed, args=(feed,), daemon=True).start()
         return job
 
     def close(self) -> None:

@@ -20,6 +20,8 @@ import mlx.core as mx
 import numpy as np
 
 PROTOCOL = 1
+# Chunks a helper may run ahead of the host's acknowledgements.
+WINDOW = 2
 _MAX_HEADER = 1 << 24
 _NONCE = 32
 
@@ -65,7 +67,11 @@ def send(
     meta: dict[str, Any],
     arrays: dict[str, tuple[np.ndarray, str]] | None = None,
 ) -> None:
-    arrays = arrays or {}
+    # Contiguous before the header goes out, so a frame is never cut short.
+    arrays = {
+        name: (np.ascontiguousarray(data), dtype)
+        for name, (data, dtype) in (arrays or {}).items()
+    }
     specs = [
         {"name": name, "dtype": dtype, "np": data.dtype.str, "shape": list(data.shape)}
         for name, (data, dtype) in arrays.items()

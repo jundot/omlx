@@ -52,6 +52,7 @@ class PrefillHelperSession:
 
     client: HelperClient
     adapter: StageAdapter
+    lm: Any
     layers: int
     name: str
     work: list[float]
@@ -122,8 +123,9 @@ class PrefillHelperSession:
         """Queue a job; ``cache`` holds a restored prefix (None without one)."""
         layers = self.pick_layers()
         prefix = self.adapter.prefix_state(cache, layers) if cache else None
+        feed = self.adapter.job_feed(self.lm, cache, tokens, grid, layers)
         try:
-            job = self.client.submit(tokens, grid, prefix, layers=layers)
+            job = self.client.submit(tokens, grid, prefix, layers=layers, feed=feed)
         except HelperError as error:
             self.note_failure(str(error))
             return None

@@ -5,12 +5,16 @@ One worker thread walks the steps (find the Mac, check its oMLX and memory,
 find or copy the files, start the helper, attach it) and then watches the
 connection. A lost helper is detached at once and retried with backoff;
 problems a retry cannot fix (version, memory, disk, pairing) wait for the
-user. Copying model files only starts on an explicit request.
+user. Copying model files only starts on an explicit request. The measured
+speeds of each model and helper Mac are kept on disk, so a restarted helper
+splits its first prompt by them instead of guessing.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import queue
 import socket
 import subprocess
@@ -21,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import __version__
+from ..cluster.registry import default_devices_path
 from . import launcher as default_launcher
 from .adapter import StageAdapter
 from .client import HelperClient
@@ -35,6 +40,11 @@ _RESERVE_BYTES = 8 << 30
 _OS_BYTES = 16 << 30
 _RETRY_DELAYS_S = (15.0, 30.0, 60.0, 120.0, 300.0)
 _WATCH_S = 2.0
+_SPEEDS_LOCK = threading.Lock()
+
+
+def default_speeds_path() -> Path:
+    return default_devices_path().with_name("prefill_helper_speeds.json")
 
 
 class _PermanentError(Exception):
@@ -85,8 +95,11 @@ class PrefillHelperManager:
         chunk_tokens: int,
         launcher: Any = default_launcher,
         connect: Callable[..., HelperClient] = HelperClient,
+        speeds_path: Path | None = None,
     ):
         self.model_path = str(Path(model_path).expanduser())
+        self.speeds_path = speeds_path or default_speeds_path()
+        self._saved: tuple | None = None
         self.model_type, self.adapter, self.lm = model_type, adapter, language_model
         self.attach, self.chunk_tokens = attach, chunk_tokens
         self.launcher, self.connect = launcher, connect
@@ -178,6 +191,7 @@ class PrefillHelperManager:
                 continue
             if self._session is not None:
                 if self._session.alive:
+                    self._save_speeds()
                     continue
                 name = self._session.name
                 stopped = self._session.client.stopped_by_helper
@@ -221,7 +235,7 @@ class PrefillHelperManager:
                 f"{__version__}."
             )
         held = self._held_layers(target.name, helper_budget(info))
-        files = launcher.required_files(self.model_path, held)
+        files = launcher.required_files(self.model_path, held, self.adapter)
         where = launcher.locate_files(target, Path(self.model_path).name, files)
         model_dir = where.get("found")
         if model_dir is None:
@@ -250,14 +264,19 @@ class PrefillHelperManager:
             process.stop()
             raise
         self._process = process
+        saved = self._load_speeds().get(self._speeds_key(), {})
         self._session = PrefillHelperSession(
             client,
             self.adapter,
+            self.lm,
             held,
             target.name,
             self.adapter.layer_work(self.lm),
             fixed_layers=self.fixed_layers,
+            unit_helper=saved.get("helper"),
+            unit_host=saved.get("host"),
         )
+        self._saved = (saved.get("helper"), saved.get("host"))
         self.attach(self._session)
         self._set("ready", node_id=self.node_id, held=held, device=info.get("device"))
 
@@ -299,8 +318,40 @@ class PrefillHelperManager:
         self._set("copying", node_id=self.node_id, path=model_dir, done=0, bytes=size)
         self.launcher.copy_files(target, self.model_path, model_dir, missing, progress)
 
+    def _speeds_key(self) -> str:
+        return f"{self.node_id}:{self.model_path}"
+
+    def _load_speeds(self) -> dict[str, Any]:
+        try:
+            return json.loads(self.speeds_path.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def _save_speeds(self) -> None:
+        session = self._session
+        speeds = (session.unit_helper, session.unit_host)
+        if None in speeds or speeds == self._saved:
+            return
+        with _SPEEDS_LOCK:
+            data = self._load_speeds()
+            data[self._speeds_key()] = {
+                "helper": speeds[0],
+                "host": speeds[1],
+                "at": time.time(),
+            }
+            try:
+                self.speeds_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.speeds_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(data, indent=1))
+                os.replace(temporary, self.speeds_path)
+            except OSError as error:
+                logger.warning("Could not save prefill helper speeds: %s", error)
+                return
+        self._saved = speeds
+
     def _teardown(self) -> None:
         if self._session is not None:
+            self._save_speeds()
             self.attach(None)
             self._session.close()
             self._session = None

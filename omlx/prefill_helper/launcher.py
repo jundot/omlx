@@ -27,8 +27,9 @@ from typing import Any
 
 from ..cluster.registry import get_device_registry
 from ..cluster.ssh_policy import cluster_ssh_options
-from ..cluster.staging import index_shards, scp_push, shards_for_stage, sidecar_files
+from ..cluster.staging import scp_push, sidecar_files
 from ..cluster.transport import probe_host_interfaces, shared_link_addresses
+from .adapter import StageAdapter
 from .worker import READY_PREFIX
 
 DEFAULT_PYTHON = "~/.omlx/bin/omlx-cluster-python"
@@ -129,11 +130,12 @@ def remote_info(target: HelperTarget, *, runner: Runner = subprocess.run) -> dic
         raise LaunchError(f"oMLX is not installed on {target.name}.") from None
 
 
-def required_files(model_path: str | Path, layers: int) -> dict[str, int]:
+def required_files(
+    model_path: str | Path, layers: int, adapter: StageAdapter
+) -> dict[str, int]:
     """Files the helper needs for layers ``[0, layers)``, with their sizes."""
     root = Path(model_path).expanduser()
-    names = [shard.name for shard in shards_for_stage(index_shards(root), 0, layers)]
-    names += list(sidecar_files(root))
+    names = sorted(adapter.weight_files(root, layers)) + list(sidecar_files(root))
     return {name: (root / name).stat().st_size for name in dict.fromkeys(names)}
 
 

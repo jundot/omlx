@@ -4,7 +4,8 @@
 Besides ``(h, pre)``, layers after the cut read the shared state of the last
 KV source before it: its compressed KV and index keys (rebuilt here from this
 Mac's cache plus the chunk's new rows), the chunk's top-k ids and the
-candidate blocks.
+candidate blocks. Engram tables stay here: this Mac sends each chunk's rows
+for the helper's Engram layers.
 """
 
 from __future__ import annotations
@@ -14,10 +15,12 @@ from contextlib import contextmanager
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 
 from ...patches.deepseek_v41 import growth
 from ...patches.deepseek_v41.loading import load
-from ..adapter import Arrays, StageAdapter
+from ...patches.deepseek_v41.storage import decode_rows, dedupe_tuple_ids
+from ..adapter import Arrays, HostArrays, StageAdapter
 
 _SLOTS = 7
 # Compressed KV and index keys grow with the prompt on KV-source layers; the
@@ -33,6 +36,39 @@ def _key(layer: int, slot: int) -> str:
 def _rows(item: Any, slot: int) -> int:
     value = item[slot]
     return 0 if value is None else int(value.shape[1])
+
+
+_WARM = object()
+
+
+class _HostRows:
+    """A helper's Engram table: this Mac reads each chunk's rows and sends
+    them with the chunk, so the helper holds no table and reads no SSD."""
+
+    def __init__(self, dim: int):
+        self.dim = dim
+        self.rows: Any = None
+
+    def put(self, inputs: HostArrays | None, layer: int) -> None:
+        if inputs is None:
+            self.rows = _WARM
+            return
+        name = f"e{layer}."
+        if name + "ids" not in inputs:
+            raise RuntimeError(f"No Engram rows for layer {layer}")
+        bits, group_size, scaled = inputs[name + "q"][0].tolist()
+        data = [inputs[f"{name}{n}"] for n in range(3) if f"{name}{n}" in inputs]
+        self.rows = (inputs[name + "ids"][0], data, bits or None, group_size, scaled)
+
+    def __call__(self, indices: mx.array) -> mx.array:
+        host = np.asarray(indices).astype(np.int64)
+        rows, self.rows = self.rows, None
+        if rows is _WARM:
+            return mx.zeros((*host.shape, self.dim), mx.bfloat16)
+        if rows is None or not np.array_equal(rows[0], host):
+            raise RuntimeError("Engram rows were sent for other ids")
+        _, data, bits, group_size, scaled = rows
+        return decode_rows(data, host.shape, bits, group_size, bool(scaled))
 
 
 @contextmanager
@@ -65,7 +101,7 @@ class DeepseekV41Adapter(StageAdapter):
         return [1.0] * mid + [0.1] + [0.0] * (c.n_layers - mid - 1)
 
     def resident(self, tensor: str) -> bool:
-        # Engram tables stay memory-mapped; draft heads and vision never load.
+        # Engram rows come from this Mac; draft heads and vision never load.
         return (
             ".engram.embed." not in tensor
             and ".mtp." not in tensor
@@ -75,9 +111,11 @@ class DeepseekV41Adapter(StageAdapter):
     def keep_first(self, lm: Any, k: int) -> None:
         lm.start_idx, lm.end_idx = 0, k
         lm.layers = lm.layers[:k]
+        for layer in lm.layers:
+            if "engram" in layer:
+                layer.engram.embed = _HostRows(lm._config.engram_head_dim)
 
     def load_first(self, path: str, k: int) -> Any:
-        # Engram tables stay memory-mapped so the layers get the GPU memory.
         model, _ = load(
             path,
             engram_ssd_offload=True,
@@ -92,9 +130,50 @@ class DeepseekV41Adapter(StageAdapter):
         with _stage_from(lm, start):
             lm.prefetch_engram(following, current, cache=cache)
 
+    def job_feed(
+        self, lm: Any, cache: list | None, tokens: np.ndarray, grid: list[int], k: int
+    ) -> Callable[[int], HostArrays] | None:
+        engram_ids = list(lm._config.engram_layer_ids)
+        tables = {i: lm.layers[i].engram.embed for i in engram_ids if i < k}
+        if not tables or lm._hasher is None:
+            return None
+        history = cache[0][_HISTORY] if cache else None
+        if history is not None and history.size:
+            history = np.asarray(history, dtype=np.int64)
+        else:
+            history = None
+        tokens = np.asarray(tokens, dtype=np.int64).reshape(1, -1)
+        starts = np.cumsum([0, *grid]).tolist()
+
+        def feed(index: int) -> HostArrays:
+            nonlocal history
+            hashes, history = lm._hasher(
+                tokens[:, starts[index] : starts[index + 1]], history
+            )
+            out: HostArrays = {}
+            for i, table in tables.items():
+                ids, _ = dedupe_tuple_ids(hashes[:, :, engram_ids.index(i)])
+                data, (bits, group_size, scaled) = table.read_packed(ids)
+                settings = np.array([bits or 0, group_size, scaled], dtype=np.int64)
+                out[f"e{i}.ids"] = (ids, "int64")
+                out[f"e{i}.q"] = (settings, "int64")
+                for n, (raw, dtype) in enumerate(data):
+                    out[f"e{i}.{n}"] = (raw, dtype)
+            return out
+
+        return feed
+
     def run_first(
-        self, lm: Any, cache: list, tokens: mx.array, next_tokens: int
+        self,
+        lm: Any,
+        cache: list,
+        tokens: mx.array,
+        next_tokens: int,
+        inputs: HostArrays | None = None,
     ) -> tuple[Arrays, Arrays]:
+        for i, layer in enumerate(lm.pipeline_layers):
+            if "engram" in layer and isinstance(layer.engram.embed, _HostRows):
+                layer.engram.embed.put(inputs, i)
         before = [{slot: _rows(item, slot) for slot in _GROWING} for item in cache]
         capture: dict[str, Any] = {}
         lm._omlx_prefill(
