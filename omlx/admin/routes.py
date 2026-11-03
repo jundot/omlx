@@ -3486,9 +3486,11 @@ async def update_model_settings(
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
-    if (
-        "prefill_helper_node_id" in sent or "prefill_helper_layers" in sent
-    ) and hasattr(entry.engine, "configure_prefill_helper"):
+    helper_fields = {"prefill_helper_node_id", "prefill_helper_layers"}
+    if not _oq_a8_kernels_available():
+        # A8 here reaches only the helper's layers.
+        helper_fields |= {"a8_prefill_enabled", "a8_prefill_min_tokens"}
+    if helper_fields & set(sent) and hasattr(entry.engine, "configure_prefill_helper"):
         # Applied to the loaded model in place; no reload.
         entry.engine.configure_prefill_helper(current_settings)
 

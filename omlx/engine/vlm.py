@@ -2516,11 +2516,6 @@ class VLMBatchedEngine(BaseEngine):
                 language_model=stage_adapter.language_model(self._adapter),
                 attach=scheduler.attach_prefill_helper,
                 chunk_tokens=scheduler._base_prefill_step_size(0, 1 << 30),
-                a8_min_tokens=(
-                    int(getattr(self._model_settings, "a8_prefill_min_tokens", 128))
-                    if getattr(self._model_settings, "a8_prefill_enabled", False)
-                    else None
-                ),
             )
             self.configure_prefill_helper(self._model_settings)
 
@@ -2928,6 +2923,11 @@ class VLMBatchedEngine(BaseEngine):
             self._prefill_helper.configure(
                 getattr(settings, "prefill_helper_node_id", None),
                 getattr(settings, "prefill_helper_layers", None),
+                (
+                    int(getattr(settings, "a8_prefill_min_tokens", 128))
+                    if getattr(settings, "a8_prefill_enabled", False)
+                    else None
+                ),
             )
 
     @property

@@ -72,6 +72,7 @@ from .model_discovery import (
     format_size,
     is_realtime_stt_model,
 )
+from .custom_kernels.quant_matmul import fast as quant_fast
 from .model_settings import (
     ModelSettings,
     ane_prefill_backend,
@@ -1337,7 +1338,11 @@ class EnginePool:
         # process-wide projection backends, and caches a prepared plan and
         # metadata on every module it classifies. None of that can be undone
         # in place, so a change here has to land on a fresh engine.
-        oq_a8_active = bool(data.get("a8_prefill_enabled", False))
+        # Without INT8 tensor units here, A8 only reaches a Prefill Accelerator
+        # Mac's layers, which follow it without reloading this model.
+        oq_a8_active = bool(data.get("a8_prefill_enabled", False)) and (
+            quant_fast.oq_a8_available()
+        )
         add("a8_prefill_enabled", oq_a8_active)
         if oq_a8_active:
             add("a8_prefill_min_tokens", data.get("a8_prefill_min_tokens", 128))

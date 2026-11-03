@@ -3183,6 +3183,50 @@
                 }
             },
 
+            prefillHelperPending() {
+                const saved = this.selectedModel?.settings || {};
+                const ms = this.modelSettings;
+                return (saved.prefill_helper_node_id || '') !== (ms.prefill_helper_node_id || '')
+                    || String(saved.prefill_helper_layers || '') !== String(ms.prefill_helper_layers || '');
+            },
+
+            // Applies the helper choice without closing the dialog, so its
+            // progress and the Copy files step show here.
+            async applyPrefillHelper() {
+                const model = this.selectedModel;
+                const ms = this.modelSettings;
+                if (!model) return;
+                const body = {
+                    prefill_helper_node_id: ms.prefill_helper_node_id || null,
+                    prefill_helper_layers: ms.prefill_helper_node_id && ms.prefill_helper_layers
+                        ? parseInt(ms.prefill_helper_layers, 10)
+                        : null,
+                };
+                // A8 rides along where it only reaches the helper's layers.
+                if (this.isA8PrefillModel(model) && model.a8_prefill_supported !== true) {
+                    body.a8_prefill_enabled = !!ms.a8_prefill_enabled;
+                }
+                this.prefillHelper.busy = true;
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    if (resp.ok) {
+                        model.settings = { ...(model.settings || {}), ...body };
+                    } else if (resp.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await resp.json().catch(() => ({}));
+                        alert(typeof data.detail === 'string' ? data.detail : window.t('js.error.save_model_settings_failed'));
+                    }
+                } catch (_) {
+                    alert(window.t('js.error.save_model_settings_failed'));
+                }
+                this.prefillHelper.busy = false;
+            },
+
             prefillHelperTakeoverText(device) {
                 if (!device?.lending) return '';
                 return window.t('modal.model_settings.prefill_helper_takes_over')

@@ -104,11 +104,10 @@ class PrefillHelperManager:
         launcher: Any = default_launcher,
         connect: Callable[..., HelperClient] = HelperClient,
         speeds_path: Path | None = None,
-        a8_min_tokens: int | None = None,
     ):
         self.model_path = str(Path(model_path).expanduser())
         # The model's A8 prefill setting, which the helper's layers follow.
-        self.a8_min_tokens = a8_min_tokens
+        self.a8_min_tokens: int | None = None
         self.speeds_path = speeds_path or default_speeds_path()
         self._saved: tuple | None = None
         self.model_type, self.adapter, self.lm = model_type, adapter, language_model
@@ -129,8 +128,13 @@ class PrefillHelperManager:
 
     # -- commands (any thread) ------------------------------------------------
 
-    def configure(self, node_id: str | None, layers: int | None) -> None:
-        self._commands.put(("configure", node_id, layers))
+    def configure(
+        self,
+        node_id: str | None,
+        layers: int | None,
+        a8_min_tokens: int | None = None,
+    ) -> None:
+        self._commands.put(("configure", node_id, layers, a8_min_tokens))
 
     def copy_files(self) -> None:
         self._copy_ok.set()
@@ -181,13 +185,21 @@ class PrefillHelperManager:
                 self._teardown()
                 return
             if kind == "configure":
-                _, node_id, layers = command
-                if (node_id, layers) == (self.node_id, self.fixed_layers):
+                _, node_id, layers, a8 = command
+                if (node_id, layers, a8) == (
+                    self.node_id,
+                    self.fixed_layers,
+                    self.a8_min_tokens,
+                ):
                     # Saving other settings must not restart a stopped helper.
                     continue
                 # Speeds are saved under the helper that measured them.
                 self._teardown()
-                self.node_id, self.fixed_layers = node_id, layers
+                self.node_id, self.fixed_layers, self.a8_min_tokens = (
+                    node_id,
+                    layers,
+                    a8,
+                )
                 wanted, attempt = node_id is not None, 0
                 if not wanted:
                     self._set("off")

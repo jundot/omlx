@@ -671,7 +671,7 @@ def launcher_version():
     return __version__
 
 
-def _manager(fake, attached, speeds_path, a8_min_tokens=None):
+def _manager(fake, attached, speeds_path):
     return PrefillHelperManager(
         model_path="/models/x",
         model_type="deepseek_v41",
@@ -681,7 +681,6 @@ def _manager(fake, attached, speeds_path, a8_min_tokens=None):
         chunk_tokens=8,
         launcher=fake,
         speeds_path=speeds_path,
-        a8_min_tokens=a8_min_tokens,
     )
 
 
@@ -787,8 +786,8 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
 
     # The helper follows the model's A8 setting, and A8 keeps its own speeds.
     fake = _FakeLauncher(None)
-    a8 = _manager(fake, attached, speeds, a8_min_tokens=256)
-    a8.configure("node-1", None)
+    a8 = _manager(fake, attached, speeds)
+    a8.configure("node-1", None, 256)
     _wait_state(a8, "ready")
     assert fake.servers[-1].a8 == 256
     assert (attached[-1].unit_helper, attached[-1].unit_host) != measured
