@@ -68,29 +68,42 @@ class IntegrationContext:
         return self.model_type == "vlm"
 
 
-def chat_models(ctx: IntegrationContext) -> dict[str, dict]:
+def chat_models(
+    ctx: IntegrationContext, *, prefer_public_inventory: bool = False
+) -> dict[str, dict]:
     """Return served chat models and their metadata, in server order."""
     # An aliased model sits under both keys; list its display id once.
-    models = {
+    status_models = {
         info.get("model_alias") or model_id: info
         for model_id, info in ctx.models_status_map.items()
     }
-    if not models:
+    models = status_models
+    if not models and ctx.model:
+        models = {ctx.model: ctx.models_status_map.get(ctx.model, {})}
+    if prefer_public_inventory or not status_models:
         # Status needs a key that /v1/models may not (e.g. under
         # allow_unauthenticated_inference), so ask for the inventory once.
         headers = {"Authorization": f"Bearer {ctx.auth_token}"} if ctx.api_key else {}
         try:
             resp = requests.get(f"{ctx.base_url}/v1/models", headers=headers, timeout=5)
             resp.raise_for_status()
-            models = {
-                m["id"]: {**m, "max_context_window": m.get("max_model_len")}
-                for m in resp.json().get("data", [])
-                if m.get("id") and m.get("model_type") in ("llm", "vlm", None)
-            }
+            public_models = {}
+            for model in resp.json().get("data", []):
+                if not model.get("id") or model.get("model_type") not in (
+                    "llm",
+                    "vlm",
+                    None,
+                ):
+                    continue
+                model_id = model["id"]
+                info = {**model, **status_models.get(model_id, {})}
+                if info.get("max_context_window") is None:
+                    info["max_context_window"] = model.get("max_model_len")
+                public_models[model_id] = info
+            if prefer_public_inventory or public_models:
+                models = public_models
         except Exception:
-            models = {}
-    if not models and ctx.model:
-        models = {ctx.model: ctx.models_status_map.get(ctx.model, {})}
+            pass
 
     chat: dict[str, dict] = {}
     for model_id, info in models.items():

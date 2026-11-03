@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -2354,7 +2355,7 @@ class TestCopilotIntegration:
     @pytest.fixture(autouse=True)
     def model_inventory(self):
         with patch("omlx.integrations.base.requests.get") as get:
-            get.return_value.json.return_value = {"data": []}
+            get.side_effect = ConnectionError("public inventory unavailable")
             yield get
 
     def test_get_command(self):
@@ -2400,14 +2401,12 @@ class TestCopilotIntegration:
             )
         )
 
-        def fake_run(argv, *, env, check):
+        def fake_exec(file, argv, env):
             captured["argv"] = argv
             captured["env"] = env
             config_path = Path(env["COPILOT_PROVIDERS_CONFIG"])
             captured["path"] = config_path
             captured["config"] = json.loads(config_path.read_text())
-            assert check is False
-            return subprocess.CompletedProcess(argv, 0)
 
         base_env = {
             "PATH": "/usr/bin",
@@ -2422,7 +2421,7 @@ class TestCopilotIntegration:
             base_env["COPILOT_OFFLINE"] = offline
         with (
             patch("omlx.integrations.copilot.os.environ", base_env),
-            patch("omlx.integrations.copilot.subprocess.run", side_effect=fake_run),
+            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_exec),
         ):
             copilot.launch(
                 ctx(
@@ -2651,7 +2650,14 @@ class TestCopilotIntegration:
         assert config["providers"][0]["name"] == "omlx"
         assert [backup.read_text() for backup in tmp_path.glob("*.bak")] == [existing]
 
-    def test_catalog_filters_models_and_preserves_capabilities(self):
+    def test_catalog_filters_models_and_preserves_capabilities(self, model_inventory):
+        model_inventory.side_effect = None
+        model_inventory.return_value.json.return_value = {
+            "data": [
+                {"id": "vision-alias", "max_model_len": 131072},
+                {"id": "text"},
+            ]
+        }
         vision = {
             "model_alias": "vision-alias",
             "model_type": "vlm",
@@ -2673,6 +2679,8 @@ class TestCopilotIntegration:
                     },
                     "embedding": {"model_type": "embedding"},
                     "hidden": {"is_hidden": True},
+                    "helper": {"model_type": "llm", "is_helper": True},
+                    "unservable": {"model_type": "llm", "model_format": "gguf"},
                 },
             )
         )
@@ -2697,20 +2705,27 @@ class TestCopilotIntegration:
             ("embedding", "raw-vision", "vision-alias"),
             ("hidden", "text", "text"),
             ("", "missing", "text"),
+            ("helper", "unservable", "text"),
+            ("unservable", "raw-vision", "vision-alias"),
         ],
     )
     def test_launch_resolves_starting_model(
-        self, tmp_path, monkeypatch, model, default_model, expected
+        self, tmp_path, monkeypatch, model_inventory, model, default_model, expected
     ):
         monkeypatch.setenv("COPILOT_PROVIDERS_CONFIG", str(tmp_path / "providers.json"))
+        model_inventory.side_effect = None
+        model_inventory.return_value.json.return_value = {
+            "data": [{"id": "text"}, {"id": "vision-alias"}]
+        }
         vision = {"model_alias": "vision-alias", "model_type": "vlm"}
-        with patch("omlx.integrations.copilot.subprocess.run") as run:
-            run.return_value.returncode = 0
+        with patch("omlx.integrations.copilot.os.execvpe") as execvpe:
             CopilotIntegration().launch(
                 ctx(
                     model=model,
                     default_model=default_model,
                     models_status_map={
+                        "helper": {"model_type": "llm", "is_helper": True},
+                        "unservable": {"model_type": "llm", "model_format": "gguf"},
                         "text": {"model_type": "llm"},
                         "raw-vision": vision,
                         "vision-alias": vision,
@@ -2719,9 +2734,18 @@ class TestCopilotIntegration:
                     },
                 )
             )
-        assert run.call_args.args[0] == ["copilot", "--model", f"omlx/{expected}"]
+        assert execvpe.call_args.args[1] == ["copilot", "--model", f"omlx/{expected}"]
         registry = json.loads((tmp_path / "providers.json").read_text())
         assert [entry["id"] for entry in registry["models"]] == ["text", "vision-alias"]
+        model_inventory.assert_called_once()
+
+    def test_catalog_respects_empty_public_inventory(self, model_inventory):
+        model_inventory.side_effect = None
+        model_inventory.return_value.json.return_value = {"data": []}
+        config = copilot_provider_config(
+            ctx(model="helper", models_status_map={"helper": {"model_type": "llm"}})
+        )
+        assert config["models"] == []
 
     @pytest.mark.parametrize(
         ("context_limit", "expected"), [(8192, 8192), (None, 32768)]
@@ -2729,6 +2753,7 @@ class TestCopilotIntegration:
     def test_catalog_uses_public_inventory_without_status(
         self, model_inventory, context_limit, expected
     ):
+        model_inventory.side_effect = None
         model_inventory.return_value.json.return_value = {
             "data": [
                 {
@@ -2752,32 +2777,14 @@ class TestCopilotIntegration:
         path.write_text('{"customKey": true}')
         monkeypatch.setenv("COPILOT_PROVIDERS_CONFIG", str(path))
         with (
-            patch("omlx.integrations.copilot.subprocess.run") as run,
+            patch("omlx.integrations.copilot.os.execvpe") as execvpe,
             pytest.raises(SystemExit, match="no chat models"),
         ):
             CopilotIntegration().launch(
                 ctx(models_status_map={"embedding": {"model_type": "embedding"}})
             )
-        run.assert_not_called()
+        execvpe.assert_not_called()
         assert path.read_text() == '{"customKey": true}'
-
-    @pytest.mark.parametrize(("returncode", "exit_code"), [(2, 2), (-15, 143)])
-    def test_launch_propagates_exit_and_keeps_registry(
-        self, tmp_path, returncode, exit_code
-    ):
-        path = tmp_path / "providers.json"
-        env = {"COPILOT_PROVIDERS_CONFIG": str(path)}
-        with (
-            patch("omlx.integrations.copilot.os.environ", env),
-            patch(
-                "omlx.integrations.copilot.subprocess.run",
-                return_value=subprocess.CompletedProcess([], returncode),
-            ),
-            pytest.raises(SystemExit) as exc,
-        ):
-            CopilotIntegration().launch(ctx(model="model"))
-        assert exc.value.code == exit_code
-        assert path.exists()
 
     def test_launch_registry_survives_failed_process_start(self, tmp_path):
         path = tmp_path / "providers.json"
@@ -2785,7 +2792,7 @@ class TestCopilotIntegration:
         with (
             patch("omlx.integrations.copilot.os.environ", env),
             patch(
-                "omlx.integrations.copilot.subprocess.run",
+                "omlx.integrations.copilot.os.execvpe",
                 side_effect=OSError("cannot start Copilot"),
             ),
             pytest.raises(OSError, match="cannot start Copilot"),
@@ -2794,7 +2801,8 @@ class TestCopilotIntegration:
         assert path.exists()
 
     @pytest.mark.skipif(os.name == "nt", reason="requires POSIX process groups")
-    def test_ctrl_c_keeps_copilot_and_registry_alive(self, tmp_path):
+    @pytest.mark.parametrize("exit_mode", ["exit", "error", "terminate"])
+    def test_copilot_process_signals_and_exit(self, tmp_path, exit_mode):
         executable = tmp_path / "copilot"
         executable.write_text(
             f"#!{sys.executable}\n"
@@ -2802,10 +2810,15 @@ class TestCopilotIntegration:
             "from pathlib import Path\n"
             "def interrupted(signum, frame):\n"
             "    print('interrupted', flush=True)\n"
+            "def terminated(signum, frame):\n"
+            "    print('terminated', flush=True)\n"
+            "    sys.exit(128 + signum)\n"
             "signal.signal(signal.SIGINT, interrupted)\n"
+            "signal.signal(signal.SIGTERM, terminated)\n"
             "print(os.environ['COPILOT_PROVIDERS_CONFIG'], flush=True)\n"
-            "sys.stdin.readline()\n"
+            "command = sys.stdin.readline().strip()\n"
             "print('registry exists:', Path(os.environ['COPILOT_PROVIDERS_CONFIG']).exists(), flush=True)\n"
+            "sys.exit(2 if command == 'error' else 0)\n"
         )
         executable.chmod(0o755)
         env = os.environ.copy()
@@ -2817,6 +2830,10 @@ class TestCopilotIntegration:
                 "-c",
                 "from omlx.integrations.base import IntegrationContext; "
                 "from omlx.integrations.copilot import CopilotIntegration; "
+                "from unittest.mock import Mock; "
+                "import omlx.integrations.base as base; "
+                "base.requests.get = Mock(return_value=Mock("
+                "json=lambda: {'data': [{'id': 'model'}]})); "
                 "CopilotIntegration().launch(IntegrationContext("
                 "host='127.0.0.1', port=8000, model='model', "
                 "models_status_map={'model': {'model_type': 'llm'}}))",
@@ -2839,14 +2856,20 @@ class TestCopilotIntegration:
             assert proc.stdout.readline().strip() == "interrupted"
             assert proc.poll() is None
             assert registry.is_file()
-            stdout, stderr = proc.communicate("exit\n", timeout=10)
-            assert proc.returncode == 0, stderr
-            assert "registry exists: True" in stdout
+            if exit_mode == "terminate":
+                proc.terminate()
+                stdout, stderr = proc.communicate(timeout=10)
+                assert "terminated" in stdout
+                assert proc.returncode == 128 + signal.SIGTERM, stderr
+            else:
+                stdout, stderr = proc.communicate(f"{exit_mode}\n", timeout=10)
+                assert proc.returncode == (2 if exit_mode == "error" else 0), stderr
+                assert "registry exists: True" in stdout
             assert registry.exists()
         finally:
-            if proc.poll() is None:
+            with suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGKILL)
-                proc.communicate()
+            proc.communicate(timeout=10)
 
 
 class TestIntegrationSettings:

@@ -6,8 +6,6 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
-import subprocess
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -20,10 +18,6 @@ from omlx.integrations.base import (
 from omlx.utils.install import get_cli_command_prefix
 
 PROVIDER_NAME = "omlx"
-
-
-def _ignore_interrupt(signum, frame):
-    pass
 
 
 def copilot_providers_config_path(env: Mapping[str, str] | None = None) -> Path:
@@ -57,7 +51,7 @@ def copilot_provider_config(ctx: IntegrationContext) -> dict:
         ctx.models_status_map.get(ctx.model, {}).get("model_alias") or ctx.model
     )
     entries = []
-    for model_id, status in chat_models(ctx).items():
+    for model_id, status in chat_models(ctx, prefer_public_inventory=True).items():
         context_window = status.get("max_context_window")
         model_type = status.get("model_type")
         reasoning = status.get("enable_thinking")
@@ -213,14 +207,4 @@ class CopilotIntegration(Integration):
         args = ["copilot", "--model", f"{PROVIDER_NAME}/{model}"]
         args.extend(ctx.extra_args)
 
-        # A caught handler resets on exec, so Copilot receives SIGINT while
-        # the launcher waits without treating Ctrl+C as its own interrupt.
-        previous_handler = signal.signal(signal.SIGINT, _ignore_interrupt)
-        try:
-            result = subprocess.run(args, env=env, check=False)
-        finally:
-            signal.signal(signal.SIGINT, previous_handler)
-        if result.returncode:
-            raise SystemExit(
-                128 - result.returncode if result.returncode < 0 else result.returncode
-            )
+        os.execvpe(args[0], args, env)
