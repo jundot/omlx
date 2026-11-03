@@ -677,6 +677,8 @@ class _PrefillChunkPlan:
     qwen4_accounting: bool
     throttled: bool
     started: float
+    # The prefill helper ran the first layers (the time is only this Mac's).
+    helper: bool = False
 
 
 @dataclass
@@ -1796,9 +1798,12 @@ _DECODE_FAIR_SHARE = 0.5
 _DECODE_STALL_TARGET_MS = 500.0
 _CONTENDED_PREFILL_CHUNK = 512
 _CONTENDED_CHUNK_FLOOR = 256  # below this, per-chunk overheads dominate
-# A helper chunk is only taken once it has arrived, except a tail chunk that
-# runs right after its predecessor; past this the request prefills here.
+# A helper chunk is only taken once it has arrived; the timeout guards a take
+# that finds the frame queue empty after all.
 _HELPER_TAKE_TIMEOUT_S = 120.0
+# While every prefill waits on the helper and nothing decodes, a step sleeps
+# this long on the next chunk instead of spinning the engine loop.
+_HELPER_POLL_S = 0.02
 # Contended chunks stay on the 64-token grid: the DSv4 native indexer only
 # engages when the chunk length is a multiple of 64 (deepseek_v4_model.py
 # L % 64 gate), and an arbitrary tps-derived cap (e.g. 297) would silently
@@ -6843,13 +6848,16 @@ class Scheduler:
                 list(drafter.target_layer_ids),
                 window_start - Scheduler._prefill_start(state),
             )
-        state.helper = session.start(
-            request.request_id,
-            tokens[:-1],
-            Scheduler._helper_chunk_grid(self, state),
-            state.cache if state.base_size > 0 else None,
-            capture,
-        )
+        # Prefix state and the job feed build arrays: keep them on the
+        # engine stream (#2197/#2183).
+        with mx.stream(self._stream):
+            state.helper = session.start(
+                request.request_id,
+                tokens[:-1],
+                Scheduler._helper_chunk_grid(self, state),
+                state.cache if state.base_size > 0 else None,
+                capture,
+            )
         # Without a job the request still prefills here in chunks.
         self.prefilling.append(request)
         self._prefill_states[request.request_id] = state
@@ -6923,7 +6931,8 @@ class Scheduler:
                 )
                 return None
         try:
-            chunk = helper.job.take(timeout=_HELPER_TAKE_TIMEOUT_S)
+            with mx.stream(self._stream):
+                chunk = helper.job.take(timeout=_HELPER_TAKE_TIMEOUT_S)
         except HelperError as error:
             Scheduler._drop_helper(self, state, str(error))
             return None
@@ -6944,7 +6953,19 @@ class Scheduler:
             qwen4_accounting=qwen4_accounting,
             throttled=False,
             started=started,
+            helper=True,
         )
+
+    def _helper_waiting_jobs(self) -> list:
+        """The helper jobs, when every prefilling request waits on one."""
+        jobs = []
+        for request in self.prefilling:
+            state = self._prefill_states.get(request.request_id)
+            helper = state.helper if state is not None else None
+            if helper is None or helper.job.ready():
+                return []
+            jobs.append(helper.job)
+        return jobs
 
     def _drop_helper(self, state: _PrefillState, reason: str) -> None:
         """Prefill the rest of *state* here; every cache is at a chunk end."""
@@ -7301,6 +7322,7 @@ class Scheduler:
         # single chunks the contended cap must bound.
         if (
             len(plans) == 1
+            and not head.helper
             and chunk_dt > 0.0
             and total_tokens >= _CONTENDED_CHUNK_FLOOR
         ):
@@ -7312,6 +7334,9 @@ class Scheduler:
         for index, plan in enumerate(plans):
             state = plan.state
             if done[index] or state.tail_at != state.base_size + state.tokens_processed:
+                continue
+            if state.helper is not None and not state.helper.job.ready():
+                # Its next step takes the tail once the helper sends it.
                 continue
             # The rest is the generation prompt, a few tokens. As a step of its
             # own it would first wait for decode to repay this chunk.
@@ -7859,6 +7884,8 @@ class Scheduler:
                 state.tokens_processed,
                 time.monotonic() - (request.prefill_started_at or time.monotonic()),
             )
+            # A requeued insert must not wait on the finished job.
+            state.helper = None
         self._emit_final_boundary_if_needed(state)
         Scheduler._clear_cache(self)
 
@@ -15779,6 +15806,9 @@ class Scheduler:
             if scheduled or (
                 self.prefilling and (prefill_gate_open or self.running)
             ):
+                waiting = Scheduler._helper_waiting_jobs(self)
+                if waiting and not scheduled and not self.running:
+                    waiting[0].wait(_HELPER_POLL_S)
                 output.has_work = True
             if chunked_rejected:
                 output.outputs.extend(chunked_rejected)

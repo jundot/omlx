@@ -52,7 +52,9 @@ def _manager(model_id: str) -> Any:
     return manager
 
 
-def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
+def _candidate(
+    device: dict[str, Any], model_path: str, adapter: Any, limit: int | None
+) -> dict:
     caps = device.get("caps") or {}
     row = {
         "node_id": device["node_id"],
@@ -68,7 +70,9 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         return {**row, "online": False, "reason": str(error)}
     shared, per_layer = adapter.memory_plan(model_path)
-    held = fit_layers(shared, per_layer, helper_budget(info), len(per_layer))
+    if limit is None:
+        limit = len(per_layer) - 1
+    held = fit_layers(shared, per_layer, helper_budget(info), limit)
     return {
         **row,
         "online": True,
@@ -93,12 +97,18 @@ async def candidates(model_id: str) -> dict:
         raise HTTPException(
             status_code=400, detail="This model has no Prefill Accelerator."
         )
+    # The family's split limit needs the loaded model; before that, any layer
+    # but the last.
+    manager = getattr(entry.engine, "prefill_helper", None) if entry.engine else None
+    limit = adapter.max_split(manager.lm) if manager is not None else None
     devices = get_device_registry().paired()
     loop = asyncio.get_running_loop()
     with ThreadPoolExecutor(max_workers=max(1, min(len(devices), 4))) as pool:
         rows = await asyncio.gather(
             *[
-                loop.run_in_executor(pool, _candidate, d, entry.model_path, adapter)
+                loop.run_in_executor(
+                    pool, _candidate, d, entry.model_path, adapter, limit
+                )
                 for d in devices
             ]
         )

@@ -114,14 +114,18 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
 
 
 _INFO = (
-    "import json, os, shutil, subprocess, omlx, mlx.core as mx; "
+    "import json, os, re, shutil, subprocess, omlx, mlx.core as mx; "
     "i = mx.device_info(); "
-    "p = subprocess.run(['/usr/bin/pmset', '-g', 'ps'], capture_output=True, "
-    "text=True).stdout; "
+    "run = lambda *a: subprocess.run(a, capture_output=True, text=True).stdout; "
+    "p = run('/usr/bin/pmset', '-g', 'ps'); v = run('/usr/bin/vm_stat'); "
+    "page = int(re.search(r'page size of (\\d+)', v).group(1)); "
+    "pages = {k: int(n) for k, n in re.findall(r'Pages (\\w+):\\s+(\\d+)', v)}; "
     "print(json.dumps({'version': omlx.__version__, "
     "'budget': i['max_recommended_working_set_size'], "
     "'memory': i['memory_size'], 'device': i.get('device_name', ''), "
     "'on_battery': 'Battery Power' in p, "
+    "'available': page * sum(pages.get(k, 0) for k in "
+    "('free', 'inactive', 'speculative', 'purgeable')), "
     "'disk_free': shutil.disk_usage(os.path.expanduser('~')).free}))"
 )
 

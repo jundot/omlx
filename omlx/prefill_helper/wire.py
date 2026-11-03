@@ -35,6 +35,16 @@ def tune(sock: socket.socket) -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    # A pulled cable or a sleeping Mac sends no FIN; notice it in ~25 s
+    # instead of the system's two hours.
+    for name, value in (
+        ("TCP_KEEPALIVE", 10),
+        ("TCP_KEEPINTVL", 5),
+        ("TCP_KEEPCNT", 3),
+    ):
+        option = getattr(socket, name, None)
+        if option is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, option, value)
 
 
 def to_host(array: mx.array) -> tuple[np.ndarray, str]:

@@ -8,7 +8,7 @@ server can show it, stop it, and explain a model load that no longer fits.
 from __future__ import annotations
 
 import json
-import os
+import subprocess
 from pathlib import Path
 
 
@@ -16,12 +16,30 @@ def active_marker_path() -> Path:
     return Path.home() / ".omlx" / "prefill-helper" / "active.json"
 
 
+def _is_helper(pid: int) -> bool:
+    """Whether ``pid`` is still a prefill helper (pids are reused)."""
+    try:
+        command = subprocess.run(
+            ["/bin/ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "omlx.prefill_helper.worker" in command
+
+
 def active_lending() -> dict | None:
     """The helper running on this Mac, if its process is alive."""
     try:
         marker = json.loads(active_marker_path().read_text())
-        os.kill(int(marker["pid"]), 0)
+        pid = int(marker["pid"])
     except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not _is_helper(pid):
+        # A helper that died without clearing its marker.
         return None
     return marker
 

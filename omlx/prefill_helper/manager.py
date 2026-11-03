@@ -40,6 +40,8 @@ _RESERVE_BYTES = 8 << 30
 _OS_BYTES = 16 << 30
 _RETRY_DELAYS_S = (15.0, 30.0, 60.0, 120.0, 300.0)
 _WATCH_S = 2.0
+# A helper with open jobs that sends nothing for this long is gone.
+_STALL_S = 60.0
 _SPEEDS_LOCK = threading.Lock()
 
 
@@ -56,6 +58,9 @@ def helper_budget(info: dict) -> int:
     budget = int(info["budget"])
     if info.get("memory"):
         budget = min(budget, int(info["memory"]) - _OS_BYTES)
+    if info.get("available"):
+        # Models the helper Mac's own server holds stay where they are.
+        budget = min(budget, int(info["available"]))
     return budget
 
 
@@ -171,11 +176,12 @@ class PrefillHelperManager:
                 return
             if kind == "configure":
                 _, node_id, layers = command
-                changed = (node_id, layers) != (self.node_id, self.fixed_layers)
-                self.node_id, self.fixed_layers = node_id, layers
-                if not changed and self._session is not None:
+                if (node_id, layers) == (self.node_id, self.fixed_layers):
+                    # Saving other settings must not restart a stopped helper.
                     continue
+                # Speeds are saved under the helper that measured them.
                 self._teardown()
+                self.node_id, self.fixed_layers = node_id, layers
                 wanted, attempt = node_id is not None, 0
                 if not wanted:
                     self._set("off")
@@ -190,6 +196,10 @@ class PrefillHelperManager:
             if not wanted:
                 continue
             if self._session is not None:
+                client = self._session.client
+                if client.stalled(_STALL_S):
+                    self._session.note_failure("the helper stopped answering")
+                    client.close()
                 if self._session.alive:
                     self._save_speeds()
                     continue
@@ -288,8 +298,13 @@ class PrefillHelperManager:
 
     def _held_layers(self, name: str, budget: int) -> int:
         shared, per_layer = self.adapter.memory_plan(self.model_path)
-        held = fit_layers(shared, per_layer, budget, self.adapter.max_split(self.lm))
+        limit = self.adapter.max_split(self.lm)
+        held = fit_layers(shared, per_layer, budget, limit)
         if self.fixed_layers is not None:
+            if self.fixed_layers > limit:
+                raise _PermanentError(
+                    f"At most {limit} layers of this model can run on a helper."
+                )
             if self.fixed_layers > held:
                 raise _PermanentError(
                     f"{self.fixed_layers} layers do not fit in {name}'s GPU memory; "

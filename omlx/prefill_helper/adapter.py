@@ -27,6 +27,12 @@ HostArrays = dict[str, tuple[np.ndarray, str]]
 _LAYER = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
+def language_tensor(tensor: str) -> bool:
+    """Whether a checkpoint tensor belongs to the language model, in MLX
+    (``language_model.``) or Hugging Face (``model.language_model.``) layout."""
+    return tensor.removeprefix("model.").startswith("language_model.")
+
+
 def _tensors(model_path: Path) -> dict[str, tuple[str, int]]:
     """File and bytes of each tensor, from the safetensors headers only."""
     index = model_path / "model.safetensors.index.json"

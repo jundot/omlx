@@ -47,6 +47,7 @@ class HelperJob:
     def __init__(self, client: HelperClient, job_id: str, chunks: list[int]):
         self.client, self.job_id, self.chunks = client, job_id, chunks
         self._frames: queue.Queue = queue.Queue()
+        self._arrived = threading.Event()
         self._taken = threading.Condition()
         self.acked = -1
         self.finished = False
@@ -55,12 +56,18 @@ class HelperJob:
         """True when the next chunk (or an error) is waiting."""
         return not self._frames.empty()
 
+    def wait(self, timeout: float) -> bool:
+        """Block until a frame is waiting or ``timeout`` seconds pass."""
+        return self.ready() or self._arrived.wait(timeout)
+
     def take(self, timeout: float | None = None) -> Chunk:
         """The next chunk as MLX arrays. Raises HelperError on failure."""
         try:
             meta, arrays = self._frames.get(timeout=timeout)
         except queue.Empty as error:
             raise HelperError("prefill helper did not answer in time") from error
+        if self._frames.empty():
+            self._arrived.clear()
         if meta.get("op") != "chunk":
             self._finish()
             raise HelperError(meta.get("error") or "prefill helper stopped")
@@ -91,6 +98,7 @@ class HelperJob:
 
     def _deliver(self, meta: dict, arrays: dict) -> None:
         self._frames.put((meta, arrays))
+        self._arrived.set()
 
     def _finish(self) -> None:
         if not self.finished:
@@ -141,6 +149,8 @@ class HelperClient:
         self._open = threading.Event()
         self.alive = True
         self.stopped_by_helper = False
+        # Last frame from the helper, or the last job sent to it.
+        self.heard = time.monotonic()
         threading.Thread(target=self._receive, daemon=True).start()
         threading.Thread(target=self._keep_warm, daemon=True).start()
 
@@ -158,6 +168,9 @@ class HelperClient:
             raise HelperError("prefill helper connection is closed")
         job = HelperJob(self, f"job-{next(self._ids)}", list(chunks))
         with self._lock:
+            if not self._jobs:
+                # The helper was idle; its silence until now does not count.
+                self.heard = time.monotonic()
             self._jobs[job.job_id] = job
             self._open.set()
         arrays = {"tokens": (np.asarray(tokens, np.int32).reshape(1, -1), "int32")}
@@ -195,6 +208,7 @@ class HelperClient:
         try:
             while True:
                 meta, arrays = wire.recv(self.sock)
+                self.heard = time.monotonic()
                 if meta.get("op") == "stopped":
                     self.stopped_by_helper = True
                     self._fail("stopped on the helper Mac")
@@ -231,3 +245,12 @@ class HelperClient:
     def job_count(self) -> int:
         with self._lock:
             return len(self._jobs)
+
+    def stalled(self, seconds: float) -> bool:
+        """True when jobs are open but the helper has sent nothing for
+        ``seconds`` (a frozen helper, or a link that dropped silently)."""
+        return (
+            self.alive
+            and bool(self.job_count())
+            and (time.monotonic() - self.heard > seconds)
+        )

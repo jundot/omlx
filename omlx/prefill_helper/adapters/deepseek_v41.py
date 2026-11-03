@@ -20,7 +20,7 @@ import numpy as np
 from ...patches.deepseek_v41 import growth
 from ...patches.deepseek_v41.loading import load
 from ...patches.deepseek_v41.storage import decode_rows, dedupe_tuple_ids
-from ..adapter import Arrays, Capture, HostArrays, StageAdapter
+from ..adapter import Arrays, Capture, HostArrays, StageAdapter, language_tensor
 
 _SLOTS = 7
 # Compressed KV and index keys grow with the prompt on KV-source layers; the
@@ -110,7 +110,7 @@ class DeepseekV41Adapter(StageAdapter):
         return (
             ".engram.embed." not in tensor
             and ".mtp." not in tensor
-            and tensor.startswith("language_model.")
+            and language_tensor(tensor)
         )
 
     def keep_first(self, lm: Any, k: int) -> None:

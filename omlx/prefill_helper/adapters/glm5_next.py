@@ -26,7 +26,7 @@ from ...utils.model_loading import (
     expand_per_layer_quant_keys,
     maybe_apply_pre_load_patches,
 )
-from ..adapter import Arrays, Capture, HostArrays, StageAdapter
+from ..adapter import Arrays, Capture, HostArrays, StageAdapter, language_tensor
 
 
 def _layers(lm: Any) -> list:
@@ -116,7 +116,7 @@ class Glm5NextAdapter(StageAdapter):
 
     def resident(self, tensor: str) -> bool:
         # Vision and the Lightning MTP head never load on the helper.
-        return tensor.startswith("language_model.") and ".mtp." not in tensor
+        return language_tensor(tensor) and ".mtp." not in tensor
 
     def keep_first(self, lm: Any, k: int) -> None:
         lm.model.layers = _layers(lm)[:k]

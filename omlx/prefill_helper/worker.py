@@ -69,8 +69,18 @@ class _Session:
 class HelperServer:
     """Serves prompt chunks for layers ``[0, k)`` of one loaded model."""
 
-    def __init__(self, lm: Any, adapter: Any, k: int, token: bytes, info: dict):
+    def __init__(
+        self,
+        lm: Any,
+        adapter: Any,
+        k: int,
+        token: bytes,
+        info: dict,
+        memory_limit: int = 0,
+    ):
         self.lm, self.adapter, self.k, self.token = lm, adapter, k, token
+        # A job whose caches outgrow this hands the prompt back to the host.
+        self.memory_limit = memory_limit
         self.info = info
         self.state = "idle"
         self._session: _Session | None = None
@@ -236,6 +246,10 @@ class HelperServer:
             if capture is not None:
                 boundary.update({f"cap.{i}": v for i, v in capture.out.items()})
             elapsed = time.perf_counter() - began
+            if self.memory_limit and mx.get_active_memory() > self.memory_limit:
+                raise RuntimeError(
+                    "the helper Mac has no GPU memory left for this prompt"
+                )
             arrays = {f"b:{n}": wire.to_host(v) for n, v in boundary.items()}
             arrays.update({f"s:{n}": wire.to_host(v) for n, v in state.items()})
             session.outbox.put(
@@ -346,7 +360,14 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
 
-    server = HelperServer(lm, adapter, args.layers, token, hello)
+    server = HelperServer(
+        lm,
+        adapter,
+        args.layers,
+        token,
+        hello,
+        memory_limit=int(info["max_recommended_working_set_size"] * 0.95),
+    )
 
     def stop(*_: Any) -> None:
         _clear_marker(marker)

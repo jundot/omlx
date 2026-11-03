@@ -43,7 +43,7 @@ from ...utils.model_loading import (
     maybe_apply_pre_load_patches,
 )
 from .. import wire
-from ..adapter import Arrays, Capture, HostArrays, StageAdapter
+from ..adapter import Arrays, Capture, HostArrays, StageAdapter, language_tensor
 
 _WARM = object()
 
@@ -133,7 +133,8 @@ def _ple_reader(table: Any, language: Any) -> Callable[[np.ndarray], tuple]:
                 (buffers[f], _SAFETENSORS_DTYPES.get(dtypes[f], dtypes[f].lower()))
                 for f in families
             ]
-            return arrays, [bits or 0, group_size or 0, 1, 0]
+            fp8 = int(str(dtypes[0]).upper().startswith("F8"))
+            return arrays, [bits or 0, group_size or 0, 1, fp8]
 
         return read_disk
     fused = getattr(table, "fused", None)
@@ -250,9 +251,9 @@ class Qwen4ExpAdapter(StageAdapter):
     def resident(self, tensor: str) -> bool:
         # The PLE table stays on this Mac; vision and MTP never load.
         return (
-            tensor.startswith("language_model.")
+            language_tensor(tensor)
             and ".mtp." not in tensor
-            and ".ngram_embedding.shards." not in tensor
+            and ".ngram_embedding.shard" not in tensor
         )
 
     def keep_first(self, lm: Any, k: int) -> None:

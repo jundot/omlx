@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 
 from .adapter import StageAdapter
-from .client import Chunk, HelperClient, HelperError, HelperJob
+from .client import Chunk, HelperClient, HelperJob
 
 logger = logging.getLogger(__name__)
 
@@ -128,18 +128,24 @@ class PrefillHelperSession:
         ``capture`` names a block drafter's layers and the first job row of
         its window; the helper returns the ones it runs.
         """
+        with self._lock:
+            stale = self._jobs.pop(request_id, None)
+        if stale is not None:
+            # A retried request must not leave its old job holding the queue.
+            stale.cancel()
         layers = self.pick_layers()
-        prefix = self.adapter.prefix_state(cache, layers) if cache else None
-        feed = self.adapter.job_feed(self.lm, cache, tokens, grid, layers)
         wanted = None
         if capture is not None:
             below = [i for i in capture[0] if i < layers]
             wanted = {"layers": below, "from": int(capture[1])} if below else None
         try:
+            prefix = self.adapter.prefix_state(cache, layers) if cache else None
+            feed = self.adapter.job_feed(self.lm, cache, tokens, grid, layers)
             job = self.client.submit(
                 tokens, grid, prefix, layers=layers, feed=feed, capture=wanted
             )
-        except HelperError as error:
+        except Exception as error:  # the request prefills here instead
+            logger.warning("Prefill helper %s did not take a job: %s", self.name, error)
             self.note_failure(str(error))
             return None
         with self._lock:

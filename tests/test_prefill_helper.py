@@ -239,6 +239,42 @@ def test_helper_over_a_socket_matches_whole_model():
     _assert_same_cache(reference, cache)
 
 
+def test_client_notices_a_helper_that_stops_sending():
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+
+    def silent():
+        sock, _ = listener.accept()
+        wire.authenticate(sock, TOKEN, server=True)
+        wire.send(sock, {"op": "hello", "protocol": wire.PROTOCOL})
+        time.sleep(2)
+        sock.close()
+
+    thread = threading.Thread(target=silent, daemon=True)
+    thread.start()
+    client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
+    assert not client.stalled(0.05)
+    client.submit(np.arange(3, 9, dtype=np.int32), [6])
+    time.sleep(0.2)
+    assert client.stalled(0.1)
+    client.close()
+    thread.join(5)
+    listener.close()
+
+
+def test_a_retried_request_cancels_its_old_job():
+    host, k = _model(tiny()), 2
+    session, listener, thread = _session(host, _helper_model(tiny(), k), k)
+    tokens = np.arange(3, 21, dtype=np.int32)
+    first = session.start("req-1", tokens, [6, 6, 6], None)
+    second = session.start("req-1", tokens, [6, 6, 6], None)
+    assert first.job.finished and not second.job.finished
+    session.close()
+    thread.join(10)
+    listener.close()
+
+
 def test_helper_rejects_a_wrong_token():
     listener, thread = _serve(_helper_model(tiny(), 2), 2, once=False)
     with pytest.raises((wire.ProtocolError, ConnectionError)):
@@ -544,6 +580,11 @@ def test_helper_files_leave_out_engram_tables_and_later_layers(tmp_path):
         json.dumps({"weight_map": weight_map})
     )
     (tmp_path / "config.json").write_text("{}")
+    # Hugging Face layout names count as language-model tensors too.
+    assert QWEN4.resident("model.language_model.layers.0.mlp.gate.weight")
+    assert not QWEN4.resident(
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_3.weight"
+    )
     files = launcher.required_files(tmp_path, 2, DSV41)
     assert sorted(files) == [
         "a.safetensors",
@@ -673,7 +714,7 @@ def test_manager_blocks_what_a_retry_cannot_fix(tmp_path):
     _wait_state(manager, "error", reason="Not even one layer")
     fake.budget = 60 << 30
     manager.configure("node-1", 3)
-    _wait_state(manager, "error", reason="at most 2")
+    _wait_state(manager, "error", reason="At most 2 layers")
     fake.paired = False
     manager.configure("node-2", None)
     _wait_state(manager, "error", reason="not paired")
@@ -716,7 +757,25 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     again.configure("node-1", None)
     _wait_state(again, "ready")
     assert (attached[-1].unit_helper, attached[-1].unit_host) == measured
+    # Switching Macs keeps the measured speeds under the Mac that measured them.
+    again.configure("node-2", None)
+    _wait_state(again, "ready")
+    saved = json.loads(speeds.read_text())
+    assert [key.split(":")[0] for key in saved] == ["node-1"]
     again.close()
+
+
+def test_saving_other_settings_leaves_a_stopped_helper_stopped(tmp_path):
+    attached, fake = [], _FakeLauncher(None)
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
+    manager.configure("node-1", None)
+    _wait_state(manager, "ready")
+    manager.stop()
+    _wait_state(manager, "stopped")
+    manager.configure("node-1", None)
+    time.sleep(0.3)
+    assert manager.status()["state"] == "stopped" and len(fake.servers) == 1
+    manager.close()
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +809,7 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
 
     marker = tmp_path / "active.json"
     monkeypatch.setattr(lending, "active_marker_path", lambda: marker)
+    monkeypatch.setattr(lending, "_is_helper", lambda pid: pid == os.getpid())
     assert client.get(f"{base}/lending").json() == {"active": False}
     marker.write_text(json.dumps({"pid": os.getpid(), "host": "Mac Studio"}))
     assert client.get(f"{base}/lending").json()["host"] == "Mac Studio"
@@ -873,6 +933,7 @@ def test_scheduler_glm_helper_prefill_matches_local():
 def test_lending_note_names_the_host_while_the_helper_runs(tmp_path, monkeypatch):
     marker = tmp_path / "active.json"
     monkeypatch.setattr(lending, "active_marker_path", lambda: marker)
+    monkeypatch.setattr(lending, "_is_helper", lambda pid: pid == os.getpid())
     assert lending.lending_note() == ""
     marker.write_text(
         json.dumps({"pid": os.getpid(), "host": "HJKmac", "active_gib": 82.4})
