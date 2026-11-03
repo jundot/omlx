@@ -152,6 +152,70 @@ struct TalkPrefs: Codable, Equatable, Sendable {
     }
 }
 
+/// Which oMLX server answers Ask AI.
+enum AskAIServerMode: String, Codable, Equatable, Sendable, CaseIterable {
+    /// The server this app runs.
+    case thisMac
+    /// Another oMLX server on the network, such as a Mac Studio.
+    case remote
+}
+
+/// Where Ask AI sends its requests: the server this app runs, or another oMLX server.
+struct AskAIEndpoint: Equatable, Sendable {
+    /// Port a bare remote address uses: oMLX's default, or 443 for `https`.
+    static let defaultPort = 8000
+    static let defaultSecurePort = 443
+
+    var scheme: String
+    var host: String
+    var port: Int
+    var apiKey: String?
+    var isRemote: Bool
+
+    /// The server this app runs, as set in settings.json.
+    init(local config: AppConfig) {
+        scheme = "http"
+        host = config.host
+        port = config.port
+        apiKey = config.apiKey
+        isRemote = false
+    }
+
+    /// Parses `host`, `host:port`, or `http(s)://host[:port]`. Nil when the
+    /// text is empty or not an address this app can reach.
+    init?(remoteAddress: String, apiKey: String?) {
+        let trimmed = remoteAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let text = trimmed.contains("://") ? trimmed : "http://" + trimmed
+        guard let parts = URLComponents(string: text),
+              let scheme = parts.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              // Foundation keeps the brackets of an IPv6 literal; the app stores bare hosts.
+              let host = parts.host?.trimmingCharacters(in: CharacterSet(charactersIn: "[]")), !host.isEmpty,
+              parts.path.isEmpty || parts.path == "/"
+        else { return nil }
+        self.scheme = scheme
+        self.host = host
+        self.port = parts.port ?? (scheme == "https" ? Self.defaultSecurePort : Self.defaultPort)
+        let key = apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.apiKey = (key?.isEmpty ?? true) ? nil : key
+        self.isRemote = true
+    }
+
+    func httpURL(path: String) -> URL? {
+        AppConfig.httpURL(host: host, port: port, path: path, scheme: scheme)
+    }
+
+    func webSocketURL(path: String, query: [URLQueryItem] = []) -> URL? {
+        AppConfig.webSocketURL(host: host, port: port, path: path, query: query, scheme: scheme)
+    }
+
+    /// A client for the model list and other admin calls on this server.
+    @MainActor
+    func makeClient() -> OMLXClient {
+        OMLXClient(host: host, port: port, apiKey: apiKey, scheme: scheme)
+    }
+}
+
 struct AskAIPrefs: Codable, Equatable, Sendable {
     static let defaultPanelWidth: Double = 680
     static let defaultPrompt = """
@@ -189,6 +253,12 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
     /// Return sends and Shift-Return inserts the newline. Command-Return
     /// sends either way.
     var sendOnEnter = false
+    /// Which oMLX server answers. Saved settings from before this existed
+    /// decode as `.thisMac`.
+    var serverMode = AskAIServerMode.thisMac
+    /// What the user typed for the other server: `host`, `host:port`, or
+    /// `http(s)://host[:port]`. Its API key lives in the Keychain, not here.
+    var remoteAddress = ""
 
     init() {}
 
@@ -213,6 +283,8 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
         gpuPowerLimitWatts = c.lenient(Int.self, .gpuPowerLimitWatts) ?? fallback.gpuPowerLimitWatts
         talk = c.lenient(TalkPrefs.self, .talk) ?? fallback.talk
         sendOnEnter = c.lenient(Bool.self, .sendOnEnter) ?? fallback.sendOnEnter
+        serverMode = c.lenient(AskAIServerMode.self, .serverMode) ?? fallback.serverMode
+        remoteAddress = c.lenient(String.self, .remoteAddress) ?? fallback.remoteAddress
         promptDefaultsApplied = c.lenient(Bool.self, .promptDefaultsApplied) ?? false
         if !promptDefaultsApplied {
             if defaultSystemPrompt.isEmpty { defaultSystemPrompt = Self.defaultPrompt }
@@ -234,6 +306,21 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
         AskAIProfile(model: defaultModel, systemPrompt: defaultSystemPrompt,
                      allowThinking: defaultAllowThinking, autoCopy: defaultAutoCopy,
                      tools: defaultTools)
+    }
+
+    /// The server Ask AI should use, or nil when "another server" is chosen
+    /// but its address is empty or invalid. `remoteKey` is the Keychain value.
+    func endpoint(local config: AppConfig, remoteKey: String?) -> AskAIEndpoint? {
+        switch serverMode {
+        case .thisMac: AskAIEndpoint(local: config)
+        case .remote: AskAIEndpoint(remoteAddress: remoteAddress, apiKey: remoteKey)
+        }
+    }
+
+    /// `endpoint(local:remoteKey:)`, reading the remote key from the Keychain
+    /// only when another server is chosen.
+    func currentEndpoint(local config: AppConfig) -> AskAIEndpoint? {
+        endpoint(local: config, remoteKey: serverMode == .remote ? Keychain.read(.askAIRemoteKey) : nil)
     }
 }
 

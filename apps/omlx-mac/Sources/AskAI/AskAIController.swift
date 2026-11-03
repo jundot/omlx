@@ -45,6 +45,8 @@ final class AskAIController {
     @ObservationIgnored private var copiedToken = 0
     /// Model id -> `model_type` from the admin model list, for the image check.
     @ObservationIgnored private var modelTypes: [String: String] = [:]
+    /// The server `modelTypes` came from.
+    @ObservationIgnored private var modelTypesSource: AskAIEndpoint?
     @ObservationIgnored private var isSubmitting = false
     @ObservationIgnored private var lastClosedAt = Date.distantPast
     /// The app in front when the panel opened, for the `{app}` placeholder.
@@ -149,6 +151,7 @@ final class AskAIController {
         inputFocus.focus()
         // Model types only feed the image check and rarely change; a miss
         // refreshes on demand.
+        dropModelTypesIfServerChanged()
         if modelTypes.isEmpty {
             Task { await refreshModelTypes() }
         }
@@ -235,6 +238,7 @@ final class AskAIController {
             return
         }
         notice = nil
+        dropModelTypesIfServerChanged()
         let images = attachments
         let submittedDraft = draft
         guard let pending = resolveSend(hasImages: !images.isEmpty) else { return }
@@ -310,11 +314,28 @@ final class AskAIController {
         return latest
     }
 
+    /// The server to ask: this Mac's, or the other one chosen in settings.
+    /// Nil when "another server" is chosen but its address is empty or invalid.
+    func currentEndpoint() -> AskAIEndpoint? {
+        guard let config = services?.config else { return nil }
+        return store.prefs.currentEndpoint(local: config)
+    }
+
+    /// Model types describe one server, so switching servers drops them.
+    private func dropModelTypesIfServerChanged() {
+        let current = currentEndpoint()
+        guard current != modelTypesSource else { return }
+        modelTypes = [:]
+        modelTypesSource = current
+    }
+
     private func start(_ pending: PendingSend, images: [AskAIImage], submittedDraft: String) {
-        guard let config = services?.config,
-              let url = AppConfig.httpURL(host: config.host, port: config.port,
-                                          path: "/v1/chat/completions")
-        else { return }
+        guard let endpoint = currentEndpoint(),
+              let url = endpoint.httpURL(path: "/v1/chat/completions")
+        else {
+            if store.prefs.serverMode == .remote { notice = Self.noServerAddressNotice }
+            return
+        }
         if pending.startsConversation {
             conversation.begin(profile: pending.profile, command: pending.command,
                                context: PromptContext(app: sourceApp))
@@ -323,14 +344,13 @@ final class AskAIController {
         }
         let tools = AskAITool.tools(for: pending.profile.tools,
                                     vision: modelTypes[pending.profile.model] == "vlm")
-        let runner = tools.isEmpty ? nil : AskAIToolRunner(host: config.host, port: config.port,
-                                                           apiKey: config.apiKey)
+        let runner = tools.isEmpty ? nil : AskAIToolRunner(endpoint: endpoint)
         // A reset during the image check leaves nothing to follow up on.
         // Keep the input so the user can send again.
         guard conversation.send(pending.text, images: images,
                                 gpuPowerLimitW: store.prefs.requestGPUPowerLimit,
                                 tools: tools,
-                                using: ChatCompletionClient(url: url, apiKey: config.apiKey),
+                                using: ChatCompletionClient(url: url, apiKey: endpoint.apiKey),
                                 runner: runner)
         else { return }
         if draft == submittedDraft { draft = "" }
@@ -362,8 +382,11 @@ final class AskAIController {
     }
 
     private func refreshModelTypes() async {
-        guard let client = services?.client,
+        dropModelTypesIfServerChanged()
+        guard let endpoint = currentEndpoint(),
+              let client = endpoint.isRemote ? endpoint.makeClient() : services?.client,
               let models = try? await client.listModels().models else { return }
+        modelTypesSource = endpoint
         modelTypes = Dictionary(models.map { ($0.id, $0.modelType ?? "") },
                                 uniquingKeysWith: { first, _ in first })
     }
@@ -373,6 +396,15 @@ final class AskAIController {
             text: String(localized: "askai.notice.unknown_preset",
                          defaultValue: "No preset named /\(command). Add it in Ask AI settings.",
                          comment: "Shown when the typed slash command matches no preset"),
+            offersSettings: true
+        )
+    }
+
+    private static var noServerAddressNotice: Notice {
+        Notice(
+            text: String(localized: "askai.notice.no_server_address",
+                         defaultValue: "Enter the other server's address in Ask AI settings.",
+                         comment: "Shown when Ask AI is set to use another server but its address is empty or not valid"),
             offersSettings: true
         )
     }

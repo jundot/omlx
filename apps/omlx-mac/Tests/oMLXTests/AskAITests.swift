@@ -194,6 +194,93 @@ final class AskAITests: XCTestCase {
         XCTAssertEqual(prefs.talk, TalkPrefs())
     }
 
+    func testSavedPrefsWithoutAServerChoiceUseThisMac() throws {
+        // Settings saved before "another server" existed must keep talking to this Mac.
+        let old = try JSONDecoder().decode(AskAIPrefs.self, from: Data(#"{"enabled":true}"#.utf8))
+        XCTAssertEqual(old.serverMode, .thisMac)
+        XCTAssertEqual(old.remoteAddress, "")
+
+        // A choice that is not a known mode falls back without dropping the other fields.
+        let bad = try JSONDecoder().decode(
+            AskAIPrefs.self,
+            from: Data(#"{"enabled":true,"serverMode":"elsewhere","remoteAddress":"studio.local"}"#.utf8)
+        )
+        XCTAssertEqual(bad.serverMode, .thisMac)
+        XCTAssertEqual(bad.remoteAddress, "studio.local")
+        XCTAssertTrue(bad.enabled)
+
+        var chosen = AskAIPrefs()
+        chosen.serverMode = .remote
+        chosen.remoteAddress = "studio.local:8000"
+        let roundTrip = try JSONDecoder().decode(AskAIPrefs.self, from: JSONEncoder().encode(chosen))
+        XCTAssertEqual(roundTrip.serverMode, .remote)
+        XCTAssertEqual(roundTrip.remoteAddress, "studio.local:8000")
+    }
+
+    func testRemoteAddressParsing() throws {
+        func parse(_ text: String) -> AskAIEndpoint? {
+            AskAIEndpoint(remoteAddress: text, apiKey: nil)
+        }
+        let bare = try XCTUnwrap(parse("studio.local"))
+        XCTAssertEqual([bare.scheme, bare.host], ["http", "studio.local"])
+        XCTAssertEqual(bare.port, AskAIEndpoint.defaultPort)
+
+        let withPort = try XCTUnwrap(parse("  studio.local:9000/ "))
+        XCTAssertEqual([withPort.scheme, withPort.host], ["http", "studio.local"])
+        XCTAssertEqual(withPort.port, 9000)
+
+        let address = try XCTUnwrap(parse("http://192.168.68.83:8000"))
+        XCTAssertEqual([address.scheme, address.host], ["http", "192.168.68.83"])
+        XCTAssertEqual(address.port, 8000)
+
+        // https without a port is the TLS default, not oMLX's 8000.
+        let secure = try XCTUnwrap(parse("https://omlx.example.com"))
+        XCTAssertEqual(secure.scheme, "https")
+        XCTAssertEqual(secure.port, AskAIEndpoint.defaultSecurePort)
+
+        let ipv6 = try XCTUnwrap(parse("[::1]:8000"))
+        XCTAssertEqual(ipv6.host, "::1")
+        XCTAssertEqual(ipv6.httpURL(path: "/v1/models")?.absoluteString, "http://[::1]:8000/v1/models")
+
+        // Nothing that cannot be reached as an oMLX server: no address, another protocol, or a path.
+        for text in ["", "   ", "ftp://studio.local", "http://studio.local/v1", "http://"] {
+            XCTAssertNil(parse(text), "\(text) should not parse")
+        }
+
+        // A blank key means no key.
+        XCTAssertNil(AskAIEndpoint(remoteAddress: "studio.local", apiKey: "  ")?.apiKey)
+        XCTAssertEqual(AskAIEndpoint(remoteAddress: "studio.local", apiKey: " sk-x \n")?.apiKey, "sk-x")
+    }
+
+    func testEndpointFollowsTheServerChoice() throws {
+        let local = AppConfig(bindAddress: "0.0.0.0", port: 8123, apiKey: "local-key",
+                              basePath: "/tmp/omlx-test", modelDir: "/tmp/omlx-test/models",
+                              hfEndpoint: "")
+        var prefs = AskAIPrefs()
+
+        // This Mac: the app's own server and key, whatever the remote fields hold.
+        prefs.remoteAddress = "studio.local"
+        let here = try XCTUnwrap(prefs.endpoint(local: local, remoteKey: "remote-key"))
+        XCTAssertFalse(here.isRemote)
+        XCTAssertEqual(here.apiKey, "local-key")
+        XCTAssertEqual(here.httpURL(path: "/v1/chat/completions")?.absoluteString,
+                       "http://127.0.0.1:8123/v1/chat/completions")
+
+        // Another server: its address and its own key; the local key must not leak to it.
+        prefs.serverMode = .remote
+        let there = try XCTUnwrap(prefs.endpoint(local: local, remoteKey: "remote-key"))
+        XCTAssertTrue(there.isRemote)
+        XCTAssertEqual(there.apiKey, "remote-key")
+        XCTAssertEqual(there.httpURL(path: "/v1/web/search")?.absoluteString,
+                       "http://studio.local:8000/v1/web/search")
+        XCTAssertEqual(there.webSocketURL(path: "/v1/realtime")?.absoluteString,
+                       "ws://studio.local:8000/v1/realtime")
+
+        // No address yet: nothing to send to, rather than falling back to this Mac.
+        prefs.remoteAddress = ""
+        XCTAssertNil(prefs.endpoint(local: local, remoteKey: "remote-key"))
+    }
+
     func testGPUPowerLimitIsClampedToTheServerRange() throws {
         let json = #"{"gpuPowerLimitEnabled":true,"gpuPowerLimitWatts":1}"#
         var prefs = try JSONDecoder().decode(AskAIPrefs.self, from: Data(json.utf8))

@@ -44,6 +44,8 @@ struct AskAIScreen: View {
     @State private var gpuPowerLimitSupported: Bool?
     @State private var microphone = MicrophoneAccess.state
     @State private var showsMicrophoneGuide = false
+    /// Bumped when the saved API key for the other server changes, so the model list reloads.
+    @State private var keyRevision = 0
 
     var body: some View {
         let askAI = services.askAI
@@ -53,6 +55,9 @@ struct AskAIScreen: View {
             case nil:
                 ModesSection(store: askAI.store, microphone: microphone,
                              showsMicrophoneGuide: $showsMicrophoneGuide)
+                if prefs.enabled || prefs.talk.enabled {
+                    ServerSection(store: askAI.store, keyRevision: $keyRevision)
+                }
                 if prefs.enabled {
                     TextSection(controller: askAI, store: askAI.store, models: models,
                                 gpuPowerLimitSupported: gpuPowerLimitSupported)
@@ -63,11 +68,7 @@ struct AskAIScreen: View {
                                  microphone: microphone, showsMicrophoneGuide: $showsMicrophoneGuide)
                 }
                 if modelsUnavailable, prefs.enabled || prefs.talk.enabled {
-                    HintLine(text: String(
-                        localized: "askai.models.unavailable",
-                        defaultValue: "Start the server to pick from installed models.",
-                        comment: "Hint when the model list could not be loaded"
-                    ))
+                    HintLine(text: Self.modelsUnavailableHint(prefs))
                     .padding(.horizontal, 28)
                     .padding(.top, 6)
                 }
@@ -101,23 +102,56 @@ struct AskAIScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             microphone = MicrophoneAccess.state
         }
-        // Reload when the server comes up after the screen opened.
-        .task(id: [prefs.enabled, prefs.talk.enabled, services.serverState.isRunningLike]) {
+        // Reload when the server comes up after the screen opened, or when
+        // Ask AI is pointed at a different server.
+        .task(id: ModelsLoadKey(textEnabled: prefs.enabled, voiceEnabled: prefs.talk.enabled,
+                                localServerRunning: services.serverState.isRunningLike,
+                                serverMode: prefs.serverMode, remoteAddress: prefs.remoteAddress,
+                                keyRevision: keyRevision)) {
             guard prefs.enabled || prefs.talk.enabled else { return }
             await loadModels()
         }
     }
 
+    /// Why the model list is empty: this Mac's server is not running, the
+    /// other server has no address yet, or it did not answer.
+    private static func modelsUnavailableHint(_ prefs: AskAIPrefs) -> String {
+        guard prefs.serverMode == .remote else {
+            return String(
+                localized: "askai.models.unavailable",
+                defaultValue: "Start the server to pick from installed models.",
+                comment: "Hint when the model list could not be loaded"
+            )
+        }
+        if AskAIEndpoint(remoteAddress: prefs.remoteAddress, apiKey: nil) == nil {
+            return String(
+                localized: "askai.models.no_address",
+                defaultValue: "Enter the other server's address to pick from its models.",
+                comment: "Hint when Ask AI uses another server and no valid address is entered yet"
+            )
+        }
+        return String(
+            localized: "askai.models.unavailable_remote",
+            defaultValue: "Can't reach the other server. Check its address and API key.",
+            comment: "Hint when Ask AI uses another server and its model list could not be loaded"
+        )
+    }
+
     /// Chat-capable models only; embedding, audio, and virtual entries
     /// cannot answer a chat request.
+    static func isChatModel(type: String?, virtual: Bool?) -> Bool {
+        let type = type ?? ""
+        return (type.isEmpty || type == "llm" || type == "vlm") && virtual != true
+    }
+
+    /// Lists the models on the server Ask AI is set to use.
     private func loadModels() async {
         do {
-            let all = try await services.client.listModels().models
+            guard let endpoint = services.askAI.currentEndpoint() else { throw OMLXClientError.invalidURL }
+            let client = endpoint.isRemote ? endpoint.makeClient() : services.client
+            let all = try await client.listModels().models
             gpuPowerLimitSupported = all.first?.gpuPowerLimitSupported
-            models = all.filter { model in
-                let type = model.modelType ?? ""
-                return (type.isEmpty || type == "llm" || type == "vlm") && model.virtual != true
-            }.map(\.id)
+            models = all.filter { Self.isChatModel(type: $0.modelType, virtual: $0.virtual) }.map(\.id)
             voiceModels = all.filter { $0.realtimeVoice == true && $0.virtual != true }.map(\.id)
             visionModels = Set(all.filter { $0.modelType == "vlm" }.map(\.id))
             modelsUnavailable = false
@@ -201,6 +235,234 @@ private struct ModesSection: View {
                 RowSwitch(isOn: voiceEnabled)
             }
         }
+    }
+}
+
+// MARK: - Server
+
+private struct ModelsLoadKey: Hashable {
+    var textEnabled: Bool
+    var voiceEnabled: Bool
+    var localServerRunning: Bool
+    var serverMode: AskAIServerMode
+    var remoteAddress: String
+    var keyRevision: Int
+}
+
+/// Which oMLX server answers: the one this app runs, or another on the
+/// network, such as a Mac Studio. The other server's API key is kept in the
+/// Keychain, not in the Ask AI settings file.
+private struct ServerSection: View {
+    @Bindable var store: AskAIStore
+    /// Bumped when the saved API key changes, so the model list reloads.
+    @Binding var keyRevision: Int
+
+    /// The key being typed.
+    @State private var apiKey = ""
+    @State private var showKey = false
+    @State private var keyLoaded = false
+    @State private var check = ConnectionCheck.idle
+
+    private enum ConnectionCheck: Equatable {
+        case idle
+        case checking
+        case connected(models: Int)
+        case failed(String)
+    }
+
+    private var isRemote: Bool { store.prefs.serverMode == .remote }
+
+    /// True when the key would cross the network unencrypted.
+    private var sendsKeyInTheClear: Bool {
+        guard let endpoint = AskAIEndpoint(remoteAddress: store.prefs.remoteAddress, apiKey: nil),
+              endpoint.scheme == "http" else { return false }
+        return !["localhost", "127.0.0.1", "::1"].contains(endpoint.host.lowercased())
+    }
+
+    var body: some View {
+        SectionHeader(String(localized: "askai.section.server",
+                             defaultValue: "Server",
+                             comment: "Section header for choosing which oMLX server Ask AI uses"))
+
+        ListGroup {
+            Row(
+                label: String(localized: "askai.row.server",
+                              defaultValue: "Answer with",
+                              comment: "Row label for choosing the oMLX server Ask AI uses"),
+                sublabel: String(localized: "askai.row.server.sub",
+                                 defaultValue: "The server on this Mac, or another oMLX server on your network, such as a Mac Studio.",
+                                 comment: "Sublabel for the Ask AI server choice"),
+                isLast: !isRemote
+            ) {
+                Segmented(
+                    selection: $store.prefs.serverMode,
+                    titleKey: "askai.row.server",
+                    options: [
+                        (AskAIServerMode.thisMac, String(localized: "askai.server.this_mac",
+                                                         defaultValue: "This Mac",
+                                                         comment: "Segment: Ask AI uses the oMLX server on this Mac")),
+                        (AskAIServerMode.remote, String(localized: "askai.server.remote",
+                                                        defaultValue: "Another server",
+                                                        comment: "Segment: Ask AI uses an oMLX server on the network")),
+                    ]
+                )
+                .frame(width: .controlMedium)
+            }
+            if isRemote {
+                Row(
+                    label: String(localized: "askai.row.server_address",
+                                  defaultValue: "Address",
+                                  comment: "Row label for the other oMLX server's address"),
+                    sublabel: String(localized: "askai.row.server_address.sub",
+                                     defaultValue: "A host, host:port, or https:// address. The default port is 8000.",
+                                     comment: "Sublabel for the other oMLX server's address")
+                ) {
+                    TextInput(text: $store.prefs.remoteAddress, placeholder: "studio.local:8000",
+                              mono: true, width: .controlWide)
+                }
+                Row(
+                    label: String(localized: "askai.row.server_key",
+                                  defaultValue: "API key",
+                                  comment: "Row label for the other oMLX server's API key"),
+                    sublabel: String(localized: "askai.row.server_key.sub",
+                                     defaultValue: "Saved in your Keychain, not in the Ask AI settings.",
+                                     comment: "Sublabel for the other oMLX server's API key")
+                ) {
+                    HStack(spacing: 4) {
+                        TextInput(text: $apiKey, placeholder: "sk-omlx-…", isSecure: !showKey,
+                                  mono: true, width: .controlMedium)
+                        Button {
+                            showKey.toggle()
+                        } label: {
+                            Image(systemName: showKey ? "eye.slash" : "eye")
+                                .frame(width: 26, height: 26)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(showKey
+                            ? String(localized: "askai.server_key.hide",
+                                     defaultValue: "Hide the API key",
+                                     comment: "Tooltip on the eye button when the other server's API key is visible")
+                            : String(localized: "askai.server_key.show",
+                                     defaultValue: "Show the API key",
+                                     comment: "Tooltip on the eye button when the other server's API key is masked"))
+                    }
+                }
+                Row(
+                    label: String(localized: "askai.row.server_test",
+                                  defaultValue: "Connection",
+                                  comment: "Row label for the button that checks the other oMLX server"),
+                    sublabel: connectionSublabel,
+                    warning: connectionWarning,
+                    isLast: true
+                ) {
+                    Button(String(localized: "askai.server.test",
+                                  defaultValue: "Test connection",
+                                  comment: "Button that checks the other oMLX server's address and API key")) {
+                        Task { await testConnection() }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(check == .checking)
+                }
+            }
+        }
+        .task {
+            apiKey = Keychain.read(.askAIRemoteKey) ?? ""
+            keyLoaded = true
+        }
+        // Save a moment after typing stops, so each keystroke does not reload the model list.
+        .task(id: apiKey) {
+            guard keyLoaded else { return }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled else { return }
+            saveKeyIfChanged()
+        }
+        .onChange(of: store.prefs.remoteAddress) { check = .idle }
+        .onChange(of: apiKey) { check = .idle }
+
+        if isRemote, sendsKeyInTheClear {
+            HintLine(
+                text: String(localized: "askai.server.insecure",
+                             defaultValue: "This address uses http, so the API key and your questions are not encrypted on the network. Use a network you trust, or an https address.",
+                             comment: "Warning when Ask AI is set to another server over plain http"),
+                icon: "exclamationmark.triangle"
+            )
+            .padding(.horizontal, 28)
+            .padding(.top, 6)
+        }
+    }
+
+    private var connectionSublabel: String? {
+        switch check {
+        case .idle:
+            nil
+        case .checking:
+            String(localized: "askai.server.test.checking",
+                   defaultValue: "Checking…",
+                   comment: "Shown while Ask AI checks the other oMLX server")
+        case .connected(let models):
+            String(localized: "askai.server.test.connected",
+                   defaultValue: "Connected. Chat models available: \(models)",
+                   comment: "Shown when the other oMLX server answered; the argument is the number of chat models")
+        case .failed:
+            nil
+        }
+    }
+
+    private var connectionWarning: String? {
+        if case .failed(let message) = check { message } else { nil }
+    }
+
+    private func saveKeyIfChanged() {
+        guard apiKey != (Keychain.read(.askAIRemoteKey) ?? "") else { return }
+        if apiKey.isEmpty {
+            Keychain.delete(.askAIRemoteKey)
+        } else {
+            Keychain.write(apiKey, to: .askAIRemoteKey)
+        }
+        keyRevision += 1
+    }
+
+    private func testConnection() async {
+        saveKeyIfChanged()
+        guard let endpoint = AskAIEndpoint(remoteAddress: store.prefs.remoteAddress, apiKey: apiKey) else {
+            check = .failed(String(localized: "askai.server.test.invalid_address",
+                                   defaultValue: "Enter a valid address, such as studio.local:8000.",
+                                   comment: "Shown when the other oMLX server's address is empty or not valid"))
+            return
+        }
+        check = .checking
+        do {
+            let all = try await endpoint.makeClient().listModels().models
+            check = .connected(models: all.filter {
+                AskAIScreen.isChatModel(type: $0.modelType, virtual: $0.virtual)
+            }.count)
+        } catch {
+            check = .failed(Self.message(for: error, endpoint: endpoint))
+        }
+    }
+
+    private static func message(for error: Error, endpoint: AskAIEndpoint) -> String {
+        if let error = error as? OMLXClientError {
+            switch error {
+            case .unauthenticated:
+                return String(localized: "askai.server.test.needs_key",
+                              defaultValue: "The server needs an API key.",
+                              comment: "Shown when the other oMLX server asks for an API key and none is set")
+            case .http(let status, _) where status == 401 || status == 403:
+                return String(localized: "askai.server.test.key_rejected",
+                              defaultValue: "The server did not accept this API key.",
+                              comment: "Shown when the other oMLX server rejects the API key")
+            default:
+                break
+            }
+        }
+        if error is URLError {
+            return String(localized: "askai.server.test.unreachable",
+                          defaultValue: "Couldn't reach \(endpoint.host):\(endpoint.port).",
+                          comment: "Shown when the other oMLX server does not answer; the arguments are its host and port")
+        }
+        return error.omlxDescription
     }
 }
 

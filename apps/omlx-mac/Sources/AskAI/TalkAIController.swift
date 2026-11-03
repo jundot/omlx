@@ -310,16 +310,17 @@ final class TalkAIController {
             query.append(URLQueryItem(name: "gpu_power_limit_w", value: String(watts)))
         }
         guard let config = services?.config,
-              let url = AppConfig.webSocketURL(
-                  host: config.host, port: config.port, path: "/v1/realtime", query: query
-              )
+              let endpoint = store.prefs.currentEndpoint(local: config),
+              let url = endpoint.webSocketURL(path: "/v1/realtime", query: query)
         else {
-            fail(TalkAIStrings.disconnected, action: .none)
+            // Another server is chosen but its address is empty or not valid.
+            fail(TalkAIStrings.disconnected,
+                 action: store.prefs.serverMode == .remote ? .appSettings : .none)
             return
         }
         phase = .connecting
         failureAction = .none
-        let client = RealtimeVoiceClient(url: url, apiKey: config.apiKey)
+        let client = RealtimeVoiceClient(url: url, apiKey: endpoint.apiKey)
         client.onEvent = { [weak self, weak client] event in
             guard let self, let client, self.client === client else { return }
             self.handle(event)
@@ -418,12 +419,12 @@ final class TalkAIController {
         toolRounds += 1
         replyRequested = false
         audio?.finishReply()
-        guard let config = services?.config else {
+        guard let config = services?.config,
+              let endpoint = store.prefs.currentEndpoint(local: config) else {
             replyFinished()
             return
         }
-        let runner = AskAIToolRunner(host: config.host, port: config.port, apiKey: config.apiKey,
-                                     screenshotPixels: Self.screenshotPixels)
+        let runner = AskAIToolRunner(endpoint: endpoint, screenshotPixels: Self.screenshotPixels)
         toolTask = Task {
             for call in calls {
                 self.toolActivity = AskAITool.activity(for: call)
