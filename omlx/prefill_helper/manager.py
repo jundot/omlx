@@ -38,6 +38,16 @@ class _PermanentError(Exception):
     """A problem only the user can fix; no automatic retry."""
 
 
+def fit_layers(shared: int, per_layer: list[int], budget: int, limit: int) -> int:
+    """How many leading layers fit in a helper's GPU budget."""
+    held, used = 0, shared + _RESERVE_BYTES
+    for size in per_layer[:limit]:
+        if used + size > budget:
+            break
+        used, held = used + size, held + 1
+    return held
+
+
 def _computer_name() -> str:
     try:
         name = subprocess.run(
@@ -242,13 +252,7 @@ class PrefillHelperManager:
 
     def _held_layers(self, name: str, budget: int) -> int:
         shared, per_layer = self.adapter.memory_plan(self.model_path)
-        limit = min(self.adapter.max_split(self.lm), len(per_layer))
-        held, used = 0, shared + _RESERVE_BYTES
-        for size in per_layer[:limit]:
-            if used + size > budget:
-                break
-            used += size
-            held += 1
+        held = fit_layers(shared, per_layer, budget, self.adapter.max_split(self.lm))
         if self.fixed_layers is not None:
             if self.fixed_layers > held:
                 raise _PermanentError(

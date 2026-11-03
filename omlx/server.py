@@ -245,6 +245,8 @@ from .exceptions import (
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
+from .prefill_helper.routes import router as prefill_helper_router
+from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
 from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
 from .utils import gpu_power
@@ -948,6 +950,15 @@ def _register_cluster_routes() -> None:
     )
     app.include_router(
         pair_admin_router,
+        dependencies=[
+            Depends(require_admin),
+            Depends(require_distributed_inference_enabled),
+        ],
+    )
+    # Prefill Accelerator: helpers are paired Macs, so it shares the gate.
+    set_prefill_helper_pool(get_engine_pool)
+    app.include_router(
+        prefill_helper_router,
         dependencies=[
             Depends(require_admin),
             Depends(require_distributed_inference_enabled),

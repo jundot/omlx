@@ -1,6 +1,8 @@
 """Prefill Accelerator: a split prefill must match the whole-model prefill."""
 
 import json
+import os
+import signal
 import socket
 import subprocess
 import threading
@@ -11,11 +13,14 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import numpy as np
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
 
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.prefill_helper import launcher, wire
 from omlx.prefill_helper import manager as manager_module
+from omlx.prefill_helper import routes as helper_routes
 from omlx.prefill_helper.adapters import adapter_for
 from omlx.prefill_helper.client import HelperClient, HelperError
 from omlx.prefill_helper.launcher import HelperTarget
@@ -623,3 +628,43 @@ def test_manager_retries_a_lost_helper_but_not_a_stopped_one(monkeypatch):
     time.sleep(0.3)
     assert manager.status()["state"] == "stopped" and len(fake.servers) == 2
     manager.close()
+
+
+# ---------------------------------------------------------------------------
+# Admin routes.
+# ---------------------------------------------------------------------------
+
+
+def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeypatch):
+    calls = []
+    manager = SimpleNamespace(
+        status=lambda: {"state": "needs_files"},
+        copy_files=lambda: calls.append("copy"),
+        retry=lambda: calls.append("retry"),
+        stop=lambda: calls.append("stop"),
+    )
+    entries = {
+        "loaded": SimpleNamespace(engine=SimpleNamespace(prefill_helper=manager)),
+        "idle": SimpleNamespace(engine=None),
+    }
+    helper_routes.set_engine_pool_getter(lambda: SimpleNamespace(get_entry=entries.get))
+    app = FastAPI()
+    app.include_router(helper_routes.router)
+    client = TestClient(app)
+    base = "/admin/api/prefill-helper"
+    assert client.get(f"{base}/models/idle").json() == {"state": "unloaded"}
+    assert client.get(f"{base}/models/loaded").json()["state"] == "needs_files"
+    assert client.post(f"{base}/models/loaded/copy").status_code == 200
+    assert client.post(f"{base}/models/idle/copy").status_code == 409
+    assert client.post(f"{base}/models/loaded/reboot").status_code == 404
+    assert calls == ["copy"]
+
+    marker = tmp_path / "active.json"
+    monkeypatch.setattr(helper_routes, "active_marker_path", lambda: marker)
+    assert client.get(f"{base}/lending").json() == {"active": False}
+    marker.write_text(json.dumps({"pid": os.getpid(), "host": "Mac Studio"}))
+    assert client.get(f"{base}/lending").json()["host"] == "Mac Studio"
+    killed = []
+    monkeypatch.setattr(helper_routes.os, "kill", lambda pid, sig: killed.append(sig))
+    assert client.post(f"{base}/lending/stop").json()["stopped"]
+    assert killed[-1] == signal.SIGTERM

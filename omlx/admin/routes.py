@@ -91,6 +91,7 @@ from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
+from ..prefill_helper.adapters import adapter_for as stage_adapter_for
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
@@ -390,6 +391,8 @@ class ModelSettingsRequest(BaseModel):
     qwen4_gdn_decode_wide_proj: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
+    prefill_helper_node_id: str | None = None
+    prefill_helper_layers: int | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     gpu_power_limit_w: int | None = None
@@ -2306,6 +2309,13 @@ def reasoning_levels(model_info: dict) -> list[str]:
     return levels
 
 
+def _prefill_helper_status(model_id: str) -> dict | None:
+    engine_pool = _get_engine_pool()
+    entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
+    manager = getattr(getattr(entry, "engine", None), "prefill_helper", None)
+    return manager.status() if manager is not None else None
+
+
 def _model_options(model_info: dict, settings) -> dict:
     """Describe model controls once for the web and native settings clients."""
     model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
@@ -2571,6 +2581,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
             "activation_fp16_supported": activation_fp16_supported,
+            "prefill_helper_supported": stage_adapter_for(
+                (model_info.get("config_model_type") or "").replace("-", "_").lower()
+            )
+            is not None,
+            "prefill_helper": _prefill_helper_status(model_id),
         }
 
         model_data.update(_model_options(model_data, settings))
@@ -2982,6 +2997,20 @@ async def update_model_settings(
         current_settings.deepseek_v41_ced_prefill_enabled = bool(
             request.deepseek_v41_ced_prefill_enabled and is_v41
         )
+    if "prefill_helper_node_id" in sent:
+        supported = stage_adapter_for(
+            (entry.config_model_type or "").replace("-", "_").lower()
+        )
+        current_settings.prefill_helper_node_id = (
+            (request.prefill_helper_node_id or None) if supported else None
+        )
+    if "prefill_helper_layers" in sent:
+        layers = request.prefill_helper_layers
+        if layers is not None and layers < 1:
+            raise HTTPException(
+                status_code=400, detail="prefill_helper_layers must be at least 1"
+            )
+        current_settings.prefill_helper_layers = layers
     if "qwen4_ple_ssd_offload" in sent:
         is_qwen4_exp = (entry.config_model_type or "").replace(
             "-", "_"
@@ -3452,6 +3481,11 @@ async def update_model_settings(
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
+    if (
+        "prefill_helper_node_id" in sent or "prefill_helper_layers" in sent
+    ) and hasattr(entry.engine, "configure_prefill_helper"):
+        # Applied to the loaded model in place; no reload.
+        entry.engine.configure_prefill_helper(current_settings)
 
     # A failed load is cached to prevent clients from retrying the same broken
     # configuration on every request. Clear that cache only when the effective

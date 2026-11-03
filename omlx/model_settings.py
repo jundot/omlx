@@ -399,6 +399,11 @@ class ModelSettings:
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
     deepseek_v41_ced_prefill_enabled: bool = False
+    # Prefill Accelerator: the paired Mac (cluster node id) that runs the
+    # first layers of each prompt chunk, and how many (None picks them from
+    # measured speed). Applied without reloading the model.
+    prefill_helper_node_id: Optional[str] = None
+    prefill_helper_layers: Optional[int] = None
     # Recast the checkpoint's bfloat16 leaves (scales, norms, embeddings) to
     # float16 after load, so the forward runs on the GPU's native float16 path
     # instead of the emulated bfloat16 one. Quantized payloads are untouched.
