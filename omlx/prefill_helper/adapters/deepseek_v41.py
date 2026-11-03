@@ -16,6 +16,7 @@ from typing import Any
 import mlx.core as mx
 
 from ...patches.deepseek_v41 import growth
+from ...patches.deepseek_v41.loading import load
 from ..adapter import Arrays, StageAdapter
 
 _SLOTS = 7
@@ -57,6 +58,16 @@ class DeepseekV41Adapter(StageAdapter):
     def keep_first(self, lm: Any, k: int) -> None:
         lm.start_idx, lm.end_idx = 0, k
         lm.layers = lm.layers[:k]
+
+    def load_first(self, path: str, k: int) -> Any:
+        # Engram tables stay memory-mapped so the layers get the GPU memory.
+        model, _ = load(
+            path,
+            engram_ssd_offload=True,
+            a8_prefill=True,
+            stage=lambda lm: self.keep_first(lm, k),
+        )
+        return model.language_model
 
     def run_first(
         self, lm: Any, cache: list, tokens: mx.array, next_tokens: int

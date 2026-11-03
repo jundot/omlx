@@ -39,6 +39,11 @@ class StageAdapter:
         """Drop layers ``[k, n)`` before the helper loads weights."""
         raise NotImplementedError
 
+    def load_first(self, path: str, k: int) -> Any:
+        """Helper: load layers ``[0, k)`` of a checkpoint; returns the module
+        ``run_first`` takes."""
+        raise NotImplementedError
+
     def run_first(
         self, lm: Any, cache: list, tokens: mx.array, next_tokens: int
     ) -> tuple[Arrays, Arrays]:
