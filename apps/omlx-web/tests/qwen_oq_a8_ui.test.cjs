@@ -41,24 +41,18 @@ assert.equal(state.showsA8Prefill({
 }), true);
 assert.equal(state.showsA8Prefill({config_model_type: 'llama', a8_prefill_supported: true}), false);
 
-// Without the kernels here, A8 follows the helper Mac: on with one, off without.
+// A8 is on until saved off; unset, it yields to ANE prefill.
+const flash = {id: 'flash', config_model_type: 'qwen4_exp', a8_prefill_supported: true};
+assert.equal(state.buildModelSettingsState(flash, {}).a8_prefill_enabled, true);
+assert.equal(state.buildModelSettingsState(flash, {a8_prefill_enabled: false}).a8_prefill_enabled, false);
+assert.equal(state.buildModelSettingsState(flash, {qwen35_ane_prefill_enabled: true}).a8_prefill_enabled, false);
+// A Prefill Accelerator Mac shows the toggle where the kernels cannot run here.
 state.selectedModel = {config_model_type: 'deepseek_v41', a8_prefill_supported: false};
-state.modelSettings.a8_prefill_enabled = false;
-state.selectPrefillHelper('m5');
+state.modelSettings.prefill_helper_node_id = 'm5';
 assert.equal(state.showsA8Prefill(state.selectedModel), true);
-assert.equal(state.modelSettings.a8_prefill_enabled, true);
-state.modelSettings.a8_prefill_enabled = false;
-state.selectPrefillHelper('m5-2');
-assert.equal(state.modelSettings.a8_prefill_enabled, false);
-state.selectPrefillHelper('');
-state.selectPrefillHelper('m5');
-assert.equal(state.modelSettings.a8_prefill_enabled, true);
-state.selectPrefillHelper('');
-assert.equal(state.modelSettings.a8_prefill_enabled, false);
-state.selectedModel = {config_model_type: 'deepseek_v41', a8_prefill_supported: true};
-state.selectPrefillHelper('m5');
-assert.equal(state.modelSettings.a8_prefill_enabled, false);
-state.selectPrefillHelper('');
+state.modelSettings.prefill_helper_node_id = '';
+assert.equal(state.showsA8Prefill(state.selectedModel), false);
+state.selectedModel = flash;
 
 state.modelSettings.a8_prefill_enabled = true;
 state.modelSettings.qwen35_ane_prefill_enabled = true;
@@ -84,6 +78,8 @@ console.log('oQ A8 visibility and ANE conflict checks passed');
         await app.saveModelSettings();
         assert.equal(payload.mtp_adaptive_max_depth, depth);
         assert.equal(payload.mtp_fixed_depth, null);
+        // A hidden A8 toggle is not sent, so it stays unset (on).
+        assert.equal('a8_prefill_enabled' in payload, false);
         const restored = app.buildModelSettingsState(app.selectedModel, payload);
         assert.equal(restored.mtp_adaptive_max_depth, String(depth));
     }
@@ -92,7 +88,7 @@ console.log('oQ A8 visibility and ANE conflict checks passed');
     // Qwen3.8-Flash-Next (qwen4_exp): the same toggle and floor are saved and restored.
     const app = create();
     app.loadModels = async () => {};
-    app.selectedModel = {id: 'flash', config_model_type: 'qwen4_exp'};
+    app.selectedModel = {id: 'flash', config_model_type: 'qwen4_exp', a8_prefill_supported: true};
     assert.equal(app.isA8PrefillModel(app.selectedModel), true);
     let payload;
     context.fetch = async (_url, init) => {

@@ -23,7 +23,7 @@ Measured on an M3 Ultra (512 GB) with an M5 Max (128 GB) over Thunderbolt 5, for
 | GLM-5.3 Flash oQ4e | 540 tok/s | 1,390 tok/s |
 | Qwen3.8 Flash-Next oQ4e | 1,310 tok/s | 3,670 tok/s |
 
-DeepSeek V4.1 and Qwen3.8 ran the helper's layers with INT8 Activation Prefill, the default with a helper. It changes numerics as it does on a single M5-series Mac. Greedy output matched the helper-off output on the tested prompts for DeepSeek V4.1 (INT8), GLM-5.3, and Qwen3.8 with 16-bit activations on the helper. MiniMax was checked on a partial checkpoint (split and whole-model caches identical); no full-model speed has been measured.
+DeepSeek V4.1 and Qwen3.8 ran the helper's layers with INT8 Activation Prefill, which is on by default. It changes numerics as it does on a single M5-series Mac. Greedy output matched the helper-off output on the tested prompts for DeepSeek V4.1 (INT8), GLM-5.3, and Qwen3.8 with 16-bit activations on the helper. MiniMax was checked on a partial checkpoint (split and whole-model caches identical); no full-model speed has been measured.
 
 ## Requirements
 
@@ -61,7 +61,7 @@ The Cluster tab's Prefill Accelerator checks report which of these the Macs use.
 
 **Layers on the helper** is **Auto** by default: each prompt is split by the measured speed of both Macs, and the measurements are kept per model and Mac so a restarted helper splits its first prompt the same way. A fixed number is available for testing.
 
-On a Mac without INT8 tensor units (M4 and earlier), choosing a helper also turns on the model's **INT8 Activation Prefill**, which then applies only to the helper's layers. Turn it off there to keep those layers on 16-bit activations. Changing it reloads the model.
+**INT8 Activation Prefill** and DeepSeek V4.1 **CED prefill** are on unless turned off in the model's settings. On a Mac without INT8 tensor units (M4 and earlier), INT8 Activation Prefill applies only to the helper's layers, and changing it restarts the helper without reloading the model.
 
 ## How it works
 

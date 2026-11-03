@@ -49,7 +49,12 @@ from ..api.utils import (
 from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
-from ..model_settings import ane_prefill_backend, ane_prefill_fraction
+from ..model_settings import (
+    a8_prefill_on,
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    ced_prefill_on,
+)
 from ..models.vlm import VLMModelAdapter
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
@@ -2069,16 +2074,8 @@ class VLMBatchedEngine(BaseEngine):
                                 False,
                             )
                         ),
-                        ced_prefill=bool(
-                            getattr(
-                                self._model_settings,
-                                "deepseek_v41_ced_prefill_enabled",
-                                False,
-                            )
-                        ),
-                        a8_prefill=bool(
-                            getattr(self._model_settings, "a8_prefill_enabled", False)
-                        ),
+                        ced_prefill=ced_prefill_on(self._model_settings),
+                        a8_prefill=a8_prefill_on(self._model_settings),
                         a8_prefill_min_tokens=int(
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
@@ -2696,10 +2693,7 @@ class VLMBatchedEngine(BaseEngine):
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
         # DeepSeek V4.1 applies the setting in its own loader.
-        if (
-            getattr(self._model_settings, "a8_prefill_enabled", False)
-            and self.model_type != "deepseek_v41"
-        ):
+        if a8_prefill_on(self._model_settings) and self.model_type != "deepseek_v41":
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -2925,7 +2919,7 @@ class VLMBatchedEngine(BaseEngine):
                 getattr(settings, "prefill_helper_layers", None),
                 (
                     int(getattr(settings, "a8_prefill_min_tokens", 128))
-                    if getattr(settings, "a8_prefill_enabled", False)
+                    if a8_prefill_on(settings)
                     else None
                 ),
             )

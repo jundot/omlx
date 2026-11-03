@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from .custom_kernels.quant_matmul import fast as quant_fast
 from .model_profiles import (
     MODEL_SPECIFIC_PROFILE_FIELDS,
     RENAMED_FIELDS,
@@ -32,7 +33,7 @@ from .model_profiles import (
 logger = logging.getLogger(__name__)
 
 # Current settings file format version
-SETTINGS_VERSION = 1
+SETTINGS_VERSION = 2
 
 # The Lightning MTP runtime clamps deeper requests to this global ceiling.
 # Keep API validation and runtime normalization on the same contract.
@@ -199,8 +200,31 @@ def resolve_qwen35_prefill_conflicts(data: dict) -> tuple:
     if not (data.get("a8_prefill_enabled") and data.get("qwen35_ane_prefill_enabled")):
         return data, []
     resolved = dict(data)
-    resolved["a8_prefill_enabled"] = False
+    # Unset, A8 yields to ANE prefill (see a8_prefill_on).
+    resolved.pop("a8_prefill_enabled")
     return resolved, ["qwen35_ane_prefill_enabled"]
+
+
+def _setting(settings: Any, name: str) -> Any:
+    if settings is None:
+        return None
+    if isinstance(settings, dict):
+        return settings.get(name)
+    return getattr(settings, name, None)
+
+
+def a8_prefill_on(settings: Any) -> bool:
+    """A8 prefill unless it was saved off. Left unset, it yields to ANE
+    prefill, which claims the same projections."""
+    value = _setting(settings, "a8_prefill_enabled")
+    if value is None:
+        return not _setting(settings, "qwen35_ane_prefill_enabled")
+    return bool(value)
+
+
+def ced_prefill_on(settings: Any) -> bool:
+    """DeepSeek V4.1 CED prefill unless it was saved off."""
+    return _setting(settings, "deepseek_v41_ced_prefill_enabled") is not False
 
 
 PROFILES_VERSION = 1
@@ -300,9 +324,10 @@ class ModelSettings:
         a8_prefill_enabled: Route eligible Qwen3.5/3.6/3.8 and DeepSeek V4.1
             prefill matmuls through the INT8-activation (QxA8) tensor kernels.
             Prefill only, and only a speed-up on hardware with native INT8
-            tensor operations -- M5-series and newer. On anything older the
-            kernels do not load and the setting is refused. Decode is
-            unaffected. Changes numerics: activations are quantized to INT8.
+            tensor operations -- M5-series and newer. On anything older it
+            applies only to a Prefill Accelerator Mac's layers. On unless
+            saved off. Decode is unaffected. Changes numerics: activations
+            are quantized to INT8.
             Also covers the routed-expert gate/up of Qwen3.8-Flash-Next
             (affine Q4 / GS64 experts); the MTP draft layer and the down
             projection stay on the A16 path. DeepSeek V4.1 covers its affine
@@ -398,7 +423,8 @@ class ModelSettings:
     # DeepSeek V4.1 CED: during prefill the decoder half only forwards the
     # last window-size tokens; decoder global KV is the encoder-final
     # projection already produced by the midpoint CSA2 layer.
-    deepseek_v41_ced_prefill_enabled: bool = False
+    # None (never saved) means on; only a saved False turns it off.
+    deepseek_v41_ced_prefill_enabled: Optional[bool] = None
     # Prefill Accelerator: the paired Mac (cluster node id) that runs the
     # first layers of each prompt chunk, and how many (None picks them from
     # measured speed). Applied without reloading the model.
@@ -465,7 +491,9 @@ class ModelSettings:
     # The kernel reads the checkpoint's own packed weight stream, so a routed
     # projection costs no extra weight memory and the module's arrays stay
     # readable by the decode path.
-    a8_prefill_enabled: bool = False
+    # None (never saved) means on where the kernels or a Prefill Accelerator
+    # Mac can run it; only a saved False turns it off.
+    a8_prefill_enabled: Optional[bool] = None
     a8_prefill_min_tokens: int = 128
 
     # MoE expert offload (stream non-resident experts from the checkpoint)
@@ -557,7 +585,7 @@ class ModelSettings:
         # The ddtree verify mode was removed; stored settings run as adaptive.
         if self.dflash_verify_mode == "ddtree":
             self.dflash_verify_mode = "adaptive"
-        if self.a8_prefill_enabled and self.a8_prefill_min_tokens < 1:
+        if a8_prefill_on(self) and self.a8_prefill_min_tokens < 1:
             raise ValueError("a8_prefill_min_tokens must be at least 1")
         # Both accelerate the same Qwen3.5 prefill projections by wrapping
         # Qwen3_5MLP.__call__, so enabling both leaves whichever patched last
@@ -824,8 +852,15 @@ class ModelSettingsManager:
             models_data = data.get("models", {})
             self._settings = {}
 
+            # Before version 2 every save stored A8 as False. Where the kernels
+            # cannot run, the setting could never be turned on, so that False
+            # was never a choice.
+            unset_a8 = version < 2 and not quant_fast.oq_a8_available()
             for model_id, model_data in models_data.items():
                 model_data = rename_legacy_fields(model_data)
+                if unset_a8 and model_data.get("a8_prefill_enabled") is False:
+                    model_data = dict(model_data)
+                    del model_data["a8_prefill_enabled"]
                 # Settings saved before the vlm_mtp exclusivity rule may
                 # combine vlm_mtp_enabled with processor-backed settings;
                 # __post_init__ would raise and the except below would drop

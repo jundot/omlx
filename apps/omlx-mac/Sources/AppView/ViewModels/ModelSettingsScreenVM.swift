@@ -751,7 +751,8 @@ final class ModelSettingsScreenVM {
                     m.deepseekV41EngramSsdOffloadSupported ?? false
                 self.deepseekV41EngramSsdOffload = self.deepseekV41EngramSsdOffloadForced
                     || (s?.deepseekV41EngramSsdOffload ?? false)
-                self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? false
+                // Unset means on; only a saved false is off.
+                self.deepseekV41CedPrefillEnabled = s?.deepseekV41CedPrefillEnabled ?? true
                 self.prefillHelperSupported = m.prefillHelperSupported ?? false
                 self.prefillHelperNodeID = s?.prefillHelperNodeId ?? ""
                 self.prefillHelperLayers = s?.prefillHelperLayers
@@ -797,7 +798,8 @@ final class ModelSettingsScreenVM {
                 self.turboquantKvScheme = s?.turboquantKvScheme ?? "turboquant"
                 self.turboquantKvBits = s?.turboquantKvBits.map { Self.formatBits($0) } ?? "4"
                 self.qwen35AnePrefillSharedFraction = s?.qwen35AnePrefillSharedFraction.map { String($0) } ?? "1"
-                self.a8PrefillEnabled = s?.a8PrefillEnabled ?? false
+                // Unset means on unless ANE prefill takes the same projections.
+                self.a8PrefillEnabled = s?.a8PrefillEnabled ?? !(s?.qwen35AnePrefillEnabled ?? false)
                 self.a8PrefillMinTokens = s?.a8PrefillMinTokens.map(String.init) ?? "128"
                 self.qwen35AnePrefillEnabled = s?.qwen35AnePrefillEnabled ?? false
                 self.qwen35AnePrefillSequenceLength = s?.qwen35AnePrefillSequenceLength.map(String.init) ?? "2048"
@@ -929,7 +931,6 @@ final class ModelSettingsScreenVM {
             let off = prefillHelperNodeID.isEmpty
             patch.prefillHelperNodeId = .some(off ? nil : prefillHelperNodeID)
             patch.prefillHelperLayers = .some(off ? nil : prefillHelperLayers)
-            if a8RunsOnlyOnHelper { patch.a8PrefillEnabled = a8PrefillEnabled }
         case .activationFp16:          patch.activationFp16Enabled = activationFp16Enabled
         case .thinkingBudgetEnabled:   patch.thinkingBudgetEnabled = thinkingBudgetEnabled
         case .thinkingBudgetTokens:    patch.thinkingBudgetTokens = Int(thinkingBudgetTokens)
@@ -1363,21 +1364,6 @@ final class ModelSettingsScreenVM {
     var isQwen35AnePrefillModel: Bool { model?.anePrefillBackend == "qwen" }
 
     /// A8 here reaches only the layers on the Prefill Accelerator Mac.
-    private var a8RunsOnlyOnHelper: Bool {
-        isA8PrefillModel && model?.a8PrefillSupported != true
-    }
-
-    /// Picks the helper Mac. Where A8 runs only on the helper's layers, it
-    /// is on with a helper Mac and off without one; the toggle can still
-    /// turn it off.
-    func selectPrefillHelper(_ nodeID: String) {
-        let wasOff = prefillHelperNodeID.isEmpty
-        prefillHelperNodeID = nodeID
-        if a8RunsOnlyOnHelper && wasOff != nodeID.isEmpty {
-            a8PrefillEnabled = !nodeID.isEmpty
-        }
-    }
-
     /// The INT8 kernels run only on GPUs with native INT8 tensor ops
     /// (M5-series or newer), here or on the Prefill Accelerator Mac. A saved
     /// "on" keeps the row so it can be turned off.
@@ -1854,9 +1840,12 @@ final class ModelSettingsScreenVM {
                     out[ProfileSettingsKey.turboquantKvBits] = AnyCodable(bits)
                 }
             }
-            putBool(ProfileSettingsKey.a8PrefillEnabled, a8PrefillEnabled)
-            if a8PrefillEnabled {
-                putInt(ProfileSettingsKey.a8PrefillMinTokens, a8PrefillMinTokens)
+            // A hidden A8 row stays unset (on) rather than saved.
+            if showsA8Prefill {
+                putBool(ProfileSettingsKey.a8PrefillEnabled, a8PrefillEnabled)
+                if a8PrefillEnabled {
+                    putInt(ProfileSettingsKey.a8PrefillMinTokens, a8PrefillMinTokens)
+                }
             }
             putBool(ProfileSettingsKey.qwen35AnePrefillEnabled, qwen35AnePrefillEnabled)
             if qwen35AnePrefillEnabled {

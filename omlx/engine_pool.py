@@ -75,6 +75,8 @@ from .model_discovery import (
 from .custom_kernels.quant_matmul import fast as quant_fast
 from .model_settings import (
     ModelSettings,
+    a8_prefill_on,
+    ced_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
@@ -1317,7 +1319,7 @@ class EnginePool:
             add("deepseek_v41_engram_ssd_offload", v41_offload)
             add(
                 "deepseek_v41_ced_prefill_enabled",
-                getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
+                ced_prefill_on(settings),
             )
             factor = yarn_factor(
                 entry.config_model_type,
@@ -1340,9 +1342,7 @@ class EnginePool:
         # in place, so a change here has to land on a fresh engine.
         # Without INT8 tensor units here, A8 only reaches a Prefill Accelerator
         # Mac's layers, which follow it without reloading this model.
-        oq_a8_active = bool(data.get("a8_prefill_enabled", False)) and (
-            quant_fast.oq_a8_available()
-        )
+        oq_a8_active = a8_prefill_on(data) and quant_fast.oq_a8_available()
         add("a8_prefill_enabled", oq_a8_active)
         if oq_a8_active:
             add("a8_prefill_min_tokens", data.get("a8_prefill_min_tokens", 128))

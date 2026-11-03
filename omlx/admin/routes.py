@@ -2994,8 +2994,9 @@ async def update_model_settings(
         current_settings.enable_thinking = request.enable_thinking
     if "deepseek_v41_ced_prefill_enabled" in sent:
         is_v41 = (entry.config_model_type or "").replace("-", "_").lower() == "deepseek_v41"
-        current_settings.deepseek_v41_ced_prefill_enabled = bool(
-            request.deepseek_v41_ced_prefill_enabled and is_v41
+        # Left unset elsewhere; unset means on for DeepSeek V4.1.
+        current_settings.deepseek_v41_ced_prefill_enabled = (
+            request.deepseek_v41_ced_prefill_enabled if is_v41 else None
         )
     if "prefill_helper_node_id" in sent:
         supported = stage_adapter_for(
@@ -3004,11 +3005,6 @@ async def update_model_settings(
         current_settings.prefill_helper_node_id = (
             (request.prefill_helper_node_id or None) if supported else None
         )
-        if not current_settings.prefill_helper_node_id and not (
-            _oq_a8_kernels_available()
-        ):
-            # Without the helper, A8 has no layers to run on here.
-            current_settings.a8_prefill_enabled = False
     if "prefill_helper_layers" in sent:
         layers = request.prefill_helper_layers
         if layers is not None and layers < 1:
@@ -3212,7 +3208,7 @@ async def update_model_settings(
     # INT8-activation (A8) prefill. Load-time like the ANE controls above: the
     # runtime signature re-creates a loaded model when this changes.
     if "a8_prefill_enabled" in sent:
-        current_settings.a8_prefill_enabled = bool(request.a8_prefill_enabled)
+        current_settings.a8_prefill_enabled = request.a8_prefill_enabled
     if "a8_prefill_min_tokens" in sent:
         value = request.a8_prefill_min_tokens
         if value is None or value < 1:
@@ -3695,18 +3691,6 @@ def _validate_model_settings(entry, settings):
                 detail=(
                     "A8 prefill is available only for Qwen3.5/3.6/3.8, "
                     "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
-                ),
-            )
-        # The layers on a Prefill Accelerator Mac follow the setting.
-        if not _oq_a8_kernels_available() and not settings.get(
-            "prefill_helper_node_id"
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "A8 prefill needs the native prefill kernels and a Metal "
-                    "device with native INT8 tensor operations (M5-series or "
-                    "newer), or a Prefill Accelerator Mac for this model."
                 ),
             )
         if settings.get("qwen35_ane_prefill_enabled"):

@@ -1472,7 +1472,7 @@ private struct PrefillAcceleratorGroup: View {
                               get: { vm.prefillHelperNodeID },
                               set: { node in
                                   guard node != vm.prefillHelperNodeID else { return }
-                                  vm.selectPrefillHelper(node)
+                                  vm.prefillHelperNodeID = node
                                   save()
                               }),
                           width: .controlWide, options: macOptions)

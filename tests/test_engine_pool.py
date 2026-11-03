@@ -992,13 +992,14 @@ class TestQwenCpuShareMemoryEstimate:
         )
         pool._entries[entry.model_id] = entry
         settings = ModelSettings()
-        off = pool._engine_runtime_signature("v41", settings)
-        settings.deepseek_v41_ced_prefill_enabled = True
+        # Unset means on.
         on = pool._engine_runtime_signature("v41", settings)
-        assert off != on
         assert dict(on)["deepseek_v41_ced_prefill_enabled"] == "True"
         settings.deepseek_v41_ced_prefill_enabled = False
-        assert pool._engine_runtime_signature("v41", settings) == off
+        off = pool._engine_runtime_signature("v41", settings)
+        assert off != on
+        settings.deepseek_v41_ced_prefill_enabled = True
+        assert pool._engine_runtime_signature("v41", settings) == on
 
     def test_qwen4_wide_decode_setting_changes_engine_signature(self, tmp_path):
         from omlx.model_settings import ModelSettings

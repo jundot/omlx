@@ -468,7 +468,7 @@ async def test_oq_a8_is_refused_outside_validated_families(config_type):
 
     assert excinfo.value.status_code == 400
     assert "Flash-Next" in excinfo.value.detail
-    assert settings.a8_prefill_enabled is False
+    assert settings.a8_prefill_enabled is None
 
 
 @pytest.mark.asyncio
@@ -530,44 +530,25 @@ def test_model_options_report_oq_a8_support(config_type, kernels, expected):
 
 
 @pytest.mark.asyncio
-async def test_oq_a8_needs_native_int8_kernels():
-    """Nothing on this hardware would run faster, so the setting is refused
-    rather than accepted and silently ignored at load."""
+async def test_oq_a8_choice_is_kept_without_native_int8_kernels():
+    """Without the kernels, A8 reaches only a Prefill Accelerator Mac's
+    layers. The saved choice is kept, and changing the helper does not write
+    one."""
     pool, entry = _failed_pool()
-    entry.config_model_type = "qwen3_5"
+    entry.config_model_type = "qwen4_exp"
     settings = ModelSettings()
 
     with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=False):
-        with pytest.raises(admin_routes.HTTPException) as excinfo:
-            await _update_settings(
-                pool,
-                settings,
-                admin_routes.ModelSettingsRequest(a8_prefill_enabled=True),
-            )
-
-    assert excinfo.value.status_code == 400
-    assert "M5-series or newer" in excinfo.value.detail
-    assert settings.a8_prefill_enabled is False
-
-    # A Prefill Accelerator Mac runs the model's first layers with A8.
-    entry.config_model_type = "qwen4_exp"
-    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=False):
         await _update_settings(
-            pool,
-            settings,
-            admin_routes.ModelSettingsRequest(
-                a8_prefill_enabled=True, prefill_helper_node_id="m5"
-            ),
+            pool, settings, admin_routes.ModelSettingsRequest(a8_prefill_enabled=False)
         )
-    assert settings.a8_prefill_enabled is True
-    # Without the Mac, A8 has nothing to run on.
-    with patch.object(admin_routes, "_oq_a8_kernels_available", return_value=False):
+        assert settings.a8_prefill_enabled is False
         await _update_settings(
-            pool,
-            settings,
-            admin_routes.ModelSettingsRequest(prefill_helper_node_id=None),
+            pool, settings, admin_routes.ModelSettingsRequest(prefill_helper_node_id="m5")
         )
-    assert settings.prefill_helper_node_id is None
+        await _update_settings(
+            pool, settings, admin_routes.ModelSettingsRequest(prefill_helper_node_id=None)
+        )
     assert settings.a8_prefill_enabled is False
 
 

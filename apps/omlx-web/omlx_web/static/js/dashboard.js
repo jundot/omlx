@@ -1718,6 +1718,8 @@
                     if (k === 'enable_thinking' && this.selectedModel?.thinking_forced) continue;
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
+                    // A hidden A8 toggle stays unset (on) rather than saved.
+                    if (k.startsWith('a8_prefill_') && !this.showsA8Prefill(this.selectedModel)) continue;
                     if (k === 'thinking_budget_enabled') {
                         if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
                         continue;
@@ -2166,8 +2168,9 @@
                     prefill_helper_supported: model?.prefill_helper_supported === true,
                     prefill_helper_node_id: s.prefill_helper_node_id || '',
                     prefill_helper_layers: s.prefill_helper_layers ? String(s.prefill_helper_layers) : '',
+                    // Unset means on; only a saved false is off.
                     deepseek_v41_ced_prefill_enabled:
-                        s.deepseek_v41_ced_prefill_enabled === true,
+                        s.deepseek_v41_ced_prefill_enabled !== false,
                     deepseek_v41_ced_prefill_supported:
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
                     qwen4_gdn_decode_wide_proj:
@@ -2208,7 +2211,8 @@
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
                     moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
-                    a8_prefill_enabled: s.a8_prefill_enabled || false,
+                    // Unset means on unless ANE prefill takes the same projections.
+                    a8_prefill_enabled: s.a8_prefill_enabled ?? !s.qwen35_ane_prefill_enabled,
                     a8_prefill_min_tokens: s.a8_prefill_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
@@ -3171,18 +3175,6 @@
                 return parts.join(' · ');
             },
 
-            // Where A8 runs only on the helper's layers, it is on with a
-            // helper Mac and off without one; the toggle can still turn it off.
-            selectPrefillHelper(nodeId) {
-                const wasOff = !this.modelSettings.prefill_helper_node_id;
-                this.modelSettings.prefill_helper_node_id = nodeId;
-                const model = this.selectedModel;
-                if (wasOff !== !nodeId && this.isA8PrefillModel(model)
-                    && model?.a8_prefill_supported !== true) {
-                    this.modelSettings.a8_prefill_enabled = !!nodeId;
-                }
-            },
-
             prefillHelperPending() {
                 const saved = this.selectedModel?.settings || {};
                 const ms = this.modelSettings;
@@ -3202,10 +3194,6 @@
                         ? parseInt(ms.prefill_helper_layers, 10)
                         : null,
                 };
-                // A8 rides along where it only reaches the helper's layers.
-                if (this.isA8PrefillModel(model) && model.a8_prefill_supported !== true) {
-                    body.a8_prefill_enabled = !!ms.a8_prefill_enabled;
-                }
                 this.prefillHelper.busy = true;
                 try {
                     const resp = await fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`, {
@@ -3345,7 +3333,8 @@
             },
 
             validateA8PrefillSettings() {
-                if (!this.modelSettings.a8_prefill_enabled) return null;
+                if (!this.modelSettings.a8_prefill_enabled
+                    || !this.showsA8Prefill(this.selectedModel)) return null;
                 // Both wrap the same MLP call, so the combination silently
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
@@ -3488,8 +3477,6 @@
                         ms.qwen4_ple_ssd_offload_forced
                             ? !!ms.qwen4_ple_ssd_offload_requested
                             : !!ms.qwen4_ple_ssd_offload,
-                    deepseek_v41_ced_prefill_enabled:
-                        !!ms.deepseek_v41_ced_prefill_enabled,
                     prefill_helper_node_id: ms.prefill_helper_node_id || null,
                     prefill_helper_layers: ms.prefill_helper_node_id && ms.prefill_helper_layers
                         ? parseInt(ms.prefill_helper_layers, 10)
@@ -3528,8 +3515,6 @@
                         : 4,
                     moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
-                    a8_prefill_enabled: !!ms.a8_prefill_enabled,
-                    a8_prefill_min_tokens: Number(ms.a8_prefill_min_tokens) || 128,
                     qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
                     // Validation only runs when the feature is enabled, so a
                     // blank numeric input must fall back to the server default
@@ -3604,6 +3589,15 @@
                     trust_remote_code: ms.trust_remote_code,
                     external_engine: ms.external_engine || null,
                 };
+                // Sent only where the toggle shows, so an untouched setting
+                // stays unset (on).
+                if (ms.deepseek_v41_ced_prefill_supported) {
+                    payload.deepseek_v41_ced_prefill_enabled = !!ms.deepseek_v41_ced_prefill_enabled;
+                }
+                if (this.showsA8Prefill(this.selectedModel)) {
+                    payload.a8_prefill_enabled = !!ms.a8_prefill_enabled;
+                    payload.a8_prefill_min_tokens = Number(ms.a8_prefill_min_tokens) || 128;
+                }
                 if (isDiffusion) {
                     Object.assign(payload, {
                         top_p: null,

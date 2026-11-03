@@ -815,8 +815,7 @@
                             <div x-show="globalSettings.server.distributed_inference_active" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                 <div>
                                     <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.prefill_helper_mac') }}</label>
-                                    <select :value="modelSettings.prefill_helper_node_id"
-                                            @change="selectPrefillHelper($event.target.value)"
+                                    <select x-model="modelSettings.prefill_helper_node_id"
                                             class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-black">
                                         <option value="">{{ t('modal.model_settings.prefill_helper_off') }}</option>
                                         <template x-for="device in prefillHelper.candidates" :key="device.node_id">
