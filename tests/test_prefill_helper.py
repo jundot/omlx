@@ -23,7 +23,7 @@ from test_scheduler_chunked_prefill import _tiny_glm5_next, _tiny_vlm_adapter
 
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
-from omlx.prefill_helper import launcher, wire
+from omlx.prefill_helper import launcher, lending, wire
 from omlx.prefill_helper import manager as manager_module
 from omlx.prefill_helper import routes as helper_routes
 from omlx.prefill_helper.adapters import adapter_for
@@ -738,7 +738,7 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     assert calls == ["copy"]
 
     marker = tmp_path / "active.json"
-    monkeypatch.setattr(helper_routes, "active_marker_path", lambda: marker)
+    monkeypatch.setattr(lending, "active_marker_path", lambda: marker)
     assert client.get(f"{base}/lending").json() == {"active": False}
     marker.write_text(json.dumps({"pid": os.getpid(), "host": "Mac Studio"}))
     assert client.get(f"{base}/lending").json()["host"] == "Mac Studio"
@@ -857,3 +857,15 @@ def test_scheduler_glm_helper_prefill_matches_local():
     session.close()
     thread.join(10)
     listener.close()
+
+
+def test_lending_note_names_the_host_while_the_helper_runs(tmp_path, monkeypatch):
+    marker = tmp_path / "active.json"
+    monkeypatch.setattr(lending, "active_marker_path", lambda: marker)
+    assert lending.lending_note() == ""
+    marker.write_text(
+        json.dumps({"pid": os.getpid(), "host": "HJKmac", "active_gib": 82.4})
+    )
+    assert "lending 82 GB to HJKmac" in lending.lending_note()
+    marker.write_text(json.dumps({"pid": 999999999, "host": "HJKmac"}))
+    assert lending.lending_note() == ""

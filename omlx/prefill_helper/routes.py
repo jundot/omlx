@@ -8,7 +8,6 @@ copy / retry / stop actions. The helper Mac: what it is lending and a Stop.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import signal
 import subprocess
@@ -22,8 +21,8 @@ from .. import __version__
 from ..cluster.registry import get_device_registry
 from . import launcher
 from .adapters import adapter_for
+from .lending import active_lending
 from .manager import fit_layers, helper_budget
-from .worker import active_marker_path
 
 router = APIRouter(prefix="/admin/api/prefill-helper", tags=["prefill-helper"])
 
@@ -172,25 +171,15 @@ async def model_action(model_id: str, action: str) -> dict:
     return manager.status()
 
 
-def _lending() -> dict | None:
-    """The helper running on this Mac, if its process is alive."""
-    try:
-        marker = json.loads(active_marker_path().read_text())
-        os.kill(int(marker["pid"]), 0)
-    except (OSError, ValueError, KeyError):
-        return None
-    return marker
-
-
 @router.get("/lending")
 async def lending() -> dict:
-    marker = _lending()
+    marker = active_lending()
     return {"active": marker is not None, **(marker or {})}
 
 
 @router.post("/lending/stop")
 async def stop_lending() -> dict:
-    marker = _lending()
+    marker = active_lending()
     if marker is None:
         return {"active": False}
     # The worker tells its host it was stopped here, so the host stays off.

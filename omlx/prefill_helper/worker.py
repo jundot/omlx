@@ -31,14 +31,11 @@ import numpy as np
 from .. import __version__
 from . import wire
 from .adapters import adapter_for
+from .lending import active_marker_path
 
 WINDOW = wire.WINDOW
 _KEEP_WARM_SECONDS = 0.5
 READY_PREFIX = "OMLX_PREFILL_HELPER_READY "
-
-
-def active_marker_path() -> Path:
-    return Path.home() / ".omlx" / "prefill-helper" / "active.json"
 
 
 @dataclass

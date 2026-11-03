@@ -80,6 +80,7 @@ from .model_settings import (
 )
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
+from .prefill_helper.lending import lending_note
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
 from .speculative.dflash import context_bytes_per_row, load_dflash_drafter
@@ -3010,6 +3011,7 @@ class EnginePool:
                             f"({failure_label}: {format_size(failure_current)}, "
                             f"{admission_kind}: {format_size(admission_size)}). "
                             f"{advice or DEFAULT_CEILING_ADVICE}."
+                            f"{lending_note()}"
                         ),
                     )
 
