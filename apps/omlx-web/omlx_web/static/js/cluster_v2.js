@@ -1764,7 +1764,7 @@ function clusterV2Wizard() {
                     detail = row.status === 'pass'
                         ? t('version_ok').replace('{version}', row.detail)
                         : t('version_mismatch')
-                            .replace('{name}', name)
+                            .replaceAll('{name}', name)
                             .replace('{version}', row.detail || '?')
                             .replace('{expected}', row.expected || '?');
                 } else if (row.key === 'memory') {

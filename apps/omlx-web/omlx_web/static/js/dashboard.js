@@ -3074,7 +3074,7 @@
                 const lending = this.prefillLending;
                 if (!lending) return '';
                 return window.t('dashboard.prefill_lending')
-                    .replace('{host}', lending.host || '?')
+                    .replaceAll('{host}', lending.host || '?')
                     .replace('{n}', lending.layers ?? '')
                     .replace('{model}', String(lending.model || '').split('/').pop());
             },
