@@ -6957,10 +6957,21 @@ class Scheduler:
             # The grid is exact, unlike the throttled estimate.
             chunk_kwargs["next_prefill_tokens"] = helper.next_size()
         adapter = session.adapter
+        lm = adapter.language_model(self.model)
         began = time.perf_counter()
+        # This Mac reads ahead only for its own layers.
+        if part.index == 0:
+            adapter.prefetch(lm, state.cache, chunk[:, :0], chunk, start=helper.layers)
+        adapter.prefetch(
+            lm,
+            state.cache,
+            chunk,
+            state.tokens_remaining[:, : helper.next_size()],
+            start=helper.layers,
+        )
         adapter.run_rest(
             prefill_model,
-            adapter.language_model(self.model),
+            lm,
             state.cache,
             chunk,
             helper.layers,
@@ -7030,7 +7041,8 @@ class Scheduler:
             # A packed row rides the head's forward, its flush and prefetch.
             if guarded:
                 Scheduler._clear_cache(self)
-                Scheduler._announce_first_prefill_chunk(self, state.tokens_remaining, state.base_size, state.boundary_enabled, state.block_size, None, state.cache)
+                if state.helper is None:
+                    Scheduler._announce_first_prefill_chunk(self, state.tokens_remaining, state.base_size, state.boundary_enabled, state.block_size, None, state.cache)
             # Known horizon: size the QSA indexer once instead of doubling
             # mid-prefill (see _reserve_qsa_index_capacity).
             self._reserve_qsa_index_capacity(
@@ -7283,7 +7295,8 @@ class Scheduler:
         next_n = (
             Scheduler._next_prefill_chunk_len(self, state, n) if remaining > 0 else 0
         )
-        if engram_prefetch is not None:
+        helper_chunk = state.helper is not None and state.helper.chunk is not None
+        if engram_prefetch is not None and not helper_chunk:
             engram_prefetch(
                 state.tokens_remaining[:, :next_n], chunk, cache=state.cache
             )
@@ -7317,7 +7330,7 @@ class Scheduler:
             if state.boundary_enabled
             else max(int(getattr(state.request, "cached_tokens", 0) or 0), 0)
         )
-        if state.helper is not None and state.helper.chunk is not None:
+        if helper_chunk:
             _bind_prefill_prompt_ids(self.model, state.request)
             Scheduler._forward_helper_chunk(
                 self, state, chunk, prefill_model, chunk_kwargs

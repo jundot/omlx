@@ -86,6 +86,12 @@ class DeepseekV41Adapter(StageAdapter):
         )
         return model.language_model
 
+    def prefetch(
+        self, lm: Any, cache: list, current: Any, following: Any, start: int = 0
+    ) -> None:
+        with _stage_from(lm, start):
+            lm.prefetch_engram(following, current, cache=cache)
+
     def run_first(
         self, lm: Any, cache: list, tokens: mx.array, next_tokens: int
     ) -> tuple[Arrays, Arrays]:

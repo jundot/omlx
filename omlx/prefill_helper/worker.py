@@ -213,9 +213,18 @@ class HelperServer:
                     session.changed.wait()
                 if job.cancelled or session.closed:
                     return
-            tokens = mx.array(job.tokens[start : start + size])[None]
+            ids = job.tokens[None, start : start + size]
             following = job.chunks[index + 1] if index + 1 < len(job.chunks) else 0
             began = time.perf_counter()
+            if index == 0:
+                self.adapter.prefetch(self.lm, cache, ids[:, :0], ids)
+            self.adapter.prefetch(
+                self.lm,
+                cache,
+                ids,
+                job.tokens[None, start + size : start + size + following],
+            )
+            tokens = mx.array(ids)
             boundary, state = self.adapter.run_first(self.lm, cache, tokens, following)
             elapsed = time.perf_counter() - began
             arrays = {f"b:{n}": wire.to_host(v) for n, v in boundary.items()}

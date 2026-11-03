@@ -75,6 +75,12 @@ class StageAdapter:
         finally:
             lm.end_idx = end
 
+    def prefetch(
+        self, lm: Any, cache: list, current: Any, following: Any, start: int = 0
+    ) -> None:
+        """Start reading what the *following* chunk looks up while *current*
+        runs on layers from *start*. An empty *current* starts a prompt."""
+
     def layer_work(self, lm: Any) -> list[float]:
         """Relative prefill cost of each layer, used to balance the split."""
         return [1.0] * self.layer_count(lm)
