@@ -19,6 +19,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
+from test_scheduler_chunked_prefill import _tiny_glm5_next, _tiny_vlm_adapter
 
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
@@ -35,6 +36,7 @@ from omlx.request import Request, SamplingParams
 from omlx.scheduler import Scheduler, SchedulerConfig
 
 DSV41 = adapter_for("deepseek_v41")
+GLM = adapter_for("glm5_next")
 _TABLES = tempfile.TemporaryDirectory(prefix="omlx-prefill-helper-")
 _TABLE_IDS = itertools.count()
 
@@ -169,11 +171,13 @@ def test_split_limit_keeps_the_ced_midpoint_here():
 TOKEN = b"session-token"
 
 
-def _serve(lm, k, *, once=True):
+def _serve(lm, k, *, once=True, adapter=DSV41):
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
-    server = HelperServer(lm, DSV41, k, TOKEN, {"protocol": wire.PROTOCOL, "layers": k})
+    server = HelperServer(
+        lm, adapter, k, TOKEN, {"protocol": wire.PROTOCOL, "layers": k}
+    )
     thread = threading.Thread(
         target=server.serve, args=(listener,), kwargs={"once": once}, daemon=True
     )
@@ -292,16 +296,16 @@ def _request(tokens, rid="req-1"):
     return request
 
 
-def _session(host, lm, k, **kwargs):
-    listener, thread = _serve(lm, k)
+def _session(host, lm, k, *, adapter=DSV41, **kwargs):
+    listener, thread = _serve(lm, k, adapter=adapter)
     client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
     session = PrefillHelperSession(
         client,
-        DSV41,
+        adapter,
         host,
         k,
         "helper-mac",
-        DSV41.layer_work(lm),
+        adapter.layer_work(lm),
         fixed_layers=k,
         min_tokens=1,
         **kwargs,
@@ -773,3 +777,83 @@ def test_accelerator_check_reports_each_row(monkeypatch):
         "warn",
     ]
     assert rows["link"]["fix"] == "Use TB." and rows["memory"]["bytes"] == 100 << 30
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.3: KDA and sparse-attention layers on either side of the cut.
+# ---------------------------------------------------------------------------
+
+
+def _glm():
+    mx.random.seed(7)
+    lm, _ = _tiny_glm5_next()
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _glm_state(cache):
+    out = []
+    for item in cache:
+        if hasattr(item, "caches"):
+            keys, _ = item[0].state
+            out += [keys, *[a for a in item[1].state if a is not None]]
+        else:
+            out += [item[0], item[1]]
+    return [np.asarray(a) for a in out]
+
+
+def _glm_logits(lm, cache, last):
+    logits = lm(last, cache=cache).logits[:, -1]
+    out = [np.asarray(logits)]
+    for _ in range(3):
+        token = mx.argmax(logits, -1)[:, None]
+        logits = lm(token, cache=cache).logits[:, -1]
+        out.append(np.asarray(logits))
+    return out
+
+
+@pytest.mark.parametrize("k,prefix", [(1, 0), (2, 0), (3, 0), (2, 1)])
+def test_glm_split_matches_whole_model(k, prefix):
+    host, helper = _glm(), _glm()
+    GLM.keep_first(helper, k)
+    ids = mx.array(np.random.default_rng(5).integers(3, 60, (1, 23)))
+    chunks = _chunks(ids, [9, 6, 7])
+    reference = host.make_cache()
+    for chunk in chunks:
+        host(chunk, cache=reference)
+
+    cache, helper_cache = host.make_cache(), helper.make_cache()
+    for chunk in chunks[:prefix]:
+        host(chunk, cache=cache)
+    if prefix:
+        GLM.load_prefix(helper_cache, GLM.prefix_state(cache, k))
+    for chunk in chunks[prefix:]:
+        boundary, state = GLM.run_first(helper, helper_cache, chunk, 0, {})
+        GLM.run_rest(None, host, cache, chunk, k, boundary, state)
+        GLM.apply_state(cache, k, state)
+        mx.eval([c.state for c in cache])
+
+    for a, b in zip(_glm_state(reference), _glm_state(cache)):
+        np.testing.assert_array_equal(a, b)
+    last = ids[:, -1:]
+    for a, b in zip(_glm_logits(host, reference, last), _glm_logits(host, cache, last)):
+        np.testing.assert_array_equal(a, b)
+
+
+def test_scheduler_glm_helper_prefill_matches_local():
+    k, tokens = 2, [int(t) for t in np.random.default_rng(3).integers(3, 60, 23)]
+    host = _tiny_vlm_adapter(_tiny_glm5_next)
+    local = _drive(_scheduler(host, 6), _request(tokens), tokens)
+
+    helper = _glm()
+    GLM.keep_first(helper, k)
+    sched = _scheduler(host, 6)
+    session, listener, thread = _session(host._language_model, helper, k, adapter=GLM)
+    sched.attach_prefill_helper(session)
+    state = _drive(sched, _request(tokens), tokens)
+    assert state.helper is not None and state.helper.index == len(state.helper.grid)
+    for a, b in zip(_glm_state(local.cache), _glm_state(state.cache)):
+        np.testing.assert_array_equal(a, b)
+    session.close()
+    thread.join(10)
+    listener.close()

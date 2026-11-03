@@ -3,10 +3,11 @@
 
 from ..adapter import StageAdapter
 from .deepseek_v41 import DeepseekV41Adapter
+from .glm5_next import Glm5NextAdapter
 
 _ADAPTERS: dict[str, StageAdapter] = {
     model_type: adapter
-    for adapter in (DeepseekV41Adapter(),)
+    for adapter in (DeepseekV41Adapter(), Glm5NextAdapter())
     for model_type in adapter.model_types
 }
 

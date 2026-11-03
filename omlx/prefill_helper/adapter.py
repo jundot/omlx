@@ -171,6 +171,9 @@ class StageAdapter:
         """This Mac: bring layers ``[0, k)`` to the end of the chunk."""
         raise NotImplementedError
 
+    def finish_chunk(self, lm: Any, tokens: mx.array, output: Any, cache: list) -> None:
+        """This Mac: after ``apply_state``, with what ``run_rest`` returned."""
+
     def prefix_state(self, cache: list, k: int) -> Arrays:
         """This Mac: full state of layers ``[0, k)`` for a cached prefix."""
         raise NotImplementedError

@@ -6969,7 +6969,7 @@ class Scheduler:
             state.tokens_remaining[:, : helper.next_size()],
             start=helper.layers,
         )
-        adapter.run_rest(
+        output = adapter.run_rest(
             prefill_model,
             lm,
             state.cache,
@@ -6980,6 +6980,7 @@ class Scheduler:
             **chunk_kwargs,
         )
         adapter.apply_state(state.cache, helper.layers, part.state)
+        adapter.finish_chunk(lm, chunk, output, state.cache)
         mx.eval([c.state for c in state.cache])
         session.observe(
             helper.layers, part.size, part.seconds, time.perf_counter() - began
