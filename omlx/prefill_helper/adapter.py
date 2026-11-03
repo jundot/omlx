@@ -9,13 +9,38 @@ back and then :meth:`StageAdapter.apply_state`. Arrays cross the link as flat
 
 from __future__ import annotations
 
+import json
+import re
+import struct
 from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 
 Arrays = dict[str, mx.array]
+_LAYER = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def _tensor_bytes(model_path: Path) -> dict[str, int]:
+    """Bytes per tensor from the safetensors headers, without loading data."""
+    index = model_path / "model.safetensors.index.json"
+    files = (
+        sorted(set(json.loads(index.read_text())["weight_map"].values()))
+        if index.exists()
+        else ["model.safetensors"]
+    )
+    sizes: dict[str, int] = {}
+    for name in files:
+        with open(model_path / name, "rb") as f:
+            (length,) = struct.unpack("<Q", f.read(8))
+            header = json.loads(f.read(length))
+        for key, spec in header.items():
+            if key != "__metadata__":
+                start, end = spec["data_offsets"]
+                sizes[key] = end - start
+    return sizes
 
 
 class StageAdapter:
@@ -53,6 +78,29 @@ class StageAdapter:
     def layer_work(self, lm: Any) -> list[float]:
         """Relative prefill cost of each layer, used to balance the split."""
         return [1.0] * self.layer_count(lm)
+
+    def resident(self, tensor: str) -> bool:
+        """Whether the helper keeps this tensor in GPU memory."""
+        return True
+
+    def needed_outside_layers(self, tensor: str) -> bool:
+        """Non-layer tensors the helper loads; all of them unless excluded."""
+        return True
+
+    def memory_plan(self, model_path: str | Path) -> tuple[int, list[int]]:
+        """(bytes outside the layers, bytes per layer) the helper holds."""
+        shared, per_layer = 0, {}
+        for tensor, size in _tensor_bytes(Path(model_path).expanduser()).items():
+            if not self.resident(tensor):
+                continue
+            match = _LAYER.search(tensor)
+            if match:
+                layer = int(match.group(1))
+                per_layer[layer] = per_layer.get(layer, 0) + size
+            elif self.needed_outside_layers(tensor):
+                shared += size
+        count = max(per_layer) + 1 if per_layer else 0
+        return shared, [per_layer.get(i, 0) for i in range(count)]
 
     def load_first(self, path: str, k: int) -> Any:
         """Helper: load layers ``[0, k)`` of a checkpoint; returns the module

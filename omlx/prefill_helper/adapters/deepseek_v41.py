@@ -64,6 +64,14 @@ class DeepseekV41Adapter(StageAdapter):
         mid = c.n_layers // 2
         return [1.0] * mid + [0.1] + [0.0] * (c.n_layers - mid - 1)
 
+    def resident(self, tensor: str) -> bool:
+        # Engram tables stay memory-mapped; draft heads and vision never load.
+        return (
+            ".engram.embed." not in tensor
+            and ".mtp." not in tensor
+            and tensor.startswith("language_model.")
+        )
+
     def keep_first(self, lm: Any, k: int) -> None:
         lm.start_idx, lm.end_idx = 0, k
         lm.layers = lm.layers[:k]

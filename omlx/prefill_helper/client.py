@@ -112,6 +112,7 @@ class HelperClient:
         self._send_lock = threading.Lock()
         self._open = threading.Event()
         self.alive = True
+        self.stopped_by_helper = False
         threading.Thread(target=self._receive, daemon=True).start()
         threading.Thread(target=self._keep_warm, daemon=True).start()
 
@@ -158,6 +159,10 @@ class HelperClient:
         try:
             while True:
                 meta, arrays = wire.recv(self.sock)
+                if meta.get("op") == "stopped":
+                    self.stopped_by_helper = True
+                    self._fail("stopped on the helper Mac")
+                    return
                 with self._lock:
                     job = self._jobs.get(meta.get("job_id", ""))
                 if job is not None:

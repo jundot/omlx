@@ -15,9 +15,11 @@ from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
 
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.prefill_helper import launcher, wire
+from omlx.prefill_helper import manager as manager_module
 from omlx.prefill_helper.adapters import adapter_for
 from omlx.prefill_helper.client import HelperClient, HelperError
 from omlx.prefill_helper.launcher import HelperTarget
+from omlx.prefill_helper.manager import PrefillHelperManager
 from omlx.prefill_helper.session import PrefillHelperSession
 from omlx.prefill_helper.worker import WINDOW, HelperServer
 from omlx.request import Request, SamplingParams
@@ -472,3 +474,152 @@ def test_probe_finds_an_existing_copy_or_lists_missing_files(tmp_path):
 def test_helper_target_rejects_a_shell_unsafe_interpreter():
     with pytest.raises(ValueError):
         HelperTarget("n", "x", "u@1.2.3.4", "1.2.3.4", "thunderbolt", "py; rm -rf ~")
+
+
+# ---------------------------------------------------------------------------
+# Manager: the steps from a chosen Mac to an attached session.
+# ---------------------------------------------------------------------------
+
+
+class _PlanAdapter(type(DSV41)):
+    """DeepSeek V4.1 adapter with a fixed memory plan (no checkpoint on disk)."""
+
+    def memory_plan(self, model_path):
+        return 1 << 30, [10 << 30] * 5
+
+
+class _FakeLauncher:
+    LaunchError = launcher.LaunchError
+
+    def __init__(self, lm, k=4, *, version=None, budget=60 << 30, missing=()):
+        self.lm, self.k = lm, k
+        self.version = version or launcher_version()
+        self.budget, self.missing = budget, list(missing)
+        self.copied, self.servers, self.paired = [], [], True
+
+    def resolve_target(self, node_id):
+        if not self.paired:
+            raise launcher.LaunchError("This Mac is not paired.")
+        return HelperTarget(
+            node_id, "M5max", "me@127.0.0.1", "127.0.0.1", "thunderbolt"
+        )
+
+    def remote_info(self, target):
+        return {
+            "version": self.version,
+            "budget": self.budget,
+            "device": "Apple M5 Max",
+        }
+
+    def required_files(self, model_path, layers):
+        return {"config.json": 10, "model-1.safetensors": 1 << 20}
+
+    def locate_files(self, target, name, files):
+        return {
+            "found": None,
+            "copy": "/helper/copy",
+            "missing": self.missing,
+            "free": 1 << 40,
+        }
+
+    def copy_files(self, target, model_path, dest, names, progress):
+        for name in names:
+            self.copied.append(name)
+            progress(name)
+        self.missing = []
+
+    def launch(self, target, model_dir, model_type, layers, *, host_name, warm_tokens):
+        listener, thread = _serve(_helper_model(tiny(), layers), layers)
+        server = SimpleNamespace(listener=listener, thread=thread, layers=layers)
+        self.servers.append(server)
+        return SimpleNamespace(
+            port=listener.getsockname()[1], token=TOKEN, hello={}, stop=listener.close
+        )
+
+
+def launcher_version():
+    from omlx import __version__
+
+    return __version__
+
+
+def _manager(fake, attached):
+    return PrefillHelperManager(
+        model_path="/models/x",
+        model_type="deepseek_v41",
+        adapter=_PlanAdapter(),
+        language_model=_model(tiny()),
+        attach=attached.append,
+        chunk_tokens=8,
+        launcher=fake,
+    )
+
+
+def _wait_state(manager, *states, reason="", timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = manager.status()
+        if status["state"] in states and reason in status.get("reason", ""):
+            return status
+        time.sleep(0.02)
+    raise AssertionError(f"state stayed {manager.status()}")
+
+
+def test_manager_waits_for_consent_before_copying_then_attaches():
+    attached = []
+    fake = _FakeLauncher(None, missing=["model-1.safetensors"])
+    manager = _manager(fake, attached)
+    manager.configure("node-1", None)
+    status = _wait_state(manager, "needs_files")
+    assert status["bytes"] == 1 << 20 and fake.copied == []
+    manager.copy_files()
+    status = _wait_state(manager, "ready")
+    # 60 GiB budget, 1 GiB shared and 8 GiB reserve hold five 10 GiB layers,
+    # but DeepSeek V4.1 keeps the CED midpoint (layer 2 of 5) here.
+    assert fake.copied == ["model-1.safetensors"] and status["held"] == 2
+    assert isinstance(attached[-1], PrefillHelperSession)
+    manager.configure(None, None)
+    _wait_state(manager, "off")
+    assert attached[-1] is None
+    manager.close()
+
+
+def test_manager_blocks_what_a_retry_cannot_fix():
+    attached = []
+    fake = _FakeLauncher(None, version="0.0.1")
+    manager = _manager(fake, attached)
+    manager.configure("node-1", None)
+    _wait_state(manager, "error", reason="update it to")
+    fake.version, fake.budget = launcher_version(), 12 << 30
+    manager.retry()
+    _wait_state(manager, "error", reason="Not even one layer")
+    fake.budget = 60 << 30
+    manager.configure("node-1", 3)
+    _wait_state(manager, "error", reason="at most 2")
+    fake.paired = False
+    manager.configure("node-2", None)
+    _wait_state(manager, "error", reason="not paired")
+    assert attached == []
+    manager.close()
+
+
+def test_manager_retries_a_lost_helper_but_not_a_stopped_one(monkeypatch):
+    monkeypatch.setattr(manager_module, "_RETRY_DELAYS_S", (0.05,))
+    monkeypatch.setattr(manager_module, "_WATCH_S", 0.05)
+    attached = []
+    fake = _FakeLauncher(None)
+    manager = _manager(fake, attached)
+    manager.configure("node-1", None)
+    _wait_state(manager, "ready")
+    first = attached[-1]
+    first.client.close()
+    _wait_state(manager, "offline", "connecting", "starting")
+    _wait_state(manager, "ready")
+    assert attached[-1] is not first and len(fake.servers) == 2
+    # Stopped on the helper Mac: stays off until the user retries.
+    attached[-1].client.stopped_by_helper = True
+    attached[-1].client.close()
+    assert _wait_state(manager, "stopped")["reason"] == "Stopped on M5max"
+    time.sleep(0.3)
+    assert manager.status()["state"] == "stopped" and len(fake.servers) == 2
+    manager.close()

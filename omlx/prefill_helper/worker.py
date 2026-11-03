@@ -70,6 +70,17 @@ class HelperServer:
         self.lm, self.adapter, self.k, self.token = lm, adapter, k, token
         self.info = info
         self.state = "idle"
+        self._session: _Session | None = None
+
+    def notify_stopped(self, timeout: float = 2.0) -> None:
+        """Tell the host this Mac's user stopped the helper, so it stays off."""
+        session = self._session
+        if session is None or session.closed:
+            return
+        sent = threading.Event()
+        session.outbox.put(({"op": "stopped"}, None))
+        session.outbox.put(("flush", sent))
+        sent.wait(timeout)
 
     def serve(self, listener: socket.socket, *, once: bool = False) -> None:
         while True:
@@ -88,6 +99,7 @@ class HelperServer:
                 return
 
     def _serve_session(self, session: _Session) -> None:
+        self._session = session
         stop_warm = _keep_gpu_warm()
         reader = threading.Thread(target=self._read, args=(session,), daemon=True)
         sender = threading.Thread(target=self._send, args=(session,), daemon=True)
@@ -151,6 +163,9 @@ class HelperServer:
             item = session.outbox.get()
             if item is None:
                 return
+            if item[0] == "flush":
+                item[1].set()
+                continue
             try:
                 wire.send(session.sock, *item)
             except OSError:
@@ -313,11 +328,18 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
 
+    server = HelperServer(lm, adapter, args.layers, token, hello)
+
     def stop(*_: Any) -> None:
         _clear_marker(marker)
         os._exit(0)
 
-    signal.signal(signal.SIGTERM, stop)
+    def stopped_here(*_: Any) -> None:
+        # SIGTERM comes from this Mac's oMLX (the user pressed Stop).
+        server.notify_stopped()
+        stop()
+
+    signal.signal(signal.SIGTERM, stopped_here)
     signal.signal(signal.SIGHUP, stop)
 
     def watch_stdin() -> None:
@@ -329,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     threading.Thread(target=watch_stdin, daemon=True).start()
     print(READY_PREFIX + json.dumps({**hello, "port": port}), flush=True)
     try:
-        HelperServer(lm, adapter, args.layers, token, hello).serve(listener)
+        server.serve(listener)
     finally:
         _clear_marker(marker)
     return 0

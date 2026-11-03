@@ -106,17 +106,27 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
     )
 
 
-def remote_version(target: HelperTarget, *, runner: Runner = subprocess.run) -> str:
+_INFO = (
+    "import json, omlx, mlx.core as mx; i = mx.device_info(); "
+    "print(json.dumps({'version': omlx.__version__, "
+    "'budget': i['max_recommended_working_set_size'], "
+    "'device': i.get('device_name', '')}))"
+)
+
+
+def remote_info(target: HelperTarget, *, runner: Runner = subprocess.run) -> dict:
+    """The helper's oMLX version and GPU memory budget."""
     result = _ssh(
         target.ssh_target,
-        f"{target.python} -c 'import omlx; print(omlx.__version__)'",
+        f"{target.python} -c {shlex.quote(_INFO)}",
         runner=runner,
         timeout=60,
     )
-    version = result.stdout.strip().splitlines()[-1:] if result.returncode == 0 else []
-    if not version:
-        raise LaunchError(f"oMLX is not installed on {target.name}.")
-    return version[0]
+    lines = result.stdout.strip().splitlines() if result.returncode == 0 else []
+    try:
+        return json.loads(lines[-1])
+    except (IndexError, ValueError):
+        raise LaunchError(f"oMLX is not installed on {target.name}.") from None
 
 
 def required_files(model_path: str | Path, layers: int) -> dict[str, int]:
