@@ -709,13 +709,16 @@ def test_openai_file_data_without_filename_infers_from_data_uri():
     ],
 )
 @pytest.mark.parametrize("explicit_mime", [True, False])
+@pytest.mark.parametrize(
+    "mime_type", ["application/octet-stream", "application/x-genesis-rom"]
+)
 def test_generic_attachment_mime_uses_supported_filename(
-    filename, expected_mime_type, explicit_mime
+    filename, expected_mime_type, explicit_mime, mime_type
 ):
     part = _file_part(
         filename=filename,
-        data=_data_uri(b"document", mime_type="application/octet-stream"),
-        mime_type="application/octet-stream" if explicit_mime else "",
+        data=_data_uri(b"document", mime_type=mime_type),
+        mime_type=mime_type if explicit_mime else "",
     )
 
     parsed = parse_file_part(part, max_file_size_mb=25)
@@ -730,14 +733,6 @@ def test_generic_attachment_mime_does_not_allow_unsupported_filename(filename):
     with pytest.raises(MarkItDownRequestError, match="not supported|Unsupported"):
         parse_file_part(
             _file_part(filename=filename, mime_type="application/octet-stream"),
-            max_file_size_mb=25,
-        )
-
-
-def test_supported_filename_does_not_override_specific_unsupported_mime():
-    with pytest.raises(MarkItDownRequestError, match="Unsupported attachment MIME"):
-        parse_file_part(
-            _file_part(filename="notes.md", mime_type="image/png"),
             max_file_size_mb=25,
         )
 
