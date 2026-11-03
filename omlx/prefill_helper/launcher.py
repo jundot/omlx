@@ -16,6 +16,7 @@ import queue
 import re
 import secrets
 import shlex
+import socket
 import subprocess
 import threading
 import time
@@ -29,6 +30,8 @@ from ..cluster.registry import get_device_registry
 from ..cluster.ssh_policy import cluster_ssh_options
 from ..cluster.staging import scp_push, sidecar_files
 from ..cluster.transport import (
+    HostInterfaces,
+    SharedLink,
     link_warnings,
     probe_host_interfaces,
     shared_link_addresses,
@@ -40,6 +43,9 @@ DEFAULT_PYTHON = "~/.omlx/bin/omlx-cluster-python"
 COPY_DIR = "~/.omlx/prefill-helper/models"
 _READY_TIMEOUT_S = 900.0
 _PARALLEL_COPIES = 4
+_FAST_LINKS = ("thunderbolt", "rdma")
+# Reaching sshd on a link-local address tells which local interface the cable is.
+_SSH_PORT = 22
 
 Runner = Callable[..., subprocess.CompletedProcess]
 # The interpreter path stays unquoted so "~" expands on the helper.
@@ -55,12 +61,17 @@ class HelperTarget:
     node_id: str
     name: str
     ssh_target: str
-    # The helper binds here and this Mac connects here (Thunderbolt first).
+    # This Mac connects and copies here (Thunderbolt first).
     address: str
     link: str
     python: str = DEFAULT_PYTHON
     # What to fix about a link that is not Thunderbolt.
     warnings: tuple[str, ...] = ()
+    # The helper binds here when it differs from ``address``: a link-local
+    # address carries each Mac's own interface as its scope.
+    bind_address: str = ""
+    # Negotiated Ethernet speed of a link that is not Thunderbolt, in Mbit/s.
+    speed_mbps: int | None = None
 
     def __post_init__(self) -> None:
         if not _PYTHON_PATH.fullmatch(self.python):
@@ -101,16 +112,68 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
         raise LaunchError(f"{device['friendly_name']} does not answer over SSH.")
     local, peer = probe_host_interfaces("localhost"), probe_host_interfaces(target)
     link = shared_link_addresses(local, peer)
+    cable = None if link.kind in _FAST_LINKS else thunderbolt_link_local(local, peer)
+    if cable is not None:
+        return HelperTarget(
+            node_id=node_id,
+            name=device["friendly_name"],
+            ssh_target=target,
+            address=cable[0],
+            link="thunderbolt",
+            bind_address=cable[1],
+        )
     if not link.ok:
         raise LaunchError(link.reason or "No network link to the helper Mac.")
+    wifi = (
+        link.source.interface in local.wifi_interfaces
+        or link.peer.interface in peer.wifi_interfaces
+    )
     return HelperTarget(
         node_id=node_id,
         name=device["friendly_name"],
         ssh_target=target,
         address=link.peer.address,
-        link=link.kind,
+        link="wifi" if wifi else link.kind,
         warnings=link_warnings(local, peer, link),
+        speed_mbps=None if wifi else _link_speed(local, peer, link),
     )
+
+
+def thunderbolt_link_local(
+    local: HostInterfaces,
+    peer: HostInterfaces,
+    *,
+    connect: Callable[..., socket.socket] = socket.create_connection,
+) -> tuple[str, str] | None:
+    """The helper's link-local address on a Thunderbolt cable, scoped for this
+    Mac and for the helper, or None.
+
+    A Thunderbolt Bridge left on DHCP has no routable IPv4, but its IPv6
+    link-local address routes over the cable once scoped to the interface.
+    """
+    for peer_interface in sorted(peer.thunderbolt_interfaces):
+        address = peer.link_local_addresses.get(peer_interface)
+        if address is None:
+            continue
+        for interface in sorted(local.thunderbolt_interfaces):
+            if interface not in local.link_local_addresses:
+                continue
+            try:
+                connect((f"{address}%{interface}", _SSH_PORT), timeout=2).close()
+            except OSError:
+                continue
+            return f"{address}%{interface}", f"{address}%{peer_interface}"
+    return None
+
+
+def _link_speed(
+    local: HostInterfaces, peer: HostInterfaces, link: SharedLink
+) -> int | None:
+    speeds = [
+        local.media_speeds.get(link.source.interface),
+        peer.media_speeds.get(link.peer.interface),
+    ]
+    return None if None in speeds else min(speeds)
 
 
 _INFO = (
@@ -278,7 +341,7 @@ def launch(
         "--layers",
         str(layers),
         "--bind",
-        target.address,
+        target.bind_address or target.address,
         "--warm-tokens",
         str(warm_tokens),
         "--host-name",

@@ -27,6 +27,9 @@ from .manager import fit_layers, helper_budget
 router = APIRouter(prefix="/admin/api/prefill-helper", tags=["prefill-helper"])
 
 _get_engine_pool: Callable[[], Any] = lambda: None  # noqa: E731
+# The helper sends up to ~180 MB/s on the tested models: 5 GbE carries that
+# with room to spare, 2.5 GbE with little.
+_FULL_SPEED_MBPS = 5000
 
 
 def set_engine_pool_getter(getter: Callable[[], Any]) -> None:
@@ -127,12 +130,16 @@ def _check(node_id: str) -> dict:
         rows.append({"key": "ssh", "status": "fail", "detail": str(error)})
         return {"node_id": node_id, "name": device["friendly_name"], "rows": rows}
     rows.append({"key": "ssh", "status": "pass", "detail": target.ssh_target})
-    fast = target.link in ("thunderbolt", "rdma")
+    fast = (
+        target.link in ("thunderbolt", "rdma")
+        or (target.speed_mbps or 0) >= _FULL_SPEED_MBPS
+    )
     rows.append(
         {
             "key": "link",
             "status": "pass" if fast else "warn",
             "detail": target.link,
+            "speed_mbps": target.speed_mbps,
             "fix": " ".join(target.warnings),
         }
     )

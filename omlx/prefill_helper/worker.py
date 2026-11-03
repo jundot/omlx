@@ -335,9 +335,13 @@ def main(argv: list[str] | None = None) -> int:
     warm_seconds = time.perf_counter() - began
     mx.clear_cache()
 
-    listener = socket.socket()
+    # getaddrinfo keeps the interface scope of a link-local address.
+    family, _, _, _, address = socket.getaddrinfo(
+        args.bind, args.port, type=socket.SOCK_STREAM
+    )[0]
+    listener = socket.socket(family)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind((args.bind, args.port))
+    listener.bind(address)
     listener.listen(1)
     port = listener.getsockname()[1]
     hello = {

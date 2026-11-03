@@ -1476,7 +1476,7 @@ private struct PrefillAcceleratorGroup: View {
                 FreeRow(isLast: true) {
                     HStack(spacing: 10) {
                         HintLine(text: String(localized: "settings.acceleration.prefill_helper.needs_cluster",
-                                              defaultValue: "Turn on Cluster in the web dashboard's Settings, then pair a Mac in its Cluster tab.",
+                                              defaultValue: "In the web dashboard, turn on Global Settings > Advanced > Enable Distributed Inference on both Macs and restart oMLX, then pair a Mac in the Cluster tab.",
                                               comment: "Hint when no Mac can be paired for the Prefill Accelerator"))
                         Spacer(minLength: 8)
                         Button(String(localized: "settings.acceleration.prefill_helper.open_cluster",

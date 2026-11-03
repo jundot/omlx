@@ -1747,9 +1747,19 @@ function clusterV2Wizard() {
                 if (row.key === 'ssh' && row.status === 'pass') {
                     detail = t('ssh_ok').replace('{target}', row.detail);
                 } else if (row.key === 'link') {
-                    detail = row.status === 'pass'
-                        ? t('link_fast')
-                        : t('link_slow').replace('{kind}', row.detail);
+                    const mbps = Number(row.speed_mbps || 0);
+                    const speed = mbps >= 1000 ? `${mbps / 1000} Gb` : `${mbps} Mb`;
+                    const ethernet = t('link_ethernet').replace('{speed}', speed);
+                    if (['thunderbolt', 'rdma'].includes(row.detail)) {
+                        detail = t('link_fast');
+                    } else if (row.status === 'pass') {
+                        detail = ethernet;
+                    } else if (mbps >= 2500) {
+                        detail = t('link_ethernet_ok').replace('{speed}', speed);
+                    } else {
+                        const kind = row.detail === 'wifi' ? 'Wi-Fi' : (mbps ? ethernet : 'Ethernet');
+                        detail = t('link_slow').replace('{kind}', kind);
+                    }
                 } else if (row.key === 'version') {
                     detail = row.status === 'pass'
                         ? t('version_ok').replace('{version}', row.detail)

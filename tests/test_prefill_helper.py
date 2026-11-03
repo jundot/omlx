@@ -9,8 +9,8 @@ import subprocess
 import tempfile
 import threading
 import time
-from pathlib import Path
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -27,6 +27,7 @@ from test_scheduler_chunked_prefill import (
     _tiny_vlm_adapter,
 )
 
+from omlx.cluster.transport import HostInterfaces, InterfaceAddress
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.storage import DiskEngramEmbedding
 from omlx.patches.mlx_vlm_minimax_m3_compat import (
@@ -819,6 +820,67 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     assert killed[-1] == signal.SIGTERM
 
 
+def test_resolve_target_uses_the_thunderbolt_link_local_without_ipv4(monkeypatch):
+    lan = InterfaceAddress
+    local = HostInterfaces(
+        "localhost",
+        (lan("en0", "192.168.1.30", 24),),
+        thunderbolt_interfaces=frozenset({"bridge0", "en2"}),
+        link_local_addresses={"bridge0": "fe80::1", "en2": "fe80::3"},
+        media_speeds={"en0": 10000},
+    )
+    peer = HostInterfaces(
+        "me@192.168.1.31",
+        (lan("en0", "192.168.1.31", 24),),
+        thunderbolt_interfaces=frozenset({"bridge0"}),
+        link_local_addresses={"bridge0": "fe80::2"},
+        media_speeds={"en0": 2500},
+    )
+    device = {
+        "friendly_name": "M5max",
+        "ssh_user": "me",
+        "last_addrs": ["192.168.1.31"],
+    }
+    monkeypatch.setattr(
+        launcher, "get_device_registry", lambda: SimpleNamespace(get=lambda n: device)
+    )
+    monkeypatch.setattr(
+        launcher,
+        "probe_host_interfaces",
+        lambda host: local if host == "localhost" else peer,
+    )
+    answered = SimpleNamespace(returncode=0)
+
+    def connect(address, timeout):
+        if address != ("fe80::2%en2", 22):
+            raise OSError("no route")
+        return MagicMock()
+
+    real = launcher.thunderbolt_link_local
+    monkeypatch.setattr(
+        launcher,
+        "thunderbolt_link_local",
+        lambda local, peer: real(local, peer, connect=connect),
+    )
+    target = launcher.resolve_target("n", runner=lambda *a, **k: answered)
+    # Each Mac scopes the address to its own end of the cable.
+    assert (target.address, target.bind_address, target.link) == (
+        "fe80::2%en2",
+        "fe80::2%bridge0",
+        "thunderbolt",
+    )
+
+    # Without the cable the LAN is used, judged by its slower end.
+    peer = replace(peer, link_local_addresses={})
+    target = launcher.resolve_target("n", runner=lambda *a, **k: answered)
+    assert (target.address, target.bind_address, target.link) == (
+        "192.168.1.31",
+        "",
+        "ethernet",
+    )
+    assert target.speed_mbps == 2500
+
+
 def test_accelerator_check_reports_each_row(monkeypatch):
     monkeypatch.setattr(
         helper_routes,
@@ -848,6 +910,9 @@ def test_accelerator_check_reports_each_row(monkeypatch):
         "warn",
     ]
     assert rows["link"]["fix"] == "Use TB." and rows["memory"]["bytes"] == 100 << 30
+    target = replace(target, speed_mbps=5000)
+    rows = {row["key"]: row for row in helper_routes._check("n")["rows"]}
+    assert rows["link"]["status"] == "pass"
 
 
 # ---------------------------------------------------------------------------

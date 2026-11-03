@@ -22001,7 +22001,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Turn on Cluster in the web dashboard's Settings, then pair a Mac in its Cluster tab."
+            "value" : "In the web dashboard, turn on Global Settings > Advanced > Enable Distributed Inference on both Macs and restart oMLX, then pair a Mac in the Cluster tab."
           }
         }
       }

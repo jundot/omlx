@@ -729,12 +729,12 @@ def _fabric_route(ssh_target: str, address: str | None) -> tuple[str, list[str]]
     if address is None:
         return ssh_target, []
     user, _, host = ssh_target.rpartition("@")
-    return (f"{user}@{address}" if user else address), [
-        "-o",
-        f"HostKeyAlias={host}",
-        "-o",
-        "StrictHostKeyChecking=yes",
-    ]
+    options = ["-o", f"HostKeyAlias={host}", "-o", "StrictHostKeyChecking=yes"]
+    if ":" in address:
+        # scp takes an IPv6 host in brackets; the cluster options pin IPv4.
+        address = f"[{address}]"
+        options += ["-o", "AddressFamily=inet6"]
+    return (f"{user}@{address}" if user else address), options
 
 
 def fabric_transfer_address(ssh_target: str, addresses: Sequence[str]) -> str | None:
