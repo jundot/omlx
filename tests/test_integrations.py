@@ -2753,21 +2753,26 @@ class TestCopilotIntegration:
     def test_catalog_uses_public_inventory_without_status(
         self, model_inventory, context_limit, expected
     ):
+        from omlx.api.openai_models import ModelInfo
+
         model_inventory.side_effect = None
         model_inventory.return_value.json.return_value = {
             "data": [
-                {
-                    "id": "public-chat",
-                    "model_type": "llm",
-                    "max_model_len": context_limit,
-                },
-                {"id": "public-embedding", "model_type": "embedding"},
+                ModelInfo(
+                    id="public-chat", model_type="llm", max_model_len=context_limit
+                ).model_dump(),
+                ModelInfo(id="public-vision", model_type="vlm").model_dump(),
+                ModelInfo(id="public-embedding", model_type="embedding").model_dump(),
             ]
         }
         config = copilot_provider_config(ctx())
-        assert [entry["id"] for entry in config["models"]] == ["public-chat"]
+        assert [entry["id"] for entry in config["models"]] == [
+            "public-chat",
+            "public-vision",
+        ]
         assert config["models"][0]["maxPromptTokens"] == expected
         assert config["models"][0]["maxContextWindowTokens"] == expected
+        assert config["models"][1]["capabilities"]["supports"]["vision"] is True
         model_inventory.assert_called_once()
 
     def test_launch_without_chat_models_leaves_registry_untouched(

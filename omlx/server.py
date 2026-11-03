@@ -3783,6 +3783,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
 
     if _server_state.engine_pool is not None:
         status = _server_state.engine_pool.get_status()
+        model_types = {m["id"]: m.get("model_type") for m in status["models"]}
         settings_manager = _server_state.settings_manager
 
         hide_helpers = bool(
@@ -3836,13 +3837,14 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                 ModelInfo(
                     id=display_id,
                     owned_by="omlx",
+                    model_type=m.get("model_type"),
                     max_model_len=get_max_context_window(model_id),
                 )
             )
         # Both sets are needed by the exposed-profile and Claude tier-alias
         # blocks below, and the latter runs with or without a settings manager,
         # so they are built here rather than inside the settings guard.
-        physical_ids = {m["id"] for m in status["models"]}
+        physical_ids = set(model_types)
         existing_ids = {m.id for m in models}
         if settings_manager:
             for profile in settings_manager.list_exposed_profile_models():
@@ -3858,6 +3860,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                     ModelInfo(
                         id=profile_model_id,
                         owned_by="omlx",
+                        model_type=model_types.get(source_model_id),
                         max_model_len=get_max_context_window(profile_model_id),
                     )
                 )
@@ -3906,6 +3909,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
                     ClaudeTierModelInfo(
                         id=slot_id,
                         owned_by="omlx",
+                        model_type=model_types.get(tier_model),
                         max_model_len=get_max_context_window(tier_model),
                         display_name=tier_model,
                         created_at=created_at,
@@ -3919,7 +3923,9 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
     if _markitdown_is_visible() and not any(
         m.id == MARKITDOWN_MODEL_ID for m in models
     ):
-        models.append(ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx"))
+        models.append(
+            ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx", model_type="markitdown")
+        )
 
     # Favorites first; stable sort keeps alphabetical order within groups.
     if favorite_ids:
@@ -3930,7 +3936,7 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
     # ``ModelInfo`` (dropping the tier metadata), while a route-level
     # exclude would drop upstream fields like ``max_model_len: null``.
     # Per-item ``model_dump()`` honors each instance's own field config:
-    # standard entries stay byte-identical, tier aliases carry metadata.
+    # standard entries omit tier fields; aliases carry them.
     return JSONResponse(
         content={
             "object": "list",
