@@ -10,6 +10,7 @@ back and then :meth:`StageAdapter.apply_state`. Arrays cross the link as flat
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 import mlx.core as mx
@@ -38,6 +39,20 @@ class StageAdapter:
     def keep_first(self, lm: Any, k: int) -> None:
         """Drop layers ``[k, n)`` before the helper loads weights."""
         raise NotImplementedError
+
+    @contextmanager
+    def use_first(self, lm: Any, k: int):
+        """Helper: run only the first ``k`` of the layers it holds."""
+        end = lm.end_idx
+        lm.end_idx = k
+        try:
+            yield
+        finally:
+            lm.end_idx = end
+
+    def layer_work(self, lm: Any) -> list[float]:
+        """Relative prefill cost of each layer, used to balance the split."""
+        return [1.0] * self.layer_count(lm)
 
     def load_first(self, path: str, k: int) -> Any:
         """Helper: load layers ``[0, k)`` of a checkpoint; returns the module

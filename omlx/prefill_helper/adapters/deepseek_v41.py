@@ -55,6 +55,15 @@ class DeepseekV41Adapter(StageAdapter):
         # The CED midpoint holds the decoder replay input, so it stays here.
         return lm._config.n_layers // 2
 
+    def layer_work(self, lm: Any) -> list[float]:
+        c = lm._config
+        if not c.ced_prefill:
+            return [1.0] * c.n_layers
+        # CED: past the midpoint only the window tail runs, and decoder tails
+        # of chunks that another chunk follows are skipped.
+        mid = c.n_layers // 2
+        return [1.0] * mid + [0.1] + [0.0] * (c.n_layers - mid - 1)
+
     def keep_first(self, lm: Any, k: int) -> None:
         lm.start_idx, lm.end_idx = 0, k
         lm.layers = lm.layers[:k]

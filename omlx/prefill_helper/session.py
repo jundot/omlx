@@ -17,13 +17,16 @@ from typing import Any
 
 import numpy as np
 
-from .adapter import Arrays, StageAdapter
+from .adapter import StageAdapter
 from .client import Chunk, HelperClient, HelperError, HelperJob
 
 logger = logging.getLogger(__name__)
 
 # Shorter prompts finish locally before the first chunk would come back.
 MIN_TOKENS = 2048
+# Short chunks (tails, block slivers) are dominated by fixed costs.
+_OBSERVE_TOKENS = 1024
+_EWMA = 0.5
 
 
 @dataclass
@@ -33,6 +36,7 @@ class HelperPrefill:
     session: PrefillHelperSession
     job: HelperJob
     grid: list[int]
+    layers: int
     index: int = 0
     chunk: Chunk | None = None
 
@@ -42,15 +46,64 @@ class HelperPrefill:
 
 @dataclass
 class PrefillHelperSession:
+    """``layers`` is how many the helper holds; each job uses the first
+    ``pick_layers()`` of them. Without a fixed choice the split follows the
+    measured seconds per unit of work on each Mac (``work`` per layer)."""
+
     client: HelperClient
     adapter: StageAdapter
     layers: int
     name: str
+    work: list[float]
+    fixed_layers: int | None = None
     min_tokens: int = MIN_TOKENS
     last_error: str | None = None
     last_prompt: dict[str, Any] | None = None
+    unit_helper: float | None = None
+    unit_host: float | None = None
     _jobs: dict[str, HelperJob] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self) -> None:
+        hello = self.client.info
+        seconds, tokens = hello.get("warm_seconds"), hello.get("warm_tokens")
+        if seconds and tokens and self.unit_helper is None:
+            self.unit_helper = seconds / (self._work(0, self.layers) * tokens)
+
+    def _work(self, start: int, end: int) -> float:
+        return max(sum(self.work[start:end]), 1e-6)
+
+    def pick_layers(self) -> int:
+        if self.fixed_layers:
+            return min(self.fixed_layers, self.layers)
+        helper = self.unit_helper
+        # Until this Mac has been timed, assume both Macs are equally fast.
+        host = self.unit_host if self.unit_host is not None else helper
+        if helper is None:
+            return self.layers
+        return min(
+            range(1, self.layers + 1),
+            key=lambda k: max(
+                helper * self._work(0, k), host * self._work(k, len(self.work))
+            ),
+        )
+
+    def observe(self, layers: int, tokens: int, helper_s: float, host_s: float) -> None:
+        """Fold one chunk's timings into the per-unit estimates."""
+        if tokens < _OBSERVE_TOKENS:
+            return
+        helper = helper_s / (self._work(0, layers) * tokens)
+        host = host_s / (self._work(layers, len(self.work)) * tokens)
+        self.unit_helper = (
+            helper
+            if self.unit_helper is None
+            else (_EWMA * helper + (1 - _EWMA) * self.unit_helper)
+        )
+        self.unit_host = (
+            host
+            if self.unit_host is None
+            else (_EWMA * host + (1 - _EWMA) * self.unit_host)
+        )
 
     @property
     def alive(self) -> bool:
@@ -64,16 +117,19 @@ class PrefillHelperSession:
         request_id: str,
         tokens: np.ndarray,
         grid: list[int],
-        prefix: Arrays | None,
+        cache: list | None,
     ) -> HelperPrefill | None:
+        """Queue a job; ``cache`` holds a restored prefix (None without one)."""
+        layers = self.pick_layers()
+        prefix = self.adapter.prefix_state(cache, layers) if cache else None
         try:
-            job = self.client.submit(tokens, grid, prefix)
+            job = self.client.submit(tokens, grid, prefix, layers=layers)
         except HelperError as error:
             self.note_failure(str(error))
             return None
         with self._lock:
             self._jobs[request_id] = job
-        return HelperPrefill(self, job, list(grid))
+        return HelperPrefill(self, job, list(grid), layers)
 
     def finish(self, request_id: str, tokens: int, seconds: float) -> None:
         with self._lock:

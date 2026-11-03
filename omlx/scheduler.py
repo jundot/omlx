@@ -6833,16 +6833,11 @@ class Scheduler:
         state.sampler = sampler
         state.sm = self._stop_sequences_for_insert(request)
         state.per_row_lps = list(logits_processors) if logits_processors else []
-        prefix = (
-            session.adapter.prefix_state(state.cache, session.layers)
-            if state.base_size > 0
-            else None
-        )
         state.helper = session.start(
             request.request_id,
             tokens[:-1],
             Scheduler._helper_chunk_grid(self, state),
-            prefix,
+            state.cache if state.base_size > 0 else None,
         )
         # Without a job the request still prefills here in chunks.
         self.prefilling.append(request)
@@ -6962,18 +6957,22 @@ class Scheduler:
             # The grid is exact, unlike the throttled estimate.
             chunk_kwargs["next_prefill_tokens"] = helper.next_size()
         adapter = session.adapter
+        began = time.perf_counter()
         adapter.run_rest(
             prefill_model,
             adapter.language_model(self.model),
             state.cache,
             chunk,
-            session.layers,
+            helper.layers,
             part.boundary,
             part.state,
             **chunk_kwargs,
         )
-        adapter.apply_state(state.cache, session.layers, part.state)
+        adapter.apply_state(state.cache, helper.layers, part.state)
         mx.eval([c.state for c in state.cache])
+        session.observe(
+            helper.layers, part.size, part.seconds, time.perf_counter() - began
+        )
 
     def _next_prefill_chunk_len(self, state: _PrefillState, n: int) -> int:
         remaining = state.tokens_remaining.shape[1]

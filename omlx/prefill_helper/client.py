@@ -120,6 +120,8 @@ class HelperClient:
         tokens: np.ndarray,
         chunks: list[int],
         prefix: dict[str, mx.array] | None = None,
+        *,
+        layers: int | None = None,
     ) -> HelperJob:
         if not self.alive:
             raise HelperError("prefill helper connection is closed")
@@ -130,7 +132,10 @@ class HelperClient:
         arrays = {"tokens": (np.asarray(tokens, np.int32).reshape(1, -1), "int32")}
         for name, value in (prefix or {}).items():
             arrays[f"p:{name}"] = wire.to_host(value)
-        self._send({"op": "job", "job_id": job.job_id, "chunks": job.chunks}, arrays)
+        meta = {"op": "job", "job_id": job.job_id, "chunks": job.chunks}
+        if layers is not None:
+            meta["layers"] = int(layers)
+        self._send(meta, arrays)
         return job
 
     def close(self) -> None:

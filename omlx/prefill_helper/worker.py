@@ -45,6 +45,7 @@ class _Job:
     job_id: str
     tokens: np.ndarray
     chunks: list[int]
+    layers: int
     prefix: dict[str, mx.array] | None = None
     acked: int = -1
     cancelled: bool = False
@@ -122,6 +123,7 @@ class HelperServer:
                             meta["job_id"],
                             arrays["tokens"][0].reshape(-1),
                             [int(n) for n in meta["chunks"]],
+                            min(int(meta.get("layers", self.k)), self.k),
                             prefix or None,
                         )
                         session.jobs.append(job)
@@ -167,45 +169,11 @@ class HelperServer:
 
     def _run_job(self, session: _Session, job: _Job) -> None:
         self.state = "working"
-        cache = self.lm.make_cache()
+        cache = None
         try:
-            if job.prefix:
-                self.adapter.load_prefix(cache, job.prefix)
-            start = 0
-            for index, size in enumerate(job.chunks):
-                with session.changed:
-                    while (
-                        index - job.acked > WINDOW
-                        and not job.cancelled
-                        and not session.closed
-                    ):
-                        session.changed.wait()
-                    if job.cancelled or session.closed:
-                        return
-                tokens = mx.array(job.tokens[start : start + size])[None]
-                following = job.chunks[index + 1] if index + 1 < len(job.chunks) else 0
-                began = time.perf_counter()
-                boundary, state = self.adapter.run_first(
-                    self.lm, cache, tokens, following
-                )
-                elapsed = time.perf_counter() - began
-                arrays = {f"b:{n}": wire.to_host(v) for n, v in boundary.items()}
-                arrays.update({f"s:{n}": wire.to_host(v) for n, v in state.items()})
-                session.outbox.put(
-                    (
-                        {
-                            "op": "chunk",
-                            "job_id": job.job_id,
-                            "index": index,
-                            "start": start,
-                            "size": size,
-                            "seconds": elapsed,
-                        },
-                        arrays,
-                    )
-                )
-                start += size
-            session.outbox.put(({"op": "done", "job_id": job.job_id}, None))
+            with self.adapter.use_first(self.lm, job.layers):
+                cache = self.lm.make_cache()
+                self._run_chunks(session, job, cache)
         except Exception as error:  # reported to the host, which prefills locally
             session.outbox.put(
                 ({"op": "error", "job_id": job.job_id, "error": repr(error)}, None)
@@ -215,6 +183,43 @@ class HelperServer:
             del cache
             mx.clear_cache()
             self.state = "idle"
+
+    def _run_chunks(self, session: _Session, job: _Job, cache: list) -> None:
+        if job.prefix:
+            self.adapter.load_prefix(cache, job.prefix)
+        start = 0
+        for index, size in enumerate(job.chunks):
+            with session.changed:
+                while (
+                    index - job.acked > WINDOW
+                    and not job.cancelled
+                    and not session.closed
+                ):
+                    session.changed.wait()
+                if job.cancelled or session.closed:
+                    return
+            tokens = mx.array(job.tokens[start : start + size])[None]
+            following = job.chunks[index + 1] if index + 1 < len(job.chunks) else 0
+            began = time.perf_counter()
+            boundary, state = self.adapter.run_first(self.lm, cache, tokens, following)
+            elapsed = time.perf_counter() - began
+            arrays = {f"b:{n}": wire.to_host(v) for n, v in boundary.items()}
+            arrays.update({f"s:{n}": wire.to_host(v) for n, v in state.items()})
+            session.outbox.put(
+                (
+                    {
+                        "op": "chunk",
+                        "job_id": job.job_id,
+                        "index": index,
+                        "start": start,
+                        "size": size,
+                        "seconds": elapsed,
+                    },
+                    arrays,
+                )
+            )
+            start += size
+        session.outbox.put(({"op": "done", "job_id": job.job_id}, None))
 
 
 def _keep_gpu_warm():
@@ -314,6 +319,14 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGHUP, stop)
+
+    def watch_stdin() -> None:
+        # The host's SSH session holds stdin open; when it ends, so does this.
+        for _ in sys.stdin:
+            pass
+        stop()
+
+    threading.Thread(target=watch_stdin, daemon=True).start()
     print(READY_PREFIX + json.dumps({**hello, "port": port}), flush=True)
     try:
         HelperServer(lm, adapter, args.layers, token, hello).serve(listener)

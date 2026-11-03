@@ -1,6 +1,8 @@
 """Prefill Accelerator: a split prefill must match the whole-model prefill."""
 
+import json
 import socket
+import subprocess
 import threading
 import time
 from types import SimpleNamespace
@@ -12,9 +14,10 @@ import pytest
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
 
 from omlx.patches.deepseek_v41.language import LanguageModel
-from omlx.prefill_helper import wire
+from omlx.prefill_helper import launcher, wire
 from omlx.prefill_helper.adapters import adapter_for
 from omlx.prefill_helper.client import HelperClient, HelperError
+from omlx.prefill_helper.launcher import HelperTarget
 from omlx.prefill_helper.session import PrefillHelperSession
 from omlx.prefill_helper.worker import WINDOW, HelperServer
 from omlx.request import Request, SamplingParams
@@ -262,7 +265,14 @@ def _session(lm, k, **kwargs):
     listener, thread = _serve(lm, k)
     client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
     session = PrefillHelperSession(
-        client, DSV41, k, "helper-mac", min_tokens=1, **kwargs
+        client,
+        DSV41,
+        k,
+        "helper-mac",
+        DSV41.layer_work(lm),
+        fixed_layers=k,
+        min_tokens=1,
+        **kwargs,
     )
     return session, listener, thread
 
@@ -376,3 +386,89 @@ def test_helper_grid_stops_at_blocks_and_tails():
     )
     # Cached prefix of 5: the first block ends at 16, the tail at 29.
     assert Scheduler._helper_chunk_grid(sched, state) == [8, 3, 8, 5, 3, 3]
+
+
+def test_auto_split_balances_measured_speed():
+    work = [1.0] * 20 + [0.1] + [0.0] * 19  # DeepSeek V4.1 with CED
+    client = SimpleNamespace(info={"warm_seconds": 18.0, "warm_tokens": 1}, alive=True)
+    session = PrefillHelperSession(client, DSV41, 18, "helper-mac", work)
+    # Before this Mac is timed, both Macs count as equally fast.
+    assert session.pick_layers() == 10
+    # This Mac takes twice as long per unit of work: the helper gets more.
+    session.observe(10, 2048, helper_s=10 * 2048, host_s=10.1 * 2 * 2048)
+    assert session.pick_layers() == 14
+    session.fixed_layers = 5
+    assert session.pick_layers() == 5
+
+
+def test_job_uses_fewer_layers_than_the_helper_holds():
+    config, held, k, sizes = tiny(**_ENGRAM), 3, 2, [6, 5, 4]
+    host = _model(config)
+    ids = mx.array(np.random.default_rng(9).integers(3, 60, (1, sum(sizes) + 1)))
+    chunks = _chunks(ids, sizes)
+    reference = host.make_cache()
+    for chunk in chunks:
+        host._omlx_prefill(chunk, cache=reference)
+
+    listener, thread = _serve(_helper_model(config, held), held)
+    client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
+    job = client.submit(np.asarray(ids[0, :-1]), sizes, layers=k)
+    cache = host.make_cache()
+    for chunk in chunks:
+        part = job.take(timeout=60)
+        assert len({name.split(".")[0] for name in part.state}) == k
+        DSV41.run_rest(
+            host._omlx_prefill, host, cache, chunk, k, part.boundary, part.state
+        )
+        DSV41.apply_state(cache, k, part.state)
+    client.close()
+    thread.join(10)
+    listener.close()
+    _assert_same_cache(reference, cache)
+
+
+# ---------------------------------------------------------------------------
+# Launcher: the file probe runs on the helper with stdlib Python only.
+# ---------------------------------------------------------------------------
+
+
+def _probe(home, files):
+    target = HelperTarget("node", "M5max", "me@10.0.0.2", "10.0.0.2", "thunderbolt")
+
+    def runner(argv, **kwargs):
+        # Run the remote command here, with HOME pointing at the fake Mac.
+        command = argv[-1]
+        return subprocess.run(
+            ["/bin/sh", "-c", command],
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+            **kwargs,
+        )
+
+    return launcher.locate_files(target, "Model-oQ3e", files, runner=runner)
+
+
+def test_probe_finds_an_existing_copy_or_lists_missing_files(tmp_path):
+    files = {"config.json": 3, "model-00001.safetensors": 5}
+    models = tmp_path / "Models" / "org" / "Model-oQ3e"
+    models.mkdir(parents=True)
+    (models / "config.json").write_bytes(b"abc")
+    (models / "model-00001.safetensors").write_bytes(b"12345")
+    (tmp_path / ".omlx").mkdir()
+    (tmp_path / ".omlx" / "settings.json").write_text(
+        json.dumps({"model": {"model_dirs": [str(tmp_path / "Models")]}})
+    )
+    found = _probe(tmp_path, files)
+    assert found["found"] == str(models)
+
+    # A size mismatch is not a copy; the copy folder then lacks everything.
+    (models / "model-00001.safetensors").write_bytes(b"1234")
+    result = _probe(tmp_path, files)
+    assert result["found"] is None
+    assert result["copy"] == str(tmp_path / ".omlx/prefill-helper/models/Model-oQ3e")
+    assert sorted(result["missing"]) == sorted(files)
+    assert result["free"] > 0
+
+
+def test_helper_target_rejects_a_shell_unsafe_interpreter():
+    with pytest.raises(ValueError):
+        HelperTarget("n", "x", "u@1.2.3.4", "1.2.3.4", "thunderbolt", "py; rm -rf ~")
