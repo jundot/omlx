@@ -1421,9 +1421,13 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             pre = mx.broadcast_to(
                 (mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1]
             )
-            if self.pipeline_rank < self.pipeline_size - 1:
+            # A prefill helper ran the layers before this stage on another Mac.
+            stage_input = kwargs.get("_stage_input")
+            if stage_input is not None:
+                h, pre = stage_input["h"], stage_input["pre"]
+            elif self.pipeline_rank < self.pipeline_size - 1:
                 h, pre = _receive_stage(h, pre, self.pipeline_rank + 1)
-            shared = {}
+            shared = {} if stage_input is None else dict(stage_input["shared"])
             # An MTP verify block runs through the fused decode kernels token-exactly
             # (decode_fused.decode_block_verify: each token gets its single-token decode
             # result, so speculation cannot change greedy output) when every layer has them.
@@ -1531,6 +1535,9 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                                 mx.zeros((1, 0), mx.int64) if slot == 6 else empty
                             )
                     rows[j].append(rc[j])
+            stage_capture = kwargs.get("_stage_capture")
+            if stage_capture is not None:
+                stage_capture.update(h=h, pre=pre, shared=shared)
             if skip_decoder:
                 # Cache-only: a skipped chunk has no decoder output to project.
                 width = c.dim if skip_logits else c.vocab_size
