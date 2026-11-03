@@ -223,7 +223,7 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models.
 
-Document attachments support PDF, DOCX, PPTX, TXT, and MD. Acceptance is based on the filename extension. Browsers report the same file with different MIME types (for example `application/octet-stream`, or whatever the OS has registered for the extension), so when the reported type is not one oMLX recognizes, the converter MIME type is inferred from the extension. Unsupported extensions, and spreadsheets by extension or reported MIME type, remain rejected.
+Document attachments support PDF, DOCX, PPTX, TXT, and MD. Attachments are accepted by filename extension. If the client reports a MIME type oMLX does not recognize, such as `application/octet-stream`, the converter MIME type is inferred from the extension.
 
 <p align="center">
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX Chat" width="720">
