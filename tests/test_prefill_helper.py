@@ -3,6 +3,8 @@
 import socket
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import numpy as np
@@ -10,9 +12,13 @@ import pytest
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
 
 from omlx.patches.deepseek_v41.language import LanguageModel
-from omlx.prefill_helper import adapter_for, wire
+from omlx.prefill_helper import wire
+from omlx.prefill_helper.adapters import adapter_for
 from omlx.prefill_helper.client import HelperClient, HelperError
+from omlx.prefill_helper.session import PrefillHelperSession
 from omlx.prefill_helper.worker import WINDOW, HelperServer
+from omlx.request import Request, SamplingParams
+from omlx.scheduler import Scheduler, SchedulerConfig
 
 DSV41 = adapter_for("deepseek_v41")
 
@@ -219,3 +225,154 @@ def test_helper_stays_a_window_ahead_and_runs_jobs_in_order():
     client.close()
     thread.join(10)
     listener.close()
+
+
+# ---------------------------------------------------------------------------
+# Scheduler flow: helper-assisted chunks vs the same scheduler alone.
+# ---------------------------------------------------------------------------
+
+
+def _scheduler(model, step):
+    tokenizer = MagicMock()
+    tokenizer.eos_token_id = 2
+    sched = Scheduler(
+        model=model,
+        tokenizer=tokenizer,
+        config=SchedulerConfig(
+            prefill_step_size=step, chunked_prefill=True, paged_cache_block_size=0
+        ),
+    )
+    sched._qwen35_prefill_floor = 0
+    sched.batch_generator = MagicMock()
+    return sched
+
+
+def _request(tokens, rid="req-1"):
+    request = Request(
+        request_id=rid,
+        prompt=list(tokens),
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    request.prompt_token_ids = list(tokens)
+    request.num_prompt_tokens = len(tokens)
+    return request
+
+
+def _session(lm, k, **kwargs):
+    listener, thread = _serve(lm, k)
+    client = HelperClient("127.0.0.1", listener.getsockname()[1], TOKEN)
+    session = PrefillHelperSession(
+        client, DSV41, k, "helper-mac", min_tokens=1, **kwargs
+    )
+    return session, listener, thread
+
+
+def _drive(sched, request, tokens):
+    """Prefill one request through the scheduler; returns its final cache."""
+    finished = {}
+
+    def complete(self, request, state, scheduled, still):
+        self._prefill_states.pop(request.request_id, None)
+        if state.helper is not None:
+            state.helper.session.finish(request.request_id, state.tokens_processed, 0.0)
+        finished["state"] = state
+
+    with patch.object(Scheduler, "_complete_chunked_prefill", complete):
+        if sched._prefill_helper is None:
+            state = sched._begin_prefill(request, tokens, None)
+            sched._prefill_states[request.request_id] = state
+            sched.prefilling.append(request)
+        else:
+            assert Scheduler._start_helper_prefill(
+                sched, request, tokens, None, MagicMock(), None
+            )
+        deadline = time.monotonic() + 60
+        while "state" not in finished and time.monotonic() < deadline:
+            sched._advance_chunked_prefills([], [])
+            if sched._prefill_helper is not None:
+                sched._prefill_helper.sync(sched._prefill_states)
+    return finished["state"]
+
+
+@pytest.mark.parametrize("config", [tiny(), tiny_ced()], ids=["plain", "ced"])
+def test_scheduler_helper_prefill_matches_local(config):
+    k, tokens = 2, [int(t) for t in np.random.default_rng(3).integers(3, 60, 23)]
+    host = _model(config)
+    local = _drive(_scheduler(host, 6), _request(tokens), tokens)
+
+    sched = _scheduler(host, 6)
+    session, listener, thread = _session(_helper_model(config, k), k)
+    sched.attach_prefill_helper(session)
+    state = _drive(sched, _request(tokens), tokens)
+    assert state.helper is not None and state.helper.index == len(state.helper.grid)
+    assert session.last_prompt["tokens"] == len(tokens) - 1
+    _assert_same_cache(local.cache, state.cache)
+    session.close()
+    thread.join(10)
+    listener.close()
+
+
+@pytest.mark.parametrize("how", ["link", "off"])
+def test_scheduler_finishes_locally_when_the_helper_leaves(how):
+    config, k = tiny_ced(), 2
+    tokens = [int(t) for t in np.random.default_rng(4).integers(3, 60, 23)]
+    host = _model(config)
+    local = _drive(_scheduler(host, 6), _request(tokens), tokens)
+
+    sched = _scheduler(host, 6)
+    session, listener, thread = _session(_helper_model(config, k), k)
+    sched.attach_prefill_helper(session)
+    original = Scheduler._forward_helper_chunk
+
+    def forward_then_leave(self, state, chunk, prefill_model, chunk_kwargs):
+        original(self, state, chunk, prefill_model, chunk_kwargs)
+        if how == "link":
+            session.client.close()
+        else:
+            sched.attach_prefill_helper(None)
+
+    with patch.object(Scheduler, "_forward_helper_chunk", forward_then_leave):
+        state = _drive(sched, _request(tokens), tokens)
+    assert state.helper is None and session.last_error
+    _assert_same_cache(local.cache, state.cache)
+    session.close()
+    thread.join(10)
+    listener.close()
+
+
+def test_scheduler_cancels_the_job_of_a_dropped_request():
+    k, tokens = 2, list(range(3, 40))
+    sched = _scheduler(_model(tiny()), 4)
+    session, listener, thread = _session(_helper_model(tiny(), k), k)
+    sched.attach_prefill_helper(session)
+    request = _request(tokens)
+    assert Scheduler._start_helper_prefill(
+        sched, request, tokens, None, MagicMock(), None
+    )
+    job = sched._prefill_states[request.request_id].helper.job
+    sched._prefill_states.pop(request.request_id)
+    sched._prefill_helper.sync(sched._prefill_states)
+    assert job.finished and not session._jobs
+    # The helper moves on to the next request.
+    other = _request(tokens[:9], "req-2")
+    assert Scheduler._start_helper_prefill(
+        sched, other, tokens[:9], None, MagicMock(), None
+    )
+    assert sched._prefill_states["req-2"].helper.job.take(timeout=30).index == 0
+    session.close()
+    thread.join(10)
+    listener.close()
+
+
+def test_helper_grid_stops_at_blocks_and_tails():
+    sched = _scheduler(MagicMock(), 8)
+    state = SimpleNamespace(
+        tokens_remaining=mx.zeros((1, 30), mx.int32),
+        base_size=5,
+        boundary_enabled=True,
+        block_size=16,
+        system_at=None,
+        tail_at=29,
+    )
+    # Cached prefix of 5: the first block ends at 16, the tail at 29.
+    assert Scheduler._helper_chunk_grid(sched, state) == [8, 3, 8, 5, 3, 3]

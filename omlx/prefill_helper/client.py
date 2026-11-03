@@ -59,7 +59,12 @@ class HelperJob:
         if meta.get("op") != "chunk":
             self._finish()
             raise HelperError(meta.get("error") or "prefill helper stopped")
-        self.client._send({"op": "ack", "job_id": self.job_id, "index": meta["index"]})
+        # A chunk received in full stays usable even if the link just dropped;
+        # the error frame queued behind it ends the job on the next take.
+        with contextlib.suppress(HelperError):
+            self.client._send(
+                {"op": "ack", "job_id": self.job_id, "index": meta["index"]}
+            )
         boundary, state = {}, {}
         for name, value in arrays.items():
             target = boundary if name.startswith("b:") else state
@@ -72,7 +77,8 @@ class HelperJob:
 
     def cancel(self) -> None:
         if not self.finished:
-            self.client._send({"op": "cancel", "job_id": self.job_id})
+            with contextlib.suppress(HelperError):
+                self.client._send({"op": "cancel", "job_id": self.job_id})
             self._finish()
 
     def _deliver(self, meta: dict, arrays: dict) -> None:

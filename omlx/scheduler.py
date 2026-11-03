@@ -84,6 +84,8 @@ from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
     should_emit_prefill_boundary,
 )
+from .prefill_helper.client import HelperError
+from .prefill_helper.session import HelperPrefill
 from .prefill_progress import get_prefill_tracker
 from .prefill_transient_tracker import PrefillTransientTracker
 from .request import (
@@ -659,6 +661,8 @@ class _PrefillState:
     tail_at: int | None = None
     end_tail: bool = False
     system_at: int | None = None
+    # Set while a prefill helper runs the first layers of this request.
+    helper: HelperPrefill | None = None
 
 
 @dataclass
@@ -1791,6 +1795,9 @@ _DECODE_FAIR_SHARE = 0.5
 _DECODE_STALL_TARGET_MS = 500.0
 _CONTENDED_PREFILL_CHUNK = 512
 _CONTENDED_CHUNK_FLOOR = 256  # below this, per-chunk overheads dominate
+# A helper chunk is only taken once it has arrived, except a tail chunk that
+# runs right after its predecessor; past this the request prefills here.
+_HELPER_TAKE_TIMEOUT_S = 120.0
 # Contended chunks stay on the 64-token grid: the DSv4 native indexer only
 # engages when the chunk length is a multiple of 64 (deepseek_v4_model.py
 # L % 64 gate), and an arbitrary tps-derived cap (e.g. 297) would silently
@@ -2305,6 +2312,8 @@ class Scheduler:
         # Populated when chunked_prefill=True and prompt exceeds prefill_step_size.
         self.prefilling: deque[Request] = deque()
         self._prefill_states: dict[str, _PrefillState] = {}
+        # Prefill Accelerator session for this model (see attach_prefill_helper).
+        self._prefill_helper = None
         # Packed prefill: "" once the model is known to be unsupported.
         self._packed_prefill_family: str | None = None
         self._packed_prefill_disabled: str | None = None
@@ -6792,6 +6801,180 @@ class Scheduler:
         if engram_prefetch is not None:
             engram_prefetch(tokens[:, :first_n], tokens[:, :0], cache=cache)
 
+    def attach_prefill_helper(self, session: Any) -> None:
+        """Use a Prefill Accelerator session, or stop using one with None.
+
+        Safe from any thread: requests a replaced session was serving notice
+        at their next chunk and continue on this Mac.
+        """
+        self._prefill_helper = session
+
+    def _start_helper_prefill(
+        self,
+        request: "Request",
+        tokens: list[int],
+        cache: "list[Any] | None",
+        sampler: Any,
+        logits_processors: Any,
+    ) -> bool:
+        """Queue *request* for the prefill helper; False to prefill it here.
+
+        Its first chunk runs in _advance_chunked_prefills once the helper sends
+        it. Drafters that capture prompt layers stay on the local path.
+        """
+        session = self._prefill_helper
+        if (
+            session is None
+            or _block_drafter_for(self.model) is not None
+            or not session.accepts(len(tokens) - 1)
+        ):
+            return False
+        state = self._begin_prefill(request, tokens, cache)
+        state.sampler = sampler
+        state.sm = self._stop_sequences_for_insert(request)
+        state.per_row_lps = list(logits_processors) if logits_processors else []
+        prefix = (
+            session.adapter.prefix_state(state.cache, session.layers)
+            if state.base_size > 0
+            else None
+        )
+        state.helper = session.start(
+            request.request_id,
+            tokens[:-1],
+            Scheduler._helper_chunk_grid(self, state),
+            prefix,
+        )
+        # Without a job the request still prefills here in chunks.
+        self.prefilling.append(request)
+        self._prefill_states[request.request_id] = state
+        return True
+
+    def _helper_chunk_grid(self, state: _PrefillState) -> list[int]:
+        """Chunk sizes for the whole prefill, as _plan_prefill_chunk cuts them
+        without the contended cap. The helper computes ahead on this grid."""
+        grid, processed = [], 0
+        remaining = int(state.tokens_remaining.shape[1])
+        while remaining > 0:
+            n = min(self._base_prefill_step_size(processed, remaining), remaining)
+            cache_tokens = state.base_size + processed
+            if state.boundary_enabled and state.block_size > 0:
+                n = clamp_prefill_chunk_to_boundary(
+                    n, cache_tokens=cache_tokens, block_size=state.block_size
+                )
+            for stop_at in (state.system_at, state.tail_at):
+                if stop_at is not None and cache_tokens < stop_at:
+                    n = min(n, stop_at - cache_tokens)
+            grid.append(n)
+            processed += n
+            remaining -= n
+        return grid
+
+    def _plan_helper_chunk(
+        self, state: _PrefillState, started: float, guarded: bool
+    ) -> "_PrefillChunkPlan | None":
+        """Take the helper's next grid chunk, or drop the helper and return
+        None when the chunk is missing or the memory guard wants it smaller."""
+        helper = state.helper
+        if helper.session is not self._prefill_helper:
+            Scheduler._drop_helper(self, state, "the accelerator was turned off")
+            return None
+        n = helper.next_size()
+        cache_tokens = state.base_size + state.tokens_processed
+        qwen4_accounting = Scheduler._qwen4_prefill_accounting_enabled(self)
+
+        def qwen4_route(query_tokens: int) -> bool:
+            return qwen4_accounting and self._qwen4_text_gathered_pricing(
+                query_tokens=query_tokens,
+                cache_tokens=cache_tokens,
+                prompt_cache=state.cache,
+            )
+
+        gathered_core = qwen4_route(n)
+        if guarded:
+            try:
+                allowed = self._adaptive_chunk_size(
+                    n,
+                    request_id=state.request.request_id,
+                    loop_label="chunked_step",
+                    kv_len=cache_tokens,
+                    gathered_core=gathered_core,
+                )
+                allowed, gathered_core = Scheduler._guard_prefill_chunk_route(
+                    self,
+                    allowed,
+                    qwen4_route,
+                    kv_len=cache_tokens,
+                    progress=state.tokens_processed,
+                    loop_label="chunked_step",
+                    request_id=state.request.request_id,
+                )
+            except (_PrefillEvictionNeeded, PrefillMemoryExceededError):
+                Scheduler._drop_helper(self, state, "memory guard paused the prefill")
+                raise
+            if allowed < n:
+                Scheduler._drop_helper(
+                    self, state, f"memory guard allows {allowed} of {n} tokens"
+                )
+                return None
+        try:
+            chunk = helper.job.take(timeout=_HELPER_TAKE_TIMEOUT_S)
+        except HelperError as error:
+            Scheduler._drop_helper(self, state, str(error))
+            return None
+        if (chunk.index, chunk.start, chunk.size) != (
+            helper.index,
+            state.tokens_processed,
+            n,
+        ):
+            Scheduler._drop_helper(self, state, "the helper sent a different chunk")
+            return None
+        helper.chunk = chunk
+        helper.index += 1
+        return _PrefillChunkPlan(
+            state=state,
+            tokens=n,
+            requested_step=n,
+            gathered_core=gathered_core,
+            qwen4_accounting=qwen4_accounting,
+            throttled=False,
+            started=started,
+        )
+
+    def _drop_helper(self, state: _PrefillState, reason: str) -> None:
+        """Prefill the rest of *state* here; every cache is at a chunk end."""
+        helper, state.helper = state.helper, None
+        if helper is not None:
+            helper.session.drop(state.request.request_id, reason)
+
+    def _forward_helper_chunk(
+        self,
+        state: _PrefillState,
+        chunk: Any,
+        prefill_model: Any,
+        chunk_kwargs: dict,
+    ) -> None:
+        """Run this Mac's layers on a chunk the helper started, then bring the
+        helper's layers to the same offset."""
+        helper = state.helper
+        session = helper.session
+        part, helper.chunk = helper.chunk, None
+        if "next_prefill_tokens" in chunk_kwargs:
+            # The grid is exact, unlike the throttled estimate.
+            chunk_kwargs["next_prefill_tokens"] = helper.next_size()
+        adapter = session.adapter
+        adapter.run_rest(
+            prefill_model,
+            adapter.language_model(self.model),
+            state.cache,
+            chunk,
+            session.layers,
+            part.boundary,
+            part.state,
+            **chunk_kwargs,
+        )
+        adapter.apply_state(state.cache, session.layers, part.state)
+        mx.eval([c.state for c in state.cache])
+
     def _next_prefill_chunk_len(self, state: _PrefillState, n: int) -> int:
         remaining = state.tokens_remaining.shape[1]
         processed = state.tokens_processed + n
@@ -6864,6 +7047,11 @@ class Scheduler:
             _cache_base_sizes(state.cache) + remaining + len(state.last_token),
             state.request.request_id,
         )
+        if state.helper is not None:
+            plan = Scheduler._plan_helper_chunk(self, state, started, guarded)
+            if plan is not None:
+                return plan
+            # The helper left; this chunk is planned locally below.
 
         # Clamp to the next block boundary so boundary snapshots fire exactly.
         if state.boundary_enabled and state.block_size > 0:
@@ -7130,6 +7318,12 @@ class Scheduler:
             if state.boundary_enabled
             else max(int(getattr(state.request, "cached_tokens", 0) or 0), 0)
         )
+        if state.helper is not None and state.helper.chunk is not None:
+            _bind_prefill_prompt_ids(self.model, state.request)
+            Scheduler._forward_helper_chunk(
+                self, state, chunk, prefill_model, chunk_kwargs
+            )
+            return
         capture_from = self._dflash_prefill_capture(
             state.request,
             prefill_model,
@@ -7193,6 +7387,7 @@ class Scheduler:
         # chunked prefill. _do_external_prefill calls _on_prompt_progress
         # via the temp_uid mapping; the chunked path has no temp uid so we
         # talk to the tracker directly with the request_id.
+        helper_name = state.helper.session.name if state.helper is not None else None
         get_prefill_tracker().update(
             state.request.request_id,
             state.tokens_processed,
@@ -7202,6 +7397,7 @@ class Scheduler:
                 if self.config.model_name
                 else ""
             ),
+            detail=f"via {helper_name}" if helper_name else None,
             extra={
                 "prompt_tokens": getattr(state.request, "num_prompt_tokens", 0),
                 "cached_tokens": getattr(state.request, "cached_tokens", 0),
@@ -7475,6 +7671,7 @@ class Scheduler:
             companion = self._prefill_states.get(request.request_id)
             if (
                 companion is not None
+                and companion.helper is None
                 and companion.tokens_remaining.shape[1] > 0
                 and not request.packed_prefill_excluded
                 and request.request_id not in self._pending_abort_ids
@@ -7601,6 +7798,12 @@ class Scheduler:
         rid = request.request_id
         # Prefill complete - emit final boundary snapshot and insert.
         self._prefill_states.pop(rid, None)
+        if state.helper is not None:
+            state.helper.session.finish(
+                rid,
+                state.tokens_processed,
+                time.monotonic() - (request.prefill_started_at or time.monotonic()),
+            )
         self._emit_final_boundary_if_needed(state)
         Scheduler._clear_cache(self)
 
@@ -7674,6 +7877,10 @@ class Scheduler:
             if not self._prefill_gate_open():
                 still_prefilling.extendleft(reversed(pending_prefills[index:]))
                 break
+            if state.helper is not None and not state.helper.job.ready():
+                # The helper is still on this chunk or an earlier request's.
+                still_prefilling.append(request)
+                continue
             # Without room for two packable rows, prefills run unpacked.
             packing = Scheduler._packed_prefill_ready(
                 self
@@ -7682,7 +7889,7 @@ class Scheduler:
 
             plans: list[_PrefillChunkPlan] = []
             try:
-                if not packing:
+                if not packing or state.helper is not None:
                     done = [self._step_prefill_chunk(state)]
                 else:
                     plans = self._plan_prefill_rows(
@@ -13441,6 +13648,12 @@ class Scheduler:
                         request.cached_tokens,
                     )
 
+                if vlm_embeds is None and Scheduler._start_helper_prefill(
+                    self, request, tokens_to_process, cache_to_use, sampler,
+                    logits_processors,
+                ):
+                    continue
+
                 # Chunked prefill: non-VLM prompts longer than one step are
                 # spread across multiple step() calls. The first chunk is run
                 # here; subsequent chunks run in _advance_chunked_prefills().
@@ -15457,6 +15670,8 @@ class Scheduler:
         # Process pending aborts FIRST (thread-safe with hybrid executor)
         self._process_pending_aborts()
         self._process_pending_memory_requeue()
+        if self._prefill_helper is not None:
+            self._prefill_helper.sync(self._prefill_states)
 
         # Drain a deferred between-turn reclaim requested by the memory
         # enforcer (only acts when the scheduler is idle).

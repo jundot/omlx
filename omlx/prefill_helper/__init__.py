@@ -6,8 +6,3 @@ the helper runs layers ``[0, k)`` and sends back the tensors that cross the cut
 plus the chunk's cache state for those layers; this Mac runs ``[k, n)`` and then
 applies that state, so every cache ends the chunk at the same offset.
 """
-
-from .adapter import StageAdapter
-from .adapters import adapter_for
-
-__all__ = ["StageAdapter", "adapter_for"]
