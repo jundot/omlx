@@ -803,6 +803,73 @@
                                 </div>
                             </div>
                         </template>
+
+                        <!-- Prefill Accelerator: a paired Mac runs the first layers -->
+                        <div class="px-4 py-3.5 space-y-3" x-show="modelSettings.prefill_helper_supported" x-cloak>
+                            <div class="min-w-0">
+                                <span class="text-sm font-medium text-neutral-700">{{ t('modal.model_settings.prefill_helper') }}</span>
+                                <p class="text-xs text-neutral-500 mt-0.5">{{ t('modal.model_settings.prefill_helper_hint') }}</p>
+                            </div>
+                            <p x-show="!globalSettings.server.distributed_inference_active" class="text-xs text-amber-700">{{ t('modal.model_settings.prefill_helper_needs_cluster') }}</p>
+                            <div x-show="globalSettings.server.distributed_inference_active" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                <div>
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.prefill_helper_mac') }}</label>
+                                    <select x-model="modelSettings.prefill_helper_node_id"
+                                            class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-black">
+                                        <option value="">{{ t('modal.model_settings.prefill_helper_off') }}</option>
+                                        <template x-for="device in prefillHelper.candidates" :key="device.node_id">
+                                            <option :value="device.node_id"
+                                                    :disabled="!prefillHelperUsable(device) && device.node_id !== modelSettings.prefill_helper_node_id"
+                                                    :selected="device.node_id === modelSettings.prefill_helper_node_id"
+                                                    x-text="prefillHelperOption(device)"></option>
+                                        </template>
+                                    </select>
+                                    <p x-show="prefillHelper.loading" class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.prefill_helper_checking') }}</p>
+                                    <p x-show="!prefillHelper.loading && prefillHelper.candidates.length === 0" class="text-xs text-neutral-400 mt-1">
+                                        {{ t('modal.model_settings.prefill_helper_no_macs') }}
+                                        <button type="button" class="underline hover:text-neutral-700"
+                                                @click="showModelSettingsModal = false; setMainTab('cluster')">{{ t('modal.model_settings.prefill_helper_open_cluster') }}</button>
+                                    </p>
+                                    <p x-show="prefillHelperCandidate(modelSettings.prefill_helper_node_id)?.on_battery" class="text-xs text-amber-700 mt-1"
+                                       x-text="window.t('modal.model_settings.prefill_helper_battery').replace('{name}', prefillHelperCandidate(modelSettings.prefill_helper_node_id)?.name || '')"></p>
+                                </div>
+                                <div x-show="modelSettings.prefill_helper_node_id">
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.prefill_helper_layers') }}</label>
+                                    <select x-model="modelSettings.prefill_helper_layers"
+                                            class="w-full px-3 py-2 border border-neutral-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-black">
+                                        <option value="">{{ t('modal.model_settings.prefill_helper_layers_auto') }}</option>
+                                        <template x-for="n in prefillHelperLayerChoices()" :key="n">
+                                            <option :value="String(n)" :selected="String(n) === modelSettings.prefill_helper_layers" x-text="n"></option>
+                                        </template>
+                                    </select>
+                                    <p class="text-xs text-neutral-400 mt-1">{{ t('modal.model_settings.prefill_helper_layers_hint') }}</p>
+                                </div>
+                            </div>
+                            <div x-show="globalSettings.server.distributed_inference_active && (modelSettings.prefill_helper_node_id || (prefillHelper.status && !['off', 'unloaded'].includes(prefillHelper.status.state)))"
+                                 class="rounded-lg bg-neutral-50 border border-neutral-200 px-3 py-2 space-y-2">
+                                <p class="text-xs"
+                                   :class="prefillHelper.status?.state === 'error' ? 'text-red-600' : (['offline', 'stopped'].includes(prefillHelper.status?.state) ? 'text-amber-700' : 'text-neutral-600')"
+                                   x-text="(selectedModel?.settings?.prefill_helper_node_id || '') !== modelSettings.prefill_helper_node_id ? window.t('modal.model_settings.prefill_helper_save_first') : prefillHelperStatusText()"></p>
+                                <div x-show="prefillHelper.status?.state === 'copying'" class="h-1.5 bg-neutral-200 rounded-full overflow-hidden">
+                                    <div class="h-full bg-black transition-all duration-500"
+                                         :style="'width: ' + Math.min(100, Math.round(100 * (prefillHelper.status?.done || 0) / Math.max(1, prefillHelper.status?.bytes || 1))) + '%'"></div>
+                                </div>
+                                <p x-show="prefillHelper.status?.on_battery && ['ready', 'working'].includes(prefillHelper.status?.state)" class="text-xs text-amber-700"
+                                   x-text="window.t('modal.model_settings.prefill_helper_battery').replace('{name}', prefillHelper.status?.name || '')"></p>
+                                <div class="flex flex-wrap gap-2" x-show="(selectedModel?.settings?.prefill_helper_node_id || '') === modelSettings.prefill_helper_node_id">
+                                    <button type="button" x-show="prefillHelper.status?.state === 'needs_files'" :disabled="prefillHelper.busy"
+                                            @click="prefillHelperAction('copy')"
+                                            class="px-3 py-1 text-xs font-medium rounded-full bg-black text-white hover:bg-neutral-800 disabled:opacity-40">{{ t('modal.model_settings.prefill_helper_copy') }}</button>
+                                    <button type="button" x-show="['offline', 'error', 'stopped'].includes(prefillHelper.status?.state)" :disabled="prefillHelper.busy"
+                                            @click="prefillHelperAction('retry')"
+                                            class="px-3 py-1 text-xs font-medium rounded-full border border-neutral-300 text-neutral-700 hover:bg-neutral-100 disabled:opacity-40"
+                                            x-text="prefillHelper.status?.state === 'stopped' ? window.t('modal.model_settings.prefill_helper_start') : window.t('modal.model_settings.prefill_helper_retry')"></button>
+                                    <button type="button" x-show="['connecting', 'needs_files', 'copying', 'starting', 'ready', 'working', 'offline'].includes(prefillHelper.status?.state)" :disabled="prefillHelper.busy"
+                                            @click="prefillHelperAction('stop')"
+                                            class="px-3 py-1 text-xs font-medium rounded-full border border-neutral-300 text-neutral-700 hover:bg-neutral-100 disabled:opacity-40">{{ t('modal.model_settings.prefill_helper_stop') }}</button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </section>
 

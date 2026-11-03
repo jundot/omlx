@@ -79,6 +79,7 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
         "version_ok": info.get("version") == __version__,
         "layers_fit": held,
         "budget": info.get("budget"),
+        "on_battery": bool(info.get("on_battery")),
     }
 
 

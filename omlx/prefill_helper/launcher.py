@@ -108,15 +108,18 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
 
 
 _INFO = (
-    "import json, omlx, mlx.core as mx; i = mx.device_info(); "
+    "import json, subprocess, omlx, mlx.core as mx; i = mx.device_info(); "
+    "p = subprocess.run(['/usr/bin/pmset', '-g', 'ps'], capture_output=True, "
+    "text=True).stdout; "
     "print(json.dumps({'version': omlx.__version__, "
     "'budget': i['max_recommended_working_set_size'], "
-    "'memory': i['memory_size'], 'device': i.get('device_name', '')}))"
+    "'memory': i['memory_size'], 'device': i.get('device_name', ''), "
+    "'on_battery': 'Battery Power' in p}))"
 )
 
 
 def remote_info(target: HelperTarget, *, runner: Runner = subprocess.run) -> dict:
-    """The helper's oMLX version and GPU memory budget."""
+    """The helper's oMLX version, GPU memory budget and power source."""
     result = _ssh(
         target.ssh_target,
         f"{target.python} -c {shlex.quote(_INFO)}",

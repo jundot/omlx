@@ -333,6 +333,12 @@
                 allowCpuSharedResource: true,
             },
             _aneTuningPollTimer: null,
+            // Prefill Accelerator: paired Macs that can help the open model,
+            // and its helper status (polled while the modal is open).
+            prefillHelper: { modelId: null, candidates: [], version: '', loading: false, status: null, busy: false },
+            _prefillHelperPollTimer: null,
+            // Set while this Mac runs another Mac's prefill helper.
+            prefillLending: null,
 
             // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
@@ -791,6 +797,7 @@
                 this.fetchClaudeDesktopStatus();
 
                 this.startUpdateCheckTimer();
+                this.pollPrefillLending();
 
                 this.onboardingStartedEmpty = !this.hasUserModels;
                 if (this.onboardingStartedEmpty
@@ -2156,6 +2163,9 @@
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    prefill_helper_supported: model?.prefill_helper_supported === true,
+                    prefill_helper_node_id: s.prefill_helper_node_id || '',
+                    prefill_helper_layers: s.prefill_helper_layers ? String(s.prefill_helper_layers) : '',
                     deepseek_v41_ced_prefill_enabled:
                         s.deepseek_v41_ced_prefill_enabled === true,
                     deepseek_v41_ced_prefill_supported:
@@ -3031,10 +3041,183 @@
                 }
                 this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                 this.showModelSettingsModal = true;
+                if (!preservingEdits) this.openPrefillHelper(model);
                 // Sync on the next frame: sections have no layout until the dialog opens.
                 this.$nextTick(() => {
                     if (this.$refs.modelSettingsBody) this.modelSettingsOnScroll(this.$refs.modelSettingsBody);
                 });
+            },
+
+            async pollPrefillLending() {
+                if (this.globalSettings.server.distributed_inference_active && !document.hidden) {
+                    try {
+                        const resp = await fetch('/admin/api/prefill-helper/lending');
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            this.prefillLending = data.active ? data : null;
+                        }
+                    } catch (_) { /* network error */ }
+                } else if (!this.globalSettings.server.distributed_inference_active) {
+                    this.prefillLending = null;
+                }
+                setTimeout(() => this.pollPrefillLending(), 5000);
+            },
+
+            async stopPrefillLending() {
+                try {
+                    await fetch('/admin/api/prefill-helper/lending/stop', { method: 'POST' });
+                } catch (_) { /* network error */ }
+                this.prefillLending = null;
+            },
+
+            prefillLendingText() {
+                const lending = this.prefillLending;
+                if (!lending) return '';
+                return window.t('dashboard.prefill_lending')
+                    .replace('{host}', lending.host || '?')
+                    .replace('{n}', lending.layers ?? '')
+                    .replace('{model}', String(lending.model || '').split('/').pop());
+            },
+
+            openPrefillHelper(model) {
+                if (this._prefillHelperPollTimer) {
+                    clearTimeout(this._prefillHelperPollTimer);
+                    this._prefillHelperPollTimer = null;
+                }
+                this.prefillHelper = {
+                    modelId: model.id,
+                    candidates: [],
+                    version: '',
+                    loading: false,
+                    status: model.prefill_helper || null,
+                    busy: false,
+                };
+                if (!model.prefill_helper_supported
+                    || !this.globalSettings.server.distributed_inference_active) return;
+                this.loadPrefillHelperCandidates();
+                this.pollPrefillHelper();
+            },
+
+            async loadPrefillHelperCandidates() {
+                const modelId = this.prefillHelper.modelId;
+                this.prefillHelper.loading = true;
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/candidates?model_id=' + encodeURIComponent(modelId)
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        const data = await resp.json();
+                        this.prefillHelper.candidates = data.devices || [];
+                        this.prefillHelper.version = data.version || '';
+                    }
+                } catch (_) { /* network error */ }
+                if (this.prefillHelper.modelId === modelId) this.prefillHelper.loading = false;
+            },
+
+            async pollPrefillHelper() {
+                const modelId = this.prefillHelper.modelId;
+                if (!this.showModelSettingsModal || this.selectedModel?.id !== modelId) {
+                    this._prefillHelperPollTimer = null;
+                    return;
+                }
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/models/' + encodeURIComponent(modelId)
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        this.prefillHelper.status = await resp.json();
+                    }
+                } catch (_) { /* network error */ }
+                this._prefillHelperPollTimer = setTimeout(() => this.pollPrefillHelper(), 2000);
+            },
+
+            async prefillHelperAction(action) {
+                const modelId = this.prefillHelper.modelId;
+                this.prefillHelper.busy = true;
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/models/' + encodeURIComponent(modelId) + '/' + action,
+                        { method: 'POST' }
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        this.prefillHelper.status = await resp.json();
+                    }
+                } catch (_) { /* network error */ }
+                this.prefillHelper.busy = false;
+            },
+
+            prefillHelperCandidate(nodeId) {
+                return this.prefillHelper.candidates.find((d) => d.node_id === nodeId) || null;
+            },
+
+            prefillHelperUsable(device) {
+                return device.online && device.version_ok && device.layers_fit > 0;
+            },
+
+            prefillHelperOption(device) {
+                const parts = [device.name];
+                if (device.chip) parts.push(device.chip + (device.ram_gb ? ` ${device.ram_gb} GB` : ''));
+                if (!device.online) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_offline'));
+                } else if (!device.version_ok) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_update')
+                        .replace('{version}', this.prefillHelper.version || ''));
+                } else if (device.layers_fit > 0) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_fits')
+                        .replace('{n}', device.layers_fit));
+                } else {
+                    parts.push(window.t('modal.model_settings.prefill_helper_no_memory'));
+                }
+                return parts.join(' · ');
+            },
+
+            prefillHelperLayerChoices() {
+                const device = this.prefillHelperCandidate(this.modelSettings.prefill_helper_node_id);
+                const most = Math.max(
+                    device?.layers_fit || 0,
+                    parseInt(this.modelSettings.prefill_helper_layers, 10) || 0,
+                );
+                return Array.from({ length: most }, (_, i) => i + 1);
+            },
+
+            prefillHelperStatusText() {
+                const s = this.prefillHelper.status;
+                const t = (key) => window.t('modal.model_settings.prefill_helper_state_' + key);
+                if (!s) return t('unloaded');
+                const name = s.name || this.prefillHelperCandidate(s.node_id)?.name || '';
+                const size = (n) => this.formatSizeBytes(Number(n || 0));
+                switch (s.state) {
+                    case 'connecting':
+                        return t('connecting').replace('{name}', name);
+                    case 'starting':
+                        return t('starting').replace('{name}', name).replace('{n}', s.layers ?? '');
+                    case 'needs_files':
+                        return t('needs_files').replace('{name}', name).replace('{size}', size(s.bytes))
+                            .replace('{path}', s.path || '').replace('{free}', size(s.free));
+                    case 'copying':
+                        return t('copying').replace('{name}', name).replace('{done}', size(s.done))
+                            .replace('{size}', size(s.bytes));
+                    case 'ready':
+                    case 'working': {
+                        let text = t(s.state).replace('{name}', name).replace('{n}', s.held ?? '');
+                        if (s.last_prompt) {
+                            text += ' · ' + t('last_prompt')
+                                .replace('{tokens}', Number(s.last_prompt.tokens).toLocaleString())
+                                .replace('{seconds}', Number(s.last_prompt.seconds).toFixed(1));
+                        }
+                        return text;
+                    }
+                    case 'offline':
+                        return t('offline').replace('{name}', name).replace('{reason}', s.reason || '');
+                    case 'stopped':
+                        return s.reason ? s.reason + '.' : t('stopped');
+                    case 'error':
+                        return s.reason || t('error');
+                    case 'unloaded':
+                        return t('unloaded');
+                    default:
+                        return '';
+                }
             },
 
             async importMtplxSidecar() {
@@ -3241,6 +3424,10 @@
                             : !!ms.qwen4_ple_ssd_offload,
                     deepseek_v41_ced_prefill_enabled:
                         !!ms.deepseek_v41_ced_prefill_enabled,
+                    prefill_helper_node_id: ms.prefill_helper_node_id || null,
+                    prefill_helper_layers: ms.prefill_helper_node_id && ms.prefill_helper_layers
+                        ? parseInt(ms.prefill_helper_layers, 10)
+                        : null,
                     qwen4_gdn_decode_wide_proj:
                         !!ms.qwen4_gdn_decode_wide_proj,
                     activation_fp16_enabled: !!ms.activation_fp16_enabled,

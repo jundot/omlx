@@ -278,7 +278,13 @@ class PrefillHelperManager:
         )
         self._saved = (saved.get("helper"), saved.get("host"))
         self.attach(self._session)
-        self._set("ready", node_id=self.node_id, held=held, device=info.get("device"))
+        self._set(
+            "ready",
+            node_id=self.node_id,
+            held=held,
+            device=info.get("device"),
+            on_battery=bool(info.get("on_battery")),
+        )
 
     def _held_layers(self, name: str, budget: int) -> int:
         shared, per_layer = self.adapter.memory_plan(self.model_path)
