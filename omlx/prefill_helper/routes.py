@@ -22,7 +22,7 @@ from .. import __version__
 from ..cluster.registry import get_device_registry
 from . import launcher
 from .adapters import adapter_for
-from .manager import fit_layers
+from .manager import fit_layers, helper_budget
 from .worker import active_marker_path
 
 router = APIRouter(prefix="/admin/api/prefill-helper", tags=["prefill-helper"])
@@ -69,7 +69,7 @@ def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         return {**row, "online": False, "reason": str(error)}
     shared, per_layer = adapter.memory_plan(model_path)
-    held = fit_layers(shared, per_layer, int(info["budget"]), len(per_layer))
+    held = fit_layers(shared, per_layer, helper_budget(info), len(per_layer))
     return {
         **row,
         "online": True,

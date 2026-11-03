@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 # Activations of one chunk and allocator headroom on the helper.
 _RESERVE_BYTES = 8 << 30
+# macOS and the helper Mac's other apps; the GPU budget alone let the helper
+# swap (105 GiB of layers on a 128 GB Mac).
+_OS_BYTES = 16 << 30
 _RETRY_DELAYS_S = (15.0, 30.0, 60.0, 120.0, 300.0)
 _WATCH_S = 2.0
 
@@ -38,8 +41,16 @@ class _PermanentError(Exception):
     """A problem only the user can fix; no automatic retry."""
 
 
+def helper_budget(info: dict) -> int:
+    """Bytes the helper may hold, from its ``remote_info``."""
+    budget = int(info["budget"])
+    if info.get("memory"):
+        budget = min(budget, int(info["memory"]) - _OS_BYTES)
+    return budget
+
+
 def fit_layers(shared: int, per_layer: list[int], budget: int, limit: int) -> int:
-    """How many leading layers fit in a helper's GPU budget."""
+    """How many leading layers fit in a helper's memory budget."""
     held, used = 0, shared + _RESERVE_BYTES
     for size in per_layer[:limit]:
         if used + size > budget:
@@ -209,7 +220,7 @@ class PrefillHelperManager:
                 f"{target.name} runs oMLX {info.get('version')}; update it to "
                 f"{__version__}."
             )
-        held = self._held_layers(target.name, int(info["budget"]))
+        held = self._held_layers(target.name, helper_budget(info))
         files = launcher.required_files(self.model_path, held)
         where = launcher.locate_files(target, Path(self.model_path).name, files)
         model_dir = where.get("found")

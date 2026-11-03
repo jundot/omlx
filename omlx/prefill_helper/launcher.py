@@ -110,7 +110,7 @@ _INFO = (
     "import json, omlx, mlx.core as mx; i = mx.device_info(); "
     "print(json.dumps({'version': omlx.__version__, "
     "'budget': i['max_recommended_working_set_size'], "
-    "'device': i.get('device_name', '')}))"
+    "'memory': i['memory_size'], 'device': i.get('device_name', '')}))"
 )
 
 
