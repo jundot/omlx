@@ -28,7 +28,11 @@ from typing import Any
 from ..cluster.registry import get_device_registry
 from ..cluster.ssh_policy import cluster_ssh_options
 from ..cluster.staging import scp_push, sidecar_files
-from ..cluster.transport import probe_host_interfaces, shared_link_addresses
+from ..cluster.transport import (
+    link_warnings,
+    probe_host_interfaces,
+    shared_link_addresses,
+)
 from .adapter import StageAdapter
 from .worker import READY_PREFIX
 
@@ -55,6 +59,8 @@ class HelperTarget:
     address: str
     link: str
     python: str = DEFAULT_PYTHON
+    # What to fix about a link that is not Thunderbolt.
+    warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _PYTHON_PATH.fullmatch(self.python):
@@ -93,9 +99,8 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
             continue
     if target is None:
         raise LaunchError(f"{device['friendly_name']} does not answer over SSH.")
-    link = shared_link_addresses(
-        probe_host_interfaces("localhost"), probe_host_interfaces(target)
-    )
+    local, peer = probe_host_interfaces("localhost"), probe_host_interfaces(target)
+    link = shared_link_addresses(local, peer)
     if not link.ok:
         raise LaunchError(link.reason or "No network link to the helper Mac.")
     return HelperTarget(
@@ -104,22 +109,25 @@ def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTa
         ssh_target=target,
         address=link.peer.address,
         link=link.kind,
+        warnings=link_warnings(local, peer, link),
     )
 
 
 _INFO = (
-    "import json, subprocess, omlx, mlx.core as mx; i = mx.device_info(); "
+    "import json, os, shutil, subprocess, omlx, mlx.core as mx; "
+    "i = mx.device_info(); "
     "p = subprocess.run(['/usr/bin/pmset', '-g', 'ps'], capture_output=True, "
     "text=True).stdout; "
     "print(json.dumps({'version': omlx.__version__, "
     "'budget': i['max_recommended_working_set_size'], "
     "'memory': i['memory_size'], 'device': i.get('device_name', ''), "
-    "'on_battery': 'Battery Power' in p}))"
+    "'on_battery': 'Battery Power' in p, "
+    "'disk_free': shutil.disk_usage(os.path.expanduser('~')).free}))"
 )
 
 
 def remote_info(target: HelperTarget, *, runner: Runner = subprocess.run) -> dict:
-    """The helper's oMLX version, GPU memory budget and power source."""
+    """The helper's oMLX version, GPU memory budget, power source and free disk."""
     result = _ssh(
         target.ssh_target,
         f"{target.python} -c {shlex.quote(_INFO)}",

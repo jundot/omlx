@@ -742,3 +742,34 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     monkeypatch.setattr(helper_routes.os, "kill", lambda pid, sig: killed.append(sig))
     assert client.post(f"{base}/lending/stop").json()["stopped"]
     assert killed[-1] == signal.SIGTERM
+
+
+def test_accelerator_check_reports_each_row(monkeypatch):
+    monkeypatch.setattr(
+        helper_routes,
+        "get_device_registry",
+        lambda: SimpleNamespace(get=lambda node: {"friendly_name": "M5max"}),
+    )
+    target = HelperTarget(
+        "n", "M5max", "u@10.0.0.2", "10.0.0.2", "ethernet", warnings=("Use TB.",)
+    )
+    monkeypatch.setattr(helper_routes.launcher, "resolve_target", lambda node: target)
+    monkeypatch.setattr(
+        helper_routes.launcher,
+        "remote_info",
+        lambda t: {
+            "version": "0.0.1",
+            "budget": 100 << 30,
+            "memory": 128 << 30,
+            "on_battery": True,
+            "disk_free": 1 << 40,
+        },
+    )
+    rows = {row["key"]: row for row in helper_routes._check("n")["rows"]}
+    assert [rows[k]["status"] for k in ("ssh", "link", "version", "power")] == [
+        "pass",
+        "warn",
+        "fail",
+        "warn",
+    ]
+    assert rows["link"]["fix"] == "Use TB." and rows["memory"]["bytes"] == 100 << 30

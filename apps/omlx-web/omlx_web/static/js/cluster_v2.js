@@ -235,6 +235,8 @@ function clusterV2Wizard() {
             benchmarkRunning: false,
             ranAt: null,
         },
+        // Prefill Accelerator checks for one paired Mac (GET /check).
+        accelerator: { nodeId: null, running: false, result: null, error: '' },
 
         // ---- plan ------------------------------------------------------------
         modelOptions: [],
@@ -516,7 +518,7 @@ function clusterV2Wizard() {
                         window.t('cluster.v2.toast.joined_cluster').replace('{name}', this.joinTargetName()),
                     );
                     await this.refreshDevices();
-                    this.startChecks();
+                    this.choosePurpose();
                 } else if (
                     snapshot.state === 'denied' &&
                     previous !== 'denied' &&
@@ -1067,6 +1069,12 @@ function clusterV2Wizard() {
                 return 'checks';
             }
             if (
+                (this.stage === 'purpose' || this.stage === 'accelerator') &&
+                this.pairedDevices().length
+            ) {
+                return this.stage;
+            }
+            if (
                 this.pairing.target ||
                 this.pendingApprovals().length ||
                 this.joinActive()
@@ -1103,6 +1111,8 @@ function clusterV2Wizard() {
                 discovering: 0,
                 device_card: 1,
                 pairing: 1,
+                purpose: 2,
+                accelerator: 2,
                 checks: 2,
                 plan: 3,
                 active: 4,
@@ -1399,7 +1409,7 @@ function clusterV2Wizard() {
                         }
                     }
                 } else {
-                    this.startChecks();
+                    this.choosePurpose();
                 }
             } catch (error) {
                 if (error?.status === 404 || error?.status === 409) {
@@ -1684,6 +1694,89 @@ function clusterV2Wizard() {
         startChecks() {
             this.stage = 'checks';
             this.runChecks();
+        },
+
+        // A paired Mac either splits models with this one (checks, plan) or
+        // runs the first layers of this Mac's prefills (Prefill Accelerator).
+        choosePurpose() {
+            this.stage = 'purpose';
+        },
+
+        async startAccelerator(device) {
+            this.stage = 'accelerator';
+            this.accelerator = {
+                nodeId: device.node_id,
+                running: true,
+                result: null,
+                error: '',
+            };
+            try {
+                const result = await this.apiFetch(
+                    '/admin/api/prefill-helper/check?node_id=' +
+                        encodeURIComponent(device.node_id),
+                );
+                if (this.accelerator.nodeId === device.node_id) {
+                    this.accelerator.result = result;
+                }
+            } catch (error) {
+                if (this.accelerator.nodeId === device.node_id) {
+                    this.accelerator.error =
+                        error?.message || window.t('cluster.v2.err.probe_failed');
+                }
+            } finally {
+                if (this.accelerator.nodeId === device.node_id) {
+                    this.accelerator.running = false;
+                }
+            }
+        },
+
+        acceleratorName() {
+            const device = this.pairedDevices().find(
+                (item) => item.node_id === this.accelerator.nodeId,
+            );
+            return this.accelerator.result?.name || this.deviceName(device);
+        },
+
+        acceleratorRows() {
+            const rows = this.accelerator.result?.rows || [];
+            const name = this.acceleratorName();
+            const t = (key) => window.t('cluster.v2.accelerator.' + key);
+            const size = (bytes) => this.formatSizeBytes(Number(bytes || 0));
+            return rows.map((row) => {
+                let detail = row.detail || '';
+                if (row.key === 'ssh' && row.status === 'pass') {
+                    detail = t('ssh_ok').replace('{target}', row.detail);
+                } else if (row.key === 'link') {
+                    detail = row.status === 'pass'
+                        ? t('link_fast')
+                        : t('link_slow').replace('{kind}', row.detail);
+                } else if (row.key === 'version') {
+                    detail = row.status === 'pass'
+                        ? t('version_ok').replace('{version}', row.detail)
+                        : t('version_mismatch')
+                            .replace('{name}', name)
+                            .replace('{version}', row.detail || '?')
+                            .replace('{expected}', row.expected || '?');
+                } else if (row.key === 'memory') {
+                    detail = t('memory_detail').replace('{size}', size(row.bytes));
+                } else if (row.key === 'disk') {
+                    detail = t('disk_detail').replace('{size}', size(row.bytes));
+                } else if (row.key === 'power') {
+                    detail = row.status === 'pass' ? t('power_ok') : t('power_battery');
+                }
+                return {
+                    key: row.key,
+                    status: row.status,
+                    label: t('row_' + row.key),
+                    detail,
+                    fix: row.fix || '',
+                };
+            });
+        },
+
+        acceleratorReady() {
+            const rows = this.accelerator.result?.rows || [];
+            return rows.length > 0 && rows.every((row) => row.status !== 'fail');
         },
 
         async runChecks() {

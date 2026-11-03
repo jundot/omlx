@@ -106,6 +106,55 @@ async def candidates(model_id: str) -> dict:
     return {"version": __version__, "devices": rows}
 
 
+def _check(node_id: str) -> dict:
+    """The accelerator checks for one paired Mac, as rows of key, status, detail."""
+    device = get_device_registry().get(node_id)
+    if device is None:
+        raise HTTPException(status_code=404, detail="This Mac is not paired.")
+    rows = []
+    try:
+        target = launcher.resolve_target(node_id)
+    except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
+        rows.append({"key": "ssh", "status": "fail", "detail": str(error)})
+        return {"node_id": node_id, "name": device["friendly_name"], "rows": rows}
+    rows.append({"key": "ssh", "status": "pass", "detail": target.ssh_target})
+    fast = target.link in ("thunderbolt", "rdma")
+    rows.append(
+        {
+            "key": "link",
+            "status": "pass" if fast else "warn",
+            "detail": target.link,
+            "fix": " ".join(target.warnings),
+        }
+    )
+    try:
+        info = launcher.remote_info(target)
+    except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
+        rows.append({"key": "version", "status": "fail", "detail": str(error)})
+        return {"node_id": node_id, "name": target.name, "rows": rows}
+    version = info.get("version")
+    rows.append(
+        {
+            "key": "version",
+            "status": "pass" if version == __version__ else "fail",
+            "detail": version,
+            "expected": __version__,
+        }
+    )
+    rows.append({"key": "memory", "status": "pass", "bytes": helper_budget(info)})
+    rows.append({"key": "disk", "status": "pass", "bytes": info.get("disk_free")})
+    rows.append(
+        {"key": "power", "status": "warn" if info.get("on_battery") else "pass"}
+    )
+    return {"node_id": node_id, "name": target.name, "rows": rows}
+
+
+@router.get("/check")
+async def check(node_id: str) -> dict:
+    """Whether a paired Mac can serve as a prefill helper."""
+    return await asyncio.get_running_loop().run_in_executor(None, _check, node_id)
+
+
 @router.get("/models/{model_id}")
 async def model_status(model_id: str) -> dict:
     engine = _entry(model_id).engine
