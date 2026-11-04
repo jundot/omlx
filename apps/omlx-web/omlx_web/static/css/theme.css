@@ -1,5 +1,6 @@
 /*
- * Web UI color tokens. Every color the web UI draws is defined in this file.
+ * Web UI color tokens. The palette and the light semantic values live here;
+ * dashboard.css supplies the dark values of the neutral utility channels.
  * Palette entries are "R G B" channels so `rgb(var(--palette-x) / <alpha>)`
  * and Tailwind's opacity modifiers keep working. The semantic tokens below
  * name roles and refer to the palette; stylesheets and templates refer to
@@ -18,6 +19,24 @@
     --palette-neutral-800: 38 38 38;
     --palette-neutral-900: 23 23 23;
     --palette-neutral-950: 10 10 10;
+
+    /* Channel values for the neutral utilities (rgb, so /alpha still works).
+       The dashboard's dark values live in dashboard.css, next to the page that
+       loads it: the chat page has its own theme and must not inherit them. */
+    --text-scale-300: var(--palette-neutral-300);
+    --text-scale-400: var(--palette-neutral-500);
+    --text-scale-500: var(--palette-neutral-500);
+    --text-scale-600: var(--palette-neutral-600);
+    --text-scale-700: var(--palette-neutral-700);
+    --text-scale-800: var(--palette-neutral-800);
+    --text-scale-900: var(--palette-neutral-900);
+    --surface-scale-white: var(--palette-white);
+    --surface-scale-50: var(--palette-neutral-50);
+    --surface-scale-100: var(--palette-neutral-100);
+    --surface-scale-200: var(--palette-neutral-200);
+    --border-scale-100: var(--palette-neutral-100);
+    --border-scale-200: var(--palette-neutral-200);
+    --border-scale-300: var(--palette-neutral-300);
     /* zinc */
     --palette-zinc-200: 228 228 231;
     --palette-zinc-300: 212 212 216;
