@@ -1479,16 +1479,22 @@ private struct AboutSection: View {
 
 // MARK: - Keychain helper
 
-// Thin SecItem wrapper. Single account/service pair — the upload screen is
-// the only consumer right now, so we keep the surface small. All accesses
-// happen on the main actor (called from the VM); the SecItem APIs are
+// Thin SecItem wrapper. Each secret is a service/account `Item`; the
+// functions default to the HuggingFace upload token. The SecItem APIs are
 // thread-safe so we don't need additional locking.
 enum Keychain {
-    private static let service = "app.omlx.hf-upload"
-    private static let account = "huggingface-token"
+    struct Item: Sendable {
+        let service: String
+        let account: String
+
+        static let huggingFaceToken = Item(service: "app.omlx.hf-upload", account: "huggingface-token")
+        static let askAIRemoteKey = Item(service: "app.omlx.ask-ai-remote", account: "api-key")
+    }
 
     /// Returns the stored token or `nil` if no item exists / the read fails.
-    static func read() -> String? {
+    static func read(_ item: Item = .huggingFaceToken) -> String? {
+        let service = item.service
+        let account = item.account
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -1509,8 +1515,10 @@ enum Keychain {
     /// Writes (or updates) the stored token. No-op on empty input so we
     /// don't accidentally clobber an existing entry with an empty string.
     @discardableResult
-    static func write(_ value: String) -> Bool {
+    static func write(_ value: String, to item: Item = .huggingFaceToken) -> Bool {
         guard let data = value.data(using: .utf8), !value.isEmpty else { return false }
+        let service = item.service
+        let account = item.account
         let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -1530,7 +1538,9 @@ enum Keychain {
     }
 
     @discardableResult
-    static func delete() -> Bool {
+    static func delete(_ item: Item = .huggingFaceToken) -> Bool {
+        let service = item.service
+        let account = item.account
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

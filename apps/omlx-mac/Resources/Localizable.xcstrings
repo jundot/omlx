@@ -42135,6 +42135,282 @@
         }
       }
     },
+    "askai.section.server" : {
+      "comment" : "Section header for choosing which oMLX server Ask AI uses",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server"
+          }
+        }
+      }
+    },
+    "askai.row.server" : {
+      "comment" : "Row label for choosing the oMLX server Ask AI uses",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Answer with"
+          }
+        }
+      }
+    },
+    "askai.row.server.sub" : {
+      "comment" : "Sublabel for the Ask AI server choice",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The server on this Mac, or another oMLX server on your network, such as a Mac Studio."
+          }
+        }
+      }
+    },
+    "askai.server.this_mac" : {
+      "comment" : "Segment: Ask AI uses the oMLX server on this Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This Mac"
+          }
+        }
+      }
+    },
+    "askai.server.remote" : {
+      "comment" : "Segment: Ask AI uses an oMLX server on the network",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Another server"
+          }
+        }
+      }
+    },
+    "askai.row.server_address" : {
+      "comment" : "Row label for the other oMLX server's address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Address"
+          }
+        }
+      }
+    },
+    "askai.row.server_address.sub" : {
+      "comment" : "Sublabel for the other oMLX server's address",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A host, host:port, or https:// address. The default port is 8000."
+          }
+        }
+      }
+    },
+    "askai.row.server_key" : {
+      "comment" : "Row label for the other oMLX server's API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API key"
+          }
+        }
+      }
+    },
+    "askai.row.server_key.sub" : {
+      "comment" : "Sublabel for the other oMLX server's API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Saved in your Keychain, not in the Ask AI settings."
+          }
+        }
+      }
+    },
+    "askai.server_key.hide" : {
+      "comment" : "Tooltip on the eye button when the other server's API key is visible",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hide the API key"
+          }
+        }
+      }
+    },
+    "askai.server_key.show" : {
+      "comment" : "Tooltip on the eye button when the other server's API key is masked",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Show the API key"
+          }
+        }
+      }
+    },
+    "askai.row.server_test" : {
+      "comment" : "Row label for the button that checks the other oMLX server",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connection"
+          }
+        }
+      }
+    },
+    "askai.server.test" : {
+      "comment" : "Button that checks the other oMLX server's address and API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Test connection"
+          }
+        }
+      }
+    },
+    "askai.server.test.checking" : {
+      "comment" : "Shown while Ask AI checks the other oMLX server",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Checking…"
+          }
+        }
+      }
+    },
+    "askai.server.test.connected" : {
+      "comment" : "Shown when the other oMLX server answered; the argument is the number of chat models",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connected. Chat models available: %lld"
+          }
+        }
+      }
+    },
+    "askai.server.test.invalid_address" : {
+      "comment" : "Shown when the other oMLX server's address is empty or not valid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter a valid address, such as studio.local:8000."
+          }
+        }
+      }
+    },
+    "askai.server.test.needs_key" : {
+      "comment" : "Shown when the other oMLX server asks for an API key and none is set",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The server needs an API key."
+          }
+        }
+      }
+    },
+    "askai.server.test.key_rejected" : {
+      "comment" : "Shown when the other oMLX server rejects the API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The server did not accept this API key."
+          }
+        }
+      }
+    },
+    "askai.server.test.unreachable" : {
+      "comment" : "Shown when the other oMLX server does not answer; the arguments are its host and port",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Couldn't reach %@:%lld."
+          }
+        }
+      }
+    },
+    "askai.server.insecure" : {
+      "comment" : "Warning when Ask AI is set to another server over plain http",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This address uses http, so the API key and your questions are not encrypted on the network. Use a network you trust, or an https address."
+          }
+        }
+      }
+    },
+    "askai.models.unavailable_remote" : {
+      "comment" : "Hint when Ask AI uses another server and its model list could not be loaded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Can't reach the other server. Check its address and API key."
+          }
+        }
+      }
+    },
+    "askai.models.no_address" : {
+      "comment" : "Hint when Ask AI uses another server and no valid address is entered yet",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter the other server's address to pick from its models."
+          }
+        }
+      }
+    },
+    "askai.notice.no_server_address" : {
+      "comment" : "Shown when Ask AI is set to use another server but its address is empty or not valid",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Enter the other server's address in Ask AI settings."
+          }
+        }
+      }
+    },
     "askai.model.select_placeholder" : {
       "comment" : "Placeholder option at the top of the Ask AI model picker",
       "extractionState" : "manual",
