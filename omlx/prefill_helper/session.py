@@ -79,10 +79,10 @@ class PrefillHelperSession:
     def pick_layers(self) -> int:
         if self.fixed_layers:
             return min(self.fixed_layers, self.layers)
-        helper = self.unit_helper
-        # Until this Mac has been timed, assume both Macs are equally fast.
-        host = self.unit_host if self.unit_host is not None else helper
-        if helper is None:
+        helper, host = self.unit_helper, self.unit_host
+        if helper is None or host is None:
+            # Until both Macs are timed the helper, usually the faster Mac,
+            # takes all it holds; its first chunk times both.
             return self.layers
         return min(
             range(1, self.layers + 1),

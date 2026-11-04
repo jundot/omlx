@@ -476,8 +476,8 @@ def test_auto_split_balances_measured_speed():
     work = [1.0] * 20 + [0.1] + [0.0] * 19  # DeepSeek V4.1 with CED
     client = SimpleNamespace(info={"warm_seconds": 18.0, "warm_tokens": 1}, alive=True)
     session = PrefillHelperSession(client, DSV41, None, 18, "helper-mac", work)
-    # Before this Mac is timed, both Macs count as equally fast.
-    assert session.pick_layers() == 10
+    # Until this Mac is timed, the helper takes every layer it holds.
+    assert session.pick_layers() == 18
     # This Mac takes twice as long per unit of work: the helper gets more.
     session.observe(10, 2048, helper_s=10 * 2048, host_s=10.1 * 2 * 2048)
     assert session.pick_layers() == 14
