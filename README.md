@@ -275,6 +275,10 @@ Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the 
   <img src="docs/images/Screenshot 2026-02-10 at 00.51.54.png" alt="oMLX Menubar Stats" width="400">
 </p>
 
+### Remote Backend (experimental)
+
+Run the models on one Mac and use everything else from another. Point the macOS app (Server → Backend → *Another server*) or the CLI (`OMLX_REMOTE_URL`, or the `remote` section of `settings.json`) at an oMLX server on your network: the app's screens, menubar, Ask AI and `omlx launch` then use that server, and no server runs on the client Mac. See [docs/experimental/remote-backend.md](docs/experimental/remote-backend.md).
+
 ### API Compatibility
 
 Drop-in replacement for OpenAI and Anthropic APIs. Supports streaming usage stats (`stream_options.include_usage`), llama.cpp-style prefill progress (`return_progress`), Anthropic adaptive thinking, and vision inputs (images as base64 or URL, video as base64).
@@ -377,6 +381,9 @@ OMLX_API_KEY=your-secret-key omlx serve --model-dir ~/models --host 0.0.0.0
 
 # Inference and admin APIs only, without the web UI (not saved to settings)
 omlx serve --model-dir ~/models --headless
+
+# Use an oMLX server on another Mac for omlx launch (remote backend)
+OMLX_REMOTE_URL=studio.local:8000 OMLX_REMOTE_API_KEY=that-servers-key omlx launch claude
 ```
 
 The default SSD cache limit, `auto`, uses 50% of the sum of free disk space and existing SSD cache files, including GDN sidecars. The budget is refreshed during use and does not shrink simply because the cache grows or the server restarts. Other disk usage can change the budget. Set `--paged-ssd-cache-max-size 20GB` for a fixed limit.

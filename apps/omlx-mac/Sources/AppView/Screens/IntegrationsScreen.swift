@@ -30,7 +30,13 @@ struct IntegrationsScreen: View {
 
             FooterBar(error: vm.lastError)
         }
-        .task { await vm.load(client: services.client) }
+        .task {
+            vm.applyEndpoint(services.config.endpoint)
+            await vm.load(client: services.client)
+        }
+        .onChange(of: services.config) { _, _ in
+            vm.applyEndpoint(services.config.endpoint)
+        }
     }
 }
 

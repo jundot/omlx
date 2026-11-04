@@ -208,12 +208,12 @@ final class AskAITests: XCTestCase {
     }
 
     func testRemoteAddressParsing() throws {
-        func parse(_ text: String) -> AskAIEndpoint? {
-            AskAIEndpoint(remoteAddress: text, apiKey: nil)
+        func parse(_ text: String) -> OMLXEndpoint? {
+            OMLXEndpoint(remoteAddress: text, apiKey: nil)
         }
         let bare = try XCTUnwrap(parse("studio.local"))
         XCTAssertEqual([bare.scheme, bare.host], ["http", "studio.local"])
-        XCTAssertEqual(bare.port, AskAIEndpoint.defaultPort)
+        XCTAssertEqual(bare.port, OMLXEndpoint.defaultPort)
 
         let withPort = try XCTUnwrap(parse("  studio.local:9000/ "))
         XCTAssertEqual([withPort.scheme, withPort.host], ["http", "studio.local"])
@@ -221,22 +221,47 @@ final class AskAITests: XCTestCase {
 
         // https without a port is the TLS default, not oMLX's 8000, and the voice socket uses wss.
         let secure = try XCTUnwrap(parse("https://omlx.example.com"))
-        XCTAssertEqual(secure.port, AskAIEndpoint.defaultSecurePort)
+        XCTAssertEqual(secure.port, OMLXEndpoint.defaultSecurePort)
         XCTAssertEqual(secure.webSocketURL(path: "/v1/realtime")?.absoluteString,
                        "wss://omlx.example.com:443/v1/realtime")
 
         let ipv6 = try XCTUnwrap(parse("[::1]:8000"))
         XCTAssertEqual(ipv6.host, "::1")
         XCTAssertEqual(ipv6.httpURL(path: "/v1/models")?.absoluteString, "http://[::1]:8000/v1/models")
+        XCTAssertEqual(ipv6.displayAddress, "[::1]:8000")
 
-        // Nothing that cannot be reached as an oMLX server: no address, another protocol, or a path.
-        for text in ["", "   ", "ftp://studio.local", "http://studio.local/v1", "http://"] {
+        // Shared with the CLI parser (omlx/settings.py parse_endpoint_address):
+        // the same inputs give the same scheme, host and port on both sides.
+        let accepted: [(String, String, String, Int)] = [
+            ("studio.local", "http", "studio.local", 8000),
+            ("studio.local:9000", "http", "studio.local", 9000),
+            ("https://studio.local", "https", "studio.local", 443),
+            ("https://studio.local:8443", "https", "studio.local", 8443),
+            ("http://192.168.1.20:8000", "http", "192.168.1.20", 8000),
+            ("http://[::1]:8000", "http", "::1", 8000),
+            ("[fe80::1]", "http", "fe80::1", 8000),
+            ("  studio.local:9000  ", "http", "studio.local", 9000),
+            ("http://studio.local:8000/", "http", "studio.local", 8000),
+        ]
+        for (text, scheme, host, port) in accepted {
+            let endpoint = try XCTUnwrap(parse(text), "\(text) should parse")
+            XCTAssertEqual([endpoint.scheme, endpoint.host], [scheme, host], text)
+            XCTAssertEqual(endpoint.port, port, text)
+        }
+
+        // Nothing that cannot be reached as an oMLX server: no address, another
+        // protocol, a path, a query, credentials, or a port out of range.
+        for text in ["", "   ", "ftp://studio.local", "http://studio.local/v1", "http://",
+                     "studio.local/v1", "studio.local:abc", "studio.local:0", "studio.local:70000",
+                     "studio.local?x=1", "studio.local#frag", "user:pw@studio.local",
+                     "h:", "[1.2.3.4]", "[zz::1]", "h%20x", "http://h:99999999999999999999",
+                     "::1", "studio local"] {
             XCTAssertNil(parse(text), "\(text) should not parse")
         }
 
         // A blank key means no key.
-        XCTAssertNil(AskAIEndpoint(remoteAddress: "studio.local", apiKey: "  ")?.apiKey)
-        XCTAssertEqual(AskAIEndpoint(remoteAddress: "studio.local", apiKey: " sk-x \n")?.apiKey, "sk-x")
+        XCTAssertNil(OMLXEndpoint(remoteAddress: "studio.local", apiKey: "  ")?.apiKey)
+        XCTAssertEqual(OMLXEndpoint(remoteAddress: "studio.local", apiKey: " sk-x \n")?.apiKey, "sk-x")
     }
 
     func testEndpointFollowsTheServerChoice() throws {
@@ -266,6 +291,19 @@ final class AskAITests: XCTestCase {
         // No address yet: nothing to send to, rather than falling back to this Mac.
         prefs.remoteAddress = ""
         XCTAssertNil(prefs.endpoint(local: local, remoteKey: "remote-key"))
+
+        // The app itself points at another Mac: "this Mac" is that server,
+        // with that server's key.
+        var remoteApp = local
+        remoteApp.remoteEnabled = true
+        remoteApp.remoteAddress = "studio.local:9000"
+        remoteApp.remoteAPIKey = "backend-key"
+        prefs.serverMode = .thisMac
+        let backend = try XCTUnwrap(prefs.endpoint(local: remoteApp, remoteKey: "remote-key"))
+        XCTAssertTrue(backend.isRemote)
+        XCTAssertEqual(backend.apiKey, "backend-key")
+        XCTAssertEqual(backend.httpURL(path: "/v1/chat/completions")?.absoluteString,
+                       "http://studio.local:9000/v1/chat/completions")
     }
 
     func testGPUPowerLimitIsClampedToTheServerRange() throws {
