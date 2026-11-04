@@ -3269,9 +3269,15 @@
                         return t(s.prompt).replace('{name}', name).replace('{size}', size(s.bytes))
                             .replace('{left}', size(s.left))
                             .replace('{copies}', (s.delete || []).map((c) => c.name + ' (' + size(c.bytes) + ')').join(', '));
-                    case 'copying':
-                        return t('copying').replace('{name}', name).replace('{done}', size(s.done))
+                    case 'copying': {
+                        const text = t('copying').replace('{name}', name).replace('{done}', size(s.done))
                             .replace('{size}', size(s.bytes));
+                        if (s.seconds_left == null) return text;
+                        const left = s.seconds_left < 90
+                            ? t('seconds_left').replace('{n}', s.seconds_left)
+                            : t('minutes_left').replace('{n}', Math.ceil(s.seconds_left / 60));
+                        return text + ' · ' + left;
+                    }
                     case 'files_ready':
                         return t('files_ready').replace('{name}', name).replace('{n}', s.held ?? '');
                     case 'ready':

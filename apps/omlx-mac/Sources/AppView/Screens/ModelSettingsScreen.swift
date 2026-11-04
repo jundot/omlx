@@ -1635,9 +1635,18 @@ private struct PrefillAcceleratorGroup: View {
                           comment: "Prefill Accelerator status asking to copy model files to a nearly full helper Mac")
         case "copying":
             let done = size(status.done), total = size(status.bytes)
-            return String(localized: "settings.acceleration.prefill_helper.state.copying",
-                          defaultValue: "Copying model files to \(name): \(done) of \(total)",
-                          comment: "Prefill Accelerator status while copying files")
+            let text = String(localized: "settings.acceleration.prefill_helper.state.copying",
+                              defaultValue: "Copying model files to \(name): \(done) of \(total)",
+                              comment: "Prefill Accelerator status while copying files")
+            guard let seconds = status.secondsLeft else { return text }
+            let left = seconds < 90
+                ? String(localized: "settings.acceleration.prefill_helper.state.seconds_left",
+                         defaultValue: "about \(seconds) s left",
+                         comment: "Prefill Accelerator copy time left, in seconds")
+                : String(localized: "settings.acceleration.prefill_helper.state.minutes_left",
+                         defaultValue: "about \((seconds + 59) / 60) min left",
+                         comment: "Prefill Accelerator copy time left, in minutes")
+            return text + " · " + left
         case "files_ready":
             let held = status.held ?? 0
             return String(localized: "settings.acceleration.prefill_helper.state.files_ready",

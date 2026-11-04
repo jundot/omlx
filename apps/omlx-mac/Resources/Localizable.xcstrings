@@ -22150,6 +22150,30 @@
         }
       }
     },
+    "settings.acceleration.prefill_helper.state.minutes_left" : {
+      "comment" : "Prefill Accelerator copy time left, in minutes",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "about %lld min left"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.seconds_left" : {
+      "comment" : "Prefill Accelerator copy time left, in seconds",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "about %lld s left"
+          }
+        }
+      }
+    },
     "settings.acceleration.prefill_helper.state.files_ready" : {
       "comment" : "Prefill Accelerator status after copying files before the model is loaded",
       "extractionState" : "manual",

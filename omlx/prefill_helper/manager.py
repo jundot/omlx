@@ -106,6 +106,13 @@ def fit_layers(shared: int, per_layer: list[int], budget: int, limit: int) -> in
     return held
 
 
+def _with_time_left(status: dict[str, Any]) -> dict[str, Any]:
+    finish_at = status.pop("finish_at", None)
+    if finish_at is not None and status.get("state") == "copying":
+        status["seconds_left"] = max(0, round(finish_at - time.time()))
+    return status
+
+
 def held_layers(
     adapter: StageAdapter,
     model_path: str,
@@ -198,12 +205,14 @@ def _prepare_files(
         )
     if plan["delete"]:
         launcher.delete_copies(target, [item["name"] for item in plan["delete"]])
-    done = 0
+    done, started = 0, time.time()
 
     def progress(name: str) -> None:
         nonlocal done
         done += files[name]
-        report("copying", path=model_dir, done=done, bytes=size)
+        # The average speed so far sets when the copy should end.
+        finish_at = started + (time.time() - started) * size / done
+        report("copying", path=model_dir, done=done, bytes=size, finish_at=finish_at)
 
     report("copying", path=model_dir, done=0, bytes=size)
     launcher.copy_files(
@@ -238,7 +247,7 @@ class FilePrep:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            return dict(self._status)
+            return _with_time_left(dict(self._status))
 
     def copy_files(self) -> None:
         self._ok.set()
@@ -413,7 +422,7 @@ class PrefillHelperManager:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            status = dict(self._status)
+            status = _with_time_left(dict(self._status))
         session = self._session
         if session is not None and status.get("state") == "ready":
             status["layers"] = session.pick_layers()

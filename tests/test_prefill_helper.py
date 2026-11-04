@@ -798,6 +798,29 @@ def test_files_copied_before_the_load_are_taken_over_not_copied_twice(tmp_path):
     manager.close()
 
 
+def test_copy_time_left_follows_the_average_speed(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(manager_module.time, "time", lambda: now[0])
+    fake = _FakeLauncher(None, missing=["a", "b"])
+    fake.required_files = lambda path, layers, adapter: {"a": 5, "b": 5}
+
+    def copy_files(target, model_path, dest, names, progress, cancelled=None):
+        for name in names:
+            now[0] += 10
+            progress(name)
+
+    fake.copy_files = copy_files
+    seen = []
+
+    def report(state, **fields):
+        seen.append(manager_module._with_time_left({"state": state, **fields}))
+
+    target = SimpleNamespace(name="M5max")
+    manager_module._prepare_files(fake, target, "/models/x", 2, None, report, None)
+    # Half the bytes in 10 s leaves 10 s.
+    assert [status.get("seconds_left") for status in seen] == [None, 10, 0]
+
+
 def test_cancel_before_the_load_stops_a_waiting_copy_without_deleting():
     old = {"name": "Old", "bytes": 20 << 30, "used": 0.0}
     fake = _FakeLauncher(

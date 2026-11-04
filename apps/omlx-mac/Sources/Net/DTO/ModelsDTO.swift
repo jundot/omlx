@@ -413,6 +413,7 @@ struct PrefillHelperStatusDTO: Codable, Equatable, Sendable {
     var bytes: Int64? = nil
     var free: Int64? = nil
     var done: Int64? = nil
+    var secondsLeft: Int? = nil
     var onBattery: Bool? = nil
     var lastPrompt: LastPrompt? = nil
     /// needs_files only: make_room or low_space, the disk left after copying
