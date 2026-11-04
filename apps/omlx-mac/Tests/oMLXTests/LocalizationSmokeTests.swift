@@ -66,7 +66,7 @@ final class LocalizationSmokeTests: XCTestCase {
         "status.section.system", "status.section.active_now",
         // High-density screens
         "models.active.title", "models.library.title",
-        "models.updates.check", "models.updates.available", "models.updates.unload",
+        "models.updates.check", "models.updates.available",
         "downloads.hf.section.title", "downloads.active.title",
         "quant.header.title", "quant.about.title",
         // Profile + bench

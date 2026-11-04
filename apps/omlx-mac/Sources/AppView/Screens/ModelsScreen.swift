@@ -30,7 +30,6 @@ struct ModelsScreen: View {
                 deletingID: vm.deletingID,
                 updates: vm,
                 onCheckUpdates: { Task { await vm.checkForUpdates(client: services.client) } },
-                onShowDownloads: { services.requestedSection = .downloads },
                 onLoad: { id in vm.load(id: id, client: services.client) },
                 onUnload: { id in vm.unload(id: id, client: services.client) },
                 onOpenSettings: { id in services.modelDetailID = id },
@@ -42,21 +41,18 @@ struct ModelsScreen: View {
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
-        .sheet(item: $vm.updatePreview) { model in
-            if let repo = model.repoId {
-                ModelCardSheet(
-                    target: ModelCardTarget(repoId: repo, source: .huggingFace, startTab: .files),
-                    client: services.client,
-                    onDownload: { _, files in
-                        Task {
-                            if await vm.startUpdate(model: model, files: files, client: services.client) {
-                                services.requestedSection = .downloads
-                            }
+        .sheet(item: $vm.updateTarget) { target in
+            ModelCardSheet(
+                target: target,
+                client: services.client,
+                onDownload: { repo, files in
+                    Task {
+                        if await vm.startUpdate(repo: repo, files: files, client: services.client) {
+                            services.requestedSection = .downloads
                         }
-                    },
-                    downloadDisabledReason: vm.downloadDisabledReason(for: model.name)
-                )
-            }
+                    }
+                }
+            )
         }
         .confirmationDialog(
             String(localized: "models.delete.confirm_title",
@@ -193,7 +189,6 @@ private struct LibrarySection: View {
     let deletingID: String?
     let updates: ModelsScreenVM
     let onCheckUpdates: () -> Void
-    let onShowDownloads: () -> Void
     let onLoad: (String) -> Void
     let onUnload: (String) -> Void
     let onOpenSettings: (String) -> Void
@@ -224,22 +219,13 @@ private struct LibrarySection: View {
                 }
             }
             .buttonStyle(.omlx(.normal, size: .small))
-            .disabled(updates.isCheckingUpdates || updates.startingUpdateID != nil || models.isEmpty)
+            .disabled(updates.isCheckingUpdates || models.isEmpty)
         }
 
         if let status = updates.updateStatus {
             Text(status)
                 .font(.omlxText(DesignTokens.FontSize.subheadline))
                 .foregroundStyle(theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 28)
-                .padding(.bottom, 4)
-        }
-        if let error = updates.updateError {
-            Text(error)
-                .font(.omlxText(DesignTokens.FontSize.subheadline))
-                .foregroundStyle(theme.redDot)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 28)
@@ -355,7 +341,7 @@ private struct LibrarySection: View {
                                             .frame(minWidth: 48)
                                     }
                                     .buttonStyle(.omlx(.normal, size: .small))
-                                    .disabled(m.isLoading || updates.isLoadBlocked(m.id))
+                                    .disabled(m.isLoading)
                                 }
                                 Button {
                                     onOpenSettings(m.id)
@@ -380,7 +366,7 @@ private struct LibrarySection: View {
                                     }
                                 }
                                 .buttonStyle(.omlx(.plain, size: .small))
-                                .disabled(deletingID != nil || updates.isUpdating(m.id))
+                                .disabled(deletingID != nil)
                                 .help(String(localized: "models.library.remove.help",
                                              defaultValue: "Remove from disk",
                                              comment: "Tooltip on the trash button that deletes a model from local storage"))
@@ -396,29 +382,14 @@ private struct LibrarySection: View {
 
     @ViewBuilder
     private func updateBadge(for model: ModelDTO) -> some View {
-        if let task = updates.updateTask(for: model.id) {
-            Button(action: onShowDownloads) {
-                StatusPill(status: .custom(
-                    color: task.isActive ? theme.accent : theme.warningText,
-                    label: task.isActive
-                        ? String(localized: "models.updates.updating", defaultValue: "Updating")
-                        : String(localized: "models.updates.manage", defaultValue: "Review download"),
-                    fillBg: true))
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(String(localized: "models.updates.progress_label",
-                                       defaultValue: "Open download progress for \(model.displayTitle)"))
-        } else if let update = updates.update(for: model.id) {
-            Button { updates.showUpdateOverview(id: model.id) } label: {
+        if let update = updates.update(for: model.id) {
+            Button { updates.showUpdate(for: model.id) } label: {
                 StatusPill(status: .custom(
                     color: .yellow,
-                    label: updates.updateIsStale(for: model.id)
-                        ? String(localized: "models.updates.last_known", defaultValue: "Update available · last known")
-                        : String(localized: "models.updates.available", defaultValue: "Update available"),
+                    label: String(localized: "models.updates.available", defaultValue: "Update available"),
                     fillBg: true))
             }
             .buttonStyle(.plain)
-            .disabled(updates.startingUpdateID != nil)
             .help(String(localized: "models.updates.details",
                          defaultValue: "\(update.files) files · \(formatBytes(update.size))"))
             .accessibilityLabel(String(localized: "models.updates.preview_label",

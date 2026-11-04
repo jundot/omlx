@@ -39,7 +39,6 @@ final class MenubarController: NSObject {
     private let updates: UpdateController?
     private let bootstrapError: Error?
     private let client: OMLXClient?
-    private let modelUpdates: ModelsScreenVM
     private let openModelSettings: (String) -> Void
     private let openAppView: () -> Void
     private let openAppearanceSettings: () -> Void
@@ -105,7 +104,6 @@ final class MenubarController: NSObject {
     init(
         server: ServerProcess?,
         config: AppConfig,
-        modelUpdates: ModelsScreenVM,
         updates: UpdateController? = nil,
         lastError: Error? = nil,
         client: OMLXClient? = nil,
@@ -119,7 +117,6 @@ final class MenubarController: NSObject {
         self.updates = updates
         self.bootstrapError = lastError
         self.client = client
-        self.modelUpdates = modelUpdates
         self.openModelSettings = openModelSettings
         self.openAppView = openAppView
         self.openAppearanceSettings = openAppearanceSettings
@@ -1105,7 +1102,7 @@ final class MenubarController: NSObject {
         }
     }
 
-    func modelItem(for m: ModelDTO) -> NSMenuItem {
+    private func modelItem(for m: ModelDTO) -> NSMenuItem {
         let title = MenubarController.modelMenuTitle(for: m)
         let parentItem: NSMenuItem
         if m.loaded, !m.sizeLabel.isEmpty {
@@ -1169,7 +1166,7 @@ final class MenubarController: NSObject {
                                      comment: "Menu item to load a model"),
                               action: #selector(loadModelAction(_:)),
                               symbol: "play.circle")
-            toggleItem.isEnabled = !modelUpdates.isLoadBlocked(m.id)
+            toggleItem.isEnabled = true
         }
         toggleItem.representedObject = m.id
         sub.addItem(toggleItem)
@@ -1207,8 +1204,6 @@ final class MenubarController: NSObject {
 
     private func refreshModels() async {
         guard serverIsRunning, let client else { return }
-        // The library stops polling while Downloads is visible.
-        await modelUpdates.refresh(client: client)
         guard let resp = try? await client.listModels() else { return }
         guard !Task.isCancelled else { return }
         models = MenubarController.visibleMenuModels(resp.models)
@@ -1221,7 +1216,7 @@ final class MenubarController: NSObject {
     // MARK: - Per-model actions
 
     @objc private func loadModelAction(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String, !modelUpdates.isLoadBlocked(id) else { return }
+        guard let id = sender.representedObject as? String else { return }
         loadingIDs.insert(id)
         rebuildModelsSubmenu()
         // The load POST runs in its own task so it isn't cancelled when the menu
@@ -1229,13 +1224,7 @@ final class MenubarController: NSObject {
         Task {
             // A failed load must drop the pending id so the entry falls back
             // to "Load model" instead of sticking on the in-progress state.
-            do {
-                if modelUpdates.isLoadBlocked(id) {
-                    loadingIDs.remove(id)
-                } else {
-                    _ = try await client?.loadModel(id: id)
-                }
-            }
+            do { _ = try await client?.loadModel(id: id) }
             catch { loadingIDs.remove(id) }
             scheduleModelsRefresh()
         }

@@ -311,7 +311,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MenubarController(
             server: server,
             config: config,
-            modelUpdates: services.models,
             updates: services.updates,
             lastError: lastError,
             client: services.client,

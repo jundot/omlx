@@ -103,7 +103,6 @@ struct ModelCardSheet: View {
     /// itself on tap so the user lands back on the row with the task
     /// already moving in the Active section.
     let onDownload: (String, [String]?) -> Void
-    var downloadDisabledReason: String? = nil
 
     @State private var state: LoadState = .idle
     /// Files picked in the Files tab, beside the required ones.
@@ -551,15 +550,6 @@ struct ModelCardSheet: View {
     @ViewBuilder
     private func footer(dto: ModelCardDTO) -> some View {
         Divider().overlay(theme.groupBorder)
-        if let downloadDisabledReason {
-            Text(downloadDisabledReason)
-                .font(.omlxText(DesignTokens.FontSize.subheadline))
-                .foregroundStyle(theme.warningText)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 20)
-                .padding(.top, 8)
-        }
         HStack(spacing: 10) {
             if let url = target.source.upstreamURL(repoId: target.repoId) {
                 Button {
@@ -601,7 +591,6 @@ struct ModelCardSheet: View {
                     }
                     .buttonStyle(.omlx(.primary))
                     .keyboardShortcut(.defaultAction)
-                    .disabled(downloadDisabledReason != nil)
                 }
             }
         }
@@ -639,7 +628,7 @@ struct ModelCardSheet: View {
             Text(allSize > 0 ? "\(downloadAllLabel) · \(formatBytes(allSize))" : downloadAllLabel)
         }
         .buttonStyle(.omlx(.normal))
-        .disabled(downloadDisabledReason != nil || !fitsDisk(allSize, dto))
+        .disabled(!fitsDisk(allSize, dto))
         Button {
             onDownload(target.repoId, picked.map(\.name))
             dismiss()
@@ -650,7 +639,7 @@ struct ModelCardSheet: View {
         }
         .buttonStyle(.omlx(update.isEmpty ? .primary : .normal))
         .keyboardShortcut(update.isEmpty ? .defaultAction : nil)
-        .disabled(downloadDisabledReason != nil || picked.isEmpty || !fitsDisk(pickedSize, dto))
+        .disabled(picked.isEmpty || !fitsDisk(pickedSize, dto))
         if !update.isEmpty {
             Button {
                 onDownload(target.repoId, update.sorted())
@@ -662,7 +651,7 @@ struct ModelCardSheet: View {
             }
             .buttonStyle(.omlx(.primary))
             .keyboardShortcut(.defaultAction)
-            .disabled(downloadDisabledReason != nil || !fitsDisk(updateSize, dto))
+            .disabled(!fitsDisk(updateSize, dto))
         }
     }
 

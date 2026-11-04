@@ -6,13 +6,10 @@ struct HFLocalModelsResponse: Decodable, Sendable {
     let models: [HFLocalModelDTO]
 }
 
-struct HFLocalModelDTO: Decodable, Equatable, Sendable, Identifiable {
+struct HFLocalModelDTO: Decodable, Sendable {
     let name: String
-    let path: String?
     let repoId: String?
     let sourceType: String?
-    let modelFormat: String?
-    var id: String { name }
 }
 
 struct HFUpdateCheckRequest: Encodable, Sendable {

@@ -114,10 +114,6 @@ final class AppServices: NSObject {
     }
 
     func updateConfig(_ next: AppConfig) {
-        if config.host != next.host || config.port != next.port
-            || config.basePath != next.basePath || config.effectiveModelDirs != next.effectiveModelDirs {
-            models.resetModelUpdates()
-        }
         self.config = next
         client.configure(host: next.host, port: next.port, apiKey: next.apiKey)
     }
@@ -227,7 +223,6 @@ final class AppServices: NSObject {
         guard basePathChanging || modelDirChanging else {
             throw BasePathChangeError.sameAsCurrent
         }
-        models.resetModelUpdates()
 
         // Stop the server BEFORE any filesystem mutation so an open log
         // file or SSD cache doesn't corrupt the move.
