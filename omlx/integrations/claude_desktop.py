@@ -160,6 +160,7 @@ def configure_omlx_gateway(
     port: int,
     api_key: str | None = None,
     home: Path | None = None,
+    base_url: str | None = None,
 ) -> bool:
     """Point Claude Desktop at the oMLX gateway.
 
@@ -169,6 +170,8 @@ def configure_omlx_gateway(
         api_key: oMLX API key, or ``"omlx"`` when the server is open
             (empty/None falls back to ``"omlx"``).
         home: fake home directory for tests (defaults to ``Path.home()``).
+        base_url: full server URL (e.g. a remote backend) used for
+            ``inferenceGatewayBaseUrl`` instead of the loopback URL.
 
     Returns:
         True when the configuration was applied, False on non-macOS
@@ -208,7 +211,8 @@ def configure_omlx_gateway(
     if previous_applied_id and previous_applied_id != PROFILE_ID:
         profile[_PREVIOUS_APPLIED_ID_KEY] = previous_applied_id
     profile["inferenceProvider"] = "gateway"
-    profile["inferenceGatewayBaseUrl"] = f"http://127.0.0.1:{port}"
+    gateway_url = base_url or f"http://127.0.0.1:{port}"
+    profile["inferenceGatewayBaseUrl"] = gateway_url
     profile["inferenceGatewayApiKey"] = key
     profile["inferenceGatewayAuthScheme"] = "bearer"
     profile["disableDeploymentModeChooser"] = True
@@ -216,8 +220,8 @@ def configure_omlx_gateway(
     _write_json(paths["profile"], profile)
 
     logger.info(
-        "Claude Desktop configured for oMLX gateway on 127.0.0.1:%s (profile %s)",
-        port,
+        "Claude Desktop configured for oMLX gateway at %s (profile %s)",
+        gateway_url,
         PROFILE_ID,
     )
     return True

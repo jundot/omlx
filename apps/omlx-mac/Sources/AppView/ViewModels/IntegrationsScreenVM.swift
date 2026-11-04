@@ -107,10 +107,27 @@ final class IntegrationsScreenVM {
     // /admin/api/stats so the shell strings reflect whatever host/port/key
     // the running server actually advertises (instead of the local config,
     // which can drift after a hot-reload).
+    private(set) var serverScheme: String = "http"
     private(set) var serverHost: String = "127.0.0.1"
     private(set) var serverPort: Int = 8000
     private(set) var serverApiKeySet: Bool = false
     private(set) var cliPrefix: String = "omlx"
+    /// A remote backend supplies scheme/host/port/key: the stats report that
+    /// server's own bind address, which is not where this app reaches it.
+    private var usesRemoteEndpoint = false
+    /// The key this install sends to the remote server. Copy uses it as is:
+    /// the remote's reveal endpoint would return that server's own main key.
+    private var remoteApiKey = ""
+
+    func applyEndpoint(_ endpoint: OMLXEndpoint) {
+        usesRemoteEndpoint = endpoint.isRemote
+        guard endpoint.isRemote else { return }
+        serverScheme = endpoint.scheme
+        serverHost = endpoint.host
+        serverPort = endpoint.port
+        remoteApiKey = endpoint.apiKey ?? ""
+        serverApiKeySet = !remoteApiKey.isEmpty
+    }
 
     /// Popup options: a leading "Select model…" placeholder + every model id.
     var modelOptions: [(String, String)] {
@@ -178,6 +195,7 @@ final class IntegrationsScreenVM {
 
     func claudeEnvRecipeForCopy(client: OMLXClient) async throws -> String {
         guard serverApiKeySet else { return claudeEnvRecipe(authToken: "") }
+        if usesRemoteEndpoint { return claudeEnvRecipe(authToken: remoteApiKey) }
         return try await claudeEnvRecipe(authToken: client.revealApiKey())
     }
 
@@ -199,7 +217,7 @@ final class IntegrationsScreenVM {
         let haiku  = haikuModel.isEmpty  ? "select-a-model" : haikuModel
         var parts: [String] = []
         parts.append(Self.shellEnvAssign("ANTHROPIC_BASE_URL",
-                                         "http://\(formatDisplayHost(serverHost)):\(serverPort)"))
+                                         "\(serverScheme)://\(formatDisplayHost(serverHost)):\(serverPort)"))
         if !authToken.isEmpty {
             parts.append(Self.shellEnvAssign("ANTHROPIC_AUTH_TOKEN", authToken))
         }
@@ -342,9 +360,11 @@ final class IntegrationsScreenVM {
             // Failure here is non-fatal: the screen still works against the
             // default `omlx` prefix and 127.0.0.1:8000.
             if let stats = try? await client.getStats() {
-                if let host = stats.host, !host.isEmpty { self.serverHost = host }
-                if let port = stats.port               { self.serverPort = port }
-                self.serverApiKeySet = stats.apiKeySet ?? false
+                if !usesRemoteEndpoint {
+                    if let host = stats.host, !host.isEmpty { self.serverHost = host }
+                    if let port = stats.port               { self.serverPort = port }
+                    self.serverApiKeySet = stats.apiKeySet ?? false
+                }
                 if let prefix = stats.cliPrefix, !prefix.isEmpty {
                     self.cliPrefix = prefix
                 }

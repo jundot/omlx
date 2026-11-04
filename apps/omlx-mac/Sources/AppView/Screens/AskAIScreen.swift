@@ -68,7 +68,7 @@ struct AskAIScreen: View {
                                  microphone: microphone, showsMicrophoneGuide: $showsMicrophoneGuide)
                 }
                 if modelsUnavailable, prefs.enabled || prefs.talk.enabled {
-                    HintLine(text: Self.modelsUnavailableHint(prefs))
+                    HintLine(text: Self.modelsUnavailableHint(prefs, appUsesRemoteBackend: services.isRemoteBackend))
                     .padding(.horizontal, 28)
                     .padding(.top, 6)
                 }
@@ -105,7 +105,7 @@ struct AskAIScreen: View {
         // Reload when the server comes up after the screen opened, or when
         // Ask AI is pointed at a different server.
         .task(id: ModelsLoadKey(textEnabled: prefs.enabled, voiceEnabled: prefs.talk.enabled,
-                                localServerRunning: services.serverState.isRunningLike,
+                                localServerRunning: services.backendIsUp,
                                 serverMode: prefs.serverMode, remoteAddress: prefs.remoteAddress,
                                 keyRevision: keyRevision)) {
             guard prefs.enabled || prefs.talk.enabled else { return }
@@ -113,15 +113,22 @@ struct AskAIScreen: View {
         }
     }
 
-    private static func modelsUnavailableHint(_ prefs: AskAIPrefs) -> String {
+    private static func modelsUnavailableHint(_ prefs: AskAIPrefs, appUsesRemoteBackend: Bool) -> String {
         guard prefs.serverMode == .remote else {
+            if appUsesRemoteBackend {
+                return String(
+                    localized: "askai.models.unavailable_app_remote",
+                    defaultValue: "Can't reach the server this app uses. Check it under Server.",
+                    comment: "Hint when Ask AI follows the app's remote backend and its model list could not be loaded"
+                )
+            }
             return String(
                 localized: "askai.models.unavailable",
                 defaultValue: "Start the server to pick from installed models.",
                 comment: "Hint when the model list could not be loaded"
             )
         }
-        if AskAIEndpoint(remoteAddress: prefs.remoteAddress, apiKey: nil) == nil {
+        if OMLXEndpoint(remoteAddress: prefs.remoteAddress, apiKey: nil) == nil {
             return String(
                 localized: "askai.models.no_address",
                 defaultValue: "Enter the other server's address to pick from its models.",
@@ -249,6 +256,7 @@ private struct ModelsLoadKey: Hashable {
 /// network, such as a Mac Studio. The other server's API key is kept in the
 /// Keychain, not in the Ask AI settings file.
 private struct ServerSection: View {
+    @Environment(AppServices.self) private var services
     @Bindable var store: AskAIStore
     @Binding var keyRevision: Int
 
@@ -266,8 +274,33 @@ private struct ServerSection: View {
 
     private var isRemote: Bool { store.prefs.serverMode == .remote }
 
+    /// "This Mac" is the app's own server. When the install points at a
+    /// remote backend, that is the server on the other Mac, so say so.
+    private var thisMacLabel: String {
+        if services.isRemoteBackend {
+            return String(localized: "askai.server.app_server",
+                          defaultValue: "oMLX's server",
+                          comment: "Segment: Ask AI uses the server this app is set to use, which is a remote backend")
+        }
+        return String(localized: "askai.server.this_mac",
+                      defaultValue: "This Mac",
+                      comment: "Segment: Ask AI uses the oMLX server on this Mac")
+    }
+
+    private var serverChoiceSublabel: String {
+        if services.isRemoteBackend {
+            let address = services.config.remoteEndpoint?.displayAddress ?? services.config.remoteAddress
+            return String(localized: "askai.row.server.sub.remote",
+                          defaultValue: "The server this app uses (\(address)), or another oMLX server on your network.",
+                          comment: "Sublabel for the Ask AI server choice when the app uses a remote backend; the argument is that server's address")
+        }
+        return String(localized: "askai.row.server.sub",
+                      defaultValue: "The server on this Mac, or another oMLX server on your network, such as a Mac Studio.",
+                      comment: "Sublabel for the Ask AI server choice")
+    }
+
     private var sendsKeyInTheClear: Bool {
-        guard let endpoint = AskAIEndpoint(remoteAddress: store.prefs.remoteAddress, apiKey: nil),
+        guard let endpoint = OMLXEndpoint(remoteAddress: store.prefs.remoteAddress, apiKey: nil),
               endpoint.scheme == "http" else { return false }
         return !["localhost", "127.0.0.1", "::1"].contains(endpoint.host.lowercased())
     }
@@ -282,18 +315,14 @@ private struct ServerSection: View {
                 label: String(localized: "askai.row.server",
                               defaultValue: "Answer with",
                               comment: "Row label for choosing the oMLX server Ask AI uses"),
-                sublabel: String(localized: "askai.row.server.sub",
-                                 defaultValue: "The server on this Mac, or another oMLX server on your network, such as a Mac Studio.",
-                                 comment: "Sublabel for the Ask AI server choice"),
+                sublabel: serverChoiceSublabel,
                 isLast: !isRemote
             ) {
                 Segmented(
                     selection: $store.prefs.serverMode,
                     titleKey: "askai.row.server",
                     options: [
-                        (AskAIServerMode.thisMac, String(localized: "askai.server.this_mac",
-                                                         defaultValue: "This Mac",
-                                                         comment: "Segment: Ask AI uses the oMLX server on this Mac")),
+                        (AskAIServerMode.thisMac, thisMacLabel),
                         (AskAIServerMode.remote, String(localized: "askai.server.remote",
                                                         defaultValue: "Another server",
                                                         comment: "Segment: Ask AI uses an oMLX server on the network")),
@@ -418,7 +447,7 @@ private struct ServerSection: View {
 
     private func testConnection() async {
         saveKeyIfChanged()
-        guard let endpoint = AskAIEndpoint(remoteAddress: store.prefs.remoteAddress, apiKey: apiKey) else {
+        guard let endpoint = OMLXEndpoint(remoteAddress: store.prefs.remoteAddress, apiKey: apiKey) else {
             check = .failed(String(localized: "askai.server.test.invalid_address",
                                    defaultValue: "Enter a valid address, such as studio.local:8000.",
                                    comment: "Shown when the other oMLX server's address is empty or not valid"))
@@ -426,7 +455,7 @@ private struct ServerSection: View {
         }
         check = .checking
         do {
-            let all = try await endpoint.remoteModels()
+            let all = try await endpoint.models()
             check = .connected(models: all.filter {
                 AskAIScreen.isChatModel(type: $0.modelType, virtual: $0.virtual)
             }.count)
@@ -435,7 +464,7 @@ private struct ServerSection: View {
         }
     }
 
-    private static func message(for error: Error, endpoint: AskAIEndpoint) -> String {
+    private static func message(for error: Error, endpoint: OMLXEndpoint) -> String {
         if let error = error as? OMLXClientError {
             switch error {
             case .unauthenticated:

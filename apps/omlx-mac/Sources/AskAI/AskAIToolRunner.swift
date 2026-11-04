@@ -167,7 +167,7 @@ enum AskAITool {
 }
 
 struct AskAIToolRunner: AskAIToolRunning {
-    let endpoint: AskAIEndpoint
+    let endpoint: OMLXEndpoint
     var screenshotPixels = AskAIImage.maxPixelSize
 
     // A search with full page content fetches several pages in turn.

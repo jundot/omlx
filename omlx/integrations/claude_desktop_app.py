@@ -79,7 +79,14 @@ class ClaudeDesktopAppIntegration(Integration):
         return f"{get_cli_command_prefix()} launch claude_desktop"
 
     def configure(self, ctx: IntegrationContext) -> None:
-        configure_omlx_gateway(port=ctx.port, api_key=ctx.api_key or "omlx")
+        # Local servers keep the loopback gateway URL, which is what
+        # ``is_configured`` recognises; only a remote backend needs the full
+        # base URL.
+        configure_omlx_gateway(
+            port=ctx.port,
+            api_key=ctx.api_key or "omlx",
+            base_url=ctx.base_url if ctx.is_remote else None,
+        )
 
     def launch(self, ctx: IntegrationContext) -> None:
         if sys.platform != "darwin":

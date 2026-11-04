@@ -35,6 +35,9 @@ final class MenubarController: NSObject {
     // MARK: - Inputs / state
 
     private let server: ServerProcess?
+    /// Set when this install points at an oMLX server on another Mac;
+    /// `server` is nil in that mode.
+    private let remoteMonitor: RemoteBackendMonitor?
     private let config: AppConfig
     private let updates: UpdateController?
     private let bootstrapError: Error?
@@ -103,6 +106,7 @@ final class MenubarController: NSObject {
 
     init(
         server: ServerProcess?,
+        remoteMonitor: RemoteBackendMonitor? = nil,
         config: AppConfig,
         updates: UpdateController? = nil,
         lastError: Error? = nil,
@@ -113,6 +117,7 @@ final class MenubarController: NSObject {
         requestQuit: @escaping () -> Void = { NSApp.terminate(nil) }
     ) {
         self.server = server
+        self.remoteMonitor = remoteMonitor
         self.config = config
         self.updates = updates
         self.bootstrapError = lastError
@@ -207,6 +212,14 @@ final class MenubarController: NSObject {
                 selector: #selector(serverPortConflict(_:)),
                 name: ServerProcess.portConflictNotification,
                 object: server
+            )
+        }
+        if let remoteMonitor {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(remoteStateChanged(_:)),
+                name: RemoteBackendMonitor.stateDidChangeNotification,
+                object: remoteMonitor
             )
         }
         if let updates {
@@ -392,7 +405,7 @@ final class MenubarController: NSObject {
         if case .failed = state { isFailed = true } else { isFailed = false }
 
         // Status header
-        let (text, color) = headerDisplay(state)
+        let (text, color) = remoteMonitor != nil ? remoteHeaderDisplay() : headerDisplay(state)
         statusHeader.attributedTitle = NSAttributedString(
             string: text,
             attributes: [.foregroundColor: color]
@@ -411,13 +424,21 @@ final class MenubarController: NSObject {
         // a transitional state we shouldn't double-trigger.
         startItem.isEnabled = (server != nil) && !liveLike
         stopItem.isEnabled = liveLike && !isStopping
+        if remoteMonitor != nil {
+            // Nothing to start or stop on this Mac.
+            startItem.isHidden = true
+            stopItem.isHidden = true
+            restartItem.isHidden = true
+        }
 
         modelsParentItem.isEnabled = isRunning
 
         // Native Settings is the recovery surface for stopped/failed servers.
         // Web Dashboard / Chat open browser URLs against the live port, so
         // they stay gated on a healthy running server.
-        let availability = MenubarController.menuAvailability(for: state)
+        let availability = remoteMonitor != nil
+            ? MenubarController.menuAvailability(remoteReachable: isRunning)
+            : MenubarController.menuAvailability(for: state)
         adminPanelItem.isEnabled = availability.settings
         webAdminItem.isEnabled = availability.webDashboard
         chatItem.isEnabled = availability.chat
@@ -455,6 +476,47 @@ final class MenubarController: NSObject {
         default:
             updateItem.isHidden = true
             updateItem.isEnabled = false
+        }
+    }
+
+    private func remoteHeaderDisplay() -> (String, NSColor) {
+        let address = config.endpoint.displayAddress
+        switch remoteMonitor?.state ?? .idle {
+        case .reachable:
+            return (
+                String(localized: "menubar.remote.reachable",
+                       defaultValue: "Remote server: \(address)",
+                       comment: "Menubar status header when the remote oMLX server answers; placeholder is its address"),
+                .systemGreen
+            )
+        case .idle, .checking:
+            return (
+                String(localized: "menubar.remote.checking",
+                       defaultValue: "Checking remote server \(address)…",
+                       comment: "Menubar status header while the remote oMLX server is being probed; placeholder is its address"),
+                .secondaryLabelColor
+            )
+        case .unauthorized:
+            return (
+                String(localized: "menubar.remote.unauthorized",
+                       defaultValue: "Remote server \(address): API key rejected",
+                       comment: "Menubar status header when the remote oMLX server rejects the API key; placeholder is its address"),
+                .systemRed
+            )
+        case .unreachable:
+            return (
+                String(localized: "menubar.remote.unreachable",
+                       defaultValue: "Remote server \(address) unreachable",
+                       comment: "Menubar status header when the remote oMLX server cannot be reached; placeholder is its address"),
+                .systemRed
+            )
+        case .invalidAddress:
+            return (
+                String(localized: "menubar.remote.invalid_address",
+                       defaultValue: "Remote server address is not valid",
+                       comment: "Menubar status header when the remote server address cannot be parsed"),
+                .systemRed
+            )
         }
     }
 
@@ -625,8 +687,7 @@ final class MenubarController: NSObject {
     private func rebuildStatsSubmenu() {
         statsSubmenu.removeAllItems()
 
-        let isRunning: Bool
-        if case .running = server?.state { isRunning = true } else { isRunning = false }
+        let isRunning = serverIsRunning
 
         if !isRunning {
             statsSubmenu.addItem(disabled(String(localized: "menubar.stats.server_off",
@@ -718,6 +779,7 @@ final class MenubarController: NSObject {
     /// config snapshot only when there is no server. Mirrors the
     /// `displayPort`/`displayHost` resolution used for the visible items.
     private func liveBaseURL() -> URL? {
+        if remoteMonitor != nil { return config.endpoint.httpURL(path: "") }
         let host = MenubarController.displayHost(server: server, fallback: config.host)
         let port = MenubarController.displayPort(server: server, fallback: config.port)
         return AppConfig.httpURL(host: host, port: port)
@@ -735,7 +797,12 @@ final class MenubarController: NSObject {
                 object: existing
             )
         }
-        let p = MenubarStatsPoller(baseURL: baseURL, apiKey: config.apiKey)
+        let p = MenubarStatsPoller(
+            baseURL: baseURL,
+            apiKey: remoteMonitor != nil ? config.endpoint.apiKey : config.apiKey,
+            // On a 401 the poller re-reads the key; in remote mode that is the remote key.
+            apiKeyLoader: { AppConfig.load().endpoint.apiKey }
+        )
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(statsDidUpdate(_:)),
@@ -781,6 +848,25 @@ final class MenubarController: NSObject {
     }
 
     // MARK: - Notification handlers
+
+    @objc private func remoteStateChanged(_ note: Notification) {
+        refreshMenuState()
+        rebuildStatsSubmenu()
+        rebuildModelsSubmenu()
+        if serverIsRunning {
+            scheduleModelsRefresh()
+        } else {
+            modelsFetchTask?.cancel()
+            modelsFetchTask = nil
+            models = []
+            unloadingIDs.removeAll()
+            loadingIDs.removeAll()
+            modelsFetched = false
+            metricsStore.markServerStopped()
+        }
+        refreshStatsPollerEndpoint()
+        metricItemsController.sync()
+    }
 
     @objc private func serverStateChanged(_ note: Notification) {
         refreshMenuState()
@@ -1013,17 +1099,32 @@ final class MenubarController: NSObject {
 
     @objc private func openWebAdmin() {
         guard serverIsRunning else { return }
-        let host = MenubarController.displayHost(server: server, fallback: config.host)
-        let port = MenubarController.displayPort(server: server, fallback: config.port)
-        guard let url = MenubarController.webAdminURL(host: host, port: port, apiKey: config.apiKey) else { return }
+        let url: URL
+        if remoteMonitor != nil {
+            let ep = config.endpoint
+            guard let u = MenubarController.webAdminURL(host: ep.host, port: ep.port, apiKey: ep.apiKey, scheme: ep.scheme) else { return }
+            url = u
+        } else {
+            let host = MenubarController.displayHost(server: server, fallback: config.host)
+            let port = MenubarController.displayPort(server: server, fallback: config.port)
+            guard let u = MenubarController.webAdminURL(host: host, port: port, apiKey: config.apiKey) else { return }
+            url = u
+        }
         NSWorkspace.shared.open(url)
     }
 
     @objc private func openChat() {
         guard serverIsRunning else { return }
-        let host = MenubarController.displayHost(server: server, fallback: config.host)
-        let port = MenubarController.displayPort(server: server, fallback: config.port)
-        guard let url = AppConfig.httpURL(host: host, port: port, path: "/admin/chat") else { return }
+        let url: URL
+        if remoteMonitor != nil {
+            guard let u = config.endpoint.httpURL(path: "/admin/chat") else { return }
+            url = u
+        } else {
+            let host = MenubarController.displayHost(server: server, fallback: config.host)
+            let port = MenubarController.displayPort(server: server, fallback: config.port)
+            guard let u = AppConfig.httpURL(host: host, port: port, path: "/admin/chat") else { return }
+            url = u
+        }
         NSWorkspace.shared.open(url)
     }
 
@@ -1332,6 +1433,7 @@ final class MenubarController: NSObject {
     }
 
     private var serverIsRunning: Bool {
+        if let remoteMonitor { return remoteMonitor.state.isReachable }
         if case .running = server?.state { return true }
         return false
     }
@@ -1360,6 +1462,11 @@ extension MenubarController {
         let settings: Bool
         let webDashboard: Bool
         let chat: Bool
+    }
+
+    /// Remote backend: Web Dashboard and Chat follow reachability like `.running`.
+    static func menuAvailability(remoteReachable: Bool) -> MenuAvailability {
+        MenuAvailability(settings: true, webDashboard: remoteReachable, chat: remoteReachable)
     }
 
     static func menuAvailability(for state: ServerProcess.State) -> MenuAvailability {
@@ -1412,11 +1519,13 @@ extension MenubarController {
     /// Internal (not private) so `MenubarControllerPortTests` can exercise
     /// it without a live `NSStatusBar`.
     static func webAdminURL(
-        host: String, port: Int, apiKey: String?, redirect: String = "/admin/dashboard"
+        host: String, port: Int, apiKey: String?, redirect: String = "/admin/dashboard",
+        scheme: String = "http"
     ) -> URL? {
         guard let baseURL = AppConfig.httpURL(
             host: AppConfig.connectableHost(for: host),
-            port: port
+            port: port,
+            scheme: scheme
         ),
               var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         else {
