@@ -64,9 +64,37 @@ struct BenchStartRequest: Encodable, Sendable {
 }
 
 struct BenchStartResponse: Codable, Sendable {
-    let benchId: String
+    /// Nil when the request was queued behind the active run.
+    let benchId: String?
     let status: String
-    let totalTests: Int
+    let totalTests: Int?
+    /// Set when `status == "queued"`; the app polls `/bench/active` until
+    /// this id is the running run, then attaches to its bench id.
+    let queueId: String?
+    let queue: [BenchQueueItem]?
+}
+
+/// One waiting throughput run. The server also returns these on
+/// `/bench/active` and on every queue mutation.
+struct BenchQueueItem: Codable, Equatable, Sendable {
+    let queueId: String?
+    let modelId: String
+    let external: Bool
+}
+
+/// Body of `DELETE /bench/queue/{idx}`; also the queue snapshot every
+/// queue mutation returns.
+struct BenchQueueResponse: Codable, Sendable {
+    let queue: [BenchQueueItem]
+}
+
+/// `/bench/active`: the running throughput run, if any, plus the queue.
+struct BenchActiveResponse: Codable, Sendable {
+    let running: Bool
+    let benchId: String?
+    let modelId: String?
+    let queueId: String?
+    let queue: [BenchQueueItem]
 }
 
 /// Single + batch results share one envelope; `testType` is the

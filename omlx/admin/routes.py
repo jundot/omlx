@@ -9376,6 +9376,7 @@ async def get_active_benchmark(is_admin: bool = Depends(require_admin)):
     return {
         "running": True,
         "queue": get_queue(),
+        "queue_id": run.queue_id,
         "bench_id": run.bench_id,
         "model_id": run.request.model_id,
         "context_profile": run.request.context_profile.value,
@@ -9463,8 +9464,12 @@ async def start_benchmark(
     # The queue task stays alive while a finished run uploads its results,
     # and it starts the next queued request afterwards.
     if queue_busy() or get_active_run() is not None:
-        add_to_queue(bench_request)
-        return {"status": "queued", "queue": get_queue()}
+        queue_id = add_to_queue(bench_request)
+        return {
+            "status": "queued",
+            "queue_id": queue_id,
+            "queue": get_queue(),
+        }
 
     # Cleanup old runs
     cleanup_old_runs()
