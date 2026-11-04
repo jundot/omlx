@@ -202,7 +202,7 @@ private struct CreditsSection: View {
             role: String(localized: "about.credits.mlx_vlm.role",
                          defaultValue: "Vision-language models on MLX",
                          comment: "About screen Credits row: role/description for the mlx-vlm project"),
-            url: URL(string: "https://github.com/Blaizzy/mlx-vlm")!
+            url: URL(string: "https://github.com/Neywa-Labs/mlx-vlm")!
         ),
         Credit(
             name: "mlx-embeddings",
@@ -216,7 +216,7 @@ private struct CreditsSection: View {
             role: String(localized: "about.credits.mlx_audio.role",
                          defaultValue: "Audio (STT / TTS / STS) models on MLX",
                          comment: "About screen Credits row: role/description for the mlx-audio project"),
-            url: URL(string: "https://github.com/Blaizzy/mlx-audio")!
+            url: URL(string: "https://github.com/Neywa-Labs/mlx-audio")!
         ),
     ]
 

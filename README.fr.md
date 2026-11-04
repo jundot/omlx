@@ -274,7 +274,7 @@ Les modèles sont auto-détectés par type. Vous pouvez aussi télécharger des 
 | Type | Modèles |
 |------|--------|
 | LLM | Tout modèle supporté par [mlx-lm](https://github.com/ml-explore/mlx-lm) |
-| VLM | Série Qwen3.5, GLM-4V, Pixtral, et autres modèles [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) |
+| VLM | Série Qwen3.5, GLM-4V, Pixtral, et autres modèles [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) |
 | OCR | DeepSeek-OCR, DOTS-OCR, GLM-OCR |
 | Embedding | BERT, BGE-M3, ModernBERT, EmbeddingGemma 2 |
 | Reranker | ModernBERT, XLM-RoBERTa |
@@ -401,7 +401,7 @@ Les contributions sont les bienvenues ! Voir le [Guide de contribution](docs/CON
 ## Remerciements
 
 - [MLX](https://github.com/ml-explore/mlx) et [mlx-lm](https://github.com/ml-explore/mlx-lm) par Apple
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) — inférence de modèles vision-langage sur Apple Silicon
+- [mlx-vlm](https://github.com/Neywa-Labs/mlx-vlm) — inférence de modèles vision-langage sur Apple Silicon
 - [vllm-mlx](https://github.com/waybarrios/vllm-mlx) — oMLX a démarré à partir de vllm-mlx v0.1.0 et a considérablement évolué avec le service multi-modèles, le cache KV à plusieurs niveaux, le support VLM avec cache paginé complet, un panneau d'admin, et une app dans la barre de menus macOS
 - [venvstacks](https://venvstacks.lmstudio.ai) — couches d'environnements Python portables pour le bundle de l'app macOS
 - [mlx-embeddings](https://github.com/Blaizzy/mlx-embeddings) — support des modèles d'embedding sur Apple Silicon

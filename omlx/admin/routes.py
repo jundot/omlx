@@ -6359,9 +6359,9 @@ def _get_engine_info() -> dict:
     packages = {
         "mlx": "https://github.com/ml-explore/mlx",
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
-        "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
+        "mlx-vlm": "https://github.com/Neywa-Labs/mlx-vlm",
         "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
-        "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
+        "mlx-audio": "https://github.com/Neywa-Labs/mlx-audio",
     }
 
     fallback_commits = _load_fallback_commits(packages)
