@@ -72,7 +72,10 @@ function usageHistory() {
             return `height: ${total > 0 ? Math.max(4, Math.round(ratio * 100)) : 0}%;`;
         },
         shade(tokens) {
-            return tokens ? `rgb(var(--palette-green-600) / ${0.2 + 0.8 * Math.sqrt(tokens / this.peak)})` : 'rgb(var(--palette-mid-gray) / 0.12)';
+            if (!tokens) return 'rgb(var(--palette-mid-gray) / 0.12)';
+            // The stock green-600 step unless a custom theme sets the success ladder.
+            const pct = (0.2 + 0.8 * Math.sqrt(tokens / this.peak)) * 100;
+            return `color-mix(in srgb, var(--success-bg-600, rgb(var(--palette-green-600))) ${pct}%, transparent)`;
         },
         number(value) {
             const locale = usageLocale();

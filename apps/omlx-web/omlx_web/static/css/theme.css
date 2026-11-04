@@ -279,6 +279,27 @@
     --timeline-accent: rgb(var(--palette-blue-500));
     --focus-ring-color: rgb(var(--palette-neutral-900));
     --switch-on: rgb(var(--palette-black));
+    /* Status roles: badges and notices pair the soft fill, the line and the
+       text; the solid colour marks dots and meters. `--<role>-text` is text on
+       the role's soft fill; `--text-danger` above is destructive text on the
+       page surfaces, so the two differ on purpose. */
+    --success: rgb(var(--palette-green-500));
+    --success-soft: rgb(var(--palette-green-50));
+    --success-line: rgb(var(--palette-green-200));
+    --success-text: rgb(var(--palette-green-700));
+    --warning: rgb(var(--palette-amber-500));
+    --warning-soft: rgb(var(--palette-amber-50));
+    --warning-line: rgb(var(--palette-amber-200));
+    --warning-text: rgb(var(--palette-amber-700));
+    --danger: rgb(var(--palette-red-500));
+    --danger-soft: rgb(var(--palette-red-50));
+    --danger-line: rgb(var(--palette-red-200));
+    --danger-text: rgb(var(--palette-red-700));
+    --info: rgb(var(--palette-blue-500));
+    --info-soft: rgb(var(--palette-blue-50));
+    --info-line: rgb(var(--palette-blue-200));
+    --info-text: rgb(var(--palette-blue-700));
+    --text-success: var(--success-text);
     color-scheme: light;
 }
 
@@ -302,6 +323,22 @@
     --timeline-accent: rgb(var(--palette-blue-400));
     --focus-ring-color: rgb(var(--palette-night-50));
     --switch-on: rgb(var(--palette-zinc-400));
+    --success: rgb(var(--palette-green-500));
+    --success-soft: rgb(var(--palette-green-500) / 0.15);
+    --success-line: rgb(var(--palette-green-500) / 0.3);
+    --success-text: rgb(var(--palette-green-400));
+    --warning: rgb(var(--palette-amber-500));
+    --warning-soft: rgb(var(--palette-amber-500) / 0.15);
+    --warning-line: rgb(var(--palette-amber-500) / 0.3);
+    --warning-text: rgb(var(--palette-amber-400));
+    --danger: rgb(var(--palette-red-500));
+    --danger-soft: rgb(var(--palette-red-500) / 0.15);
+    --danger-line: rgb(var(--palette-red-500) / 0.3);
+    --danger-text: rgb(var(--palette-red-300));
+    --info: rgb(var(--palette-blue-500));
+    --info-soft: rgb(var(--palette-blue-500) / 0.15);
+    --info-line: rgb(var(--palette-blue-500) / 0.3);
+    --info-text: rgb(var(--palette-blue-300));
     color-scheme: dark;
 }
 
