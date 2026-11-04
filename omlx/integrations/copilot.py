@@ -21,12 +21,14 @@ PROVIDER_NAME = "omlx"
 
 
 def copilot_providers_config_path(env: Mapping[str, str] | None = None) -> Path:
-    """Resolve the CLI providers file (``COPILOT_PROVIDERS_CONFIG`` or default)."""
+    """Resolve the CLI providers file the way Copilot does."""
     resolved: Mapping[str, str] = os.environ if env is None else env
     override = resolved.get("COPILOT_PROVIDERS_CONFIG")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".copilot" / "providers.json"
+    home = resolved.get("COPILOT_HOME")
+    config_dir = Path(home).expanduser() if home else Path.home() / ".copilot"
+    return config_dir / "providers.json"
 
 
 def _clobber_omlx_entries(entries: list, key: str, replacement: list) -> list:
