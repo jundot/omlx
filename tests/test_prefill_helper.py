@@ -876,6 +876,28 @@ def test_a_helper_started_during_the_load_is_taken_over_not_started_twice(
     assert stopped == [True] and manager_module.file_prep("/models/z") is None
 
 
+def test_a_check_reports_the_files_and_copies_nothing():
+    fake = _FakeLauncher(None, missing=["model-1.safetensors"])
+    adapter = _PlanAdapter()
+    manager_module.prepare(
+        "/models/c", adapter, "node-1", None, check_only=True, launcher=fake
+    )
+    prep = manager_module.file_prep("/models/c")
+    status = _wait_state(prep, "files_missing")
+    assert status["bytes"] == 1 << 20 and fake.copied == []
+    # Saving the choice again copies instead of checking.
+    manager_module.prepare("/models/c", adapter, "node-1", None, launcher=fake)
+    _wait_state(manager_module.file_prep("/models/c"), "files_ready")
+    assert fake.copied == ["model-1.safetensors"]
+    # A later check keeps that result rather than replacing it.
+    copy = manager_module.file_prep("/models/c")
+    manager_module.prepare(
+        "/models/c", adapter, "node-1", None, check_only=True, launcher=fake
+    )
+    assert manager_module.file_prep("/models/c") is copy
+    manager_module.prepare("/models/c", None, None, None)
+
+
 def test_cancel_before_the_load_stops_a_waiting_copy_without_deleting():
     old = {"name": "Old", "bytes": 20 << 30, "used": 0.0}
     fake = _FakeLauncher(
@@ -988,7 +1010,13 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
         "loaded": SimpleNamespace(engine=SimpleNamespace(prefill_helper=manager)),
         "idle": SimpleNamespace(engine=None, model_path="/models/idle"),
     }
-    helper_routes.set_engine_pool_getter(lambda: SimpleNamespace(get_entry=entries.get))
+    saved = SimpleNamespace(prefill_helper_node_id=None)
+    helper_routes.set_engine_pool_getter(
+        lambda: SimpleNamespace(
+            get_entry=entries.get,
+            _settings_manager=SimpleNamespace(get_settings=lambda model_id: saved),
+        )
+    )
     app = FastAPI()
     app.include_router(helper_routes.router)
     client = TestClient(app)
@@ -997,6 +1025,8 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     assert client.get(f"{base}/models/loaded").json()["state"] == "needs_files"
     assert client.post(f"{base}/models/loaded/copy").status_code == 200
     assert client.post(f"{base}/models/idle/copy").status_code == 409
+    # Without a saved helper there is nothing to check.
+    assert client.post(f"{base}/models/idle/check").json() == {"state": "unloaded"}
     assert client.post(f"{base}/models/loaded/reboot").status_code == 404
     assert calls == ["copy"]
 

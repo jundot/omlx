@@ -1522,8 +1522,16 @@ private struct PrefillAcceleratorGroup: View {
         }
         .task(id: vm.modelID) {
             await vm.loadPrefillHelperCandidates(client: client)
+            var checked = false
             while !Task.isCancelled {
                 await vm.refreshPrefillHelperStatus(client: client)
+                // A saved helper of an unloaded model: see whether its files
+                // are already there (nothing is copied).
+                if !checked, vm.prefillHelperStatus?.state == "unloaded",
+                   !vm.prefillHelperNodeID.isEmpty {
+                    checked = true
+                    await vm.prefillHelperAction("check", client: client)
+                }
                 try? await Task.sleep(for: .seconds(2))
             }
         }
@@ -1647,6 +1655,11 @@ private struct PrefillAcceleratorGroup: View {
                          defaultValue: "about \((seconds + 59) / 60) min left",
                          comment: "Prefill Accelerator copy time left, in minutes")
             return text + " · " + left
+        case "files_missing":
+            let held = status.held ?? 0, need = size(status.bytes)
+            return String(localized: "settings.acceleration.prefill_helper.state.files_missing",
+                          defaultValue: "\(name) needs \(need) of model files for \(held) layers. They are copied when this model loads, or copy them now.",
+                          comment: "Prefill Accelerator status when the helper Mac lacks model files before the model is loaded")
         case "files_ready":
             let held = status.held ?? 0
             return String(localized: "settings.acceleration.prefill_helper.state.files_ready",
@@ -1701,7 +1714,7 @@ private struct PrefillAcceleratorGroup: View {
             .buttonStyle(.omlx(.primary, size: .small))
             .disabled(vm.prefillHelperBusy)
         }
-        if state == "unloaded" {
+        if state == "files_missing" {
             Button(String(localized: "settings.acceleration.prefill_helper.copy_now",
                           defaultValue: "Copy Files Now",
                           comment: "Button that copies model files to the helper Mac before the model is loaded")) {

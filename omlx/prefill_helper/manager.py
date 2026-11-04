@@ -228,7 +228,8 @@ class FilePrep:
     """Copies a model's helper files before the model is loaded.
 
     With ``launch`` ({model_type, warm_tokens, a8_min_tokens}) it then starts
-    the helper, for the model being loaded to take over.
+    the helper, for the model being loaded to take over. ``check_only`` only
+    reports whether the files are there.
     """
 
     def __init__(
@@ -240,8 +241,10 @@ class FilePrep:
         launcher: Any = default_launcher,
         after: FilePrep | None = None,
         launch: dict[str, Any] | None = None,
+        check_only: bool = False,
     ):
         self.model_path, self.adapter, self.launcher = model_path, adapter, launcher
+        self.check_only = check_only
         self.node_id, self.layers, self._after = node_id, layers, after
         self._launch, self._sealed = launch, False
         # (target, remote_info, held layers, HelperProcess) once started.
@@ -307,6 +310,16 @@ class FilePrep:
             if self._cancel.is_set():
                 raise _CancelledError
 
+    def _check(self, target: Any, held: int) -> None:
+        files = self.launcher.required_files(self.model_path, held, self.adapter)
+        where = self.launcher.locate_files(target, Path(self.model_path).name, files)
+        missing = [] if where.get("found") else where["missing"]
+        if missing:
+            size = sum(files[name] for name in missing)
+            self._set("files_missing", held=held, bytes=size, free=where["free"])
+        else:
+            self._set("files_ready", held=held)
+
     def _run(self) -> None:
         if self._after is not None:
             # Its last files may still be in flight to the same folder.
@@ -322,6 +335,9 @@ class FilePrep:
                 target.name,
                 self.layers,
             )
+            if self.check_only:
+                self._check(target, held)
+                return
             model_dir = _prepare_files(
                 self.launcher,
                 target,
@@ -372,6 +388,7 @@ def prepare(
     *,
     restart: bool = False,
     launch: dict[str, Any] | None = None,
+    check_only: bool = False,
     launcher: Any = default_launcher,
 ) -> None:
     """Start, keep or cancel the file copy (and with ``launch`` the helper)."""
@@ -383,6 +400,8 @@ def prepare(
             and not restart
             and (prep.node_id, prep.layers) == (node_id, layers)
             and prep.status()["state"] not in ("error", "stopped")
+            # A check never replaces a copy; a copy replaces a check.
+            and (check_only or not prep.check_only)
             and (launch is None or prep.launch_with(launch))
         ):
             # Saving the same choice again keeps the copy going.
@@ -392,7 +411,7 @@ def prepare(
             prep.cancel()
         if node_id is not None:
             _PREPS[key] = FilePrep(
-                key, adapter, node_id, layers, launcher, prep, launch
+                key, adapter, node_id, layers, launcher, prep, launch, check_only
             )
 
 

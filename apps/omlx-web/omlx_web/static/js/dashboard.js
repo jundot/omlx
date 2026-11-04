@@ -3100,6 +3100,7 @@
                         prefill_helper_layers: model.settings?.prefill_helper_layers ?? null,
                     },
                     applied: false,
+                    checked: false,
                 };
                 if (!model.prefill_helper_supported
                     || !this.globalSettings.server.distributed_inference_active) return;
@@ -3135,6 +3136,14 @@
                     );
                     if (resp.ok && this.prefillHelper.modelId === modelId) {
                         this.prefillHelper.status = await resp.json();
+                        // A saved helper of an unloaded model: see whether its
+                        // files are already there (nothing is copied).
+                        if (this.prefillHelper.status.state === 'unloaded'
+                            && this.selectedModel?.settings?.prefill_helper_node_id
+                            && !this.prefillHelper.checked) {
+                            this.prefillHelper.checked = true;
+                            this.prefillHelperAction('check');
+                        }
                     }
                 } catch (_) { /* network error */ }
                 this._prefillHelperPollTimer = setTimeout(() => this.pollPrefillHelper(), 2000);
@@ -3279,7 +3288,11 @@
                         return text + ' · ' + left;
                     }
                     case 'files_ready':
-                        return t('files_ready').replace('{name}', name).replace('{n}', s.held ?? '');
+                        return t('files_ready').replace('{name}', name).replace('{n}', s.held ?? '')
+                            + (this.prefillHelper.applied ? ' ' + t('save_keeps') : '');
+                    case 'files_missing':
+                        return t('files_missing').replace('{name}', name).replace('{n}', s.held ?? '')
+                            .replace('{size}', size(s.bytes));
                     case 'ready':
                     case 'working': {
                         let text = t(s.state).replace('{name}', name).replace('{n}', s.held ?? '');

@@ -22174,6 +22174,18 @@
         }
       }
     },
+    "settings.acceleration.prefill_helper.state.files_missing" : {
+      "comment" : "Prefill Accelerator status when the helper Mac lacks model files before the model is loaded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ needs %@ of model files for %lld layers. They are copied when this model loads, or copy them now."
+          }
+        }
+      }
+    },
     "settings.acceleration.prefill_helper.state.files_ready" : {
       "comment" : "Prefill Accelerator status after copying files before the model is loaded",
       "extractionState" : "manual",

@@ -54,6 +54,11 @@ def _entry(model_id: str) -> Any:
     return entry
 
 
+def _saved_settings(model_id: str) -> Any:
+    settings = getattr(_get_engine_pool(), "_settings_manager", None)
+    return settings.get_settings(model_id) if settings is not None else None
+
+
 def _adapter(entry: Any) -> Any:
     model_type = getattr(entry, "config_model_type", "") or ""
     return adapter_for(model_type.replace("-", "_").lower())
@@ -232,16 +237,30 @@ async def model_status(model_id: str) -> dict:
 
 @router.post("/models/{model_id}/{action}")
 async def model_action(model_id: str, action: str) -> dict:
-    if action not in ("copy", "retry", "stop"):
+    if action not in ("check", "copy", "retry", "stop"):
         raise HTTPException(status_code=404, detail=f"Unknown action: {action}")
     entry = _entry(model_id)
     manager = getattr(entry.engine, "prefill_helper", None)
     if manager is not None:
-        {"copy": manager.copy_files, "retry": manager.retry, "stop": manager.stop}[
-            action
-        ]()
+        if action != "check":
+            {"copy": manager.copy_files, "retry": manager.retry, "stop": manager.stop}[
+                action
+            ]()
         return manager.status()
     prep = file_prep(entry.model_path)
+    if action == "check":
+        # Whether a saved helper already has the files; nothing is copied.
+        settings = _saved_settings(model_id)
+        node_id = getattr(settings, "prefill_helper_node_id", None)
+        if prep is None and node_id and _adapter(entry) is not None:
+            prepare(
+                entry.model_path,
+                _adapter(entry),
+                node_id,
+                getattr(settings, "prefill_helper_layers", None),
+                check_only=True,
+            )
+        return helper_status(entry) or {"state": "unloaded"}
     if prep is None:
         raise HTTPException(
             status_code=409, detail="Load the model to use the Prefill Accelerator."
