@@ -31,6 +31,7 @@ from ..cluster.registry import default_devices_path
 from . import launcher as default_launcher
 from .adapter import StageAdapter
 from .client import HelperClient
+from .lending import forget_host
 from .session import PrefillHelperSession
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,7 @@ def _reach(launcher: Any, node_id: str, report: Callable[..., None]) -> tuple:
         target = launcher.resolve_target(node_id)
     except launcher.LaunchError as error:
         raise _PermanentError(str(error)) from error
+    forget_host(node_id)
     report("connecting", name=target.name, link=target.link)
     info = launcher.remote_info(target, host=this_host())
     if info.get("version") != __version__:

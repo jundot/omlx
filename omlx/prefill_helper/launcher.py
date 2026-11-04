@@ -90,7 +90,9 @@ def _ssh(target: str, command: str, *, runner: Runner = subprocess.run, timeout=
 
 def resolve_target(node_id: str, *, runner: Runner = subprocess.run) -> HelperTarget:
     """The paired Mac's SSH target and the link address to use."""
-    device = get_device_registry().get(node_id)
+    registry = get_device_registry()
+    # The registry also holds Macs that are only discovered.
+    device = registry.get(node_id) if registry.is_paired(node_id) else None
     if device is None:
         raise LaunchError("This Mac is not paired. Pair it in the Cluster tab.")
     user = device.get("ssh_user") or getpass.getuser()

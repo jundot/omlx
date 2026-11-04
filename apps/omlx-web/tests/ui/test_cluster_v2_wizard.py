@@ -683,6 +683,8 @@ def test_prefill_accelerator_reopens_for_a_mac_in_use_and_ends_at_its_checks():
 component.devicesPayload = { paired: [{ node_id: 'm5', friendly_name: 'M5max' }] };
 component.devicesLoaded = true;
 component.deploymentsLoaded = true;
+// An old record says this Mac helps M5max; its model using M5max wins.
+component.helperRole = { active: false, helps: { node_id: 'm5', name: 'M5max' } };
 let check;
 component.apiFetch = (url) => url === '/admin/api/models'
   ? Promise.resolve({ models: [{ settings: { prefill_helper_node_id: 'm5' } }] })

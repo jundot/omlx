@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import numpy as np
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from test_deepseek_v41 import _ENGRAM, load_reference_weights, tiny, tiny_ced
 from test_mlx_vlm_minimax_m3_compat import _tiny_text_config
@@ -927,9 +927,8 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     monkeypatch.setattr(lending, "_is_helper", lambda pid: pid == os.getpid())
     monkeypatch.setattr(lending, "host_marker_path", lambda: tmp_path / "host.json")
     paired = {}
-    monkeypatch.setattr(
-        helper_routes, "get_device_registry", lambda: SimpleNamespace(get=paired.get)
-    )
+    registry = SimpleNamespace(get=paired.get, is_paired=paired.__contains__)
+    monkeypatch.setattr(helper_routes, "get_device_registry", lambda: registry)
     assert client.get(f"{base}/lending").json() == {"active": False, "helps": None}
     lending.record_host("studio-node", "Studio")
     # Only a host still paired here uses this Mac.
@@ -1004,9 +1003,8 @@ def test_resolve_target_uses_the_thunderbolt_link_local_without_ipv4(monkeypatch
         "ssh_user": "me",
         "last_addrs": ["192.168.1.31"],
     }
-    monkeypatch.setattr(
-        launcher, "get_device_registry", lambda: SimpleNamespace(get=lambda n: device)
-    )
+    registry = SimpleNamespace(get=lambda n: device, is_paired=lambda n: True)
+    monkeypatch.setattr(launcher, "get_device_registry", lambda: registry)
     monkeypatch.setattr(
         launcher,
         "probe_host_interfaces",
@@ -1044,12 +1042,15 @@ def test_resolve_target_uses_the_thunderbolt_link_local_without_ipv4(monkeypatch
     assert target.speed_mbps == 2500
 
 
-def test_accelerator_check_reports_each_row(monkeypatch):
-    monkeypatch.setattr(
-        helper_routes,
-        "get_device_registry",
-        lambda: SimpleNamespace(get=lambda node: {"friendly_name": "M5max"}),
-    )
+def test_accelerator_check_reports_each_row(tmp_path, monkeypatch):
+    paired = {"n": {"friendly_name": "M5max"}}
+    registry = SimpleNamespace(get=paired.get, is_paired=paired.__contains__)
+    monkeypatch.setattr(helper_routes, "get_device_registry", lambda: registry)
+    monkeypatch.setattr(lending, "host_marker_path", lambda: tmp_path / "host.json")
+    # Only discovered, not paired: no checks.
+    with pytest.raises(HTTPException):
+        helper_routes._check("other")
+    lending.record_host("n", "M5max")
     target = HelperTarget(
         "n", "M5max", "u@10.0.0.2", "10.0.0.2", "ethernet", warnings=("Use TB.",)
     )
@@ -1070,8 +1071,9 @@ def test_accelerator_check_reports_each_row(monkeypatch):
     monkeypatch.setattr(helper_routes.launcher, "remote_info", remote_info)
     monkeypatch.setattr(helper_routes, "this_host", lambda: me)
     rows = {row["key"]: row for row in helper_routes._check("n")["rows"]}
-    # The checks note on the helper Mac which Mac uses it.
-    assert hosts == [me]
+    # The checks note on the helper Mac which Mac uses it, and this Mac stops
+    # counting itself as that Mac's helper.
+    assert hosts == [me] and lending.recorded_host() is None
     assert [rows[k]["status"] for k in ("ssh", "link", "version", "power")] == [
         "pass",
         "warn",

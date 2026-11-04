@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from contextlib import suppress
 from pathlib import Path
 
 
@@ -26,6 +27,14 @@ def record_host(node_id: str, name: str) -> None:
     path = host_marker_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"node_id": node_id, "name": name}))
+
+
+def forget_host(node_id: str) -> None:
+    """Drop the record once this Mac uses *node_id* as its own helper."""
+    host = recorded_host()
+    if host is not None and host["node_id"] == node_id:
+        with suppress(OSError):
+            host_marker_path().unlink()
 
 
 def recorded_host() -> dict | None:

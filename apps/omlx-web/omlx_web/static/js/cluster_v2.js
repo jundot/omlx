@@ -1813,7 +1813,10 @@ function clusterV2Wizard() {
                 return;
             }
             this.acceleratorRestored = true;
-            if (this.wizardState() !== 'device_card') return;
+            // A model here using that Mac makes this Mac its host, even when an
+            // old record says this Mac helps it.
+            const open = () => ['device_card', 'helper'].includes(this.wizardState());
+            if (!open()) return;
             let payload;
             try {
                 payload = await this.apiFetch('/admin/api/models');
@@ -1824,11 +1827,11 @@ function clusterV2Wizard() {
                 (payload?.models || []).map((model) => model.settings?.prefill_helper_node_id),
             );
             const device = this.pairedDevices().find((item) => used.has(item.node_id));
-            if (device && this.wizardState() === 'device_card') this.startAccelerator(device);
+            if (device && open()) this.startAccelerator(device, { asHost: true });
         },
 
-        async startAccelerator(device) {
-            if (device && this.helperRole?.helps?.node_id === device.node_id) {
+        async startAccelerator(device, { asHost = false } = {}) {
+            if (!asHost && device && this.helperRole?.helps?.node_id === device.node_id) {
                 // This Mac is that Mac's Prefill Accelerator, not its host.
                 this.stage = null;
                 return;

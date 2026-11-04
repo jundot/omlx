@@ -23,7 +23,7 @@ from .. import __version__
 from ..cluster.registry import get_device_registry
 from . import launcher
 from .adapters import adapter_for
-from .lending import active_lending, recorded_host
+from .lending import active_lending, forget_host, recorded_host
 from .manager import (
     computer_name,
     file_prep,
@@ -145,9 +145,12 @@ async def candidates(model_id: str) -> dict:
 
 def _check(node_id: str) -> dict:
     """The accelerator checks for one paired Mac, as rows of key, status, detail."""
-    device = get_device_registry().get(node_id)
+    registry = get_device_registry()
+    device = registry.get(node_id) if registry.is_paired(node_id) else None
     if device is None:
         raise HTTPException(status_code=404, detail="This Mac is not paired.")
+    # This Mac is that Mac's host now, not its helper.
+    forget_host(node_id)
     rows = []
     try:
         target = launcher.resolve_target(node_id)
@@ -197,7 +200,7 @@ async def check(node_id: str) -> dict:
 
 
 def _copies(node_id: str, delete: str | None = None) -> dict:
-    if get_device_registry().get(node_id) is None:
+    if not get_device_registry().is_paired(node_id):
         raise HTTPException(status_code=404, detail="This Mac is not paired.")
     try:
         target = launcher.resolve_target(node_id)
@@ -257,7 +260,12 @@ async def lending() -> dict:
     """On the helper Mac: the running helper and the Mac that set this one up."""
     marker = active_lending()
     host = recorded_host()
-    device = get_device_registry().get(host["node_id"]) if host else None
+    registry = get_device_registry()
+    device = (
+        registry.get(host["node_id"])
+        if host and registry.is_paired(host["node_id"])
+        else None
+    )
     # A host that is no longer paired here no longer uses this Mac.
     helps = (
         {
