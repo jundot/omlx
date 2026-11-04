@@ -518,9 +518,10 @@ def test_job_uses_fewer_layers_than_the_helper_holds():
 # ---------------------------------------------------------------------------
 
 
-def _probe(home, files):
-    target = HelperTarget("node", "M5max", "me@10.0.0.2", "10.0.0.2", "thunderbolt")
+_REMOTE = HelperTarget("node", "M5max", "me@10.0.0.2", "10.0.0.2", "thunderbolt")
 
+
+def _remote(home):
     def runner(argv, **kwargs):
         # Run the remote command here, with HOME pointing at the fake Mac.
         command = argv[-1]
@@ -530,7 +531,11 @@ def _probe(home, files):
             **kwargs,
         )
 
-    return launcher.locate_files(target, "Model-oQ3e", files, runner=runner)
+    return runner
+
+
+def _probe(home, files):
+    return launcher.locate_files(_REMOTE, "Model-oQ3e", files, runner=_remote(home))
 
 
 def test_probe_finds_an_existing_copy_or_lists_missing_files(tmp_path):
@@ -553,6 +558,41 @@ def test_probe_finds_an_existing_copy_or_lists_missing_files(tmp_path):
     assert result["copy"] == str(tmp_path / ".omlx/prefill-helper/models/Model-oQ3e")
     assert sorted(result["missing"]) == sorted(files)
     assert result["free"] > 0
+
+
+def test_other_copies_are_listed_and_deleted_but_never_the_running_one(tmp_path):
+    copies = tmp_path / ".omlx" / "prefill-helper" / "models"
+    for name in ("Model-oQ3e", "Old", "Running"):
+        (copies / name).mkdir(parents=True)
+        (copies / name / "config.json").write_bytes(b"1234")
+    own = tmp_path / "Models" / "Own"
+    own.mkdir(parents=True)
+    (copies / "Link").symlink_to(own)
+    (tmp_path / ".omlx" / "prefill-helper" / "active.json").write_text(
+        json.dumps({"model": str(copies / "Running")})
+    )
+    result = _probe(tmp_path, {"config.json": 3})
+    assert [(c["name"], c["bytes"]) for c in result["copies"]] == [("Old", 4)]
+    assert (copies / "Model-oQ3e" / ".last_used").exists()
+
+    names = ["Running", "Link", "../Models", "Old"]
+    assert launcher.delete_copies(_REMOTE, names, runner=_remote(tmp_path)) > 0
+    assert sorted(p.name for p in copies.iterdir()) == ["Link", "Model-oQ3e", "Running"]
+    assert own.is_dir()
+
+
+def test_copy_plan_keeps_50_gib_free_or_asks():
+    gib = 1 << 30
+    old = {"name": "Old", "bytes": 20 * gib, "used": 1.0}
+    older = {"name": "Older", "bytes": 20 * gib, "used": 0.0}
+    plan = manager_module.copy_plan
+    assert plan(100 * gib, 200 * gib, [old])["kind"] == "copy"
+    # The least recently used copies go first, only as many as needed.
+    room = plan(100 * gib, 120 * gib, [old, older, {**old, "name": "New", "used": 9}])
+    assert room["kind"] == "make_room" and room["left"] == 60 * gib
+    assert [c["name"] for c in room["delete"]] == ["Older", "Old"]
+    assert plan(100 * gib, 120 * gib, [])["kind"] == "low_space"
+    assert plan(100 * gib, 90 * gib, [old])["kind"] == "no_space"
 
 
 def test_helper_target_rejects_a_shell_unsafe_interpreter():
@@ -607,11 +647,23 @@ class _PlanAdapter(type(DSV41)):
 class _FakeLauncher:
     LaunchError = launcher.LaunchError
 
-    def __init__(self, lm, k=4, *, version=None, budget=60 << 30, missing=()):
+    def __init__(
+        self,
+        lm,
+        k=4,
+        *,
+        version=None,
+        budget=60 << 30,
+        missing=(),
+        free=1 << 40,
+        copies=(),
+        hold=None,
+    ):
         self.lm, self.k = lm, k
         self.version = version or launcher_version()
         self.budget, self.missing = budget, list(missing)
-        self.copied, self.servers, self.paired = [], [], True
+        self.free, self.copies, self.hold = free, list(copies), hold
+        self.copied, self.deleted, self.servers, self.paired = [], [], [], True
 
     def resolve_target(self, node_id):
         if not self.paired:
@@ -620,7 +672,7 @@ class _FakeLauncher:
             node_id, "M5max", "me@127.0.0.1", "127.0.0.1", "thunderbolt"
         )
 
-    def remote_info(self, target):
+    def remote_info(self, target, host=None):
         return {
             "version": self.version,
             "budget": self.budget,
@@ -635,11 +687,17 @@ class _FakeLauncher:
             "found": None,
             "copy": "/helper/copy",
             "missing": self.missing,
-            "free": 1 << 40,
+            "copies": self.copies,
+            "free": self.free,
         }
 
-    def copy_files(self, target, model_path, dest, names, progress):
+    def delete_copies(self, target, names):
+        self.deleted.append(names)
+
+    def copy_files(self, target, model_path, dest, names, progress, cancelled=None):
         for name in names:
+            if self.hold is not None:
+                self.hold.wait(10)
             self.copied.append(name)
             progress(name)
         self.missing = []
@@ -694,23 +752,64 @@ def _wait_state(manager, *states, reason="", timeout=30):
     raise AssertionError(f"state stayed {manager.status()}")
 
 
-def test_manager_waits_for_consent_before_copying_then_attaches(tmp_path):
+def test_manager_asks_before_deleting_other_copies_then_attaches(tmp_path):
     attached = []
-    fake = _FakeLauncher(None, missing=["model-1.safetensors"])
+    old = {"name": "Old", "bytes": 20 << 30, "used": 0.0}
+    fake = _FakeLauncher(
+        None, missing=["model-1.safetensors"], free=40 << 30, copies=[old]
+    )
     manager = _manager(fake, attached, tmp_path / "speeds.json")
     manager.configure("node-1", None)
     status = _wait_state(manager, "needs_files")
-    assert status["bytes"] == 1 << 20 and fake.copied == []
+    assert status["prompt"] == "make_room"
+    assert status["delete"] == [{"name": "Old", "bytes": 20 << 30}]
+    assert fake.copied == [] and fake.deleted == []
     manager.copy_files()
     status = _wait_state(manager, "ready")
     # 60 GiB budget, 1 GiB shared and 8 GiB reserve hold five 10 GiB layers,
     # but DeepSeek V4.1 keeps the CED midpoint (layer 2 of 5) here.
-    assert fake.copied == ["model-1.safetensors"] and status["held"] == 2
+    assert fake.deleted == [["Old"]] and fake.copied == ["model-1.safetensors"]
+    assert status["held"] == 2
     assert isinstance(attached[-1], PrefillHelperSession)
     manager.configure(None, None)
     _wait_state(manager, "off")
     assert attached[-1] is None
     manager.close()
+
+
+def test_files_copied_before_the_load_are_taken_over_not_copied_twice(tmp_path):
+    release = threading.Event()
+    fake = _FakeLauncher(None, missing=["model-1.safetensors"], hold=release)
+    manager_module.prepare("/models/x", _PlanAdapter(), "node-1", None, launcher=fake)
+    prep = manager_module.file_prep("/models/x")
+    _wait_state(prep, "copying")
+    # Saving the same choice again keeps that copy going.
+    manager_module.prepare("/models/x", _PlanAdapter(), "node-1", None, launcher=fake)
+    assert manager_module.file_prep("/models/x") is prep
+
+    attached = []
+    manager = _manager(fake, attached, tmp_path / "speeds.json")
+    manager.configure("node-1", None)
+    _wait_state(manager, "copying")
+    release.set()
+    _wait_state(manager, "ready")
+    assert fake.copied == ["model-1.safetensors"]
+    assert manager_module.file_prep("/models/x") is None
+    manager.close()
+
+
+def test_cancel_before_the_load_stops_a_waiting_copy_without_deleting():
+    old = {"name": "Old", "bytes": 20 << 30, "used": 0.0}
+    fake = _FakeLauncher(
+        None, missing=["model-1.safetensors"], free=40 << 30, copies=[old]
+    )
+    manager_module.prepare("/models/y", _PlanAdapter(), "node-1", None, launcher=fake)
+    prep = manager_module.file_prep("/models/y")
+    assert _wait_state(prep, "needs_files")["prompt"] == "make_room"
+    manager_module.prepare("/models/y", _PlanAdapter(), None, None, launcher=fake)
+    _wait_state(prep, "stopped")
+    assert fake.deleted == [] and fake.copied == []
+    assert manager_module.file_prep("/models/y") is None
 
 
 def test_manager_blocks_what_a_retry_cannot_fix(tmp_path):
@@ -809,7 +908,7 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     )
     entries = {
         "loaded": SimpleNamespace(engine=SimpleNamespace(prefill_helper=manager)),
-        "idle": SimpleNamespace(engine=None),
+        "idle": SimpleNamespace(engine=None, model_path="/models/idle"),
     }
     helper_routes.set_engine_pool_getter(lambda: SimpleNamespace(get_entry=entries.get))
     app = FastAPI()
@@ -826,7 +925,18 @@ def test_routes_report_status_forward_actions_and_stop_lending(tmp_path, monkeyp
     marker = tmp_path / "active.json"
     monkeypatch.setattr(lending, "active_marker_path", lambda: marker)
     monkeypatch.setattr(lending, "_is_helper", lambda pid: pid == os.getpid())
-    assert client.get(f"{base}/lending").json() == {"active": False}
+    monkeypatch.setattr(lending, "host_marker_path", lambda: tmp_path / "host.json")
+    paired = {}
+    monkeypatch.setattr(
+        helper_routes, "get_device_registry", lambda: SimpleNamespace(get=paired.get)
+    )
+    assert client.get(f"{base}/lending").json() == {"active": False, "helps": None}
+    lending.record_host("studio-node", "Studio")
+    # Only a host still paired here uses this Mac.
+    assert client.get(f"{base}/lending").json()["helps"] is None
+    paired["studio-node"] = {"friendly_name": "Mac Studio"}
+    helps = client.get(f"{base}/lending").json()["helps"]
+    assert helps == {"node_id": "studio-node", "name": "Mac Studio"}
     assert lending.lending_note() == ""
     marker.write_text(
         json.dumps({"pid": os.getpid(), "host": "Mac Studio", "active_gib": 82.4})
@@ -851,10 +961,10 @@ def test_a_mac_helping_another_model_counts_that_memory_as_free(monkeypatch):
     monkeypatch.setattr(helper_routes.launcher, "remote_info", lambda t: info)
     monkeypatch.setattr(helper_routes, "computer_name", lambda: "Studio")
     device = {"node_id": "n", "friendly_name": "M5max"}
-    row = helper_routes._candidate(device, "/models/Mine", _PlanAdapter(), None)
+    row = helper_routes._candidate(device, "/models/Mine", _PlanAdapter())
     assert row["lending"] == {"host": "Studio", "model": "Other"}
     # Helping this same model is not a takeover.
-    row = helper_routes._candidate(device, "/models/Other", _PlanAdapter(), None)
+    row = helper_routes._candidate(device, "/models/Other", _PlanAdapter())
     assert row["lending"] is None
 
 
@@ -944,18 +1054,24 @@ def test_accelerator_check_reports_each_row(monkeypatch):
         "n", "M5max", "u@10.0.0.2", "10.0.0.2", "ethernet", warnings=("Use TB.",)
     )
     monkeypatch.setattr(helper_routes.launcher, "resolve_target", lambda node: target)
-    monkeypatch.setattr(
-        helper_routes.launcher,
-        "remote_info",
-        lambda t: {
+    hosts = []
+
+    def remote_info(target, host=None):
+        hosts.append(host)
+        return {
             "version": "0.0.1",
             "budget": 100 << 30,
             "memory": 128 << 30,
             "on_battery": True,
             "disk_free": 1 << 40,
-        },
-    )
+        }
+
+    me = {"node_id": "studio", "name": "Studio"}
+    monkeypatch.setattr(helper_routes.launcher, "remote_info", remote_info)
+    monkeypatch.setattr(helper_routes, "this_host", lambda: me)
     rows = {row["key"]: row for row in helper_routes._check("n")["rows"]}
+    # The checks note on the helper Mac which Mac uses it.
+    assert hosts == [me]
     assert [rows[k]["status"] for k in ("ssh", "link", "version", "power")] == [
         "pass",
         "warn",

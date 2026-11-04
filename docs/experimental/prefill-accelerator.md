@@ -59,7 +59,7 @@ The Cluster tab's Prefill Accelerator checks report which of these the Macs use.
 1. On both Macs, enable Distributed Inference and restart oMLX, then pair the two Macs in the Cluster tab.
 2. After pairing, choose **Prefill Accelerator** and run its checks (SSH, link, version, GPU memory, free disk, power).
 3. Open the model's settings, go to **Acceleration**, and choose the Mac under **Prefill Accelerator**.
-4. If the helper lacks the files, the row shows their size, the destination and the free space; press **Copy files**.
+4. If the helper Mac lacks the model files, they are copied to `~/.omlx/prefill-helper/models` there. The copy starts on its own when at least 50 GB stays free. When deleting older copies there would keep 50 GB free, the row names them and **Delete and copy** removes them first. Otherwise the row shows the space left after copying and **Copy anyway** fills the disk past 50 GB. A model that does not fit at all is refused.
 5. When the model is loaded the helper starts, loads its layers and reports **Ready**. Long prompts then show "via <Mac>" in the prefill progress.
 
 **Layers on the helper** is **Auto** by default: each prompt is split by the measured speed of both Macs, and the measurements are kept per model and Mac so a restarted helper splits its first prompt the same way. A fixed number is available for testing.
@@ -76,7 +76,7 @@ Prompts shorter than 2,048 tokens and prompts with images prefill here. Other pr
 
 ## On the helper Mac
 
-The dashboard and the Mac app show a banner while the Mac is helping, with a **Stop** button. A model load on the helper Mac that no longer fits because of the helper is refused with a message that names it. The helper exits when the host's SSH session ends, so a crashed host never leaves layers loaded.
+The dashboard and the Mac app show a banner while the Mac is helping, with a **Stop** button. The host's Cluster tab lists the model copies it made here and can delete them. Models in the helper Mac's own model folders are used in place and never deleted, and neither is the copy the running helper uses. A model load on the helper Mac that no longer fits because of the helper is refused with a message that names it. The helper exits when the host's SSH session ends, so a crashed host never leaves layers loaded.
 
 ## Admin API
 
@@ -87,7 +87,8 @@ All endpoints need an admin session and Distributed Inference turned on.
 | `GET /admin/api/prefill-helper/candidates?model_id=` | Paired Macs and how many layers of the model each can hold |
 | `GET /admin/api/prefill-helper/check?node_id=` | Prefill Accelerator checks for one paired Mac |
 | `GET /admin/api/prefill-helper/models/{id}` | The model's helper state |
-| `POST /admin/api/prefill-helper/models/{id}/{copy\|retry\|stop}` | Copy files, retry, or stop the helper |
+| `POST /admin/api/prefill-helper/models/{id}/{copy\|retry\|stop}` | Confirm a copy prompt, retry, or stop the helper |
+| `GET /admin/api/prefill-helper/copies?node_id=`, `POST .../copies/delete?node_id=&name=` | Model copies on a paired Mac, and deleting one |
 | `GET /admin/api/prefill-helper/lending`, `POST .../lending/stop` | On the helper Mac: what it runs, and Stop |
 
 The model settings `prefill_helper_node_id` and `prefill_helper_layers` (null for Auto) choose the helper; they are per model and not part of profiles.

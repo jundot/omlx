@@ -92,6 +92,8 @@ from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
 from ..prefill_helper.adapters import adapter_for as stage_adapter_for
+from ..prefill_helper.routes import helper_status as prefill_helper_status
+from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
@@ -2312,8 +2314,7 @@ def reasoning_levels(model_info: dict) -> list[str]:
 def _prefill_helper_status(model_id: str) -> dict | None:
     engine_pool = _get_engine_pool()
     entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
-    manager = getattr(getattr(entry, "engine", None), "prefill_helper", None)
-    return manager.status() if manager is not None else None
+    return prefill_helper_status(entry) if entry is not None else None
 
 
 def _model_options(model_info: dict, settings) -> dict:
@@ -3486,9 +3487,12 @@ async def update_model_settings(
     if not _oq_a8_kernels_available():
         # A8 here reaches only the helper's layers.
         helper_fields |= {"a8_prefill_enabled", "a8_prefill_min_tokens"}
-    if helper_fields & set(sent) and hasattr(entry.engine, "configure_prefill_helper"):
-        # Applied to the loaded model in place; no reload.
-        entry.engine.configure_prefill_helper(current_settings)
+    if helper_fields & set(sent):
+        if hasattr(entry.engine, "configure_prefill_helper"):
+            # Applied to the loaded model in place; no reload.
+            entry.engine.configure_prefill_helper(current_settings)
+        else:
+            prepare_prefill_helper(entry, current_settings)
 
     # A failed load is cached to prevent clients from retrying the same broken
     # configuration on every request. Clear that cache only when the effective

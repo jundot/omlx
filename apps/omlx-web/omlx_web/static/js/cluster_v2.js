@@ -236,7 +236,12 @@ function clusterV2Wizard() {
             ranAt: null,
         },
         // Prefill Accelerator checks for one paired Mac (GET /check).
-        accelerator: { nodeId: null, running: false, result: null, error: '' },
+        accelerator: { nodeId: null, running: false, result: null, error: '', copies: null, deleting: [] },
+        acceleratorRestored: false,
+        // On a helper Mac: its running helper and the Mac that set it up.
+        helperRole: null,
+        // A Mac that pressed Pair on this one: {node_id, name}.
+        pairInvite: null,
 
         // ---- plan ------------------------------------------------------------
         modelOptions: [],
@@ -362,7 +367,9 @@ function clusterV2Wizard() {
             this.tickBusy = true;
             try {
                 await this.refreshDevices();
+                await this.refreshHelperRole();
                 await this.refreshJoinState();
+                await this.refreshInvite();
                 await this.refreshRuntime();
                 this.tickCount += 1;
                 if (
@@ -372,6 +379,7 @@ function clusterV2Wizard() {
                     await this.refreshDeployments();
                     await this.refreshRdmaLinks();
                 }
+                await this.restoreAccelerator();
             } finally {
                 this.tickBusy = false;
             }
@@ -1081,6 +1089,7 @@ function clusterV2Wizard() {
             ) {
                 return 'pairing';
             }
+            if (this.stage === null && this.helperRoleHost()) return 'helper';
             if (
                 this.discoveredDevices().length ||
                 this.pairedDevices().length
@@ -1105,6 +1114,16 @@ function clusterV2Wizard() {
                 { key: 'plan', title: window.t('cluster.v2.steps.plan_title'), hint: this.planStepHint() },
                 { key: 'active', title: window.t('cluster.v2.steps.active_title'), hint: window.t('cluster.v2.steps.active_hint') },
             ];
+            if (wizard === 'accelerator' || wizard === 'helper') {
+                // Prefill Accelerator ends at its checks; nothing is split or activated.
+                const ready =
+                    wizard === 'helper' || (!this.accelerator.running && this.acceleratorReady());
+                steps[2].hint = window.t('cluster.v2.steps.accelerator_checks_hint');
+                return steps.slice(0, 3).map((step, index) => ({
+                    ...step,
+                    state: index < 2 || ready ? 'done' : 'active',
+                }));
+            }
             // Map the 8 UI states onto the 5 step slots.
             const slotFor = {
                 empty: 0,
@@ -1362,6 +1381,42 @@ function clusterV2Wizard() {
                 busy: false,
                 error: '',
             };
+            // That Mac then asks its user to show the code; best effort.
+            this.apiFetch('/api/cluster/pair/invite', {
+                method: 'POST',
+                body: JSON.stringify({ node_id: device.node_id }),
+            }).catch(() => {});
+        },
+
+        pairingStepOne() {
+            return window.t('cluster.v2.pairing.step1')
+                .replaceAll('{name}', this.deviceName(this.pairing.target))
+                .replaceAll('{self}', this.deviceName(this.selfDevice()));
+        },
+
+        async refreshInvite() {
+            try {
+                this.pairInvite = (await this.apiFetch('/api/cluster/pair/invite'))?.invite || null;
+            } catch (_) {
+                this.pairInvite = null;
+            }
+        },
+
+        async acceptInvite() {
+            const device = this.discoveredDevices().find(
+                (item) => item.node_id === this.pairInvite?.node_id,
+            );
+            this.pairInvite = null;
+            if (device) await this.beginJoinAsJoiner(device);
+        },
+
+        async dismissInvite() {
+            this.pairInvite = null;
+            try {
+                await this.apiFetch('/api/cluster/pair/invite', { method: 'DELETE' });
+            } catch (_) {
+                /* it expires on its own */
+            }
         },
 
         cancelPairing() {
@@ -1702,6 +1757,63 @@ function clusterV2Wizard() {
             this.stage = 'purpose';
         },
 
+        async refreshHelperRole() {
+            try {
+                this.helperRole = await this.apiFetch('/admin/api/prefill-helper/lending');
+            } catch (_) {
+                this.helperRole = null;
+            }
+        },
+
+        helperRoleHost() {
+            const role = this.helperRole;
+            return (role?.active ? role.host : '') || role?.helps?.name || '';
+        },
+
+        helperRoleText() {
+            const role = this.helperRole || {};
+            const key = role.active ? 'cluster.v2.helper.active' : 'cluster.v2.helper.idle';
+            return window.t(key)
+                .replaceAll('{host}', this.helperRoleHost())
+                .replace('{n}', role.layers ?? '')
+                .replace('{model}', String(role.model || '').split('/').pop());
+        },
+
+        async stopHelping() {
+            try {
+                await this.apiFetch('/admin/api/prefill-helper/lending/stop', { method: 'POST' });
+            } catch (_) {
+                /* refreshed below */
+            }
+            await this.refreshHelperRole();
+        },
+
+        // A paired Mac that a model already uses as its Prefill Accelerator
+        // opens on that screen; Change setup goes back to the choice.
+        async restoreAccelerator() {
+            if (
+                this.acceleratorRestored ||
+                !this.devicesLoaded ||
+                !this.deploymentsLoaded ||
+                !this.pairedDevices().length
+            ) {
+                return;
+            }
+            this.acceleratorRestored = true;
+            if (this.wizardState() !== 'device_card') return;
+            let payload;
+            try {
+                payload = await this.apiFetch('/admin/api/models');
+            } catch (_) {
+                return;
+            }
+            const used = new Set(
+                (payload?.models || []).map((model) => model.settings?.prefill_helper_node_id),
+            );
+            const device = this.pairedDevices().find((item) => used.has(item.node_id));
+            if (device && this.wizardState() === 'device_card') this.startAccelerator(device);
+        },
+
         async startAccelerator(device) {
             this.stage = 'accelerator';
             this.accelerator = {
@@ -1709,7 +1821,10 @@ function clusterV2Wizard() {
                 running: true,
                 result: null,
                 error: '',
+                copies: null,
+                deleting: [],
             };
+            this.loadAcceleratorCopies();
             try {
                 const result = await this.apiFetch(
                     '/admin/api/prefill-helper/check?node_id=' +
@@ -1726,6 +1841,28 @@ function clusterV2Wizard() {
             } finally {
                 if (this.accelerator.nodeId === device.node_id) {
                     this.accelerator.running = false;
+                }
+            }
+        },
+
+        // Model copies this Mac made on the helper; its own model folders never show here.
+        async loadAcceleratorCopies(remove = '') {
+            const nodeId = this.accelerator.nodeId;
+            const query = 'node_id=' + encodeURIComponent(nodeId)
+                + (remove ? '&name=' + encodeURIComponent(remove) : '');
+            if (remove) this.accelerator.deleting = [...this.accelerator.deleting, remove];
+            try {
+                const result = await this.apiFetch(
+                    '/admin/api/prefill-helper/copies' + (remove ? '/delete?' : '?') + query,
+                    remove ? { method: 'POST' } : {},
+                );
+                if (this.accelerator.nodeId === nodeId) this.accelerator.copies = result;
+            } catch (_) {
+                // A failed delete keeps the list as it was.
+                if (!remove && this.accelerator.nodeId === nodeId) this.accelerator.copies = null;
+            } finally {
+                if (remove && this.accelerator.nodeId === nodeId) {
+                    this.accelerator.deleting = this.accelerator.deleting.filter((name) => name !== remove);
                 }
             }
         },

@@ -87,9 +87,9 @@ class DeepseekV41Adapter(StageAdapter):
     def layer_count(self, lm: Any) -> int:
         return lm._config.n_layers
 
-    def max_split(self, lm: Any) -> int:
+    def split_limit(self, n_layers: int) -> int:
         # The CED midpoint holds the decoder replay input, so it stays here.
-        return lm._config.n_layers // 2
+        return n_layers // 2
 
     def layer_work(self, lm: Any) -> list[float]:
         c = lm._config

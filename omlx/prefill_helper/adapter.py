@@ -86,9 +86,9 @@ class StageAdapter:
     def layer_count(self, lm: Any) -> int:
         raise NotImplementedError
 
-    def max_split(self, lm: Any) -> int:
+    def split_limit(self, n_layers: int) -> int:
         """Largest ``k`` this family supports; the helper holds ``[0, k)``."""
-        return self.layer_count(lm) - 1
+        return n_layers - 1
 
     def keep_first(self, lm: Any, k: int) -> None:
         """Drop layers ``[k, n)`` before the helper loads weights."""

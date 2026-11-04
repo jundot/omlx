@@ -2,7 +2,8 @@
 """This Mac running another Mac's prefill helper, seen through its marker file.
 
 The helper process writes the marker while it holds layers here, so this Mac's
-server can show it, stop it, and explain a model load that no longer fits.
+server can show it, stop it, and explain a model load that no longer fits. The
+host's checks and helper starts also note here which Mac set this one up.
 """
 
 from __future__ import annotations
@@ -14,6 +15,25 @@ from pathlib import Path
 
 def active_marker_path() -> Path:
     return Path.home() / ".omlx" / "prefill-helper" / "active.json"
+
+
+def host_marker_path() -> Path:
+    return Path.home() / ".omlx" / "prefill-helper" / "host.json"
+
+
+def record_host(node_id: str, name: str) -> None:
+    """Remember the Mac that uses this one as its Prefill Accelerator."""
+    path = host_marker_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"node_id": node_id, "name": name}))
+
+
+def recorded_host() -> dict | None:
+    try:
+        host = json.loads(host_marker_path().read_text())
+    except (OSError, ValueError):
+        return None
+    return host if isinstance(host, dict) and host.get("node_id") else None
 
 
 def _is_helper(pid: int) -> bool:

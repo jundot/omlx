@@ -21934,14 +21934,38 @@
         }
       }
     },
-    "settings.acceleration.prefill_helper.copy" : {
-      "comment" : "Button that copies model files to the helper Mac",
+    "settings.acceleration.prefill_helper.copy_anyway" : {
+      "comment" : "Button that copies model files to a nearly full helper Mac",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Copy Files"
+            "value" : "Copy Anyway"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.copy_now" : {
+      "comment" : "Button that copies model files to the helper Mac before the model is loaded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Copy Files Now"
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.delete_and_copy" : {
+      "comment" : "Button that deletes older model copies on the helper Mac, then copies model files",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Delete and Copy"
           }
         }
       }
@@ -22126,6 +22150,18 @@
         }
       }
     },
+    "settings.acceleration.prefill_helper.state.files_ready" : {
+      "comment" : "Prefill Accelerator status after copying files before the model is loaded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Model files for %lld layers are ready on %@. The Prefill Accelerator starts when this model is loaded."
+          }
+        }
+      }
+    },
     "settings.acceleration.prefill_helper.state.last_prompt" : {
       "comment" : "Prefill Accelerator status suffix with the last prompt timing",
       "extractionState" : "manual",
@@ -22138,14 +22174,26 @@
         }
       }
     },
-    "settings.acceleration.prefill_helper.state.needs_files" : {
-      "comment" : "Prefill Accelerator status asking to copy model files",
+    "settings.acceleration.prefill_helper.state.low_space" : {
+      "comment" : "Prefill Accelerator status asking to copy model files to a nearly full helper Mac",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%@ needs %@ of model files in %@ (%@ free)."
+            "value" : "%@ is low on disk space. Copying %@ of model files leaves only %@ free."
+          }
+        }
+      }
+    },
+    "settings.acceleration.prefill_helper.state.make_room" : {
+      "comment" : "Prefill Accelerator status asking to delete older model copies on the helper Mac before copying",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ needs %@ of model files. To keep 50 GB free, copying first deletes these older model copies: %@. %@ stays free."
           }
         }
       }

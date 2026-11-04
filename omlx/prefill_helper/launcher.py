@@ -177,9 +177,11 @@ def _link_speed(
 
 
 _INFO = (
-    "import json, os, re, shutil, subprocess, omlx, mlx.core as mx; "
-    "from omlx.prefill_helper.lending import active_lending; "
-    "i = mx.device_info(); m = active_lending() or {}; "
+    "import json, os, re, shutil, subprocess, sys, omlx, mlx.core as mx; "
+    "import omlx.prefill_helper.lending as L; "
+    "h = json.loads(sys.argv[1]) if len(sys.argv) > 1 else None; "
+    "h and L.record_host(h['node_id'], h['name']); "
+    "i = mx.device_info(); m = L.active_lending() or {}; "
     "run = lambda *a: subprocess.run(a, capture_output=True, text=True).stdout; "
     "p = run('/usr/bin/pmset', '-g', 'ps'); v = run('/usr/bin/vm_stat'); "
     "page = int(re.search(r'page size of (\\d+)', v).group(1)); "
@@ -196,11 +198,22 @@ _INFO = (
 )
 
 
-def remote_info(target: HelperTarget, *, runner: Runner = subprocess.run) -> dict:
-    """The helper's oMLX version, GPU memory budget, power source and free disk."""
+def remote_info(
+    target: HelperTarget,
+    *,
+    host: dict | None = None,
+    runner: Runner = subprocess.run,
+) -> dict:
+    """The helper's oMLX version, GPU memory budget, power source and free disk.
+
+    ``host`` ({node_id, name}) is noted there as the Mac that uses it.
+    """
+    command = f"{target.python} -c {shlex.quote(_INFO)}"
+    if host is not None:
+        command += " " + shlex.quote(json.dumps(host))
     result = _ssh(
         target.ssh_target,
-        f"{target.python} -c {shlex.quote(_INFO)}",
+        command,
         runner=runner,
         timeout=60,
     )
@@ -221,7 +234,8 @@ def required_files(
 
 
 # Runs on the helper with /usr/bin/python3 -I: finds a complete copy of the
-# model in its model folders, else reports what the copy folder still lacks.
+# model in its model folders, else reports what the copy folder still lacks
+# and the other copies there (the running helper's is never offered).
 _PROBE = r"""
 import json, os, shutil, sys
 req = json.loads(sys.argv[1])
@@ -250,14 +264,57 @@ for top in dirs:
             break
     if found:
         break
-copy = os.path.join(os.path.expanduser(req["copy_dir"]), req["name"])
+root = os.path.expanduser(req["copy_dir"])
+copy = os.path.join(root, req["name"])
 missing = [n for n, s in req["files"].items()
            if not (os.path.isfile(os.path.join(copy, n)) and os.path.getsize(os.path.join(copy, n)) == s)]
+if found is None and req["files"] and os.path.isdir(copy):
+    open(os.path.join(copy, ".last_used"), "w").close()
+running = ""
+try:
+    with open(os.path.join(home, ".omlx", "prefill-helper", "active.json")) as f:
+        running = os.path.realpath(json.load(f).get("model") or "")
+except Exception:
+    pass
+copies = []
+for name in sorted(os.listdir(root)) if os.path.isdir(root) else []:
+    path = os.path.join(root, name)
+    if name == req["name"] or os.path.islink(path) or not os.path.isdir(path) or os.path.realpath(path) == running:
+        continue
+    size = sum(os.path.getsize(os.path.join(r, n)) for r, _, ns in os.walk(path) for n in ns)
+    marker = os.path.join(path, ".last_used")
+    copies.append({"name": name, "bytes": size,
+                   "used": os.path.getmtime(marker if os.path.exists(marker) else path)})
 parent = copy
 while not os.path.isdir(parent):
     parent = os.path.dirname(parent)
-print(json.dumps({"found": found, "copy": copy, "missing": missing,
+print(json.dumps({"found": found, "copy": copy, "missing": missing, "copies": copies,
                   "free": shutil.disk_usage(parent).free}))
+"""
+
+# Removes copies by folder name, only directly inside the copy folder and
+# never the running helper's.
+_DELETE = r"""
+import json, os, shutil, sys
+req = json.loads(sys.argv[1])
+root = os.path.realpath(os.path.expanduser(req["copy_dir"]))
+running = ""
+try:
+    with open(os.path.expanduser("~/.omlx/prefill-helper/active.json")) as f:
+        running = os.path.realpath(json.load(f).get("model") or "")
+except Exception:
+    pass
+for name in req["names"]:
+    path = os.path.join(root, name)
+    if os.sep in name or name in ("", ".", "..") or os.path.islink(path):
+        continue
+    real = os.path.realpath(path)
+    if os.path.dirname(real) == root and real != running:
+        shutil.rmtree(path, ignore_errors=True)
+parent = root
+while not os.path.isdir(parent):
+    parent = os.path.dirname(parent)
+print(json.dumps({"free": shutil.disk_usage(parent).free}))
 """
 
 
@@ -277,17 +334,42 @@ def locate_files(
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+def list_copies(target: HelperTarget, *, runner: Runner = subprocess.run) -> dict:
+    """The model copies on the helper Mac and its free bytes."""
+    where = locate_files(target, "", {}, runner=runner)
+    return {"copies": where["copies"], "free": where["free"]}
+
+
+def delete_copies(
+    target: HelperTarget, names: list[str], *, runner: Runner = subprocess.run
+) -> int:
+    """Remove other models' copies on the helper; returns its free bytes."""
+    request = json.dumps({"names": names, "copy_dir": COPY_DIR})
+    command = f"/usr/bin/python3 -I -c {shlex.quote(_DELETE)} {shlex.quote(request)}"
+    result = _ssh(target.ssh_target, command, runner=runner, timeout=300)
+    if result.returncode != 0:
+        raise LaunchError(f"Could not remove model copies on {target.name}.")
+    return int(json.loads(result.stdout.strip().splitlines()[-1])["free"])
+
+
 def copy_files(
     target: HelperTarget,
     model_path: str | Path,
     destination: str,
     names: list[str],
     progress: Callable[[str], None] | None = None,
+    *,
+    cancelled: Callable[[], bool] | None = None,
 ) -> None:
-    """Copy *names* over the link address, a few files at a time."""
+    """Copy *names* over the link address, a few files at a time.
+
+    After ``cancelled`` turns true, files not yet started are skipped.
+    """
     source = str(Path(model_path).expanduser())
 
     def push(name: str) -> None:
+        if cancelled is not None and cancelled():
+            return
         scp_push(
             destination_host=target.ssh_target,
             source_dir=source,

@@ -5,9 +5,10 @@ One worker thread walks the steps (find the Mac, check its oMLX and memory,
 find or copy the files, start the helper, attach it) and then watches the
 connection. A lost helper is detached at once and retried with backoff;
 problems a retry cannot fix (version, memory, disk, pairing) wait for the
-user. Copying model files only starts on an explicit request. The measured
-speeds of each model and helper Mac are kept on disk, so a restarted helper
-splits its first prompt by them instead of guessing.
+user. Model files are copied at once when 50 GB stay free, else after the
+user agrees; a copy started before the model loads is taken over, never run
+twice. The measured speeds of each model and helper Mac are kept on disk, so
+a restarted helper splits its first prompt by them instead of guessing.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import __version__
+from ..cluster.identity import get_node_identity
 from ..cluster.registry import default_devices_path
 from . import launcher as default_launcher
 from .adapter import StageAdapter
@@ -38,6 +40,8 @@ _RESERVE_BYTES = 8 << 30
 # macOS and the helper Mac's other apps; the GPU budget alone let the helper
 # swap (105 GiB of layers on a 128 GB Mac).
 _OS_BYTES = 16 << 30
+# Disk a model copy leaves free on the helper Mac without asking.
+_DISK_SPARE_BYTES = 50 << 30
 _RETRY_DELAYS_S = (15.0, 30.0, 60.0, 120.0, 300.0)
 _WATCH_S = 2.0
 # A helper with open jobs that sends nothing for this long is gone.
@@ -51,6 +55,10 @@ def default_speeds_path() -> Path:
 
 class _PermanentError(Exception):
     """A problem only the user can fix; no automatic retry."""
+
+
+class _CancelledError(Exception):
+    """The helper choice changed while its files were being prepared."""
 
 
 def helper_budget(info: dict) -> int:
@@ -67,6 +75,26 @@ def helper_budget(info: dict) -> int:
     return budget
 
 
+def copy_plan(size: int, free: int, copies: list[dict]) -> dict:
+    """How to fit *size* bytes of model files on the helper Mac.
+
+    ``copy`` leaves the spare free and runs at once. ``make_room`` first removes
+    the least recently used other copies, ``low_space`` fills the disk past the
+    spare; both wait for the user. ``no_space`` cannot fit without removing
+    more than the other copies.
+    """
+    if free - size >= _DISK_SPARE_BYTES:
+        return {"kind": "copy", "delete": [], "left": free - size}
+    freed, delete = 0, []
+    for copy in sorted(copies, key=lambda item: item["used"]):
+        delete.append(copy)
+        freed += copy["bytes"]
+        if free + freed - size >= _DISK_SPARE_BYTES:
+            return {"kind": "make_room", "delete": delete, "left": free + freed - size}
+    kind = "low_space" if free >= size else "no_space"
+    return {"kind": kind, "delete": [], "left": free - size}
+
+
 def fit_layers(shared: int, per_layer: list[int], budget: int, limit: int) -> int:
     """How many leading layers fit in a helper's memory budget."""
     held, used = 0, shared + _RESERVE_BYTES
@@ -75,6 +103,237 @@ def fit_layers(shared: int, per_layer: list[int], budget: int, limit: int) -> in
             break
         used, held = used + size, held + 1
     return held
+
+
+def held_layers(
+    adapter: StageAdapter,
+    model_path: str,
+    budget: int,
+    name: str,
+    fixed: int | None = None,
+) -> int:
+    """Layers the helper holds: as many as fit, or the fixed number."""
+    shared, per_layer = adapter.memory_plan(model_path)
+    limit = adapter.split_limit(len(per_layer))
+    held = fit_layers(shared, per_layer, budget, limit)
+    if fixed is not None:
+        if fixed > limit:
+            raise _PermanentError(
+                f"At most {limit} layers of this model can run on a helper."
+            )
+        if fixed > held:
+            raise _PermanentError(
+                f"{fixed} layers do not fit in {name}'s GPU memory; at most {held} do."
+            )
+        held = fixed
+    if held < 1:
+        raise _PermanentError(f"Not even one layer fits in {name}'s GPU memory.")
+    return held
+
+
+def this_host() -> dict | None:
+    """This Mac as the helper Mac records it, once the cluster identity exists."""
+    try:
+        identity = get_node_identity()
+    except RuntimeError:
+        return None
+    return {"node_id": identity.node_id, "name": identity.friendly_name}
+
+
+def _reach(launcher: Any, node_id: str, report: Callable[..., None]) -> tuple:
+    """The helper Mac and its ``remote_info``, if it runs this oMLX."""
+    try:
+        target = launcher.resolve_target(node_id)
+    except launcher.LaunchError as error:
+        raise _PermanentError(str(error)) from error
+    report("connecting", name=target.name, link=target.link)
+    info = launcher.remote_info(target, host=this_host())
+    if info.get("version") != __version__:
+        raise _PermanentError(
+            f"{target.name} runs oMLX {info.get('version')}; update it to "
+            f"{__version__}."
+        )
+    return target, info
+
+
+def _prepare_files(
+    launcher: Any,
+    target: Any,
+    model_path: str,
+    held: int,
+    adapter: StageAdapter,
+    report: Callable[..., None],
+    ask: Callable[..., None],
+    cancelled: Callable[[], bool] | None = None,
+) -> str:
+    """The folder on the helper Mac with the files for *held* layers.
+
+    Missing files are copied there. ``ask`` blocks until the user agrees to
+    remove other copies or fill the disk.
+    """
+    files = launcher.required_files(model_path, held, adapter)
+    where = launcher.locate_files(target, Path(model_path).name, files)
+    if where.get("found"):
+        return where["found"]
+    model_dir, missing = where["copy"], where["missing"]
+    if not missing:
+        return model_dir
+    size = sum(files[name] for name in missing)
+    plan = copy_plan(size, where["free"], where.get("copies", []))
+    if plan["kind"] == "no_space":
+        raise _PermanentError(
+            f"{target.name} needs {size / 2**30:.0f} GiB free for the "
+            f"model files; {where['free'] / 2**30:.0f} GiB is free."
+        )
+    if plan["kind"] != "copy":
+        ask(
+            path=model_dir,
+            bytes=size,
+            free=where["free"],
+            prompt=plan["kind"],
+            left=plan["left"],
+            delete=[{"name": c["name"], "bytes": c["bytes"]} for c in plan["delete"]],
+        )
+    if plan["delete"]:
+        launcher.delete_copies(target, [item["name"] for item in plan["delete"]])
+    done = 0
+
+    def progress(name: str) -> None:
+        nonlocal done
+        done += files[name]
+        report("copying", path=model_dir, done=done, bytes=size)
+
+    report("copying", path=model_dir, done=0, bytes=size)
+    launcher.copy_files(
+        target, model_path, model_dir, missing, progress, cancelled=cancelled
+    )
+    if cancelled is not None and cancelled():
+        raise _CancelledError
+    return model_dir
+
+
+class FilePrep:
+    """Copies a model's helper files before the model is loaded."""
+
+    def __init__(
+        self,
+        model_path: str,
+        adapter: StageAdapter,
+        node_id: str,
+        layers: int | None,
+        launcher: Any = default_launcher,
+        after: FilePrep | None = None,
+    ):
+        self.model_path, self.adapter, self.launcher = model_path, adapter, launcher
+        self.node_id, self.layers, self._after = node_id, layers, after
+        self._status: dict[str, Any] = {"state": "connecting", "node_id": node_id}
+        self._ok, self._cancel = threading.Event(), threading.Event()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(
+            target=self._run, name="omlx-prefill-helper-files", daemon=True
+        )
+        self._thread.start()
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._status)
+
+    def copy_files(self) -> None:
+        self._ok.set()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def running(self) -> bool:
+        return self._thread.is_alive()
+
+    def join(self, timeout: float | None = None) -> None:
+        self._thread.join(timeout)
+
+    def _set(self, state: str, **fields: Any) -> None:
+        with self._lock:
+            keep = {k: self._status[k] for k in ("name", "link") if k in self._status}
+            self._status = {"state": state, "node_id": self.node_id, **keep, **fields}
+
+    def _ask(self, **fields: Any) -> None:
+        self._set("needs_files", **fields)
+        while not self._ok.wait(timeout=1.0):
+            if self._cancel.is_set():
+                raise _CancelledError
+
+    def _run(self) -> None:
+        if self._after is not None:
+            # Its last files may still be in flight to the same folder.
+            self._after.join()
+        try:
+            if self._cancel.is_set():
+                raise _CancelledError
+            target, info = _reach(self.launcher, self.node_id, self._set)
+            held = held_layers(
+                self.adapter,
+                self.model_path,
+                helper_budget(info),
+                target.name,
+                self.layers,
+            )
+            _prepare_files(
+                self.launcher,
+                target,
+                self.model_path,
+                held,
+                self.adapter,
+                self._set,
+                self._ask,
+                self._cancel.is_set,
+            )
+            self._set("files_ready", held=held)
+        except _CancelledError:
+            self._set("stopped")
+        except Exception as error:  # SSH, version, memory, disk
+            logger.warning("Prefill helper files not prepared: %s", error)
+            self._set("error", reason=str(error))
+
+
+_PREPS: dict[str, FilePrep] = {}
+_PREPS_LOCK = threading.Lock()
+
+
+def prepare(
+    model_path: str,
+    adapter: StageAdapter,
+    node_id: str | None,
+    layers: int | None,
+    *,
+    restart: bool = False,
+    launcher: Any = default_launcher,
+) -> None:
+    """Start, keep or cancel the file copy for a model that is not loaded."""
+    key = str(Path(model_path).expanduser())
+    with _PREPS_LOCK:
+        prep = _PREPS.pop(key, None)
+        if (
+            prep is not None
+            and not restart
+            and (prep.node_id, prep.layers) == (node_id, layers)
+            and prep.status()["state"] not in ("error", "stopped")
+        ):
+            # Saving the same choice again keeps the copy going.
+            _PREPS[key] = prep
+            return
+        if prep is not None:
+            prep.cancel()
+        if node_id is not None:
+            _PREPS[key] = FilePrep(key, adapter, node_id, layers, launcher, prep)
+
+
+def file_prep(model_path: str) -> FilePrep | None:
+    with _PREPS_LOCK:
+        return _PREPS.get(str(Path(model_path).expanduser()))
+
+
+def _take_prep(model_path: str) -> FilePrep | None:
+    with _PREPS_LOCK:
+        return _PREPS.pop(model_path, None)
 
 
 def computer_name() -> str:
@@ -253,37 +512,32 @@ class PrefillHelperManager:
                 attempt += 1
                 self._set("offline", reason=str(error))
 
+    def _report(self, state: str, **fields: Any) -> None:
+        self._set(state, node_id=self.node_id, **fields)
+
     def _start(self) -> None:
         launcher = self.launcher
         self._set("connecting", node_id=self.node_id)
-        try:
-            target = launcher.resolve_target(self.node_id)
-        except launcher.LaunchError as error:
-            raise _PermanentError(str(error)) from error
-        self._set(
-            "connecting", node_id=self.node_id, name=target.name, link=target.link
+        prep = _take_prep(self.model_path)
+        if prep is not None:
+            self._follow(prep)
+        target, info = _reach(launcher, self.node_id, self._report)
+        held = held_layers(
+            self.adapter,
+            self.model_path,
+            helper_budget(info),
+            target.name,
+            self.fixed_layers,
         )
-        info = launcher.remote_info(target)
-        if info.get("version") != __version__:
-            raise _PermanentError(
-                f"{target.name} runs oMLX {info.get('version')}; update it to "
-                f"{__version__}."
-            )
-        held = self._held_layers(target.name, helper_budget(info))
-        files = launcher.required_files(self.model_path, held, self.adapter)
-        where = launcher.locate_files(target, Path(self.model_path).name, files)
-        model_dir = where.get("found")
-        if model_dir is None:
-            missing = where["missing"]
-            size = sum(files[name] for name in missing)
-            if size > where["free"]:
-                raise _PermanentError(
-                    f"{target.name} needs {size / 2**30:.0f} GiB free for the "
-                    f"model files; {where['free'] / 2**30:.0f} GiB is free."
-                )
-            model_dir = where["copy"]
-            if missing:
-                self._copy(target, model_dir, missing, files, size, free=where["free"])
+        model_dir = _prepare_files(
+            launcher,
+            target,
+            self.model_path,
+            held,
+            self.adapter,
+            self._report,
+            self._ask,
+        )
         self._set("starting", node_id=self.node_id, layers=held)
         process = launcher.launch(
             target,
@@ -322,48 +576,32 @@ class PrefillHelperManager:
             on_battery=bool(info.get("on_battery")),
         )
 
-    def _held_layers(self, name: str, budget: int) -> int:
-        shared, per_layer = self.adapter.memory_plan(self.model_path)
-        limit = self.adapter.max_split(self.lm)
-        held = fit_layers(shared, per_layer, budget, limit)
-        if self.fixed_layers is not None:
-            if self.fixed_layers > limit:
-                raise _PermanentError(
-                    f"At most {limit} layers of this model can run on a helper."
-                )
-            if self.fixed_layers > held:
-                raise _PermanentError(
-                    f"{self.fixed_layers} layers do not fit in {name}'s GPU memory; "
-                    f"at most {held} do."
-                )
-            held = self.fixed_layers
-        if held < 1:
-            raise _PermanentError(f"Not even one layer fits in {name}'s GPU memory.")
-        return held
-
-    def _copy(self, target, model_dir, missing, files, size, *, free) -> None:
+    def _ask(self, **fields: Any) -> None:
+        # Removing other copies or filling the disk waits for the user.
         self._copy_ok.clear()
-        self._set(
-            "needs_files",
-            node_id=self.node_id,
-            path=model_dir,
-            bytes=size,
-            free=free,
-        )
+        self._report("needs_files", **fields)
         while not self._copy_ok.wait(timeout=1.0):
             if not self._commands.empty():
                 raise RuntimeError("cancelled while waiting to copy files")
-        done = 0
 
-        def progress(name: str) -> None:
-            nonlocal done
-            done += files[name]
-            self._set(
-                "copying", node_id=self.node_id, path=model_dir, done=done, bytes=size
-            )
-
-        self._set("copying", node_id=self.node_id, path=model_dir, done=0, bytes=size)
-        self.launcher.copy_files(target, self.model_path, model_dir, missing, progress)
+    def _follow(self, prep: FilePrep) -> None:
+        """Wait for a copy started before the load; never copy alongside it."""
+        if prep.node_id != self.node_id:
+            prep.cancel()
+            prep.join()
+            return
+        self._copy_ok.clear()
+        while prep.running():
+            status = prep.status()
+            if status["state"] in ("needs_files", "copying"):
+                self._set(**status)
+            if self._copy_ok.is_set():
+                prep.copy_files()
+            if not self._commands.empty():
+                prep.cancel()
+                prep.join()
+                raise RuntimeError("cancelled while copying files")
+            prep.join(timeout=1.0)
 
     def _speeds_key(self) -> str:
         # A8 changes the helper's speed, so each setting keeps its own.

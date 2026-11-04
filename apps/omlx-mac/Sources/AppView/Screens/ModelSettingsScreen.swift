@@ -1621,15 +1621,28 @@ private struct PrefillAcceleratorGroup: View {
                           defaultValue: "Loading \(layers) layers on \(name)...",
                           comment: "Prefill Accelerator status while the helper loads layers")
         case "needs_files":
-            let need = size(status.bytes), free = size(status.free), path = status.path ?? ""
-            return String(localized: "settings.acceleration.prefill_helper.state.needs_files",
-                          defaultValue: "\(name) needs \(need) of model files in \(path) (\(free) free).",
-                          comment: "Prefill Accelerator status asking to copy model files")
+            let need = size(status.bytes), left = size(status.left)
+            if status.prompt == "make_room" {
+                let copies = (status.delete ?? [])
+                    .map { "\($0.name) (\(size($0.bytes)))" }
+                    .joined(separator: ", ")
+                return String(localized: "settings.acceleration.prefill_helper.state.make_room",
+                              defaultValue: "\(name) needs \(need) of model files. To keep 50 GB free, copying first deletes these older model copies: \(copies). \(left) stays free.",
+                              comment: "Prefill Accelerator status asking to delete older model copies on the helper Mac before copying")
+            }
+            return String(localized: "settings.acceleration.prefill_helper.state.low_space",
+                          defaultValue: "\(name) is low on disk space. Copying \(need) of model files leaves only \(left) free.",
+                          comment: "Prefill Accelerator status asking to copy model files to a nearly full helper Mac")
         case "copying":
             let done = size(status.done), total = size(status.bytes)
             return String(localized: "settings.acceleration.prefill_helper.state.copying",
                           defaultValue: "Copying model files to \(name): \(done) of \(total)",
                           comment: "Prefill Accelerator status while copying files")
+        case "files_ready":
+            let held = status.held ?? 0
+            return String(localized: "settings.acceleration.prefill_helper.state.files_ready",
+                          defaultValue: "Model files for \(held) layers are ready on \(name). The Prefill Accelerator starts when this model is loaded.",
+                          comment: "Prefill Accelerator status after copying files before the model is loaded")
         case "ready", "working":
             let held = status.held ?? 0
             var text = String(localized: "settings.acceleration.prefill_helper.state.ready",
@@ -1667,12 +1680,25 @@ private struct PrefillAcceleratorGroup: View {
     private var actionButtons: some View {
         let state = vm.prefillHelperStatus?.state ?? ""
         if state == "needs_files" {
-            Button(String(localized: "settings.acceleration.prefill_helper.copy",
-                          defaultValue: "Copy Files",
-                          comment: "Button that copies model files to the helper Mac")) {
+            Button(vm.prefillHelperStatus?.prompt == "make_room"
+                   ? String(localized: "settings.acceleration.prefill_helper.delete_and_copy",
+                            defaultValue: "Delete and Copy",
+                            comment: "Button that deletes older model copies on the helper Mac, then copies model files")
+                   : String(localized: "settings.acceleration.prefill_helper.copy_anyway",
+                            defaultValue: "Copy Anyway",
+                            comment: "Button that copies model files to a nearly full helper Mac")) {
                 Task { await vm.prefillHelperAction("copy", client: client) }
             }
             .buttonStyle(.omlx(.primary, size: .small))
+            .disabled(vm.prefillHelperBusy)
+        }
+        if state == "unloaded" {
+            Button(String(localized: "settings.acceleration.prefill_helper.copy_now",
+                          defaultValue: "Copy Files Now",
+                          comment: "Button that copies model files to the helper Mac before the model is loaded")) {
+                save()
+            }
+            .buttonStyle(.omlx(.normal, size: .small))
             .disabled(vm.prefillHelperBusy)
         }
         if ["offline", "error", "stopped"].contains(state) {

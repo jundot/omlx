@@ -335,7 +335,7 @@
             _aneTuningPollTimer: null,
             // Prefill Accelerator: paired Macs that can help the open model,
             // and its helper status (polled while the modal is open).
-            prefillHelper: { modelId: null, candidates: [], version: '', loading: false, status: null, busy: false },
+            prefillHelper: { modelId: null, candidates: [], version: '', loading: false, status: null, busy: false, original: null, applied: false },
             _prefillHelperPollTimer: null,
             // Set while this Mac runs another Mac's prefill helper.
             prefillLending: null,
@@ -3095,6 +3095,11 @@
                     loading: false,
                     status: model.prefill_helper || null,
                     busy: false,
+                    original: {
+                        prefill_helper_node_id: model.settings?.prefill_helper_node_id || null,
+                        prefill_helper_layers: model.settings?.prefill_helper_layers ?? null,
+                    },
+                    applied: false,
                 };
                 if (!model.prefill_helper_supported
                     || !this.globalSettings.server.distributed_inference_active) return;
@@ -3203,6 +3208,7 @@
                     });
                     if (resp.ok) {
                         model.settings = { ...(model.settings || {}), ...body };
+                        this.prefillHelper.applied = true;
                     } else if (resp.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -3213,6 +3219,22 @@
                     alert(window.t('js.error.save_model_settings_failed'));
                 }
                 this.prefillHelper.busy = false;
+            },
+
+            // Cancel undoes an applied helper choice; Save keeps it.
+            closeModelSettings() {
+                this.showModelSettingsModal = false;
+                const model = this.selectedModel;
+                const body = this.prefillHelper.original;
+                if (!this.prefillHelper.applied || !model || !body) return;
+                this.prefillHelper.applied = false;
+                fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                }).then((resp) => {
+                    if (resp.ok) model.settings = { ...(model.settings || {}), ...body };
+                }).catch(() => { /* network error */ });
             },
 
             prefillHelperTakeoverText(device) {
@@ -3244,11 +3266,14 @@
                     case 'starting':
                         return t('starting').replace('{name}', name).replace('{n}', s.layers ?? '');
                     case 'needs_files':
-                        return t('needs_files').replace('{name}', name).replace('{size}', size(s.bytes))
-                            .replace('{path}', s.path || '').replace('{free}', size(s.free));
+                        return t(s.prompt).replace('{name}', name).replace('{size}', size(s.bytes))
+                            .replace('{left}', size(s.left))
+                            .replace('{copies}', (s.delete || []).map((c) => c.name + ' (' + size(c.bytes) + ')').join(', '));
                     case 'copying':
                         return t('copying').replace('{name}', name).replace('{done}', size(s.done))
                             .replace('{size}', size(s.bytes));
+                    case 'files_ready':
+                        return t('files_ready').replace('{name}', name).replace('{n}', s.held ?? '');
                     case 'ready':
                     case 'working': {
                         let text = t(s.state).replace('{name}', name).replace('{n}', s.held ?? '');
@@ -3711,6 +3736,7 @@
                         // Refresh the model list to update badges
                         await this.loadModels();
                         const data = await response.json();
+                        this.prefillHelper.applied = false;
                         this.showModelSettingsModal = false;
                         if (data.requires_reload) {
                             if (data.auto_reloaded) {

@@ -2,7 +2,8 @@
 """Admin API for the Prefill Accelerator, on both Macs.
 
 This Mac: candidate helpers for a model, the model's helper status and the
-copy / retry / stop actions. The helper Mac: what it is lending and a Stop.
+copy / retry / stop actions, also while files are copied before the model
+loads. The helper Mac: what it is lending and a Stop.
 """
 
 from __future__ import annotations
@@ -22,8 +23,15 @@ from .. import __version__
 from ..cluster.registry import get_device_registry
 from . import launcher
 from .adapters import adapter_for
-from .lending import active_lending
-from .manager import computer_name, fit_layers, helper_budget
+from .lending import active_lending, recorded_host
+from .manager import (
+    computer_name,
+    file_prep,
+    fit_layers,
+    helper_budget,
+    prepare,
+    this_host,
+)
 
 router = APIRouter(prefix="/admin/api/prefill-helper", tags=["prefill-helper"])
 
@@ -46,19 +54,34 @@ def _entry(model_id: str) -> Any:
     return entry
 
 
-def _manager(model_id: str) -> Any:
-    engine = _entry(model_id).engine
-    manager = getattr(engine, "prefill_helper", None)
-    if manager is None:
-        raise HTTPException(
-            status_code=409, detail="Load the model to use the Prefill Accelerator."
-        )
-    return manager
+def _adapter(entry: Any) -> Any:
+    model_type = getattr(entry, "config_model_type", "") or ""
+    return adapter_for(model_type.replace("-", "_").lower())
 
 
-def _candidate(
-    device: dict[str, Any], model_path: str, adapter: Any, limit: int | None
-) -> dict:
+def prepare_unloaded(entry: Any, settings: Any) -> None:
+    """Copy the helper's files for a saved choice before the model loads."""
+    adapter = _adapter(entry)
+    if adapter is None or getattr(entry.engine, "prefill_helper", None) is not None:
+        return
+    prepare(
+        entry.model_path,
+        adapter,
+        getattr(settings, "prefill_helper_node_id", None),
+        getattr(settings, "prefill_helper_layers", None),
+    )
+
+
+def helper_status(entry: Any) -> dict | None:
+    """The loaded model's helper, else the copy made before it loads."""
+    manager = getattr(entry.engine, "prefill_helper", None)
+    if manager is not None:
+        return manager.status()
+    prep = file_prep(entry.model_path)
+    return prep.status() if prep is not None else None
+
+
+def _candidate(device: dict[str, Any], model_path: str, adapter: Any) -> dict:
     caps = device.get("caps") or {}
     row = {
         "node_id": device["node_id"],
@@ -74,8 +97,7 @@ def _candidate(
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         return {**row, "online": False, "reason": str(error)}
     shared, per_layer = adapter.memory_plan(model_path)
-    if limit is None:
-        limit = len(per_layer) - 1
+    limit = adapter.split_limit(len(per_layer))
     held = fit_layers(shared, per_layer, helper_budget(info), limit)
     lending = info.get("lending")
     if lending:
@@ -104,25 +126,17 @@ def _candidate(
 async def candidates(model_id: str) -> dict:
     """Paired Macs and whether each can help this model."""
     entry = _entry(model_id)
-    adapter = adapter_for(
-        (getattr(entry, "config_model_type", "") or "").replace("-", "_").lower()
-    )
+    adapter = _adapter(entry)
     if adapter is None:
         raise HTTPException(
             status_code=400, detail="This model has no Prefill Accelerator."
         )
-    # The family's split limit needs the loaded model; before that, any layer
-    # but the last.
-    manager = getattr(entry.engine, "prefill_helper", None) if entry.engine else None
-    limit = adapter.max_split(manager.lm) if manager is not None else None
     devices = get_device_registry().paired()
     loop = asyncio.get_running_loop()
     with ThreadPoolExecutor(max_workers=max(1, min(len(devices), 4))) as pool:
         rows = await asyncio.gather(
             *[
-                loop.run_in_executor(
-                    pool, _candidate, d, entry.model_path, adapter, limit
-                )
+                loop.run_in_executor(pool, _candidate, d, entry.model_path, adapter)
                 for d in devices
             ]
         )
@@ -155,7 +169,7 @@ def _check(node_id: str) -> dict:
         }
     )
     try:
-        info = launcher.remote_info(target)
+        info = launcher.remote_info(target, host=this_host())
     except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
         rows.append({"key": "version", "status": "fail", "detail": str(error)})
         return {"node_id": node_id, "name": target.name, "rows": rows}
@@ -182,27 +196,78 @@ async def check(node_id: str) -> dict:
     return await asyncio.get_running_loop().run_in_executor(None, _check, node_id)
 
 
+def _copies(node_id: str, delete: str | None = None) -> dict:
+    if get_device_registry().get(node_id) is None:
+        raise HTTPException(status_code=404, detail="This Mac is not paired.")
+    try:
+        target = launcher.resolve_target(node_id)
+        if delete:
+            launcher.delete_copies(target, [delete])
+        return launcher.list_copies(target)
+    except (launcher.LaunchError, OSError, subprocess.SubprocessError) as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@router.get("/copies")
+async def copies(node_id: str) -> dict:
+    """Model copies this Mac made on a paired Mac, and its free disk."""
+    return await asyncio.get_running_loop().run_in_executor(None, _copies, node_id)
+
+
+@router.post("/copies/delete")
+async def delete_copy(node_id: str, name: str) -> dict:
+    """Remove one model copy from a paired Mac (never its own model folders)."""
+    return await asyncio.get_running_loop().run_in_executor(
+        None, _copies, node_id, name
+    )
+
+
 @router.get("/models/{model_id}")
 async def model_status(model_id: str) -> dict:
-    engine = _entry(model_id).engine
-    manager = getattr(engine, "prefill_helper", None)
-    return manager.status() if manager is not None else {"state": "unloaded"}
+    return helper_status(_entry(model_id)) or {"state": "unloaded"}
 
 
 @router.post("/models/{model_id}/{action}")
 async def model_action(model_id: str, action: str) -> dict:
-    manager = _manager(model_id)
-    actions = {"copy": manager.copy_files, "retry": manager.retry, "stop": manager.stop}
-    if action not in actions:
+    if action not in ("copy", "retry", "stop"):
         raise HTTPException(status_code=404, detail=f"Unknown action: {action}")
-    actions[action]()
-    return manager.status()
+    entry = _entry(model_id)
+    manager = getattr(entry.engine, "prefill_helper", None)
+    if manager is not None:
+        {"copy": manager.copy_files, "retry": manager.retry, "stop": manager.stop}[
+            action
+        ]()
+        return manager.status()
+    prep = file_prep(entry.model_path)
+    if prep is None:
+        raise HTTPException(
+            status_code=409, detail="Load the model to use the Prefill Accelerator."
+        )
+    if action == "copy":
+        prep.copy_files()
+    elif action == "stop":
+        prep.cancel()
+    else:
+        prepare(entry.model_path, prep.adapter, prep.node_id, prep.layers, restart=True)
+    return helper_status(entry) or {"state": "unloaded"}
 
 
 @router.get("/lending")
 async def lending() -> dict:
+    """On the helper Mac: the running helper and the Mac that set this one up."""
     marker = active_lending()
-    return {"active": marker is not None, **(marker or {})}
+    host = recorded_host()
+    device = get_device_registry().get(host["node_id"]) if host else None
+    # A host that is no longer paired here no longer uses this Mac.
+    helps = (
+        {
+            "node_id": host["node_id"],
+            "name": device.get("friendly_name") or host["name"],
+        }
+        if device
+        else None
+    )
+    return {"active": marker is not None, **(marker or {}), "helps": helps}
 
 
 @router.post("/lending/stop")

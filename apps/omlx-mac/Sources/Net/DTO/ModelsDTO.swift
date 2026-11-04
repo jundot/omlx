@@ -415,6 +415,16 @@ struct PrefillHelperStatusDTO: Codable, Equatable, Sendable {
     var done: Int64? = nil
     var onBattery: Bool? = nil
     var lastPrompt: LastPrompt? = nil
+    /// needs_files only: make_room or low_space, the disk left after copying
+    /// and the older copies make_room deletes first.
+    var prompt: String? = nil
+    var left: Int64? = nil
+    var delete: [Copy]? = nil
+
+    struct Copy: Codable, Equatable, Sendable {
+        let name: String
+        let bytes: Int64
+    }
 }
 
 /// GET /admin/api/prefill-helper/candidates?model_id=: paired Macs and
