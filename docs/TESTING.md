@@ -25,6 +25,10 @@ The audio model-list smoke test checks that app startup publishes its shim insid
 
 Run `xcodebuild -project apps/omlx-mac/oMLX.xcodeproj -scheme oMLX -destination 'platform=macOS' -only-testing:oMLXTests/ThemeTests test` to check theme colors. The readability case renders a probe through `.omlxThemed()` with isolated saved preferences, checking disabled and enabled colors in light and dark appearances. It covers the shared theme path used by popovers, not app relaunch or full-screen layout.
 
+# macOS server restart health tests
+
+Run `python -m pytest -q apps/omlx-mac/Tests/python/test_server_process_health.py` on macOS with the Xcode Command Line Tools to check `ServerProcess` restart health. It compiles the production `ServerProcess.swift` with stubbed app dependencies and short-lived `/bin/sleep` children, so no app, Python server or model is needed.
+
 # Text-only VLM loading tests
 
 Run `python -m pytest -q tests/test_vlm_vision_fallback.py` to check strict loading and logits with a small quantized DiffusionGemma checkpoint, unchanged loaders for unreadable shards or retained vision, and patch restoration after loading errors. No model download is required.

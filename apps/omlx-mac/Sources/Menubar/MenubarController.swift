@@ -823,6 +823,7 @@ final class MenubarController: NSObject {
 
     @objc private func statsDidUpdate(_ note: Notification) {
         if let poller = note.object as? MenubarStatsPoller,
+           poller.lastTickWasSuccess,
            let lastStatusSuccessAt = poller.lastStatusSuccessAt {
             server?.recordAuxiliaryHealthSuccess(at: lastStatusSuccessAt)
         }
