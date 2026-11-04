@@ -40,8 +40,18 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 _PATCH_MARKER = "_omlx_qwen35_padded_row_attention_patch"
 # Verify-row offsets for the current forward, stored on each full-attention
-# cache: (pads, cache._idx before this forward's update, query length).
+# cache: (pads, cache._idx before this forward's update, query length, mask
+# shape). The hook stores them only after checking that the forward's mask is
+# exactly left padding + causal; each layer then receives a full-width slice
+# of that mask (_prepare_projected_qkv), so the shape identifies it.
 _ROWS_ATTR = "_omlx_qwen35_verify_row_pads"
+try:
+    from ..model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS as _MAX_DRAFTS
+except ImportError:  # pragma: no cover - keeps the patch importable alone
+    _MAX_DRAFTS = 8
+# Widest MTP verify block (target token + drafts). Wider multi-token forwards
+# (prefill chunks) are not verify and keep their current path.
+_MAX_VERIFY_WIDTH = _MAX_DRAFTS + 1
 # Matches the bounded padded-verify kernel in qwen35_verify_attention: at or
 # below this many keys that kernel already serves the batch.
 _VERIFY_KERNEL_MAX_KEYS = 8192
@@ -121,15 +131,17 @@ def _decode_rows(q35, queries, keys, values, cache) -> list[int] | None:
     return list(pads) if len(plans) > 1 else None
 
 
-def _verify_rows(queries, keys, cache) -> list[int] | None:
+def _verify_rows(queries, keys, cache, mask) -> list[int] | None:
     """Pads of a padded verify batch beyond the bounded verify kernel."""
     rows = getattr(cache, _ROWS_ATTR, None)
     if rows is None:
         return None
-    pads, idx_before, length = rows
+    pads, idx_before, length, mask_shape = rows
     if (
-        queries.shape[2] != length
-        or length <= 1
+        not isinstance(mask, mx.array)
+        or mask.shape != mask_shape
+        or queries.shape[2] != length
+        or not 1 < length <= _MAX_VERIFY_WIDTH
         or len(pads) != queries.shape[0]
         or cache._idx != idx_before + length
         or keys.shape[2] != cache._idx
@@ -140,10 +152,8 @@ def _verify_rows(queries, keys, cache) -> list[int] | None:
     return list(pads)
 
 
-def _causal_padded_mask(mask, batch: int, length: int, k_size: int) -> bool:
-    """The mask BatchKVCache.make_mask builds: left padding plus causal only."""
-    if mask is None or (isinstance(mask, str) and mask == "causal"):
-        return True
+def _padded_causal_mask_shape(mask, batch: int, length: int, k_size: int) -> bool:
+    """Shape of the mask BatchKVCache.make_mask builds for a padded block."""
     return (
         isinstance(mask, mx.array)
         and mask.dtype == mx.bool_
@@ -195,15 +205,24 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
             delattr(cache, _ROWS_ATTR)
         length = h.shape[1]
         if (
-            length > 1
+            1 < length <= _MAX_VERIFY_WIDTH
             and _plain_padded_cache(cache)
             and cache._idx + length > _VERIFY_KERNEL_MAX_KEYS
-            and _causal_padded_mask(mask, h.shape[0], length, cache._idx + length)
+            and _padded_causal_mask_shape(mask, h.shape[0], length, cache._idx + length)
         ):
+            from mlx_lm.models.base import create_causal_mask
+
+            # The per-row route drops the mask and slices each row's keys
+            # from its pad: only valid if the mask is exactly that.
+            expected = create_causal_mask(
+                length, offset=cache._idx, left_padding=cache.left_padding
+            )
+            same = mx.array_equal(mask, expected)
             # One small host read per forward, like mlx-vlm's decode pads.
+            mx.eval(same, cache.left_padding)
             pads = tuple(int(p) for p in cache.left_padding.tolist())
-            if len(pads) == h.shape[0] and max(pads) > 0:
-                setattr(cache, _ROWS_ATTR, (pads, cache._idx, length))
+            if same.item() and len(pads) == h.shape[0] and max(pads) > 0:
+                setattr(cache, _ROWS_ATTR, (pads, cache._idx, length, mask.shape))
         return mask
 
     def set_pads(caches, layers, pads):
@@ -232,12 +251,8 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
         ):
             if queries.shape[2] == 1:
                 pads = _decode_rows(q35, queries, keys, values, cache)
-            elif _causal_padded_mask(
-                mask, queries.shape[0], queries.shape[2], keys.shape[2]
-            ):
-                pads = _verify_rows(queries, keys, cache)
             else:
-                pads = None
+                pads = _verify_rows(queries, keys, cache, mask)
             if pads is not None:
                 out = _per_row(original_attention, queries, keys, values, pads, scale)
                 if out is not None:

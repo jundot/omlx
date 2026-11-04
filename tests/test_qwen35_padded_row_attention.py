@@ -151,8 +151,8 @@ def test_short_verify_keeps_the_bounded_kernel(patched):
 
 def test_stale_verify_rows_are_ignored(patched):
     cache, q, k, v, mask, _ = _step([SHORT + 3000, LONG], 4)
-    pads, idx, length = getattr(cache, patched.mod._ROWS_ATTR)
-    setattr(cache, patched.mod._ROWS_ATTR, (pads, idx - 1, length))
+    pads, idx, length, shape = getattr(cache, patched.mod._ROWS_ATTR)
+    setattr(cache, patched.mod._ROWS_ATTR, (pads, idx - 1, length, shape))
     _call(q, k, v, cache, mask)
     assert cache in patched.calls
 
@@ -171,4 +171,62 @@ def test_rows_are_cleared_when_the_next_forward_is_not_padded(patched):
     caches = [cache, None, cache]
     q35._create_qwen3_5_attention_mask(h, cache)
     q35._set_qwen3_5_decode_left_padding(caches, _layers(), None)
+    assert not hasattr(cache, patched.mod._ROWS_ATTR)
+
+
+
+def _padded_causal(cache, length):
+    """The mask a padded batch should have: left padding plus causal."""
+    from mlx_lm.models.base import create_causal_mask
+
+    return create_causal_mask(
+        length, offset=cache._idx - length, left_padding=cache.left_padding
+    )
+
+
+def _reference(queries, keys, values, mask):
+    """Plain float32 attention over the whole padded batch with its mask."""
+    q = queries.astype(mx.float32)
+    k = mx.repeat(keys.astype(mx.float32), Q_HEADS // KV_HEADS, axis=1)
+    v = mx.repeat(values.astype(mx.float32), Q_HEADS // KV_HEADS, axis=1)
+    scores = mx.where(mask, (q @ k.transpose(0, 1, 3, 2)) * SCALE, -mx.inf)
+    return mx.softmax(scores, axis=-1) @ v
+
+
+@pytest.mark.parametrize("length", [1, 4])
+def test_rows_match_an_independent_masked_reference(patched, length):
+    # Unlike _solo, this shares no slicing with the patch.
+    cache, q, k, v, mask, _ = _step([SHORT + 3000, LONG], length)
+    out = _call(q, k, v, cache, mask)
+    assert out is not None and cache not in patched.calls
+    ref = _reference(q, k, v, _padded_causal(cache, length))
+    assert mx.allclose(out.astype(mx.float32), ref, atol=2e-2, rtol=2e-2).item()
+
+
+def test_forwards_wider_than_a_verify_block_keep_their_path(patched):
+    # A prefill chunk through the verifier is not a verify block.
+    cache, q, k, v, mask, _ = _step([SHORT + 3000, LONG], patched.mod._MAX_VERIFY_WIDTH + 7)
+    assert not hasattr(cache, patched.mod._ROWS_ATTR)
+    _call(q, k, v, cache, mask)
+    assert cache in patched.calls
+
+
+def test_a_mask_that_hides_more_than_padding_is_not_claimed(patched, monkeypatch):
+    from mlx_lm.models.base import create_causal_mask
+
+    def stricter(h, cache):
+        # Same shape as the padded causal mask, but row 1 may not see its
+        # first real key: dropping the mask per row would change its output.
+        mask = create_causal_mask(
+            h.shape[1], offset=cache._idx, left_padding=cache.left_padding
+        )
+        first = int(cache.left_padding[1].item())
+        return mask & ~(mx.arange(mask.shape[-1]) == first)[None, None, None, :]
+
+    # Re-apply the hook over a mask creator that adds that restriction.
+    monkeypatch.setattr(patched.mod, "_PATCHED", False)
+    monkeypatch.setattr(q35, "_create_qwen3_5_attention_mask", stricter)
+    monkeypatch.setattr(q35, "_qwen3_5_left_padded_attention", patched.original)
+    assert patched.mod.apply_qwen35_padded_row_attention_patch()
+    cache, *_ = _step([SHORT + 3000, LONG], 4)
     assert not hasattr(cache, patched.mod._ROWS_ATTR)
