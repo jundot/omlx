@@ -32,6 +32,7 @@ from omlx.cluster.discovery import (
     decode_wassup,
     encode_hello,
     encode_wassup,
+    interface_link,
 )
 from omlx.cluster.identity import NodeIdentity
 from omlx.cluster.registry import DeviceRegistry
@@ -740,6 +741,49 @@ def test_link_classification():
     assert _classify_link("fe80::1", "unknown", 0.0005) == "tb"
     assert _classify_link("10.0.0.1", "unknown", 0.005) == "ethernet"
     assert _classify_link("10.0.0.1", "unknown", 0.050) == "wifi"
+
+
+def test_interface_link_names_the_local_port_of_a_direct_route(monkeypatch):
+    routes = {
+        "192.168.2.2": "  interface: bridge0\n",
+        "192.168.1.9": "  interface: en1\n",
+        "192.168.1.30": "  interface: en0\n",
+        # Through a router the far side's link is unknown.
+        "10.9.9.9": "    gateway: 192.168.1.1\n  interface: en0\n",
+    }
+    ports = (
+        "Hardware Port: Ethernet\nDevice: en0\n\n"
+        "Hardware Port: Wi-Fi\nDevice: en1\n\n"
+        "Hardware Port: Thunderbolt Bridge\nDevice: bridge0\n"
+    )
+
+    def run(argv, **kwargs):
+        return SimpleNamespace(
+            stdout=ports if argv[0].endswith("networksetup") else routes[argv[-1]]
+        )
+
+    monkeypatch.setattr("omlx.cluster.discovery.subprocess.run", run)
+    monkeypatch.setattr("omlx.cluster.discovery.sys.platform", "darwin")
+    monkeypatch.setattr("omlx.cluster.discovery._link_cache", {})
+    monkeypatch.setattr("omlx.cluster.discovery._port_cache", [0.0, None])
+    assert [interface_link(ip) for ip in routes] == ["tb", "wifi", "ethernet", None]
+
+
+def test_a_mac_shows_its_fastest_verified_link_not_the_last_probed(monkeypatch):
+    links = {"10.0.1.5": "tb", "10.0.0.5": "wifi"}
+    monkeypatch.setattr("omlx.cluster.discovery.interface_link", links.get)
+    service, _ = _service(
+        "aaaa-node",
+        prober=lambda ip, port, timeout: {
+            "node_id": "bbbb-node",
+            "version": "0.6.1",
+            "cluster_name": "omlx",
+        },
+    )
+    for ip in links:
+        service.add_manual(ip, 8000)
+        service.probe_candidate_now(ip, 8000)
+    assert service.peers()[0].link == "tb"
 
 
 # -- mDNS -----------------------------------------------------------------------

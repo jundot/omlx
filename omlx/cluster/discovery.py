@@ -527,6 +527,10 @@ from dataclasses import dataclass, field  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from .._version import __version__ as _omlx_version  # noqa: E402
+from .transport import (  # noqa: E402
+    parse_thunderbolt_interfaces,
+    parse_wifi_interfaces,
+)
 
 logger = logging.getLogger(__name__)  # noqa: E402
 _probe_diagnostics = threading.local()
@@ -1044,6 +1048,80 @@ def _classify_link(ip: str, if_type: str, rtt: float | None) -> PeerLink:
     if rtt < 0.010:
         return "ethernet"
     return "wifi"
+
+
+# Fastest first; a Mac shows the best link among its verified addresses.
+_LINK_RANK = {"tb": 0, "ethernet": 1, "wifi": 2, "tailscale": 3, "unknown": 4}
+_LINK_CACHE_S = 60.0
+_link_cache: dict[str, tuple[float, PeerLink | None]] = {}
+_port_cache: list[Any] = [0.0, None]
+_link_cache_lock = threading.Lock()
+
+
+def _local_ports() -> tuple[frozenset[str], frozenset[str]]:
+    """(Thunderbolt, Wi-Fi) interface names from macOS hardware ports."""
+    now = time.monotonic()
+    with _link_cache_lock:
+        if _port_cache[1] is not None and now - _port_cache[0] < _LINK_CACHE_S:
+            return _port_cache[1]
+    try:
+        output = subprocess.run(  # noqa: S603 - fixed system executable
+            ["/usr/sbin/networksetup", "-listallhardwareports"],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        output = ""
+    ports = (parse_thunderbolt_interfaces(output), parse_wifi_interfaces(output))
+    with _link_cache_lock:
+        _port_cache[:] = [now, ports]
+    return ports
+
+
+def interface_link(ip: str) -> PeerLink | None:
+    """Kind of the local interface that reaches *ip* directly, on macOS.
+
+    ``None`` when the route goes through a gateway (the far side is unknown)
+    or the interface is not a named hardware port.
+    """
+
+    if sys.platform != "darwin" or ":" in ip:
+        return None
+    now = time.monotonic()
+    with _link_cache_lock:
+        cached = _link_cache.get(ip)
+        if cached is not None and now - cached[0] < _LINK_CACHE_S:
+            return cached[1]
+    try:
+        output = subprocess.run(  # noqa: S603 - fixed system executable
+            ["/sbin/route", "-n", "get", ip],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        output = ""
+    fields = dict(
+        (key.strip().lower(), value.strip())
+        for key, sep, value in (line.partition(":") for line in output.splitlines())
+        if sep
+    )
+    interface = fields.get("interface", "")
+    link: PeerLink | None = None
+    if interface and "gateway" not in fields:
+        thunderbolt, wifi = _local_ports()
+        if interface in thunderbolt:
+            link = "tb"
+        elif interface in wifi:
+            link = "wifi"
+        elif interface.startswith("en"):
+            link = "ethernet"
+    with _link_cache_lock:
+        _link_cache[ip] = (now, link)
+    return link
 
 
 def _load_zeroconf() -> Any | None:
@@ -1785,6 +1863,11 @@ class DiscoveryService:
                 "error": "" if result is not None else "probe returned no identity",
             }
         rtt = self._clock() - started
+        link = (
+            interface_link(ip) or _classify_link(ip, if_type, rtt)
+            if result is not None
+            else "unknown"
+        )
         if result is None:
             with self._lock:
                 candidate = self._candidates.get((ip, port))
@@ -1818,6 +1901,7 @@ class DiscoveryService:
                 candidate["node_id"] = node_id
                 candidate["last_transport"] = diagnostic.get("transport")
                 candidate["last_error"] = ""
+                candidate["link"] = link
             peer = self._peers.get(node_id)
             is_new = peer is None
             if peer is None:
@@ -1832,7 +1916,14 @@ class DiscoveryService:
             if not any(a["ip"] == ip for a in peer.addrs):
                 peer.addrs.append({"ip": ip, "if_type": if_type})
                 peer.addrs = peer.addrs[-8:]
-            peer.link = _classify_link(ip, if_type, rtt)
+            fresh = [
+                value.get("link") or "unknown"
+                for value in self._candidates.values()
+                if value.get("node_id") == node_id
+                and value.get("verified")
+                and now - (value.get("last_success") or 0.0) < self.config.dead_after
+            ]
+            peer.link = min(fresh or [link], key=lambda kind: _LINK_RANK.get(kind, 4))
         self._merge_registry(peer)
         if is_new:
             self._fire_change(peer)
@@ -1981,7 +2072,20 @@ class DiscoveryService:
 
     @staticmethod
     def _local_addresses() -> list[bytes]:
+        # Every LAN IPv4, so a peer can probe the Thunderbolt or wired path
+        # too, not only the address the host name resolves to.
         packed: list[bytes] = []
+        for item in local_addr_dicts():
+            with suppress(ValueError):
+                ip = ipaddress.ip_address(item["ip"])
+                if (
+                    item.get("if_type") == "lan"
+                    and ip.version == 4
+                    and not (ip.is_loopback or ip.is_link_local)
+                ):
+                    packed.append(ip.packed)
+        if packed:
+            return packed[:8]
         with suppress(OSError):
             hostname = socket.gethostname()
             for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
