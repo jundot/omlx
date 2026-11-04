@@ -6272,7 +6272,7 @@ def _stock_quantized_linear_call(self, x):
     )
 
 
-def _batched_decode_spy(monkeypatch, nax=False):
+def _batched_decode_spy(monkeypatch, nax=False, bits=4):
     """Enable batched decode routing on small layers and record each route.
 
     The patch wraps a stock call, so verify wrappers installed by other tests
@@ -6281,6 +6281,7 @@ def _batched_decode_spy(monkeypatch, nax=False):
     monkeypatch.setattr(nn.QuantizedLinear, "__call__", _stock_quantized_linear_call)
     monkeypatch.setattr(batched_decode_qmm, "_PATCHED", False)
     monkeypatch.setattr(qwen35_verify_qmm, "is_nax_available", lambda: nax)
+    monkeypatch.setattr(qwen35_verify_qmm, "_MIN_ROUTE_N", 256)
     monkeypatch.setattr(qwen35_verify_qmm, "_MIN_SG8_ROUTE_N", 256)
     monkeypatch.setattr(qwen35_verify_qmm, "_MIN_MMA_ROUTE_N", 256)
     batched_decode_qmm._route.cache_clear()
@@ -6294,29 +6295,36 @@ def _batched_decode_spy(monkeypatch, nax=False):
     monkeypatch.setattr(qwen35_verify_qmm, "run_route", spy)
     assert batched_decode_qmm.apply_batched_decode_qmm_patch()
     mx.random.seed(5)
-    layer = nn.QuantizedLinear(512, 288, bias=False, bits=4, group_size=64)
+    layer = nn.QuantizedLinear(512, 288, bias=False, bits=bits, group_size=64)
     layer.scales = layer.scales.astype(mx.bfloat16)
     layer.biases = layer.biases.astype(mx.bfloat16)
     return layer, calls
 
 
 @pytest.mark.parametrize(
-    "shape,routed",
+    "shape,bits,routed",
     [
-        ((8, 1, 512), "sg8"),
-        ((16, 1, 512), "mma"),
-        ((24, 1, 512), "mma"),
-        ((4, 1, 512), None),
-        ((1, 8, 512), None),
-        ((8, 2, 512), None),
+        ((8, 1, 512), 4, "sg8"),
+        ((16, 1, 512), 4, "mma"),
+        ((24, 1, 512), 4, "mma"),
+        ((6, 1, 512), 8, "vk"),
+        ((4, 1, 512), 4, None),
+        ((1, 8, 512), 4, None),
+        ((8, 2, 512), 4, None),
     ],
 )
-def test_batched_decode_routes_one_token_rows(monkeypatch, shape, routed):
+def test_batched_decode_routes_one_token_rows(monkeypatch, shape, bits, routed):
     """Decode steps of six or more requests take the multi-row kernels."""
-    layer, calls = _batched_decode_spy(monkeypatch)
+    layer, calls = _batched_decode_spy(monkeypatch, bits=bits)
     x = (mx.random.normal(shape) * 0.5).astype(mx.bfloat16)
     expected = mx.quantized_matmul(
-        x, layer.weight, layer.scales, layer.biases, transpose=True, group_size=64
+        x,
+        layer.weight,
+        layer.scales,
+        layer.biases,
+        transpose=True,
+        group_size=64,
+        bits=bits,
     ).astype(mx.float32)
     out = layer(x).astype(mx.float32)
     assert calls == ([routed] if routed else [])

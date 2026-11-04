@@ -4,8 +4,9 @@
 Stock affine ``quantized_matmul`` reads the weights once per ``qmv_wide`` tile
 of up to five rows, then switches to a qmm, so a decode step of 8 or 16
 requests costs far more than one of four. The verify kernels in
-``qwen35_verify_qmm`` (``sg8`` up to 8 rows, ``mma`` up to 24) read each
-weight tile once for every row, and they serve one-token decode rows too.
+``qwen35_verify_qmm`` (``vk`` at 6 rows, ``sg8`` up to 8 rows, ``mma`` up to
+24) read each weight tile once for every row, and they serve one-token decode
+rows too.
 
 Only (rows, 1, K) inputs with at least ``MIN_ROWS`` rows are routed, and only
 while no speculative verify or one-row exactness mode is armed. Those modes
@@ -28,7 +29,8 @@ logger = logging.getLogger(__name__)
 
 # On M3 Ultra sg8 is slower than stock qmv_wide at four decode rows.
 MIN_ROWS = 6
-_ROUTES = ("sg8", "mma", "m1_mma")
+# vk takes the 6-row layers sg8 cannot read (8-bit), which mma starts above.
+_ROUTES = ("sg8", "mma", "m1_mma", "vk")
 
 _PATCHED = False
 _ENABLED = False
