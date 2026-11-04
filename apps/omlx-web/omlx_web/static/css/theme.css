@@ -296,6 +296,23 @@
     --info-line: rgb(var(--palette-blue-200));
     --info-text: rgb(var(--palette-blue-700));
     --text-success: var(--success-text);
+
+    /* Named steps. Values match what the console draws today; the utility
+       layer starts resolving through them in the next steps. */
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+    --radius-pill: 9999px;
+    --shadow-raised: 0 1px 2px 0 rgb(var(--palette-black) / 0.05);
+    --shadow-overlay: 0 4px 12px 0 rgb(var(--palette-black) / 0.15);
+    --z-sticky: 30;
+    --z-dropdown: 40;
+    --z-overlay: 50;
+    --z-modal: 60;
+    --z-toast: 1000;
+    --layout-rail: 260px;
+    --layout-rail-wide: 320px;
     color-scheme: light;
 }
 
