@@ -23,6 +23,7 @@ from pydantic import BaseModel, field_validator
 from ..custom_kernels.quant_matmul import fast as quant_fast
 from ..model_discovery import model_display_name
 from ..model_settings import a8_prefill_on, ced_prefill_on, oq_a8_model_supported
+from ..prefill_helper.manager import PrefillHelperManager
 from ..utils.proc_memory import get_lifetime_max_phys_footprint
 from ..utils.system_sampler import SystemSampler
 from .external_api import ExternalAPIClient, ExternalEndpointConfig
@@ -517,7 +518,9 @@ def _prefill_helper_details(engine: Any) -> dict | None:
     Hardware only; the helper Mac's name and node id stay local.
     """
     manager = getattr(engine, "prefill_helper", None)
-    status = manager.status() if manager is not None else {}
+    if not isinstance(manager, PrefillHelperManager):
+        return None
+    status = manager.status()
     if status.get("state") not in ("ready", "working"):
         return None
     memory = status.get("memory")
@@ -534,7 +537,7 @@ def _prefill_helper_details(engine: Any) -> dict | None:
 async def _wait_for_prefill_helper(run: Any, engine: Any) -> dict | None:
     """Wait for the chosen helper so every test runs with it, or give up."""
     manager = getattr(engine, "prefill_helper", None)
-    if manager is None:
+    if not isinstance(manager, PrefillHelperManager):
         return None
     deadline = time.monotonic() + _PREFILL_HELPER_WAIT_S
     announced = False
@@ -2021,7 +2024,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         logger.info(f"Benchmark: loaded {request.model_id}")
         if model_settings is not None:
             helper = None
-            if getattr(model_settings, "prefill_helper_node_id", None):
+            if isinstance(getattr(model_settings, "prefill_helper_node_id", None), str):
                 helper = await _wait_for_prefill_helper(run, engine)
             if helper is not None:
                 run.feature_flags.append(

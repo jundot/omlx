@@ -1127,9 +1127,10 @@ def test_prefill_helper_details_only_while_it_helps():
         "held": 28,
         "link": "thunderbolt",
     }
-    manager = SimpleNamespace(
-        status=lambda: status, fixed_layers=None, a8_min_tokens=128
-    )
+    from omlx.prefill_helper.manager import PrefillHelperManager
+
+    manager = MagicMock(spec=PrefillHelperManager, fixed_layers=None, a8_min_tokens=128)
+    manager.status.side_effect = lambda: status
     engine = SimpleNamespace(prefill_helper=manager)
     # Hardware only: the Mac's name and node id stay local.
     assert _prefill_helper_details(engine) == {
@@ -1142,7 +1143,8 @@ def test_prefill_helper_details_only_while_it_helps():
     }
     status["state"] = "connecting"
     assert _prefill_helper_details(engine) is None
-    assert _prefill_helper_details(SimpleNamespace()) is None
+    # An engine without a helper manager (a mock answers any attribute).
+    assert _prefill_helper_details(MagicMock()) is None
 
 
 class TestFilterUploadedSettings:
