@@ -108,6 +108,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "deepseek_v41_engram_ssd_offload",
         # Architecture-level prefill strategy; explicit per model.
         "deepseek_v41_ced_prefill_enabled",
+        # Which other Mac helps depends on this setup, not on the model.
+        "prefill_helper_node_id",
+        "prefill_helper_layers",
         # Only meaningful for checkpoints that carry bfloat16 leaves; the
         # dashboard gates it per model, so a profile must not carry it over.
         "activation_fp16_enabled",

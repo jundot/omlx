@@ -49,13 +49,20 @@ from ..api.utils import (
 from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
-from ..model_settings import ane_prefill_backend, ane_prefill_fraction
+from ..model_settings import (
+    a8_prefill_on,
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    ced_prefill_on,
+)
 from ..models.vlm import VLMModelAdapter
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
+from ..prefill_helper.adapters import adapter_for as stage_adapter_for
+from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
@@ -1725,6 +1732,7 @@ class VLMBatchedEngine(BaseEngine):
 
         self._vlm_model = None
         self._processor = None
+        self._prefill_helper: PrefillHelperManager | None = None
         # Set after load for checkpoints that take native video input.
         self._native_video = False
         self._tokenizer = None
@@ -2066,16 +2074,8 @@ class VLMBatchedEngine(BaseEngine):
                                 False,
                             )
                         ),
-                        ced_prefill=bool(
-                            getattr(
-                                self._model_settings,
-                                "deepseek_v41_ced_prefill_enabled",
-                                False,
-                            )
-                        ),
-                        a8_prefill=bool(
-                            getattr(self._model_settings, "a8_prefill_enabled", False)
-                        ),
+                        ced_prefill=ced_prefill_on(self._model_settings),
+                        a8_prefill=a8_prefill_on(self._model_settings),
                         a8_prefill_min_tokens=int(
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
@@ -2503,8 +2503,20 @@ class VLMBatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
-        # TurboQuant KV cache
         scheduler = self._engine.engine.scheduler
+        stage_adapter = stage_adapter_for(self.model_type)
+        if stage_adapter is not None:
+            self._prefill_helper = PrefillHelperManager(
+                model_path=self._model_name,
+                model_type=self.model_type,
+                adapter=stage_adapter,
+                language_model=stage_adapter.language_model(self._adapter),
+                attach=scheduler.attach_prefill_helper,
+                chunk_tokens=scheduler._base_prefill_step_size(0, 1 << 30),
+            )
+            self.configure_prefill_helper(self._model_settings)
+
+        # TurboQuant KV cache
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
@@ -2681,10 +2693,7 @@ class VLMBatchedEngine(BaseEngine):
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
         # DeepSeek V4.1 applies the setting in its own loader.
-        if (
-            getattr(self._model_settings, "a8_prefill_enabled", False)
-            and self.model_type != "deepseek_v41"
-        ):
+        if a8_prefill_on(self._model_settings) and self.model_type != "deepseek_v41":
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -2902,10 +2911,33 @@ class VLMBatchedEngine(BaseEngine):
     def dflash_drafter(self) -> Any | None:
         return self._dflash_drafter
 
+    def configure_prefill_helper(self, settings: Any) -> None:
+        """Apply the model's Prefill Accelerator choice without a reload."""
+        if self._prefill_helper is not None:
+            self._prefill_helper.configure(
+                getattr(settings, "prefill_helper_node_id", None),
+                getattr(settings, "prefill_helper_layers", None),
+                (
+                    int(getattr(settings, "a8_prefill_min_tokens", 128))
+                    if a8_prefill_on(settings)
+                    else None
+                ),
+            )
+
+    @property
+    def prefill_helper(self) -> PrefillHelperManager | None:
+        return self._prefill_helper
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
         engine = self._engine
+        if self._prefill_helper is not None:
+            # Stops the helper on the other Mac and frees its memory.
+            await asyncio.get_running_loop().run_in_executor(
+                None, self._prefill_helper.close
+            )
+            self._prefill_helper = None
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
             cancel_event.set()

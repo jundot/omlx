@@ -22,6 +22,14 @@
         </div>
 
         <div class="mx-auto px-4 sm:px-6 py-6 sm:py-10 relative z-10" :class="mainTab === 'status' ? dashboardWidthClass : 'max-w-7xl'">
+            <!-- This Mac runs another Mac's Prefill Accelerator helper. -->
+            <div x-show="prefillLending" x-cloak
+                 class="mb-6 bg-amber-50 border border-amber-200 rounded-2xl px-5 py-4 flex items-center justify-between gap-4">
+                <p class="text-sm text-amber-900" x-text="prefillLendingText()"></p>
+                <button type="button" @click="stopPrefillLending()"
+                        class="flex-shrink-0 px-4 py-1.5 text-sm font-medium rounded-full bg-amber-600 text-white hover:bg-amber-700">{{ t('dashboard.prefill_lending_stop') }}</button>
+            </div>
+
             <!-- Status Main Tab -->
             {% include "dashboard/_status.html" %}
 

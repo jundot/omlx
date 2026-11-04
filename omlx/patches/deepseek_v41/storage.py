@@ -321,6 +321,29 @@ def decode_array(raw, dtype):
     return mx.array(raw)
 
 
+def decode_rows(data, shape, bits, group_size, scaled):
+    """bf16 rows of shape ``shape + (dim,)`` from packed table rows.
+
+    ``data`` holds ``(raw, dtype)`` for the weight, then scales and biases.
+    """
+    values = decode_array(*data[0])
+    if bits is not None:
+        values = mx.dequantize(
+            values,
+            decode_array(*data[1]),
+            decode_array(*data[2]),
+            bits=bits,
+            group_size=group_size,
+            mode="affine",
+        )
+    elif scaled:
+        scales = decode_array(*data[1])
+        values = (values.reshape(values.shape[0], -1, 32) * scales[..., None]).reshape(
+            values.shape
+        )
+    return values.reshape(*shape, values.shape[-1]).astype(mx.bfloat16)
+
+
 def dedupe_tuple_ids(ids):
     """Unique Engram 24-id tuples for wide prefill rows, and their inverse.
 
@@ -430,6 +453,11 @@ class DiskEngramEmbedding(nn.Module):
                     result.append((raw[rows], dtype))
             return result
 
+    def read_packed(self, host):
+        """Packed rows of ``host`` and the ``decode_rows`` settings for them."""
+        settings = (self._bits, self._group_size, self._scale_key is not None)
+        return self._read_rows(host), settings
+
     def __call__(self, indices):
         host = np.asarray(indices).astype(np.int64)
         pending, self._prefetched = self._prefetched, None
@@ -440,22 +468,9 @@ class DiskEngramEmbedding(nn.Module):
                 data = self._read_rows(host)
         else:
             data = self._read_rows(host)
-        values = decode_array(*data[0])
-        if self._bits is not None:
-            values = mx.dequantize(
-                values,
-                decode_array(*data[1]),
-                decode_array(*data[2]),
-                bits=self._bits,
-                group_size=self._group_size,
-                mode="affine",
-            )
-        elif self._scale_key is not None:
-            scales = decode_array(*data[1])
-            values = (
-                values.reshape(values.shape[0], -1, 32) * scales[..., None]
-            ).reshape(values.shape)
-        return values.reshape(*host.shape, values.shape[-1]).astype(mx.bfloat16)
+        return decode_rows(
+            data, host.shape, self._bits, self._group_size, self._scale_key is not None
+        )
 
     def close(self):
         with self._lock:

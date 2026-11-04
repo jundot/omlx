@@ -72,14 +72,20 @@ from .model_discovery import (
     format_size,
     is_realtime_stt_model,
 )
+from .custom_kernels.quant_matmul import fast as quant_fast
 from .model_settings import (
     ModelSettings,
+    a8_prefill_on,
+    ced_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
     validate_ane_prefill,
 )
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
+from .prefill_helper.adapters import adapter_for as prefill_stage_adapter
+from .prefill_helper.lending import lending_note
+from .prefill_helper.manager import prepare as prepare_prefill_helper
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
 from .speculative.dflash import context_bytes_per_row, load_dflash_drafter
@@ -1315,7 +1321,7 @@ class EnginePool:
             add("deepseek_v41_engram_ssd_offload", v41_offload)
             add(
                 "deepseek_v41_ced_prefill_enabled",
-                getattr(settings, "deepseek_v41_ced_prefill_enabled", False),
+                ced_prefill_on(settings),
             )
             factor = yarn_factor(
                 entry.config_model_type,
@@ -1336,7 +1342,9 @@ class EnginePool:
         # process-wide projection backends, and caches a prepared plan and
         # metadata on every module it classifies. None of that can be undone
         # in place, so a change here has to land on a fresh engine.
-        oq_a8_active = bool(data.get("a8_prefill_enabled", False))
+        # Without INT8 tensor units here, A8 only reaches a Prefill Accelerator
+        # Mac's layers, which follow it without reloading this model.
+        oq_a8_active = a8_prefill_on(data) and quant_fast.oq_a8_available()
         add("a8_prefill_enabled", oq_a8_active)
         if oq_a8_active:
             add("a8_prefill_min_tokens", data.get("a8_prefill_min_tokens", 128))
@@ -2390,6 +2398,30 @@ class EnginePool:
                 logger.debug("external process memory read failed", exc_info=True)
         return total
 
+    def _start_prefill_helper_early(self, entry: Any, settings: Any) -> bool:
+        """Start the chosen Prefill Accelerator while this Mac loads the model."""
+        node_id = getattr(settings, "prefill_helper_node_id", None)
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        adapter = prefill_stage_adapter(model_type)
+        if node_id is None or adapter is None:
+            return False
+        prepare_prefill_helper(
+            entry.model_path,
+            adapter,
+            node_id,
+            getattr(settings, "prefill_helper_layers", None),
+            launch={
+                "model_type": model_type,
+                "warm_tokens": self._scheduler_config.prefill_step_size,
+                "a8_min_tokens": (
+                    int(getattr(settings, "a8_prefill_min_tokens", 128))
+                    if a8_prefill_on(settings)
+                    else None
+                ),
+            },
+        )
+        return True
+
     def _validate_llm_engine_ready(self, model_id: str, engine: object | None) -> None:
         if engine is None:
             raise ModelLoadingError(
@@ -3010,6 +3042,7 @@ class EnginePool:
                             f"({failure_label}: {format_size(failure_current)}, "
                             f"{admission_kind}: {format_size(admission_size)}). "
                             f"{advice or DEFAULT_CEILING_ADVICE}."
+                            f"{lending_note()}"
                         ),
                     )
 
@@ -4287,6 +4320,9 @@ class EnginePool:
 
             if isinstance(engine, SplashEngine):
                 self._starting_external[model_id] = engine
+            early_helper = hasattr(
+                type(engine), "prefill_helper"
+            ) and self._start_prefill_helper_early(entry, model_settings)
             try:
                 await self._start_engine(engine)
             except Exception as start_error:
@@ -4374,6 +4410,9 @@ class EnginePool:
                     raise
             finally:
                 self._starting_external.pop(model_id, None)
+                if early_helper and getattr(engine, "prefill_helper", None) is None:
+                    # No loaded model will take the started helper over.
+                    prepare_prefill_helper(entry.model_path, None, None, None)
 
             # Check if memory enforcer requested abort during loading
             if entry.abort_loading:
