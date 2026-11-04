@@ -1184,6 +1184,12 @@
             "value" : "Number Scale"
           }
         },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zahlenformat"
+          }
+        },
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1224,6 +1230,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Applies to counts in the window; the menu bar stays compact."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gilt für Zähler im Fenster; die Menüleiste bleibt kompakt."
           }
         },
         "ja" : {
@@ -1268,6 +1280,12 @@
             "value" : "Higher Units"
           }
         },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Größere Einheiten"
+          }
+        },
         "ja" : {
           "stringUnit" : {
             "state" : "translated",
@@ -1308,6 +1326,12 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Exact Digits"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vollständige Zahlen"
           }
         },
         "ja" : {
