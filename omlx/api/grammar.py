@@ -25,12 +25,149 @@ The processor supports two usage modes:
 """
 
 import logging
+import re
 from typing import List, Optional
 
 import mlx.core as mx
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def with_tool_call_alternative(output_format: dict, tokenizer, tools=None) -> dict:
+    """Allow a tool response independently of the final answer's format.
+
+    Prefer xgrammar's tool formats for the loaded parser. Other paired
+    protocols retain parser validation, including literal markers in arguments.
+    Never infer a protocol from the model name or the reasoning parser.
+    """
+    begin = getattr(tokenizer, "tool_call_start", None)
+    end = getattr(tokenizer, "tool_call_end", None)
+    if not isinstance(begin, str) or not begin or not isinstance(end, str):
+        raise ValueError(
+            "Cannot combine tools and structured output without tool-call delimiters"
+        )
+
+    parser_module = getattr(getattr(tokenizer, "tool_parser", None), "__module__", "")
+    parser = (
+        parser_module.rsplit(".", 1)[-1]
+        if parser_module.startswith(("mlx_lm.tool_parsers.", "mlx_vlm.tools.parsers."))
+        else None
+    )
+    # Only formats whose disabled-reasoning builtin is a standalone call can
+    # be composed here. Others retain their tokenizer's envelope below.
+    builtin = {
+        "qwen3_coder": "qwen_3_5",
+        "glm47": "glm_4_7",
+        "kimi_k2": "kimi",
+    }.get(parser)
+    if tools and builtin:
+        from .._torch_stub import install as _install_torch_stub
+
+        _install_torch_stub()
+        import xgrammar as xgr
+
+        tool_format = xgr.get_model_structural_tag(
+            builtin,
+            tools=tools,
+            tool_choice="required",
+            reasoning=False,
+            max_whitespace_cnt=32,
+        ).model_dump()["format"]
+        # The final-answer alternative owns text output. Keep only actual calls
+        # from a builtin that otherwise permits prose around its triggers.
+        if tool_format["type"] == "triggered_tags":
+            tool_format = {"type": "or", "elements": tool_format["tags"]}
+    elif tools and (parser == "json_tools" or (begin == "[TOOL_CALLS]" and not end)):
+        calls = []
+        headers = []
+        for tool in tools:
+            function = tool["function"]
+            name = function["name"]
+            parameters = function.get("parameters")
+            if parameters is None or function.get("strict") is False:
+                parameters = {"type": "object"}
+            calls.append(
+                {
+                    "type": "object",
+                    "properties": {"name": {"const": name}, "arguments": parameters},
+                    "required": ["name", "arguments"],
+                }
+            )
+            if not end:
+                headers.append(
+                    {
+                        "type": "tag",
+                        "begin": f"{begin}{name}[ARGS]",
+                        "content": {
+                            "type": "json_schema",
+                            "json_schema": parameters,
+                            "max_whitespace_cnt": 32,
+                        },
+                        "end": "",
+                    }
+                )
+        call_schema = {"anyOf": calls}
+        json_call = {
+            "type": "tag",
+            "begin": begin,
+            "content": {
+                "type": "json_schema",
+                "json_schema": (
+                    {"type": "array", "items": call_schema, "minItems": 1}
+                    if not end
+                    else {
+                        "anyOf": [
+                            call_schema,
+                            {"type": "array", "items": call_schema, "minItems": 1},
+                        ]
+                    }
+                ),
+                "max_whitespace_cnt": 32,
+            },
+            "end": end,
+        }
+        tool_format = {"type": "or", "elements": [json_call, *headers]}
+    elif end:
+        # AnyText inside a Tag eagerly consumes the first closing marker,
+        # even when it belongs to a quoted argument. A regular language for
+        # the complete envelope preserves such payloads for the output parser.
+        tool_format = {
+            "type": "regex",
+            "pattern": re.escape(begin) + r"[\s\S]*" + re.escape(end),
+        }
+    else:
+        raise ValueError("Unsupported one-sided tool-call protocol")
+
+    whitespace = {"type": "regex", "pattern": r"[ \t\r\n]{0,32}"}
+    tool_calls = {
+        "type": "sequence",
+        "elements": [
+            whitespace,
+            {
+                "type": "plus",
+                "content": {
+                    "type": "sequence",
+                    "elements": [
+                        tool_format,
+                        whitespace,
+                    ],
+                },
+            },
+        ],
+    }
+    if output_format["type"] == "json_schema":
+        # JSON permits surrounding whitespace. It must remain a valid prefix
+        # for the final answer too, or a newline commits decoding to tools.
+        output_format = {
+            "type": "sequence",
+            "elements": [
+                whitespace,
+                {**output_format, "max_whitespace_cnt": 32},
+                whitespace,
+            ],
+        }
+    return {"type": "or", "elements": [output_format, tool_calls]}
 
 
 def create_grammar_compiler(tokenizer, model, *, cache_limit_bytes=-1):

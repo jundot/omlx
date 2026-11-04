@@ -4045,15 +4045,19 @@ def parse_json_output(
 
 def build_json_system_prompt(
     response_format: Optional[Union[ResponseFormat, Dict[str, Any]]] = None,
+    *,
+    tools_available: bool = False,
 ) -> Optional[str]:
     """
     Build a system prompt instruction for JSON output.
 
-    For models without native JSON mode support, this adds instructions
-    to the prompt to encourage proper JSON formatting.
+    Local grammar enforcement constrains tokens but does not tell the model
+    what its final answer should contain. Make that contract visible while
+    leaving reasoning and intermediate tool calls available.
 
     Args:
         response_format: ResponseFormat specification
+        tools_available: Whether the model can call tools before its final answer
 
     Returns:
         System prompt instruction string, or None if not needed
@@ -4080,24 +4084,31 @@ def build_json_system_prompt(
         return None
 
     if format_type == "json_object":
-        return (
-            "You must respond with valid JSON only. "
-            "Do not include any explanation or text outside the JSON object."
+        prompt = (
+            "Your final answer must be valid JSON only. "
+            "Do not include Markdown or text outside the final JSON object."
         )
-
-    if format_type == "json_schema":
+    elif format_type == "json_schema":
         json_schema_spec = rf_dict.get("json_schema") or {}
         schema = json_schema_spec.get("schema", {})
         name = json_schema_spec.get("name", "response")
         description = json_schema_spec.get("description", "")
 
-        prompt = f"You must respond with valid JSON matching the '{name}' schema."
+        prompt = f"Your final answer must be valid JSON matching the '{name}' schema."
         if description:
             prompt += f" {description}"
         prompt += (
             f"\n\nJSON Schema:\n```json\n{json.dumps(schema, indent=2)}\n```\n\n"
-            "Respond with only the JSON object, no additional text or explanation."
+            "For the final answer, return only the JSON value, "
+            "with no Markdown or text outside it."
         )
-        return prompt
+    else:
+        return None
 
-    return None
+    if tools_available:
+        prompt += (
+            "\nYou may call available tools as needed before your final answer. "
+            "The JSON format requirement applies only to the final answer, "
+            "not to tool calls or tool results."
+        )
+    return prompt

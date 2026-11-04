@@ -250,6 +250,10 @@ Run `python -m pytest -q tests/test_engine_pool.py tests/test_active_models_visi
 
 Run `python -m pytest -q tests/integration/test_server_endpoints.py -k structured_output` to check that JSON cleanup keeps Unicode keys and values readable. The cases cover `json_object` and `json_schema` on both OpenAI endpoints, including buffered chat streaming and Responses completion events. Responses streaming must finish with the same text as the emitted deltas. They also check that an unpaired surrogate escape in the model JSON is returned unchanged instead of failing response serialization.
 
+# Structured output with tools
+
+Run `python -m pytest -q tests/test_grammar_tool_calls.py tests/integration/test_responses_tool_merge.py` for the grammar and endpoint regressions: tool calls alongside final JSON, newline token masks, parser compatibility, and schema visibility after tool results. The endpoint cases cover both OpenAI endpoints, streaming, MCP tools, native format delegation, and fallback warnings. Check model behavior separately with a representative multi-turn tool conversation.
+
 # Batched Qwen4 QSA decode and verify tests
 
 Run `python -m pytest -q tests/test_qwen4_qsa_decode_gather.py -k "batch_bank or batch_gather"` to check the batched QSA paths. The row-bank cases drive one attention layer through right-padded chunked prompt prefill, decode, verify windows, ragged vector rollback, reorder and drop filters, extend, trim and state restore, and require layer outputs and cache state to be bit-identical with fresh per-row indexer caches. The gathered cases compare batched decode steps and verify windows with the dense masked path: outputs allclose, cache state identical, every query bounded to the QSA budget plus its tail, and each fail-closed case kept on the dense path. Both groups include the served ratio 4 / top-k 512 geometry.

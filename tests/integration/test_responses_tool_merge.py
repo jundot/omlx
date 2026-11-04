@@ -55,6 +55,8 @@ class MockTokenizer:
 class MockGenerationOutput:
     def __init__(self, text="Chat response.", **kwargs):
         self.text = text
+        self.new_text = kwargs.get("new_text", text)
+        self.finished = kwargs.get("finished", True)
         self.tokens = kwargs.get("tokens", [1, 2, 3])
         self.prompt_tokens = kwargs.get("prompt_tokens", 10)
         self.completion_tokens = kwargs.get("completion_tokens", 5)
@@ -312,6 +314,189 @@ class TestMCPMergeOrderingResponses:
         matching = [t for t in tools if t["function"]["name"] == "weather__get_weather"]
         assert len(matching) == 1
         assert matching[0]["function"]["description"] == "client override"
+
+
+class TestStructuredOutputWithTools:
+    SCHEMA = {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    }
+
+    @pytest.fixture
+    def format_engine(self, engine, monkeypatch):
+        import xgrammar as xgr
+        from mlx_lm.tool_parsers import qwen3_coder
+
+        vocab = [bytes([i]) for i in range(256)] + [b"</s>"]
+        engine._grammar_compiler = xgr.GrammarCompiler(
+            xgr.TokenizerInfo(vocab, stop_token_ids=[256]), max_threads=1
+        )
+        engine._tokenizer.tool_call_start = qwen3_coder.tool_call_start
+        engine._tokenizer.tool_call_end = qwen3_coder.tool_call_end
+        engine._tokenizer.tool_parser = qwen3_coder.parse_tool_call
+        engine._tokenizer.chat_template = (
+            "{% if message['role'] == 'tool' %}{{ tool_calls }}{% endif %}"
+        )
+        engine._tokenizer._omlx_supports_mid_system_messages = True
+        engine.recorded_messages = []
+
+        async def chat(messages, **kwargs):
+            engine.recorded_messages.append(messages)
+            engine.recorded_chat_kwargs.append(kwargs)
+            return MockGenerationOutput(text='{"answer":"done"}')
+
+        async def stream_chat(messages, **kwargs):
+            yield await chat(messages, **kwargs)
+
+        monkeypatch.setattr(engine, "chat", chat)
+        monkeypatch.setattr(engine, "stream_chat", stream_chat)
+        return engine
+
+    def payload(self, endpoint, stream=False):
+        prompt = {"role": "user", "content": "Check the weather before answering."}
+        payload = {"model": "test-model", "stream": stream}
+        if endpoint == "responses":
+            payload.update(
+                input=[
+                    prompt,
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "weather__get_weather",
+                        "arguments": '{"location":"Berlin"}',
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "Sunny",
+                    },
+                ],
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "answer",
+                        "strict": True,
+                        "schema": self.SCHEMA,
+                    }
+                },
+            )
+        else:
+            payload.update(
+                messages=[
+                    prompt,
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "weather__get_weather",
+                                    "arguments": '{"location":"Berlin"}',
+                                },
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "strict": True,
+                        "schema": self.SCHEMA,
+                    },
+                },
+            )
+        return payload
+
+    @pytest.mark.parametrize(
+        "endpoint,stream,mid_system",
+        [
+            ("responses", False, True),
+            ("responses", True, False),
+            ("chat/completions", False, False),
+            ("chat/completions", True, True),
+        ],
+    )
+    def test_schema_and_tools_follow_tool_results(
+        self, client_with_mcp, format_engine, monkeypatch, endpoint, stream, mid_system
+    ):
+        import json
+        import xgrammar as xgr
+        import omlx.server as server
+
+        monkeypatch.setattr(
+            server, "_unsupported_mid_system_policy", lambda: "user_note_safe"
+        )
+        format_engine.tokenizer._omlx_supports_mid_system_messages = mid_system
+        response = client_with_mcp.post(
+            f"/v1/{endpoint}", json=self.payload(endpoint, stream)
+        )
+        assert response.status_code == 200, response.text
+        if stream:
+            events = [
+                json.loads(line[6:])
+                for line in response.text.splitlines()
+                if line.startswith("data: ") and line[6:] != "[DONE]"
+            ]
+            assert events and all(
+                "error" not in e and e.get("type") != "response.failed" for e in events
+            )
+        messages = format_engine.recorded_messages[-1]
+        assert messages[-2]["role"] == "tool" and messages[-2]["content"] == "Sunny"
+        assert messages[-1]["role"] == ("system" if mid_system else "user")
+        instruction = messages[-1]["content"]
+        assert (
+            json.loads(instruction.split("```json\n", 1)[1].split("```", 1)[0])
+            == self.SCHEMA
+        )
+        assert "tool calls" in instruction and "tool results" in instruction
+        kwargs = format_engine.recorded_chat_kwargs[-1]
+        assert kwargs["tools"][0]["function"]["name"] == "weather__get_weather"
+        grammar = kwargs["compiled_grammar"]
+        for output in (
+            '\n\n{"answer":"done"}\r\n',
+            "<tool_call>\n<function=weather__get_weather>\n<parameter=location>Berlin</parameter>\n</function>\n</tool_call>",
+        ):
+            matcher = xgr.GrammarMatcher(grammar)
+            assert matcher.accept_string(output) and matcher.accept_token(256)
+        assert not xgr.GrammarMatcher(grammar).accept_string("unstructured answer")
+        assert "Warning" not in response.headers
+
+    @pytest.mark.parametrize("backend", ["fallback", "native"])
+    def test_native_delegation_and_fallback_warning(
+        self, client_with_mcp, format_engine, backend
+    ):
+        if backend == "native":
+            format_engine.supports_native_response_format = True
+        else:
+            format_engine._grammar_compiler = None
+        response = client_with_mcp.post("/v1/responses", json=self.payload("responses"))
+        assert response.status_code == 200, response.text
+        assert ("Warning" in response.headers) == (backend == "fallback")
+        assert (
+            "JSON Schema:" in format_engine.recorded_messages[-1][-1]["content"]
+        ) == (backend == "fallback")
+        if backend == "native":
+            assert (
+                format_engine.recorded_chat_kwargs[-1]["response_format"]["type"]
+                == "json_schema"
+            )
+
+    def test_assistant_prefill_stays_last(self, client_with_mcp, format_engine):
+        payload = self.payload("chat/completions")
+        payload["messages"].append(
+            {"role": "assistant", "content": '{"answer":', "partial": True}
+        )
+        response = client_with_mcp.post("/v1/chat/completions", json=payload)
+        assert response.status_code == 200, response.text
+        messages = format_engine.recorded_messages[-1]
+        assert "JSON Schema:" in messages[0]["content"]
+        assert messages[-1] == {"role": "assistant", "content": '{"answer":'}
 
 
 class TestToolChoiceNoneSuppressesTemplateExposure:
