@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
 import socket
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -24,6 +26,8 @@ from .pairing import (
 
 if TYPE_CHECKING:
     from .pairing import PairingManager
+
+logger = logging.getLogger(__name__)
 
 
 def _connection_failure_message(exc: Exception) -> str | None:
@@ -66,6 +70,8 @@ class PairingSession:
         self.mutation_lock = threading.RLock()
         self.attempt: dict[str, Any] | None = None
         self.polling = False
+        # (node_id, received_at) of a Mac that asked this one to join it.
+        self.invite: tuple[str, float] | None = None
         self.withdrawals: list[dict[str, str]] = []
         self.cleanup_lock = threading.Lock()
         self.retry_after: dict[str, float] = {}
@@ -83,6 +89,34 @@ class PairingSession:
                     "expires_at": self.attempt["expires_at"],
                     "completing": False,
                 }
+                if self.attempt.get("state") == "awaiting_approval":
+                    self._start_watch(self.attempt)
+
+    def _start_watch(self, attempt: dict[str, Any]) -> None:
+        if self.manager.join_watch_s is None:
+            return
+        threading.Thread(
+            target=self._watch,
+            args=(attempt,),
+            name="omlx-pair-join-watch",
+            daemon=True,
+        ).start()
+
+    def _watch(self, attempt: dict[str, Any]) -> None:
+        # The approval package opens only with this Mac's code, which expires;
+        # do not wait for a dashboard tab to ask for it.
+        while True:
+            time.sleep(self.manager.join_watch_s)
+            with self.lock:
+                if (
+                    self.attempt is not attempt
+                    or self.snapshot()["state"] != "awaiting_approval"
+                ):
+                    return
+            try:
+                self.poll()
+            except Exception:
+                logger.debug("join status check failed", exc_info=True)
 
     def _save(self) -> None:
         # Persist the original proof before sending a request or retiring it.
@@ -131,7 +165,27 @@ class PairingSession:
                     return self.snapshot()
             return result
 
+    def offer_invite(self, node_id: str) -> None:
+        with self.lock:
+            self.invite = (node_id, self.manager._clock())
+
+    def current_invite(self) -> str | None:
+        """The node that asked this Mac to join it, for as long as a code lives."""
+        with self.lock:
+            if self.invite is None:
+                return None
+            node_id, received = self.invite
+            if self.manager._clock() - received > CODE_TTL_SECONDS:
+                self.invite = None
+                return None
+            return node_id
+
+    def dismiss_invite(self) -> None:
+        with self.lock:
+            self.invite = None
+
     def begin(self, address: str) -> dict[str, Any]:
+        self.dismiss_invite()
         with self.mutation_lock:
             with self.lock:
                 cleanup = (
@@ -254,6 +308,7 @@ class PairingSession:
                     node_id=self.manager.node_id,
                     detail={"coordinator": normalized},
                 )
+                self._start_watch(attempt)
             return self.snapshot()
 
     def poll(self) -> dict[str, Any]:
