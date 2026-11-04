@@ -1354,6 +1354,30 @@ class TestProcessChatMessages:
             is_partial=None,
         )
 
+    def test_prepared_prompt_stops_before_generation(self):
+        """Generation uses mlx-vlm's ids, so the prepared prompt ends here."""
+        engine = _make_loaded_engine()
+        engine._prepare_vision_inputs = MagicMock(
+            return_value=([1, 2, 3], None, None, None, 0, [])
+        )
+        kwargs = {"_prepared_prompt": ("Hello", [9, 9]), "seed": 1}
+
+        result = engine._process_chat_messages(
+            [{"role": "user", "content": "Hello"}], tools=None, kwargs=kwargs
+        )
+
+        assert result[0] == [1, 2, 3]
+        assert kwargs == {"seed": 1}
+
+    def test_count_chat_tokens_matches_prepared_prompt(self):
+        engine = _make_loaded_engine()
+        messages = [{"role": "user", "content": "Hello"}]
+
+        prompt, token_ids = engine.prepare_chat_prompt(messages)
+
+        assert token_ids == engine._tokenizer.encode(prompt)
+        assert engine.count_chat_tokens(messages) == len(token_ids)
+
     @patch("omlx.engine.vlm.extract_images_from_messages")
     def test_text_only_passes_tools_to_prepare_vision(self, mock_extract):
         """Text-only + tools still convert and pass tools through VLM path."""

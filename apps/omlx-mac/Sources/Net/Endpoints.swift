@@ -31,6 +31,15 @@ enum AdminAPI {
     static func modelSettingsOptimal(_ id: String) -> String { "\(modelSettings(id))/optimal" }
     static func modelSettingsRecipe(_ id: String) -> String { "\(modelSettings(id))/recipe" }
     static func importMtplx(_ id: String) -> String { "\(models)/\(id)/import-mtplx" }
+    // Prefill Accelerator (needs the server's cluster setting on).
+    static let prefillHelper = "\(prefix)/prefill-helper"
+    static let prefillHelperCandidates = "\(prefillHelper)/candidates"
+    static func prefillHelperStatus(_ id: String) -> String { "\(prefillHelper)/models/\(id)" }
+    static func prefillHelperAction(_ id: String, _ action: String) -> String {
+        "\(prefillHelper)/models/\(id)/\(action)"
+    }
+    static let prefillLending = "\(prefillHelper)/lending"
+    static let prefillLendingStop = "\(prefillHelper)/lending/stop"
     static func modelGenerationConfig(_ id: String) -> String { "\(models)/\(id)/generation_config" }
     static let reloadModels    = "\(prefix)/reload"
 

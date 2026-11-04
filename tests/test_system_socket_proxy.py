@@ -49,9 +49,10 @@ def test_system_proxy_bridges_a_loopback_stream(monkeypatch, tmp_path):
     assert result == {"request": b"ping"}
 
 
-def test_control_proxy_auto_skips_loopback():
+def test_control_proxy_auto_skips_loopback_and_unscoped_link_local():
     assert should_proxy_control_socket("127.0.0.1") is False
     assert should_proxy_control_socket("localhost") is False
+    assert should_proxy_control_socket("fe80::1") is False
 
 
 def test_system_proxy_reaches_ipv6_loopback():

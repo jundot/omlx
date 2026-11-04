@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from omlx.integrations.base import IntegrationContext
+from omlx.integrations.copilot import copilot_provider_config
 from omlx.model_settings import ModelSettings, ModelSettingsManager
 from omlx.server import ServerState, app
 from omlx.settings import GlobalSettings
@@ -65,6 +67,55 @@ def _list_ids(state) -> list[str]:
 def test_lists_all_models_by_default(tmp_path):
     state = _state([_model("chat-a"), _model("chat-b")], tmp_path)
     assert _list_ids(state) == ["chat-a", "chat-b"]
+
+
+def test_public_model_types_support_copilot_discovery(tmp_path):
+    models = [
+        _model("chat", model_type="llm"),
+        _model("vision", model_type="vlm"),
+        _model("embedding", model_type="embedding"),
+        _model("reranker", model_type="reranker"),
+        _model("image", model_type="image"),
+        _model("speech", model_type="stt"),
+    ]
+    state = _state(models, tmp_path)
+    state.settings_manager.set_settings(
+        "vision", ModelSettings(model_alias="vision-alias")
+    )
+    state.settings_manager.save_profile(
+        "vision", "fast", "Fast", None, {"temperature": 0.1}, expose_as_model=True
+    )
+    with (
+        patch("omlx.server._server_state", state),
+        patch("omlx.server.get_max_context_window", return_value=8192),
+    ):
+        response = TestClient(app).get("/v1/models")
+    assert response.status_code == 200
+    inventory = response.json()
+    assert {model["id"]: model["model_type"] for model in inventory["data"]} == {
+        "chat": "llm",
+        "vision-alias": "vlm",
+        "embedding": "embedding",
+        "reranker": "reranker",
+        "image": "image",
+        "speech": "stt",
+        "vision-alias:fast": "vlm",
+    }
+    with patch("omlx.integrations.base.requests.get") as get:
+        get.return_value.json.return_value = inventory
+        config = copilot_provider_config(
+            IntegrationContext(host="127.0.0.1", port=8000)
+        )
+    assert [model["id"] for model in config["models"]] == [
+        "chat",
+        "vision-alias",
+        "vision-alias:fast",
+    ]
+    assert config["models"][0]["maxContextWindowTokens"] == 8192
+    assert config["models"][0]["capabilities"]["supports"]["vision"] is False
+    assert all(
+        model["capabilities"]["supports"]["vision"] for model in config["models"][1:]
+    )
 
 
 def test_per_model_hidden_excluded(tmp_path):

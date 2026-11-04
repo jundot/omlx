@@ -19,6 +19,12 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..patches.mlx_audio_compat import ensure_ming_post_load_skips_campplus_conversion
+from ..patches.mlx_audio_ming3 import (
+    apply_ming3_patches,
+    prepare_ming3_state,
+    release_ming3_state,
+)
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -30,6 +36,78 @@ logger = logging.getLogger(__name__)
 # (a/b = US/GB English, e = es, f = fr, h = hi, i = it, j = ja, p = pt-br,
 # z = zh; see mlx_audio.tts.models.kokoro.pipeline.LANG_CODES).
 _KOKORO_VOICE_RE = re.compile(r"^([abefhijpz])[fm]_")
+
+# Ming-3.0 built-in voices from upstream tts_tasks.py and cookbooks/instructions.md,
+# without the named cartoon-character voices.
+MING3_VOICES = (
+    "US_Emma",
+    "UK_George",
+    "UK_Charlotte",
+    "灵小安",
+    "灵语汐",
+    "灵小萌",
+    "灵小柔",
+    "灵小雅",
+    "花小呗",
+    "灵韵",
+    "妩媚妲己",
+    "灵婉",
+    "灵小月",
+    "灵朵儿",
+    "灵小锋",
+    "灵小川",
+    "灵小甄",
+    "灵小知",
+    "灵小惠",
+    "灵小晴",
+    "灵小琪",
+    "灵梦",
+    "灵恬",
+    "灵小汐",
+    "灵小棠",
+    "灵小梨",
+    "灵小芸",
+    "灵空",
+    "灵宇",
+    "灵朗",
+    "灵楷",
+    "灵旭",
+    "灵江",
+    "悲伤女声",
+    "皮六",
+    "悟空",
+)
+
+
+# mlx-audio's bailingmm Model._is_moe_llm_config keys.
+_BAILING_MOE_KEYS = (
+    "moe_intermediate_size",
+    "num_experts",
+    "num_shared_experts",
+    "norm_topk_prob",
+    "num_experts_per_tok",
+    "first_k_dense_replace",
+)
+
+
+def is_ming3_config(config: Dict[str, Any]) -> bool:
+    """Same test as mlx-audio's ``Model.ming3``, from config.json alone.
+
+    Ming-3.0 has a dense LLM backbone and one-latent DiT patches; Ming Omni
+    uses 4-latent patches.
+    """
+    if "BailingMMNativeForConditionalGeneration" not in (
+        config.get("architectures") or []
+    ):
+        return False
+    llm = config.get("llm_config") or config.get("text_config") or {}
+    moe = config.get("model_type") != "dense" and all(
+        llm.get(key) is not None for key in _BAILING_MOE_KEYS
+    )
+    ditar = config.get("ditar_config") or {}
+    patch_size = ditar.get("patch_size")
+    history = ditar.get("history_patch_size", patch_size)
+    return not moe and patch_size == 1 and history == 1
 
 
 def _infer_kokoro_lang_code(voice: Optional[str]) -> Optional[str]:
@@ -143,6 +221,9 @@ class TTSEngine(BaseNonStreamingEngine):
                 'Install it with: pip install "omlx[audio]"'
             ) from exc
 
+        ensure_ming_post_load_skips_campplus_conversion()
+        apply_ming3_patches()
+
         model_name = self._model_name
 
         def _load_sync():
@@ -165,7 +246,9 @@ class TTSEngine(BaseNonStreamingEngine):
                 return _load_model(model_name, strict=False)
 
         loop = asyncio.get_running_loop()
-        self._model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
+        model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
+        await loop.run_in_executor(get_mlx_executor(), prepare_ming3_state, model)
+        self._model = model
         logger.info(f"TTS engine started: {self._model_name}")
 
     async def stop(self) -> None:
@@ -174,10 +257,14 @@ class TTSEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping TTS engine: {self._model_name}")
+        model = self._model
         self._model = None
 
-        gc.collect()
         loop = asyncio.get_running_loop()
+        # MLX compile caches are per thread; free them on the thread that ran them.
+        await loop.run_in_executor(get_mlx_executor(), release_ming3_state, model)
+        del model
+        gc.collect()
         await loop.run_in_executor(
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )

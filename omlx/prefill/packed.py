@@ -136,17 +136,25 @@ def _wrap_mixer(
         if p.kind is inspect.Parameter.VAR_KEYWORD
     ]
     has_mask = "mask" in signature.parameters
+    inherited = "__call__" not in cls.__dict__
+
+    def original(self, *args, **kwargs):
+        # An inherited __call__ is looked up on each call, so a later patch of
+        # the base class (the GDN prework decode) still reaches this class.
+        if inherited:
+            return super(cls, self).__call__(*args, **kwargs)
+        return current(self, *args, **kwargs)
 
     def packed_call(self, *args, **kwargs):
         # Decode and unpacked prefill skip the argument binding.
         if not isinstance(kwargs.get("cache"), PackedRows) and not any(
             isinstance(arg, PackedRows) for arg in args
         ):
-            return current(self, *args, **kwargs)
+            return original(self, *args, **kwargs)
         bound = signature.bind(self, *args, **kwargs)
         rows = bound.arguments.get("cache")
         if not isinstance(rows, PackedRows):
-            return current(self, *args, **kwargs)
+            return original(self, *args, **kwargs)
         arguments = dict(bound.arguments)
         del arguments["self"]
         extra = {}
@@ -168,7 +176,7 @@ def _wrap_mixer(
             for name in ("position_ids", "position_embeddings"):
                 if row_args.get(name) is not None:
                     row_args[name] = _slice_tokens(row_args[name], start, end, total)
-            outputs.append(current(self, **row_args, **extra))
+            outputs.append(original(self, **row_args, **extra))
         return mx.concatenate(outputs, axis=1)
 
     packed_call._omlx_packed_mixer = True
