@@ -2,7 +2,7 @@
 """
 MLX Model wrappers for oMLX.
 
-This module provides wrappers around mlx-lm and mlx-embeddings
+This module provides wrappers around mlx-lm and mlx-vlm
 for integration with oMLX's model execution system.
 """
 

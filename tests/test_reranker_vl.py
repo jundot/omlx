@@ -5,13 +5,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-
-try:
-    import mlx.core as mx
-
-    HAS_MLX = True
-except ImportError:
-    HAS_MLX = False
+from mlx_vlm.server.reranking import RerankItem
 
 from omlx.exceptions import InvalidRequestError
 from omlx.models.reranker import (
@@ -71,13 +65,14 @@ class TestVLRerankerValidation:
 
 
 class TestVLItemBuilder:
-    def test_str_becomes_text_dict(self, tmp_path):
+
+    def test_str_becomes_text_item(self, tmp_path):
         model = MLXRerankerModel(str(tmp_path))
-        assert model._build_vl_item("hello") == {"text": "hello"}
+        assert model._build_vl_item("hello") == RerankItem(text="hello")
 
     def test_dict_text_only(self, tmp_path):
         model = MLXRerankerModel(str(tmp_path))
-        assert model._build_vl_item({"text": "hi"}) == {"text": "hi"}
+        assert model._build_vl_item({"text": "hi"}) == RerankItem(text="hi")
 
     def test_dict_image_loads_via_load_image(self, tmp_path):
         model = MLXRerankerModel(str(tmp_path))
@@ -87,7 +82,7 @@ class TestVLItemBuilder:
         ) as mock_load:
             result = model._build_vl_item({"image": IMAGE_DATA_URI})
         mock_load.assert_called_once_with(IMAGE_DATA_URI, field="image")
-        assert result == {"image": fake_img}
+        assert result == RerankItem(image=fake_img)
 
     def test_dict_text_and_image(self, tmp_path):
         model = MLXRerankerModel(str(tmp_path))
@@ -97,7 +92,7 @@ class TestVLItemBuilder:
         ) as mock_load:
             result = model._build_vl_item({"text": "t", "image": IMAGE_DATA_URI})
         mock_load.assert_called_once_with(IMAGE_DATA_URI, field="image")
-        assert result == {"text": "t", "image": fake_img}
+        assert result == RerankItem(text="t", image=fake_img)
 
     def test_dict_image_rejects_url(self, tmp_path):
         model = MLXRerankerModel(str(tmp_path))
@@ -111,71 +106,101 @@ class TestVLItemBuilder:
 
 
 class TestVLRerankScoring:
-    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
-    def test_rerank_vl_wraps_process_output(self, tmp_path):
-        """_rerank_vl sorts model.process() scores into RerankOutput."""
+
+    @pytest.mark.parametrize("trust_remote_code", [False, True])
+    def test_loader_preserves_remote_code_setting(self, tmp_path, trust_remote_code):
+        tmp_path = tmp_path / "qwen3-vl-reranker"
+        tmp_path.mkdir()
+        config = {
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "model_type": "qwen3_vl",
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        processor = MagicMock()
+        with (
+            patch(
+                "omlx.models.reranker.load_reranker",
+                return_value=(object(), processor),
+            ) as load,
+            patch("omlx.models.reranker.ensure_chat_template"),
+        ):
+            model = MLXRerankerModel(str(tmp_path), trust_remote_code=trust_remote_code)
+            model.load()
+        load.assert_called_once_with(tmp_path, trust_remote_code=trust_remote_code)
+        assert model._vl_config == config
+
+    def test_untrusted_custom_architecture_is_rejected_before_loading(self, tmp_path):
+        tmp_path = tmp_path / "qwen3-vl-reranker"
+        tmp_path.mkdir()
+        (tmp_path / "config.json").write_text(
+            json.dumps(
+                {
+                    "architectures": ["Qwen3VLForConditionalGeneration"],
+                    "model_type": "qwen3_vl",
+                    "model_file": "custom.py",
+                }
+            )
+        )
+        with (
+            patch("omlx.models.reranker.load_reranker") as load,
+            pytest.raises(ValueError, match="Enable Trust Remote Code"),
+        ):
+            MLXRerankerModel(str(tmp_path)).load()
+        load.assert_not_called()
+
+    @staticmethod
+    def _vl_model(tmp_path):
         model = MLXRerankerModel(str(tmp_path))
         model._is_vl_reranker = True
         model._loaded = True
-
-        # Mock mlx-embeddings model: process() returns mx.array([0.2, 0.9, 0.5])
-        mock_model = MagicMock()
-        mock_model.process.return_value = mx.array([0.2, 0.9, 0.5])
-        model.model = mock_model
+        model.model = MagicMock()
         model.processor = MagicMock()
+        model._vl_config = {"model_type": "qwen3_vl"}
+        return model
 
-        output = model._rerank_vl(
-            query="cat",
-            documents=["doc a", "doc b", "doc c"],
-            max_length=8192,
-        )
+    def test_rerank_vl_sorts_mlx_vlm_scores(self, tmp_path):
+        model = self._vl_model(tmp_path)
+        with patch(
+            "omlx.models.reranker.score_documents",
+            return_value=([0.2, 0.9, 0.5], 42),
+        ) as score:
+            output = model._rerank_vl(
+                query="cat", documents=["doc a", "doc b", "doc c"]
+            )
 
         assert isinstance(output, RerankOutput)
         assert output.scores == pytest.approx([0.2, 0.9, 0.5], rel=1e-5)
-        assert output.indices == [1, 2, 0]  # sorted descending
-        assert output.total_tokens == 0
-
-        # process() called with the expected input dict shape
-        call_args = mock_model.process.call_args
-        inputs = call_args[0][0]
-        assert "instruction" in inputs
-        assert inputs["query"] == {"text": "cat"}
-        assert inputs["documents"] == [
-            {"text": "doc a"},
-            {"text": "doc b"},
-            {"text": "doc c"},
+        assert output.indices == [1, 2, 0]
+        assert output.total_tokens == 42
+        args = score.call_args[0]
+        assert args[:3] == (model.model, model.processor, model._vl_config)
+        assert args[3] == RerankItem(text="cat")
+        assert args[4] == [
+            RerankItem(text="doc a"),
+            RerankItem(text="doc b"),
+            RerankItem(text="doc c"),
         ]
-        assert call_args[1]["processor"] is model.processor
 
-    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_rerank_vl_with_image_documents(self, tmp_path):
-        """_rerank_vl threads image dicts through _build_vl_item."""
-        model = MLXRerankerModel(str(tmp_path))
-        model._is_vl_reranker = True
-        model._loaded = True
-
-        mock_model = MagicMock()
-        mock_model.process.return_value = mx.array([0.7, 0.3])
-        model.model = mock_model
-        model.processor = MagicMock()
-
+        model = self._vl_model(tmp_path)
         fake_img = object()
-        with patch("omlx.models.reranker.load_image", return_value=fake_img):
+        with (
+            patch("omlx.models.reranker.load_image", return_value=fake_img),
+            patch(
+                "omlx.models.reranker.score_documents", return_value=([0.7, 0.3], 9)
+            ) as score,
+        ):
             output = model._rerank_vl(
                 query={"text": "a dog"},
-                documents=[
-                    {"text": "desc"},
-                    {"image": IMAGE_DATA_URI},
-                ],
-                max_length=8192,
+                documents=[{"text": "desc"}, {"image": IMAGE_DATA_URI}],
             )
 
         assert output.indices == [0, 1]
-        inputs = mock_model.process.call_args[0][0]
-        assert inputs["documents"][0] == {"text": "desc"}
-        assert inputs["documents"][1] == {"image": fake_img}
+        assert score.call_args[0][4] == [
+            RerankItem(text="desc"),
+            RerankItem(image=fake_img),
+        ]
 
-    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     @pytest.mark.parametrize(
         ("instruction", "expected"),
         [
@@ -185,23 +210,19 @@ class TestVLRerankScoring:
         ],
     )
     def test_rerank_forwards_instruction(self, tmp_path, instruction, expected):
-        model = MLXRerankerModel(str(tmp_path))
-        model._is_vl_reranker = True
-        model._loaded = True
-        model.model = MagicMock()
-        model.model.process.return_value = mx.array([0.5])
-        model.processor = MagicMock()
+        model = self._vl_model(tmp_path)
+        with patch(
+            "omlx.models.reranker.score_documents", return_value=([0.5], 3)
+        ) as score:
+            model.rerank("cat", ["doc"], instruction=instruction)
 
-        model.rerank("cat", ["doc"], instruction=instruction)
-
-        assert model.model.process.call_args[0][0]["instruction"] == expected
+        assert score.call_args[0][5] == expected
 
 
 class TestRerankDispatchCoerce:
     """Regression: text-only reranker paths still receive strings even when
     callers pass dict inputs (backwards compat for /v1/rerank dict docs)."""
 
-    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_causal_lm_path_receives_strings_from_dict_inputs(self, tmp_path):
         model = MLXRerankerModel(str(tmp_path))
         model._is_causal_lm = True

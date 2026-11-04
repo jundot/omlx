@@ -313,6 +313,36 @@ def expand_glm_moe_dsa_fused_quant_keys(cfg: dict) -> dict:
     return cfg
 
 
+def normalize_encoder_quantization_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Translate legacy encoder quantization metadata for mlx-vlm."""
+    if "quantization" in cfg:
+        return cfg
+
+    quantization_config = cfg.get("quantization_config")
+    if quantization_config is None:
+        quantization_config = (cfg.get("text_config") or {}).get("quantization_config")
+        if quantization_config is not None:
+            cfg["quantization_config"] = quantization_config
+    if quantization_config is None:
+        return cfg
+
+    method = quantization_config.get("quant_method")
+    formats = {
+        "compressed-tensors": (32, 4, "affine"),
+        "mxfp4": (32, 4, "mxfp4"),
+        "nvfp4": (16, 4, "nvfp4"),
+        "mxfp8": (32, 8, "mxfp8"),
+    }
+    if method in formats:
+        group_size, bits, mode = formats[method]
+        quantization = {"group_size": group_size, "bits": bits, "mode": mode}
+        cfg["quantization"] = quantization
+        cfg["quantization_config"] = quantization
+    elif method in ("awq", "gptq", "bitnet"):
+        logger.warning("Quantization method %s is not supported for encoders", method)
+    return cfg
+
+
 def normalize_qwen35_text_config(cfg: dict) -> dict:
     """Use mlx-lm's Qwen3.5 names for text-only Hugging Face checkpoints."""
     model_type = cfg.get("model_type")

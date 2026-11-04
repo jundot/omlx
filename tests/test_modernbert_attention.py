@@ -5,12 +5,10 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
-from mlx_embeddings.models.modernbert import Model, ModelArgs, ModernBertModel
+from mlx_vlm.models.modernbert.config import ModelConfig
+from mlx_vlm.models.modernbert.modernbert import Model
 
-from omlx.patches.modernbert_attention import (
-    _update_attention_mask,
-    patch_modernbert_attention,
-)
+from omlx.patches.modernbert_attention import _masks, patch_modernbert_attention
 
 
 @pytest.mark.parametrize("length", [64, 128, 255, 256, 257, 288])
@@ -19,13 +17,7 @@ def test_padded_attention_is_finite_and_matches_single(length, dtype):
     mx.random.seed(3507)
     short = 5
     mask = mx.array([[1] * short + [0] * (length - short), [1] * length])
-    config = SimpleNamespace(
-        config=SimpleNamespace(local_attention=128),
-        embeddings=SimpleNamespace(
-            norm=SimpleNamespace(weight=mx.ones(64, dtype=dtype))
-        ),
-    )
-    masks = _update_attention_mask(config, mask)
+    masks = _masks(SimpleNamespace(local_attention=128), mask, dtype)
     q, k, v = [mx.random.normal((2, 1, length, 64)).astype(dtype) for _ in range(3)]
     for additive in masks:
         output = mx.fast.scaled_dot_product_attention(
@@ -43,13 +35,12 @@ def test_padded_attention_is_finite_and_matches_single(length, dtype):
 
 
 def test_patch_is_idempotent_and_scoped(monkeypatch):
-    original = ModernBertModel._update_attention_mask
-    monkeypatch.setattr(ModernBertModel, "_update_attention_mask", original)
-    unrelated = SimpleNamespace(model=SimpleNamespace())
-    patch_modernbert_attention(unrelated)
-    assert ModernBertModel._update_attention_mask is original
+    monkeypatch.setattr(Model, "_masks", Model._masks)
+    original = Model._masks
+    patch_modernbert_attention(SimpleNamespace())
+    assert Model._masks is original
     model = Model(
-        ModelArgs(
+        ModelConfig(
             model_type="modernbert",
             vocab_size=128,
             hidden_size=64,
@@ -60,4 +51,4 @@ def test_patch_is_idempotent_and_scoped(monkeypatch):
     )
     patch_modernbert_attention(model)
     patch_modernbert_attention(model)
-    assert ModernBertModel._update_attention_mask is _update_attention_mask
+    assert Model._masks is _masks

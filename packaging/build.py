@@ -410,7 +410,6 @@ def _write_engine_commits(omlx_pkg_dir: Path):
     repo_urls = {
         "mlx-lm": "https://github.com/ml-explore/mlx-lm",
         "mlx-vlm": "https://github.com/Blaizzy/mlx-vlm",
-        "mlx-embeddings": "https://github.com/Blaizzy/mlx-embeddings",
         "mlx-audio": "https://github.com/Blaizzy/mlx-audio",
     }
 

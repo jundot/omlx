@@ -71,7 +71,7 @@ Run `python -m pytest -q tests/test_cli.py tests/test_integrations.py` to check 
 
 # ModernBERT embedding tests
 
-Run `python -m pytest -q tests/test_modernbert_attention.py tests/test_embedding.py tests/test_mlx_embeddings_compat.py` to check finite padded attention, single-input equivalence, local-window masking, and embedding integration. The attention regression covers fp16, bf16, and fp32 at lengths around the affected SDPA tile boundaries.
+Run `python -m pytest -q tests/test_modernbert_attention.py tests/test_embedding.py` to check finite padded attention, single-input equivalence, local-window masking, and embedding integration. The attention regression covers fp16, bf16, and fp32 at lengths around the affected SDPA tile boundaries.
 
 # GGUF model tests
 
