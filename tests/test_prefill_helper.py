@@ -835,6 +835,47 @@ def test_copy_time_left_follows_the_average_speed(monkeypatch):
     assert [status.get("seconds_left") for status in seen] == [None, 10, 0]
 
 
+def test_a_helper_started_during_the_load_is_taken_over_not_started_twice(
+    tmp_path,
+):
+    fake = _FakeLauncher(None)
+    launch = {"model_type": "deepseek_v41", "warm_tokens": 8, "a8_min_tokens": None}
+    adapter = _PlanAdapter()
+    manager_module.prepare(
+        "/models/z", adapter, "node-1", None, launch=launch, launcher=fake
+    )
+    prep = manager_module.file_prep("/models/z")
+    prep.join(30)
+    assert prep.launched is not None and len(fake.servers) == 1
+
+    attached = []
+    manager = PrefillHelperManager(
+        model_path="/models/z",
+        model_type="deepseek_v41",
+        adapter=adapter,
+        language_model=_model(tiny()),
+        attach=attached.append,
+        chunk_tokens=8,
+        launcher=fake,
+        speeds_path=tmp_path / "speeds.json",
+    )
+    manager.configure("node-1", None)
+    _wait_state(manager, "ready")
+    assert len(fake.servers) == 1
+    manager.close()
+
+    # A load that fails stops the helper it started.
+    manager_module.prepare(
+        "/models/z", adapter, "node-1", None, launch=launch, launcher=fake
+    )
+    prep = manager_module.file_prep("/models/z")
+    prep.join(30)
+    stopped = []
+    prep.launched[3].stop = lambda: stopped.append(True)
+    manager_module.prepare("/models/z", None, None, None)
+    assert stopped == [True] and manager_module.file_prep("/models/z") is None
+
+
 def test_cancel_before_the_load_stops_a_waiting_copy_without_deleting():
     old = {"name": "Old", "bytes": 20 << 30, "used": 0.0}
     fake = _FakeLauncher(

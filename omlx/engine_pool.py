@@ -83,7 +83,9 @@ from .model_settings import (
 )
 from .patches.minimax_m3_dspark import bundled_dspark_path, load_minimax_dspark_drafter
 from .patches.qwen35_yarn import yarn_factor
+from .prefill_helper.adapters import adapter_for as prefill_stage_adapter
 from .prefill_helper.lending import lending_note
+from .prefill_helper.manager import prepare as prepare_prefill_helper
 from .scheduler import SchedulerConfig
 from .settings import get_settings as get_global_settings
 from .speculative.dflash import context_bytes_per_row, load_dflash_drafter
@@ -2396,6 +2398,30 @@ class EnginePool:
                 logger.debug("external process memory read failed", exc_info=True)
         return total
 
+    def _start_prefill_helper_early(self, entry: Any, settings: Any) -> bool:
+        """Start the chosen Prefill Accelerator while this Mac loads the model."""
+        node_id = getattr(settings, "prefill_helper_node_id", None)
+        model_type = (entry.config_model_type or "").replace("-", "_").lower()
+        adapter = prefill_stage_adapter(model_type)
+        if node_id is None or adapter is None:
+            return False
+        prepare_prefill_helper(
+            entry.model_path,
+            adapter,
+            node_id,
+            getattr(settings, "prefill_helper_layers", None),
+            launch={
+                "model_type": model_type,
+                "warm_tokens": self._scheduler_config.prefill_step_size,
+                "a8_min_tokens": (
+                    int(getattr(settings, "a8_prefill_min_tokens", 128))
+                    if a8_prefill_on(settings)
+                    else None
+                ),
+            },
+        )
+        return True
+
     def _validate_llm_engine_ready(self, model_id: str, engine: object | None) -> None:
         if engine is None:
             raise ModelLoadingError(
@@ -4294,6 +4320,9 @@ class EnginePool:
 
             if isinstance(engine, SplashEngine):
                 self._starting_external[model_id] = engine
+            early_helper = hasattr(
+                type(engine), "prefill_helper"
+            ) and self._start_prefill_helper_early(entry, model_settings)
             try:
                 await self._start_engine(engine)
             except Exception as start_error:
@@ -4381,6 +4410,9 @@ class EnginePool:
                     raise
             finally:
                 self._starting_external.pop(model_id, None)
+                if early_helper and getattr(engine, "prefill_helper", None) is None:
+                    # No loaded model will take the started helper over.
+                    prepare_prefill_helper(entry.model_path, None, None, None)
 
             # Check if memory enforcer requested abort during loading
             if entry.abort_loading:

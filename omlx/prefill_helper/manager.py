@@ -6,8 +6,9 @@ find or copy the files, start the helper, attach it) and then watches the
 connection. A lost helper is detached at once and retried with backoff;
 problems a retry cannot fix (version, memory, disk, pairing) wait for the
 user. Model files are copied at once when 50 GB stay free, else after the
-user agrees; a copy started before the model loads is taken over, never run
-twice. The measured speeds of each model and helper Mac are kept on disk, so
+user agrees. While this Mac loads the model, the helper is copied to and
+started on the other Mac, and the loaded model takes it over; nothing is
+copied or started twice. The measured speeds of each model and helper Mac are kept on disk, so
 a restarted helper splits its first prompt by them instead of guessing.
 """
 
@@ -224,7 +225,11 @@ def _prepare_files(
 
 
 class FilePrep:
-    """Copies a model's helper files before the model is loaded."""
+    """Copies a model's helper files before the model is loaded.
+
+    With ``launch`` ({model_type, warm_tokens, a8_min_tokens}) it then starts
+    the helper, for the model being loaded to take over.
+    """
 
     def __init__(
         self,
@@ -234,9 +239,13 @@ class FilePrep:
         layers: int | None,
         launcher: Any = default_launcher,
         after: FilePrep | None = None,
+        launch: dict[str, Any] | None = None,
     ):
         self.model_path, self.adapter, self.launcher = model_path, adapter, launcher
         self.node_id, self.layers, self._after = node_id, layers, after
+        self._launch, self._sealed = launch, False
+        # (target, remote_info, held layers, HelperProcess) once started.
+        self.launched: tuple | None = None
         self._status: dict[str, Any] = {"state": "connecting", "node_id": node_id}
         self._ok, self._cancel = threading.Event(), threading.Event()
         self._lock = threading.Lock()
@@ -254,6 +263,32 @@ class FilePrep:
 
     def cancel(self) -> None:
         self._cancel.set()
+        with self._lock:
+            launched, self.launched = self.launched, None
+        if launched is not None:
+            launched[3].stop()
+
+    def launch_with(self, launch: dict[str, Any]) -> bool:
+        """Start the helper after the files; False once that step has passed."""
+        with self._lock:
+            if self._sealed:
+                return False
+            self._launch = launch
+            return True
+
+    def adopt(self, node_id: str, layers: int | None, a8: int | None) -> tuple | None:
+        """The started helper if it matches the loaded model's choice."""
+        with self._lock:
+            launched, self.launched = self.launched, None
+            wanted = (
+                self.node_id,
+                self.layers,
+                (self._launch or {}).get("a8_min_tokens"),
+            )
+        if launched is not None and wanted != (node_id, layers, a8):
+            launched[3].stop()
+            return None
+        return launched
 
     def running(self) -> bool:
         return self._thread.is_alive()
@@ -287,7 +322,7 @@ class FilePrep:
                 target.name,
                 self.layers,
             )
-            _prepare_files(
+            model_dir = _prepare_files(
                 self.launcher,
                 target,
                 self.model_path,
@@ -297,7 +332,27 @@ class FilePrep:
                 self._ask,
                 self._cancel.is_set,
             )
-            self._set("files_ready", held=held)
+            with self._lock:
+                launch, self._sealed = self._launch, True
+            if launch is None:
+                self._set("files_ready", held=held)
+                return
+            self._set("starting", layers=held)
+            process = self.launcher.launch(
+                target,
+                model_dir,
+                launch["model_type"],
+                held,
+                host_name=computer_name(),
+                warm_tokens=launch["warm_tokens"],
+                a8_min_tokens=launch["a8_min_tokens"],
+            )
+            with self._lock:
+                if not self._cancel.is_set():
+                    self.launched, process = (target, info, held, process), None
+            if process is not None:
+                process.stop()
+                raise _CancelledError
         except _CancelledError:
             self._set("stopped")
         except Exception as error:  # SSH, version, memory, disk
@@ -316,9 +371,10 @@ def prepare(
     layers: int | None,
     *,
     restart: bool = False,
+    launch: dict[str, Any] | None = None,
     launcher: Any = default_launcher,
 ) -> None:
-    """Start, keep or cancel the file copy for a model that is not loaded."""
+    """Start, keep or cancel the file copy (and with ``launch`` the helper)."""
     key = str(Path(model_path).expanduser())
     with _PREPS_LOCK:
         prep = _PREPS.pop(key, None)
@@ -327,6 +383,7 @@ def prepare(
             and not restart
             and (prep.node_id, prep.layers) == (node_id, layers)
             and prep.status()["state"] not in ("error", "stopped")
+            and (launch is None or prep.launch_with(launch))
         ):
             # Saving the same choice again keeps the copy going.
             _PREPS[key] = prep
@@ -334,7 +391,9 @@ def prepare(
         if prep is not None:
             prep.cancel()
         if node_id is not None:
-            _PREPS[key] = FilePrep(key, adapter, node_id, layers, launcher, prep)
+            _PREPS[key] = FilePrep(
+                key, adapter, node_id, layers, launcher, prep, launch
+            )
 
 
 def file_prep(model_path: str) -> FilePrep | None:
@@ -530,35 +589,40 @@ class PrefillHelperManager:
         launcher = self.launcher
         self._set("connecting", node_id=self.node_id)
         prep = _take_prep(self.model_path)
+        adopted = None
         if prep is not None:
             self._follow(prep)
-        target, info = _reach(launcher, self.node_id, self._report)
-        held = held_layers(
-            self.adapter,
-            self.model_path,
-            helper_budget(info),
-            target.name,
-            self.fixed_layers,
-        )
-        model_dir = _prepare_files(
-            launcher,
-            target,
-            self.model_path,
-            held,
-            self.adapter,
-            self._report,
-            self._ask,
-        )
-        self._set("starting", node_id=self.node_id, layers=held)
-        process = launcher.launch(
-            target,
-            model_dir,
-            self.model_type,
-            held,
-            host_name=computer_name(),
-            warm_tokens=self.chunk_tokens,
-            a8_min_tokens=self.a8_min_tokens,
-        )
+            adopted = prep.adopt(self.node_id, self.fixed_layers, self.a8_min_tokens)
+        if adopted is not None:
+            target, info, held, process = adopted
+        else:
+            target, info = _reach(launcher, self.node_id, self._report)
+            held = held_layers(
+                self.adapter,
+                self.model_path,
+                helper_budget(info),
+                target.name,
+                self.fixed_layers,
+            )
+            model_dir = _prepare_files(
+                launcher,
+                target,
+                self.model_path,
+                held,
+                self.adapter,
+                self._report,
+                self._ask,
+            )
+            self._set("starting", node_id=self.node_id, layers=held)
+            process = launcher.launch(
+                target,
+                model_dir,
+                self.model_type,
+                held,
+                host_name=computer_name(),
+                warm_tokens=self.chunk_tokens,
+                a8_min_tokens=self.a8_min_tokens,
+            )
         try:
             client = self.connect(target.address, process.port, process.token)
         except Exception:
@@ -605,7 +669,7 @@ class PrefillHelperManager:
         self._copy_ok.clear()
         while prep.running():
             status = prep.status()
-            if status["state"] in ("needs_files", "copying"):
+            if status["state"] in ("needs_files", "copying", "starting"):
                 self._set(**status)
             if self._copy_ok.is_set():
                 prep.copy_files()
