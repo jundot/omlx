@@ -272,10 +272,30 @@ def test_speech_unknown_voice_is_400(say_client):
 
 
 def test_speech_mp3_is_transcoded(say_client):
+    pytest.importorskip("soundfile")
     r = _speak(say_client, response_format="mp3")
     assert r.status_code == 200
     assert r.headers["content-type"] == "audio/mpeg"
     assert r.content[:4] != b"RIFF"
+
+
+@pytest.mark.parametrize("fmt", ["mp3", "opus", "flac"])
+def test_speech_encoded_formats_need_soundfile(say_client, monkeypatch, fmt):
+    from omlx.api import audio_routes
+
+    monkeypatch.setattr(audio_routes, "_has_soundfile", lambda: False)
+    r = _speak(say_client, response_format=fmt)
+    assert r.status_code == 400
+    assert "audio extra" in r.json()["error"]["message"]
+    assert say_client.renders == []
+
+
+@pytest.mark.parametrize("fmt", ["wav", "pcm"])
+def test_speech_raw_formats_work_without_soundfile(say_client, monkeypatch, fmt):
+    from omlx.api import audio_routes
+
+    monkeypatch.setattr(audio_routes, "_has_soundfile", lambda: False)
+    assert _speak(say_client, response_format=fmt).status_code == 200
 
 
 def test_speech_input_limit(say_client):

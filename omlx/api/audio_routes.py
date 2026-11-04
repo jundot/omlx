@@ -1533,6 +1533,12 @@ def _global_settings():
     return getattr(_server_state, "global_settings", None)
 
 
+def _has_soundfile() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("soundfile") is not None
+
+
 async def _speech_via_macos_say(
     request: AudioSpeechRequest, response_format: str
 ) -> Response:
@@ -1552,6 +1558,14 @@ async def _speech_via_macos_say(
             status_code=400,
             detail=(
                 f"'input' is longer than {macos_say.MAX_INPUT_CHARS} characters"
+            ),
+        )
+    if response_format not in ("wav", "pcm") and not _has_soundfile():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"response_format '{response_format}' needs the audio extra "
+                "(soundfile); use 'wav' or 'pcm'"
             ),
         )
     voice = macos_say.explicit_voice(request.voice)
