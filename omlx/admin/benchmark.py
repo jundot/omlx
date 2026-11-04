@@ -174,6 +174,9 @@ class BenchmarkRun:
 
     bench_id: str
     request: BenchmarkRequest
+    # Queue entry this run came from, so a client that queued it can tell
+    # when its own request is the one running. None for a direct start.
+    queue_id: Optional[str] = None
     status: str = "running"  # running, completed, cancelled, error
     events: list[dict] = field(default_factory=list)
     cond: asyncio.Condition = field(default_factory=asyncio.Condition)
@@ -601,10 +604,12 @@ def get_active_run() -> Optional[BenchmarkRun]:
     return None
 
 
-def create_run(request: BenchmarkRequest) -> BenchmarkRun:
+def create_run(
+    request: BenchmarkRequest, queue_id: Optional[str] = None
+) -> BenchmarkRun:
     """Create and register a new benchmark run."""
     bench_id = f"bench-{uuid.uuid4().hex[:12]}"
-    run = BenchmarkRun(bench_id=bench_id, request=request)
+    run = BenchmarkRun(bench_id=bench_id, request=request, queue_id=queue_id)
     _benchmark_runs[bench_id] = run
     return run
 
@@ -621,8 +626,9 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
             del _benchmark_runs[bid]
 
 
-# Requests waiting for the running benchmark, oldest first.
-_queue: list[BenchmarkRequest] = []
+# Requests waiting for the running benchmark, oldest first, each with the
+# id handed back to the client that queued it.
+_queue: list[tuple[str, BenchmarkRequest]] = []
 # Task running `run_queue`. It outlives a run's "running" status while that
 # run uploads its results, and it starts the next queued request afterwards.
 _queue_task: Optional[asyncio.Task] = None
@@ -633,8 +639,11 @@ def queue_busy() -> bool:
     return _queue_task is not None and not _queue_task.done()
 
 
-def add_to_queue(request: BenchmarkRequest) -> None:
-    _queue.append(request)
+def add_to_queue(request: BenchmarkRequest) -> str:
+    """Queue `request` and return the id the caller can watch for."""
+    queue_id = f"q-{uuid.uuid4().hex[:8]}"
+    _queue.append((queue_id, request))
+    return queue_id
 
 
 def remove_from_queue(idx: int) -> bool:
@@ -650,7 +659,12 @@ def clear_queue() -> None:
 
 def get_queue() -> list[dict]:
     return [
-        {"model_id": r.model_id, "external": r.external is not None} for r in _queue
+        {
+            "queue_id": queue_id,
+            "model_id": r.model_id,
+            "external": r.external is not None,
+        }
+        for queue_id, r in _queue
     ]
 
 
@@ -661,7 +675,8 @@ async def run_queue(run: BenchmarkRun, engine_pool: Any) -> None:
         if run.status == "cancelled" or not _queue:
             return
         cleanup_old_runs()
-        run = create_run(_queue.pop(0))
+        queue_id, request = _queue.pop(0)
+        run = create_run(request, queue_id=queue_id)
         run.task = asyncio.current_task()
 
 

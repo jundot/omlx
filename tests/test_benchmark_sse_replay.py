@@ -404,6 +404,7 @@ class TestActiveBenchEndpoint:
             "context_profile": "code_python",
             "force_lm_engine": False,
             "external": False,
+            "queue_id": None,
         }
 
 
@@ -429,14 +430,16 @@ class TestConcurrentStartQueueing:
             },
         )
         assert r.status_code == 200, r.text
-        assert r.json() == {
-            "status": "queued",
-            "queue": [{"model_id": "model-x", "external": False}],
-        }
+        body = r.json()
+        assert body["status"] == "queued"
+        assert body["queue_id"].startswith("q-")
+        assert body["queue"] == [
+            {"queue_id": body["queue_id"], "model_id": "model-x", "external": False}
+        ]
         # The registry still has only the original run — the queued
         # request starts after it, not alongside it.
         assert len(_benchmark_runs) == 1
-        assert get_queue() == [{"model_id": "model-x", "external": False}]
+        assert get_queue() == body["queue"]
 
     def test_start_queues_while_finished_run_uploads(self, bench_client, monkeypatch):
         # The run is "completed" but its queue task is still uploading and
