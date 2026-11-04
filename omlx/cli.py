@@ -471,7 +471,6 @@ def launch_command(args, extra_args: list[str] | None = None):
     import requests
 
     from .integrations import IntegrationContext, get_integration, list_integrations
-    from .integrations.base import bracket_host
     from .settings import GlobalSettings
 
     def _optional_str(value) -> str | None:
@@ -492,19 +491,20 @@ def launch_command(args, extra_args: list[str] | None = None):
         print("Available: " + ", ".join(i.name for i in list_integrations()))
         sys.exit(1)
 
-    # Resolve host/port: CLI args > env vars > settings.json > defaults
+    # Resolve target: explicit --host/--port (local) > remote backend > local
+    # settings. API key: CLI arg > remote/local settings > empty.
     settings = GlobalSettings.load()
-    host = args.host or settings.server.host
-    port = args.port or settings.server.port
-
-    # host may be a comma-separated list of bind addresses; pick the first one
-    # for connecting. Wildcard addresses (0.0.0.0, ::) are valid bind targets
-    # but not connectable — fall back to localhost in that case.
-    first_bind = [h.strip() for h in host.split(",") if h.strip()][0] if host else ""
-    connect_host = (
-        first_bind if first_bind not in ("", "0.0.0.0", "::") else "127.0.0.1"
-    )
-    base_url = f"http://{bracket_host(connect_host)}:{port}"
+    try:
+        endpoint = settings.client_endpoint(
+            host=args.host,
+            port=args.port,
+            api_key=getattr(args, "api_key", None),
+        )
+    except ValueError as e:
+        print(str(e))
+        sys.exit(1)
+    base_url = endpoint.base_url
+    api_key = endpoint.api_key
 
     # Claude Desktop resolves tier aliases server-side, so it needs no
     # launch-time model — but it does need the desktop switch. The toggle
@@ -524,16 +524,19 @@ def launch_command(args, extra_args: list[str] | None = None):
         resp = requests.get(f"{base_url}/health", timeout=3)
         resp.raise_for_status()
     except Exception:
-        print(f"oMLX server is not running at {base_url}")
-        print("Start the server first: omlx start")
+        print(f"oMLX server is not reachable at {base_url}")
+        if endpoint.is_remote:
+            print(
+                "Remote backend configured in settings (remote.url); "
+                "check the server on that Mac."
+            )
+        else:
+            print("Start the server first: omlx start")
         sys.exit(1)
     try:
         default_model = _optional_str(resp.json().get("default_model")) or ""
     except (ValueError, AttributeError):
         default_model = ""
-
-    # Get API key: CLI args > settings.json > empty
-    api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
 
     claude_settings = getattr(settings, "claude_code", None)
     cli_opus_model = _optional_str(getattr(args, "opus_model", None))
@@ -670,9 +673,11 @@ def launch_command(args, extra_args: list[str] | None = None):
         ]
         context_window = min(context_windows) if context_windows else None
     ctx = IntegrationContext(
-        host=connect_host,
-        port=port,
-        api_key=api_key,
+        scheme=endpoint.scheme,
+        is_remote=endpoint.is_remote,
+        host=endpoint.host,
+        port=endpoint.port,
+        api_key=endpoint.api_key,
         model=model,
         default_model=default_model,
         opus_model=opus_model if tool_name == "claude" else None,
@@ -1402,13 +1407,21 @@ Example directory structure:
         "--host",
         type=str,
         default=None,
-        help="oMLX server host (default: from settings or 127.0.0.1)",
+        help=(
+            "Local oMLX server host (default: from settings or 127.0.0.1). "
+            "An explicit host/port targets a local server and bypasses the "
+            "remote backend"
+        ),
     )
     launch_parser.add_argument(
         "--port",
         type=int,
         default=None,
-        help="oMLX server port (default: from settings or 8000)",
+        help=(
+            "Local oMLX server port (default: from settings or 8000). "
+            "An explicit host/port targets a local server and bypasses the "
+            "remote backend"
+        ),
     )
     launch_parser.add_argument(
         "--api-key",

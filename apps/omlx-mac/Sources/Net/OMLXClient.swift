@@ -37,6 +37,8 @@ extension Error {
 
 @MainActor
 final class OMLXClient: ObservableObject {
+    /// `http` for the server on this Mac; a remote backend may be `https`.
+    private(set) var scheme: String
     private(set) var host: String
     private(set) var port: Int
     private(set) var apiKey: String?
@@ -45,7 +47,9 @@ final class OMLXClient: ObservableObject {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil, session: URLSession? = nil) {
+    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil,
+         scheme: String = "http", session: URLSession? = nil) {
+        self.scheme = scheme
         self.host = host
         self.port = port
         self.apiKey = apiKey
@@ -67,10 +71,19 @@ final class OMLXClient: ObservableObject {
         self.decoder = dec
     }
 
+    /// Re-point at a host and port, keeping the current scheme.
     func configure(host: String, port: Int, apiKey: String?) {
         self.host = host
         self.port = port
         self.apiKey = apiKey
+    }
+
+    /// Re-point at `endpoint`: the server on this Mac or the remote backend.
+    func configure(endpoint: OMLXEndpoint) {
+        self.scheme = endpoint.scheme
+        self.host = endpoint.host
+        self.port = endpoint.port
+        self.apiKey = endpoint.apiKey
     }
 
     // MARK: - Endpoints
@@ -636,7 +649,7 @@ final class OMLXClient: ObservableObject {
         isRetry: Bool = false
     ) async throws -> T {
         var components = URLComponents()
-        components.scheme = "http"
+        components.scheme = scheme
         components.host = host
         components.port = port
         components.path = path
@@ -677,7 +690,7 @@ final class OMLXClient: ObservableObject {
     private func login(apiKey: String) async throws {
         struct LoginReq: Encodable { let apiKey: String; let remember: Bool }
         var components = URLComponents()
-        components.scheme = "http"
+        components.scheme = scheme
         components.host = host
         components.port = port
         components.path = "/admin/api/login"

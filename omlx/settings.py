@@ -21,9 +21,11 @@ Usage:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -699,6 +701,105 @@ class AuthSettings:
         )
 
 
+def bracket_host(host: str) -> str:
+    """Return ``host`` in URL-authority form, bracketing bare IPv6 literals.
+
+    ``http://::1:8000`` is not a valid URL (requests rejects it with
+    InvalidURL); the RFC 3986 form is ``http://[::1]:8000``. IPv4 literals,
+    hostnames, and already-bracketed literals pass through unchanged.
+    """
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+@dataclass(frozen=True)
+class ClientEndpoint:
+    """Where client-side features (CLI launch, macOS app, Ask AI) reach a server."""
+
+    scheme: str  # "http" | "https"
+    host: str  # no brackets
+    port: int
+    api_key: str = ""
+    is_remote: bool = False
+
+    @property
+    def base_url(self) -> str:
+        return f"{self.scheme}://{bracket_host(self.host)}:{self.port}"
+
+
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_DEFAULT_ENDPOINT_PORT = 8000
+
+
+def parse_endpoint_address(text: str) -> ClientEndpoint | None:
+    """Parse a user-typed server address into a :class:`ClientEndpoint`.
+
+    Accepts ``host``, ``host:port``, ``http(s)://host[:port][/]`` and
+    bracketed IPv6 (``[::1]``, ``http://[::1]:8000``). The port defaults to
+    443 for ``https`` and 8000 otherwise. Returns None for anything else:
+    empty input, other schemes, paths, query/fragment, userinfo, bad ports.
+    The returned endpoint carries no api_key.
+    """
+    text = (text or "").strip()
+    if not text or any(c in text for c in "?#@%") or any(c.isspace() for c in text):
+        return None
+
+    scheme = "http"
+    if "://" in text:
+        scheme, _, text = text.partition("://")
+        scheme = scheme.lower()
+        if scheme not in ("http", "https"):
+            return None
+    if text.endswith("/"):
+        text = text[:-1]
+    if not text or "/" in text:
+        return None
+
+    if text.startswith("["):
+        close = text.find("]")
+        if close == -1:
+            return None
+        host, rest = text[1:close], text[close + 1 :]
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return None
+        if rest and not rest.startswith(":"):
+            return None
+        port_text = rest[1:] if rest else None
+    else:
+        if text.count(":") > 1:  # unbracketed IPv6 is ambiguous with a port
+            return None
+        host, sep, port_text = text.partition(":")
+        if not sep:
+            port_text = None
+        if not _HOSTNAME_RE.match(host):
+            return None
+
+    if port_text is None:
+        port = 443 if scheme == "https" else _DEFAULT_ENDPOINT_PORT
+    else:
+        if not (port_text.isascii() and port_text.isdigit()):
+            return None
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            return None
+    return ClientEndpoint(scheme=scheme, host=host, port=port)
+
+
+def _local_connect_host(bind_host: str | None) -> str:
+    """Pick a connectable host from a server.host bind setting.
+
+    ``bind_host`` may be a comma-separated list of bind addresses; the first
+    is used. Wildcard addresses (``0.0.0.0``, ``::``) are valid bind targets
+    but not connectable, so they fall back to loopback.
+    """
+    entries = [h.strip() for h in (bind_host or "").split(",") if h.strip()]
+    first = entries[0] if entries else ""
+    return first if first not in ("", "0.0.0.0", "::") else "127.0.0.1"
+
+
 @dataclass
 class MCPSettings:
     """MCP (Model Context Protocol) configuration settings."""
@@ -716,6 +817,38 @@ class MCPSettings:
         return cls(
             config_path=data.get("config_path"),
             expose_tools=data.get("expose_tools", True),
+        )
+
+
+@dataclass
+class RemoteSettings:
+    """Remote oMLX backend for client-side features.
+
+    When enabled, this install's client features (``omlx launch``, the macOS
+    app, Ask AI) talk to another oMLX server at ``url`` instead of the local
+    one. Client-side only: the server never acts on it, and it is NOT exposed
+    through the admin global-settings API.
+    """
+
+    enabled: bool = False
+    url: str = ""
+    api_key: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "url": self.url,
+            "api_key": self.api_key,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RemoteSettings:
+        """Create from dictionary."""
+        return cls(
+            enabled=data.get("enabled", False),
+            url=data.get("url", ""),
+            api_key=data.get("api_key"),
         )
 
 
@@ -1087,6 +1220,7 @@ class GlobalSettings:
     cache: CacheSettings = field(default_factory=CacheSettings)
     auth: AuthSettings = field(default_factory=AuthSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
+    remote: RemoteSettings = field(default_factory=RemoteSettings)
     huggingface: HuggingFaceSettings = field(default_factory=HuggingFaceSettings)
     modelscope: ModelScopeSettings = field(default_factory=ModelScopeSettings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
@@ -1176,6 +1310,8 @@ class GlobalSettings:
                 self.auth = AuthSettings.from_dict(data["auth"])
             if "mcp" in data:
                 self.mcp = MCPSettings.from_dict(data["mcp"])
+            if "remote" in data:
+                self.remote = RemoteSettings.from_dict(data["remote"])
             if "huggingface" in data:
                 self.huggingface = HuggingFaceSettings.from_dict(data["huggingface"])
             if "modelscope" in data:
@@ -1223,6 +1359,13 @@ class GlobalSettings:
 
     def _apply_env_overrides(self) -> None:
         """Apply OMLX_* environment variable overrides."""
+        # Remote backend (client-side only)
+        if remote_url := os.getenv("OMLX_REMOTE_URL"):
+            self.remote.url = remote_url
+            self.remote.enabled = True
+        if remote_api_key := os.getenv("OMLX_REMOTE_API_KEY"):
+            self.remote.api_key = remote_api_key
+
         # Server settings
         if host := os.getenv("OMLX_HOST"):
             self.server.host = host
@@ -1551,6 +1694,47 @@ class GlobalSettings:
 
         return effective
 
+    def client_endpoint(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        api_key: str | None = None,
+    ) -> ClientEndpoint:
+        """Resolve the server client-side features should talk to.
+
+        Explicit ``host``/``port`` (CLI flags) mean "this local target" and
+        bypass the remote backend. Otherwise an enabled ``remote`` wins, then
+        the local server. Raises ValueError when remote is enabled but its url
+        cannot be parsed.
+        """
+        if host or port:
+            return ClientEndpoint(
+                scheme="http",
+                host=_local_connect_host(host or self.server.host),
+                port=port or self.server.port,
+                api_key=api_key or self.auth.api_key or "",
+            )
+        if self.remote.enabled:
+            parsed = parse_endpoint_address(self.remote.url)
+            if parsed is None:
+                raise ValueError(
+                    f"Invalid remote.url {self.remote.url!r} in settings: "
+                    "expected host, host:port or http(s)://host[:port]"
+                )
+            return ClientEndpoint(
+                scheme=parsed.scheme,
+                host=parsed.host,
+                port=parsed.port,
+                api_key=api_key or self.remote.api_key or "",
+                is_remote=True,
+            )
+        return ClientEndpoint(
+            scheme="http",
+            host=_local_connect_host(self.server.host),
+            port=self.server.port,
+            api_key=api_key or self.auth.api_key or "",
+        )
+
     def save(self) -> None:
         """Save current settings to the settings file."""
         self.ensure_directories()
@@ -1564,6 +1748,7 @@ class GlobalSettings:
             "cache": self.cache.to_dict(),
             "auth": self.auth.to_dict(),
             "mcp": self.mcp.to_dict(),
+            "remote": self.remote.to_dict(),
             "huggingface": self.huggingface.to_dict(),
             "modelscope": self.modelscope.to_dict(),
             "network": self.network.to_dict(),

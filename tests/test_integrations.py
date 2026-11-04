@@ -2223,7 +2223,31 @@ class TestClaudeDesktopIntegration:
             lambda **kwargs: calls.append(kwargs) or True,
         )
         ClaudeDesktopAppIntegration().configure(ctx(port=8123, api_key="secret"))
-        assert calls == [{"port": 8123, "api_key": "secret"}]
+        assert calls == [{"port": 8123, "api_key": "secret", "base_url": None}]
+
+    def test_configure_passes_base_url_for_remote_backend(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            claude_desktop_app,
+            "configure_omlx_gateway",
+            lambda **kwargs: calls.append(kwargs) or True,
+        )
+        ClaudeDesktopAppIntegration().configure(
+            ctx(
+                host="studio.local",
+                port=8443,
+                api_key="secret",
+                scheme="https",
+                is_remote=True,
+            )
+        )
+        assert calls == [
+            {
+                "port": 8443,
+                "api_key": "secret",
+                "base_url": "https://studio.local:8443",
+            }
+        ]
 
     @pytest.mark.parametrize("running", [False, True])
     def test_launch_opens_app_unless_running(self, monkeypatch, capsys, running):
@@ -2801,13 +2825,20 @@ class TestDshIntegration:
         """
         # (name, ctx overrides, expected agent config, expected credential)
         cases = [
-            ("no default model keeps the session default untouched",
-             {"api_key": "sk-test"}, None, "sk-test"),
+            (
+                "no default model keeps the session default untouched",
+                {"api_key": "sk-test"},
+                None,
+                "sk-test",
+            ),
             # No API key configured: the ref still resolves (the dummy token the
             # base context supplies) so the route never fails MISSING_CREDENTIAL.
-            ("a named model becomes the session default",
-             {"model": "Qwen3.8-27B-oQ5e-mtp", "api_key": ""},
-             {"provider": "omlx", "model": "Qwen3.8-27B-oQ5e-mtp"}, "omlx"),
+            (
+                "a named model becomes the session default",
+                {"model": "Qwen3.8-27B-oQ5e-mtp", "api_key": ""},
+                {"provider": "omlx", "model": "Qwen3.8-27B-oQ5e-mtp"},
+                "omlx",
+            ),
         ]
         for index, (name, overrides, agent, token) in enumerate(cases):
             home = dsh_env / f"case-{index}"
@@ -2828,9 +2859,7 @@ class TestDshIntegration:
 
             _, data = _route(home / "profiles" / "desktop" / "cordis.patch.yml")
             if agent is None:
-                assert not any(
-                    e.get("id") == "agent-default-model" for e in data
-                ), name
+                assert not any(e.get("id") == "agent-default-model" for e in data), name
             else:
                 entry = next(e for e in data if e.get("id") == "agent-default-model")
                 assert entry["config"] == agent, name
@@ -3068,30 +3097,44 @@ class TestDshPatchWriter:
         """
         # (name, seed, default_model, expected agent config or None)
         cases = [
-            ("no default model leaves the agent entry untouched",
-             self._AGENT_ENTRY, None,
-             {"provider": "opencode-go1", "model": "mimo-v2.6-flash"}),
-            ("a default model rewrites the existing agent entry",
-             self._AGENT_ENTRY + self._PI_AI_ENTRY, "Qwen3.8-27B-oQ5e-mtp",
-             {"provider": "omlx", "model": "Qwen3.8-27B-oQ5e-mtp"}),
-            ("an empty flow config is rewritten",
-             "- id: llm-pi-ai\n"
-             '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
-             "  config: {}\n",
-             None, None),
-            ("an empty flow providers is rewritten",
-             "- id: llm-pi-ai\n"
-             '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
-             "  config:\n"
-             "    providers: {}\n",
-             None, None),
+            (
+                "no default model leaves the agent entry untouched",
+                self._AGENT_ENTRY,
+                None,
+                {"provider": "opencode-go1", "model": "mimo-v2.6-flash"},
+            ),
+            (
+                "a default model rewrites the existing agent entry",
+                self._AGENT_ENTRY + self._PI_AI_ENTRY,
+                "Qwen3.8-27B-oQ5e-mtp",
+                {"provider": "omlx", "model": "Qwen3.8-27B-oQ5e-mtp"},
+            ),
+            (
+                "an empty flow config is rewritten",
+                "- id: llm-pi-ai\n"
+                '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+                "  config: {}\n",
+                None,
+                None,
+            ),
+            (
+                "an empty flow providers is rewritten",
+                "- id: llm-pi-ai\n"
+                '  name: "@deepseek-ai/dsh-llm-pi-ai"\n'
+                "  config:\n"
+                "    providers: {}\n",
+                None,
+                None,
+            ),
         ]
         for index, (name, seed, default_model, agent) in enumerate(cases):
             path = tmp_path / f"patch-{index}.yml"
             path.write_text(seed)
 
             write_dsh_patch(
-                path, "http://127.0.0.1:8000/v1", DSH_MODELS,
+                path,
+                "http://127.0.0.1:8000/v1",
+                DSH_MODELS,
                 default_model=default_model,
             )
 
@@ -3191,32 +3234,48 @@ class TestDshCredentialsRef:
         """
         # (name, seed or None, value, expected refs, expected records)
         cases = [
-            ("updates an existing ref and keeps the others",
-             "version: 1\n"
-             "records:\n"
-             "  deepseek-account-platform/default:\n"
-             "    kind: token\n"
-             "    payload:\n"
-             '      token: "secret"\n'
-             "refs:\n"
-             '  DEEPSEEK_API_KEY: "dk"\n'
-             '  OMLX_API_KEY: "stale"\n',
-             "sk-fresh",
-             {"DEEPSEEK_API_KEY": "dk", "OMLX_API_KEY": "sk-fresh"},
-             {"deepseek-account-platform/default": {
-                 "kind": "token", "payload": {"token": "secret"}}}),
-            ("appends a missing ref to an existing section",
-             'version: 1\nrecords: {}\nrefs:\n  DEEPSEEK_API_KEY: "dk"\n',
-             "sk-new",
-             {"DEEPSEEK_API_KEY": "dk", "OMLX_API_KEY": "sk-new"}, {}),
-            ("appends a refs section when missing",
-             "version: 1\nrecords: {}\n",
-             "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
-            ("rewrites an inline empty refs as a block",
-             "version: 1\nrecords: {}\nrefs: {}\n",
-             "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
-            ("creates a missing file",
-             None, "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
+            (
+                "updates an existing ref and keeps the others",
+                "version: 1\n"
+                "records:\n"
+                "  deepseek-account-platform/default:\n"
+                "    kind: token\n"
+                "    payload:\n"
+                '      token: "secret"\n'
+                "refs:\n"
+                '  DEEPSEEK_API_KEY: "dk"\n'
+                '  OMLX_API_KEY: "stale"\n',
+                "sk-fresh",
+                {"DEEPSEEK_API_KEY": "dk", "OMLX_API_KEY": "sk-fresh"},
+                {
+                    "deepseek-account-platform/default": {
+                        "kind": "token",
+                        "payload": {"token": "secret"},
+                    }
+                },
+            ),
+            (
+                "appends a missing ref to an existing section",
+                'version: 1\nrecords: {}\nrefs:\n  DEEPSEEK_API_KEY: "dk"\n',
+                "sk-new",
+                {"DEEPSEEK_API_KEY": "dk", "OMLX_API_KEY": "sk-new"},
+                {},
+            ),
+            (
+                "appends a refs section when missing",
+                "version: 1\nrecords: {}\n",
+                "sk-new",
+                {"OMLX_API_KEY": "sk-new"},
+                {},
+            ),
+            (
+                "rewrites an inline empty refs as a block",
+                "version: 1\nrecords: {}\nrefs: {}\n",
+                "sk-new",
+                {"OMLX_API_KEY": "sk-new"},
+                {},
+            ),
+            ("creates a missing file", None, "sk-new", {"OMLX_API_KEY": "sk-new"}, {}),
         ]
         for index, (name, seed, value, refs, records) in enumerate(cases):
             path = tmp_path / f"credentials-{index}.yaml"
