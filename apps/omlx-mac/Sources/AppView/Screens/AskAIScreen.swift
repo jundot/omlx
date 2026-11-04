@@ -291,11 +291,11 @@ private struct ServerSection: View {
         if services.isRemoteBackend {
             let address = services.config.remoteEndpoint?.displayAddress ?? services.config.remoteAddress
             return String(localized: "askai.row.server.sub.remote",
-                          defaultValue: "The server this app uses (\(address)), or another oMLX server on your network.",
+                          defaultValue: "The server this app uses (\(address)), or a different oMLX server on your network.",
                           comment: "Sublabel for the Ask AI server choice when the app uses a remote backend; the argument is that server's address")
         }
         return String(localized: "askai.row.server.sub",
-                      defaultValue: "The server on this Mac, or another oMLX server on your network, such as a Mac Studio.",
+                      defaultValue: "The server on this Mac, or a different oMLX server on your network, such as a Mac Studio.",
                       comment: "Sublabel for the Ask AI server choice")
     }
 
@@ -324,8 +324,8 @@ private struct ServerSection: View {
                     options: [
                         (AskAIServerMode.thisMac, thisMacLabel),
                         (AskAIServerMode.remote, String(localized: "askai.server.remote",
-                                                        defaultValue: "Another server",
-                                                        comment: "Segment: Ask AI uses an oMLX server on the network")),
+                                                        defaultValue: "Different server",
+                                                        comment: "Segment: Ask AI uses a different oMLX server than the app does")),
                     ]
                 )
                 .frame(width: .controlMedium)
