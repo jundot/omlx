@@ -276,7 +276,7 @@ Native Swift / SwiftUI menubar app (not Electron). Start, stop, and monitor the 
 
 ### Remote Backend (experimental)
 
-Run the models on one Mac and use everything else from another. Point the macOS app (Server → Backend → *Another server*) or the CLI (`OMLX_REMOTE_URL`, or the `remote` section of `settings.json`) at an oMLX server on your network: the app's screens, menubar, Ask AI and `omlx launch` then use that server, and no server runs on the client Mac. See [docs/experimental/remote-backend.md](docs/experimental/remote-backend.md).
+Run the models on one Mac and use everything else from another. Point the macOS app (Server → Backend → *Remote server*) or the CLI (`OMLX_REMOTE_URL`, or the `remote` section of `settings.json`) at an oMLX server on your network: the app's screens, menubar, Ask AI and `omlx launch` then use that server, and no server runs on the client Mac. See [docs/experimental/remote-backend.md](docs/experimental/remote-backend.md).
 
 ### API Compatibility
 

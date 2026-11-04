@@ -22885,6 +22885,90 @@
         }
       }
     },
+    "remote.badge.help" : {
+      "comment" : "Tooltip of the remote server badge; the arguments are the address and its state",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This app manages the oMLX server at %1$@, which is %2$@. Click to change it."
+          }
+        }
+      }
+    },
+    "remote.badge.state.checking" : {
+      "comment" : "Remote server badge tooltip state: the server is being probed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "being checked"
+          }
+        }
+      }
+    },
+    "remote.badge.state.invalid" : {
+      "comment" : "Remote server badge tooltip state: the address cannot be parsed",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "not a valid address"
+          }
+        }
+      }
+    },
+    "remote.badge.state.reachable" : {
+      "comment" : "Remote server badge tooltip state: the server answers",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "reachable"
+          }
+        }
+      }
+    },
+    "remote.badge.state.unauthorized" : {
+      "comment" : "Remote server badge tooltip state: the server rejects the API key",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "rejecting the API key"
+          }
+        }
+      }
+    },
+    "remote.badge.state.unreachable" : {
+      "comment" : "Remote server badge tooltip state: the server does not answer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "unreachable"
+          }
+        }
+      }
+    },
+    "remote.badge.title" : {
+      "comment" : "Label of the badge shown on every screen while the app uses a server on another Mac",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Remote server"
+          }
+        }
+      }
+    },
     "security.api_key.copy" : {
       "comment" : "Tooltip on the API key copy button",
       "extractionState" : "manual",
@@ -24236,7 +24320,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Another server"
+            "value" : "Remote server"
           }
         }
       }
@@ -27158,7 +27242,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "The oMLX server this app uses. With another server, nothing runs on this Mac: models, settings and logs are that server's."
+            "value" : "The oMLX server this app uses. With a remote server, nothing runs on this Mac: models, settings and logs are that server's."
           }
         }
       }
@@ -42700,7 +42784,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "The server on this Mac, or another oMLX server on your network, such as a Mac Studio."
+            "value" : "The server on this Mac, or a different oMLX server on your network, such as a Mac Studio."
           }
         }
       }
@@ -42724,7 +42808,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Another server"
+            "value" : "Different server"
           }
         }
       }
@@ -42736,7 +42820,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "The server this app uses (%@), or another oMLX server on your network."
+            "value" : "The server this app uses (%@), or a different oMLX server on your network."
           }
         }
       }
