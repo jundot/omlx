@@ -1,20 +1,12 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /*
- * Custom theme: overrides of the main semantic color tokens in
- * static/css/theme.css, saved on the server as `ui.custom_theme`. base.html
- * puts the saved overrides in window._customTheme and loads this file in
- * <head>, so the theme paints with the first frame; the settings editor in
- * dashboard.js saves through /admin/api/global-settings and calls apply().
- *
- * Overrides are {light: {token: hex}, dark: {token: hex}} and are drawn as
- * `:root[data-theme="<mode>"] { --token: hex }`, together with the neutral
- * utility channels each token stands for and, for a status colour, its soft
- * fill, line and text.
+ * Saved overrides of the theme.css color tokens (ui.custom_theme), painted from
+ * <head> before first paint. This file owns the token list and the contrast
+ * floor; the server only checks that each value is #rrggbb.
  */
 (function () {
     const STYLE_ID = 'omlx-custom-theme';
     const MODES = ['light', 'dark'];
-    // Keep GROUPS and CONTRAST_RULES in sync with omlx/theme_contract.py.
     const GROUPS = [
         { id: 'surfaces', tokens: ['bg-primary', 'bg-secondary', 'bg-tertiary'] },
         { id: 'text', tokens: ['text-primary', 'text-secondary', 'text-tertiary', 'text-muted'] },
@@ -52,7 +44,6 @@
     // floor depend on whatever is drawn behind it.
     const HEX = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i;
 
-    // '#abc', 'abc', '#AABBCC' -> '#aabbcc'; anything else -> null.
     function normalizeHex(value) {
         const match = HEX.exec(String(value ?? '').trim());
         if (!match) return null;
@@ -70,7 +61,7 @@
         return '#' + byte(r) + byte(g) + byte(b);
     }
 
-    // WCAG 2 contrast ratio of two colors; null when either is not a valid hex.
+    // WCAG 2 ratio; null when either color is not a valid hex.
     function contrast(fg, bg) {
         const pair = [rgb(fg), rgb(bg)];
         if (!pair[0] || !pair[1]) return null;
@@ -85,7 +76,6 @@
         return (hi + 0.05) / (lo + 0.05);
     }
 
-    // Every contrast-rule pair of one theme's colors, with its ratio.
     function contrastChecks(colors) {
         return CONTRAST_RULES.flatMap(([foreground, backgrounds]) => backgrounds.map(background => ({
             foreground,
@@ -94,7 +84,6 @@
         })));
     }
 
-    // Keep known tokens with valid colors; drop everything else.
     function sanitize(theme) {
         const clean = { light: {}, dark: {} };
         for (const mode of MODES) {
@@ -123,8 +112,7 @@
             lines.push(`--${token}-soft: color-mix(in srgb, ${hex} ${tint[0]}, ${base});`);
             lines.push(`--${token}-line: color-mix(in srgb, ${hex} ${tint[1]}, ${base});`);
             lines.push(`--${token}-text: color-mix(in srgb, ${hex}, ${tint[2]});`);
-            // One channel per palette step, so status.css can keep the step
-            // ladder instead of collapsing the shades into one role colour.
+            // One channel per palette step keeps status.css's shade ladder.
             const pct = (light, dark) => (mode === 'dark' ? dark : light);
             const tintMix = (value, surface) => `color-mix(in srgb, ${hex} ${value}, ${surface})`;
             const steps = {

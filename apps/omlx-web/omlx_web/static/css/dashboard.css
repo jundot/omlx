@@ -1,9 +1,7 @@
     :root { accent-color: rgb(var(--palette-neutral-900)); }
     [data-theme="dark"] { accent-color: rgb(var(--palette-neutral-200)); }
 
-    /* Dark values for the neutral utilities in tailwind.config.js. They live
-       here, not in theme.css, because the chat page loads theme.css without
-       this file and keeps its own theme. */
+    /* Dark neutral channels. Not in theme.css: chat loads it without this file. */
     [data-theme="dark"] {
         --text-scale-300: var(--palette-zinc-450);
         --text-scale-400: var(--palette-zinc-450);
@@ -27,13 +25,9 @@
     }
 
     /* === Page-level backgrounds === */
-    /* `.bg-white` resolves through --surface-scale-white, so no dark remap is
-       needed; keeping one would block the hover utilities. A 20% white overlay
-       is an intentional highlight on a dark card, not a surface, so it keeps
-       the palette white instead of the dark surface channel. */
+    /* A 20% white overlay highlights a dark card, so it stays white. */
     [data-theme="dark"] .bg-white\/20 { background-color: rgb(var(--palette-white) / 0.2) !important; }
-    /* --surface-scale-100 and -200 share night-700, so the common
-       bg-neutral-100 + hover:bg-neutral-200 chip would not change on hover. */
+    /* The 100 and 200 surface channels share night-700, so step the hover up. */
     [data-theme="dark"] .hover\:bg-neutral-200:hover { background-color: rgb(var(--palette-zinc-700)) !important; }
 
     /* Cluster status is operational data, not decorative helper copy. Keep
@@ -52,8 +46,7 @@
     .settings-rows > :not(template):not([style*="display: none"]) ~ :not(template):not([style*="display: none"]) { border-top: 1px solid rgb(var(--border-scale-200)); }
 
     /* === Hover states ===
-       In dark the 700 step shares the 600 step's colour, so a 700 hover would
-       barely show on 400-600 text; lift it to the primary text colour. */
+       In dark the 700 step equals 600, so lift its hover to the primary text. */
     [data-theme="dark"] .hover\:text-neutral-700:hover { color: var(--text-primary) !important; }
 
     /* === Gauge track (visible in both themes) === */
@@ -67,8 +60,7 @@
     [data-theme="dark"] .shadow-lg { box-shadow: 0 4px 12px 0 rgb(var(--palette-black) / 0.5) !important; }
 
     /* === Primary buttons and badges: bg-neutral-900 ===
-       Drawn from the --btn-primary tokens in both themes (dark inverts them).
-       No !important: hover and disabled variants still win. */
+       No !important, so hover and disabled variants still win. */
     :is(button, a, span).bg-neutral-900 { background-color: var(--btn-primary); color: var(--btn-primary-text); }
     :is(button, a).hover\:bg-neutral-800:hover { background-color: var(--btn-primary-hover); }
     [data-theme="dark"] :is(button, a, span).bg-neutral-900 :is(span, svg, .text-white) {
@@ -157,8 +149,7 @@
     }
 
     /* === Decorative tag hues (dark mode adjustments) ===
-       The four semantic status roles live in status.css now. These remaining
-       badge hues are a fixed taxonomy, not theme colors, and stay here. */
+       Fixed hues, not theme roles; the status roles are in status.css. */
     [data-theme="dark"] .bg-orange-50 { background-color: rgb(var(--palette-orange-500) / 0.15) !important; }
     [data-theme="dark"] .border-orange-200 { border-color: rgb(var(--palette-orange-500) / 0.3) !important; }
     [data-theme="dark"] .text-orange-700 { color: rgb(var(--palette-orange-300)) !important; }
@@ -704,11 +695,9 @@
         grid-template-columns: minmax(0, 1fr);
         align-items: start;
     }
-    /* The first x-for card follows the <template> sibling, so space-y would
-       inset it; keep both columns' top edges level. */
+    /* The first card follows a <template>, so space-y would inset it. */
     .theme-editor .space-y-4 > :first-of-type { margin-top: 0; }
-    /* Previews first: above the fields on narrow screens, on their left on wide
-       ones, so the two columns start at the same top edge. */
+    /* Previews above the fields when narrow, on their left when wide. */
     .theme-editor__aside { order: -1; }
     @media (min-width: 1280px) {
         .theme-editor { grid-template-columns: 30rem minmax(0, 1fr); }
@@ -722,8 +711,6 @@
     @media (min-width: 1536px) {
         .theme-editor { grid-template-columns: 34rem minmax(0, 1fr); }
     }
-    /* The light and the dark column heads keep their own theme's colors,
-       whichever theme the page is in. */
     .theme-mode-head {
         justify-content: center;
         justify-self: center;
@@ -758,9 +745,6 @@
         border: 1px solid var(--border-normal);
         overflow: hidden;
         cursor: pointer;
-        /* A checkerboard so translucent colors read as translucent. */
-        background-image: conic-gradient(rgb(var(--palette-mid-gray) / 0.25) 25%, transparent 0 50%, rgb(var(--palette-mid-gray) / 0.25) 0 75%, transparent 0);
-        background-size: 0.5rem 0.5rem;
     }
     /* The native color input is transparent; show its focus on the swatch. */
     .theme-swatch:focus-within { outline: 2px solid var(--focus-ring-color); outline-offset: 2px; }
@@ -779,9 +763,7 @@
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         text-transform: lowercase;
     }
-    /* Each value column keeps its own theme, whichever theme the page is in. */
-    /* Beats the dark `input` rule, which paints every field with the page
-       theme. */
+    /* Beats the dark `input` rule so each column keeps its own theme. */
     .theme-editor .theme-mode-cell .theme-hex-input {
         background-color: var(--theme-cell-bg) !important;
         border-color: var(--theme-cell-border) !important;
@@ -791,8 +773,7 @@
     .theme-hex-input--invalid,
     [data-theme="dark"] .theme-hex-input--invalid { border-color: var(--text-danger) !important; }
 
-    /* The live preview: a small theme specimen drawn only from the tokens,
-       which the editor sets inline on .theme-preview. */
+    /* Drawn only from the tokens the editor sets inline. */
     .theme-preview {
         border: 1px solid var(--border-faint);
         border-radius: 1rem;

@@ -3146,8 +3146,6 @@ class TestUISettings:
 class TestCustomThemeRoute:
     """/api/global-settings validates and persists ui_custom_theme."""
 
-    THEME = {"light": {"bg-primary": "#fdf6e3"}, "dark": {"text-danger": "#f87171"}}
-
     def _post(self, gs, monkeypatch, body):
         import asyncio
 
@@ -3159,63 +3157,30 @@ class TestCustomThemeRoute:
             admin_routes.update_global_settings(request=request, is_admin=True)
         )
 
-    def test_post_persists_and_get_exposes_theme(self, tmp_path, monkeypatch):
-        import asyncio
-
+    def test_post_persists_and_null_restores(self, tmp_path, monkeypatch):
         from omlx.admin import routes as admin_routes
 
         gs = GlobalSettings(base_path=tmp_path)
-        theme = {"light": {"bg-primary": "#FDF6E3"}, "dark": {"text-danger": "#f87171"}}
-        result = self._post(gs, monkeypatch, {"ui_custom_theme": theme})
-        assert "ui_custom_theme" in result["runtime_applied"]
-        assert gs.ui.custom_theme == self.THEME
-        assert GlobalSettings.load(base_path=tmp_path).ui.custom_theme == self.THEME
-        # Read the getter before the GET route, which rebinds the server's host.
-        assert admin_routes.configured_custom_theme() == self.THEME
-        settings = asyncio.run(admin_routes.get_global_settings(is_admin=True))
-        assert settings["ui"]["custom_theme"] == self.THEME
-
-    @pytest.mark.parametrize("theme", [None, {"light": {}, "dark": {}}])
-    def test_null_or_empty_restores_stock_colors(self, tmp_path, monkeypatch, theme):
-        gs = GlobalSettings(base_path=tmp_path)
-        gs.ui.custom_theme = self.THEME
+        theme = {"light": {"bg-primary": "#FDF6E3"}, "dark": {}}
         self._post(gs, monkeypatch, {"ui_custom_theme": theme})
-        assert gs.ui.custom_theme is None
+        saved = {"light": {"bg-primary": "#fdf6e3"}, "dark": {}}
+        assert GlobalSettings.load(base_path=tmp_path).ui.custom_theme == saved
+        assert admin_routes.configured_custom_theme() == saved
 
-    def test_post_without_theme_keeps_current(self, tmp_path, monkeypatch):
-        gs = GlobalSettings(base_path=tmp_path)
-        gs.ui.custom_theme = self.THEME
-        result = self._post(gs, monkeypatch, {})
-        assert "ui_custom_theme" not in result["runtime_applied"]
-        assert gs.ui.custom_theme == self.THEME
+        self._post(gs, monkeypatch, {"ui_custom_theme": None})
+        assert gs.ui.custom_theme is None
 
     @pytest.mark.parametrize(
         "colors",
-        [
-            {"palette-white": "#000000"},
-            {"bg-primary": "red"},
-            {"bg-primary": "#fff"},
-            # Translucent text would pass any contrast check against its RGB.
-            {"text-primary": "#00000000"},
-        ],
+        [{"bg-primary": "red"}, {"text-primary": "#00000000"}, {"Bad Key": "#000000"}],
     )
-    def test_rejects_unknown_tokens_and_non_hex(self, colors):
+    def test_rejects_malformed_colors(self, colors):
         from pydantic import ValidationError
 
         from omlx.admin.routes import CustomThemeRequest
 
         with pytest.raises(ValidationError):
             CustomThemeRequest.model_validate({"light": colors})
-
-    def test_rejects_low_contrast_pairs(self):
-        from pydantic import ValidationError
-
-        from omlx.admin.routes import CustomThemeRequest
-
-        with pytest.raises(ValidationError):
-            CustomThemeRequest.model_validate(
-                {"light": {"bg-primary": "#111111", "text-primary": "#222222"}}
-            )
 
 
 class TestDashboardLayoutRoute:

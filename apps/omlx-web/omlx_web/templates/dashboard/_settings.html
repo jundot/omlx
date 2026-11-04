@@ -2101,7 +2101,7 @@
                     </div>
 
                     <div class="theme-editor">
-                        <!-- Live preview: above the fields on narrow screens, on their left on wide ones -->
+                        <!-- Live preview -->
                         <div class="theme-editor__aside">
                             <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                                 <div class="flex items-center gap-3 px-6 py-4 bg-neutral-100 border-b border-neutral-200">
@@ -2164,7 +2164,7 @@
                                                         </div>
                                                     </div>
                                                 </div>
-                                                <!-- Contrast checks: the lowest ratio of each rule, against the floor -->
+                                                <!-- Contrast checks -->
                                                 <ul class="space-y-0.5 text-caption">
                                                     <template x-for="check in themeContrastChecks(mode)" :key="check.id">
                                                         <li class="flex items-center justify-between gap-2">
@@ -2183,7 +2183,7 @@
                                 </div>
                             </div>
 
-                            <!-- Actions: under the preview card -->
+                            <!-- Actions -->
                             <div class="mt-4 space-y-3">
                                 <div class="space-y-1">
                                     <span x-show="customThemeSaved" x-cloak class="flex items-center gap-2 text-sm text-neutral-700">
@@ -2226,7 +2226,7 @@
                             </div>
                         </div>
 
-                        <!-- Token fields: one card per group, light and dark side by side -->
+                        <!-- Token fields -->
                         <div class="space-y-4 min-w-0">
                             <template x-for="group in customThemeGroups" :key="group.id">
                                 <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">

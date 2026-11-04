@@ -20,9 +20,7 @@
     --palette-neutral-900: 23 23 23;
     --palette-neutral-950: 10 10 10;
 
-    /* Channel values for the neutral utilities (rgb, so /alpha still works).
-       The dashboard's dark values live in dashboard.css, next to the page that
-       loads it: the chat page has its own theme and must not inherit them. */
+    /* Neutral utility channels; the dark values are in dashboard.css. */
     --text-scale-300: var(--palette-neutral-300);
     --text-scale-400: var(--palette-neutral-500);
     --text-scale-500: var(--palette-neutral-500);
@@ -279,10 +277,8 @@
     --timeline-accent: rgb(var(--palette-blue-500));
     --focus-ring-color: rgb(var(--palette-neutral-900));
     --switch-on: rgb(var(--palette-black));
-    /* Status roles: badges and notices pair the soft fill, the line and the
-       text; the solid colour marks dots and meters. `--<role>-text` is text on
-       the role's soft fill; `--text-danger` above is destructive text on the
-       page surfaces, so the two differ on purpose. */
+    /* Status roles. `--<role>-text` is text on the soft fill, unlike
+       `--text-danger`, which is destructive text on the page surfaces. */
     --success: rgb(var(--palette-green-500));
     --success-soft: rgb(var(--palette-green-50));
     --success-line: rgb(var(--palette-green-200));

@@ -19,12 +19,8 @@ module.exports = {
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
       },
-      // Neutral utilities resolve through theme.css, so light and dark share
-      // one definition; dashboard.css supplies the dark channels and the one
-      // dark hover override (hover:text-neutral-700). bg-white is a surface
-      // too; text-white and the other white utilities keep the palette.
-      // Values match the palette steps the classes used before (text-400 took
-      // the 500 step for AA; see #4727).
+      // Neutral utilities read the theme.css channels (dark values in
+      // dashboard.css). text-400 takes the 500 step for AA (#4727).
       textColor: {
         neutral: {
           300: 'rgb(var(--text-scale-300) / <alpha-value>)',

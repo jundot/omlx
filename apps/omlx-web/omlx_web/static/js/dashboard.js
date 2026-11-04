@@ -141,10 +141,7 @@
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
             enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
-            // Custom theme editor (static/js/custom_theme.js): the saved
-            // overrides, the defaults from theme.css, and the text in each field.
-            // base.html loads custom_theme.js first; the script tests that load
-            // this file alone have no OmlxCustomTheme, hence the fallbacks.
+            // Script tests load this file without custom_theme.js, hence the fallbacks.
             customThemeGroups: window.OmlxCustomTheme?.GROUPS ?? [],
             customThemeStored: window.OmlxCustomTheme?.sanitize(window._customTheme) ?? { light: {}, dark: {} },
             customThemeDefaults: { light: {}, dark: {} },
@@ -5148,8 +5145,7 @@
             get activeModelsPressureBarColor() {
                 const pct = this.activeModelsPressurePercent;
                 if (pct >= 90) return 'var(--danger)';
-                // The in-between steps keep their palette hues unless a custom theme
-                // blends its own roles (custom_theme.js sets --meter-high/--meter-mid).
+                // custom_theme.js sets --meter-high/--meter-mid only for custom status roles.
                 if (pct >= 80) return 'var(--meter-high, rgb(var(--palette-orange-500)))';
                 if (pct >= 70) return 'var(--warning)';
                 if (pct >= 60) return 'var(--meter-mid, rgb(var(--palette-yellow-400)))';
@@ -7424,7 +7420,6 @@
                 return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token]) !== null;
             },
 
-            // The color a field stands for: its valid text, else the default.
             themeTokenColor(mode, token) {
                 return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token])
                     || this.customThemeDefaults[mode][token] || '#000000';
@@ -7434,7 +7429,6 @@
                 return this.themeTokenColor(mode, token) !== this.customThemeDefaults[mode][token];
             },
 
-            // The draft as overrides: only the colors that differ from theme.css.
             customThemeOverrides() {
                 const overrides = { light: {}, dark: {} };
                 for (const mode of ['light', 'dark']) {
@@ -7456,31 +7450,24 @@
                     && this.themeContrastChecks(mode).every(check => check.ok));
             },
 
-            // The stock color of a token, from theme.css. The column chrome uses
-            // these, not the draft, so editing a surface cannot make the light
-            // column dark or the dark one light.
+            // Column chrome uses stock colors so editing a surface never flips a column.
             themeModeColor(mode, token) {
                 const stock = this.customThemeDefaults[mode] && this.customThemeDefaults[mode][token];
                 return stock || this.themeTokenColor(mode, token);
             },
 
-            // The two column heads keep their own theme's colors whichever theme the
-            // page is in, so the light and the dark column stay distinguishable.
             themeModeHeadStyle(mode) {
                 const color = token => this.themeModeColor(mode, token);
                 return `background:${color('bg-primary')}; border-color:${color('border-normal')}; color:${color('text-secondary')};`;
             },
 
-            // The value fields keep their own theme's surface and text, so the
-            // light and the dark column read as light and dark in either theme.
             themeModeCellStyle(mode) {
                 const color = token => this.themeModeColor(mode, token);
                 return `--theme-cell-bg:${color('bg-primary')}; --theme-cell-fg:${color('text-primary')};`
                     + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`;
             },
 
-            // The preview's own token values: stock ones, then the edited ones with
-            // everything a saved token would also set (status tints included).
+            // Edited tokens also carry their derived channels and status tints.
             themePreviewStyle(mode) {
                 const api = window.OmlxCustomTheme;
                 const stock = this.customThemeDefaults[mode];
@@ -7494,8 +7481,7 @@
                 return lines.join(' ');
             },
 
-            // The lowest ratio of each contrast rule (custom_theme.js), the same
-            // pairs and floor the server enforces on save.
+            // The only contrast check: the server stores any #rrggbb it gets.
             themeContrastChecks(mode) {
                 const api = window.OmlxCustomTheme;
                 const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
@@ -7524,7 +7510,6 @@
                 this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
             },
 
-            // Clicking an element in a preview jumps to the field it is drawn from.
             focusThemeToken(mode, event) {
                 const token = event.target.closest('[data-token]')?.dataset.token;
                 const field = token && document.getElementById(`theme-token-${mode}-${token}`);
@@ -7533,7 +7518,6 @@
                 field.select();
             },
 
-            // Save to the server (ui.custom_theme), then repaint this page.
             async saveCustomTheme(overrides) {
                 const api = window.OmlxCustomTheme;
                 const theme = api.sanitize(overrides);

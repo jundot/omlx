@@ -1,15 +1,7 @@
 /*
- * Status roles. The badge, notice, dot and meter utilities read the four
- * semantic roles from theme.css in both themes. This file is loaded on every
- * page after tailwind.css, so the chat and login pages get the same colors as
- * the dashboard; dashboard.css no longer carries page-scoped copies.
- *
- * Each palette step keeps its own channel (`--danger-bg-600`, `--danger-fg-500`,
- * `--danger-bd-300`, ...). The fallback is what the console drew before: the
- * role's soft fill and line for the 50/200 steps (they differ in dark), the
- * palette step otherwise. When a custom theme sets a role, custom_theme.js
- * replaces the whole ladder with shades derived from it, keeping the number
- * of steps and their order instead of merging them.
+ * Status utilities read the theme.css roles on every page. Each step has its
+ * own channel (--danger-bg-600, ...) that custom_theme.js sets for a custom
+ * role; the fallback is the stock color.
  */
 .bg-green-50 { background-color: var(--success-bg-50, var(--success-soft)); }
 .bg-green-100 { background-color: var(--success-bg-100, rgb(var(--palette-green-100))); }
@@ -71,11 +63,9 @@
 .text-blue-900 { color: var(--info-fg-900, rgb(var(--palette-blue-900))); }
 .hover\:bg-blue-100:hover { background-color: var(--info-bg-100, rgb(var(--palette-blue-100))); }
 
-/* Stock dark steps that the light palette cannot express; only used when no
-   custom theme sets the channel. */
+/* Stock dark steps that differ from the light palette. */
 [data-theme="dark"] .text-green-600 { color: var(--success-fg-600, rgb(var(--palette-green-400))); }
 [data-theme="dark"] .text-green-700 { color: var(--success-fg-700, rgb(var(--palette-green-400))); }
-[data-theme="dark"] .text-amber-600 { color: rgb(var(--palette-amber-400)); }
 [data-theme="dark"] .text-amber-700 { color: var(--warning-fg-700, rgb(var(--palette-amber-400))); }
 [data-theme="dark"] .text-amber-800 { color: var(--warning-fg-800, rgb(var(--palette-amber-300))); }
 [data-theme="dark"] .text-amber-900 { color: var(--warning-fg-900, rgb(var(--palette-amber-300))); }

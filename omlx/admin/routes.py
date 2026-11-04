@@ -88,7 +88,6 @@ from ..model_settings import (
     oq_a8_model_supported,
     validate_kv_compression_settings,
 )
-from ..theme_contract import check_theme
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
@@ -609,19 +608,27 @@ class UpdateTemplateRequest(BaseModel):
         return _normalize_profile_settings(value, universal=True)
 
 
+_THEME_TOKEN = re.compile(r"[a-z][a-z0-9-]{0,47}")
+_THEME_HEX = re.compile(r"#[0-9a-f]{6}")
+
+
 class CustomThemeRequest(BaseModel):
     """Saved color token overrides for the light and dark web UI themes."""
 
-    light: dict[str, str] = Field(default_factory=dict)
-    dark: dict[str, str] = Field(default_factory=dict)
+    # omlx_web owns the token list and the contrast floor; check only the shape.
+    light: dict[str, str] = Field(default_factory=dict, max_length=64)
+    dark: dict[str, str] = Field(default_factory=dict, max_length=64)
 
-    @model_validator(mode="after")
-    def _valid_and_readable(self):
-        clean, errors = check_theme({"light": self.light, "dark": self.dark})
-        if errors:
-            raise ValueError("; ".join(error["message"] for error in errors))
-        self.light, self.dark = clean["light"], clean["dark"]
-        return self
+    @field_validator("light", "dark")
+    @classmethod
+    def _opaque_hex(cls, colors: dict[str, str]) -> dict[str, str]:
+        clean = {}
+        for token, value in colors.items():
+            color = value.strip().lower()
+            if not _THEME_TOKEN.fullmatch(token) or not _THEME_HEX.fullmatch(color):
+                raise ValueError(f"{token!r}: expected a token name and #rrggbb")
+            clean[token] = color
+        return clean
 
 
 # Dashboard layout grid contract. Keep in sync with static/js/dashboard_layout.js.
