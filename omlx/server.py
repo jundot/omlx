@@ -2427,7 +2427,7 @@ def _prepare_chat_prompt_for_request(
     is_partial: bool | None = None,
 ) -> tuple[int, tuple[str, list[int]] | None]:
     # Subclasses (e.g. distributed) have their own prompt handling.
-    if type(engine) is BatchedEngine:
+    if type(engine) in (BatchedEngine, VLMBatchedEngine):
         prepared = engine.prepare_chat_prompt(
             messages, tools, chat_template_kwargs, is_partial
         )
@@ -2441,6 +2441,18 @@ def _prepare_chat_prompt_for_request(
         ),
         None,
     )
+
+
+async def _prepare_prompt_off_loop(engine: BaseEngine, prepare, *args, **kwargs):
+    """Call ``prepare(engine, ...)`` in a worker thread for VLM engines.
+
+    Encoding a long prompt on the event loop stalls every other stream. The text
+    engine stays on the loop: its ``_apply_chat_template`` lazily builds the
+    k2_horizon grammar compiler, and a second request would see it half built.
+    """
+    if isinstance(engine, VLMBatchedEngine):
+        return await asyncio.to_thread(prepare, engine, *args, **kwargs)
+    return prepare(engine, *args, **kwargs)
 
 
 class _ContextLengthExceededError(HTTPException):
@@ -5161,8 +5173,9 @@ async def create_chat_completion(
         )
         # Validate context window before sending to model
         try:
-            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+            num_prompt_tokens, prepared_prompt = await _prepare_prompt_off_loop(
                 engine,
+                _prepare_chat_prompt_for_request,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,
@@ -8103,7 +8116,9 @@ async def create_anthropic_message(
         chat_kwargs.update(_cache_store_kwargs(http_request))
 
         # Validate context window before sending to model
-        num_prompt_tokens, prepared_prompt = _count_anthropic_prompt(engine, prompt)
+        num_prompt_tokens, prepared_prompt = await _prepare_prompt_off_loop(
+            engine, _count_anthropic_prompt, prompt
+        )
         validate_context_window(num_prompt_tokens, request.model)
 
         if prepared_prompt is not None:
@@ -8309,7 +8324,9 @@ async def count_anthropic_tokens(
             thinking=request.thinking,
         )
         prompt = await _prepare_anthropic_prompt(temp_request, engine, resolved_model)
-        input_tokens = _count_anthropic_prompt(engine, prompt)[0]
+        input_tokens, _ = await _prepare_prompt_off_loop(
+            engine, _count_anthropic_prompt, prompt
+        )
         logger.debug(
             f"Token count: {input_tokens} tokens for {len(prompt.messages)} messages"
         )
@@ -8762,8 +8779,9 @@ async def create_response(
 
         # Validate context window
         try:
-            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+            num_prompt_tokens, prepared_prompt = await _prepare_prompt_off_loop(
                 engine,
+                _prepare_chat_prompt_for_request,
                 messages,
                 tools_for_template,
                 chat_template_kwargs=merged_ct_kwargs or None,

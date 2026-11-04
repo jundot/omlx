@@ -2452,9 +2452,10 @@ class VLMBatchedEngine(BaseEngine):
         # Extract tokenizer from processor with deep-copy for thread safety.
         # The processor keeps the original tokenizer for executor-thread work
         # (_prepare_vision_inputs / prepare_inputs), while this deep copy is
-        # used exclusively on the event loop (apply_chat_template, encode).
-        # Without separate Rust tokenizer backends, concurrent access causes
-        # "RuntimeError: Already borrowed".
+        # used on the event loop and in the worker threads that prepare chat
+        # prompts (apply_chat_template, encode), which leave padding alone.
+        # Sharing a Rust tokenizer backend with the executor's padded calls
+        # causes "RuntimeError: Already borrowed".
         # See: https://github.com/huggingface/tokenizers/issues/537
         if hasattr(self._processor, "tokenizer"):
             self._tokenizer = copy.deepcopy(self._processor.tokenizer)
@@ -5273,28 +5274,32 @@ class VLMBatchedEngine(BaseEngine):
                 "This text-only model does not support image input.",
                 field="messages",
             )
-        prompt = self._apply_chat_template(
-            text_messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
-        # Tokenizer errors propagate as 500 today regardless of where they
-        # fire; the real chat path's add_request → tokenize call has no
-        # path-specific 400 handler. Don't introduce a NEW failure mode
-        # in preflight: skip the memory check on tokenizer error and let
-        # the real chat path surface the same error through the existing
-        # handler chain.
-        try:
-            num_tokens = len(self._tokenizer.encode(prompt))
-        except Exception as e:
-            logger.warning(
-                "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
-                "%s; skipping prefill memory check, real chat path will "
-                "surface the error",
-                type(e).__name__,
+        prepared = kwargs.get("_prepared_prompt")
+        if prepared is not None:
+            num_tokens = len(prepared[1])
+        else:
+            prompt = self._apply_chat_template(
+                text_messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
             )
-            return
+            # Tokenizer errors propagate as 500 today regardless of where they
+            # fire; the real chat path's add_request → tokenize call has no
+            # path-specific 400 handler. Don't introduce a NEW failure mode
+            # in preflight: skip the memory check on tokenizer error and let
+            # the real chat path surface the same error through the existing
+            # handler chain.
+            try:
+                num_tokens = len(self._tokenizer.encode(prompt))
+            except Exception as e:
+                logger.warning(
+                    "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
+                    "%s; skipping prefill memory check, real chat path will "
+                    "surface the error",
+                    type(e).__name__,
+                )
+                return
         # Use the decoded dimensions, including resizing and EXIF orientation,
         # so the memory estimate matches the images passed to the processor.
         image_tokens = _count_image_tokens_real(
@@ -5575,6 +5580,9 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        # The ids below come from mlx-vlm's own render; the prepared prompt only
+        # covers the checks made before generation.
+        kwargs.pop("_prepared_prompt", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -6061,6 +6069,25 @@ class VLMBatchedEngine(BaseEngine):
         For VLM messages with images, this counts only the text tokens.
         Image tokens are added during vision encoding and vary by model.
         """
+        _, token_ids = self.prepare_chat_prompt(
+            messages, tools, chat_template_kwargs, is_partial
+        )
+        return len(token_ids)
+
+    def prepare_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> tuple[str, list[int]]:
+        """Render and tokenize the text-only prompt for reuse within one request.
+
+        Unlike ``BatchedEngine``, the result never reaches generation:
+        ``_prepare_vision_inputs`` renders through mlx-vlm and encodes without
+        special tokens. It only serves the context check, the preflight and
+        thinking detection.
+        """
         # Extract text-only version for token counting through the same media
         # split as the real request, so video parts are not rejected here
         # before they reach the multimodal path.
@@ -6073,7 +6100,7 @@ class VLMBatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return len(self._tokenizer.encode(prompt))
+        return prompt, list(self._tokenizer.encode(prompt))
 
     async def tokenize_chat(
         self,

@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -17,6 +18,7 @@ from omlx.api.body_limit import RequestBodySizeLimitMiddleware
 from omlx.engine.base import GenerationOutput
 from omlx.engine.batched import BatchedEngine
 from omlx.engine.decision import DecisionEngine
+from omlx.engine.vlm import VLMBatchedEngine
 from omlx.engine_pool import EngineEntry
 from omlx.exceptions import (
     InvalidRequestError,
@@ -1870,6 +1872,134 @@ def test_chat_routes_reuse_final_prepared_prompt(
         ]
         start = next(event for event in events if event["type"] == "message_start")
         assert start["message"]["usage"]["input_tokens"] == len(prepared[1])
+
+
+def test_prepare_chat_prompt_for_request_prepares_vlm_prompt():
+    engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+    engine.prepare_chat_prompt = MagicMock(return_value=("prompt", [1, 2]))
+    messages = [{"role": "user", "content": "Hello"}]
+
+    assert srv._prepare_chat_prompt_for_request(engine, messages) == (
+        2,
+        ("prompt", [1, 2]),
+    )
+
+
+@pytest.fixture
+def served_vlm_engine(monkeypatch):
+    """Serve a real VLMBatchedEngine with a stub tokenizer and scheduler."""
+    encode_threads = []
+    loop_threads = []
+
+    def encode(prompt, **kwargs):
+        encode_threads.append(threading.get_ident())
+        return [11, 12, 13]
+
+    async def get_engine(*args, **kwargs):
+        loop_threads.append(threading.get_ident())
+        return engine
+
+    scheduler = MagicMock()
+    scheduler.preflight_eviction_request.return_value = None
+    engine = VLMBatchedEngine(model_name="test-model")
+    engine._loaded = True
+    engine._vlm_model = SimpleNamespace(
+        config=SimpleNamespace(model_type="qwen3_vl", vision_config=None)
+    )
+    # A think-start id sends thinking detection to the prompt ids as well.
+    engine._tokenizer = SimpleNamespace(
+        encode=encode,
+        apply_chat_template=MagicMock(return_value="canonical prompt"),
+        think_start="<think>",
+        think_start_id=7,
+    )
+    engine._engine = SimpleNamespace(engine=SimpleNamespace(scheduler=scheduler))
+    engine.start = AsyncMock()
+    output = GenerationOutput(
+        text="Done.", new_text="Done.", prompt_tokens=3, completion_tokens=1
+    )
+    generated = []
+
+    async def chat(**kwargs):
+        generated.append(kwargs)
+        return output
+
+    async def stream_chat(**kwargs):
+        generated.append(kwargs)
+        yield output
+
+    engine.chat = chat
+    engine.stream_chat = stream_chat
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type="qwen3_vl", preserve_thinking_default=None
+    )
+    state = ServerState()
+    state.engine_pool = pool
+    monkeypatch.setattr(srv, "_server_state", state)
+    monkeypatch.setattr(srv, "get_engine_for_model", get_engine)
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setattr(srv, "validate_context_window", MagicMock())
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    return SimpleNamespace(
+        encode_threads=encode_threads,
+        loop_threads=loop_threads,
+        generated=generated,
+        scheduler=scheduler,
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "path", ["/v1/chat/completions", "/v1/messages", "/v1/responses"]
+)
+def test_vlm_chat_routes_tokenize_prompt_once_off_the_event_loop(
+    served_vlm_engine, path, stream
+):
+    served = served_vlm_engine
+    body = {"model": "test-model", "stream": stream}
+    if path == "/v1/responses":
+        body.update(input="Hello", store=False)
+    else:
+        body.update(messages=[{"role": "user", "content": "Hello"}], max_tokens=16)
+
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(path, json=body)
+
+    assert response.status_code == 200, response.text
+    assert len(served.encode_threads) == 1
+    assert served.encode_threads[0] not in served.loop_threads
+    assert (
+        served.scheduler.preflight_or_raise.call_args.kwargs["num_prompt_tokens"] == 3
+    )
+    assert served.generated[0]["_prepared_prompt"] == (
+        "canonical prompt",
+        [11, 12, 13],
+    )
+
+
+def test_vlm_count_tokens_route_encodes_off_the_event_loop(served_vlm_engine):
+    served = served_vlm_engine
+
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["input_tokens"] == 3
+    assert len(served.encode_threads) == 1
+    assert served.encode_threads[0] not in served.loop_threads
 
 
 @pytest.mark.parametrize("ignore_eos", [None, True])
