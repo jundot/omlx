@@ -60,7 +60,11 @@ def to_host(array: mx.array) -> tuple[np.ndarray, str]:
 
 def from_host(data: np.ndarray, dtype: str) -> mx.array:
     array = mx.array(data)
-    return array.view(mx.bfloat16) if dtype == "bfloat16" else array
+    if dtype == "bfloat16":
+        array = array.view(mx.bfloat16)
+        # A pending view runs on this thread's stream; another thread cannot.
+        mx.eval(array)
+    return array
 
 
 def _recv_exact(sock: socket.socket, view: memoryview) -> None:

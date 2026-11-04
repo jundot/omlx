@@ -595,6 +595,20 @@ def test_copy_plan_keeps_50_gib_free_or_asks():
     assert plan(100 * gib, 90 * gib, [old])["kind"] == "no_space"
 
 
+def test_arrays_decoded_on_one_thread_run_on_another():
+    # The helper decodes a job's prefix on its reader thread and runs the job
+    # on another; a pending bfloat16 view there raised "no Stream(gpu, N)".
+    data, dtype = wire.to_host(mx.ones((2, 3), dtype=mx.bfloat16))
+    decoded = {}
+    reader = threading.Thread(
+        target=lambda: decoded.update(a=wire.from_host(data, dtype))
+    )
+    reader.start()
+    reader.join()
+    assert decoded["a"].dtype == mx.bfloat16
+    assert mx.sum(decoded["a"]).item() == 6
+
+
 def test_helper_target_rejects_a_shell_unsafe_interpreter():
     with pytest.raises(ValueError):
         HelperTarget("n", "x", "u@1.2.3.4", "1.2.3.4", "thunderbolt", "py; rm -rf ~")
