@@ -54,7 +54,7 @@
         <!-- Where you are. Five steps (three for Prefill Accelerator), derived from the live snapshot. -->
         <div class="mb-6" data-cluster-v2-steps x-show="wizardState() !== 'error'">
             <ol class="grid grid-cols-2 sm:grid-cols-3 gap-3"
-                :class="wizardState() === 'accelerator' ? 'lg:grid-cols-3' : 'lg:grid-cols-5'">
+                :class="['accelerator', 'helper'].includes(wizardState()) ? 'lg:grid-cols-3' : 'lg:grid-cols-5'">
                 <template x-for="(step, index) in wizardSteps()" :key="step.key">
                     <li class="relative rounded-xl border p-3 transition-all duration-300 animate-fade-in-up"
                         :style="'animation-delay: ' + (index * 0.06) + 's'"
