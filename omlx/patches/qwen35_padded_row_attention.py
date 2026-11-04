@@ -45,6 +45,19 @@ _ROWS_ATTR = "_omlx_qwen35_verify_row_pads"
 # Matches the bounded padded-verify kernel in qwen35_verify_attention: at or
 # below this many keys that kernel already serves the batch.
 _VERIFY_KERNEL_MAX_KEYS = 8192
+_ENGAGED_LOGGED: set[tuple[int, int]] = set()
+
+
+def _log_engaged(rows: int, q_len: int) -> None:
+    # One line per (rows, width), like the verify-split patch, so a log shows
+    # which batch shapes this path served.
+    if (rows, q_len) not in _ENGAGED_LOGGED:
+        _ENGAGED_LOGGED.add((rows, q_len))
+        logger.info(
+            "[padded-row] batch-1 attention per row engaged (rows=%d, q_len=%d)",
+            rows,
+            q_len,
+        )
 
 
 def _batch_cache_types() -> tuple[type, ...]:
@@ -228,6 +241,7 @@ def apply_qwen35_padded_row_attention_patch() -> bool:
             if pads is not None:
                 out = _per_row(original_attention, queries, keys, values, pads, scale)
                 if out is not None:
+                    _log_engaged(len(pads), queries.shape[2])
                     return out
         return original_attention(
             queries, keys, values, cache=cache, scale=scale, mask=mask
