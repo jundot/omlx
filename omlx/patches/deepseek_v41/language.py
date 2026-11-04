@@ -7,6 +7,7 @@ Batch rows are evaluated independently so late admission cannot share history.
 """
 
 import math
+import threading
 from contextlib import contextmanager, nullcontext
 from functools import cache, lru_cache
 
@@ -827,14 +828,28 @@ def _prefill_cache_limit():
     return min(_PREFILL_CACHE_CAP, get_max_working_set_bytes() // _PREFILL_CACHE_SHARE)
 
 
+# The cache limit is process-global and each engine runs on its own thread, so
+# scopes can exit out of order. Only the last scope to exit restores the limit.
+_prefill_cache_scope_lock = threading.Lock()
+_prefill_cache_scope_depth = 0
+_prefill_cache_scope_saved = None
+
+
 @contextmanager
 def _prefill_cache_scope():
     """Bound the allocator pool for one wide-prefill layer loop."""
-    previous = mx.set_cache_limit(_prefill_cache_limit())
+    global _prefill_cache_scope_depth, _prefill_cache_scope_saved
+    with _prefill_cache_scope_lock:
+        if _prefill_cache_scope_depth == 0:
+            _prefill_cache_scope_saved = mx.set_cache_limit(_prefill_cache_limit())
+        _prefill_cache_scope_depth += 1
     try:
         yield
     finally:
-        mx.set_cache_limit(previous)
+        with _prefill_cache_scope_lock:
+            _prefill_cache_scope_depth -= 1
+            if _prefill_cache_scope_depth == 0:
+                mx.set_cache_limit(_prefill_cache_scope_saved)
 
 
 @mx.compile
