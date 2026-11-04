@@ -79,7 +79,10 @@ and says which one failed.
 The client stores the remote key in its own `settings.json`, next to the
 local key, so the CLI can read it. `OMLX_REMOTE_API_KEY` overrides the file
 for one process, but like `OMLX_API_KEY` it is written back whenever
-settings are saved, so it is not a way to keep the key off disk. Over plain
+settings are saved, so it is not a way to keep the key off disk. The app declares an App Transport Security
+exception (`NSAllowsArbitraryLoads`) so that plain `http` to a hostname such
+as `studio.lan` is not refused by macOS; `.local` names and IP addresses were
+already allowed. Over plain
 `http` the key and prompts cross the network unencrypted, and the menubar's
 Web Dashboard link carries the key in its auto-login URL; the app warns
 about plain http, and `https` avoids it. Rotating the remote key from the
