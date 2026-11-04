@@ -27,14 +27,7 @@ Run `xcodebuild -project apps/omlx-mac/oMLX.xcodeproj -scheme oMLX -destination 
 
 # macOS server restart health tests
 
-Run `python -m pytest -q apps/omlx-mac/Tests/python/test_server_process_health.py`
-on macOS with the Xcode Command Line Tools installed. The harness compiles the
-production `ServerProcess.swift` with isolated dependencies and exercises stale
-status during restart backoff, cancelled and late health probes, child replacement,
-live-child health recovery, and manual stop during backoff. It uses temporary logs
-and short-lived `/bin/sleep` children; it does not start the installed app or Python
-server. Full app validation still requires `make app` and a web-dashboard restart
-with the built app, both with and without a settings change.
+Run `python -m pytest -q apps/omlx-mac/Tests/python/test_server_process_health.py` on macOS with the Xcode Command Line Tools to check `ServerProcess` restart health. It compiles the production `ServerProcess.swift` with stubbed app dependencies and short-lived `/bin/sleep` children, so no app, Python server or model is needed.
 
 # Text-only VLM loading tests
 

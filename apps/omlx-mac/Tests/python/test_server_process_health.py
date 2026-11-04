@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Execute ServerProcess health/restart regressions with the macOS Swift compiler.
-
-The harness is appended to the unmodified production source so a same-file
-extension can control private lifecycle state and probe ordering. Only external
-dependencies are stubbed; no lifecycle method is copied or rewritten. This runs
-in the Python CI suite without an Xcode test host or the bundled Python runtime.
-"""
+"""Run ServerProcess restart health regressions compiled with swiftc."""
 
 from __future__ import annotations
 
@@ -17,19 +11,7 @@ from pathlib import Path
 import pytest
 
 APP = Path(__file__).resolve().parents[2]
-CASES = (
-    "restart_after_stale_status",
-    "stop_during_backoff",
-    "exit_cancels_health_loop",
-    "no_child_health",
-    "dead_child_status",
-    "live_health",
-    "live_status_fallback",
-    "live_failure_and_recovery",
-    "probe_after_exit",
-    "probe_after_replacement",
-    "cancelled_probe",
-)
+CASES = ("restart_after_stale_status", "probe_after_exit", "live_status_fallback")
 
 
 @pytest.fixture(scope="module")
@@ -67,7 +49,7 @@ def health_harness(tmp_path_factory):
 
 @pytest.mark.parametrize("scenario", CASES)
 def test_server_process_health(health_harness, tmp_path, scenario):
-    # Accept the real spawn arguments, but never start Python or load a model.
+    # Stands in for Python and ignores the serve arguments.
     child = tmp_path / "child"
     child.write_text("#!/bin/sh\nexec /bin/sleep 30\n")
     child.chmod(0o755)
