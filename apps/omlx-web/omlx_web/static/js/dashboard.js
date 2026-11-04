@@ -149,6 +149,8 @@
             customThemeSaving: false,
             customThemeSaved: false,
             customThemeError: '',
+            customThemeJson: '',
+            customThemeJsonError: '',
             _customThemeSavedTimer: null,
             _customThemeReady: false,
 
@@ -7401,11 +7403,11 @@
                 this.fillCustomThemeDraft();
             },
 
-            fillCustomThemeDraft() {
+            fillCustomThemeDraft(theme = this.customThemeStored) {
                 const draft = { light: {}, dark: {} };
                 for (const mode of ['light', 'dark']) {
                     for (const token of window.OmlxCustomTheme.TOKENS) {
-                        draft[mode][token] = this.customThemeStored[mode][token]
+                        draft[mode][token] = theme[mode]?.[token]
                             || this.customThemeDefaults[mode][token] || '';
                     }
                 }
@@ -7556,6 +7558,40 @@
             discardCustomThemeDraft() {
                 this.customThemeError = '';
                 this.fillCustomThemeDraft();
+            },
+
+            // The full palette, so an agent sees every token, not only the overrides.
+            async copyCustomThemeJson() {
+                const theme = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        theme[mode][token] = this.themeTokenColor(mode, token);
+                    }
+                }
+                this.customThemeJson = JSON.stringify(theme, null, 2);
+                this.customThemeJsonError = '';
+                try {
+                    await navigator.clipboard.writeText(this.customThemeJson);
+                } catch (error) {
+                    console.debug('Clipboard unavailable:', error);
+                }
+            },
+
+            // Fills the fields only; Apply still runs the contrast check.
+            importCustomThemeJson() {
+                const api = window.OmlxCustomTheme;
+                let clean;
+                try {
+                    clean = api.sanitize(JSON.parse(this.customThemeJson));
+                } catch (error) {
+                    clean = { light: {}, dark: {} };
+                }
+                if (api.isEmpty(clean)) {
+                    this.customThemeJsonError = window.t('settings.theme.json.invalid');
+                    return;
+                }
+                this.customThemeJsonError = '';
+                this.fillCustomThemeDraft(clean);
             },
 
             async resetCustomTheme() {
