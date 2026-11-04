@@ -717,11 +717,20 @@ def test_a_helper_mac_shows_whom_it_helps_until_setup_changes():
 component.devicesPayload = { paired: [{ node_id: 'm3', friendly_name: 'HJKmac' }] };
 component.helperRole = { active: false, helps: { node_id: 'm3', name: 'HJKmac' } };
 const idle = [component.wizardState(), component.helperRoleText()];
-component.helperRole = { active: true, host: 'HJKmac', layers: 28, model: '/m/MiniMax' };
+component.helperRole = {
+  active: true, host: 'HJKmac', layers: 28, model: '/m/MiniMax',
+  helps: { node_id: 'm3', name: 'HJKmac' },
+};
 const busy = component.helperRoleText();
 const steps = component.wizardSteps().map((step) => step.state);
+component.choosePurpose(true);
+const afterPairing = component.wizardState();
 component.choosePurpose();
-process.stdout.write(JSON.stringify({ idle, busy, steps, changed: component.wizardState() }));
+const changed = component.wizardState();
+component.startAccelerator({ node_id: 'm3' });
+process.stdout.write(JSON.stringify({
+  idle, busy, steps, afterPairing, changed, picked: component.wizardState(),
+}));
 """
     )
 
@@ -729,7 +738,11 @@ process.stdout.write(JSON.stringify({ idle, busy, steps, changed: component.wiza
     assert result["idle"][1].startswith("It starts when HJKmac loads")
     assert result["busy"] == "Helping HJKmac with long prompts: 28 layers of MiniMax."
     assert result["steps"] == ["done"] * 3
+    # The chooser that opens after pairing yields; Change setup does not.
+    assert result["afterPairing"] == "helper"
     assert result["changed"] == "purpose"
+    # Picking Prefill Accelerator for the Mac it helps shows the helper side.
+    assert result["picked"] == "helper"
 
 
 def test_retry_loading_ownership_supersedes_retained_failure_marker():

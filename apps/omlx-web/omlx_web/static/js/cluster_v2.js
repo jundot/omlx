@@ -242,6 +242,8 @@ function clusterV2Wizard() {
         helperRole: null,
         // A Mac that pressed Pair on this one: {node_id, name}.
         pairInvite: null,
+        // The chooser opened by itself after pairing, not from Change setup.
+        purposeAuto: false,
 
         // ---- plan ------------------------------------------------------------
         modelOptions: [],
@@ -526,7 +528,7 @@ function clusterV2Wizard() {
                         window.t('cluster.v2.toast.joined_cluster').replace('{name}', this.joinTargetName()),
                     );
                     await this.refreshDevices();
-                    this.choosePurpose();
+                    this.choosePurpose(true);
                 } else if (
                     snapshot.state === 'denied' &&
                     previous !== 'denied' &&
@@ -1076,6 +1078,9 @@ function clusterV2Wizard() {
             if (this.stage === 'checks' && this.pairedDevices().length) {
                 return 'checks';
             }
+            if (this.stage === 'purpose' && this.purposeAuto && this.helperRoleHost()) {
+                return 'helper';
+            }
             if (
                 (this.stage === 'purpose' || this.stage === 'accelerator') &&
                 this.pairedDevices().length
@@ -1464,7 +1469,7 @@ function clusterV2Wizard() {
                         }
                     }
                 } else {
-                    this.choosePurpose();
+                    this.choosePurpose(true);
                 }
             } catch (error) {
                 if (error?.status === 404 || error?.status === 409) {
@@ -1753,8 +1758,9 @@ function clusterV2Wizard() {
 
         // A paired Mac either splits models with this one (checks, plan) or
         // runs the first layers of this Mac's prefills (Prefill Accelerator).
-        choosePurpose() {
+        choosePurpose(auto = false) {
             this.stage = 'purpose';
+            this.purposeAuto = auto;
         },
 
         async refreshHelperRole() {
@@ -1768,6 +1774,13 @@ function clusterV2Wizard() {
         helperRoleHost() {
             const role = this.helperRole;
             return (role?.active ? role.host : '') || role?.helps?.name || '';
+        },
+
+        // Forgetting this Mac's host ends the helper role; the host can no
+        // longer reach it.
+        helperHostDevice() {
+            const nodeId = this.helperRole?.helps?.node_id;
+            return this.pairedDevices().find((item) => item.node_id === nodeId) || null;
         },
 
         helperRoleText() {
@@ -1815,6 +1828,11 @@ function clusterV2Wizard() {
         },
 
         async startAccelerator(device) {
+            if (device && this.helperRole?.helps?.node_id === device.node_id) {
+                // This Mac is that Mac's Prefill Accelerator, not its host.
+                this.stage = null;
+                return;
+            }
             this.stage = 'accelerator';
             this.accelerator = {
                 nodeId: device.node_id,

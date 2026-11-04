@@ -630,8 +630,10 @@
                 <div class="flex items-center gap-2">
                     <button type="button" x-show="helperRole?.active" @click="stopHelping()"
                             class="px-3 py-1.5 text-xs font-semibold text-neutral-900 bg-neutral-100 border border-neutral-200 rounded-full hover:bg-neutral-200 whitespace-nowrap">{{ t('cluster.v2.helper.stop') }}</button>
-                    <button type="button" @click="choosePurpose()"
-                            class="px-3 py-1.5 text-xs font-medium text-neutral-500 rounded-full hover:bg-neutral-100 whitespace-nowrap">{{ t('cluster.v2.accelerator.change_setup') }}</button>
+                    <button type="button" @click="forgetCluster(helperHostDevice())"
+                            :disabled="clusterLifecycleBusy || !helperHostDevice()"
+                            class="px-3 py-1.5 text-xs font-medium rounded-full border border-neutral-200 text-neutral-600 hover:bg-neutral-100 disabled:opacity-40 whitespace-nowrap"
+                            x-text="confirmForgetFor === 'node:' + helperHostDevice()?.node_id ? window.t('cluster.v2.helper.confirm_forget').replaceAll('{host}', helperRoleHost()) : window.t('cluster.v2.helper.forget')"></button>
                 </div>
             </div>
         </section>

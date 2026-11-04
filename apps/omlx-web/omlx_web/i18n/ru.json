@@ -897,6 +897,8 @@
   "cluster.v2.helper.active": "Helping {host} with long prompts: {n} layers of {model}.",
   "cluster.v2.helper.idle": "It starts when {host} loads a model that uses this Mac, and stops when that model unloads. Nothing runs here until then.",
   "cluster.v2.helper.stop": "Stop helping",
+  "cluster.v2.helper.forget": "Forget cluster settings",
+  "cluster.v2.helper.confirm_forget": "Click again to forget {host}",
   "cluster.v2.accelerator.copies_title": "Model copies on {name} ({free} free)",
   "cluster.v2.accelerator.copies_none": "No model copies. Models already in that Mac's own folders are used in place and never removed here.",
   "cluster.v2.accelerator.copies_delete": "Delete",
