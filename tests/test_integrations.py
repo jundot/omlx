@@ -38,7 +38,7 @@ from omlx.integrations.codex import (
     write_codex_config,
 )
 from omlx.integrations.codex_app import CodexAppIntegration, find_codex_app_bundle
-from omlx.integrations.copilot import CopilotIntegration
+from omlx.integrations.copilot import CopilotIntegration, copilot_provider_config
 from omlx.integrations.dsh import (
     DshConfigShapeError,
     DshIntegration,
@@ -2348,6 +2348,12 @@ class TestClaudeDesktopConfigWriter:
 
 
 class TestCopilotIntegration:
+    @pytest.fixture(autouse=True)
+    def model_inventory(self):
+        with patch("omlx.integrations.base.requests.get") as get:
+            get.side_effect = ConnectionError("public inventory unavailable")
+            yield get
+
     def test_get_command(self):
         copilot = CopilotIntegration()
         cmd = copilot.get_command(ctx(port=8000, api_key="key", model="qwen3.5"))
@@ -2357,32 +2363,58 @@ class TestCopilotIntegration:
     def test_get_command_no_model(self):
         copilot = CopilotIntegration()
         cmd = copilot.get_command(ctx(port=8000, api_key="", model=""))
-        assert "select-a-model" in cmd
+        assert cmd.endswith("launch copilot")
 
     def test_type(self):
         copilot = CopilotIntegration()
         assert copilot.type == "env_var"
         assert copilot.display_name == "Copilot CLI"
         assert copilot.install_check == "copilot"
+        assert copilot.requires_model_selection is False
 
-    def test_launch_sets_provider_env(self):
+    def test_launch_merges_into_user_providers_file(self, tmp_path):
         copilot = CopilotIntegration()
         captured = {}
+        existing_config = tmp_path / "providers.json"
+        existing_config.write_text(
+            json.dumps(
+                {
+                    "providers": [
+                        {"name": "user", "type": "openai", "baseUrl": "https://x/v1"},
+                        {
+                            "name": "omlx",
+                            "type": "openai",
+                            "baseUrl": "http://stale/v1",
+                        },
+                    ],
+                    "models": [
+                        {"id": "their-model", "provider": "user"},
+                        {"id": "stale-model", "provider": "omlx"},
+                    ],
+                    "customKey": {"keep": True},
+                }
+            )
+        )
 
-        def fake_execvpe(binary, argv, env):
-            captured["binary"] = binary
+        def fake_exec(file, argv, env):
             captured["argv"] = argv
             captured["env"] = env
+            config_path = Path(env["COPILOT_PROVIDERS_CONFIG"])
+            captured["path"] = config_path
+            captured["config"] = json.loads(config_path.read_text())
 
         base_env = {
             "PATH": "/usr/bin",
             "PYTHONHOME": "/bundle/python",
             "PYTHONPATH": "/bundle/lib",
             "PYTHONDONTWRITEBYTECODE": "1",
+            "COPILOT_PROVIDERS_CONFIG": str(existing_config),
+            "COPILOT_PROVIDER_BASE_URL": "https://example.invalid",
+            "COPILOT_MODEL": "old-model",
         }
         with (
             patch("omlx.integrations.copilot.os.environ", base_env),
-            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_execvpe),
+            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_exec),
         ):
             copilot.launch(
                 ctx(
@@ -2391,59 +2423,222 @@ class TestCopilotIntegration:
                     model="qwen3.5",
                     context_window=131072,
                     max_tokens=8192,
+                    extra_args=("--resume",),
                 )
             )
 
         env = captured["env"]
-        assert captured["binary"] == "copilot"
-        assert captured["argv"] == ["copilot"]
-        assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8000/v1"
-        assert env["COPILOT_PROVIDER_TYPE"] == "openai"
-        assert env["COPILOT_PROVIDER_WIRE_API"] == "responses"
-        assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "secret"
-        assert env["COPILOT_MODEL"] == "qwen3.5"
-        assert env["COPILOT_PROVIDER_MODEL_ID"] == "qwen3.5"
-        assert env["COPILOT_PROVIDER_WIRE_MODEL"] == "qwen3.5"
-        assert env["COPILOT_PROVIDER_MAX_PROMPT_TOKENS"] == "131072"
-        assert env["COPILOT_PROVIDER_MAX_OUTPUT_TOKENS"] == "8192"
+        assert captured["argv"] == ["copilot", "--model", "omlx/qwen3.5", "--resume"]
+        assert captured["path"] == existing_config
+        assert "COPILOT_PROVIDER_BASE_URL" not in env
+        assert "COPILOT_MODEL" not in env
         assert "PYTHONHOME" not in env
         assert "PYTHONPATH" not in env
         assert "PYTHONDONTWRITEBYTECODE" not in env
+        assert captured["config"]["providers"] == [
+            {"name": "user", "type": "openai", "baseUrl": "https://x/v1"},
+            {
+                "name": "omlx",
+                "type": "openai",
+                "baseUrl": "http://127.0.0.1:8000/v1",
+                "wireApi": "responses",
+                "bearerToken": "secret",
+            },
+        ]
+        models = {model["id"]: model for model in captured["config"]["models"]}
+        assert set(models) == {"their-model", "qwen3.5"}
+        assert models["their-model"] == {"id": "their-model", "provider": "user"}
+        assert models["qwen3.5"]["maxPromptTokens"] == 131072
+        assert models["qwen3.5"]["maxContextWindowTokens"] == 131072
+        assert models["qwen3.5"]["maxOutputTokens"] == 8192
+        assert captured["config"]["customKey"] == {"keep": True}
+        assert captured["path"].stat().st_mode & 0o777 == 0o600
 
-    def test_launch_open_server_uses_omlx_token(self):
+    @pytest.mark.parametrize("copilot_home", [None, "custom-home"])
+    def test_configure_uses_copilot_config_dir(
+        self, tmp_path, monkeypatch, copilot_home
+    ):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        env = {"COPILOT_HOME": str(tmp_path / copilot_home)} if copilot_home else {}
+        with patch("omlx.integrations.copilot.os.environ", env):
+            CopilotIntegration().configure(ctx(port=8000, api_key="k", model="m"))
+        path = tmp_path / (copilot_home or ".copilot") / "providers.json"
+        config = json.loads(path.read_text())
+        assert config["providers"] == [
+            {
+                "name": "omlx",
+                "type": "openai",
+                "baseUrl": "http://127.0.0.1:8000/v1",
+                "wireApi": "responses",
+                "bearerToken": "k",
+            }
+        ]
+        assert [model["id"] for model in config["models"]] == ["m"]
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def test_configure_rewrites_stale_entries_on_relaunch(self, tmp_path):
+        path = tmp_path / "providers.json"
         copilot = CopilotIntegration()
-        captured = {}
+        env = {"COPILOT_PROVIDERS_CONFIG": str(path)}
+        with patch("omlx.integrations.copilot.os.environ", env):
+            copilot.configure(ctx(port=8000, api_key="key1", model="old-model"))
+            first = json.loads(path.read_text())
+            assert first["providers"][0]["bearerToken"] == "key1"
+            path.chmod(0o644)
+            copilot.configure(ctx(port=8001, api_key="key2", model="new-model"))
+        second = json.loads(path.read_text())
+        backups = list(tmp_path.glob("*.bak"))
+        assert [json.loads(backup.read_text()) for backup in backups] == [first]
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert backups[0].stat().st_mode & 0o777 == 0o600
+        assert second["providers"][0]["bearerToken"] == "key2"
+        assert second["providers"][0]["baseUrl"] == "http://127.0.0.1:8001/v1"
+        assert [model["id"] for model in second["models"]] == ["new-model"]
 
-        def fake_execvpe(binary, argv, env):
-            captured["env"] = env
-
-        with (
-            patch("omlx.integrations.copilot.os.environ", {"PATH": "/usr/bin"}),
-            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_execvpe),
-        ):
-            copilot.launch(ctx(port=8000, api_key="", model="qwen3.5"))
-
-        assert captured["env"]["COPILOT_PROVIDER_BEARER_TOKEN"] == "omlx"
-
-    def test_launch_without_model_or_limits(self):
+    def test_configure_skips_rewrite_when_unchanged(self, tmp_path):
         copilot = CopilotIntegration()
-        captured = {}
+        launch_ctx = ctx(port=8000, api_key="key", model="m")
+        path = tmp_path / "providers.json"
+        env = {"COPILOT_PROVIDERS_CONFIG": str(path)}
+        with patch("omlx.integrations.copilot.os.environ", env):
+            copilot.configure(launch_ctx)
+            mtime = path.stat().st_mtime_ns
+            copilot.configure(launch_ctx)
+        assert path.stat().st_mtime_ns == mtime
+        assert not list(tmp_path.glob("*.bak"))
 
-        def fake_execvpe(binary, argv, env):
-            captured["env"] = env
-
-        with (
-            patch("omlx.integrations.copilot.os.environ", {"PATH": "/usr/bin"}),
-            patch("omlx.integrations.copilot.os.execvpe", side_effect=fake_execvpe),
+    def test_configure_preserves_registry_symlink(self, tmp_path):
+        target = tmp_path / "actual.json"
+        target.write_text('{"customKey": {"keep": true}}')
+        path = tmp_path / "providers.json"
+        path.symlink_to(target)
+        with patch(
+            "omlx.integrations.copilot.os.environ",
+            {"COPILOT_PROVIDERS_CONFIG": str(path)},
         ):
-            copilot.launch(ctx(port=8000, api_key="key", model=""))
+            CopilotIntegration().configure(ctx(api_key="new", model="m"))
+        assert path.is_symlink()
+        assert json.loads(target.read_text())["customKey"] == {"keep": True}
+        assert json.loads(target.read_text())["providers"][0]["bearerToken"] == "new"
 
-        env = captured["env"]
-        assert "COPILOT_MODEL" not in env
-        assert "COPILOT_PROVIDER_MODEL_ID" not in env
-        assert "COPILOT_PROVIDER_WIRE_MODEL" not in env
-        assert "COPILOT_PROVIDER_MAX_PROMPT_TOKENS" not in env
-        assert "COPILOT_PROVIDER_MAX_OUTPUT_TOKENS" not in env
+    @pytest.mark.parametrize("existing", ["not json {{{", '["legacy"]'])
+    def test_configure_invalid_file_is_backed_up(self, tmp_path, existing):
+        path = tmp_path / "providers.json"
+        path.write_text(existing)
+        env = {"COPILOT_PROVIDERS_CONFIG": str(path)}
+        with patch("omlx.integrations.copilot.os.environ", env):
+            CopilotIntegration().configure(ctx(port=8000, api_key="k", model="m"))
+        config = json.loads(path.read_text())
+        assert config["providers"][0]["name"] == "omlx"
+        assert [backup.read_text() for backup in tmp_path.glob("*.bak")] == [existing]
+
+    def test_catalog_filters_models_and_preserves_capabilities(self, model_inventory):
+        model_inventory.side_effect = None
+        model_inventory.return_value.json.return_value = {
+            "data": [
+                {"id": "vision-alias", "max_model_len": 131072},
+                {"id": "text"},
+            ]
+        }
+        vision = {
+            "model_alias": "vision-alias",
+            "model_type": "vlm",
+            "max_context_window": 131072,
+            "max_tokens": 4096,
+            "enable_thinking": True,
+            "reasoning_levels": ["low", "max", "ultra", "off", "on"],
+        }
+        config = copilot_provider_config(
+            ctx(
+                model="vision-alias",
+                models_status_map={
+                    "vision": vision,
+                    "vision-alias": vision,
+                    "text": {
+                        "model_type": "llm",
+                        "enable_thinking": False,
+                        "reasoning_levels": ["high"],
+                    },
+                    "embedding": {"model_type": "embedding"},
+                    "hidden": {"is_hidden": True},
+                    "helper": {"model_type": "llm", "is_helper": True},
+                    "unservable": {"model_type": "llm", "model_format": "gguf"},
+                },
+            )
+        )
+        assert config["providers"][0]["bearerToken"] == "omlx"
+        models = {model["id"]: model for model in config["models"]}
+        assert set(models) == {"vision-alias", "text"}
+        assert models["vision-alias"]["maxOutputTokens"] == 4096
+        assert models["vision-alias"]["capabilities"]["supports"] == {
+            "vision": True,
+            "reasoning_effort": ["low", "max"],
+        }
+        assert models["text"]["maxPromptTokens"] == 32768
+        assert models["text"]["capabilities"]["supports"] == {"vision": False}
+
+    @pytest.mark.parametrize(
+        ("model", "default_model", "expected"),
+        [
+            ("text", "raw-vision", "text"),
+            ("raw-vision", "text", "vision-alias"),
+            ("unservable", "raw-vision", "vision-alias"),
+            ("", "missing", "text"),
+        ],
+    )
+    def test_launch_resolves_starting_model(
+        self, tmp_path, monkeypatch, model_inventory, model, default_model, expected
+    ):
+        monkeypatch.setenv("COPILOT_PROVIDERS_CONFIG", str(tmp_path / "providers.json"))
+        model_inventory.side_effect = None
+        model_inventory.return_value.json.return_value = {
+            "data": [{"id": "text"}, {"id": "vision-alias"}]
+        }
+        vision = {"model_alias": "vision-alias", "model_type": "vlm"}
+        with patch("omlx.integrations.copilot.os.execvpe") as execvpe:
+            CopilotIntegration().launch(
+                ctx(
+                    model=model,
+                    default_model=default_model,
+                    models_status_map={
+                        "helper": {"model_type": "llm", "is_helper": True},
+                        "unservable": {"model_type": "llm", "model_format": "gguf"},
+                        "text": {"model_type": "llm"},
+                        "raw-vision": vision,
+                        "vision-alias": vision,
+                        "embedding": {"model_type": "embedding"},
+                        "hidden": {"model_type": "llm", "is_hidden": True},
+                    },
+                )
+            )
+        assert execvpe.call_args.args[1] == ["copilot", "--model", f"omlx/{expected}"]
+        registry = json.loads((tmp_path / "providers.json").read_text())
+        assert [entry["id"] for entry in registry["models"]] == ["text", "vision-alias"]
+        model_inventory.assert_called_once()
+
+    def test_catalog_respects_empty_public_inventory(self, model_inventory):
+        model_inventory.side_effect = None
+        model_inventory.return_value.json.return_value = {"data": []}
+        config = copilot_provider_config(
+            ctx(model="helper", models_status_map={"helper": {"model_type": "llm"}})
+        )
+        assert config["models"] == []
+
+    def test_launch_without_chat_models_leaves_registry_untouched(
+        self, tmp_path, monkeypatch
+    ):
+        path = tmp_path / "providers.json"
+        path.write_text('{"customKey": true}')
+        monkeypatch.setenv("COPILOT_PROVIDERS_CONFIG", str(path))
+        with (
+            patch("omlx.integrations.copilot.os.execvpe") as execvpe,
+            pytest.raises(SystemExit, match="no chat models"),
+        ):
+            CopilotIntegration().launch(
+                ctx(models_status_map={"embedding": {"model_type": "embedding"}})
+            )
+        execvpe.assert_not_called()
+        assert path.read_text() == '{"customKey": true}'
 
 
 class TestIntegrationSettings:

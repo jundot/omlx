@@ -671,14 +671,14 @@ class ModelInfo(BaseModel):
     object: str = "model"
     created: int = Field(default_factory=get_unix_timestamp)
     owned_by: str = "omlx"
+    model_type: str | None = None
     # vLLM-compatible extension: lets OpenAI-style clients discover the
     # effective context window from the listing without a separate call
     # to /v1/models/status (see #1308).
     max_model_len: int | None = None
     # Claude Desktop (Anthropic gateway mode) extensions. Only serialized on
     # derived Claude tier alias entries (see ClaudeTierModelInfo below);
-    # excluded by default so the standard OpenAI listing is byte-identical
-    # to previous releases.
+    # excluded by default so standard entries omit tier-specific metadata.
     display_name: str | None = Field(default=None, exclude=True)
     created_at: str | None = Field(default=None, exclude=True)
     anthropic_family_tier: str | None = Field(default=None, exclude=True)

@@ -171,6 +171,12 @@ and a capability-gated experimental token-only output path. See
 security boundaries, current limitations, and the physical-hardware validation
 checklist.
 
+A paired Mac can also speed up prefill without splitting the model: the
+[Prefill Accelerator](docs/experimental/prefill-accelerator.md) runs the first
+layers of long prompts on the other Mac while the model, its cache and
+decoding stay on this one (DeepSeek V4.1, GLM-5.3, Qwen3.8 Flash-Next and
+MiniMax M3).
+
 ### Vision-Language Models
 
 Run VLMs with the same continuous batching and tiered KV cache stack as text LLMs. Supports multi-image chat, base64/URL/file image inputs, and tool calling with vision context. MiMo V2.6 checkpoints with bundled sidecars also accept sampled-frame video and 24 kHz audio. Qwen3.5, Qwen3.6 and Qwen3.8 checkpoints (dense and MoE) accept native video input as base64 `video_url` / `input_video` data URIs; video needs OpenCV (`opencv-python-headless`). oQ conversion of official MiMo V2.6 checkpoints preserves image and audio support. OCR models (DeepSeek-OCR, DOTS-OCR, GLM-OCR) are auto-detected with optimized prompts.
@@ -223,7 +229,7 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
 
 Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models.
 
-Document attachments support PDF, DOCX, PPTX, TXT, and MD. If a client reports only the generic `application/octet-stream` MIME type, oMLX infers the converter MIME type from the supported filename extension; unsupported extensions and explicit unsupported MIME types remain rejected.
+Document attachments support PDF, DOCX, PPTX, TXT, and MD. Attachments are accepted by filename extension. If the client reports a MIME type oMLX does not recognize, such as `application/octet-stream`, the converter MIME type is inferred from the extension.
 
 <p align="center">
   <img src="docs/images/ScreenShot_2026-03-14_104350_610.png" alt="oMLX Chat" width="720">
@@ -247,6 +253,8 @@ Set up OpenClaw, OpenCode, Codex, Hermes Agent, Copilot, Pi, Mistral Vibe, and D
 </p>
 
 `omlx launch codex` and `omlx launch codex_app` give Codex a catalog of every chat model on the server, so you switch models with `/model` or the app's model picker. `--model`, the saved Codex model, or the server default picks the starting model. This needs Codex 0.148 or newer; relaunch after you add or remove models.
+
+`omlx launch copilot` gives Copilot CLI a catalog of every chat model on the server, so you switch models with `/model`. `--model`, the saved Copilot model, or the server default picks the starting model. The catalog goes into Copilot's `providers.json` next to your other providers, and the file is kept at `0600` because it holds the server's API key. This needs Copilot CLI 1.0.83 or newer; relaunch after you add or remove models.
 
 Install [Mistral Vibe](https://github.com/mistralai/mistral-vibe) 2.26.0 or newer with `uv tool install mistral-vibe`, then run `omlx launch vibe` to select a local model, or `omlx launch vibe --model <model-id>`. Vibe's provider, model, API-key reference and context window are configured for that process through its `VIBE_*` environment overrides. Existing `config.toml`, `VIBE_HOME`, tool permissions and cloud configuration are preserved. Pass Vibe arguments after `--`, for example `omlx launch vibe --model <model-id> -- --resume`.
 
@@ -475,3 +483,4 @@ Contributions are welcome! See [Contributing Guide](docs/CONTRIBUTING.md) for de
 - [Splash](https://github.com/incoai/splash) - The verify-shape linear kernels use Splash's bf16 `0x4300 | q` weight operand with per-group input sums (from its Apache-2.0 `linear_q4_sgmatrix.metal`), and the tensor-op verify attention adapts the tile design of Splash's `paged_attention_tile.h`, and a GGUF's tokenizer is derived from its header as Splash's Apache-2.0 `install/gguf.py` derives it; Splash itself can also serve supported models as an external engine
 - [SiliconScope](https://github.com/kennss/SiliconScope) - The menu bar statistics take their design and rendering approach from SiliconScope by Kennt Kim, which also inspired the energy-efficient re-render gating
 - [m5gpu](https://github.com/beamivalice/m5gpu) - The GPU power limit writes the AGX GPU power target that m5gpu by beamivalice documented (`SetMaxGPUAbsolutePower` with `AbsoluteTarget`, and `-1000` to remove it)
+- [ming-tts-serve](https://github.com/sbusso/ming-tts-serve) - Ming-3.0-tts's pipelined decode loop follows Stéphane Busso's ming-tts-serve, and its fused DiT kernels are adapted from ming-tts-serve's MIT-licensed `ming_fused.zig`

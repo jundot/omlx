@@ -18,6 +18,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..exceptions import PrefillMemoryExceededError
 from .performance import ExecutionSettings
 from .planner import PipelineAssignment
 
@@ -87,6 +88,22 @@ def _python_token_id(value: Any) -> int:
     if not 0 <= token <= 2**31 - 1:
         raise ValueError("generated token is outside signed int32 range")
     return token
+
+
+def _type_tool_turn_as_user(request: Any, tokenized: Any) -> Any:
+    """Type a tool-result turn's prompt checkpoint "user", as for a user turn.
+
+    MLX-LM types it "assistant", which LRUPromptCache evicts first, so a
+    non-trimmable cache lost the conversation prefix on every agent step.
+    """
+
+    messages = getattr(request, "messages", None)
+    # A trailing assistant message is a prefill that the model continues.
+    if not messages or messages[-1].get("role") == "assistant":
+        return tokenized
+    if tokenized[2] != ["assistant"]:
+        return tokenized
+    return (tokenized[0], tokenized[1], ["user"], *tokenized[3:])
 
 
 class MarkerWriter(Protocol):
@@ -1669,11 +1686,28 @@ def install_server_telemetry(
             )
 
         def _tokenize(self, tokenizer: Any, request: Any, args: Any) -> Any:
-            tokenized = super()._tokenize(tokenizer, request, args)
+            tokenized = _type_tool_turn_as_user(
+                request, super()._tokenize(tokenizer, request, args)
+            )
             if prefill_guard is None:
                 return tokenized
 
             prompt = tokenized[0]
+            try:
+                self._omlx_admit_prefill(prompt)
+            except PrefillMemoryExceededError:
+                # The vote is shared, so every rank rejected. Drop the prompts
+                # each rank retains and measure once more before refusing.
+                logger.warning(
+                    "Prefill rejected; dropping %d cached prompts and retrying",
+                    len(self.prompt_cache),
+                )
+                self.prompt_cache.trim_to(n_sequences=0, n_bytes=0)
+                mx.clear_cache()
+                self._omlx_admit_prefill(prompt)
+            return tokenized
+
+        def _omlx_admit_prefill(self, prompt: list[int]) -> None:
             _cache, rest = self.prompt_cache.prefetch_nearest_cache(
                 self.model_provider.model_key,
                 prompt,
@@ -1691,7 +1725,6 @@ def install_server_telemetry(
             except Exception:
                 self.prompt_cache.discard_prefetched_cache()
                 raise
-            return tokenized
 
         def _serve_single(self, request: Any, stream: Any) -> Any:
             # The coordinated context above makes every rank observe the same

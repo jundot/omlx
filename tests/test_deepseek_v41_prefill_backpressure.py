@@ -86,6 +86,27 @@ def test_v41_prefill_evals_stream_per_layer(monkeypatch):
     assert events["limits"] == []
 
 
+def test_prefill_cache_scope_restores_limit_after_out_of_order_exit(monkeypatch):
+    """Two engines' scopes can exit out of order; the limit must still return
+    to the pre-entry value, not stay at the prefill bound."""
+    current = [1 << 40]
+
+    def fake_set_cache_limit(limit):
+        previous, current[0] = current[0], limit
+        return previous
+
+    monkeypatch.setattr(v41_lang.mx, "set_cache_limit", fake_set_cache_limit)
+    monkeypatch.setattr(v41_lang, "_prefill_cache_limit", lambda: _TEST_CACHE_LIMIT)
+
+    scope_a, scope_b = v41_lang._prefill_cache_scope(), v41_lang._prefill_cache_scope()
+    scope_a.__enter__()
+    scope_b.__enter__()
+    scope_a.__exit__(None, None, None)
+    assert current[0] == _TEST_CACHE_LIMIT, "an open scope must keep the bound"
+    scope_b.__exit__(None, None, None)
+    assert current[0] == 1 << 40
+
+
 def test_apply_patch_replaces_foreign_vendor_alias_and_warns(caplog):
     """apply_patch used ``sys.modules.setdefault``, which silently keeps a
     pre-existing ``mlx_vlm.models.deepseek_v41`` (the exact failure mode that

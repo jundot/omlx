@@ -44,6 +44,10 @@ jobs:
           # pytest 9.2 ignores xdist 3.8's loadgroup node id suffix, so the gpu group runs in parallel.
           python -m pip install "pytest<9.2" pytest-asyncio pytest-xdist
 
+      # xdist workers share one Harmony vocab cache file. Parallel cold downloads can read it half written.
+      - name: Warm the Harmony vocab cache
+        run: python -c "from openai_harmony import load_harmony_encoding; load_harmony_encoding('HarmonyGptOss')"
+
       - name: Run unit tests
         run: >-
           python -m pytest tests/ apps/omlx-web/tests apps/omlx-mac/Tests/python

@@ -847,6 +847,8 @@ class PairingManager:
       install/retract steps; defaults drive ``omlx/cluster/ssh_keys.py``.
     * ``http_post`` / ``http_get`` — joiner-side transport; loopback fakes
       in tests, urllib in production.
+    * ``join_watch_s`` — how often a join awaiting approval asks the
+      coordinator in the background; ``None`` leaves it to dashboard polls.
     """
 
     def __init__(
@@ -868,8 +870,10 @@ class PairingManager:
         http_get: Callable[[str, float], Any] | None = None,
         clock: Callable[[], float] = time.time,
         audit: PairingAuditLog | Callable[..., Any] | None = None,
+        join_watch_s: float | None = None,
     ) -> None:
         self.base_path = Path(base_path) if base_path is not None else DEFAULT_BASE_PATH
+        self.join_watch_s = join_watch_s
         self._identity = (
             dict(identity)
             if identity is not None
@@ -1699,6 +1703,7 @@ def configure_pairing_manager(
     *,
     registry: Any = None,
     enrollment_store: Any = None,
+    join_watch_s: float | None = 2.0,
     **kwargs: Any,
 ) -> PairingManager:
     """Create the process-wide manager at server startup.
@@ -1713,6 +1718,7 @@ def configure_pairing_manager(
             registry,
             enrollment_store,
             base_path=base_path,
+            join_watch_s=join_watch_s,
             **kwargs,
         )
         return _configured_manager

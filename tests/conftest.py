@@ -496,6 +496,15 @@ def _reset_batched_decode_qmm():
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_discovery_links(monkeypatch):
+    """Classify discovered links by RTT, not by this machine's routing table."""
+    discovery = sys.modules.get("omlx.cluster.discovery")
+    if discovery is not None:
+        monkeypatch.setattr(discovery, "interface_link", lambda ip: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_api_key_failures():
     """Keep the process-global wrong API key budget hermetic per test."""
     auth = sys.modules.get("omlx.admin.auth")
