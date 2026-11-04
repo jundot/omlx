@@ -25,6 +25,8 @@ class WebUIHost:
     is_admin: Callable[[Request], bool]
     ui_language: Callable[[], str]
     main_api_key: Callable[[], str | None]
+    # Saved color token overrides, painted with the first frame of every page.
+    custom_theme: Callable[[], dict | None] = lambda: None
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -52,6 +54,7 @@ try:
 except Exception:
     pass
 templates.env.globals["t"] = lambda key: _en_locale.get(key, key)
+templates.env.globals["custom_theme"] = lambda: None
 templates.env.globals["locale_json"] = json.dumps(_en_locale, ensure_ascii=False)
 templates.env.globals["current_lang"] = "en"
 
@@ -98,6 +101,7 @@ def set_host(host: WebUIHost) -> None:
     global _host
     _host = host
     templates.env.globals["version"] = host.version
+    templates.env.globals["custom_theme"] = lambda: _host.custom_theme()
 
 
 async def require_admin(request: Request) -> bool:

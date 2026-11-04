@@ -22,6 +22,9 @@
 
     <!-- Color tokens: every color the web UI draws (static/css/theme.css) -->
     <link rel="stylesheet" href="{{ static('css/theme.css') }}">
+    <!-- Custom theme: the saved token overrides, applied before first paint -->
+    <script>window._customTheme = {{ custom_theme() | tojson }};</script>
+    <script src="{{ static('js/custom_theme.js') }}"></script>
 
     <!-- Tailwind CSS (pre-compiled) -->
     <link rel="stylesheet" href="{{ static('css/tailwind.css') }}">

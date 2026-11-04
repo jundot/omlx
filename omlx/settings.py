@@ -879,21 +879,27 @@ class UISettings:
     language: str = "en"
     # Admin dashboard block layout. None means the built-in default layout.
     dashboard_layout: dict[str, Any] | None = None
+    # Web UI color token overrides, {"light": {token: hex}, "dark": {...}}.
+    # None means the stock colors.
+    custom_theme: dict[str, dict[str, str]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "language": self.language,
             "dashboard_layout": self.dashboard_layout,
+            "custom_theme": self.custom_theme,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> UISettings:
         """Create from dictionary."""
         layout = data.get("dashboard_layout")
+        theme = data.get("custom_theme")
         return cls(
             language=data.get("language", "en"),
             dashboard_layout=layout if isinstance(layout, dict) else None,
+            custom_theme=theme if isinstance(theme, dict) else None,
         )
 
 
