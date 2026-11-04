@@ -527,10 +527,6 @@ from dataclasses import dataclass, field  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 from .._version import __version__ as _omlx_version  # noqa: E402
-from .transport import (  # noqa: E402
-    parse_thunderbolt_interfaces,
-    parse_wifi_interfaces,
-)
 
 logger = logging.getLogger(__name__)  # noqa: E402
 _probe_diagnostics = threading.local()
@@ -1074,7 +1070,17 @@ def _local_ports() -> tuple[frozenset[str], frozenset[str]]:
         ).stdout
     except (OSError, subprocess.SubprocessError):
         output = ""
-    ports = (parse_thunderbolt_interfaces(output), parse_wifi_interfaces(output))
+    thunderbolt, wifi, port = set(), set(), ""
+    for line in output.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() == "Hardware Port":
+            port = value.strip()
+        elif key.strip() == "Device":
+            if port.startswith("Thunderbolt"):
+                thunderbolt.add(value.strip())
+            elif port.startswith("Wi-Fi"):
+                wifi.add(value.strip())
+    ports = (frozenset(thunderbolt), frozenset(wifi))
     with _link_cache_lock:
         _port_cache[:] = [now, ports]
     return ports
