@@ -648,7 +648,7 @@ class PrefillHelperManager:
             process.stop()
             raise
         self._process = process
-        saved = self._load_speeds().get(self._speeds_key(), {})
+        saved = self._saved_speeds()
         self._session = PrefillHelperSession(
             client,
             self.adapter,
@@ -699,9 +699,24 @@ class PrefillHelperManager:
             prep.join(timeout=1.0)
 
     def _speeds_key(self) -> str:
-        # A8 changes the helper's speed, so each setting keeps its own.
+        # The folder name survives moving or linking the model elsewhere. A8
+        # changes the helper's speed, so each setting keeps its own.
         a8 = ":a8" if self.a8_min_tokens is not None else ""
-        return f"{self.node_id}:{self.model_path}{a8}"
+        return f"{self.node_id}:{Path(self.model_path).name}{a8}"
+
+    def _saved_speeds(self) -> dict[str, Any]:
+        data = self._load_speeds()
+        if self._speeds_key() in data:
+            return data[self._speeds_key()]
+        # Older entries were keyed by the full model path.
+        a8 = ":a8" if self.a8_min_tokens is not None else ""
+        older = [
+            value
+            for key, value in data.items()
+            if key.startswith(f"{self.node_id}:")
+            and key.endswith(f"/{Path(self.model_path).name}{a8}")
+        ]
+        return max(older, key=lambda value: value.get("at", 0), default={})
 
     def _load_speeds(self) -> dict[str, Any]:
         try:

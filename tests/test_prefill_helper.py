@@ -965,9 +965,13 @@ def test_manager_retries_a_lost_helper_but_not_a_stopped_one(tmp_path, monkeypat
 
 def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     attached, speeds = [], tmp_path / "speeds.json"
+    # Saved before the model moved: keyed by its old full path.
+    old = {"helper": 1e-5, "host": 3e-5, "at": 1.0}
+    speeds.write_text(json.dumps({"node-1:/moved/from/x": old}))
     manager = _manager(_FakeLauncher(None), attached, speeds)
     manager.configure("node-1", None)
     _wait_state(manager, "ready")
+    assert (attached[-1].unit_helper, attached[-1].unit_host) == (1e-5, 3e-5)
     attached[-1].observe(2, 2048, helper_s=1.0, host_s=3.0)
     measured = (attached[-1].unit_helper, attached[-1].unit_host)
     manager.close()
@@ -980,7 +984,7 @@ def test_manager_starts_a_new_helper_from_the_saved_speeds(tmp_path):
     again.configure("node-2", None)
     _wait_state(again, "ready")
     saved = json.loads(speeds.read_text())
-    assert [key.split(":")[0] for key in saved] == ["node-1"]
+    assert {key.split(":")[0] for key in saved} == {"node-1"} and "node-1:x" in saved
     again.close()
 
     # The helper follows the model's A8 setting, and A8 keeps its own speeds.
