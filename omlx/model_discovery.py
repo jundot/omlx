@@ -391,6 +391,8 @@ AUDIO_TTS_ARCHITECTURES = {
     "VibeVoiceForConditionalGeneration",
     "VibeVoiceStreamingForConditionalGenerationInference",
     "KugelAudioForConditionalGeneration",
+    # Ming-3.0-tts ships model_type "dense", which is an LLM collision name.
+    "BailingMMNativeForConditionalGeneration",
 }
 
 AUDIO_STS_ARCHITECTURES = {

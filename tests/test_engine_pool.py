@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import mlx.core as mx
 import pytest
 
+import omlx.engine_pool as engine_pool_module
 from omlx.engine_pool import (
     EngineEntry,
     EnginePool,
@@ -991,13 +992,14 @@ class TestQwenCpuShareMemoryEstimate:
         )
         pool._entries[entry.model_id] = entry
         settings = ModelSettings()
-        off = pool._engine_runtime_signature("v41", settings)
-        settings.deepseek_v41_ced_prefill_enabled = True
+        # Unset means on.
         on = pool._engine_runtime_signature("v41", settings)
-        assert off != on
         assert dict(on)["deepseek_v41_ced_prefill_enabled"] == "True"
         settings.deepseek_v41_ced_prefill_enabled = False
-        assert pool._engine_runtime_signature("v41", settings) == off
+        off = pool._engine_runtime_signature("v41", settings)
+        assert off != on
+        settings.deepseek_v41_ced_prefill_enabled = True
+        assert pool._engine_runtime_signature("v41", settings) == on
 
     def test_qwen4_wide_decode_setting_changes_engine_signature(self, tmp_path):
         from omlx.model_settings import ModelSettings
@@ -2102,7 +2104,7 @@ class TestEnginePoolAsync:
         assert second is base_engine
         base_engine.stop.assert_not_awaited()
 
-    def test_oq_a8_forces_a_separate_engine(self, pool_with_mock_engines):
+    def test_oq_a8_forces_a_separate_engine(self, pool_with_mock_engines, monkeypatch):
         """The patch replaces MLP.__call__ process-wide, registers process-wide
         projection backends, and caches a plan on every module it classifies;
         none of that can be undone in place, so a change here has to land on a
@@ -2115,16 +2117,29 @@ class TestEnginePoolAsync:
         other_floor = ModelSettings(a8_prefill_enabled=True, a8_prefill_min_tokens=1024)
 
         sig = lambda s: pool._engine_runtime_signature("model-a", s)  # noqa: E731
+        monkeypatch.setattr(
+            engine_pool_module.quant_fast, "oq_a8_available", lambda: True
+        )
         assert sig(off) != sig(on)
         assert sig(on) != sig(other_floor)
+        # Without INT8 tensor units only a Prefill Accelerator Mac uses it.
+        monkeypatch.setattr(
+            engine_pool_module.quant_fast, "oq_a8_available", lambda: False
+        )
+        assert sig(off) == sig(on)
 
-    def test_oq_a8_toggle_changes_qwen4_exp_signature(self, pool_with_mock_engines):
+    def test_oq_a8_toggle_changes_qwen4_exp_signature(
+        self, pool_with_mock_engines, monkeypatch
+    ):
         """Flash-Next reloads on the same toggle, so routed-expert tags never
         outlive an OFF request (OFF -> ON -> OFF -> ON each get a new engine)."""
         from omlx.model_settings import ModelSettings
 
         pool = pool_with_mock_engines
         pool._entries["model-a"].config_model_type = "qwen4_exp"
+        monkeypatch.setattr(
+            engine_pool_module.quant_fast, "oq_a8_available", lambda: True
+        )
         sig = lambda enabled: pool._engine_runtime_signature(  # noqa: E731
             "model-a", ModelSettings(a8_prefill_enabled=enabled)
         )

@@ -239,21 +239,6 @@
     --palette-signal-red-600: 217 45 32;
     /* mid-gray */
     --palette-mid-gray: 128 128 128;
-    /* fabric-ink */
-    --palette-fabric-ink-450: 17 19 31;
-    --palette-fabric-ink-500: 17 19 26;
-    --palette-fabric-ink-550: 15 18 27;
-    --palette-fabric-ink-600: 16 21 34;
-    --palette-fabric-ink-700: 8 15 25;
-    --palette-fabric-ink-725: 8 13 22;
-    --palette-fabric-ink-750: 8 12 20;
-    --palette-fabric-ink-775: 10 13 20;
-    --palette-fabric-ink-800: 11 13 18;
-    --palette-fabric-ink-950: 2 6 15;
-    /* fabric-lime */
-    --palette-fabric-lime-300: 183 243 74;
-    --palette-fabric-lime-600: 118 185 0;
-    --palette-fabric-lime-800: 74 112 0;
 
     /* Surfaces, text, borders and controls */
     --bg-primary: rgb(var(--palette-white));

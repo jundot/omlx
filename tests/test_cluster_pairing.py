@@ -981,6 +981,40 @@ def _restore_manager_getter():
     pairing_routes.set_pairing_manager_getter(None)
 
 
+def test_an_invite_only_asks_the_other_mac_to_show_its_code(tmp_path, monkeypatch):
+    client, manager, clock = _client(tmp_path)
+    host = SimpleNamespace(
+        node_id="host-node",
+        friendly_name="Studio",
+        paired=False,
+        http_port=8000,
+        addrs=[{"ip": "127.0.0.1"}, {"ip": "fe80::1"}, {"ip": "10.0.0.2"}],
+    )
+    service = SimpleNamespace(peers=lambda: [host], address_health=lambda node: {})
+    monkeypatch.setattr(pairing_routes, "discovery_service_or_none", lambda: service)
+    sent = []
+    manager._http_post = lambda url, payload, timeout: sent.append((url, payload))
+    assert client.post("/api/cluster/pair/invite", json={"node_id": "host-node"}).json()
+    # Loopback and scope-less link-local addresses cannot reach the other Mac.
+    assert sent == [
+        ("http://10.0.0.2:8000/api/cluster/pair/invited", {"node_id": "coord-node"})
+    ]
+
+    invited = "/api/cluster/pair/invited"
+    assert client.post(invited, json={"node_id": "stranger"}).status_code == 404
+    assert client.post(invited, json={"node_id": "host-node"}).status_code == 202
+    assert client.get("/api/cluster/pair/invite").json() == {
+        "invite": {"node_id": "host-node", "name": "Studio"}
+    }
+    # Nothing joins until this Mac's user asks for the code.
+    assert manager.ui_session.snapshot()["state"] == "idle"
+    client.delete("/api/cluster/pair/invite")
+    assert client.get("/api/cluster/pair/invite").json() == {"invite": None}
+    client.post(invited, json={"node_id": "host-node"})
+    clock.now += CODE_TTL_SECONDS + 1
+    assert client.get("/api/cluster/pair/invite").json() == {"invite": None}
+
+
 def test_endpoints_full_flow(tmp_path, monkeypatch):
     client, manager, _ = _client(tmp_path)
     joiner = _manager(tmp_path, node_id="join-node", name="Joiner")

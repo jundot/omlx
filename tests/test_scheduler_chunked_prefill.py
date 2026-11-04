@@ -31,6 +31,7 @@ from omlx.prefill.packed import (
     PackedBatch,
     PackedRow,
     PackedRows,
+    _wrap_mixer,
     install_packed_prefill,
     packed_min_row_tokens,
     run_packed_prefill,
@@ -1979,6 +1980,22 @@ def _assert_same_cache(actual, expected):
     for a, b in zip(actual, expected):
         assert a.shape == b.shape
         assert mx.array_equal(a, b).item()
+
+
+def test_packed_wrapper_follows_a_later_patch_of_an_inherited_call():
+    """Qwen4 GDN inherits __call__; a patch of the base class applied after
+    the packed wrapper (the GDN prework decode) must still reach it."""
+
+    class Base:
+        def __call__(self, inputs, mask=None, cache=None):
+            return "original"
+
+    class Child(Base):
+        pass
+
+    _wrap_mixer(Child, lambda x, cache: None, x_arg="inputs")
+    Base.__call__ = lambda self, inputs, mask=None, cache=None: "patched"
+    assert Child()(mx.zeros((1, 2))) == "patched"
 
 
 @pytest.mark.parametrize(

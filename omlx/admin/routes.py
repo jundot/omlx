@@ -85,12 +85,16 @@ from ..model_settings import (
     validate_moe_expert_offload,
     MOE_OFFLOAD_MTP_MODEL_TYPES,
     merge_chat_template_kwargs,
+    oq_a8_model_supported,
     validate_kv_compression_settings,
 )
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
 from ..patches.deepseek_v41.encoding import REASONING_EFFORT_MAPPINGS
 from ..patches.k2_horizon import REASONING_EFFORTS
 from ..patches.moe_offload_compat import moe_offload_compatibility
+from ..prefill_helper.adapters import adapter_for as stage_adapter_for
+from ..prefill_helper.routes import helper_status as prefill_helper_status
+from ..prefill_helper.routes import prepare_unloaded as prepare_prefill_helper
 from ..settings import (
     BURST_DECODE_MODES,
     SPLASH_KV_FORMATS,
@@ -243,17 +247,7 @@ print(deleted)
     return deleted, len(node_ids)
 
 
-def _oq_a8_model_supported(config_type: str | None) -> bool:
-    """True for the model families the A8 prefill paths can route.
-
-    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) and
-    DeepSeek V4.1 match exactly: only those validated checkpoint families have
-    routed-expert A8, so a ``qwen4`` prefix would admit unvalidated models.
-    """
-    config_type = str(config_type or "").lower().replace("-", "_")
-    return config_type in ("qwen4_exp", "deepseek_v41") or config_type.startswith(
-        ("qwen3_5", "qwen3_6", "qwen3_8")
-    )
+_oq_a8_model_supported = oq_a8_model_supported
 
 
 def _oq_a8_kernels_available() -> bool:
@@ -390,6 +384,8 @@ class ModelSettingsRequest(BaseModel):
     qwen4_gdn_decode_wide_proj: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
+    prefill_helper_node_id: str | None = None
+    prefill_helper_layers: int | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     gpu_power_limit_w: int | None = None
@@ -2306,6 +2302,12 @@ def reasoning_levels(model_info: dict) -> list[str]:
     return levels
 
 
+def _prefill_helper_status(model_id: str) -> dict | None:
+    engine_pool = _get_engine_pool()
+    entry = engine_pool.get_entry(model_id) if engine_pool is not None else None
+    return prefill_helper_status(entry) if entry is not None else None
+
+
 def _model_options(model_info: dict, settings) -> dict:
     """Describe model controls once for the web and native settings clients."""
     model_type = (model_info.get("config_model_type") or "").lower().replace("-", "_")
@@ -2571,6 +2573,11 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
             "activation_fp16_supported": activation_fp16_supported,
+            "prefill_helper_supported": stage_adapter_for(
+                (model_info.get("config_model_type") or "").replace("-", "_").lower()
+            )
+            is not None,
+            "prefill_helper": _prefill_helper_status(model_id),
         }
 
         model_data.update(_model_options(model_data, settings))
@@ -2979,9 +2986,24 @@ async def update_model_settings(
         current_settings.enable_thinking = request.enable_thinking
     if "deepseek_v41_ced_prefill_enabled" in sent:
         is_v41 = (entry.config_model_type or "").replace("-", "_").lower() == "deepseek_v41"
-        current_settings.deepseek_v41_ced_prefill_enabled = bool(
-            request.deepseek_v41_ced_prefill_enabled and is_v41
+        # Left unset elsewhere; unset means on for DeepSeek V4.1.
+        current_settings.deepseek_v41_ced_prefill_enabled = (
+            request.deepseek_v41_ced_prefill_enabled if is_v41 else None
         )
+    if "prefill_helper_node_id" in sent:
+        supported = stage_adapter_for(
+            (entry.config_model_type or "").replace("-", "_").lower()
+        )
+        current_settings.prefill_helper_node_id = (
+            (request.prefill_helper_node_id or None) if supported else None
+        )
+    if "prefill_helper_layers" in sent:
+        layers = request.prefill_helper_layers
+        if layers is not None and layers < 1:
+            raise HTTPException(
+                status_code=400, detail="prefill_helper_layers must be at least 1"
+            )
+        current_settings.prefill_helper_layers = layers
     if "qwen4_ple_ssd_offload" in sent:
         is_qwen4_exp = (entry.config_model_type or "").replace(
             "-", "_"
@@ -3178,7 +3200,7 @@ async def update_model_settings(
     # INT8-activation (A8) prefill. Load-time like the ANE controls above: the
     # runtime signature re-creates a loaded model when this changes.
     if "a8_prefill_enabled" in sent:
-        current_settings.a8_prefill_enabled = bool(request.a8_prefill_enabled)
+        current_settings.a8_prefill_enabled = request.a8_prefill_enabled
     if "a8_prefill_min_tokens" in sent:
         value = request.a8_prefill_min_tokens
         if value is None or value < 1:
@@ -3452,6 +3474,16 @@ async def update_model_settings(
 
     # Persist settings
     settings_manager.set_settings(model_id, current_settings)
+    helper_fields = {"prefill_helper_node_id", "prefill_helper_layers"}
+    if not _oq_a8_kernels_available():
+        # A8 here reaches only the helper's layers.
+        helper_fields |= {"a8_prefill_enabled", "a8_prefill_min_tokens"}
+    if helper_fields & set(sent):
+        if hasattr(entry.engine, "configure_prefill_helper"):
+            # Applied to the loaded model in place; no reload.
+            entry.engine.configure_prefill_helper(current_settings)
+        else:
+            prepare_prefill_helper(entry, current_settings)
 
     # A failed load is cached to prevent clients from retrying the same broken
     # configuration on every request. Clear that cache only when the effective
@@ -3656,15 +3688,6 @@ def _validate_model_settings(entry, settings):
                     "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
                 ),
             )
-        if not _oq_a8_kernels_available():
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "A8 prefill needs the native prefill kernels and a Metal "
-                    "device with native INT8 tensor operations (M5-series or "
-                    "newer)."
-                ),
-            )
         if settings.get("qwen35_ane_prefill_enabled"):
             raise HTTPException(
                 status_code=400,
@@ -3712,7 +3735,11 @@ async def create_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
+    # Profiles never carry the helper Mac; A8 checks need the model's own.
+    helper = mgr.get_settings(model_id).prefill_helper_node_id
+    _validate_model_settings(
+        entry, {"prefill_helper_node_id": helper, **(request.settings or {})}
+    )
     engine_pool = _get_engine_pool()
     try:
         profile = mgr.save_profile(
@@ -3757,7 +3784,11 @@ async def update_model_profile(
 
     mgr = _require_settings_manager()
     entry = _require_model(model_id)
-    _validate_model_settings(entry, request.settings or {})
+    # Profiles never carry the helper Mac; A8 checks need the model's own.
+    helper = mgr.get_settings(model_id).prefill_helper_node_id
+    _validate_model_settings(
+        entry, {"prefill_helper_node_id": helper, **(request.settings or {})}
+    )
     engine_pool = _get_engine_pool()
     try:
         updated = mgr.update_profile(
@@ -3993,7 +4024,9 @@ def _feature_problem(
                 "A8 prefill is available only for Qwen3.5/3.6/3.8, "
                 "Qwen3.8-Flash-Next and DeepSeek V4.1 models."
             )
-        if not _oq_a8_kernels_available():
+        if not _oq_a8_kernels_available() and not snapshot.get(
+            "prefill_helper_node_id"
+        ):
             return (
                 "A8 prefill needs the native prefill kernels and a Metal "
                 "device with native INT8 tensor operations."

@@ -25,7 +25,9 @@ from omlx.admin.benchmark import (
     _generate_prompt,
     _load_bench_corpus,
     _log_ane_benchmark_trace,
+    _prefill_helper_details,
     _run_batch_test,
+    _setting_feature_flags,
     _run_single_test,
     _upload_model_name,
     _upload_model_repo,
@@ -772,6 +774,9 @@ class _FakeBenchEnginePool:
     def get_loaded_model_ids(self):
         return []
 
+    def get_entry(self, model_id):
+        return SimpleNamespace(config_model_type="llama")
+
     async def get_engine(self, model_id, force_lm=False):
         self.force_lm_values.append(force_lm)
         return self._engine
@@ -1089,6 +1094,59 @@ class TestDeriveFeatureFlags:
         assert _derive_feature_flags(SimpleNamespace()) == []
 
 
+def test_speed_badges_follow_what_the_model_runs_with(monkeypatch):
+    from omlx.admin import benchmark as bench
+    from omlx.model_settings import ModelSettings
+
+    monkeypatch.setattr(bench.quant_fast, "oq_a8_available", lambda: False)
+
+    def keys(**kwargs):
+        return [flag["key"] for flag in _setting_feature_flags(**kwargs)]
+
+    on = ModelSettings()
+    # Without INT8 kernels here, A8 runs only on a helper's layers.
+    assert keys(model_settings=on, model_type="deepseek_v41") == ["ced_prefill"]
+    assert keys(model_settings=on, model_type="deepseek_v41", helper_a8=True) == [
+        "a8_prefill",
+        "ced_prefill",
+    ]
+    off = ModelSettings(
+        a8_prefill_enabled=False, deepseek_v41_ced_prefill_enabled=False
+    )
+    assert keys(model_settings=off, model_type="deepseek_v41", helper_a8=True) == []
+    assert keys(model_settings=on, model_type="llama", helper_a8=True) == []
+
+
+def test_prefill_helper_details_only_while_it_helps():
+    status = {
+        "state": "ready",
+        "name": "M5max",
+        "node_id": "node",
+        "device": "Apple M5 Max",
+        "memory": 128 << 30,
+        "held": 28,
+        "link": "thunderbolt",
+    }
+    from omlx.prefill_helper.manager import PrefillHelperManager
+
+    manager = MagicMock(spec=PrefillHelperManager, fixed_layers=None, a8_min_tokens=128)
+    manager.status.side_effect = lambda: status
+    engine = SimpleNamespace(prefill_helper=manager)
+    # Hardware only: the Mac's name and node id stay local.
+    assert _prefill_helper_details(engine) == {
+        "helper": "Apple M5 Max",
+        "helper_memory_gb": 128,
+        "layers": 28,
+        "split": "auto",
+        "link": "thunderbolt",
+        "a8": True,
+    }
+    status["state"] = "connecting"
+    assert _prefill_helper_details(engine) is None
+    # An engine without a helper manager (a mock answers any attribute).
+    assert _prefill_helper_details(MagicMock()) is None
+
+
 class TestFilterUploadedSettings:
     """Allowlist projection — a denylist would ship every future field."""
 
@@ -1224,6 +1282,24 @@ class TestFilterUploadedSettings:
             "ttl_seconds",
         ):
             assert key not in out
+
+    def test_a_model_type_keeps_its_family_and_reports_default_on_toggles(self):
+        settings = self._settings(
+            deepseek_v41_engram_ssd_offload=True,
+            qwen4_ple_ssd_offload=True,
+            activation_fp16_enabled=True,
+            gpu_power_limit_w=60,
+        )
+        out = _filter_uploaded_settings(settings, "deepseek_v41")
+        # Unset A8 and CED are on, so the run reports them as on.
+        assert out["a8_prefill_enabled"] is True
+        assert out["deepseek_v41_ced_prefill_enabled"] is True
+        assert out["deepseek_v41_engram_ssd_offload"] is True
+        assert "qwen4_ple_ssd_offload" not in out
+        assert out["activation_fp16_enabled"] is True and out["gpu_power_limit_w"] == 60
+        other = _filter_uploaded_settings(settings, "llama")
+        assert "a8_prefill_enabled" not in other
+        assert not [k for k in other if k.startswith(("deepseek_v41_", "qwen4_"))]
 
     def test_grammar_body_is_dropped_but_the_toggle_is_kept(self):
         out = _filter_uploaded_settings(

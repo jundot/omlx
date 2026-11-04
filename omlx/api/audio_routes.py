@@ -44,13 +44,14 @@ from ..engine.realtime_voice import (
     ResponseResult,
     pcm16_bytes,
 )
+from ..engine.tts import MING3_VOICES, is_ming3_config
 from ..engine.vlm import (
     VLMBatchedEngine,
     realtime_voice_capabilities,
     realtime_voice_instructions,
     realtime_voice_names,
 )
-from ..exceptions import ModelNotFoundError
+from ..exceptions import InvalidRequestError, ModelNotFoundError
 from ..server_metrics import get_server_metrics
 from ..utils import gpu_power
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
@@ -1496,6 +1497,8 @@ async def list_model_voices(model: Optional[str] = None, realtime: bool = False)
         spk = talker.get("spk_id") or config.get("spk_id") or {}
         if config.get("model_type") in SPEECH_MODEL_TYPES:
             voices = list(VOICES)
+        elif is_ming3_config(config):
+            voices = list(MING3_VOICES)
         elif isinstance(spk, dict):
             voices = sorted(spk.keys())
     return {"model": resolved, "voices": voices}
@@ -1588,7 +1591,7 @@ async def create_speech(request: AudioSpeechRequest):
                 status_code=500,
                 detail="TTS streaming produced no audio output",
             ) from exc
-        except HTTPException:
+        except (HTTPException, InvalidRequestError):
             raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -1612,7 +1615,7 @@ async def create_speech(request: AudioSpeechRequest):
             repetition_penalty=request.repetition_penalty,
             max_tokens=request.max_tokens,
         )
-    except HTTPException:
+    except (HTTPException, InvalidRequestError):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

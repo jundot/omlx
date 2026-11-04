@@ -90,6 +90,24 @@ class TestVoicesEndpoint:
         assert response.status_code == 200
         assert response.json()["voices"] == ["aiden", "serena", "vivian"]
 
+    def test_ming3_lists_builtin_voices_and_omni_does_not(self, voices_client):
+        """Ming-3.0 voices live in code; Ming Omni (patch 4) has none."""
+        client, _, model_dir = voices_client
+        config = model_dir / "config.json"
+        ming = {
+            "model_type": "dense",
+            "architectures": ["BailingMMNativeForConditionalGeneration"],
+            "ditar_config": {"patch_size": 1},
+        }
+        config.write_text(json.dumps(ming))
+        voices = client.get("/v1/audio/voices", params={"model": "ming"}).json()
+        assert voices["voices"][:3] == ["US_Emma", "UK_George", "UK_Charlotte"]
+        assert "灵小柔" in voices["voices"]
+
+        config.write_text(json.dumps({**ming, "ditar_config": {"patch_size": 4}}))
+        voices = client.get("/v1/audio/voices", params={"model": "ming"}).json()
+        assert voices["voices"] == []
+
     def test_model_without_named_voices_returns_empty_list(self, voices_client):
         """Voice-cloning base models legitimately have no named speakers."""
         client, _, model_dir = voices_client

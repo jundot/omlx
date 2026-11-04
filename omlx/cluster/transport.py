@@ -14,9 +14,9 @@ import secrets
 import shlex
 import subprocess
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .ssh_policy import apply_cluster_ssh_policy, cluster_ssh_options
@@ -1059,6 +1059,8 @@ _LINK_KIND_RANK = {"rdma": 3, "thunderbolt": 2, "ethernet": 1}
 _IFCONFIG_HEADER = re.compile(
     r"^(?P<name>[^\s:]+):\s+flags=[0-9a-fA-F]+<(?P<flags>[^>]*)>"
 )
+# "1000baseT", "2500Base-T", "10Gbase-T", "100baseTX" in an ifconfig media line.
+_MEDIA_SPEED = re.compile(r"(\d+)(G?)base", re.IGNORECASE)
 _HARDWARE_PORT = re.compile(r"^Hardware Port:\s*(?P<port>.+)$")
 _HARDWARE_DEVICE = re.compile(r"^Device:\s*(?P<device>\S+)$")
 
@@ -1093,6 +1095,11 @@ class HostInterfaces:
     # Up interfaces holding only a self-assigned 169.254 address, which never
     # appear in ``addresses``.
     self_assigned_interfaces: frozenset[str] = frozenset()
+    # IPv6 link-local address per up interface. A Thunderbolt Bridge left on
+    # DHCP has one, and it routes when scoped to the interface.
+    link_local_addresses: Mapping[str, str] = field(default_factory=dict)
+    # Negotiated Ethernet speed per up interface, in Mbit/s.
+    media_speeds: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1164,8 +1171,10 @@ def _interface_address(interface: str, fields: list[str]) -> InterfaceAddress | 
     return InterfaceAddress(interface, str(address), prefix_length)
 
 
-def _up_inet_lines(output: str) -> Iterator[tuple[str, list[str]]]:
-    """``(interface, fields)`` for each ``inet`` line of an up interface.
+def _up_inet_lines(
+    output: str, keyword: str = "inet"
+) -> Iterator[tuple[str, list[str]]]:
+    """``(interface, fields)`` for each ``keyword`` line of an up interface.
 
     Addresses on a down interface are dropped: ifconfig keeps listing them, and
     a rank told to bind one gets the same EADDRNOTAVAIL as a stale address.
@@ -1183,7 +1192,7 @@ def _up_inet_lines(output: str) -> Iterator[tuple[str, list[str]]]:
             is_up = header is not None and "UP" in header.group("flags").split(",")
             continue
         fields = line.split()
-        if interface and is_up and len(fields) >= 2 and fields[0] == "inet":
+        if interface and is_up and len(fields) >= 2 and fields[0] == keyword:
             yield interface, fields
 
 
@@ -1212,6 +1221,29 @@ def parse_self_assigned_interfaces(output: str) -> frozenset[str]:
             if ipaddress.IPv4Address(fields[1]) in _SELF_ASSIGNED_NETWORK:
                 interfaces.add(interface)
     return frozenset(interfaces)
+
+
+def parse_link_local_addresses(output: str) -> dict[str, str]:
+    """IPv6 link-local address per up interface, from ``ifconfig -a``."""
+
+    addresses: dict[str, str] = {}
+    for interface, fields in _up_inet_lines(output, "inet6"):
+        address = fields[1].partition("%")[0]
+        with suppress(ValueError):
+            if ipaddress.IPv6Address(address).is_link_local:
+                addresses.setdefault(interface, address)
+    return addresses
+
+
+def parse_media_speeds(output: str) -> dict[str, int]:
+    """Negotiated Ethernet speed in Mbit/s per up interface, from ``ifconfig -a``."""
+
+    speeds: dict[str, int] = {}
+    for interface, fields in _up_inet_lines(output, "media:"):
+        match = _MEDIA_SPEED.search(" ".join(fields))
+        if match is not None:
+            speeds[interface] = int(match[1]) * (1000 if match[2] else 1)
+    return speeds
 
 
 def _hardware_port_devices(output: str, port_prefix: str) -> frozenset[str]:
@@ -1317,6 +1349,8 @@ def probe_host_interfaces(ssh_hostname: str) -> HostInterfaces:
         thunderbolt_interfaces=parse_thunderbolt_interfaces(ports),
         wifi_interfaces=parse_wifi_interfaces(ports),
         self_assigned_interfaces=parse_self_assigned_interfaces(ifconfig),
+        link_local_addresses=parse_link_local_addresses(ifconfig),
+        media_speeds=parse_media_speeds(ifconfig),
     )
 
 

@@ -73,7 +73,23 @@ struct ModelSettingsScreen: View {
             )
             .padding(.top, 14)
         case .acceleration:
-            EnginePage(vm: vm) { AccelerationSection(vm: vm, client: services.client) }
+            EnginePage(vm: vm) {
+                VStack(alignment: .leading, spacing: 16) {
+                    AccelerationSection(vm: vm, client: services.client)
+                    if vm.prefillHelperSupported {
+                        PrefillAcceleratorGroup(vm: vm, client: services.client) {
+                            // Pairing lives in the web dashboard's Cluster tab.
+                            let config = services.config
+                            if let url = MenubarController.webAdminURL(
+                                host: config.host, port: config.port, apiKey: config.apiKey,
+                                redirect: "/admin/dashboard?tab=cluster"
+                            ) {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                    }
+                }
+            }
         case .memory:
             EnginePage(vm: vm) { MemorySavingSection(vm: vm, client: services.client) }
         case .advanced:
@@ -1432,6 +1448,306 @@ private struct EnginePage<Content: View>: View {
     }
 }
 
+// MARK: - Prefill Accelerator
+
+private struct PrefillAcceleratorGroup: View {
+    @Bindable var vm: ModelSettingsScreenVM
+    let client: OMLXClient
+    let openCluster: () -> Void
+
+    @Environment(\.omlxTheme) private var theme
+
+    var body: some View {
+        ListGroup {
+            Row(label: String(localized: "settings.acceleration.prefill_helper.label",
+                              defaultValue: "Prefill Accelerator",
+                              comment: "Row label for choosing the Mac that helps prefill"),
+                sublabel: String(localized: "settings.acceleration.prefill_helper.sub",
+                                 defaultValue: "Another Mac runs the first layers of long prompts, so prefill finishes sooner. Decoding stays on this Mac.",
+                                 comment: "Sublabel for the Prefill Accelerator picker"),
+                warning: takeoverWarning ?? batteryWarning,
+                isLast: !vm.prefillHelperAvailable ? false : vm.prefillHelperNodeID.isEmpty && statusText == nil) {
+                if vm.prefillHelperAvailable {
+                    Popup(selection: Binding(
+                              get: { vm.prefillHelperNodeID },
+                              set: { node in
+                                  guard node != vm.prefillHelperNodeID else { return }
+                                  vm.prefillHelperNodeID = node
+                                  save()
+                              }),
+                          width: .controlWide, options: macOptions)
+                }
+            }
+            if !vm.prefillHelperAvailable {
+                FreeRow(isLast: true) {
+                    HStack(spacing: 10) {
+                        HintLine(text: String(localized: "settings.acceleration.prefill_helper.needs_cluster",
+                                              defaultValue: "In the web dashboard, turn on Global Settings > Advanced > Enable Distributed Inference on both Macs and restart oMLX, then pair a Mac in the Cluster tab.",
+                                              comment: "Hint when no Mac can be paired for the Prefill Accelerator"))
+                        Spacer(minLength: 8)
+                        Button(String(localized: "settings.acceleration.prefill_helper.open_cluster",
+                                      defaultValue: "Open Cluster Tab",
+                                      comment: "Button opening the web dashboard's Cluster tab"),
+                               action: openCluster)
+                            .buttonStyle(.omlx(.normal, size: .small))
+                    }
+                }
+            } else {
+                if !vm.prefillHelperNodeID.isEmpty {
+                    Row(label: String(localized: "settings.acceleration.prefill_helper.layers.label",
+                                      defaultValue: "Layers on the helper",
+                                      comment: "Row label for the number of layers the helper Mac runs"),
+                        sublabel: String(localized: "settings.acceleration.prefill_helper.layers.sub",
+                                         defaultValue: "Auto splits the work by the measured speed of both Macs.",
+                                         comment: "Sublabel for the Prefill Accelerator layer count"),
+                        isLast: statusText == nil) {
+                        Popup(selection: vm.bind($vm.prefillHelperLayers, save: save),
+                              width: .controlCompact, options: layerOptions)
+                    }
+                }
+                if let text = statusText {
+                    FreeRow(isLast: true) {
+                        HStack(spacing: 10) {
+                            StatusPill(status: pill, compact: true)
+                            Text(text)
+                                .font(.omlxText(11.5))
+                                .foregroundStyle(theme.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 8)
+                            actionButtons
+                        }
+                    }
+                }
+            }
+        }
+        .task(id: vm.modelID) {
+            await vm.loadPrefillHelperCandidates(client: client)
+            var checked = false
+            while !Task.isCancelled {
+                await vm.refreshPrefillHelperStatus(client: client)
+                // A saved helper of an unloaded model: see whether its files
+                // are already there (nothing is copied).
+                if !checked, vm.prefillHelperStatus?.state == "unloaded",
+                   !vm.prefillHelperNodeID.isEmpty {
+                    checked = true
+                    await vm.prefillHelperAction("check", client: client)
+                }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+    }
+
+    private func save() {
+        Task { await vm.save(.prefillHelper, client: client) }
+    }
+
+    private var macOptions: [(String, String)] {
+        var options = [("", String(localized: "settings.acceleration.prefill_helper.off",
+                                   defaultValue: "Off",
+                                   comment: "Picker option that turns the Prefill Accelerator off"))]
+        for device in vm.prefillHelperCandidates {
+            options.append((device.nodeId, describe(device)))
+        }
+        if !vm.prefillHelperNodeID.isEmpty,
+           !vm.prefillHelperCandidates.contains(where: { $0.nodeId == vm.prefillHelperNodeID }) {
+            options.append((vm.prefillHelperNodeID, vm.prefillHelperStatus?.name ?? vm.prefillHelperNodeID))
+        }
+        return options
+    }
+
+    private func describe(_ device: PrefillHelperCandidatesDTO.Device) -> String {
+        var parts = [device.name]
+        if !device.online {
+            parts.append(String(localized: "settings.acceleration.prefill_helper.offline",
+                                defaultValue: "offline",
+                                comment: "Picker suffix for a paired Mac that does not answer"))
+        } else if device.versionOk != true {
+            parts.append(String(localized: "settings.acceleration.prefill_helper.update",
+                                defaultValue: "needs the same oMLX version",
+                                comment: "Picker suffix for a paired Mac on another oMLX version"))
+        } else if let fit = device.layersFit, fit > 0 {
+            parts.append(String(localized: "settings.acceleration.prefill_helper.fits",
+                                defaultValue: "\(fit) layers fit",
+                                comment: "Picker suffix with how many layers fit on the helper Mac"))
+        } else {
+            parts.append(String(localized: "settings.acceleration.prefill_helper.no_memory",
+                                defaultValue: "not enough memory",
+                                comment: "Picker suffix for a paired Mac without room for one layer"))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var layerOptions: [(Int?, String)] {
+        [(nil, String(localized: "settings.acceleration.prefill_helper.auto",
+                      defaultValue: "Auto",
+                      comment: "Layer count option that splits by measured speed"))]
+            + vm.prefillHelperLayerChoices.map { (Optional($0), "\($0)") }
+    }
+
+    private var takeoverWarning: String? {
+        guard let device = vm.prefillHelperCandidates.first(where: { $0.nodeId == vm.prefillHelperNodeID }),
+              let lending = device.lending else { return nil }
+        let name = device.name
+        return String(localized: "settings.acceleration.prefill_helper.takes_over",
+                      defaultValue: "\(name) is helping \(lending.host ?? "another Mac") with \(lending.model ?? "another model"). Using it here stops that.",
+                      comment: "Warning when the chosen helper Mac already helps another model")
+    }
+
+    private var batteryWarning: String? {
+        let device = vm.prefillHelperCandidates.first { $0.nodeId == vm.prefillHelperNodeID }
+        guard device?.onBattery == true || vm.prefillHelperStatus?.onBattery == true else { return nil }
+        let name = device?.name ?? vm.prefillHelperStatus?.name ?? ""
+        return String(localized: "settings.acceleration.prefill_helper.battery",
+                      defaultValue: "\(name) is on battery power. Prefill drains its battery quickly.",
+                      comment: "Warning when the helper Mac runs on battery")
+    }
+
+    private var pill: StatusPill.Status {
+        switch vm.prefillHelperStatus?.state {
+        case "ready", "working": return .running
+        case "connecting", "starting", "copying", "needs_files": return .starting
+        case "offline", "stopped": return .custom(color: theme.amberDot, label: "", fillBg: true)
+        case "error": return .error
+        default: return .stopped
+        }
+    }
+
+    private var statusText: String? {
+        guard !vm.prefillHelperNodeID.isEmpty, let status = vm.prefillHelperStatus else { return nil }
+        let name = status.name ?? ""
+        let size = { (bytes: Int64?) in
+            ByteCountFormatter.string(fromByteCount: bytes ?? 0, countStyle: .file)
+        }
+        switch status.state {
+        case "connecting":
+            return String(localized: "settings.acceleration.prefill_helper.state.connecting",
+                          defaultValue: "Connecting to \(name)...",
+                          comment: "Prefill Accelerator status while connecting")
+        case "starting":
+            let layers = status.layers ?? 0
+            return String(localized: "settings.acceleration.prefill_helper.state.starting",
+                          defaultValue: "Loading \(layers) layers on \(name)...",
+                          comment: "Prefill Accelerator status while the helper loads layers")
+        case "needs_files":
+            let need = size(status.bytes), left = size(status.left)
+            if status.prompt == "make_room" {
+                let copies = (status.delete ?? [])
+                    .map { "\($0.name) (\(size($0.bytes)))" }
+                    .joined(separator: ", ")
+                return String(localized: "settings.acceleration.prefill_helper.state.make_room",
+                              defaultValue: "\(name) needs \(need) of model files. To keep 50 GB free, copying first deletes these older model copies: \(copies). \(left) stays free.",
+                              comment: "Prefill Accelerator status asking to delete older model copies on the helper Mac before copying")
+            }
+            return String(localized: "settings.acceleration.prefill_helper.state.low_space",
+                          defaultValue: "\(name) is low on disk space. Copying \(need) of model files leaves only \(left) free.",
+                          comment: "Prefill Accelerator status asking to copy model files to a nearly full helper Mac")
+        case "copying":
+            let done = size(status.done), total = size(status.bytes)
+            let text = String(localized: "settings.acceleration.prefill_helper.state.copying",
+                              defaultValue: "Copying model files to \(name): \(done) of \(total)",
+                              comment: "Prefill Accelerator status while copying files")
+            guard let seconds = status.secondsLeft else { return text }
+            let left = seconds < 90
+                ? String(localized: "settings.acceleration.prefill_helper.state.seconds_left",
+                         defaultValue: "about \(seconds) s left",
+                         comment: "Prefill Accelerator copy time left, in seconds")
+                : String(localized: "settings.acceleration.prefill_helper.state.minutes_left",
+                         defaultValue: "about \((seconds + 59) / 60) min left",
+                         comment: "Prefill Accelerator copy time left, in minutes")
+            return text + " · " + left
+        case "files_missing":
+            let held = status.held ?? 0, need = size(status.bytes)
+            return String(localized: "settings.acceleration.prefill_helper.state.files_missing",
+                          defaultValue: "\(name) needs \(need) of model files for \(held) layers. They are copied when this model loads, or copy them now.",
+                          comment: "Prefill Accelerator status when the helper Mac lacks model files before the model is loaded")
+        case "files_ready":
+            let held = status.held ?? 0
+            return String(localized: "settings.acceleration.prefill_helper.state.files_ready",
+                          defaultValue: "Model files for \(held) layers are ready on \(name). The Prefill Accelerator starts when this model is loaded.",
+                          comment: "Prefill Accelerator status after copying files before the model is loaded")
+        case "ready", "working":
+            let held = status.held ?? 0
+            var text = String(localized: "settings.acceleration.prefill_helper.state.ready",
+                              defaultValue: "Ready on \(name) with \(held) layers",
+                              comment: "Prefill Accelerator status when the helper is ready")
+            if let last = status.lastPrompt {
+                let seconds = String(format: "%.1f", last.seconds)
+                text += " · " + String(localized: "settings.acceleration.prefill_helper.state.last_prompt",
+                                       defaultValue: "last prompt \(last.tokens) tokens in \(seconds)s",
+                                       comment: "Prefill Accelerator status suffix with the last prompt timing")
+            }
+            return text
+        case "offline":
+            let reason = status.reason ?? ""
+            return String(localized: "settings.acceleration.prefill_helper.state.offline",
+                          defaultValue: "\(name) is unreachable (\(reason)). Retrying.",
+                          comment: "Prefill Accelerator status while the helper is unreachable")
+        case "stopped":
+            return status.reason.map { $0 + "." } ?? String(
+                localized: "settings.acceleration.prefill_helper.state.stopped",
+                defaultValue: "Stopped.",
+                comment: "Prefill Accelerator status after Stop")
+        case "error":
+            return status.reason ?? ""
+        case "unloaded":
+            return String(localized: "settings.acceleration.prefill_helper.state.unloaded",
+                          defaultValue: "Starts when this model is loaded.",
+                          comment: "Prefill Accelerator status while the model is not loaded")
+        default:
+            return nil
+        }
+    }
+
+    @ViewBuilder
+    private var actionButtons: some View {
+        let state = vm.prefillHelperStatus?.state ?? ""
+        if state == "needs_files" {
+            Button(vm.prefillHelperStatus?.prompt == "make_room"
+                   ? String(localized: "settings.acceleration.prefill_helper.delete_and_copy",
+                            defaultValue: "Delete and Copy",
+                            comment: "Button that deletes older model copies on the helper Mac, then copies model files")
+                   : String(localized: "settings.acceleration.prefill_helper.copy_anyway",
+                            defaultValue: "Copy Anyway",
+                            comment: "Button that copies model files to a nearly full helper Mac")) {
+                Task { await vm.prefillHelperAction("copy", client: client) }
+            }
+            .buttonStyle(.omlx(.primary, size: .small))
+            .disabled(vm.prefillHelperBusy)
+        }
+        if state == "files_missing" {
+            Button(String(localized: "settings.acceleration.prefill_helper.copy_now",
+                          defaultValue: "Copy Files Now",
+                          comment: "Button that copies model files to the helper Mac before the model is loaded")) {
+                save()
+            }
+            .buttonStyle(.omlx(.normal, size: .small))
+            .disabled(vm.prefillHelperBusy)
+        }
+        if ["offline", "error", "stopped"].contains(state) {
+            Button(state == "stopped"
+                   ? String(localized: "settings.acceleration.prefill_helper.start",
+                            defaultValue: "Start Again",
+                            comment: "Button that restarts a stopped helper")
+                   : String(localized: "settings.acceleration.prefill_helper.retry",
+                            defaultValue: "Retry",
+                            comment: "Button that retries starting the helper")) {
+                Task { await vm.prefillHelperAction("retry", client: client) }
+            }
+            .buttonStyle(.omlx(.normal, size: .small))
+            .disabled(vm.prefillHelperBusy)
+        }
+        if ["connecting", "needs_files", "copying", "starting", "ready", "working", "offline"].contains(state) {
+            Button(String(localized: "settings.acceleration.prefill_helper.stop",
+                          defaultValue: "Stop",
+                          comment: "Button that stops the helper")) {
+                Task { await vm.prefillHelperAction("stop", client: client) }
+            }
+            .buttonStyle(.omlx(.normal, size: .small))
+            .disabled(vm.prefillHelperBusy)
+        }
+    }
+}
+
 private struct MemorySavingSection: View {
     @Bindable var vm: ModelSettingsScreenVM
     let client: OMLXClient
@@ -2103,9 +2419,15 @@ private struct AccelerationSection: View {
 
     private var a8PrefillSublabel: String {
         if let reason = vm.a8PrefillConflictReason { return reason }
-        return String(localized: "settings.experimental.qwen_oq_a8.sub",
+        let text = String(localized: "settings.experimental.qwen_oq_a8.sub",
                       defaultValue: "Experimental GPU INT8 activation quantization for supported Q4/Q5/Q8 prefill operations on Qwen3.5/3.6/3.8, routed expert gate/up projections on Qwen3.8 Flash-Next, and the expert and attention projections of DeepSeek V4.1. Requires M5-series or newer and the native kernels. Outputs and model quality may change; some quantization formats receive no acceleration. Cannot be combined with ANE prefill. Applies after the model reloads.",
                       comment: "Sublabel describing the oQ INT8-activation prefill kernels")
+        guard vm.model?.a8PrefillSupported != true, !vm.prefillHelperNodeID.isEmpty else {
+            return text
+        }
+        return text + " " + String(localized: "settings.experimental.qwen_oq_a8.helper_only",
+                                   defaultValue: "This Mac has no INT8 tensor units, so only the layers on the Prefill Accelerator Mac use INT8 activations.",
+                                   comment: "Added to the INT8 prefill sublabel when only the Prefill Accelerator Mac can run it")
     }
 
     private var mtpToggleDisabled: Bool {

@@ -844,6 +844,13 @@ final class ModelSettingsScreenVMTests: XCTestCase {
         XCTAssertTrue(vm.showsA8Prefill)
         vm.model = try model(#","a8_prefill_supported":false,"settings":{"a8_prefill_enabled":true}"#)
         XCTAssertTrue(vm.showsA8Prefill)
+
+        // A Prefill Accelerator Mac shows the row where the kernels cannot run here.
+        vm.model = try model(#","a8_prefill_supported":false"#)
+        vm.prefillHelperNodeID = "m5"
+        XCTAssertTrue(vm.showsA8Prefill)
+        vm.prefillHelperNodeID = ""
+        XCTAssertFalse(vm.showsA8Prefill)
     }
 
     func testLoadDefaultsStagesGenerationFieldsOnly() {

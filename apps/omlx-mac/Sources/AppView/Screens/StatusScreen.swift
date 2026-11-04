@@ -25,6 +25,7 @@ struct StatusScreen: View {
             // expose port/host editors, so Restart just bounces the cached
             // endpoint.
             ServerHeroCard()
+            PrefillLendingBanner()
 
             SectionHeader(String(localized: "status.session_stats",
                                   defaultValue: "Serving Stats",
@@ -793,5 +794,64 @@ private struct UpdatesSection: View {
         return String(localized: "status.updates.last_checked_date",
                       defaultValue: "Last checked \(formatter.string(from: date))",
                       comment: "Last-checked text when the last check was before today; placeholder is the formatted date and time")
+    }
+}
+
+/// Shown while this Mac runs another Mac's Prefill Accelerator helper.
+private struct PrefillLendingBanner: View {
+    @Environment(AppServices.self) private var services
+    @Environment(\.omlxTheme) private var theme
+    @State private var lending: PrefillLendingDTO?
+    @State private var stopping = false
+
+    var body: some View {
+        Group {
+            if let lending, lending.active {
+                HStack(spacing: 12) {
+                    Image(systemName: "bolt.horizontal.circle")
+                        .foregroundStyle(theme.warningText)
+                    Text(text(lending))
+                        .font(.omlxText(12.5))
+                        .foregroundStyle(theme.warningText)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button(String(localized: "status.prefill_lending.stop",
+                                  defaultValue: "Stop",
+                                  comment: "Button that stops lending this Mac to another Mac's prefill")) {
+                        Task { await stop() }
+                    }
+                    .buttonStyle(.omlx(.normal, size: .small))
+                    .disabled(stopping)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(theme.warningBg))
+                .padding(.horizontal, 28)
+                .padding(.top, 12)
+            }
+        }
+        .task {
+            while !Task.isCancelled {
+                // The endpoint exists only while the cluster setting is on.
+                lending = try? await services.client.prefillLending()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    private func text(_ lending: PrefillLendingDTO) -> String {
+        let host = lending.host ?? "another Mac"
+        let layers = lending.layers ?? 0
+        let model = (lending.model ?? "").split(separator: "/").last.map(String.init) ?? ""
+        return String(localized: "status.prefill_lending.text",
+                      defaultValue: "This Mac is helping \(host) with prompt prefill: \(layers) layers of \(model). It stops when \(host) unloads the model.",
+                      comment: "Banner shown while this Mac runs another Mac's prefill helper")
+    }
+
+    private func stop() async {
+        stopping = true
+        defer { stopping = false }
+        _ = try? await services.client.stopPrefillLending()
+        lending = nil
     }
 }

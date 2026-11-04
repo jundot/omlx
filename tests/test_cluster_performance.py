@@ -117,7 +117,7 @@ def test_partial_measurements_fall_back_to_original_memory_objective():
     assert all(item.predicted_stage_seconds is None for item in plan.assignments)
 
 
-def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
+def test_execution_tuner_reduces_concurrency_and_caps_prompt_cache():
     settings = execution_profile("throughput")
     assignments = [
         SimpleNamespace(headroom_bytes=3 * 1024**3),
@@ -130,14 +130,14 @@ def test_execution_tuner_reduces_concurrency_and_synchronizes_prompt_cache():
     assert tuned.prompt_concurrency == 1
     assert tuned.prefill_step_size == 512
     assert tuned.pipeline_microbatch_size == 1
-    assert tuned.prompt_cache_size == 1
+    assert tuned.prompt_cache_size == 2
     assert tuned.prompt_cache_bytes is None
     assert tuned.ring_connections_per_ip == 1
     assert "critical headroom" in tuned.tuning_reason
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "prompt cache byte budget disabled" in tuned.tuning_reason
 
 
-def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
+def test_prompt_cache_bytes_stay_disabled_when_auto_tuning_is_disabled():
     settings = replace(
         execution_profile("throughput", auto_tune=False),
         prompt_cache_size=16,
@@ -154,9 +154,9 @@ def test_prompt_cache_is_synchronized_even_when_auto_tuning_is_disabled():
     )
 
     assert tuned.decode_concurrency == settings.decode_concurrency
-    assert tuned.prompt_cache_size == 1
+    assert tuned.prompt_cache_size == 16
     assert tuned.prompt_cache_bytes is None
-    assert "synchronized single-prefix cache" in tuned.tuning_reason
+    assert "prompt cache byte budget disabled" in tuned.tuning_reason
 
 
 def test_performance_profiles_reject_nonfinite_measurements():
