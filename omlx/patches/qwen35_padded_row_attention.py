@@ -19,13 +19,23 @@ original seam with no cache and a causal mask, which is the batch-1 route
 (stock SDPA for decode, ``qwen35_verify_sdpa_split`` for verify). The output
 of every row therefore equals that request decoding alone, bit for bit.
 
-Everything else keeps its current path: batches the ragged kernel or the
-bounded verify kernel serve, quantized caches, explicit masks other than the
-left-padded causal mask, and any shape this patch does not recognize.
+The multi-token case is recognized by shape, not by caller: any block of
+2..MAX_LIGHTNING_MTP_DRAFT_TOKENS + 1 query tokens over more than 8,192 keys
+whose mask is exactly left padding plus causal. A short prefill block of that
+shape gets the same treatment, which is equally exact for it: the per-row
+route attends to the same keys the mask allows.
 
-Row offsets are read once per forward, in the attention-mask hook, the way
-mlx-vlm already reads them for left-padded decode, and are copied to every
-full-attention cache so the layers do not synchronize with the GPU.
+Everything else keeps its current path: batches the ragged kernel or the
+bounded verify kernel serve, quantized caches, wider blocks (prefill
+chunks), masks other than left padding plus causal, and any shape this patch
+does not recognize.
+
+Row offsets and the mask check are read once per forward, in the
+attention-mask hook, in one host read (the way mlx-vlm already reads offsets
+for left-padded decode), and copied to every full-attention cache so the
+layers do not synchronize with the GPU. The check costs about 0.4 ms per
+forward at 100K keys and 0.75 ms at 262K (M5 Max), against about 4 ms per
+layer saved at 100K.
 """
 
 from __future__ import annotations
@@ -49,8 +59,8 @@ try:
     from ..model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS as _MAX_DRAFTS
 except ImportError:  # pragma: no cover - keeps the patch importable alone
     _MAX_DRAFTS = 8
-# Widest MTP verify block (target token + drafts). Wider multi-token forwards
-# (prefill chunks) are not verify and keep their current path.
+# Widest MTP verify block (target token + drafts). Wider multi-token blocks
+# (prefill chunks) keep their current path.
 _MAX_VERIFY_WIDTH = _MAX_DRAFTS + 1
 # Matches the bounded padded-verify kernel in qwen35_verify_attention: at or
 # below this many keys that kernel already serves the batch.
