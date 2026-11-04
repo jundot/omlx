@@ -9,6 +9,13 @@ import XCTest
 
 final class SystemMetricsTests: XCTestCase {
 
+    /// Resolve the expectation the way the app does, through the main
+    /// bundle. Pinning English here fails on any non-English host, and the
+    /// point of the assertion is the key mapping, not the language.
+    private static func localized(_ key: String, _ fallback: String) -> String {
+        NSLocalizedString(key, bundle: .main, value: fallback, comment: "")
+    }
+
     // MARK: - Thermal severity mapping
 
     func testThermalSeverityNominal() {
@@ -40,10 +47,10 @@ final class SystemMetricsTests: XCTestCase {
     }
 
     func testThermalLabelsMatchSeverity() {
-        XCTAssertEqual(SystemMetricsPoller.label(for: .nominal),  "Nominal")
-        XCTAssertEqual(SystemMetricsPoller.label(for: .fair),     "Fair")
-        XCTAssertEqual(SystemMetricsPoller.label(for: .serious),  "Serious")
-        XCTAssertEqual(SystemMetricsPoller.label(for: .critical), "Critical")
+        XCTAssertEqual(SystemMetricsPoller.label(for: .nominal),  Self.localized("metrics.thermal.nominal", "Nominal"))
+        XCTAssertEqual(SystemMetricsPoller.label(for: .fair),     Self.localized("metrics.thermal.fair", "Fair"))
+        XCTAssertEqual(SystemMetricsPoller.label(for: .serious),  Self.localized("metrics.thermal.serious", "Serious"))
+        XCTAssertEqual(SystemMetricsPoller.label(for: .critical), Self.localized("metrics.thermal.critical", "Critical"))
     }
 
     // MARK: - GPU utilization clamp

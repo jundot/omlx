@@ -7,7 +7,9 @@ import threading
 import time
 from types import SimpleNamespace
 
+import mlx_lm.server as mlx_server
 import pytest
+from mlx_lm.models.cache import LRUPromptCache
 
 from omlx.cluster.performance import execution_profile
 from omlx.cluster.planner import PipelineAssignment
@@ -17,6 +19,7 @@ from omlx.cluster.telemetry import (
     _TelemetryQueue,
     install_server_telemetry,
 )
+from omlx.exceptions import PrefillMemoryExceededError
 
 
 class _Clock:
@@ -33,6 +36,11 @@ class _Marker:
 
     def update(self, phase, **extra):
         self.updates.append((phase, extra))
+
+
+def _recurrent_cache():
+    """A non-trimmable layer cache, like GatedDeltaNet or DeepSeek V4.1 state."""
+    return [SimpleNamespace(nbytes=1, is_trimmable=lambda: False)]
 
 
 class _Queue:
@@ -407,6 +415,61 @@ def test_server_patch_binds_batch_uid_and_restores_mlx_lm_classes(monkeypatch):
 
     assert mlx_server.ResponseGenerator is FakeResponseGenerator
     assert mlx_server.BatchGenerator is FakeBatchGenerator
+
+
+def test_tool_turn_checkpoint_survives_a_single_slot_prompt_cache(monkeypatch):
+    first, second = [1, 2, 3], [1, 2, 3, 4, 5, 6]
+
+    class FakeResponseGenerator:
+        def _tokenize(self, _tokenizer, _request, _args):
+            # Pinned MLX-LM types every non-user turn's prompt "assistant".
+            return second, [second], ["assistant"], "normal", None
+
+    tool = SimpleNamespace(messages=[{"role": "tool"}])
+    prefill = SimpleNamespace(messages=[{"role": "assistant"}])
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    with install_server_telemetry(_Marker()):
+        tokenize = mlx_server.ResponseGenerator()._tokenize
+        types = tokenize(None, tool, None)[2]
+        assert tokenize(None, prefill, None)[2] == ["assistant"]
+
+    # The batched server's checkpoints for a first user turn and a tool turn.
+    cache = LRUPromptCache(1)
+    cache.insert_cache("m", first[:-1], _recurrent_cache(), cache_type="user")
+    cache.insert_cache("m", second[:-1], _recurrent_cache(), cache_type=types[0])
+    cache.insert_cache("m", second + [7], _recurrent_cache(), cache_type="assistant")
+    _, rest = cache.fetch_nearest_cache("m", second + [8, 9])
+    assert rest == [6, 8, 9]
+
+
+def test_rejected_prefill_drops_retained_prompts_and_checks_again(monkeypatch):
+    class FakeResponseGenerator:
+        def __init__(self):
+            self.model_provider = SimpleNamespace(model_key="model")
+            self.prompt_cache = mlx_server.LRUPromptCache(4)
+
+        def _tokenize(self, _tokenizer, _request, _args):
+            return [1, 2, 3], [[1, 2, 3]], ["user"], "normal", None
+
+    rejections = []
+
+    def check_collective(*_args, **_kwargs):
+        if rejections.pop(0):
+            raise PrefillMemoryExceededError(message="rank 1 is full")
+
+    monkeypatch.setattr(mlx_server, "ResponseGenerator", FakeResponseGenerator)
+    guard = SimpleNamespace(check_collective=check_collective)
+    with install_server_telemetry(_Marker(), prefill_guard=guard):
+        generator = mlx_server.ResponseGenerator()
+        generator.prompt_cache.insert_cache("model", [9, 9], _recurrent_cache())
+
+        rejections[:] = [True, False]
+        assert generator._tokenize(None, None, None)[0] == [1, 2, 3]
+        assert len(generator.prompt_cache) == 0
+
+        rejections[:] = [True, True]
+        with pytest.raises(PrefillMemoryExceededError):
+            generator._tokenize(None, None, None)
 
 
 def test_sequential_distributed_cancellation_exits_all_ranks_without_upstream_error(

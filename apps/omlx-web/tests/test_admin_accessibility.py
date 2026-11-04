@@ -47,7 +47,11 @@ def _contrast_ratio(first: str, second: str) -> float:
 
 
 def test_focus_ring_uses_theme_aware_two_pixel_outline():
-    focus_rule = re.search(r":focus-visible\s*\{([^}]*)\}", BASE, re.DOTALL)
+    focus_rule = re.search(
+        r"\[data-enhanced-readability\] :focus-visible[^{]*\{([^}]*)\}",
+        BASE,
+        re.DOTALL,
+    )
     assert focus_rule is not None
     assert "outline: 2px solid var(--focus-ring-color) !important" in focus_rule.group(
         1

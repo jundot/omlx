@@ -49,13 +49,20 @@ from ..api.utils import (
 from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
-from ..model_settings import ane_prefill_backend, ane_prefill_fraction
+from ..model_settings import (
+    a8_prefill_on,
+    ane_prefill_backend,
+    ane_prefill_fraction,
+    ced_prefill_on,
+)
 from ..models.vlm import VLMModelAdapter
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
+from ..prefill_helper.adapters import adapter_for as stage_adapter_for
+from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
 from ..speculative.dflash import attach_drafter, detach_drafter
 from ..utils.image import (
@@ -1725,6 +1732,7 @@ class VLMBatchedEngine(BaseEngine):
 
         self._vlm_model = None
         self._processor = None
+        self._prefill_helper: PrefillHelperManager | None = None
         # Set after load for checkpoints that take native video input.
         self._native_video = False
         self._tokenizer = None
@@ -2066,16 +2074,8 @@ class VLMBatchedEngine(BaseEngine):
                                 False,
                             )
                         ),
-                        ced_prefill=bool(
-                            getattr(
-                                self._model_settings,
-                                "deepseek_v41_ced_prefill_enabled",
-                                False,
-                            )
-                        ),
-                        a8_prefill=bool(
-                            getattr(self._model_settings, "a8_prefill_enabled", False)
-                        ),
+                        ced_prefill=ced_prefill_on(self._model_settings),
+                        a8_prefill=a8_prefill_on(self._model_settings),
                         a8_prefill_min_tokens=int(
                             getattr(self._model_settings, "a8_prefill_min_tokens", 128)
                         ),
@@ -2452,9 +2452,10 @@ class VLMBatchedEngine(BaseEngine):
         # Extract tokenizer from processor with deep-copy for thread safety.
         # The processor keeps the original tokenizer for executor-thread work
         # (_prepare_vision_inputs / prepare_inputs), while this deep copy is
-        # used exclusively on the event loop (apply_chat_template, encode).
-        # Without separate Rust tokenizer backends, concurrent access causes
-        # "RuntimeError: Already borrowed".
+        # used on the event loop and in the worker threads that prepare chat
+        # prompts (apply_chat_template, encode), which leave padding alone.
+        # Sharing a Rust tokenizer backend with the executor's padded calls
+        # causes "RuntimeError: Already borrowed".
         # See: https://github.com/huggingface/tokenizers/issues/537
         if hasattr(self._processor, "tokenizer"):
             self._tokenizer = copy.deepcopy(self._processor.tokenizer)
@@ -2503,8 +2504,20 @@ class VLMBatchedEngine(BaseEngine):
 
         await self._engine.engine.start()
 
-        # TurboQuant KV cache
         scheduler = self._engine.engine.scheduler
+        stage_adapter = stage_adapter_for(self.model_type)
+        if stage_adapter is not None:
+            self._prefill_helper = PrefillHelperManager(
+                model_path=self._model_name,
+                model_type=self.model_type,
+                adapter=stage_adapter,
+                language_model=stage_adapter.language_model(self._adapter),
+                attach=scheduler.attach_prefill_helper,
+                chunk_tokens=scheduler._base_prefill_step_size(0, 1 << 30),
+            )
+            self.configure_prefill_helper(self._model_settings)
+
+        # TurboQuant KV cache
         scheduler.moe_offload_stats = offload_stats
         scheduler.moe_offload_release = offload_release
         scheduler.moe_offload_restore = offload_restore
@@ -2681,10 +2694,7 @@ class VLMBatchedEngine(BaseEngine):
         # because it quantizes activations to INT8, which changes numerics;
         # the patch itself falls through for anything it cannot route.
         # DeepSeek V4.1 applies the setting in its own loader.
-        if (
-            getattr(self._model_settings, "a8_prefill_enabled", False)
-            and self.model_type != "deepseek_v41"
-        ):
+        if a8_prefill_on(self._model_settings) and self.model_type != "deepseek_v41":
             try:
                 from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
 
@@ -2902,10 +2912,33 @@ class VLMBatchedEngine(BaseEngine):
     def dflash_drafter(self) -> Any | None:
         return self._dflash_drafter
 
+    def configure_prefill_helper(self, settings: Any) -> None:
+        """Apply the model's Prefill Accelerator choice without a reload."""
+        if self._prefill_helper is not None:
+            self._prefill_helper.configure(
+                getattr(settings, "prefill_helper_node_id", None),
+                getattr(settings, "prefill_helper_layers", None),
+                (
+                    int(getattr(settings, "a8_prefill_min_tokens", 128))
+                    if a8_prefill_on(settings)
+                    else None
+                ),
+            )
+
+    @property
+    def prefill_helper(self) -> PrefillHelperManager | None:
+        return self._prefill_helper
+
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
         cancelled = False
         engine = self._engine
+        if self._prefill_helper is not None:
+            # Stops the helper on the other Mac and frees its memory.
+            await asyncio.get_running_loop().run_in_executor(
+                None, self._prefill_helper.close
+            )
+            self._prefill_helper = None
 
         for cancel_event in getattr(self, "_diffusion_cancel_events", ()):
             cancel_event.set()
@@ -5241,28 +5274,32 @@ class VLMBatchedEngine(BaseEngine):
                 "This text-only model does not support image input.",
                 field="messages",
             )
-        prompt = self._apply_chat_template(
-            text_messages,
-            template_tools,
-            chat_template_kwargs=ct_kwargs,
-            is_partial=partial,
-        )
-        # Tokenizer errors propagate as 500 today regardless of where they
-        # fire; the real chat path's add_request → tokenize call has no
-        # path-specific 400 handler. Don't introduce a NEW failure mode
-        # in preflight: skip the memory check on tokenizer error and let
-        # the real chat path surface the same error through the existing
-        # handler chain.
-        try:
-            num_tokens = len(self._tokenizer.encode(prompt))
-        except Exception as e:
-            logger.warning(
-                "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
-                "%s; skipping prefill memory check, real chat path will "
-                "surface the error",
-                type(e).__name__,
+        prepared = kwargs.get("_prepared_prompt")
+        if prepared is not None:
+            num_tokens = len(prepared[1])
+        else:
+            prompt = self._apply_chat_template(
+                text_messages,
+                template_tools,
+                chat_template_kwargs=ct_kwargs,
+                is_partial=partial,
             )
-            return
+            # Tokenizer errors propagate as 500 today regardless of where they
+            # fire; the real chat path's add_request → tokenize call has no
+            # path-specific 400 handler. Don't introduce a NEW failure mode
+            # in preflight: skip the memory check on tokenizer error and let
+            # the real chat path surface the same error through the existing
+            # handler chain.
+            try:
+                num_tokens = len(self._tokenizer.encode(prompt))
+            except Exception as e:
+                logger.warning(
+                    "VLMBatchedEngine.preflight_chat: tokenizer.encode raised "
+                    "%s; skipping prefill memory check, real chat path will "
+                    "surface the error",
+                    type(e).__name__,
+                )
+                return
         # Use the decoded dimensions, including resizing and EXIF orientation,
         # so the memory estimate matches the images passed to the processor.
         image_tokens = _count_image_tokens_real(
@@ -5543,6 +5580,9 @@ class VLMBatchedEngine(BaseEngine):
 
         ct_kwargs = kwargs.pop("chat_template_kwargs", None)
         partial = kwargs.pop("is_partial", None)
+        # The ids below come from mlx-vlm's own render; the prepared prompt only
+        # covers the checks made before generation.
+        kwargs.pop("_prepared_prompt", None)
 
         # Keep VLM-capable models on one prompt-rendering path, even before the
         # first image arrives. Otherwise the conversation switches prompt families
@@ -6029,6 +6069,25 @@ class VLMBatchedEngine(BaseEngine):
         For VLM messages with images, this counts only the text tokens.
         Image tokens are added during vision encoding and vary by model.
         """
+        _, token_ids = self.prepare_chat_prompt(
+            messages, tools, chat_template_kwargs, is_partial
+        )
+        return len(token_ids)
+
+    def prepare_chat_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict] | None = None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
+    ) -> tuple[str, list[int]]:
+        """Render and tokenize the text-only prompt for reuse within one request.
+
+        Unlike ``BatchedEngine``, the result never reaches generation:
+        ``_prepare_vision_inputs`` renders through mlx-vlm and encodes without
+        special tokens. It only serves the context check, the preflight and
+        thinking detection.
+        """
         # Extract text-only version for token counting through the same media
         # split as the real request, so video parts are not rejected here
         # before they reach the multimodal path.
@@ -6041,7 +6100,7 @@ class VLMBatchedEngine(BaseEngine):
             chat_template_kwargs=chat_template_kwargs,
             is_partial=is_partial,
         )
-        return len(self._tokenizer.encode(prompt))
+        return prompt, list(self._tokenizer.encode(prompt))
 
     async def tokenize_chat(
         self,

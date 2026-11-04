@@ -576,7 +576,12 @@ class TestLaunchCommandFunction:
         assert ctx.cross_session is True
 
     @pytest.mark.parametrize(
-        ("tool", "setting"), [("dsh", "dsh_model"), ("codex_app", "codex_model")]
+        ("tool", "setting"),
+        [
+            ("dsh", "dsh_model"),
+            ("codex_app", "codex_model"),
+            ("copilot", "copilot_model"),
+        ],
     )
     def test_launch_command_skips_picker_when_integration_registers_catalog(
         self, tool, setting

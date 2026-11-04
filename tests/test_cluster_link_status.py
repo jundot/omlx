@@ -26,7 +26,9 @@ from omlx.cluster.transport import (
     detect_transports,
     link_warnings,
     parse_interface_addresses,
+    parse_link_local_addresses,
     parse_linux_ip_addresses,
+    parse_media_speeds,
     parse_self_assigned_interfaces,
     parse_thunderbolt_interfaces,
     parse_wifi_interfaces,
@@ -678,6 +680,30 @@ def test_an_address_on_a_down_interface_is_not_offered():
 
     assert ("en4", "10.0.1.1") in addresses
     assert ("en6", "10.0.1.9") not in addresses
+
+
+def test_link_local_addresses_and_media_speeds_are_read_per_up_interface():
+    ifconfig = (
+        "bridge0: flags=8a63<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n"
+        "\tinet6 fe80::34dc:83ff:fef6:3f80%bridge0 prefixlen 64 scopeid 0x1a \n"
+        "\tinet 169.254.120.99 netmask 0xffff0000 broadcast 169.254.255.255\n"
+        "\tmedia: autoselect\n"
+        "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n"
+        "\tinet6 fd34::1 prefixlen 64 autoconf secured \n"
+        "\tinet6 fe80::4a6:44e2:6646:9035%en0 prefixlen 64 secured scopeid 0xb \n"
+        "\tmedia: autoselect (10Gbase-T <full-duplex>)\n"
+        "en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n"
+        "\tmedia: 100baseTX <full-duplex>\n"
+        "en7: flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500\n"
+        "\tinet6 fe80::9%en7 prefixlen 64 scopeid 0x9 \n"
+        "\tmedia: autoselect (2500Base-T <full-duplex>)\n"
+    )
+
+    assert parse_link_local_addresses(ifconfig) == {
+        "bridge0": "fe80::34dc:83ff:fef6:3f80",
+        "en0": "fe80::4a6:44e2:6646:9035",
+    }
+    assert parse_media_speeds(ifconfig) == {"en0": 10000, "en5": 100}
 
 
 def test_loopback_and_self_assigned_addresses_are_never_a_shared_subnet():

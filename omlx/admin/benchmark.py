@@ -20,7 +20,10 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
 
+from ..custom_kernels.quant_matmul import fast as quant_fast
 from ..model_discovery import model_display_name
+from ..model_settings import a8_prefill_on, ced_prefill_on, oq_a8_model_supported
+from ..prefill_helper.manager import PrefillHelperManager
 from ..utils.proc_memory import get_lifetime_max_phys_footprint
 from ..utils.system_sampler import SystemSampler
 from .external_api import ExternalAPIClient, ExternalEndpointConfig
@@ -363,6 +366,12 @@ _UPLOADED_SETTING_FIELDS = (
     "turboquant_skip_last",
     "a8_prefill_enabled",
     "a8_prefill_min_tokens",
+    "activation_fp16_enabled",
+    "gpu_power_limit_w",
+    "deepseek_v41_ced_prefill_enabled",
+    "deepseek_v41_engram_ssd_offload",
+    "qwen4_ple_ssd_offload",
+    "qwen4_gdn_decode_wide_proj",
     "moe_expert_offload_enabled",
     "moe_expert_offload_resident_fraction",
     "specprefill_enabled",
@@ -415,8 +424,19 @@ _PATH_VALUED_SETTING_FIELDS = frozenset(
 _MAX_UPLOADED_SETTINGS_BYTES = 6144
 
 
-def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
-    """Project model settings onto the uploadable allowlist."""
+# Settings that only one model family reads.
+_FAMILY_SETTING_PREFIXES = {"deepseek_v41_": "deepseek_v41", "qwen4_": "qwen4_exp"}
+_PREFILL_HELPER_WAIT_S = 600.0
+
+
+def _filter_uploaded_settings(
+    model_settings: Any, model_type: str | None = None
+) -> dict | None:
+    """Project model settings onto the uploadable allowlist.
+
+    With ``model_type``, settings of other model families are dropped and
+    toggles left unset report the value the model runs with.
+    """
     to_dict = getattr(model_settings, "to_dict", None)
     if not callable(to_dict):
         return None
@@ -434,6 +454,20 @@ def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
         if key in _PATH_VALUED_SETTING_FIELDS and isinstance(value, str):
             value = os.path.basename(value.rstrip("/")) or value
         filtered[key] = value
+    if model_type is not None:
+        for key in list(filtered):
+            for prefix, family in _FAMILY_SETTING_PREFIXES.items():
+                if key.startswith(prefix) and model_type != family:
+                    del filtered[key]
+        if oq_a8_model_supported(model_type):
+            filtered["a8_prefill_enabled"] = a8_prefill_on(model_settings)
+        else:
+            filtered.pop("a8_prefill_enabled", None)
+            filtered.pop("a8_prefill_min_tokens", None)
+        if model_type == "deepseek_v41":
+            filtered["deepseek_v41_ced_prefill_enabled"] = ced_prefill_on(
+                model_settings
+            )
 
     if len(json.dumps(filtered, separators=(",", ":"))) > _MAX_UPLOADED_SETTINGS_BYTES:
         logger.warning(
@@ -449,6 +483,90 @@ def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
             if key in raw:
                 filtered[key] = raw[key]
     return filtered
+
+
+def _setting_feature_flags(
+    model_settings: Any, model_type: str | None, *, helper_a8: bool = False
+) -> list[dict]:
+    """Speed features that are on by default or belong to one model family.
+
+    A8 counts only where it runs: on this Mac's kernels or the helper's layers.
+    """
+    flags = []
+    if (
+        oq_a8_model_supported(model_type)
+        and a8_prefill_on(model_settings)
+        and (quant_fast.oq_a8_available() or helper_a8)
+    ):
+        flags.append({"key": "a8_prefill", "label": "INT8 Activation Prefill"})
+    if model_type == "deepseek_v41" and ced_prefill_on(model_settings):
+        flags.append({"key": "ced_prefill", "label": "CED Prefill"})
+    if model_type == "qwen4_exp" and getattr(
+        model_settings, "qwen4_gdn_decode_wide_proj", False
+    ):
+        flags.append(
+            {"key": "qwen4_wide_decode", "label": "Qwen4 Extended Fused Decode"}
+        )
+    if getattr(model_settings, "activation_fp16_enabled", False):
+        flags.append({"key": "activation_fp16", "label": "Float16 Activations"})
+    return flags
+
+
+def _prefill_helper_details(engine: Any) -> dict | None:
+    """The Prefill Accelerator a loaded model uses right now, if any.
+
+    Hardware only; the helper Mac's name and node id stay local.
+    """
+    manager = getattr(engine, "prefill_helper", None)
+    if not isinstance(manager, PrefillHelperManager):
+        return None
+    status = manager.status()
+    if status.get("state") not in ("ready", "working"):
+        return None
+    memory = status.get("memory")
+    return {
+        "helper": status.get("device"),
+        "helper_memory_gb": round(memory / 2**30) if memory else None,
+        "layers": status.get("held"),
+        "split": "auto" if manager.fixed_layers is None else "fixed",
+        "link": status.get("link"),
+        "a8": manager.a8_min_tokens is not None,
+    }
+
+
+async def _wait_for_prefill_helper(run: Any, engine: Any) -> dict | None:
+    """Wait for the chosen helper so every test runs with it, or give up."""
+    manager = getattr(engine, "prefill_helper", None)
+    if not isinstance(manager, PrefillHelperManager):
+        return None
+    deadline = time.monotonic() + _PREFILL_HELPER_WAIT_S
+    announced = False
+    while time.monotonic() < deadline:
+        status = manager.status()
+        details = _prefill_helper_details(engine)
+        if details is not None:
+            return details
+        if status.get("state") in ("error", "stopped", "needs_files"):
+            break
+        if not announced and status.get("name"):
+            announced = True
+            await _send_event(
+                run,
+                {
+                    "type": "progress",
+                    "phase": "load",
+                    "message": "Waiting for the Prefill Accelerator on "
+                    f"{status['name']}...",
+                    "current": 0,
+                    "total": 0,
+                },
+            )
+        await asyncio.sleep(1.0)
+    logger.info(
+        "Benchmark: Prefill Accelerator not ready (%s); running without it",
+        manager.status().get("state"),
+    )
+    return None
 
 
 def _with_benchmark_context(
@@ -1832,6 +1950,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         # and the produced numbers are tied to whatever was active when
         # generation actually ran.
         model_settings = None
+        entry = engine_pool.get_entry(request.model_id)
+        model_type = (
+            str(getattr(entry, "config_model_type", "") or "").replace("-", "_").lower()
+        )
         sm = getattr(engine_pool, "_settings_manager", None)
         if sm is not None:
             try:
@@ -1842,7 +1964,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 run.feature_flags = _derive_feature_flags(model_settings)
                 run.model_settings_snapshot = _with_benchmark_context(
                     request.context_profile,
-                    _filter_uploaded_settings(model_settings),
+                    _filter_uploaded_settings(model_settings, model_type),
                 )
             except Exception as e:
                 logger.warning(
@@ -1900,6 +2022,24 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             force_lm=force_lm,
         )
         logger.info(f"Benchmark: loaded {request.model_id}")
+        if model_settings is not None:
+            helper = None
+            if isinstance(getattr(model_settings, "prefill_helper_node_id", None), str):
+                helper = await _wait_for_prefill_helper(run, engine)
+            if helper is not None:
+                run.feature_flags.append(
+                    {"key": "prefill_accelerator", "label": "Prefill Accelerator"}
+                )
+                run.model_settings_snapshot["prefill_accelerator"] = {
+                    key: value for key, value in helper.items() if key != "a8"
+                }
+            run.feature_flags.extend(
+                _setting_feature_flags(
+                    model_settings,
+                    model_type,
+                    helper_a8=bool(helper and helper["a8"]),
+                )
+            )
 
         chat = _ChatBenchmark.for_engine(engine, request.context_profile)
 

@@ -167,9 +167,7 @@ enum AskAITool {
 }
 
 struct AskAIToolRunner: AskAIToolRunning {
-    let host: String
-    let port: Int
-    let apiKey: String?
+    let endpoint: AskAIEndpoint
     var screenshotPixels = AskAIImage.maxPixelSize
 
     // A search with full page content fetches several pages in turn.
@@ -195,13 +193,13 @@ struct AskAIToolRunner: AskAIToolRunning {
     }
 
     private func web(_ path: String, body: [String: String]) async -> AskAIToolResult {
-        guard let url = AppConfig.httpURL(host: host, port: port, path: path) else {
+        guard let url = endpoint.httpURL(path: path) else {
             return AskAITool.failure("request_failed", "The oMLX server address is invalid.")
         }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let apiKey, !apiKey.isEmpty {
+        if let apiKey = endpoint.apiKey, !apiKey.isEmpty {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
