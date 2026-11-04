@@ -114,14 +114,6 @@
             box-shadow: 0 0 0 2px rgb(var(--palette-black) / 0.1);
         }
 
-        /* Clear keyboard focus indicator (complements the enhanced-readability
-           contrast boost). Visible on :focus-visible only, so mouse users see
-           no extra chrome while keyboard users always see where focus is. */
-        :focus-visible {
-            outline: 2px solid var(--focus-ring-color) !important;
-            outline-offset: 2px;
-        }
-
         dialog.dashboard-dialog {
             margin: 0;
             padding: 0;
@@ -199,6 +191,13 @@
             color: var(--text-primary) !important;
         }
         [data-enhanced-readability] ::placeholder { color: var(--text-primary) !important; opacity: 1 !important; }
+        /* Keyboard focus ring. Text fields and selects are excluded: browsers
+           match :focus-visible on them for mouse focus too, and they already
+           show focus with their own border or shadow. */
+        [data-enhanced-readability] :focus-visible:not(textarea, select, input:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="submit"])) {
+            outline: 2px solid var(--focus-ring-color) !important;
+            outline-offset: 2px;
+        }
         /* Font-size floor: lift all <12px text to 12px. KaTeX is intentionally
            excluded (its font-size stays untouched, preserving 1.21em scaling).
            Tailwind arbitrary-value classes MUST use the escaped form

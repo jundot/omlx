@@ -659,6 +659,60 @@ def test_qwen4_measured_excess_is_flat_not_scaled_to_the_next_chunk():
     assert predicted < 20 * _GB / measured_tokens * candidate
 
 
+def test_flat_overhead_throttle_keeps_the_chunk_its_prediction_fits():
+    """Weights above the soft watermark put every chunk in a tier. Flat-overhead
+    profiles size from their static profile and measured overhead, so a
+    throttled chunk keeps the largest size that fits instead of a tier."""
+    hard = 114 * _GB
+    ns = _throttle_ctx(current=0, hard=hard, monitor=_qwen4_monitor())
+    target = Scheduler._prefill_peak_target(ns)
+    ns._fake_current = int(
+        target - ns._predicted_chunk_transient(4096, 0, gathered_core=True)
+    )
+    assert ns._fake_current > ns._memory_limit_bytes * ns._prefill_safe_zone_ratio
+    fits = Scheduler._largest_fitting_prefill_chunk(
+        ns, 8192, 32, target - ns._fake_current, 0, gathered_core=True
+    )
+    assert 4096 <= fits < 8192
+    assert _call(ns, 8192, gathered_core=True) == fits
+
+    # A model sized by its EWMA keeps the tier at the same usage.
+    per_token = (target - ns._fake_current) / 4096 / Scheduler._PREFILL_TRANSIENT_SAFETY
+    generic = _throttle_ctx(current=0, hard=hard, samples_bpt=per_token)
+    generic._fake_current = ns._fake_current
+    assert _call(generic, 8192) <= Scheduler._PREFILL_STEP_TIERS[0]
+
+
+def test_qwen4_released_overhead_does_not_shrink_chunks_to_the_floor():
+    """Replay sequential 34K-token prompts on a 128 GB M5 Max. Every pool clear
+    re-armed the overhead an 8192-token chunk had shown, so each later chunk
+    was charged it and the prefill ran at 32 tokens, and admission priced the
+    32-token floor chunk at 2.9 GB. A chunk is charged what was measured up to
+    its width."""
+    ns = _throttle_ctx(current=0, hard=117.5 * _GB, monitor=_qwen4_monitor())
+    for n_tokens, kv_len, delta_mb in (
+        (8192, 0, 5130),
+        (2048, 8192, 1580),
+        (32, 10240, 148),
+    ):
+        Scheduler._record_chunk_transient(
+            ns,
+            n_tokens,
+            0,
+            delta_mb * 1024**2,
+            request_id="earlier",
+            loop_label="incident-replay",
+            kv_len=kv_len,
+            requested_step=8192,
+            gathered_core=True,
+        )
+    ns._prefill_transient_tracker.record_flat_reclaim(8 * _GB)
+    ns._fake_current = int(102.65 * _GB)
+
+    assert _call(ns, 7552, kv_len=17024, gathered_core=True) >= 2048
+    assert ns._admission_transient_bound(32, 34_000, gathered_core=True) < _GB / 2
+
+
 @pytest.mark.parametrize(
     ("markers", "predicted", "expected"),
     [([], True, True), ([True, True], False, True), ([True, False], True, False)],

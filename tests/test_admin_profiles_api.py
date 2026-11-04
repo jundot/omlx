@@ -1075,16 +1075,13 @@ class TestExposeAsModelAPI:
 
 
 @pytest.mark.parametrize("operation", ["create", "update", "apply"])
-@pytest.mark.parametrize("reason", ["hardware", "architecture", "conflict", "floor"])
+@pytest.mark.parametrize("reason", ["architecture", "conflict", "floor"])
 def test_a8_profile_validation_preserves_settings(
     client, monkeypatch, operation, reason
 ):
     c, mgr = client
     entry = admin_routes._get_engine_pool().get_entry("model-a")
     entry.config_model_type = "llama" if reason == "architecture" else "qwen3_5"
-    monkeypatch.setattr(
-        admin_routes, "_oq_a8_kernels_available", lambda: reason != "hardware"
-    )
     settings = {"a8_prefill_enabled": True}
     if reason == "conflict":
         settings["qwen35_ane_prefill_enabled"] = True

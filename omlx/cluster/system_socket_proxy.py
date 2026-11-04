@@ -105,12 +105,16 @@ def should_proxy_control_socket(host: str) -> bool:
     """Whether a non-loopback control socket should use the macOS carrier."""
 
     try:
-        loopback = ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
     except ValueError:
-        loopback = host.strip().lower() in {"localhost", "localhost.local"}
-    use_proxy = (
-        sys.platform == "darwin" and not loopback and _system_python() is not None
-    )
+        local = host.strip().lower() in {"localhost", "localhost.local"}
+    else:
+        # A link-local address without its interface has no route from any
+        # process; the carrier would only wait out its timeout.
+        local = address.is_loopback or (
+            address.version == 6 and address.is_link_local and not address.scope_id
+        )
+    use_proxy = sys.platform == "darwin" and not local and _system_python() is not None
     logger.debug("control transport: system proxy fallback available=%s", use_proxy)
     return use_proxy
 

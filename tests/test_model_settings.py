@@ -12,6 +12,8 @@ from omlx.model_settings import (
     SETTINGS_VERSION,
     ModelSettings,
     ModelSettingsManager,
+    a8_prefill_on,
+    ced_prefill_on,
     resolve_qwen35_prefill_conflicts,
     resolve_vlm_mtp_conflicts,
 )
@@ -891,11 +893,47 @@ class TestVlmMtpProcessorExclusivity:
 # --------------------------------------------------------------------------
 
 
-def test_oq_a8_defaults_to_off():
-    """It changes inference numerics, so it must be opt-in."""
+def test_a8_and_ced_are_on_until_saved_off():
+    """Unset means on; only a saved False turns them off. Unset A8 yields to
+    ANE prefill, which takes the same projections."""
     settings = ModelSettings()
-    assert settings.a8_prefill_enabled is False
+    assert settings.a8_prefill_enabled is None and a8_prefill_on(settings)
+    assert settings.deepseek_v41_ced_prefill_enabled is None
+    assert ced_prefill_on(settings) and ced_prefill_on(None)
     assert settings.a8_prefill_min_tokens == 128
+    assert not a8_prefill_on(ModelSettings(qwen35_ane_prefill_enabled=True))
+    assert not a8_prefill_on({"a8_prefill_enabled": False})
+    assert not ced_prefill_on({"deepseek_v41_ced_prefill_enabled": False})
+    # Unset values are not written, so they stay distinguishable.
+    assert "a8_prefill_enabled" not in settings.to_dict()
+
+
+@pytest.mark.parametrize("kernels", [False, True])
+def test_old_files_unset_a8_only_where_it_could_not_be_turned_on(
+    tmp_path, monkeypatch, kernels
+):
+    """Before version 2 every save stored A8 False. Without the kernels the
+    toggle was hidden and saving it on was refused, so that False is a
+    default; with them it may be a choice. CED False is kept either way."""
+    monkeypatch.setattr(
+        "omlx.model_settings.quant_fast.oq_a8_available", lambda: kernels
+    )
+    (tmp_path / "model_settings.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "models": {
+                    "m": {
+                        "qwen35_oq_a8_enabled": False,
+                        "deepseek_v41_ced_prefill_enabled": False,
+                    }
+                },
+            }
+        )
+    )
+    settings = ModelSettingsManager(tmp_path).get_settings("m")
+    assert settings.a8_prefill_enabled is (False if kernels else None)
+    assert settings.deepseek_v41_ced_prefill_enabled is False
 
 
 def test_oq_a8_and_ane_prefill_cannot_both_be_enabled():
@@ -924,12 +962,12 @@ def test_prefill_conflict_resolution_keeps_ane_and_reports_it():
             "max_tokens": 4096,
         }
     )
-    assert resolved["a8_prefill_enabled"] is False
+    assert "a8_prefill_enabled" not in resolved
     assert resolved["qwen35_ane_prefill_enabled"] is True
     assert resolved["max_tokens"] == 4096
     assert conflicts == ["qwen35_ane_prefill_enabled"]
     # The resolved dict has to be constructible -- that is the whole point.
-    assert ModelSettings.from_dict(resolved).a8_prefill_enabled is False
+    assert not a8_prefill_on(ModelSettings.from_dict(resolved))
 
 
 def test_prefill_conflict_resolution_leaves_clean_dicts_alone():
@@ -966,7 +1004,7 @@ def test_a_saved_profile_with_both_accelerators_still_loads(tmp_path):
     manager = ModelSettingsManager(tmp_path)
     settings = manager.get_settings("clash/model")
     assert settings.qwen35_ane_prefill_enabled is True
-    assert settings.a8_prefill_enabled is False
+    assert not a8_prefill_on(settings)
     # The rest of the blob survives the downgrade.
     assert settings.a8_prefill_min_tokens == 512
 

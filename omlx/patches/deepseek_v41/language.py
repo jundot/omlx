@@ -7,6 +7,7 @@ Batch rows are evaluated independently so late admission cannot share history.
 """
 
 import math
+import threading
 from contextlib import contextmanager, nullcontext
 from functools import cache, lru_cache
 
@@ -827,14 +828,28 @@ def _prefill_cache_limit():
     return min(_PREFILL_CACHE_CAP, get_max_working_set_bytes() // _PREFILL_CACHE_SHARE)
 
 
+# The cache limit is process-global and each engine runs on its own thread, so
+# scopes can exit out of order. Only the last scope to exit restores the limit.
+_prefill_cache_scope_lock = threading.Lock()
+_prefill_cache_scope_depth = 0
+_prefill_cache_scope_saved = None
+
+
 @contextmanager
 def _prefill_cache_scope():
     """Bound the allocator pool for one wide-prefill layer loop."""
-    previous = mx.set_cache_limit(_prefill_cache_limit())
+    global _prefill_cache_scope_depth, _prefill_cache_scope_saved
+    with _prefill_cache_scope_lock:
+        if _prefill_cache_scope_depth == 0:
+            _prefill_cache_scope_saved = mx.set_cache_limit(_prefill_cache_limit())
+        _prefill_cache_scope_depth += 1
     try:
         yield
     finally:
-        mx.set_cache_limit(previous)
+        with _prefill_cache_scope_lock:
+            _prefill_cache_scope_depth -= 1
+            if _prefill_cache_scope_depth == 0:
+                mx.set_cache_limit(_prefill_cache_scope_saved)
 
 
 @mx.compile
@@ -1421,9 +1436,13 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
             pre = mx.broadcast_to(
                 (mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1]
             )
-            if self.pipeline_rank < self.pipeline_size - 1:
+            # A prefill helper ran the layers before this stage on another Mac.
+            stage_input = kwargs.get("_stage_input")
+            if stage_input is not None:
+                h, pre = stage_input["h"], stage_input["pre"]
+            elif self.pipeline_rank < self.pipeline_size - 1:
                 h, pre = _receive_stage(h, pre, self.pipeline_rank + 1)
-            shared = {}
+            shared = {} if stage_input is None else dict(stage_input["shared"])
             # An MTP verify block runs through the fused decode kernels token-exactly
             # (decode_fused.decode_block_verify: each token gets its single-token decode
             # result, so speculation cannot change greedy output) when every layer has them.
@@ -1531,6 +1550,9 @@ class LanguageModel(DSparkMixin, PipelineMixin, nn.Module):
                                 mx.zeros((1, 0), mx.int64) if slot == 6 else empty
                             )
                     rows[j].append(rc[j])
+            stage_capture = kwargs.get("_stage_capture")
+            if stage_capture is not None:
+                stage_capture.update(h=h, pre=pre, shared=shared)
             if skip_decoder:
                 # Cache-only: a skipped chunk has no decoder output to project.
                 width = c.dim if skip_logits else c.vocab_size

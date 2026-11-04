@@ -195,6 +195,30 @@ final class OMLXClient: ObservableObject {
         try await postEmpty(AdminAPI.importMtplx(id))
     }
 
+    // MARK: - Prefill Accelerator
+
+    func prefillHelperCandidates(id: String) async throws -> PrefillHelperCandidatesDTO {
+        try await get(AdminAPI.prefillHelperCandidates, query: [URLQueryItem(name: "model_id", value: id)])
+    }
+
+    func prefillHelperStatus(id: String) async throws -> PrefillHelperStatusDTO {
+        try await get(AdminAPI.prefillHelperStatus(id))
+    }
+
+    /// `action` is copy, retry or stop.
+    func prefillHelperAction(id: String, action: String) async throws -> PrefillHelperStatusDTO {
+        try await postEmpty(AdminAPI.prefillHelperAction(id, action))
+    }
+
+    func prefillLending() async throws -> PrefillLendingDTO {
+        try await get(AdminAPI.prefillLending)
+    }
+
+    @discardableResult
+    func stopPrefillLending() async throws -> PrefillLendingDTO {
+        try await postEmpty(AdminAPI.prefillLendingStop)
+    }
+
     func listModelProfiles(id: String) async throws -> ProfileListResponse {
         try await get(AdminAPI.modelProfiles(id))
     }

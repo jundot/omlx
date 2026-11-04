@@ -97,7 +97,7 @@ The same endpoints accept an `X-oMLX-Cache-Store: off` request header. The reque
 | `/admin/api/bench/accuracy/...` | Accuracy benchmark queue |
 | `/admin/api/bench/ane-tune/...` | ANE prefill tuning |
 
-Cluster endpoints are described in [distributed-cluster.md](experimental/distributed-cluster.md).
+Cluster endpoints are described in [distributed-cluster.md](experimental/distributed-cluster.md), and the Prefill Accelerator endpoints in [prefill-accelerator.md](experimental/prefill-accelerator.md).
 
 ## Long-running tasks
 

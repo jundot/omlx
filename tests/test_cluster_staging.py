@@ -252,6 +252,21 @@ def test_copies_take_a_verified_fabric_address_with_the_paired_host_key(
     # Commands around the copy keep the paired name.
     assert all(c[-2] == "me@studio.local" for c in commands if c[0] == "ssh")
 
+    # A scoped link-local address is bracketed and resolved as IPv6.
+    commands.clear()
+    scp_push(
+        destination_host="me@studio.local",
+        source_dir=str(source),
+        destination_dir="/models/example",
+        filename="weights.safetensors",
+        transfer_address="fe80::2%bridge0",
+    )
+    scp_command = next(command for command in commands if command[0] == "scp")
+    assert scp_command[-1].startswith("me@[fe80::2%bridge0]:")
+    assert scp_command.index("AddressFamily=inet6") < scp_command.index(
+        "AddressFamily=inet"
+    )
+
 
 def test_remote_install_refuses_a_wrong_sized_partial_without_replacing_final(
     tmp_path,

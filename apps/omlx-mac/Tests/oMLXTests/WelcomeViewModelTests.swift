@@ -8,6 +8,13 @@ import XCTest
 @MainActor
 final class WelcomeViewModelTests: XCTestCase {
 
+    /// Resolve the expectation the way the app does, through the main
+    /// bundle. Pinning English here fails on any non-English host, and the
+    /// point of the assertion is the key mapping, not the language.
+    private static func localized(_ key: String, _ fallback: String) -> String {
+        NSLocalizedString(key, bundle: .main, value: fallback, comment: "")
+    }
+
     // AppServices uses a weak reference to its services on WelcomeViewModel,
     // so the test must keep a strong reference for the lifetime of each case.
     private var services: AppServices!
@@ -64,7 +71,7 @@ final class WelcomeViewModelTests: XCTestCase {
         vm.basePath = "   "
         vm.apiKey = "secret-key"
         XCTAssertFalse(vm.validateSetup())
-        XCTAssertEqual(vm.lastError, "Base directory is required.")
+        XCTAssertEqual(vm.lastError, Self.localized("welcome.error.base_dir_required", "Base directory is required."))
     }
 
     func testValidateSetupFailsOnInvalidPort() {
@@ -72,7 +79,7 @@ final class WelcomeViewModelTests: XCTestCase {
         vm.apiKey = "secret-key"
         vm.portText = "0"
         XCTAssertFalse(vm.validateSetup())
-        XCTAssertEqual(vm.lastError, "Port must be a number between 1 and 65535.")
+        XCTAssertEqual(vm.lastError, Self.localized("welcome.error.port_out_of_range", "Port must be a number between 1 and 65535."))
     }
 
     func testValidateSetupFailsOnPortNonNumeric() {
@@ -80,14 +87,14 @@ final class WelcomeViewModelTests: XCTestCase {
         vm.apiKey = "secret-key"
         vm.portText = "abc"
         XCTAssertFalse(vm.validateSetup())
-        XCTAssertEqual(vm.lastError, "Port must be a number between 1 and 65535.")
+        XCTAssertEqual(vm.lastError, Self.localized("welcome.error.port_out_of_range", "Port must be a number between 1 and 65535."))
     }
 
     func testValidateSetupFailsOnShortApiKey() {
         let vm = makeVM()
         vm.apiKey = "abc"
         XCTAssertFalse(vm.validateSetup())
-        XCTAssertEqual(vm.lastError, "API key must be at least 4 characters.")
+        XCTAssertEqual(vm.lastError, Self.localized("welcome.error.key_too_short", "API key must be at least 4 characters."))
     }
 
     func testValidateSetupFailsOnApiKeyWhitespace() {
@@ -95,13 +102,13 @@ final class WelcomeViewModelTests: XCTestCase {
         // 4+ chars but a space inside — server-side validator rejects.
         vm.apiKey = "ab cd"
         XCTAssertFalse(vm.validateSetup())
-        XCTAssertEqual(vm.lastError, "API key must not contain whitespace.")
+        XCTAssertEqual(vm.lastError, Self.localized("welcome.error.key_whitespace", "API key must not contain whitespace."))
     }
 
     func testValidateSetupFailsOnApiKeyNonPrintable() {
         let vm = makeVM()
         vm.apiKey = "abcd\u{007F}"   // DEL char, outside printable ASCII
         XCTAssertFalse(vm.validateSetup())
-        XCTAssertEqual(vm.lastError, "API key must contain only printable ASCII.")
+        XCTAssertEqual(vm.lastError, Self.localized("welcome.error.key_non_ascii", "API key must contain only printable ASCII."))
     }
 }

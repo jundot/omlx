@@ -13,6 +13,9 @@ copy-paste endpoints stay untouched under ``/admin/api/cluster`` as
 * ``pair_admin_router`` — admin-facing approve/deny/unpair.  Mounted with
   ``Depends(require_admin)`` exactly like the existing cluster router.
 
+An invite only asks the other Mac's user to show a code; it never starts a
+join there, so the joiner still chooses which Mac it trusts.
+
 Both are wired in ``omlx/server.py:_register_cluster_routes``.
 """
 
@@ -25,7 +28,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
-from .discovery_routes import ProbeRateLimiter
+from .discovery_routes import ProbeRateLimiter, discovery_service_or_none
 from .pairing import (
     CODE_DIGITS,
     EnrollmentDriveError,
@@ -44,6 +47,7 @@ pair_admin_router = APIRouter(prefix="/api/cluster", tags=["cluster-v2-pairing-a
 _get_pairing_manager: Any = get_pairing_manager
 pair_request_rate_limiter = ProbeRateLimiter(rate_per_second=0.5, burst=8)
 pair_status_rate_limiter = ProbeRateLimiter(rate_per_second=5.0, burst=20)
+pair_invite_rate_limiter = ProbeRateLimiter(rate_per_second=0.5, burst=4)
 
 
 def set_pairing_manager_getter(getter: Any) -> None:
@@ -169,6 +173,85 @@ async def cluster_pair_request(body: PairRequestBody, request: Request):
     except PairingError as exc:
         raise _pairing_http_error(exc) from exc
     return snapshot
+
+
+class PairInviteBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    node_id: str = Field(min_length=1, max_length=255)
+
+
+def _discovered(node_id: str) -> Any:
+    """An unpaired Mac that discovery found and verified here."""
+    service = discovery_service_or_none()
+    if service is None:
+        return None
+    for peer in service.peers():
+        if peer.node_id == node_id and not peer.paired:
+            return peer
+    return None
+
+
+def _send_invite(manager: PairingManager, node_id: str) -> bool:
+    peer = _discovered(node_id)
+    service = discovery_service_or_none()
+    if peer is None or service is None or not peer.http_port:
+        return False
+    health = service.address_health(node_id)
+    usable = []
+    for item in peer.addrs:
+        try:
+            ip = ipaddress.ip_address(item["ip"])
+        except ValueError:
+            continue
+        # A scope-less link-local or this Mac's own loopback cannot reach it.
+        if ip.version == 4 and not ip.is_loopback:
+            usable.append(str(ip))
+    for addr in sorted(
+        usable, key=lambda ip: health.get(ip, {}).get("state") != "verified"
+    ):
+        try:
+            manager._http_post(
+                f"http://{addr}:{peer.http_port}/api/cluster/pair/invited",
+                {"node_id": manager.node_id},
+                3.0,
+            )
+        except Exception:
+            continue
+        return True
+    return False
+
+
+@pair_admin_router.post("/pair/invite")
+async def cluster_pair_invite(body: PairInviteBody):
+    """Ask a discovered Mac to offer joining this one (best effort)."""
+    return {"sent": await asyncio.to_thread(_send_invite, _manager(), body.node_id)}
+
+
+@pair_router.post("/pair/invited", status_code=202)
+async def cluster_pair_invited(body: PairInviteBody, request: Request):
+    """Another Mac asks this one to join it; only its dashboard prompt changes."""
+    source = request.client.host if request.client is not None else ""
+    if not pair_invite_rate_limiter.allow(source or "unknown"):
+        raise HTTPException(status_code=429, detail="pair invite rate limit exceeded")
+    if _discovered(body.node_id) is None:
+        raise HTTPException(status_code=404, detail="unknown Mac")
+    _manager().ui_session.offer_invite(body.node_id)
+    return {"ok": True}
+
+
+@pair_admin_router.get("/pair/invite")
+async def cluster_pair_invite_state():
+    node_id = _manager().ui_session.current_invite()
+    peer = _discovered(node_id) if node_id else None
+    if peer is None:
+        return {"invite": None}
+    return {"invite": {"node_id": node_id, "name": peer.friendly_name}}
+
+
+@pair_admin_router.delete("/pair/invite")
+async def cluster_pair_invite_dismiss():
+    _manager().ui_session.dismiss_invite()
+    return {"invite": None}
 
 
 class PairCancelRequestBody(BaseModel):
