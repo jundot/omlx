@@ -586,7 +586,7 @@ private struct BackendSection: View {
                    defaultValue: "Backend",
                    comment: "Section heading for choosing which oMLX server this app uses"),
             subtitle: String(localized: "server.section.backend.sub",
-                             defaultValue: "The oMLX server this app uses. With another server, nothing runs on this Mac: models, settings and logs are that server's.",
+                             defaultValue: "The oMLX server this app uses. With a remote server, nothing runs on this Mac: models, settings and logs are that server's.",
                              comment: "Subtitle for the Backend section in Server screen")
         )
         ListGroup {
@@ -604,7 +604,7 @@ private struct BackendSection: View {
                                        defaultValue: "This Mac",
                                        comment: "Segment: the app uses the oMLX server it runs on this Mac")),
                         (true, String(localized: "server.backend.remote",
-                                      defaultValue: "Another server",
+                                      defaultValue: "Remote server",
                                       comment: "Segment: the app uses an oMLX server on another Mac")),
                     ]
                 )

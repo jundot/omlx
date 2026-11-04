@@ -64,9 +64,9 @@ final class StatusScreenVM {
         String(format: "%d%%", Int(gpuUtilizationPercent.rounded()))
     }
 
-    func start(client: OMLXClient) async {
+    func start(client: OMLXClient, remote: OMLXEndpoint? = nil) async {
         self.client = client
-        metrics.start()
+        metrics.start(remote: remote)
         // Load the scheduler cap once; failing silently is fine — the
         // default keeps the % column readable until the server responds.
         if let settings = try? await client.getGlobalSettings(),
