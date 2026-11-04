@@ -66,36 +66,20 @@
     /* === Settings dropdown === */
     [data-theme="dark"] .shadow-lg { box-shadow: 0 4px 12px 0 rgb(var(--palette-black) / 0.5) !important; }
 
-    /* === Buttons: bg-neutral-900 text-white → invert in dark mode === */
-    [data-theme="dark"] button.bg-neutral-900,
-    [data-theme="dark"] a.bg-neutral-900 {
-        background-color: rgb(var(--palette-neutral-200)) !important;
-        color: rgb(var(--palette-zinc-900)) !important;
-    }
-    [data-theme="dark"] button.hover\:bg-neutral-800:hover,
-    [data-theme="dark"] a.hover\:bg-neutral-800:hover {
-        background-color: rgb(var(--palette-zinc-300)) !important;
-    }
-    /* Status badge inversion */
-    [data-theme="dark"] span.bg-neutral-900 {
-        background-color: rgb(var(--palette-neutral-200)) !important;
-        color: rgb(var(--palette-zinc-900)) !important;
-    }
-    [data-theme="dark"] span.bg-neutral-900 span {
-        color: rgb(var(--palette-zinc-900)) !important;
+    /* === Primary buttons and badges: bg-neutral-900 ===
+       Drawn from the --btn-primary tokens in both themes (dark inverts them).
+       No !important: hover and disabled variants still win. */
+    :is(button, a, span).bg-neutral-900 { background-color: var(--btn-primary); color: var(--btn-primary-text); }
+    :is(button, a).hover\:bg-neutral-800:hover { background-color: var(--btn-primary-hover); }
+    [data-theme="dark"] :is(button, a, span).bg-neutral-900 :is(span, svg, .text-white) {
+        color: var(--btn-primary-text);
     }
     [data-theme="dark"] span.bg-neutral-900 span.bg-white {
-        background-color: rgb(var(--palette-zinc-900)) !important;
-    }
-    /* Inverted button text */
-    [data-theme="dark"] button.bg-neutral-900 .text-white,
-    [data-theme="dark"] button.bg-neutral-900 span,
-    [data-theme="dark"] button.bg-neutral-900 svg {
-        color: rgb(var(--palette-zinc-900)) !important;
+        background-color: var(--btn-primary-text);
     }
     /* Spinner inside inverted button */
-    [data-theme="dark"] button.bg-neutral-900 svg.animate-spin circle { stroke: rgb(var(--palette-zinc-900)); }
-    [data-theme="dark"] button.bg-neutral-900 svg.animate-spin path { fill: rgb(var(--palette-zinc-900)); }
+    [data-theme="dark"] button.bg-neutral-900 svg.animate-spin circle { stroke: var(--btn-primary-text); }
+    [data-theme="dark"] button.bg-neutral-900 svg.animate-spin path { fill: var(--btn-primary-text); }
 
     /* Tensor segments use a semantic palette instead of theme-remapped
        Tailwind utilities. This prevents white-on-light text when dark-mode
@@ -149,31 +133,18 @@
     [data-theme="dark"] pre:not(.bg-neutral-100) { background-color: var(--code-bg) !important; color: var(--text-primary) !important; }
 
     /* === Focus rings === */
-    [data-theme="dark"] .focus\:ring-neutral-900:focus { --tw-ring-color: var(--border-normal) !important; }
-    [data-theme="dark"] .focus\:ring-black:focus { --tw-ring-color: var(--border-normal) !important; }
-    [data-theme="dark"] .focus\:ring-2:focus { --tw-ring-color: var(--border-normal) !important; }
+    .focus\:ring-neutral-900:focus,
+    .focus\:ring-black:focus { --tw-ring-color: var(--focus-ring-color); }
 
-    /* === Toggle switches (ON state: bg-black) === */
-    [data-theme="dark"] button.bg-black {
-        background-color: rgb(var(--palette-zinc-400)) !important;
-    }
+    /* === Toggle switches and selected choices (ON state: bg-black) === */
+    button.bg-black { background-color: var(--switch-on); }
+    button.border-black { border-color: var(--switch-on); }
     [data-theme="dark"] button.bg-black span.bg-white {
-        background-color: rgb(var(--palette-white)) !important;
+        background-color: rgb(var(--palette-white));
     }
     /* Toggle OFF state */
-    [data-theme="dark"] button.bg-neutral-200 {
-        background-color: var(--bg-tertiary) !important;
-    }
     [data-theme="dark"] button[role="switch"].bg-neutral-200:not(:focus) {
         box-shadow: inset 0 0 0 1px rgb(var(--palette-zinc-500));
-    }
-    /* Default radio button (ON state) */
-    [data-theme="dark"] button.bg-black.border-black {
-        background-color: rgb(var(--palette-zinc-400)) !important;
-        border-color: rgb(var(--palette-zinc-400)) !important;
-    }
-    [data-theme="dark"] button.border-neutral-300 {
-        border-color: var(--border-normal) !important;
     }
     [data-theme="dark"] button.hover\:border-neutral-400:hover {
         border-color: var(--text-muted) !important;
@@ -183,8 +154,8 @@
     [data-theme="dark"] input[type="range"] {
         background-color: var(--border-faint) !important;
     }
-    [data-theme="dark"] input[type="range"]::-webkit-slider-thumb {
-        background-color: rgb(var(--palette-zinc-400)) !important;
+    input[type="range"]::-webkit-slider-thumb {
+        background-color: var(--switch-on);
     }
 
     /* === Badge colors (dark mode adjustments) === */
