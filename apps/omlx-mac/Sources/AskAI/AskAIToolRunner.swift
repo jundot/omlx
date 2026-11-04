@@ -167,7 +167,6 @@ enum AskAITool {
 }
 
 struct AskAIToolRunner: AskAIToolRunning {
-    /// The server whose `/v1/web` endpoints run web search and page fetches.
     let endpoint: AskAIEndpoint
     var screenshotPixels = AskAIImage.maxPixelSize
 

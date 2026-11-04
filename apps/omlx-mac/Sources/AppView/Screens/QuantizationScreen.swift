@@ -1479,18 +1479,15 @@ private struct AboutSection: View {
 
 // MARK: - Keychain helper
 
-// Thin SecItem wrapper. Each secret is an `Item` (a service/account pair);
-// every function defaults to the HuggingFace upload token, so the upload
-// screen reads as before. The SecItem APIs are thread-safe so we don't need
-// additional locking.
+// Thin SecItem wrapper. Each secret is a service/account `Item`; the
+// functions default to the HuggingFace upload token. The SecItem APIs are
+// thread-safe so we don't need additional locking.
 enum Keychain {
-    /// One Keychain entry, identified by its service and account.
     struct Item: Sendable {
         let service: String
         let account: String
 
         static let huggingFaceToken = Item(service: "app.omlx.hf-upload", account: "huggingface-token")
-        /// API key for the oMLX server Ask AI talks to when it is not this Mac.
         static let askAIRemoteKey = Item(service: "app.omlx.ask-ai-remote", account: "api-key")
     }
 

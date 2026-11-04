@@ -40,19 +40,15 @@ final class OMLXClient: ObservableObject {
     private(set) var host: String
     private(set) var port: Int
     private(set) var apiKey: String?
-    /// `http` for the local server; `https` when Ask AI points at a remote server behind TLS.
-    private(set) var scheme: String
 
     private let session: URLSession
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
 
-    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil, scheme: String = "http",
-         session: URLSession? = nil) {
+    init(host: String = "127.0.0.1", port: Int = 8000, apiKey: String? = nil, session: URLSession? = nil) {
         self.host = host
         self.port = port
         self.apiKey = apiKey
-        self.scheme = scheme
 
         let cfg = URLSessionConfiguration.default
         cfg.httpCookieStorage = HTTPCookieStorage.shared
@@ -71,11 +67,10 @@ final class OMLXClient: ObservableObject {
         self.decoder = dec
     }
 
-    func configure(host: String, port: Int, apiKey: String?, scheme: String = "http") {
+    func configure(host: String, port: Int, apiKey: String?) {
         self.host = host
         self.port = port
         self.apiKey = apiKey
-        self.scheme = scheme
     }
 
     // MARK: - Endpoints
@@ -606,7 +601,7 @@ final class OMLXClient: ObservableObject {
         isRetry: Bool = false
     ) async throws -> T {
         var components = URLComponents()
-        components.scheme = scheme
+        components.scheme = "http"
         components.host = host
         components.port = port
         components.path = path
@@ -646,7 +641,7 @@ final class OMLXClient: ObservableObject {
     private func login(apiKey: String) async throws {
         struct LoginReq: Encodable { let apiKey: String; let remember: Bool }
         var components = URLComponents()
-        components.scheme = scheme
+        components.scheme = "http"
         components.host = host
         components.port = port
         components.path = "/admin/api/login"

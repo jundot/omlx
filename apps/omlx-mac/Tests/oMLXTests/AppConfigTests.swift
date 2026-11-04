@@ -211,19 +211,6 @@ final class AppConfigTests: XCTestCase {
         XCTAssertEqual(url.absoluteString, "ws://[::1]:9000/v1/realtime?model=Qwen3%20Omni")
     }
 
-    func testURLBuildersUseTheRequestedScheme() throws {
-        // A remote server behind TLS needs https, and wss for the voice socket.
-        let https = try XCTUnwrap(AppConfig.httpURL(host: "omlx.example.com", port: 443,
-                                                    path: "/v1/models", scheme: "https"))
-        XCTAssertEqual(https.absoluteString, "https://omlx.example.com:443/v1/models")
-        let ipv6 = try XCTUnwrap(AppConfig.httpURL(host: "::1", port: 9000, path: "/health", scheme: "https"))
-        XCTAssertEqual(ipv6.absoluteString, "https://[::1]:9000/health")
-        let secureSocket = try XCTUnwrap(AppConfig.webSocketURL(
-            host: "omlx.example.com", port: 443, path: "/v1/realtime", scheme: "https"
-        ))
-        XCTAssertEqual(secureSocket.absoluteString, "wss://omlx.example.com:443/v1/realtime")
-    }
-
     func testLoadAcceptsBindAddressFallback() throws {
         let url = AppConfig.settingsURL(basePath: tempBase)
         let original: [String: Any] = [

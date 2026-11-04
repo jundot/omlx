@@ -126,7 +126,6 @@ struct AppConfig: Sendable, Equatable, Codable {
         }
     }
 
-    /// `scheme` is `http` for the local server; a remote server may use `https`.
     static func httpURL(host: String, port: Int, path: String = "", scheme: String = "http") -> URL? {
         let urlHost = normalizedURLHost(host)
         let urlPath = path.isEmpty ? "" : (path.hasPrefix("/") ? path : "/" + path)

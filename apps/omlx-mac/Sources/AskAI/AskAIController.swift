@@ -43,9 +43,8 @@ final class AskAIController {
     @ObservationIgnored private var openSettingsAction: (() -> Void)?
     @ObservationIgnored private var hotKeySuspended = false
     @ObservationIgnored private var copiedToken = 0
-    /// Model id -> `model_type` from the admin model list, for the image check.
+    /// Model id -> `model_type` from the server's model list, for the image check.
     @ObservationIgnored private var modelTypes: [String: String] = [:]
-    /// The server `modelTypes` came from.
     @ObservationIgnored private var modelTypesSource: AskAIEndpoint?
     @ObservationIgnored private var isSubmitting = false
     @ObservationIgnored private var lastClosedAt = Date.distantPast
@@ -314,14 +313,18 @@ final class AskAIController {
         return latest
     }
 
-    /// The server to ask: this Mac's, or the other one chosen in settings.
     /// Nil when "another server" is chosen but its address is empty or invalid.
     func currentEndpoint() -> AskAIEndpoint? {
         guard let config = services?.config else { return nil }
         return store.prefs.currentEndpoint(local: config)
     }
 
-    /// Model types describe one server, so switching servers drops them.
+    func listModels(on endpoint: AskAIEndpoint) async throws -> [ModelDTO] {
+        if endpoint.isRemote { return try await endpoint.remoteModels() }
+        guard let client = services?.client else { throw OMLXClientError.invalidURL }
+        return try await client.listModels().models
+    }
+
     private func dropModelTypesIfServerChanged() {
         let current = currentEndpoint()
         guard current != modelTypesSource else { return }
@@ -384,8 +387,7 @@ final class AskAIController {
     private func refreshModelTypes() async {
         dropModelTypesIfServerChanged()
         guard let endpoint = currentEndpoint(),
-              let client = endpoint.isRemote ? endpoint.makeClient() : services?.client,
-              let models = try? await client.listModels().models else { return }
+              let models = try? await listModels(on: endpoint) else { return }
         modelTypesSource = endpoint
         modelTypes = Dictionary(models.map { ($0.id, $0.modelType ?? "") },
                                 uniquingKeysWith: { first, _ in first })

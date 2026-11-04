@@ -313,7 +313,6 @@ final class TalkAIController {
               let endpoint = store.prefs.currentEndpoint(local: config),
               let url = endpoint.webSocketURL(path: "/v1/realtime", query: query)
         else {
-            // Another server is chosen but its address is empty or not valid.
             fail(TalkAIStrings.disconnected,
                  action: store.prefs.serverMode == .remote ? .appSettings : .none)
             return

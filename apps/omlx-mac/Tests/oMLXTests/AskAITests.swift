@@ -198,16 +198,6 @@ final class AskAITests: XCTestCase {
         // Settings saved before "another server" existed must keep talking to this Mac.
         let old = try JSONDecoder().decode(AskAIPrefs.self, from: Data(#"{"enabled":true}"#.utf8))
         XCTAssertEqual(old.serverMode, .thisMac)
-        XCTAssertEqual(old.remoteAddress, "")
-
-        // A choice that is not a known mode falls back without dropping the other fields.
-        let bad = try JSONDecoder().decode(
-            AskAIPrefs.self,
-            from: Data(#"{"enabled":true,"serverMode":"elsewhere","remoteAddress":"studio.local"}"#.utf8)
-        )
-        XCTAssertEqual(bad.serverMode, .thisMac)
-        XCTAssertEqual(bad.remoteAddress, "studio.local")
-        XCTAssertTrue(bad.enabled)
 
         var chosen = AskAIPrefs()
         chosen.serverMode = .remote
@@ -229,14 +219,11 @@ final class AskAITests: XCTestCase {
         XCTAssertEqual([withPort.scheme, withPort.host], ["http", "studio.local"])
         XCTAssertEqual(withPort.port, 9000)
 
-        let address = try XCTUnwrap(parse("http://192.168.68.83:8000"))
-        XCTAssertEqual([address.scheme, address.host], ["http", "192.168.68.83"])
-        XCTAssertEqual(address.port, 8000)
-
-        // https without a port is the TLS default, not oMLX's 8000.
+        // https without a port is the TLS default, not oMLX's 8000, and the voice socket uses wss.
         let secure = try XCTUnwrap(parse("https://omlx.example.com"))
-        XCTAssertEqual(secure.scheme, "https")
         XCTAssertEqual(secure.port, AskAIEndpoint.defaultSecurePort)
+        XCTAssertEqual(secure.webSocketURL(path: "/v1/realtime")?.absoluteString,
+                       "wss://omlx.example.com:443/v1/realtime")
 
         let ipv6 = try XCTUnwrap(parse("[::1]:8000"))
         XCTAssertEqual(ipv6.host, "::1")

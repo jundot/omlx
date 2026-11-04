@@ -152,11 +152,8 @@ struct TalkPrefs: Codable, Equatable, Sendable {
     }
 }
 
-/// Which oMLX server answers Ask AI.
 enum AskAIServerMode: String, Codable, Equatable, Sendable, CaseIterable {
-    /// The server this app runs.
     case thisMac
-    /// Another oMLX server on the network, such as a Mac Studio.
     case remote
 }
 
@@ -172,7 +169,6 @@ struct AskAIEndpoint: Equatable, Sendable {
     var apiKey: String?
     var isRemote: Bool
 
-    /// The server this app runs, as set in settings.json.
     init(local config: AppConfig) {
         scheme = "http"
         host = config.host
@@ -209,10 +205,21 @@ struct AskAIEndpoint: Equatable, Sendable {
         AppConfig.webSocketURL(host: host, port: port, path: path, query: query, scheme: scheme)
     }
 
-    /// A client for the model list and other admin calls on this server.
-    @MainActor
-    func makeClient() -> OMLXClient {
-        OMLXClient(host: host, port: port, apiKey: apiKey, scheme: scheme)
+    /// The model list of a remote server. `/v1/models/status` also accepts
+    /// sub keys; the admin model list accepts only the main key.
+    func remoteModels() async throws -> [ModelDTO] {
+        guard let url = httpURL(path: "/v1/models/status") else { throw OMLXClientError.invalidURL }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        if let apiKey { request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization") }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw OMLXClientError.invalidResponse }
+        if http.statusCode == 401, apiKey == nil { throw OMLXClientError.unauthenticated }
+        guard 200..<300 ~= http.statusCode else {
+            throw OMLXClientError.http(status: http.statusCode, body: String(data: data, encoding: .utf8))
+        }
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode(ListModelsResponse.self, from: data).models
     }
 }
 
@@ -253,8 +260,6 @@ struct AskAIPrefs: Codable, Equatable, Sendable {
     /// Return sends and Shift-Return inserts the newline. Command-Return
     /// sends either way.
     var sendOnEnter = false
-    /// Which oMLX server answers. Saved settings from before this existed
-    /// decode as `.thisMac`.
     var serverMode = AskAIServerMode.thisMac
     /// What the user typed for the other server: `host`, `host:port`, or
     /// `http(s)://host[:port]`. Its API key lives in the Keychain, not here.

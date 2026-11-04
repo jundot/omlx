@@ -113,8 +113,6 @@ struct AskAIScreen: View {
         }
     }
 
-    /// Why the model list is empty: this Mac's server is not running, the
-    /// other server has no address yet, or it did not answer.
     private static func modelsUnavailableHint(_ prefs: AskAIPrefs) -> String {
         guard prefs.serverMode == .remote else {
             return String(
@@ -144,12 +142,10 @@ struct AskAIScreen: View {
         return (type.isEmpty || type == "llm" || type == "vlm") && virtual != true
     }
 
-    /// Lists the models on the server Ask AI is set to use.
     private func loadModels() async {
         do {
             guard let endpoint = services.askAI.currentEndpoint() else { throw OMLXClientError.invalidURL }
-            let client = endpoint.isRemote ? endpoint.makeClient() : services.client
-            let all = try await client.listModels().models
+            let all = try await services.askAI.listModels(on: endpoint)
             gpuPowerLimitSupported = all.first?.gpuPowerLimitSupported
             models = all.filter { Self.isChatModel(type: $0.modelType, virtual: $0.virtual) }.map(\.id)
             voiceModels = all.filter { $0.realtimeVoice == true && $0.virtual != true }.map(\.id)
@@ -254,10 +250,8 @@ private struct ModelsLoadKey: Hashable {
 /// Keychain, not in the Ask AI settings file.
 private struct ServerSection: View {
     @Bindable var store: AskAIStore
-    /// Bumped when the saved API key changes, so the model list reloads.
     @Binding var keyRevision: Int
 
-    /// The key being typed.
     @State private var apiKey = ""
     @State private var showKey = false
     @State private var keyLoaded = false
@@ -272,7 +266,6 @@ private struct ServerSection: View {
 
     private var isRemote: Bool { store.prefs.serverMode == .remote }
 
-    /// True when the key would cross the network unencrypted.
     private var sendsKeyInTheClear: Bool {
         guard let endpoint = AskAIEndpoint(remoteAddress: store.prefs.remoteAddress, apiKey: nil),
               endpoint.scheme == "http" else { return false }
@@ -433,7 +426,7 @@ private struct ServerSection: View {
         }
         check = .checking
         do {
-            let all = try await endpoint.makeClient().listModels().models
+            let all = try await endpoint.remoteModels()
             check = .connected(models: all.filter {
                 AskAIScreen.isChatModel(type: $0.modelType, virtual: $0.virtual)
             }.count)
@@ -1010,10 +1003,9 @@ private struct VoiceAdvancedSection: View {
     /// Voices and default prompt of the selected model's realtime session.
     private func loadModelInfo() async {
         let model = store.prefs.talk.model
-        let config = services.config
         guard !model.isEmpty,
-              var components = AppConfig.httpURL(host: config.host, port: config.port,
-                                                 path: "/v1/audio/voices")
+              let endpoint = services.askAI.currentEndpoint(),
+              var components = endpoint.httpURL(path: "/v1/audio/voices")
                   .flatMap({ URLComponents(url: $0, resolvingAgainstBaseURL: false) })
         else {
             voices = []
@@ -1028,7 +1020,7 @@ private struct VoiceAdvancedSection: View {
                                  URLQueryItem(name: "realtime", value: "true")]
         guard let url = components.url else { return }
         var request = URLRequest(url: url)
-        if let key = config.apiKey, !key.isEmpty {
+        if let key = endpoint.apiKey, !key.isEmpty {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
         struct Info: Decodable {
