@@ -30,8 +30,8 @@
         'bg-tertiary': ['surface-scale-100'],
         'text-primary': ['text-scale-900', 'text-scale-800'],
         'text-secondary': ['text-scale-700', 'text-scale-600'],
-        'text-tertiary': ['text-scale-500'],
-        'text-muted': ['text-scale-400'],
+        // text-neutral-400 draws the 500 step for AA, so it follows tertiary, not muted.
+        'text-tertiary': ['text-scale-500', 'text-scale-400'],
         'border-faint': ['border-scale-100', 'border-scale-200'],
         'border-normal': ['border-scale-300'],
     };

@@ -65,6 +65,11 @@ test('css scopes each theme to its data-theme value', () => {
     assert.doesNotMatch(css, /dark/);
 });
 
+test('muted leaves text-neutral-400 on the tertiary channel', () => {
+    assert.doesNotMatch(theme.css({light: {'text-muted': '#94a3b9'}, dark: {}}), /--text-scale-400/);
+    assert.match(theme.css({light: {'text-tertiary': '#555555'}, dark: {}}), /--text-scale-400: 85 85 85;/);
+});
+
 test('contrast follows WCAG and checks every rule pair', () => {
     assert.equal(theme.contrast('#000000', '#ffffff').toFixed(1), '21.0');
     assert.equal(theme.contrast('#ffffff', '#ffffff'), 1);

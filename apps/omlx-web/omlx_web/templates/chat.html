@@ -2532,7 +2532,7 @@
                         :disabled="!activePromptProfile || !promptDirty"
                         class="flex items-center gap-1.5 px-4 py-2 rounded-lg text-caption font-semibold transition-all duration-200"
                         :class="promptDirty && activePromptProfile
-                            ? 'bg-neutral-900 text-white hover:bg-neutral-800 dark:bg-neutral-100 dark:text-neutral-900'
+                            ? 'bg-accent text-accent-fg hover:bg-accent-hover'
                             : 'bg-neutral-200 text-neutral-500 cursor-not-allowed'">
                         <i data-lucide="save" class="w-3 h-3"></i>
                         <span>{{ t('chat.save_settings') }}</span>
