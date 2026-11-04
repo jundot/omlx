@@ -2,6 +2,32 @@
 
 import Foundation
 
+struct HFLocalModelsResponse: Decodable, Sendable {
+    let models: [HFLocalModelDTO]
+}
+
+struct HFLocalModelDTO: Decodable, Sendable {
+    let name: String
+    let repoId: String?
+    let sourceType: String?
+}
+
+struct HFUpdateCheckRequest: Encodable, Sendable {
+    let repoIds: [String]
+    var hfToken: String = ""
+}
+
+struct HFUpdateCheckResponse: Decodable, Equatable, Sendable {
+    let updates: [String: HFModelUpdateDTO]
+    let checked: Int
+    let failed: [String]
+}
+
+struct HFModelUpdateDTO: Decodable, Equatable, Sendable {
+    let files: Int
+    let size: Int64
+}
+
 struct HFTaskListResponse: Codable, Sendable {
     let tasks: [HFTaskDTO]
 }

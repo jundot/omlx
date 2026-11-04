@@ -14,9 +14,10 @@ import SwiftUI
 
 struct ModelsScreen: View {
     @Environment(AppServices.self) private var services
-    @State private var vm = ModelsScreenVM()
+    private var vm: ModelsScreenVM { services.models }
 
     var body: some View {
+        @Bindable var vm = vm
         VStack(alignment: .leading, spacing: 0) {
             ActiveModelsSection(
                 models: vm.activeModels,
@@ -27,6 +28,8 @@ struct ModelsScreen: View {
                 models: vm.libraryModels,
                 isModelLoaded: { id in vm.activeModels.contains(where: { $0.id == id }) },
                 deletingID: vm.deletingID,
+                updates: vm,
+                onCheckUpdates: { Task { await vm.checkForUpdates(client: services.client) } },
                 onLoad: { id in vm.load(id: id, client: services.client) },
                 onUnload: { id in vm.unload(id: id, client: services.client) },
                 onOpenSettings: { id in services.modelDetailID = id },
@@ -38,6 +41,19 @@ struct ModelsScreen: View {
         }
         .task { await vm.start(client: services.client) }
         .onDisappear { vm.stop() }
+        .sheet(item: $vm.updateTarget) { target in
+            ModelCardSheet(
+                target: target,
+                client: services.client,
+                onDownload: { repo, files in
+                    Task {
+                        if await vm.startUpdate(repo: repo, files: files, client: services.client) {
+                            services.requestedSection = .downloads
+                        }
+                    }
+                }
+            )
+        }
         .confirmationDialog(
             String(localized: "models.delete.confirm_title",
                    defaultValue: "Delete this model from disk?",
@@ -171,6 +187,8 @@ private struct LibrarySection: View {
     let models: [ModelDTO]
     let isModelLoaded: (String) -> Bool
     let deletingID: String?
+    let updates: ModelsScreenVM
+    let onCheckUpdates: () -> Void
     let onLoad: (String) -> Void
     let onUnload: (String) -> Void
     let onOpenSettings: (String) -> Void
@@ -189,7 +207,30 @@ private struct LibrarySection: View {
                                     comment: "Section heading for the on-disk model library"),
                       subtitle: String(localized: "models.library.subtitle",
                                        defaultValue: "Models: \(models.count) · \(formatBytes(totalSize)) on disk",
-                                       comment: "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk"))
+                                       comment: "Subtitle for the Model Library section. Placeholders: model count, total bytes on disk")) {
+            Button(action: onCheckUpdates) {
+                HStack(spacing: 5) {
+                    if updates.isCheckingUpdates {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    Text(String(localized: "models.updates.check", defaultValue: "Check for updates"))
+                }
+            }
+            .buttonStyle(.omlx(.normal, size: .small))
+            .disabled(updates.isCheckingUpdates || models.isEmpty)
+        }
+
+        if let status = updates.updateStatus {
+            Text(status)
+                .font(.omlxText(DesignTokens.FontSize.subheadline))
+                .foregroundStyle(theme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 28)
+                .padding(.bottom, 4)
+        }
 
         ListGroup {
             if models.isEmpty {
@@ -269,6 +310,7 @@ private struct LibrarySection: View {
                                                          comment: "Tooltip on the GGUF badge in the model library"))
                                     }
                                 }
+                                updateBadge(for: m)
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                                     .font(.omlxMono(DesignTokens.FontSize.subheadline))
                                     .foregroundStyle(theme.textSecondary)
@@ -335,6 +377,23 @@ private struct LibrarySection: View {
                     }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func updateBadge(for model: ModelDTO) -> some View {
+        if let update = updates.update(for: model.id) {
+            Button { updates.showUpdate(for: model.id) } label: {
+                StatusPill(status: .custom(
+                    color: .yellow,
+                    label: String(localized: "models.updates.available", defaultValue: "Update available"),
+                    fillBg: true))
+            }
+            .buttonStyle(.plain)
+            .help(String(localized: "models.updates.details",
+                         defaultValue: "\(update.files) files · \(formatBytes(update.size))"))
+            .accessibilityLabel(String(localized: "models.updates.preview_label",
+                                       defaultValue: "Review update for \(model.displayTitle)"))
         }
     }
 

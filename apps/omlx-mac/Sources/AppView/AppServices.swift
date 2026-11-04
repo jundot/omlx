@@ -40,6 +40,8 @@ final class AppServices: NSObject {
 
     let client: OMLXClient
     let updates: UpdateController
+    /// Keep model update results when navigating to Downloads or model settings.
+    let models = ModelsScreenVM()
     /// Read-only preset bundle (sourced from the shipped JSON + remote
     /// refresh). The per-model settings preset chip strip subscribes via
     /// Observation to react to refreshes.

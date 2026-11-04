@@ -13,6 +13,14 @@ final class ModelsScreenVM {
     /// double-tap deletes against a model the server is still unloading.
     private(set) var deletingID: String?
 
+    /// Files tab of the model card opened from an update badge.
+    var updateTarget: ModelCardTarget?
+    private(set) var isCheckingUpdates = false
+    private(set) var updateStatus: String?
+    /// Results of the last update check, keyed by lowercased repo id.
+    private var updates: [String: HFModelUpdateDTO] = [:]
+    private var repoByModel: [String: String] = [:]
+
     @ObservationIgnored
     private weak var client: OMLXClient?
     @ObservationIgnored
@@ -22,6 +30,57 @@ final class ModelsScreenVM {
         allModels.filter { $0.loaded || $0.isLoading }
     }
     var libraryModels: [ModelDTO] { allModels }
+
+    func update(for id: String) -> HFModelUpdateDTO? {
+        repoByModel[id].flatMap { updates[$0.lowercased()] }
+    }
+
+    func showUpdate(for id: String) {
+        guard let repo = repoByModel[id] else { return }
+        updateTarget = ModelCardTarget(repoId: repo, source: .huggingFace, startTab: .files)
+    }
+
+    func checkForUpdates(client: OMLXClient) async {
+        isCheckingUpdates = true
+        defer { isCheckingUpdates = false }
+        do {
+            // The server skips repos it did not download or still downloads.
+            var repos: [String: String] = [:]
+            for m in try await client.listHFLocalModels().models where m.sourceType == "local" {
+                if let repo = m.repoId { repos[m.name] = repo }
+            }
+            repoByModel = repos
+            let result = try await client.checkHFModelUpdates(repoIds: Set(repos.values).sorted())
+            if result.checked == 0 {
+                updates = [:]
+                updateStatus = String(localized: "models.updates.nothing",
+                                      defaultValue: "No eligible models to check.")
+            } else if result.failed.count == result.checked {
+                updateStatus = String(localized: "models.updates.check_failed",
+                                      defaultValue: "Could not check for model updates. Previous results are last known results.")
+            } else {
+                updates = Dictionary(result.updates.map { ($0.key.lowercased(), $0.value) },
+                                     uniquingKeysWith: { first, _ in first })
+                updateStatus = String(localized: "models.updates.result",
+                                      defaultValue: "Updates available: \(updates.count) · Checked: \(result.checked) · Failed: \(result.failed.count)")
+            }
+        } catch {
+            updateStatus = String(localized: "models.updates.check_error",
+                                  defaultValue: "Could not check for model updates: \(error.omlxDescription)")
+        }
+    }
+
+    func startUpdate(repo: String, files: [String]?, client: OMLXClient) async -> Bool {
+        do {
+            _ = try await client.startHFDownload(repoId: repo, files: files)
+            updates.removeValue(forKey: repo.lowercased())
+            return true
+        } catch {
+            updateStatus = String(localized: "models.updates.start_error",
+                                  defaultValue: "Could not start the model update: \(error.omlxDescription)")
+            return false
+        }
+    }
 
     func start(client: OMLXClient) async {
         self.client = client
