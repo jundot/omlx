@@ -14,18 +14,24 @@ With a remote backend configured:
 - The macOS app does not start a Python server. Every screen (Models,
   Downloads, Settings, Logs, Benchmarks, Security, Usage) talks to the remote
   server's admin API, so edits there change *that* server's settings.json.
-- The menubar shows the remote server's reachability and stats. Web Dashboard
-  and Chat open the remote server's pages.
+- Every screen carries a "Remote server" badge (top right) with the server's
+  address and a status dot; click it to open the Server screen.
+- The menubar icon, status header and throughput items follow the remote
+  server. The System Stats submenu, the CPU/GPU/MEM items and the Status
+  screen's RAM and thermal rows show the *server Mac's* utilization, read
+  from `GET /api/system-metrics` (added with this feature; same key as
+  `/api/status`). Web Dashboard and Chat open the remote server's pages.
 - `omlx launch <tool>` configures the tool with the remote server's URL and
   API key.
 - Ask AI's "This Mac" choice becomes "oMLX's server", which is the remote one.
-  Its own "Another server" setting still works for a third server.
+  Its own "Different server" setting still works for chatting with a third
+  server, for example when models run locally but a bigger one lives elsewhere.
 - `omlx start`, `omlx stop` and `omlx restart` report the remote server's
   state and refuse to start or stop it. Manage the server on its own Mac.
 
 ## Configure it
 
-**macOS app:** Server → Backend → *Another server*. Enter the address
+**macOS app:** Server → Backend → *Remote server*. Enter the address
 (`studio.local`, `studio.local:8000`, or `https://omlx.example.com`) and that
 server's main API key, click *Test connection*, then *Apply and Relaunch*.
 The app stops its local server and reopens using the remote one.

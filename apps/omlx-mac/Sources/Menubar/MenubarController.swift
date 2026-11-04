@@ -86,6 +86,10 @@ final class MenubarController: NSObject {
     private var systemStatsParentItem: NSMenuItem!
     private var systemStatsSubmenu: NSMenu!
     private let systemStatsSampler = SystemStatsSampler()
+    /// Remote backend: the server Mac's metrics replace the local sampler.
+    /// Built lazily, rebuilt when the endpoint changes (history is per server).
+    private var remoteStatsSource: RemoteSystemStatsSource?
+    private var remoteStatsFetchTask: Task<Void, Never>?
     private var systemItemsController: SystemMenubarItemsController!
     private var systemStatsTimer: Timer?
     private var systemStatsTimerInterval: TimeInterval = 0
@@ -449,7 +453,7 @@ final class MenubarController: NSObject {
         // Live throughput lives in the dedicated LIV/AVG/ALL metric items,
         // so the main item stays a fixed square icon. This runs on every stats
         // tick, and assigning even the same image redraws the item.
-        let icon = state.isRunningLike ? iconFilled : iconOutline
+        let icon = (remoteMonitor != nil ? isRunning : state.isRunningLike) ? iconFilled : iconOutline
         if statusItem.button?.image !== icon {
             statusItem.button?.image = icon
         }
@@ -657,11 +661,45 @@ final class MenubarController: NSObject {
             return
         }
         lastSystemTickAt = Date()
-        let snapshot = systemStatsSampler.sample()
+        if remoteMonitor != nil {
+            remoteSystemSamplingTick()
+            return
+        }
+        applySystemStats(systemStatsSampler.sample())
+    }
+
+    private func applySystemStats(_ snapshot: SystemStatsSnapshot) {
         if systemStatsSubmenuOpen {
             updateSystemStatsPanels(with: snapshot)
         }
         systemItemsController.apply(snapshot)
+    }
+
+    /// Remote backend: show the server Mac's utilization. While the server
+    /// is not reachable, show the empty snapshot (the "no data" state:
+    /// em-dashes and empty bars) instead of this Mac's numbers. A tick that
+    /// arrives while a fetch is in flight is dropped.
+    private func remoteSystemSamplingTick() {
+        guard remoteMonitor?.state.isReachable == true else {
+            remoteStatsFetchTask?.cancel()
+            remoteStatsFetchTask = nil
+            applySystemStats(SystemStatsSnapshot())
+            return
+        }
+        guard remoteStatsFetchTask == nil else { return }
+        let endpoint = config.endpoint
+        if remoteStatsSource?.endpoint != endpoint {
+            remoteStatsSource = RemoteSystemStatsSource(endpoint: endpoint)
+        }
+        guard let source = remoteStatsSource else { return }
+        remoteStatsFetchTask = Task { [weak self] in
+            let snapshot = await source.fetch()
+            guard let self, !Task.isCancelled else { return }
+            self.remoteStatsFetchTask = nil
+            // The endpoint may have changed while the request was in flight.
+            guard self.remoteStatsSource === source else { return }
+            self.applySystemStats(snapshot ?? SystemStatsSnapshot())
+        }
     }
 
     private func updateSystemStatsPanels(with snapshot: SystemStatsSnapshot) {
