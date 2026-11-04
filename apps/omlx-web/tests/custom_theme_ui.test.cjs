@@ -82,3 +82,9 @@ test('a custom status role also sets the pressure meter blends', () => {
     assert.match(theme.css({light: {danger: '#b91c1c'}, dark: {}}), /--meter-high: color-mix/);
     assert.doesNotMatch(theme.css({light: {'bg-primary': '#fdf6e3'}, dark: {}}), /--meter-/);
 });
+
+test('every token and group has an English label', () => {
+    const en = JSON.parse(fs.readFileSync(path.join(WEB, 'i18n/en.json'), 'utf8'));
+    for (const token of theme.TOKENS) assert.ok(en[`settings.theme.token.${token}`], token);
+    for (const group of theme.GROUPS) assert.ok(en[`settings.theme.group.${group.id}`], group.id);
+});
