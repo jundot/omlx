@@ -584,6 +584,7 @@ class PrefillHelperManager:
             node_id=self.node_id,
             held=held,
             device=info.get("device"),
+            memory=info.get("memory"),
             on_battery=bool(info.get("on_battery")),
         )
 

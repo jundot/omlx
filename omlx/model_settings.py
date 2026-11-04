@@ -222,6 +222,19 @@ def a8_prefill_on(settings: Any) -> bool:
     return bool(value)
 
 
+def oq_a8_model_supported(config_type: str | None) -> bool:
+    """True for the model families the A8 prefill paths can route.
+
+    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) and
+    DeepSeek V4.1 match exactly: only those validated checkpoint families have
+    routed-expert A8, so a ``qwen4`` prefix would admit unvalidated models.
+    """
+    config_type = str(config_type or "").lower().replace("-", "_")
+    return config_type in ("qwen4_exp", "deepseek_v41") or config_type.startswith(
+        ("qwen3_5", "qwen3_6", "qwen3_8")
+    )
+
+
 def ced_prefill_on(settings: Any) -> bool:
     """DeepSeek V4.1 CED prefill unless it was saved off."""
     return _setting(settings, "deepseek_v41_ced_prefill_enabled") is not False

@@ -72,7 +72,7 @@ Each prompt is cut into a fixed chunk grid when it is admitted. For every chunk 
 
 Large lookup tables (DeepSeek V4.1 Engram, Qwen3.8 PLE) stay on this Mac. It reads each chunk's rows and sends them ahead, so the helper holds no table and reads nothing from its SSD.
 
-Prompts shorter than 2,048 tokens and prompts with images prefill here. Other prompts queue for the helper in arrival order. If the helper disconnects or is stopped, the prompt continues here from the last finished chunk.
+A benchmark waits up to 10 minutes for the helper to be ready, and an uploaded result names the helper's chip, memory, layers and link (never its name). Prompts shorter than 2,048 tokens and prompts with images prefill here. Other prompts queue for the helper in arrival order. If the helper disconnects or is stopped, the prompt continues here from the last finished chunk.
 
 ## On the helper Mac
 

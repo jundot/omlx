@@ -85,6 +85,7 @@ from ..model_settings import (
     validate_moe_expert_offload,
     MOE_OFFLOAD_MTP_MODEL_TYPES,
     merge_chat_template_kwargs,
+    oq_a8_model_supported,
     validate_kv_compression_settings,
 )
 from ..patches.deepseek_v4.chat_template_v4 import REASONING_EFFORT_PROMPTS
@@ -246,17 +247,7 @@ print(deleted)
     return deleted, len(node_ids)
 
 
-def _oq_a8_model_supported(config_type: str | None) -> bool:
-    """True for the model families the A8 prefill paths can route.
-
-    Qwen3.5/3.6/3.8 match by prefix. Qwen3.8-Flash-Next (``qwen4_exp``) and
-    DeepSeek V4.1 match exactly: only those validated checkpoint families have
-    routed-expert A8, so a ``qwen4`` prefix would admit unvalidated models.
-    """
-    config_type = str(config_type or "").lower().replace("-", "_")
-    return config_type in ("qwen4_exp", "deepseek_v41") or config_type.startswith(
-        ("qwen3_5", "qwen3_6", "qwen3_8")
-    )
+_oq_a8_model_supported = oq_a8_model_supported
 
 
 def _oq_a8_kernels_available() -> bool:
