@@ -12,17 +12,7 @@ from pathlib import Path
 
 import requests
 
-
-def bracket_host(host: str) -> str:
-    """Return ``host`` in URL-authority form, bracketing bare IPv6 literals.
-
-    ``http://::1:8000`` is not a valid URL (requests rejects it with
-    InvalidURL); the RFC 3986 form is ``http://[::1]:8000``. IPv4 literals,
-    hostnames, and already-bracketed literals pass through unchanged.
-    """
-    if ":" in host and not host.startswith("["):
-        return f"[{host}]"
-    return host
+from omlx.settings import bracket_host
 
 
 @dataclass(frozen=True)
@@ -50,10 +40,15 @@ class IntegrationContext:
     # read it instead of fetching the status again themselves; empty for
     # direct constructions.
     models_status_map: dict[str, dict] = field(default_factory=dict)
+    # "http" | "https"; last so positional callers keep working.
+    scheme: str = "http"
+    # True when the launcher resolved a remote backend (settings ``remote``
+    # section or OMLX_REMOTE_URL) rather than the local server.
+    is_remote: bool = False
 
     @property
     def base_url(self) -> str:
-        return f"http://{bracket_host(self.host)}:{self.port}"
+        return f"{self.scheme}://{bracket_host(self.host)}:{self.port}"
 
     @property
     def openai_base_url(self) -> str:

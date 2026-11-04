@@ -181,7 +181,11 @@ private struct APIKeyEditorRow: View {
         defer { saving = false }
         let next = trimmed
         let ok = await vm.applyApiKey(next, client: client)
-        if ok {
+        if ok, services.isRemoteBackend {
+            // The key belongs to the server on the other Mac; keep the
+            // local copy the app logs in with in step.
+            services.backendAPIKeyDidChange(next)
+        } else if ok {
             // Server state changes reapply `services.config` to the client.
             var updated = services.config
             updated.apiKey = next

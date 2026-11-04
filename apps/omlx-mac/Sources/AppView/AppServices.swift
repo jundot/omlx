@@ -67,7 +67,9 @@ final class AppServices: NSObject {
 
     init(config: AppConfig = .default, server: ServerProcess? = nil) {
         self.config = config
-        self.client = OMLXClient(host: config.host, port: config.port, apiKey: config.apiKey)
+        let endpoint = config.endpoint
+        self.client = OMLXClient(host: endpoint.host, port: endpoint.port,
+                                 apiKey: endpoint.apiKey, scheme: endpoint.scheme)
         self.updates = UpdateController()
         super.init()
         self.bind(server: server)
@@ -115,7 +117,7 @@ final class AppServices: NSObject {
 
     func updateConfig(_ next: AppConfig) {
         self.config = next
-        client.configure(host: next.host, port: next.port, apiKey: next.apiKey)
+        client.configure(endpoint: next.endpoint)
     }
 
     func setAutoStartOnLaunch(_ enabled: Bool, persist: Bool = true) throws {
@@ -131,7 +133,90 @@ final class AppServices: NSObject {
 
     var hasServer: Bool { server != nil }
 
+    // MARK: - Remote backend
+
+    /// Reachability of the remote backend. `.idle` when this install runs
+    /// its own server.
+    var remoteState: RemoteBackendMonitor.State = .idle
+    @ObservationIgnored
+    private var remoteMonitor: RemoteBackendMonitor?
+
+    /// This install points at an oMLX server on another Mac.
+    var isRemoteBackend: Bool { config.isRemote }
+
+    /// The server this app talks to answers: the managed process is
+    /// running, or the remote backend is reachable.
+    var backendIsUp: Bool {
+        config.isRemote ? remoteState.isReachable : serverState.isRunningLike
+    }
+
+    func bind(remoteMonitor: RemoteBackendMonitor?) {
+        if self.remoteMonitor != nil {
+            NotificationCenter.default.removeObserver(
+                self,
+                name: RemoteBackendMonitor.stateDidChangeNotification,
+                object: nil
+            )
+        }
+        self.remoteMonitor = remoteMonitor
+        if let remoteMonitor {
+            self.remoteState = remoteMonitor.state
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(remoteStateDidChange(_:)),
+                name: RemoteBackendMonitor.stateDidChangeNotification,
+                object: remoteMonitor
+            )
+        } else {
+            self.remoteState = .idle
+        }
+    }
+
+    @objc private func remoteStateDidChange(_ note: Notification) {
+        guard let monitor = note.object as? RemoteBackendMonitor, monitor === remoteMonitor else { return }
+        remoteState = monitor.state
+    }
+
+    /// Probe the remote backend now instead of waiting for the next tick.
+    func refreshRemoteBackend() async {
+        await remoteMonitor?.refresh()
+    }
+
+    /// Point this install at another Mac, or back at its own server. The
+    /// choice is read at launch (it decides whether a server is spawned at
+    /// all), so this stops the managed server, writes the `remote` slice
+    /// and reopens the app.
+    func applyRemoteBackend(enabled: Bool, address: String, apiKey: String?) async throws {
+        await server?.stop()
+        try AppConfig.saveRemoteBackend(
+            basePath: config.basePath, enabled: enabled, address: address, apiKey: apiKey
+        )
+        var updated = config
+        updated.remoteEnabled = enabled
+        updated.remoteAddress = address
+        updated.remoteAPIKey = AppConfig.cleanedKey(apiKey)
+        self.config = updated
+        relaunchApp()
+    }
+
+    /// The Security screen rotated the key of the server this app talks
+    /// to. With a remote backend that server is on another Mac, so keep
+    /// the local copy in step or the next launch cannot log in.
+    func backendAPIKeyDidChange(_ key: String) {
+        guard config.isRemote else { return }
+        var updated = config
+        updated.remoteAPIKey = AppConfig.cleanedKey(key)
+        try? AppConfig.saveRemoteBackend(
+            basePath: updated.basePath, enabled: true,
+            address: updated.remoteAddress, apiKey: updated.remoteAPIKey
+        )
+        updateConfig(updated)
+    }
+
     var canSaveSettingsOffline: Bool {
+        // A remote backend is never "offline" from here: its settings are
+        // changed through its admin API, not by editing a local file.
+        if config.isRemote { return false }
         switch serverState {
         case .stopped, .failed: return true
         default: return false
@@ -247,7 +332,7 @@ final class AppServices: NSObject {
             if let host { updated.bindAddress = host }
             try AppConfig.saveServerEndpoint(basePath: updated.basePath, host: host, port: port)
             self.config = updated
-            client.configure(host: updated.host, port: updated.port, apiKey: updated.apiKey)
+            client.configure(endpoint: updated.endpoint)
         }
 
         if let server {
@@ -415,6 +500,10 @@ final class AppServices: NSObject {
 
     /// Apply an API-validated endpoint while live, or persist it for the next start.
     func applyServerEndpoint(host: String? = nil, port: Int? = nil) async throws {
+        // With a remote backend the PATCH the caller already sent changed
+        // that server's bind; nothing here moves, and the local server
+        // fields must not pick up the other Mac's address.
+        if config.isRemote { return }
         let wasOffline = canSaveSettingsOffline
         let resolvedBindAddress = host ?? config.bindAddress
         let resolvedPort = port ?? config.port
