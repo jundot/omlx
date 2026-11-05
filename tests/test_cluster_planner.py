@@ -762,6 +762,44 @@ def test_offloaded_engram_tables_stay_out_of_pipeline_rank_memory():
     )
 
 
+def test_offloaded_experts_stay_out_of_pipeline_rank_memory():
+    layout = ModelLayout(
+        source="experts",
+        fixed_weight_bytes=0,
+        layer_weight_bytes=(100, 300, 100),
+        supports_pipeline=True,
+    )
+    small = [NodeBudget(node_id="mini", capacity_bytes=320, rank=0)]
+    offload = (0, 200, 0)
+
+    for planner in (plan_unequal_pipeline, plan_proportional_pipeline):
+        with pytest.raises(PlanningError):
+            planner(layout, small)
+        (assignment,) = planner(
+            layout,
+            small,
+            moe_offload_layer_bytes=offload,
+            moe_expert_offload_resident_fraction=0.125,
+        ).assignments
+        assert assignment.layer_weight_bytes == 500
+        assert assignment.ssd_weight_bytes == 0
+        assert assignment.moe_offload_weight_bytes == 200
+        assert assignment.moe_expert_offload_resident_fraction == 0.125
+        assert assignment.planned_weight_bytes == 300
+        assert _assignment_from_dict(assignment.to_dict()) == assignment
+
+    large = [NodeBudget(node_id="studio", capacity_bytes=1000, rank=0)]
+    assert (
+        plan_unequal_pipeline(
+            layout,
+            large,
+            moe_offload_layer_bytes=offload,
+            moe_expert_offload_resident_fraction=0.125,
+        ).plan_hash
+        != plan_unequal_pipeline(layout, large).plan_hash
+    )
+
+
 def test_complete_model_layout_cache_invalidates_on_shard_overwrite(
     tmp_path, monkeypatch
 ):

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import re
 import sys
 from collections.abc import Callable
@@ -81,6 +82,7 @@ def progressive_sharded_load(
     trust_remote_code: bool = False,
     progress: ProgressCallback | None = None,
     engram_ssd_offload: bool = False,
+    moe_expert_offload_resident_fraction: float = 0.0,
     utils_module: Any = None,
     mx_module: Any = None,
 ) -> Any:
@@ -136,10 +138,27 @@ def progressive_sharded_load(
                 raise ValueError("this model supports pipeline parallelism only")
             model = tensor_loader(model_path, tensor_group)
         else:
+            stage_kwargs = {"engram_ssd_offload": engram_ssd_offload}
+            if moe_expert_offload_resident_fraction:
+                accepted = inspect.signature(stage_loader).parameters
+                if (
+                    "moe_expert_offload_resident_fraction" not in accepted
+                    and not any(
+                        item.kind is inspect.Parameter.VAR_KEYWORD
+                        for item in accepted.values()
+                    )
+                ):
+                    raise ValueError(
+                        "this architecture's stage loader does not support "
+                        "MoE expert offload"
+                    )
+                stage_kwargs["moe_expert_offload_resident_fraction"] = (
+                    moe_expert_offload_resident_fraction
+                )
             model = stage_loader(
                 model_path,
                 pipeline_group or mx_module.distributed.init(),
-                engram_ssd_offload=engram_ssd_offload,
+                **stage_kwargs,
             )
         if return_config:
             return model, tokenizer, metadata_config
@@ -288,6 +307,7 @@ def install_progressive_loader(
     *,
     progress: ProgressCallback | None = None,
     engram_ssd_offload: bool = False,
+    moe_expert_offload_resident_fraction: float = 0.0,
 ) -> Any:
     """Install the loader only around ``ModelProvider.load_default()``."""
 
@@ -299,6 +319,9 @@ def install_progressive_loader(
             **kwargs,
             progress=progress,
             engram_ssd_offload=engram_ssd_offload,
+            moe_expert_offload_resident_fraction=(
+                moe_expert_offload_resident_fraction
+            ),
         )
 
     server_module.sharded_load = load

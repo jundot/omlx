@@ -62,6 +62,28 @@ def test_checkpoint_offload_matches_prefill_decode_and_closes(
     disk.close()
 
 
+def test_offload_layer_bytes_match_the_loader_capacity(tmp_path):
+    source, _ = write_checkpoint(
+        tmp_path,
+        vision=False,
+        n_routed_experts=8,
+        n_activated_experts=2,
+    )
+    from omlx.patches.deepseek_v41.moe_offload import _plan, offload_layer_bytes
+
+    plan = _plan(source, 0.25)
+    by_layer = {}
+    for prefix, size in plan.layer_bytes.items():
+        by_layer[int(prefix.split(".")[2])] = (
+            size - size * plan.capacity // plan.count
+        )
+    expected = tuple(by_layer[index] for index in sorted(by_layer))
+
+    assert offload_layer_bytes(source, 0.25) == expected
+    assert sum(expected) == plan.full_bytes - plan.resident_bytes
+    plan.close()
+
+
 def test_missing_expert_is_rejected_before_loading(tmp_path):
     source, _ = write_checkpoint(tmp_path, vision=False)
     path = source / "model.safetensors.index.json"

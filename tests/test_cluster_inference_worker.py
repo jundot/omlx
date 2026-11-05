@@ -1246,6 +1246,24 @@ def test_the_rank_loads_engram_from_ssd_only_when_its_plan_offloads_it(
     assert offload is (ssd_weight_bytes > 0)
 
 
+def test_the_rank_forwards_the_moe_expert_resident_fraction(monkeypatch, tmp_path):
+    plan = _uneven_plan()
+    assignments = (
+        replace(
+            plan[0],
+            moe_expert_offload_resident_fraction=0.125,
+            moe_offload_weight_bytes=4 * GiB,
+        ),
+        plan[1],
+    )
+
+    record = _run_rank(monkeypatch, tmp_path, assignments=assignments)
+
+    assert record["progressive_loader_kwargs"][
+        "moe_expert_offload_resident_fraction"
+    ] == 0.125
+
+
 def test_the_wired_limit_asks_for_the_admission_budget_not_apples_maximum(
     monkeypatch, tmp_path
 ):
