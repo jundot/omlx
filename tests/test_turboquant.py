@@ -680,26 +680,32 @@ def test_decode_multirow_matches_dequantize_reference(q_len, monkeypatch):
     assert mx.abs(ref_nomask - ref).max().item() > 1e-3
 
 
-@pytest.mark.parametrize("q_len", [2, 3, 4])
+@pytest.mark.parametrize("q_len", [2, 4, 5, 8, 15])
 def test_fused_multirow_kernel_matches_dequantize_reference(q_len, monkeypatch):
-    """Above the token floor, MSE-codec MTP verify outside the MMA kernel's
-    envelope takes the fused multi-row kernel (one KV unpack shared across
-    rows, issue #2215). Its output must match the dequantize+SDPA reference
-    with the causal tail mask, and the dispatcher must route to it
-    bit-exactly."""
+    """Above the token floor, 3-bit MTP verify (outside the MMA kernel's
+    envelope) takes the fused multi-row kernel in groups of up to 4 rows
+    (issue #2215). Wide context-copy windows must stay on it rather than
+    unpacking the whole cache every cycle (issue #4866). The output must
+    match the dequantize+SDPA reference with the causal tail mask, and the
+    dispatcher must route to it bit-exactly."""
     from omlx.patches import turboquant_attention as tq_attention
 
     monkeypatch.setattr(tq_attention, "_mma_mse_attention", lambda *a, **k: None)
     mx.random.seed(0)
     B, n_q, n_kv, D = 1, 16, 2, 256
-    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 512
+    # Off a 256-token step boundary, so the buffers outgrow the prefix.
+    T = tq_attention._FUSED_MULTIROW_MIN_TOKENS + 500
     fp_cache = KVCache()
     fp_cache.update_and_fetch(
-        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
-        mx.random.normal((B, n_kv, T, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T - q_len, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, T - q_len, D)).astype(mx.float16),
     )
-    tq = TurboQuantKVCache.from_cache(fp_cache, bits=4.0)
-    ks, vs = tq.state
+    tq = TurboQuantKVCache.from_cache(fp_cache, bits=3.0)
+    ks, vs = tq.update_and_fetch(
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+        mx.random.normal((B, n_kv, q_len, D)).astype(mx.float16),
+    )
+    assert tq.keys.norms.shape[2] > tq.offset == T
     queries = mx.random.normal((B, n_q, q_len, D)).astype(mx.float16)
     scale = D**-0.5
 
