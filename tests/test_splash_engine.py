@@ -2271,6 +2271,25 @@ class TestSplashRuntimeCache:
         await engine.stop()
         assert engine._status_task is None
 
+    async def test_status_refresh_keeps_a_cancel_raised_as_timeout(self, tmp_path):
+        # Older anyio raises the request timeout in place of a cancel that
+        # lands with the deadline.
+        fetching = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            fetching.set()
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                raise httpx.ReadTimeout("timed out", request=request) from None
+
+        engine = _engine_with_transport(tmp_path, handler)
+        task = asyncio.create_task(engine._refresh_status())
+        await fetching.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
     def test_cache_dashboard_lists_splash_next_to_mlx(self, tmp_path):
         settings = SimpleNamespace(
             base_path=tmp_path,

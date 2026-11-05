@@ -1401,11 +1401,17 @@ class SplashEngine(BaseEngine):
         """Keep the last /status snapshot for the synchronous getters."""
         if self._client is None:
             return
+        task = asyncio.current_task()
+        cancelling = task.cancelling()
         try:
             response = await self._client.get("/status", timeout=2)
             response.raise_for_status()
             data = response.json()
         except Exception:
+            # Older anyio turns a cancel that lands with the request deadline
+            # into a timeout error; keep it a cancel so stop() can finish.
+            if task.cancelling() > cancelling:
+                raise asyncio.CancelledError from None
             logger.debug("Splash: failed to fetch /status", exc_info=True)
             return
         if not isinstance(data, dict):
