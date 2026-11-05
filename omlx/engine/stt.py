@@ -487,7 +487,8 @@ class _SegmentedRealtimeBackend:
         kwargs = {"language": self._language} if self._language else {}
         out: list[str] = []
         for segment in segments:
-            result = self._model.generate(segment, **kwargs)
+            # mlx-audio generate() takes a path or mx.array, not NumPy.
+            result = self._model.generate(mx.array(segment), **kwargs)
             text = (getattr(result, "text", "") or "").strip()
             if text:
                 out.append(" " + text if self._emitted else text)

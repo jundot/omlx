@@ -220,6 +220,8 @@ class _FakeWholeBufferModel:
         self.seconds: list[float] = []
 
     def generate(self, audio, **kwargs):
+        # Parakeet casts the waveform like this; NumPy input raises TypeError.
+        audio = audio.astype(mx.bfloat16)
         self.seconds.append(len(audio) / 16000)
         return SimpleNamespace(text=f" part{len(self.seconds)} ")
 
