@@ -16,6 +16,7 @@ from omlx.settings import (
     AuthSettings,
     CacheSettings,
     ClaudeCodeSettings,
+    ClientEndpoint,
     GlobalSettings,
     HuggingFaceSettings,
     IntegrationSettings,
@@ -24,6 +25,7 @@ from omlx.settings import (
     MemorySettings,
     ModelSettings,
     NetworkSettings,
+    RemoteSettings,
     SamplingSettings,
     SchedulerSettings,
     ServerSettings,
@@ -33,6 +35,7 @@ from omlx.settings import (
     get_ssd_capacity,
     get_system_memory,
     init_settings,
+    parse_endpoint_address,
     reset_settings,
     resolve_default_base_path,
 )
@@ -829,6 +832,211 @@ class TestMCPSettings:
         backups = list(tmp_path.glob("settings.json.corrupt-*"))
         assert len(backups) == 1
         assert "garbage-tail" in backups[0].read_text()
+
+
+class TestRemoteSettings:
+    """RemoteSettings section: defaults, persistence, env overrides."""
+
+    def test_defaults(self):
+        r = RemoteSettings()
+        assert r.enabled is False
+        assert r.url == ""
+        assert r.api_key is None
+
+    def test_to_dict_from_dict_round_trip(self):
+        r = RemoteSettings(enabled=True, url="studio.local:9000", api_key="k")
+        d = r.to_dict()
+        assert d == {"enabled": True, "url": "studio.local:9000", "api_key": "k"}
+        assert RemoteSettings.from_dict(d) == r
+
+    def test_from_dict_missing_keys_use_defaults(self):
+        assert RemoteSettings.from_dict({}) == RemoteSettings()
+
+    def test_global_defaults_disabled(self, tmp_path):
+        assert GlobalSettings(base_path=tmp_path).remote == RemoteSettings()
+
+    def test_save_load_round_trip(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("OMLX_REMOTE_URL", raising=False)
+        monkeypatch.delenv("OMLX_REMOTE_API_KEY", raising=False)
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.remote = RemoteSettings(enabled=True, url="https://x.local", api_key="k")
+        gs.save()
+        saved = json.loads((tmp_path / "settings.json").read_text())
+        assert saved["remote"] == {
+            "enabled": True,
+            "url": "https://x.local",
+            "api_key": "k",
+        }
+        assert GlobalSettings.load(base_path=tmp_path).remote == gs.remote
+
+    def test_env_url_sets_url_and_enables(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("OMLX_REMOTE_API_KEY", raising=False)
+        monkeypatch.setenv("OMLX_REMOTE_URL", "studio.local:9000")
+        r = GlobalSettings.load(base_path=tmp_path).remote
+        assert r.url == "studio.local:9000"
+        assert r.enabled is True
+        assert r.api_key is None
+
+    def test_env_api_key(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("OMLX_REMOTE_URL", raising=False)
+        monkeypatch.setenv("OMLX_REMOTE_API_KEY", "env-key")
+        r = GlobalSettings.load(base_path=tmp_path).remote
+        assert r.api_key == "env-key"
+        assert r.enabled is False
+
+    def test_env_overrides_file(self, tmp_path, monkeypatch):
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.remote = RemoteSettings(enabled=False, url="old.local", api_key="old")
+        gs.save()
+        monkeypatch.setenv("OMLX_REMOTE_URL", "new.local")
+        monkeypatch.setenv("OMLX_REMOTE_API_KEY", "new")
+        r = GlobalSettings.load(base_path=tmp_path).remote
+        assert (r.enabled, r.url, r.api_key) == (True, "new.local", "new")
+
+
+class TestParseEndpointAddress:
+    """Vectors shared with the macOS app's Swift parser."""
+
+    @pytest.mark.parametrize(
+        ("text", "scheme", "host", "port"),
+        [
+            ("studio.local", "http", "studio.local", 8000),
+            ("studio.local:9000", "http", "studio.local", 9000),
+            ("https://studio.local", "https", "studio.local", 443),
+            ("https://studio.local:8443", "https", "studio.local", 8443),
+            ("http://192.168.1.20:8000", "http", "192.168.1.20", 8000),
+            ("http://[::1]:8000", "http", "::1", 8000),
+            ("[fe80::1]", "http", "fe80::1", 8000),
+            ("  studio.local:9000  ", "http", "studio.local", 9000),
+            ("http://studio.local:8000/", "http", "studio.local", 8000),
+        ],
+    )
+    def test_accepted(self, text, scheme, host, port):
+        ep = parse_endpoint_address(text)
+        assert ep is not None
+        assert (ep.scheme, ep.host, ep.port) == (scheme, host, port)
+        assert ep.api_key == ""
+        assert ep.is_remote is False
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "   ",
+            "studio.local/v1",
+            "ftp://x",
+            "http://",
+            "studio.local:abc",
+            "studio.local:0",
+            "studio.local:70000",
+            "studio.local:",
+            "studio.local?x=1",
+            "studio.local#frag",
+            "http://studio.local:8000/?a=b",
+            "a:b@host",
+            "http://user@studio.local",
+            "http://studio.local//",
+            "::1",
+            "[::1",
+            "[nothex]:8000",
+            "[::1]x",
+        ],
+    )
+    def test_rejected(self, text):
+        assert parse_endpoint_address(text) is None
+
+    def test_base_url_brackets_ipv6(self):
+        assert parse_endpoint_address("http://[::1]:8000").base_url == (
+            "http://[::1]:8000"
+        )
+        assert parse_endpoint_address("https://studio.local").base_url == (
+            "https://studio.local:443"
+        )
+        assert ClientEndpoint("http", "127.0.0.1", 8000).base_url == (
+            "http://127.0.0.1:8000"
+        )
+
+
+class TestClientEndpointResolver:
+    """GlobalSettings.client_endpoint precedence."""
+
+    @staticmethod
+    def _gs(tmp_path, **remote):
+        gs = GlobalSettings(base_path=tmp_path)
+        gs.server.host = "127.0.0.1"
+        gs.server.port = 8000
+        gs.auth.api_key = "local-key"
+        gs.remote = RemoteSettings(**remote)
+        return gs
+
+    def test_local_default(self, tmp_path):
+        ep = self._gs(tmp_path).client_endpoint()
+        assert ep == ClientEndpoint("http", "127.0.0.1", 8000, "local-key", False)
+
+    @pytest.mark.parametrize("bind", ["0.0.0.0", "::", "", " , "])
+    def test_wildcard_bind_maps_to_loopback(self, tmp_path, bind):
+        gs = self._gs(tmp_path)
+        gs.server.host = bind
+        assert gs.client_endpoint().host == "127.0.0.1"
+
+    def test_first_entry_of_bind_list(self, tmp_path):
+        gs = self._gs(tmp_path)
+        gs.server.host = "10.0.0.5, 127.0.0.1"
+        assert gs.client_endpoint().host == "10.0.0.5"
+
+    def test_local_cli_api_key_wins(self, tmp_path):
+        assert self._gs(tmp_path).client_endpoint(api_key="cli").api_key == "cli"
+
+    def test_local_no_key_is_empty(self, tmp_path):
+        gs = self._gs(tmp_path)
+        gs.auth.api_key = None
+        assert gs.client_endpoint().api_key == ""
+
+    def test_remote_beats_local(self, tmp_path):
+        gs = self._gs(
+            tmp_path, enabled=True, url="https://studio.local:8443", api_key="rk"
+        )
+        ep = gs.client_endpoint()
+        assert ep == ClientEndpoint("https", "studio.local", 8443, "rk", True)
+
+    def test_remote_cli_api_key_wins(self, tmp_path):
+        gs = self._gs(tmp_path, enabled=True, url="studio.local", api_key="rk")
+        assert gs.client_endpoint(api_key="cli").api_key == "cli"
+
+    def test_remote_without_key_does_not_borrow_local_key(self, tmp_path):
+        gs = self._gs(tmp_path, enabled=True, url="studio.local")
+        assert gs.client_endpoint().api_key == ""
+
+    def test_remote_disabled_is_ignored(self, tmp_path):
+        gs = self._gs(tmp_path, enabled=False, url="studio.local")
+        assert gs.client_endpoint().is_remote is False
+
+    def test_disabled_remote_with_bad_url_is_ignored(self, tmp_path):
+        gs = self._gs(tmp_path, enabled=False, url="ftp://x")
+        assert gs.client_endpoint().host == "127.0.0.1"
+
+    def test_explicit_host_beats_remote(self, tmp_path):
+        gs = self._gs(tmp_path, enabled=True, url="studio.local", api_key="rk")
+        ep = gs.client_endpoint(host="10.1.1.1")
+        assert ep == ClientEndpoint("http", "10.1.1.1", 8000, "local-key", False)
+
+    def test_explicit_port_beats_remote(self, tmp_path):
+        gs = self._gs(tmp_path, enabled=True, url="studio.local", api_key="rk")
+        ep = gs.client_endpoint(port=9100)
+        assert ep == ClientEndpoint("http", "127.0.0.1", 9100, "local-key", False)
+
+    def test_explicit_wildcard_host_maps_to_loopback(self, tmp_path):
+        gs = self._gs(tmp_path)
+        assert gs.client_endpoint(host="0.0.0.0").host == "127.0.0.1"
+
+    def test_bad_remote_url_raises(self, tmp_path):
+        gs = self._gs(tmp_path, enabled=True, url="studio.local/v1")
+        with pytest.raises(ValueError, match="remote.url"):
+            gs.client_endpoint()
+
+    def test_bad_remote_url_ignored_with_explicit_host(self, tmp_path):
+        gs = self._gs(tmp_path, enabled=True, url="")
+        assert gs.client_endpoint(host="127.0.0.1").is_remote is False
 
 
 class TestUsageSettings:

@@ -3425,6 +3425,14 @@ async def health(response: Response):
     }
 
 
+@app.get("/api/system-metrics")
+async def system_metrics(_: bool = Depends(verify_api_key)):
+    """Host CPU, GPU, memory, load, uptime and thermal state of this machine."""
+    from .system_metrics import collect_system_metrics
+
+    return await asyncio.to_thread(collect_system_metrics)
+
+
 @app.get("/api/status")
 async def server_status(_: bool = Depends(verify_api_key)):
     """Lightweight status endpoint for external tool polling (statuslines, scripts)."""

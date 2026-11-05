@@ -45,7 +45,7 @@ final class AskAIController {
     @ObservationIgnored private var copiedToken = 0
     /// Model id -> `model_type` from the server's model list, for the image check.
     @ObservationIgnored private var modelTypes: [String: String] = [:]
-    @ObservationIgnored private var modelTypesSource: AskAIEndpoint?
+    @ObservationIgnored private var modelTypesSource: OMLXEndpoint?
     @ObservationIgnored private var isSubmitting = false
     @ObservationIgnored private var lastClosedAt = Date.distantPast
     /// The app in front when the panel opened, for the `{app}` placeholder.
@@ -314,13 +314,13 @@ final class AskAIController {
     }
 
     /// Nil when "another server" is chosen but its address is empty or invalid.
-    func currentEndpoint() -> AskAIEndpoint? {
+    func currentEndpoint() -> OMLXEndpoint? {
         guard let config = services?.config else { return nil }
         return store.prefs.currentEndpoint(local: config)
     }
 
-    func listModels(on endpoint: AskAIEndpoint) async throws -> [ModelDTO] {
-        if endpoint.isRemote { return try await endpoint.remoteModels() }
+    func listModels(on endpoint: OMLXEndpoint) async throws -> [ModelDTO] {
+        if endpoint.isRemote { return try await endpoint.models() }
         guard let client = services?.client else { throw OMLXClientError.invalidURL }
         return try await client.listModels().models
     }

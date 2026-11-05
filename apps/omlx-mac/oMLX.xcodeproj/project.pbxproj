@@ -29,6 +29,7 @@
 		2BB00000000000000000000D /* ScreenScaffold.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000D /* ScreenScaffold.swift */; };
 		2BB00000000000000000000E /* CountFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CC00000000000000000000E /* CountFormat.swift */; };
 		3BB000000000000000000001 /* AppConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000001 /* AppConfig.swift */; };
+		AB0100000000000000000E01 /* OMLXEndpoint.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC0100000000000000000E01 /* OMLXEndpoint.swift */; };
 		3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000002 /* MenubarStatsPoller.swift */; };
 		3BB000000000000000000003 /* MenubarVisibilityWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */; };
 		3BB000000000000000000010 /* MenubarMetricPrefs.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000010 /* MenubarMetricPrefs.swift */; };
@@ -42,6 +43,8 @@
 		3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000004 /* ShellEnvWriter.swift */; };
 		3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CC000000000000000000005 /* APIKeyGenerator.swift */; };
 		4BB000000000000000000001 /* PortConflictResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000001 /* PortConflictResolver.swift */; };
+		AB0100000000000000000E02 /* RemoteBackendMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC0100000000000000000E02 /* RemoteBackendMonitor.swift */; };
+		AB0100000000000000000E03 /* RemoteSystemStats.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC0100000000000000000E03 /* RemoteSystemStats.swift */; };
 		4BB000000000000000000002 /* SignalHandlers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000002 /* SignalHandlers.swift */; };
 		4BB000000000000000000003 /* AppControlServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4CC000000000000000000003 /* AppControlServer.swift */; };
 		6BB000000000000000000001 /* AppView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CC000000000000000000001 /* AppView.swift */; };
@@ -107,6 +110,7 @@
 		BBB000000000000000000006 /* UpdateInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000005 /* UpdateInstaller.swift */; };
 		DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000001 /* AppServicesPathTests.swift */; };
 		DBB000000000000000000002 /* AppConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000002 /* AppConfigTests.swift */; };
+		DBB000000000000000000E03 /* RemoteSystemStatsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000E03 /* RemoteSystemStatsTests.swift */; };
 		DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */; };
 		DBB000000000000000000004 /* ProfileDTODecodeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000004 /* ProfileDTODecodeTests.swift */; };
 		DBB000000000000000000005 /* SamplingValidatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000005 /* SamplingValidatorTests.swift */; };
@@ -197,6 +201,7 @@
 		2CC00000000000000000000C /* CodeChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeChip.swift; sourceTree = "<group>"; };
 		2CC00000000000000000000D /* ScreenScaffold.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenScaffold.swift; sourceTree = "<group>"; };
 		3CC000000000000000000001 /* AppConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfig.swift; sourceTree = "<group>"; };
+		AC0100000000000000000E01 /* OMLXEndpoint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OMLXEndpoint.swift; sourceTree = "<group>"; };
 		3CC000000000000000000002 /* MenubarStatsPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarStatsPoller.swift; sourceTree = "<group>"; };
 		3CC000000000000000000003 /* MenubarVisibilityWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarVisibilityWatcher.swift; sourceTree = "<group>"; };
 		3CC000000000000000000010 /* MenubarMetricPrefs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarMetricPrefs.swift; sourceTree = "<group>"; };
@@ -210,6 +215,8 @@
 		3CC000000000000000000004 /* ShellEnvWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShellEnvWriter.swift; sourceTree = "<group>"; };
 		3CC000000000000000000005 /* APIKeyGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = APIKeyGenerator.swift; sourceTree = "<group>"; };
 		4CC000000000000000000001 /* PortConflictResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PortConflictResolver.swift; sourceTree = "<group>"; };
+		AC0100000000000000000E02 /* RemoteBackendMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteBackendMonitor.swift; sourceTree = "<group>"; };
+		AC0100000000000000000E03 /* RemoteSystemStats.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteSystemStats.swift; sourceTree = "<group>"; };
 		4CC000000000000000000002 /* SignalHandlers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignalHandlers.swift; sourceTree = "<group>"; };
 		4CC000000000000000000003 /* AppControlServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppControlServer.swift; sourceTree = "<group>"; };
 		6CC000000000000000000001 /* AppView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppView.swift; sourceTree = "<group>"; };
@@ -275,6 +282,7 @@
 		BCC000000000000000000005 /* UpdateInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateInstaller.swift; sourceTree = "<group>"; };
 		DCC000000000000000000001 /* AppServicesPathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppServicesPathTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000002 /* AppConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfigTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000E03 /* RemoteSystemStatsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteSystemStatsTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreenVMStorageDiffTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000004 /* ProfileDTODecodeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProfileDTODecodeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000005 /* SamplingValidatorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SamplingValidatorTests.swift; sourceTree = "<group>"; };
@@ -371,6 +379,7 @@
 			children = (
 				DCC000000000000000000001 /* AppServicesPathTests.swift */,
 				DCC000000000000000000002 /* AppConfigTests.swift */,
+				DCC000000000000000000E03 /* RemoteSystemStatsTests.swift */,
 				DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */,
 				DCC000000000000000000004 /* ProfileDTODecodeTests.swift */,
 				DCC000000000000000000005 /* SamplingValidatorTests.swift */,
@@ -444,6 +453,7 @@
 				3CC000000000000000000015 /* SystemStatsSampler.swift */,
 				3CC000000000000000000016 /* SystemStatsPanels.swift */,
 				3CC000000000000000000017 /* SystemMenubarItemsController.swift */,
+				AC0100000000000000000E03 /* RemoteSystemStats.swift */,
 			);
 			path = Menubar;
 			sourceTree = "<group>";
@@ -474,6 +484,7 @@
 				1CCCCCCCCCCCCCCCCCCCCCC8 /* PythonRuntime.swift */,
 				1CCCCCCCCCCCCCCCCCCCCCC9 /* ServerProcess.swift */,
 				4CC000000000000000000001 /* PortConflictResolver.swift */,
+				AC0100000000000000000E02 /* RemoteBackendMonitor.swift */,
 				4CC000000000000000000002 /* SignalHandlers.swift */,
 				4CC000000000000000000003 /* AppControlServer.swift */,
 			);
@@ -514,6 +525,7 @@
 			isa = PBXGroup;
 			children = (
 				3CC000000000000000000001 /* AppConfig.swift */,
+				AC0100000000000000000E01 /* OMLXEndpoint.swift */,
 				3CC000000000000000000004 /* ShellEnvWriter.swift */,
 				3CC000000000000000000005 /* APIKeyGenerator.swift */,
 			);
@@ -811,6 +823,7 @@
 				AAD9D5172FE283D100FAEA05 /* ServerScreenVM.swift in Sources */,
 				2BB00000000000000000000C /* CodeChip.swift in Sources */,
 				3BB000000000000000000001 /* AppConfig.swift in Sources */,
+				AB0100000000000000000E01 /* OMLXEndpoint.swift in Sources */,
 				3BB000000000000000000004 /* ShellEnvWriter.swift in Sources */,
 				3BB000000000000000000005 /* APIKeyGenerator.swift in Sources */,
 				3BB000000000000000000002 /* MenubarStatsPoller.swift in Sources */,
@@ -823,7 +836,9 @@
 				3BB000000000000000000015 /* SystemStatsSampler.swift in Sources */,
 				3BB000000000000000000016 /* SystemStatsPanels.swift in Sources */,
 				3BB000000000000000000017 /* SystemMenubarItemsController.swift in Sources */,
+				AB0100000000000000000E03 /* RemoteSystemStats.swift in Sources */,
 				4BB000000000000000000001 /* PortConflictResolver.swift in Sources */,
+				AB0100000000000000000E02 /* RemoteBackendMonitor.swift in Sources */,
 				4BB000000000000000000002 /* SignalHandlers.swift in Sources */,
 				4BB000000000000000000003 /* AppControlServer.swift in Sources */,
 				6BB000000000000000000001 /* AppView.swift in Sources */,
@@ -895,6 +910,7 @@
 				DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */,
 				DBB0000000000000000000F5 /* LogRecordsTests.swift in Sources */,
 				DBB000000000000000000002 /* AppConfigTests.swift in Sources */,
+				DBB000000000000000000E03 /* RemoteSystemStatsTests.swift in Sources */,
 				DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */,
 				DBB000000000000000000004 /* ProfileDTODecodeTests.swift in Sources */,
 				DBB000000000000000000005 /* SamplingValidatorTests.swift in Sources */,

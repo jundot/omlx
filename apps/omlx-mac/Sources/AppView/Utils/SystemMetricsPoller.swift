@@ -26,15 +26,33 @@ final class SystemMetricsPoller {
     @ObservationIgnored
     private var pollTask: Task<Void, Never>?
 
-    func start() {
+    /// `remote` set: sample the oMLX server's Mac via `/api/system-metrics`
+    /// instead of this one. Nil: this Mac, as before.
+    func start(remote: OMLXEndpoint? = nil) {
         pollTask?.cancel()
-        // Read once immediately so the bar doesn't flash empty on appear.
-        tick()
+        guard let remote else {
+            // Read once immediately so the bar doesn't flash empty on appear.
+            tick()
+            pollTask = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(5))
+                    if Task.isCancelled { return }
+                    await MainActor.run { self?.tick() }
+                }
+            }
+            return
+        }
+        // Do not show this Mac's numbers as the server's while the first
+        // remote reading is in flight.
+        ramUsedBytes = nil
+        ramTotalBytes = nil
+        thermalState = .nominal
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(5))
+                let metrics = await RemoteSystemMetrics.fetch(from: remote)
                 if Task.isCancelled { return }
-                await MainActor.run { self?.tick() }
+                self?.applyRemote(metrics)
+                try? await Task.sleep(for: .seconds(5))
             }
         }
     }
@@ -50,6 +68,21 @@ final class SystemMetricsPoller {
         if let used = Self.readRamUsedBytes() {
             ramUsedBytes = used
         }
+    }
+
+    /// Nil (server unreachable, older server, bad key) blanks the RAM bar
+    /// rather than keeping a stale reading.
+    func applyRemote(_ metrics: RemoteSystemMetrics?) {
+        guard let metrics else {
+            ramUsedBytes = nil
+            ramTotalBytes = nil
+            thermalState = .nominal
+            return
+        }
+        let memory = metrics.snapshotMemory
+        ramTotalBytes = memory.totalBytes > 0 ? memory.totalBytes : nil
+        ramUsedBytes = memory.totalBytes > 0 ? memory.usedBytes : nil
+        thermalState = metrics.processThermalState
     }
 
     // MARK: - Mach
