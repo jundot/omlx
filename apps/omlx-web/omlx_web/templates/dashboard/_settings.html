@@ -1546,6 +1546,61 @@
                                 </div>
                             </div>
                         </div>
+                        <div x-show="globalSettings.integrations.macos_say_available" class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
+                                <div class="flex items-center gap-3">
+                                    <i data-lucide="audio-lines" class="w-4 h-4 text-neutral-500"></i>
+                                    <span class="text-xs font-bold uppercase tracking-wider text-neutral-600">{{ t('settings.integrations.macos_say.section_label') }}</span>
+                                </div>
+                                <span class="badge bg-neutral-200 text-neutral-600 border-neutral-300 font-mono">macos-say</span>
+                            </div>
+                            <div class="divide-y divide-neutral-100">
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.macos_say.enabled') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.macos_say.enabled_hint') }}</p>
+                                    </div>
+                                    <button type="button" role="switch"
+                                            :aria-checked="globalSettings.integrations.macos_say_enabled ? 'true' : 'false'"
+                                            @click="globalSettings.integrations.macos_say_enabled = !globalSettings.integrations.macos_say_enabled; saveIntegrationSettings().then(() => loadModels())"
+                                            :class="globalSettings.integrations.macos_say_enabled ? 'bg-black' : 'bg-neutral-200'"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.integrations.macos_say_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.macos_say.autodetect') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.macos_say.autodetect_hint') }}</p>
+                                    </div>
+                                    <button type="button" role="switch"
+                                            :aria-checked="globalSettings.integrations.macos_say_autodetect && globalSettings.integrations.macos_say_enabled ? 'true' : 'false'"
+                                            @click="globalSettings.integrations.macos_say_autodetect = !globalSettings.integrations.macos_say_autodetect; saveIntegrationSettings()"
+                                            :disabled="!globalSettings.integrations.macos_say_enabled"
+                                            :class="[
+                                                globalSettings.integrations.macos_say_autodetect && globalSettings.integrations.macos_say_enabled ? 'bg-black' : 'bg-neutral-200',
+                                                !globalSettings.integrations.macos_say_enabled ? 'opacity-40 cursor-not-allowed' : ''
+                                            ]"
+                                            class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black">
+                                        <span :class="globalSettings.integrations.macos_say_autodetect && globalSettings.integrations.macos_say_enabled ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-4 sm:px-6 py-4">
+                                    <div>
+                                        <label class="text-sm text-neutral-700">{{ t('settings.integrations.macos_say.language') }}</label>
+                                        <p class="text-xs text-neutral-400 mt-0.5">{{ t('settings.integrations.macos_say.language_hint') }}</p>
+                                    </div>
+                                    <input type="text"
+                                           x-model.trim="globalSettings.integrations.macos_say_language"
+                                           @change="saveIntegrationSettings()"
+                                           :disabled="!globalSettings.integrations.macos_say_enabled"
+                                           placeholder="en-GB"
+                                           class="w-24 px-3 py-2 text-sm font-mono border border-neutral-200 rounded-lg focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all disabled:opacity-40">
+                                </div>
+                            </div>
+                        </div>
                         <div class="bg-white rounded-2xl border border-neutral-200 overflow-hidden">
                             <div class="flex items-center justify-between px-6 py-4 bg-neutral-100 border-b border-neutral-200">
                                 <div class="flex items-center gap-3">

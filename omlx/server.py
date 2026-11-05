@@ -249,7 +249,7 @@ from .prefill_helper.routes import router as prefill_helper_router
 from .prefill_helper.routes import set_engine_pool_getter as set_prefill_helper_pool
 from .prefill_progress import get_prefill_tracker
 from .server_metrics import get_server_metrics, reset_server_metrics
-from .utils import gpu_power
+from .utils import gpu_power, macos_say
 from .utils.network import is_loopback_bind
 
 logging.basicConfig(level=logging.INFO)
@@ -3950,6 +3950,13 @@ async def list_models(_: bool = Depends(verify_inference_api_key)) -> JSONRespon
     ):
         models.append(
             ModelInfo(id=MARKITDOWN_MODEL_ID, owned_by="omlx", model_type="markitdown")
+        )
+
+    if macos_say.model_visible(_server_state.global_settings) and not any(
+        m.id == macos_say.MODEL_ID for m in models
+    ):
+        models.append(
+            ModelInfo(id=macos_say.MODEL_ID, owned_by="omlx", model_type="audio_tts")
         )
 
     # Favorites first; stable sort keeps alphabetical order within groups.

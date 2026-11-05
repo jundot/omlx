@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from omlx.integrations.base import IntegrationContext
@@ -31,6 +32,12 @@ class _Pool:
             "loaded_count": 0,
             "models": self._models,
         }
+
+
+@pytest.fixture(autouse=True)
+def _no_macos_say(monkeypatch):
+    """These tests pin exact lists; keep the built-in macos-say entry out."""
+    monkeypatch.setattr("omlx.utils.macos_say.available", lambda: False)
 
 
 def _model(model_id: str, config_model_type: str = "llama", **extra) -> dict:

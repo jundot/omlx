@@ -976,6 +976,10 @@ class IntegrationSettings:
     markitdown_max_file_size_mb: int = 25
     markitdown_max_files_per_request: int = 5
     markitdown_pdf_processing_engine: str = "markitdown"
+    # macos-say TTS (omlx/utils/macos_say.py); empty language = none
+    macos_say_enabled: bool = True
+    macos_say_autodetect: bool = True
+    macos_say_language: str = ""
     # "ddgs" (all engines) | "ddgs_custom" | "duckduckgo" | "brave" | "searxng"
     web_search_provider: str = "ddgs"
     web_search_brave_api_key: str = ""
@@ -1010,6 +1014,9 @@ class IntegrationSettings:
             "markitdown_max_file_size_mb": self.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": self.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": self.markitdown_pdf_processing_engine,
+            "macos_say_enabled": self.macos_say_enabled,
+            "macos_say_autodetect": self.macos_say_autodetect,
+            "macos_say_language": self.macos_say_language,
             "web_search_provider": self.web_search_provider,
             "web_search_brave_api_key": self.web_search_brave_api_key,
             "web_search_searxng_url": self.web_search_searxng_url,
@@ -1047,6 +1054,9 @@ class IntegrationSettings:
             markitdown_pdf_processing_engine=data.get(
                 "markitdown_pdf_processing_engine", "markitdown"
             ),
+            macos_say_enabled=bool(data.get("macos_say_enabled", True)),
+            macos_say_autodetect=bool(data.get("macos_say_autodetect", True)),
+            macos_say_language=str(data.get("macos_say_language") or ""),
             web_search_provider=data.get("web_search_provider", "ddgs"),
             web_search_brave_api_key=data.get("web_search_brave_api_key", ""),
             web_search_searxng_url=data.get("web_search_searxng_url", ""),

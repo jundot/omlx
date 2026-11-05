@@ -53,7 +53,7 @@ from ..engine.vlm import (
 )
 from ..exceptions import InvalidRequestError, ModelNotFoundError
 from ..server_metrics import get_server_metrics
-from ..utils import gpu_power
+from ..utils import gpu_power, macos_say
 from .audio_models import AudioSpeechRequest, AudioTranscriptionResponse
 
 logger = logging.getLogger(__name__)
@@ -1525,6 +1525,81 @@ def _transcode_speech_output(wav_bytes: bytes, response_format: str) -> bytes:
     return buf.getvalue()
 
 
+def _global_settings():
+    try:
+        from omlx.server import _server_state
+    except Exception:
+        return None
+    return getattr(_server_state, "global_settings", None)
+
+
+def _has_soundfile() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("soundfile") is not None
+
+
+async def _speech_via_macos_say(
+    request: AudioSpeechRequest, response_format: str
+) -> Response:
+    """``model: "macos-say"``: render with the macOS ``say`` command."""
+    gs = _global_settings()
+    if not macos_say.available():
+        raise HTTPException(
+            status_code=400, detail="macos-say is only available on macOS"
+        )
+    if not macos_say.enabled(gs):
+        raise HTTPException(
+            status_code=400,
+            detail="macos-say is turned off in Settings > Integrations",
+        )
+    if len(request.input) > macos_say.MAX_INPUT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'input' is longer than {macos_say.MAX_INPUT_CHARS} characters"
+            ),
+        )
+    if response_format not in ("wav", "pcm") and not _has_soundfile():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"response_format '{response_format}' needs the audio extra "
+                "(soundfile); use 'wav' or 'pcm'"
+            ),
+        )
+    voice = macos_say.explicit_voice(request.voice)
+    if voice:
+        if not await asyncio.to_thread(macos_say.voice_is_installed, voice):
+            raise HTTPException(
+                status_code=400,
+                detail=f"macOS voice '{voice}' is not installed (see `say -v ?`)",
+            )
+    else:
+        integrations = getattr(gs, "integrations", None)
+        voice = await asyncio.to_thread(
+            macos_say.pick_voice,
+            request.input,
+            macos_say.normalize_language(request.language),
+            macos_say.normalize_language(
+                getattr(integrations, "macos_say_language", "")
+            ),
+            bool(getattr(integrations, "macos_say_autodetect", True)),
+        )
+    try:
+        audio = await asyncio.to_thread(
+            macos_say.synthesize, request.input, voice, request.speed
+        )
+        if response_format != "wav":
+            audio = await asyncio.to_thread(
+                _transcode_speech_output, audio, response_format
+            )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    _record_audio_request(macos_say.MODEL_ID)
+    return Response(content=audio, media_type=_SPEECH_RESPONSE_FORMATS[response_format])
+
+
 @router.post("/v1/audio/speech")
 async def create_speech(request: AudioSpeechRequest):
     """OpenAI-compatible text-to-speech endpoint."""
@@ -1550,6 +1625,9 @@ async def create_speech(request: AudioSpeechRequest):
                 detail="Streaming TTS currently only supports response_format='wav'",
             )
         streaming_interval = _resolve_tts_streaming_interval(request)
+
+    if request.model == macos_say.MODEL_ID:
+        return await _speech_via_macos_say(request, response_format)
 
     audio_bytes = _decode_ref_audio_base64(request)
 

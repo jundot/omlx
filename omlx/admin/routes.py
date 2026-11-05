@@ -101,7 +101,7 @@ from ..settings import (
     SubKeyEntry,
     burst_decode_env,
 )
-from ..utils import gpu_power
+from ..utils import gpu_power, macos_say
 from ..utils.fatal import is_command_buffer_error
 from ..utils.hardware import (
     compute_owner_hash,
@@ -816,6 +816,9 @@ class GlobalSettingsRequest(BaseModel):
     markitdown_max_file_size_mb: int | None = None
     markitdown_max_files_per_request: int | None = None
     markitdown_pdf_processing_engine: str | None = None
+    macos_say_enabled: bool | None = None
+    macos_say_autodetect: bool | None = None
+    macos_say_language: str | None = None
     web_search_provider: str | None = None
     web_search_brave_api_key: str | None = None
     web_search_searxng_url: str | None = None
@@ -4825,6 +4828,10 @@ def _global_settings_response(global_settings):
             "markitdown_max_file_size_mb": global_settings.integrations.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": global_settings.integrations.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": global_settings.integrations.markitdown_pdf_processing_engine,
+            "macos_say_enabled": global_settings.integrations.macos_say_enabled,
+            "macos_say_autodetect": global_settings.integrations.macos_say_autodetect,
+            "macos_say_language": global_settings.integrations.macos_say_language,
+            "macos_say_available": macos_say.available(),
             "web_search_provider": global_settings.integrations.web_search_provider,
             "web_search_brave_api_key": global_settings.integrations.web_search_brave_api_key,
             "web_search_searxng_url": global_settings.integrations.web_search_searxng_url,
@@ -5764,6 +5771,26 @@ async def update_global_settings(
         global_settings.integrations.markitdown_enabled = bool(
             request.markitdown_enabled
         )
+        integrations_changed = True
+    if "macos_say_enabled" in request.model_fields_set:
+        global_settings.integrations.macos_say_enabled = bool(
+            request.macos_say_enabled
+        )
+        integrations_changed = True
+    if "macos_say_autodetect" in request.model_fields_set:
+        global_settings.integrations.macos_say_autodetect = bool(
+            request.macos_say_autodetect
+        )
+        integrations_changed = True
+    if "macos_say_language" in request.model_fields_set:
+        raw = (request.macos_say_language or "").strip()
+        lang = macos_say.normalize_language(raw)
+        if raw and not lang:
+            raise HTTPException(
+                status_code=400,
+                detail="macos_say_language must be a language tag like 'en' or 'cs-CZ'",
+            )
+        global_settings.integrations.macos_say_language = lang
         integrations_changed = True
     if "markitdown_expose_model" in request.model_fields_set:
         global_settings.integrations.markitdown_expose_model = bool(
