@@ -399,3 +399,99 @@ def test_sushi_pack_picks_sushi_without_settings(sushi_pack, tmp_path):
     assert pool.external_engine_id("gguf", None) == "splash"
     assert pool.external_engine_id("plain", None) is None
     assert pool.external_engine_id("pack", SimpleNamespace(external_engine="splash")) == "splash"
+
+
+@pytest.fixture
+def dsv41_pack(tmp_path):
+    model = tmp_path / "models" / "beamster" / "DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw"
+    model.mkdir(parents=True)
+    (model / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v41",
+                "architectures": ["DeepseekV41ForCausalLM"],
+                "expert_quant": {"format": "stq", "k": 2.5, "codebook": "pair1"},
+                "text_config": {"model_type": "deepseek_v41_text"},
+                "vision_config": {"model_type": "x"},
+            }
+        )
+    )
+    (model / "model-00001.safetensors").write_bytes(b"\0" * 4096)
+    return model
+
+
+def test_stq_pack_is_a_sushi_pack():
+    assert sushi_mod.sushi_expert_format({"expert_quant": {"format": "stq"}}) == "stq"
+    assert is_sushi_pack({"model_type": "deepseek_v41", "expert_quant": {"format": "STQ"}})
+    assert not is_sushi_pack({"expert_quant": {"format": "gptq"}})
+
+
+def test_min_version_by_arch_and_format():
+    assert sushi_mod.sushi_min_version(
+        {"model_type": "deepseek_v41", "expert_quant": {"format": "stq"}}
+    ) == (1, 5, 0)
+    assert sushi_mod.sushi_min_version(
+        {"model_type": "qwen4_exp", "expert_quant": {"format": "stq"}}
+    ) == (1, 3, 0)
+    assert sushi_mod.sushi_min_version(
+        {"model_type": "qwen4_exp", "expert_quant": {"format": "exl3"}}
+    ) is None
+
+
+def test_old_sushi_refused_for_dsv41(dsv41_pack, fake_sushi, monkeypatch):
+    # The fake reports 1.0.0, older than DeepSeek's 1.5.0.
+    target, reason = resolve_sushi_target(dsv41_pack, str(fake_sushi))
+    assert target is None and "1.5.0" in reason and "sushi update" in reason
+    monkeypatch.setattr(sushi_mod, "_read_version", lambda path, mtime: "1.5.2")
+    target, reason = resolve_sushi_target(dsv41_pack, str(fake_sushi))
+    assert target is not None and target.model_type == "deepseek_v41", reason
+
+
+def test_dsv41_launch_skips_qwen_flags(dsv41_pack, fake_sushi, tmp_path):
+    binary, _ = find_sushi_binary(str(fake_sushi))
+    engine = SushiEngine(
+        model_name=str(dsv41_pack),
+        model_id="ds",
+        target=SushiTarget(binary, "deepseek_v41", True),
+        log_dir=tmp_path,
+        options=SushiOptions(ssd_budget_gb=96),
+    )
+    cmd = engine._serve_command(4321)
+    for refused in ("--kv-quant", "--mtp-head-kv-quant", "--ctx-size", "--mtp",
+                    "--prefill-chunk", "--max-tokens", "--temp"):
+        assert refused not in cmd, refused
+    joined = " ".join(cmd)
+    assert "--ssd-budget-gb 96" in joined and "--prefix-cache-disk 20GB" in joined
+    assert engine.max_context_tokens is None  # Sushi plans DeepSeek's context
+
+
+def test_dsv41_streamed_memory_estimate(dsv41_pack):
+    gib = 1024**3
+    est = sushi_mod.sushi_memory_estimate(
+        dsv41_pack, None, "8", model_type="deepseek_v41", ssd_budget_gb=108
+    )
+    assert 113 * gib < est < 118 * gib  # budget + state + image + reserve
+    full = sushi_mod.sushi_memory_estimate(dsv41_pack, None, "8", model_type="deepseek_v41")
+    assert full < 10 * gib  # resident: weights (4 KiB here) + the extras
+
+
+@pytest.mark.parametrize(
+    "ram_gb, wired_mb, expected",
+    [(128, 0, 96), (128, 122_000, 108), (96, 0, 80), (192, 0, None), (256, 0, None)],
+)
+def test_dsv41_default_ssd_budget(ram_gb, wired_mb, expected):
+    ram = int(ram_gb * 1024**3)
+    assert sushi_mod.sushi_default_ssd_budget_gb("deepseek_v41", ram, wired_mb) == expected
+    assert sushi_mod.sushi_default_ssd_budget_gb("qwen4_exp", ram, wired_mb) is None
+
+
+def test_qwen_launch_keeps_tuned_flags(sushi_pack, fake_sushi, tmp_path):
+    binary, _ = find_sushi_binary(str(fake_sushi))
+    engine = SushiEngine(
+        model_name=str(sushi_pack), model_id="q",
+        target=SushiTarget(binary, "qwen4_exp", True),
+        log_dir=tmp_path, options=SushiOptions(),
+    )
+    cmd = engine._serve_command(1)
+    assert "--kv-quant" in cmd and "--mtp-head-kv-quant" in cmd
+    assert "--ssd-budget-gb" not in cmd
