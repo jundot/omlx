@@ -5,6 +5,8 @@ from typing import Optional
 
 import mlx.core as mx
 
+from . import msa_nax
+
 try:
     from omlx.custom_kernels.sparse_index import fast as _index_fast
 except Exception:  # pragma: no cover - optional native extension
@@ -504,6 +506,19 @@ def build_grouped_msa_topk(
     """
     if idx_queries.ndim != 4 or idx_keys.ndim != 4:
         raise ValueError("idx_queries/idx_keys must have shape [B, H, L, D].")
+
+    # The selection below needs at least topk blocks.
+    if block_size == msa_nax.BLOCK and idx_keys.shape[2] > (topk - 1) * block_size:
+        scores = msa_nax.block_scores(idx_queries, idx_keys, q_start, scale)
+        if scores is not None:
+            return _select_msa_topk_from_block_scores(
+                scores,
+                q_start=q_start,
+                block_size=block_size,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+            )
 
     native = _build_grouped_msa_topk_native(
         idx_queries,
