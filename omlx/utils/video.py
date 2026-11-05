@@ -16,11 +16,14 @@ from typing import Any
 from PIL import Image
 
 from ..exceptions import InvalidRequestError
+from ..settings import get_settings
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_VIDEO_BYTES = 200 * 1024 * 1024
 DEFAULT_MAX_VIDEO_FRAMES = 16
+# Base64 characters decoded per step when writing a clip; a multiple of 4.
+_BASE64_CHUNK_CHARS = 4 * 1024 * 1024
 
 # Qwen3.5/3.6/3.8 checkpoints (dense and MoE) carry the Qwen3-VL video tower:
 # temporal patches of two frames and 3D mRoPE with a time axis. mlx-vlm's
@@ -68,16 +71,38 @@ def _video_url(part: Any) -> str | None:
     return None
 
 
-def _decode_video_data_uri(
+def get_max_video_bytes() -> int:
+    """Return the resolved inline video limit in bytes."""
+    try:
+        settings = get_settings()
+    except RuntimeError:
+        return DEFAULT_MAX_VIDEO_BYTES
+    return settings.server.max_video_upload_bytes()
+
+
+def _locate_video_payload(
     value: str, field: str = "messages", subject: str = "video_url"
-) -> tuple[bytes, str]:
-    if not isinstance(value, str) or not value.strip().startswith("data:"):
+) -> tuple[int, int, str]:
+    """Find the base64 payload of a video data URI without copying it.
+
+    Validates the data URI and its size against ``max_video_upload_size``.
+    Returns the payload's start and end offsets in ``value`` and the file
+    suffix for its media type.
+    """
+    if not isinstance(value, str):
+        raise InvalidRequestError(_VIDEO_INPUT_ERROR, field=field)
+    start, end = 0, len(value)
+    while start < end and value[start].isspace():
+        start += 1
+    while end > start and value[end - 1].isspace():
+        end -= 1
+    if not value.startswith("data:", start, end):
         raise InvalidRequestError(_VIDEO_INPUT_ERROR, field=field)
 
-    prefix, separator, encoded = value.strip().partition(",")
-    prefix_lower = prefix.lower()
+    comma = value.find(",", start, end)
+    prefix_lower = value[start:comma].lower() if comma >= 0 else ""
     if (
-        separator != ","
+        comma < 0
         or not prefix_lower.startswith("data:video/")
         or ";base64" not in prefix_lower
     ):
@@ -85,26 +110,17 @@ def _decode_video_data_uri(
             f"{subject} must use a base64 video data URI.", field=field
         )
 
-    estimated_size = len(encoded) * 3 // 4
-    if estimated_size > DEFAULT_MAX_VIDEO_BYTES:
-        raise InvalidRequestError(
-            f"Video payload exceeds {DEFAULT_MAX_VIDEO_BYTES} bytes.",
-            field=field,
-        )
-    try:
-        payload = base64.b64decode(encoded, validate=True)
-    except (binascii.Error, ValueError) as exc:
-        raise InvalidRequestError(
-            f"{subject} contains invalid base64 data.", field=field
-        ) from exc
-    if not payload:
+    limit = get_max_video_bytes()
+    if (end - comma - 1) * 3 // 4 > limit:
+        raise InvalidRequestError(f"Video payload exceeds {limit} bytes.", field=field)
+    if comma + 1 == end:
         raise InvalidRequestError("Video payload is empty.", field=field)
 
-    media_type = prefix.split(";", 1)[0].split("/", 1)[-1].lower()
+    media_type = prefix_lower.split(";", 1)[0].split("/", 1)[-1]
     suffix = {"quicktime": ".mov", "x-matroska": ".mkv"}.get(
         media_type, f".{media_type}"
     )
-    return payload, suffix
+    return comma + 1, end, suffix
 
 
 def _sample_indices(frame_count: int, max_frames: int) -> list[int]:
@@ -125,14 +141,9 @@ def _decode_video_frames(value: str, max_frames: int) -> list[Image.Image]:
             field="messages",
         ) from exc
 
-    payload, suffix = _decode_video_data_uri(value)
-    path: Path | None = None
+    path, _ = write_video_data_uri(value)
     capture = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
-            handle.write(payload)
-            path = Path(handle.name)
-
         capture = cv2.VideoCapture(str(path))
         if not capture.isOpened():
             raise InvalidRequestError("Could not decode video input.", field="messages")
@@ -221,17 +232,39 @@ def require_opencv(field: str = "messages"):
 def write_video_data_uri(
     value: str, field: str = "messages", subject: str = "video_url"
 ) -> tuple[Path, str]:
-    """Write an inline video to a temporary file for the native video path.
+    """Validate an inline video and write it to a temporary file.
 
-    Applies the same validation and size limit as MiMo's frame sampler. Returns
-    the file path and the SHA-256 of the payload, which identifies the clip in
-    the prefix cache. The caller deletes the file once preprocessing is done.
+    The payload is checked against ``max_video_upload_size`` before anything is
+    decoded, then decoded in chunks straight to the file, so memory use does not
+    grow with the clip. Returns the file path and the SHA-256 of the payload,
+    which identifies the clip in the prefix cache. The caller deletes the file.
     """
-    payload, suffix = _decode_video_data_uri(value, field, subject)
-    digest = hashlib.sha256(payload).hexdigest()
+    start, end, suffix = _locate_video_payload(value, field, subject)
+    digest = hashlib.sha256()
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
-        handle.write(payload)
-    return Path(handle.name), digest
+        path = Path(handle.name)
+        try:
+            offset = start
+            while offset < end:
+                stop = offset + _BASE64_CHUNK_CHARS
+                if end - stop < 4:
+                    # The tail, with any padding, goes into the last chunk.
+                    stop = end
+                elif value[stop - 1] == "=":
+                    raise binascii.Error("padding before the end of the payload")
+                chunk = base64.b64decode(value[offset:stop], validate=True)
+                handle.write(chunk)
+                digest.update(chunk)
+                offset = stop
+        except (binascii.Error, ValueError) as exc:
+            path.unlink(missing_ok=True)
+            raise InvalidRequestError(
+                f"{subject} contains invalid base64 data.", field=field
+            ) from exc
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+    return path, digest.hexdigest()
 
 
 @dataclass(frozen=True)
