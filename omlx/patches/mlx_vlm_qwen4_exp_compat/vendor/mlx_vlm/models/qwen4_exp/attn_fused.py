@@ -495,10 +495,22 @@ def _gpu_class() -> str:
         return ""
 
 
+@functools.lru_cache(maxsize=None)
+def _thread_limited_gpu() -> bool:
+    """g13/g14 GPUs cap threadgroups at 896 threads, below the 1024 threads
+    the combine kernels launch; they must keep the MLX path rather than
+    fail each warm-up probe."""
+    try:
+        architecture = str(mx.device_info().get("architecture", ""))
+    except Exception:
+        return False
+    return architecture.startswith(("applegpu_g13", "applegpu_g14"))
+
+
 def rows_available() -> bool:
     """Whether the fused decode/verify attention rows can run on this GPU at
     all (layers still check their own shapes): off after a kernel failure."""
-    return not _DISABLED and _gpu_class() == "d"
+    return not _DISABLED and _gpu_class() == "d" and not _thread_limited_gpu()
 
 
 def row_plan(first_keys: int, last_keys: int) -> int | None:
@@ -688,7 +700,7 @@ def ready(dtype, heads: int, kv_heads: int, head_dim: int, rotary_dim: int, pos_
     transcribed plans 12+ of them on a 'd' GPU. Each specialization runs once
     on tiny inputs first; a compile or launch failure turns the kernels off."""
     global _DISABLED
-    if _gpu_class() != "d" or not prep_ready(
+    if _gpu_class() != "d" or _thread_limited_gpu() or not prep_ready(
         dtype, heads, kv_heads, head_dim, rotary_dim, pos_ndim
     ):
         return False
